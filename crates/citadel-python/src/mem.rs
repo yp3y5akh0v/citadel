@@ -4,16 +4,18 @@ use std::sync::Arc;
 
 use citadel_mem::types::{
     AtomAttestation, AtomHit, AtomInput, EdgeKind, ErasureReceipt, EvictionPolicy, FetchQuery,
-    FusionWeights, GraphExpand, RecallQuery, RerankStrategy, SlotErasure,
+    FusionWeights, GraphExpand, MemoryRegionInfo, MemoryRegionInventory, RecallQuery,
+    ReembedReport, RerankStrategy, SlotErasure, StoredRegionIdentity,
 };
 #[cfg(feature = "candle-embed")]
 use citadel_mem::{CandleConfig, CandleEmbedder, CrossEncoder};
 use citadel_mem::{
-    EmbedError, Embedder, EmbeddingMetric, MemoryEngine, MockEmbedder, MockReranker, Reranker,
+    EmbedError, Embedder, EmbeddingMetric, MemoryEngine, MemoryMaintenance, MockEmbedder,
+    MockReranker, Reranker,
 };
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyBool, PyDict};
 use pyo3::IntoPyObjectExt;
 use serde_json::Value as Json;
 
@@ -114,13 +116,45 @@ struct PyEmbedder {
     has_query_method: bool,
 }
 
+fn extract_embedder_dim(value: &Bound<'_, PyAny>) -> PyResult<usize> {
+    let raw: i64 = value.extract()?;
+    if value.is_instance_of::<PyBool>() || !(1..=i64::from(u16::MAX)).contains(&raw) {
+        return Err(PyValueError::new_err(
+            "embedder dim must be a positive integer no greater than 65535",
+        ));
+    }
+    Ok(raw as usize)
+}
+
 impl PyEmbedder {
     fn from_object(obj: &Bound<'_, PyAny>) -> PyResult<Self> {
-        let dim: usize = obj.getattr("dim")?.extract()?;
+        let dim_value = obj.getattr("dim")?;
+        let dim = extract_embedder_dim(&dim_value)?;
         let metric: String = obj.getattr("metric")?.extract()?;
         let metric = parse_embedding_metric(&metric)?;
         let model_id: String = obj.getattr("model_id")?.extract()?;
+        let model_id = model_id.trim().to_owned();
+        if model_id.is_empty()
+            || matches!(
+                model_id.to_ascii_lowercase().as_str(),
+                "unknown" | "default"
+            )
+        {
+            return Err(PyValueError::new_err(
+                "embedder model_id must be a nonblank string other than 'unknown' or 'default'",
+            ));
+        }
         let has_query_method = obj.hasattr("embed_queries")?;
+        if !obj.hasattr("embed")? || !obj.getattr("embed")?.is_callable() {
+            return Err(PyTypeError::new_err(
+                "embedder must provide a callable embed(texts) method",
+            ));
+        }
+        if has_query_method && !obj.getattr("embed_queries")?.is_callable() {
+            return Err(PyTypeError::new_err(
+                "embedder embed_queries attribute must be callable",
+            ));
+        }
         Ok(Self {
             callable: obj.clone().unbind(),
             dim,
@@ -188,8 +222,11 @@ impl Embedder for PyEmbedder {
 }
 
 fn build_embedder(obj: &Bound<'_, PyAny>) -> PyResult<Arc<dyn Embedder>> {
-    // A built-in CandleEmbedder is already a Rust `Embedder` - use it directly
-    // (no Rust->Python->Rust round-trip per batch).
+    // Built-in embedders are already Rust `Embedder`s; avoid a
+    // Rust->Python->Rust round-trip and Python list allocation per batch.
+    if let Ok(mock) = obj.extract::<PyRef<'_, PyMockEmbedder>>() {
+        return Ok(mock.inner.clone());
+    }
     #[cfg(feature = "candle-embed")]
     {
         if let Ok(ce) = obj.extract::<PyRef<'_, PyCandleEmbedder>>() {
@@ -211,6 +248,17 @@ struct PyReranker {
 impl PyReranker {
     fn from_object(obj: &Bound<'_, PyAny>) -> PyResult<Self> {
         let model_id: String = obj.getattr("model_id")?.extract()?;
+        let model_id = model_id.trim().to_owned();
+        if model_id.is_empty() {
+            return Err(PyValueError::new_err(
+                "reranker model_id must be a nonblank string",
+            ));
+        }
+        if !obj.hasattr("rerank")? || !obj.getattr("rerank")?.is_callable() {
+            return Err(PyTypeError::new_err(
+                "reranker must provide a callable rerank(query, passages) method",
+            ));
+        }
         Ok(Self {
             callable: obj.clone().unbind(),
             model_id,
@@ -241,6 +289,15 @@ impl Reranker for PyReranker {
                     passages.len()
                 )));
             }
+            if let Some((index, score)) = scores
+                .iter()
+                .enumerate()
+                .find(|(_, score)| !score.is_finite())
+            {
+                return Err(EmbedError::Backend(format!(
+                    "rerank returned non-finite score {score} at index {index}"
+                )));
+            }
             Ok(scores)
         })
     }
@@ -263,7 +320,10 @@ fn build_reranker(obj: &Bound<'_, PyAny>) -> PyResult<Arc<dyn Reranker>> {
 fn parse_rerank_strategy(strategy: &str, rrf_k: f32) -> PyResult<RerankStrategy> {
     match strategy.to_ascii_lowercase().as_str() {
         "replace" => Ok(RerankStrategy::Replace),
-        "rrf" => Ok(RerankStrategy::Rrf { k: rrf_k }),
+        "rrf" if rrf_k.is_finite() && rrf_k > 0.0 => Ok(RerankStrategy::Rrf { k: rrf_k }),
+        "rrf" => Err(PyValueError::new_err(
+            "rrf_k must be finite and greater than zero",
+        )),
         other => Err(PyValueError::new_err(format!(
             "unknown rerank strategy '{other}' (replace|rrf)"
         ))),
@@ -316,9 +376,12 @@ impl PyCandleEmbedder {
     /// `preset` selects pooling/prefixes: e5-large|bge-small|bge-base|bge-large|minilm|granite-r2.
     #[new]
     #[pyo3(signature = (model_dir, preset="e5-large"))]
-    fn new(model_dir: &str, preset: &str) -> PyResult<Self> {
+    fn new(py: Python<'_>, model_dir: &str, preset: &str) -> PyResult<Self> {
         let cfg = candle_config_for(preset)?;
-        let inner = CandleEmbedder::from_dir(model_dir, cfg).map_err(to_pyerr)?;
+        let model_dir = model_dir.to_owned();
+        let inner = py
+            .detach(move || CandleEmbedder::from_dir(&model_dir, cfg))
+            .map_err(to_pyerr)?;
         Ok(Self {
             inner: Arc::new(inner),
         })
@@ -375,8 +438,11 @@ impl PyCrossEncoder {
     /// Load `config.json` + `tokenizer.json` + `model.safetensors` from `model_dir`
     /// as a ms-marco-MiniLM-L-6-v2-style cross-encoder (512-token pairs).
     #[new]
-    fn new(model_dir: &str) -> PyResult<Self> {
-        let inner = CrossEncoder::ms_marco_minilm_l6(model_dir).map_err(to_pyerr)?;
+    fn new(py: Python<'_>, model_dir: &str) -> PyResult<Self> {
+        let model_dir = model_dir.to_owned();
+        let inner = py
+            .detach(move || CrossEncoder::ms_marco_minilm_l6(&model_dir))
+            .map_err(to_pyerr)?;
         Ok(Self {
             inner: Arc::new(inner),
         })
@@ -392,16 +458,20 @@ impl PyCrossEncoder {
 /// the embedder protocol for tests and quickstarts.
 #[pyclass(name = "MockEmbedder")]
 pub(crate) struct PyMockEmbedder {
-    inner: MockEmbedder,
+    inner: Arc<MockEmbedder>,
 }
 
 #[pymethods]
 impl PyMockEmbedder {
     #[new]
     #[pyo3(signature = (dim, metric="cosine"))]
-    fn new(dim: usize, metric: &str) -> PyResult<Self> {
+    fn new(dim: &Bound<'_, PyAny>, metric: &str) -> PyResult<Self> {
+        let dim = extract_embedder_dim(dim)?;
         Ok(Self {
-            inner: MockEmbedder::with_metric(dim, parse_embedding_metric(metric)?),
+            inner: Arc::new(MockEmbedder::with_metric(
+                dim,
+                parse_embedding_metric(metric)?,
+            )),
         })
     }
 
@@ -589,6 +659,179 @@ impl PySlotErasure {
     }
 }
 
+/// What a region records about itself, read from its row.
+#[pyclass(name = "RegionIdentity")]
+pub(crate) struct PyRegionIdentity {
+    inner: StoredRegionIdentity,
+}
+
+#[pymethods]
+impl PyRegionIdentity {
+    #[getter]
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    #[getter]
+    fn dim(&self) -> u16 {
+        self.inner.dim()
+    }
+
+    #[getter]
+    fn metric(&self) -> &'static str {
+        embedding_metric_name(self.inner.metric())
+    }
+
+    #[getter]
+    fn encrypted(&self) -> bool {
+        self.inner.encrypted()
+    }
+
+    /// The model the region records.
+    #[getter]
+    fn model_id(&self) -> &str {
+        self.inner.model_id()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "RegionIdentity(name={:?}, dim={}, metric={:?}, encrypted={}, model_id={:?})",
+            self.name(),
+            self.dim(),
+            self.metric(),
+            self.encrypted(),
+            self.model_id()
+        )
+    }
+}
+
+/// Persisted region inventory returned by `MemoryMaintenance.regions`.
+#[pyclass(name = "MemoryRegionInfo")]
+pub(crate) struct PyMemoryRegionInfo {
+    inner: MemoryRegionInfo,
+}
+
+#[pymethods]
+impl PyMemoryRegionInfo {
+    #[getter]
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    #[getter]
+    fn dim(&self) -> u16 {
+        self.inner.dim()
+    }
+
+    #[getter]
+    fn metric(&self) -> &'static str {
+        embedding_metric_name(self.inner.metric())
+    }
+
+    #[getter]
+    fn encrypted(&self) -> bool {
+        self.inner.encrypted()
+    }
+
+    #[getter]
+    fn model_id(&self) -> &str {
+        self.inner.model_id()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "MemoryRegionInfo(name={:?}, dim={}, metric={:?}, encrypted={}, model_id={:?})",
+            self.name(),
+            self.dim(),
+            self.metric(),
+            self.encrypted(),
+            self.model_id()
+        )
+    }
+}
+
+/// One region and its live-atom count from an inventory pass under one
+/// key-lifecycle guard.
+#[pyclass(name = "MemoryRegionInventory")]
+pub(crate) struct PyMemoryRegionInventory {
+    inner: MemoryRegionInventory,
+}
+
+#[pymethods]
+impl PyMemoryRegionInventory {
+    #[getter]
+    fn region(&self) -> PyMemoryRegionInfo {
+        PyMemoryRegionInfo {
+            inner: self.inner.region().clone(),
+        }
+    }
+
+    #[getter]
+    fn live_atoms(&self) -> Option<u64> {
+        self.inner.live_atoms()
+    }
+
+    #[getter]
+    fn unavailable(&self) -> Option<&str> {
+        self.inner.unavailable()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "MemoryRegionInventory(region={:?}, live_atoms={:?}, unavailable={:?})",
+            self.inner.region().name(),
+            self.inner.live_atoms(),
+            self.inner.unavailable()
+        )
+    }
+}
+
+/// Report from `Memory.reembed_region`: what the migration did, and did not do.
+#[pyclass(name = "ReembedReport")]
+pub(crate) struct PyReembedReport {
+    inner: ReembedReport,
+}
+
+#[pymethods]
+impl PyReembedReport {
+    #[getter]
+    fn atoms_migrated(&self) -> u64 {
+        self.inner.atoms_migrated
+    }
+
+    #[getter]
+    fn model_id(&self) -> String {
+        self.inner.model_id.clone()
+    }
+
+    #[getter]
+    fn ann_rebuilt(&self) -> bool {
+        self.inner.ann_rebuilt
+    }
+
+    #[getter]
+    fn similarity_edges_rewoven(&self) -> u64 {
+        self.inner.similarity_edges_rewoven
+    }
+
+    #[getter]
+    fn similarity_edges_cleared(&self) -> u64 {
+        self.inner.similarity_edges_cleared
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "ReembedReport(atoms_migrated={}, model_id={:?}, ann_rebuilt={}, \
+             similarity_edges_rewoven={}, similarity_edges_cleared={})",
+            self.inner.atoms_migrated,
+            self.inner.model_id,
+            self.inner.ann_rebuilt,
+            self.inner.similarity_edges_rewoven,
+            self.inner.similarity_edges_cleared
+        )
+    }
+}
+
 /// Receipt from `Memory.forget`: what was (cryptographically) erased.
 #[pyclass(name = "ErasureReceipt")]
 pub(crate) struct PyErasureReceipt {
@@ -757,11 +1000,133 @@ impl PyRecallOptions {
     }
 }
 
+// ---- maintenance -----------------------------------------------------------
+
+/// Model-free inventory, verification, and erasure over existing memory data.
+#[pyclass(name = "MemoryMaintenance")]
+pub(crate) struct PyMemoryMaintenance {
+    inner: Arc<MemoryMaintenance>,
+}
+
+impl PyMemoryMaintenance {
+    pub(crate) fn open(py: Python<'_>, db: Arc<citadel::Database>) -> PyResult<Self> {
+        let inner = py
+            .detach(move || MemoryMaintenance::open(db))
+            .map_err(to_pyerr)?;
+        Ok(Self {
+            inner: Arc::new(inner),
+        })
+    }
+}
+
+#[pymethods]
+impl PyMemoryMaintenance {
+    /// Persisted region inventory. A row can remain after its content key was erased.
+    fn regions(&self, py: Python<'_>) -> PyResult<Vec<PyMemoryRegionInfo>> {
+        let maintenance = Arc::clone(&self.inner);
+        Ok(py
+            .detach(move || maintenance.regions())
+            .map_err(to_pyerr)?
+            .into_iter()
+            .map(|inner| PyMemoryRegionInfo { inner })
+            .collect())
+    }
+
+    /// Region metadata and counts from one key-lifecycle-guarded inventory pass;
+    /// unreadable rows carry an error.
+    fn inventory(&self, py: Python<'_>) -> PyResult<Vec<PyMemoryRegionInventory>> {
+        let maintenance = Arc::clone(&self.inner);
+        Ok(py
+            .detach(move || maintenance.inventory())
+            .map_err(to_pyerr)?
+            .into_iter()
+            .map(|inner| PyMemoryRegionInventory { inner })
+            .collect())
+    }
+
+    /// Count every live, unexpired atom in a region.
+    fn count(&self, py: Python<'_>, region: &str) -> PyResult<u64> {
+        let maintenance = Arc::clone(&self.inner);
+        let region = region.to_owned();
+        py.detach(move || maintenance.count_region(&region))
+            .map_err(to_pyerr)
+    }
+
+    /// Deterministic, non-semantic fetch without attaching an embedder.
+    #[pyo3(signature =(region, kind=None, *, payload_filter=None, limit=100, newest=false, after_id=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn fetch(
+        &self,
+        py: Python<'_>,
+        region: &str,
+        kind: Option<&str>,
+        payload_filter: Option<Py<PyAny>>,
+        limit: usize,
+        newest: bool,
+        after_id: Option<i64>,
+    ) -> PyResult<Vec<PyAtomHit>> {
+        let mut query = FetchQuery::new(limit);
+        if let Some(kind) = kind {
+            query = query.with_kind(kind);
+        }
+        query.payload_filter = match &payload_filter {
+            Some(filter) => Some(py_to_json(py, filter.bind(py))?),
+            None => None,
+        };
+        query.newest = newest;
+        query.after_id = after_id;
+        let maintenance = Arc::clone(&self.inner);
+        let region = region.to_owned();
+        Ok(py
+            .detach(move || maintenance.fetch_range(&region, &query))
+            .map_err(to_pyerr)?
+            .into_iter()
+            .map(PyAtomHit::from_hit)
+            .collect())
+    }
+
+    /// Re-authenticate requested atoms from stored bytes.
+    fn verify(
+        &self,
+        py: Python<'_>,
+        region: &str,
+        ids: Vec<i64>,
+    ) -> PyResult<Vec<PyAtomAttestation>> {
+        let maintenance = Arc::clone(&self.inner);
+        let region = region.to_owned();
+        Ok(py
+            .detach(move || maintenance.verify_atoms(&region, &ids))
+            .map_err(to_pyerr)?
+            .into_iter()
+            .map(|inner| PyAtomAttestation { inner })
+            .collect())
+    }
+
+    /// Forget atoms without loading the model that produced their vectors.
+    #[pyo3(signature = (region, ids, force=false))]
+    fn forget(
+        &self,
+        py: Python<'_>,
+        region: &str,
+        ids: Vec<i64>,
+        force: bool,
+    ) -> PyResult<PyErasureReceipt> {
+        let maintenance = Arc::clone(&self.inner);
+        let region = region.to_owned();
+        Ok(PyErasureReceipt {
+            inner: py
+                .detach(move || maintenance.forget_atoms(&region, &ids, force))
+                .map_err(to_pyerr)?,
+        })
+    }
+}
+
 // ---- the engine ------------------------------------------------------------
 
 /// The memory engine over a `Database`. Obtain via `db.memory()`.
 ///
-/// Holds no `Database` reference: a handle is pinned to its creating thread.
+/// Shares the engine's database reference and remains usable after the originating
+/// Python `Database` handle closes.
 #[pyclass(name = "Memory")]
 pub(crate) struct PyMemory {
     inner: Arc<MemoryEngine>,
@@ -781,29 +1146,121 @@ impl PyMemory {
 #[pymethods]
 impl PyMemory {
     /// Create a plaintext region bound to `embedder`.
-    fn create_region(&self, name: &str, embedder: &Bound<'_, PyAny>) -> PyResult<i64> {
-        self.inner
-            .create_region(name, build_embedder(embedder)?)
+    fn create_region(
+        &self,
+        py: Python<'_>,
+        name: &str,
+        embedder: &Bound<'_, PyAny>,
+    ) -> PyResult<i64> {
+        let engine = Arc::clone(&self.inner);
+        let name = name.to_owned();
+        let embedder = build_embedder(embedder)?;
+        py.detach(move || engine.create_region(&name, embedder))
             .map_err(to_pyerr)
     }
 
     /// Create an encrypted region (per-atom sealing + crypto-erasure). Requires the
     /// database to have been opened with `region_keys=True`.
-    fn create_encrypted_region(&self, name: &str, embedder: &Bound<'_, PyAny>) -> PyResult<i64> {
-        self.inner
-            .create_encrypted_region(name, build_embedder(embedder)?)
+    fn create_encrypted_region(
+        &self,
+        py: Python<'_>,
+        name: &str,
+        embedder: &Bound<'_, PyAny>,
+    ) -> PyResult<i64> {
+        let engine = Arc::clone(&self.inner);
+        let name = name.to_owned();
+        let embedder = build_embedder(embedder)?;
+        py.detach(move || engine.create_encrypted_region(&name, embedder))
             .map_err(to_pyerr)
     }
 
-    fn drop_region(&self, name: &str) -> PyResult<()> {
-        self.inner.drop_region(name).map_err(to_pyerr)
+    /// Identities for operational regions whose persisted key state is live.
+    ///
+    /// No embedder or attachment is needed, but encrypted rows still authenticate
+    /// their region-key binding. Use `Database.memory_maintenance().regions()` to
+    /// inventory rows whose content key may already be unavailable.
+    fn regions(&self, py: Python<'_>) -> PyResult<Vec<PyRegionIdentity>> {
+        let engine = Arc::clone(&self.inner);
+        Ok(py
+            .detach(move || engine.stored_region_identities())
+            .map_err(to_pyerr)?
+            .into_iter()
+            .map(|inner| PyRegionIdentity { inner })
+            .collect())
     }
 
-    /// Remember one atom (a dict with `kind` + `text`, optional `payload`, `score`,
-    /// `confidence`, `created_at`, `expires_at`, `immutable`). Returns its id.
+    /// One operational region identity, including its live key-state check.
+    fn region(&self, py: Python<'_>, name: &str) -> PyResult<Option<PyRegionIdentity>> {
+        let engine = Arc::clone(&self.inner);
+        let name = name.to_owned();
+        py.detach(move || engine.stored_region_identity(&name))
+            .map(|identity| identity.map(|inner| PyRegionIdentity { inner }))
+            .map_err(to_pyerr)
+    }
+
+    /// Attach an existing region bound to `embedder`.
+    fn attach_existing_region(
+        &self,
+        py: Python<'_>,
+        name: &str,
+        embedder: &Bound<'_, PyAny>,
+    ) -> PyResult<i64> {
+        let engine = Arc::clone(&self.inner);
+        let name = name.to_owned();
+        let embedder = build_embedder(embedder)?;
+        py.detach(move || engine.attach_existing_region(&name, embedder))
+            .map_err(to_pyerr)
+    }
+
+    fn drop_region(&self, py: Python<'_>, name: &str) -> PyResult<()> {
+        let engine = Arc::clone(&self.inner);
+        let name = name.to_owned();
+        py.detach(move || engine.drop_region(&name))
+            .map_err(to_pyerr)
+    }
+
+    /// Correct persisted model provenance without changing vectors. Use only when
+    /// the vectors are already correct and `model_id` is wrong.
+    fn reclassify_region(&self, py: Python<'_>, name: &str, model_id: String) -> PyResult<()> {
+        let engine = Arc::clone(&self.inner);
+        let name = name.to_owned();
+        py.detach(move || engine.reclassify_region(&name, model_id))
+            .map_err(to_pyerr)
+    }
+
+    /// Recompute a region's vectors with a different model, from the stored text.
+    ///
+    /// For a store whose vectors are wrong, which is the opposite fault to
+    /// `reclassify_region`. Atom ids are preserved, so edges, idempotency
+    /// records, TTLs, confidence, scores and access counts all survive; only the
+    /// vectors change, and the `SimilarTo` web is rebuilt over them.
+    ///
+    /// Refuses rather than converting a region holding atoms that carry a vector
+    /// but no text, since no new vector can be computed for those.
+    fn reembed_region(
+        &self,
+        py: Python<'_>,
+        name: &str,
+        embedder: &Bound<'_, PyAny>,
+    ) -> PyResult<PyReembedReport> {
+        let engine = Arc::clone(&self.inner);
+        let name = name.to_owned();
+        let embedder = build_embedder(embedder)?;
+        py.detach(move || engine.reembed_region(&name, embedder, None))
+            .map(|inner| PyReembedReport { inner })
+            .map_err(to_pyerr)
+    }
+
+    /// Remember one atom (a dict with `kind` + `text`, optional `embedding`,
+    /// `payload`, `score`, `confidence`, `created_at`, `expires_at`, `immutable`).
+    /// A supplied embedding skips passage embedding but is still validated against
+    /// the region's dimension and finite-value rules. Returns the atom id.
     fn remember(&self, py: Python<'_>, region: &str, atom: &Bound<'_, PyDict>) -> PyResult<i64> {
         let input = dict_to_atom_input(py, atom)?;
-        self.inner.remember(region, input).map_err(to_pyerr)
+        let engine = Arc::clone(&self.inner);
+        let region = region.to_owned();
+        py.detach(move || engine.remember(&region, input))
+            .map_err(to_pyerr)
     }
 
     /// Remember one atom as the sole occupant of `key`, superseding whatever atom
@@ -819,8 +1276,10 @@ impl PyMemory {
         key: &str,
     ) -> PyResult<i64> {
         let input = dict_to_atom_input(py, atom)?;
-        self.inner
-            .remember_replacing_keyed(region, input, key)
+        let engine = Arc::clone(&self.inner);
+        let region = region.to_owned();
+        let key = key.to_owned();
+        py.detach(move || engine.remember_replacing_keyed(&region, input, &key))
             .map(|o| o.id)
             .map_err(to_pyerr)
     }
@@ -838,8 +1297,9 @@ impl PyMemory {
             .iter()
             .map(|(atom, key)| Ok((dict_to_atom_input(py, atom.bind(py))?, key.clone())))
             .collect::<PyResult<Vec<_>>>()?;
-        self.inner
-            .remember_replacing_keyed_batch(region, inputs)
+        let engine = Arc::clone(&self.inner);
+        let region = region.to_owned();
+        py.detach(move || engine.remember_replacing_keyed_batch(&region, inputs))
             .map(|outs| outs.into_iter().map(|o| o.id).collect())
             .map_err(to_pyerr)
     }
@@ -855,15 +1315,21 @@ impl PyMemory {
             .iter()
             .map(|a| dict_to_atom_input(py, a.bind(py)))
             .collect::<PyResult<Vec<_>>>()?;
-        self.inner.remember_batch(region, inputs).map_err(to_pyerr)
+        let engine = Arc::clone(&self.inner);
+        let region = region.to_owned();
+        py.detach(move || engine.remember_batch(&region, inputs))
+            .map_err(to_pyerr)
     }
 
     /// Hybrid recall by `text` (embedded + keyword-ranked) and/or a precomputed
     /// `embedding`; returns the top `k` atoms by fused score. `options` carries the
     /// advanced `RecallQuery` modifiers (payload filter, weights, recency, graph).
     #[pyo3(signature = (region, *, text=None, embedding=None, k=10, kinds=None, options=None))]
+    // The parameter list is the Python keyword signature; a struct would break it.
+    #[allow(clippy::too_many_arguments)]
     fn recall(
         &self,
+        py: Python<'_>,
         region: &str,
         text: Option<String>,
         embedding: Option<Vec<f32>>,
@@ -902,9 +1368,10 @@ impl PyMemory {
                 q = q.with_superseded(true);
             }
         }
-        Ok(self
-            .inner
-            .recall(region, q)
+        let engine = Arc::clone(&self.inner);
+        let region = region.to_owned();
+        Ok(py
+            .detach(move || engine.recall(&region, q))
             .map_err(to_pyerr)?
             .into_iter()
             .map(PyAtomHit::from_hit)
@@ -934,61 +1401,83 @@ impl PyMemory {
         };
         q.newest = newest;
         q.after_id = after_id;
-        Ok(self
-            .inner
-            .fetch_range(region, &q)
+        let engine = Arc::clone(&self.inner);
+        let region = region.to_owned();
+        Ok(py
+            .detach(move || engine.fetch_range(&region, &q))
             .map_err(to_pyerr)?
             .into_iter()
             .map(PyAtomHit::from_hit)
             .collect())
     }
 
-    fn fetch_one(&self, region: &str, atom_id: i64) -> PyResult<Option<PyAtomHit>> {
-        Ok(self
-            .inner
-            .fetch_one(region, atom_id)
+    fn fetch_one(&self, py: Python<'_>, region: &str, atom_id: i64) -> PyResult<Option<PyAtomHit>> {
+        let engine = Arc::clone(&self.inner);
+        let region = region.to_owned();
+        Ok(py
+            .detach(move || engine.fetch_one(&region, atom_id))
             .map_err(to_pyerr)?
             .map(PyAtomHit::from_hit))
     }
 
-    fn count(&self, region: &str, kind: &str) -> PyResult<u64> {
-        self.inner.count(region, kind).map_err(to_pyerr)
+    fn count(&self, py: Python<'_>, region: &str, kind: &str) -> PyResult<u64> {
+        let engine = Arc::clone(&self.inner);
+        let region = region.to_owned();
+        let kind = kind.to_owned();
+        py.detach(move || engine.count(&region, &kind))
+            .map_err(to_pyerr)
     }
 
     /// Link two atoms with a typed edge (causes/contradicts/refines/precedes/
     /// supersedes/derived_from/depends_on/similar_to).
     #[pyo3(signature = (src, dst, kind, weight=1.0))]
-    fn link(&self, src: i64, dst: i64, kind: &str, weight: f32) -> PyResult<()> {
-        self.inner
-            .link(src, dst, parse_edge_kind(kind)?, weight)
+    fn link(&self, py: Python<'_>, src: i64, dst: i64, kind: &str, weight: f32) -> PyResult<()> {
+        let engine = Arc::clone(&self.inner);
+        let kind = parse_edge_kind(kind)?;
+        py.detach(move || engine.link(src, dst, kind, weight))
             .map_err(to_pyerr)
     }
 
     /// Evict atoms by policy; returns the number removed.
-    fn evict(&self, region: &str, policy: &PyEvictionPolicy) -> PyResult<u64> {
-        Ok(self
-            .inner
-            .evict(region, policy.inner.clone())
+    fn evict(&self, py: Python<'_>, region: &str, policy: &PyEvictionPolicy) -> PyResult<u64> {
+        let engine = Arc::clone(&self.inner);
+        let region = region.to_owned();
+        let policy = policy.inner.clone();
+        Ok(py
+            .detach(move || engine.evict(&region, policy))
             .map_err(to_pyerr)?
             .removed)
     }
 
     /// Forget atoms (cryptographic erasure on encrypted regions); returns a receipt.
     #[pyo3(signature = (region, ids, force=false))]
-    fn forget(&self, region: &str, ids: Vec<i64>, force: bool) -> PyResult<PyErasureReceipt> {
+    fn forget(
+        &self,
+        py: Python<'_>,
+        region: &str,
+        ids: Vec<i64>,
+        force: bool,
+    ) -> PyResult<PyErasureReceipt> {
+        let engine = Arc::clone(&self.inner);
+        let region = region.to_owned();
         Ok(PyErasureReceipt {
-            inner: self
-                .inner
-                .forget_atoms(region, &ids, force)
+            inner: py
+                .detach(move || engine.forget_atoms(&region, &ids, force))
                 .map_err(to_pyerr)?,
         })
     }
 
     /// Attest the integrity/origin of atoms (encrypted regions).
-    fn verify(&self, region: &str, ids: Vec<i64>) -> PyResult<Vec<PyAtomAttestation>> {
-        Ok(self
-            .inner
-            .verify_atoms(region, &ids)
+    fn verify(
+        &self,
+        py: Python<'_>,
+        region: &str,
+        ids: Vec<i64>,
+    ) -> PyResult<Vec<PyAtomAttestation>> {
+        let engine = Arc::clone(&self.inner);
+        let region = region.to_owned();
+        Ok(py
+            .detach(move || engine.verify_atoms(&region, &ids))
             .map_err(to_pyerr)?
             .into_iter()
             .map(|inner| PyAtomAttestation { inner })
@@ -1004,16 +1493,19 @@ impl PyMemory {
         payload: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
         let json = py_to_json(py, payload)?;
-        self.inner
-            .update_atom_payload(region, atom_id, &json)
+        let engine = Arc::clone(&self.inner);
+        let region = region.to_owned();
+        py.detach(move || engine.update_atom_payload(&region, atom_id, &json))
             .map_err(to_pyerr)
     }
 
     /// The most recently created atom of `kind`, if any.
-    fn fetch_last(&self, region: &str, kind: &str) -> PyResult<Option<PyAtomHit>> {
-        Ok(self
-            .inner
-            .fetch_last(region, kind)
+    fn fetch_last(&self, py: Python<'_>, region: &str, kind: &str) -> PyResult<Option<PyAtomHit>> {
+        let engine = Arc::clone(&self.inner);
+        let region = region.to_owned();
+        let kind = kind.to_owned();
+        Ok(py
+            .detach(move || engine.fetch_last(&region, &kind))
             .map_err(to_pyerr)?
             .map(PyAtomHit::from_hit))
     }
@@ -1029,8 +1521,8 @@ impl PyMemory {
         kind: Option<String>,
     ) -> PyResult<Vec<Py<PyAny>>> {
         let kind = kind.map(|s| parse_edge_kind(&s)).transpose()?;
-        self.inner
-            .fetch_edges(src, dst, kind)
+        let engine = Arc::clone(&self.inner);
+        py.detach(move || engine.fetch_edges(src, dst, kind))
             .map_err(to_pyerr)?
             .iter()
             .map(|e| {
@@ -1058,9 +1550,10 @@ impl PyMemory {
         neighbors: usize,
         max_distance: f32,
     ) -> PyResult<Py<PyAny>> {
-        let r = self
-            .inner
-            .evolve(region, atom_id, neighbors, max_distance)
+        let engine = Arc::clone(&self.inner);
+        let region = region.to_owned();
+        let r = py
+            .detach(move || engine.evolve(&region, atom_id, neighbors, max_distance))
             .map_err(to_pyerr)?;
         let d = PyDict::new(py);
         d.set_item("links_added", r.links_added)?;
@@ -1070,9 +1563,10 @@ impl PyMemory {
 
     /// Structural digest of a region since `since_micros`: `{total, kinds: [...]}`.
     fn summarize(&self, py: Python<'_>, region: &str, since_micros: i64) -> PyResult<Py<PyAny>> {
-        let r = self
-            .inner
-            .summarize(region, since_micros)
+        let engine = Arc::clone(&self.inner);
+        let region = region.to_owned();
+        let r = py
+            .detach(move || engine.summarize(&region, since_micros))
             .map_err(to_pyerr)?;
         let kinds = r
             .kinds
@@ -1133,7 +1627,12 @@ impl PyMemory {
     /// `{"source": "loaded", "segment_b3": bytes}` or `{"source": "built",
     /// "refusal": str|None}`.
     fn ann_cache_status(&self, py: Python<'_>, region: &str) -> PyResult<Option<Py<PyAny>>> {
-        match self.inner.ann_cache_status(region).map_err(to_pyerr)? {
+        let engine = Arc::clone(&self.inner);
+        let region = region.to_owned();
+        let status = py
+            .detach(move || engine.ann_cache_status(&region))
+            .map_err(to_pyerr)?;
+        match status {
             None => Ok(None),
             Some(src) => Ok(Some(ann_index_source_dict(py, &src)?.into_py_any(py)?)),
         }

@@ -1,12 +1,15 @@
 //! Encrypted SQL surface: `Database`, `QueryResult`, and DB administration.
 
-use std::rc::Rc;
 use std::sync::Arc;
 
-use citadel::{Argon2Profile, CipherId, Database, DatabaseBuilder, KdfAlgorithm, SyncMode};
+use citadel::{
+    Argon2Profile, CancelToken, CipherId, Database, DatabaseBuilder, IntegrityError, KdfAlgorithm,
+    SyncMode,
+};
 use citadel_mem::MemoryEngine;
 use citadel_sql::{datetime, Connection, ExecutionResult, QueryResult, Value};
 use numpy::PyReadonlyArray1;
+use parking_lot::Mutex;
 use pyo3::exceptions::{PyOverflowError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{
@@ -15,9 +18,10 @@ use pyo3::types::{
 };
 use pyo3::IntoPyObjectExt;
 use self_cell::self_cell;
+use zeroize::Zeroizing;
 
 use crate::errors::{encryption_err, programming_err};
-use crate::mem::PyMemory;
+use crate::mem::{PyMemory, PyMemoryMaintenance};
 use crate::vector::require_finite;
 use crate::{ann_index_source_dict, ann_segment_info_dict, to_pyerr, value_to_py};
 
@@ -34,7 +38,8 @@ self_cell!(
 /// One connection, not one per handle: each caches the schema it loaded, so a second
 /// would not see a table the first created.
 struct SharedConn {
-    cell: DbCell,
+    db: Arc<Database>,
+    cell: Mutex<DbCell>,
     /// Watched from other threads, which must not touch `cell` at all: alive for
     /// exactly as long as some handle still holds this connection. Atomic where the
     /// connection itself is not, since only this crosses a thread boundary.
@@ -44,7 +49,10 @@ struct SharedConn {
 impl SharedConn {
     fn open(owner: Arc<Database>) -> PyResult<Self> {
         Ok(Self {
-            cell: DbCell::try_new(owner, |owner| Connection::open(owner)).map_err(to_pyerr)?,
+            db: Arc::clone(&owner),
+            cell: Mutex::new(
+                DbCell::try_new(owner, |owner| Connection::open(owner)).map_err(to_pyerr)?,
+            ),
             token: Arc::new(()),
         })
     }
@@ -53,7 +61,7 @@ impl SharedConn {
 thread_local! {
     /// Connections this thread owns. Weak, so a closed handle releases its own.
     static OPEN_CONNS: std::cell::RefCell<
-        std::collections::HashMap<std::path::PathBuf, std::rc::Weak<SharedConn>>,
+        std::collections::HashMap<std::path::PathBuf, std::sync::Weak<SharedConn>>,
     > = Default::default();
 }
 
@@ -88,8 +96,8 @@ static DIGEST_KEY: std::sync::LazyLock<[u8; 32]> = std::sync::LazyLock::new(|| {
     k
 });
 
-fn passphrase_digest(key: &str) -> [u8; 32] {
-    *blake3::keyed_hash(&DIGEST_KEY, key.as_bytes()).as_bytes()
+fn passphrase_digest(key: &[u8]) -> [u8; 32] {
+    *blake3::keyed_hash(&DIGEST_KEY, key).as_bytes()
 }
 
 /// Constant time, so a rejected passphrase leaks nothing through how long it took.
@@ -116,7 +124,7 @@ fn reuse(
     open: &mut std::collections::HashMap<std::path::PathBuf, OpenFile>,
     ident: &std::path::Path,
     path: &str,
-    key: &str,
+    key: &[u8],
     region_keys: bool,
     options: bool,
     create: Option<bool>,
@@ -136,7 +144,7 @@ fn reuse(
     let accepted = if key_file == entry.key_file {
         same_digest(&digest, &entry.passphrase)
     } else {
-        db.verify_passphrase(key.as_bytes()).map_err(to_pyerr)?
+        db.verify_passphrase(key).map_err(to_pyerr)?
     };
     if !accepted {
         return Err(encryption_err(format!(
@@ -152,7 +160,7 @@ fn reuse(
         return Err(programming_err(format!(
             "{path} is open on another thread of this process. A connection belongs to \
              the thread that opened it, so open it once and dispatch work to that \
-             thread, or pass the memory engine, which any thread may use."
+             thread, or pass a Memory or MemoryMaintenance capability, which any thread may use."
         )));
     }
 
@@ -188,18 +196,18 @@ fn attach(
 ) -> PyResult<PyDatabase> {
     let Some(ident) = ident else {
         // In-memory: no file to contend over, so nothing to share it with.
-        return Ok(PyDatabase::new(Rc::new(SharedConn::open(owner)?)));
+        return Ok(PyDatabase::new(Arc::new(SharedConn::open(owner)?)));
     };
     let live = OPEN_CONNS
-        .with_borrow(|c| c.get(ident).and_then(std::rc::Weak::upgrade))
+        .with_borrow(|c| c.get(ident).and_then(std::sync::Weak::upgrade))
         // Only when it wraps this database: a connection cached over a predecessor at
         // the same path would silently drop the one just opened.
-        .filter(|c| Arc::ptr_eq(c.cell.borrow_owner(), &owner));
+        .filter(|c| Arc::ptr_eq(&c.db, &owner));
     let conn = match live {
         Some(conn) => conn,
         None => {
-            let conn = Rc::new(SharedConn::open(owner)?);
-            OPEN_CONNS.with_borrow_mut(|c| c.insert(ident.to_path_buf(), Rc::downgrade(&conn)));
+            let conn = Arc::new(SharedConn::open(owner)?);
+            OPEN_CONNS.with_borrow_mut(|c| c.insert(ident.to_path_buf(), Arc::downgrade(&conn)));
             conn
         }
     };
@@ -216,16 +224,33 @@ fn attach(
 /// created.
 fn shared_engine(db: &Arc<Database>) -> PyResult<Arc<MemoryEngine>> {
     let ident = identity(db.data_path());
-    let mut open = OPEN_FILES.lock().unwrap();
     if let Some(i) = ident.as_ref() {
-        if let Some(engine) = open.get(i).and_then(|e| e.engine.upgrade()) {
+        if let Some(engine) = OPEN_FILES
+            .lock()
+            .unwrap()
+            .get(i)
+            .and_then(|e| e.engine.upgrade())
+        {
             return Ok(engine);
         }
     }
+
+    // Opening the memory schema can perform file I/O. Do it outside the global
+    // registry lock, then resolve a race in favor of the engine registered first.
     let engine = Arc::new(MemoryEngine::open(Arc::clone(db)).map_err(to_pyerr)?);
     if let Some(i) = ident {
+        let mut open = OPEN_FILES.lock().unwrap();
+        if let Some(existing) = open.get(&i).and_then(|e| e.engine.upgrade()) {
+            return Ok(existing);
+        }
         if let Some(entry) = open.get_mut(&i) {
-            entry.engine = Arc::downgrade(&engine);
+            let same_database = entry
+                .db
+                .upgrade()
+                .is_some_and(|registered| Arc::ptr_eq(&registered, db));
+            if same_database {
+                entry.engine = Arc::downgrade(&engine);
+            }
         }
     }
     Ok(engine)
@@ -356,31 +381,357 @@ fn to_values(py: Python<'_>, params: &Option<Vec<Py<PyAny>>>) -> PyResult<Option
     }
 }
 
-/// An open encrypted database with one long-lived connection, so transaction
-/// state persists across calls. `unsendable`: the connection is `!Sync`, so the
-/// handle is pinned to its creating thread (like sqlite3's default).
-#[pyclass(unsendable, name = "Database")]
-pub(crate) struct PyDatabase {
-    /// Shared with every other handle to this file, so closing is per handle.
-    conn: Option<Rc<SharedConn>>,
-    /// Cached from the open-file table, which keeps one engine per database.
-    memory: std::cell::OnceCell<Arc<MemoryEngine>>,
+/// A one-shot cancellation flag that can be tripped from another Python thread.
+#[pyclass(name = "CancelToken")]
+pub(crate) struct PyCancelToken {
+    inner: CancelToken,
 }
 
-impl PyDatabase {
-    fn new(conn: Rc<SharedConn>) -> Self {
+#[pymethods]
+impl PyCancelToken {
+    #[new]
+    fn new() -> Self {
         Self {
-            conn: Some(conn),
-            memory: std::cell::OnceCell::new(),
+            inner: CancelToken::new(),
         }
     }
 
+    fn cancel(&self) {
+        self.inner.cancel();
+    }
+
+    #[getter]
+    fn is_cancelled(&self) -> bool {
+        self.inner.is_cancelled()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("CancelToken(cancelled={})", self.inner.is_cancelled())
+    }
+}
+
+/// An open encrypted database with one long-lived connection, so transaction
+/// state persists across calls. Operations are pinned to the creating thread
+/// (like sqlite3's default), while final destruction is safe on any thread.
+#[pyclass(name = "Database")]
+pub(crate) struct PyDatabase {
+    owner_thread: std::thread::ThreadId,
+    /// Shared with every other handle to this file, so closing is per handle.
+    conn: Option<Arc<SharedConn>>,
+    /// Cached from the open-file table, which keeps one engine per database.
+    memory: std::sync::OnceLock<Arc<MemoryEngine>>,
+}
+
+impl PyDatabase {
+    fn new(conn: Arc<SharedConn>) -> Self {
+        Self {
+            owner_thread: std::thread::current().id(),
+            conn: Some(conn),
+            memory: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn ensure_owner_thread(&self) -> PyResult<()> {
+        if self.owner_thread == std::thread::current().id() {
+            return Ok(());
+        }
+        Err(programming_err(
+            "Database operations must run on the thread that opened the handle; pass its Memory or MemoryMaintenance capability across threads instead",
+        ))
+    }
+
     /// Borrow the live cell, or raise if this handle has been closed.
-    fn cell(&self) -> PyResult<&DbCell> {
+    fn shared_conn(&self) -> PyResult<&Arc<SharedConn>> {
+        self.ensure_owner_thread()?;
         self.conn
             .as_ref()
-            .map(|c| &c.cell)
             .ok_or_else(|| programming_err("operation on a closed Database"))
+    }
+
+    fn database(&self) -> PyResult<Arc<Database>> {
+        Ok(Arc::clone(&self.shared_conn()?.db))
+    }
+
+    fn with_connection<T>(&self, f: impl FnOnce(&Connection<'_>) -> T) -> PyResult<T> {
+        let cell = self.shared_conn()?.cell.lock();
+        Ok(cell.with_dependent(|_owner, conn| f(conn)))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PyIntegrityErrorKind {
+    CommitSlotChecksumMismatch,
+    CommitSlotMacMismatch,
+    CommitSlotDowngrade,
+    CommitSlotUnknownFormat,
+    CommitSlotUnknownMerkleScheme,
+    PageReadFailed,
+    PageTampered,
+    ChecksumMismatch,
+    PageIdMismatch,
+    PageTransactionOutOfBounds,
+    ReachablePageOutOfBounds,
+    TreeDepthMismatch,
+    PageMerkleMismatch,
+    SlotMerkleRootMismatch,
+    PageCountMetadataMismatch,
+    KeyOrderViolation,
+    KeyRangeViolation,
+    MalformedPage,
+    MalformedOverflowReference,
+    OverflowLengthOutOfBounds,
+    OverflowPageDataLengthOutOfBounds,
+    OverflowChainLengthMismatch,
+    OverflowChainPageCountOutOfBounds,
+    OverflowDigestMismatch,
+    DuplicatePageRef,
+    EntryCountMismatch,
+    NamedTableEntryCountMismatch,
+    MalformedTableDescriptor,
+    InvalidTableDescriptor,
+    NamedTableHashCollision,
+    DuplicateNamedTableSlotHash,
+    InvalidPageType,
+    PendingFreeEntryCountOutOfBounds,
+    PendingFreePageOutOfBounds,
+    PendingFreeEntryOutOfBounds,
+    PendingFreeTransactionOutOfBounds,
+    DuplicatePendingFreeEntry,
+    PendingFreeEntryStillReachable,
+}
+
+impl PyIntegrityErrorKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CommitSlotChecksumMismatch => "commit_slot_checksum_mismatch",
+            Self::CommitSlotMacMismatch => "commit_slot_mac_mismatch",
+            Self::CommitSlotDowngrade => "commit_slot_downgrade",
+            Self::CommitSlotUnknownFormat => "commit_slot_unknown_format",
+            Self::CommitSlotUnknownMerkleScheme => "commit_slot_unknown_merkle_scheme",
+            Self::PageReadFailed => "page_read_failed",
+            Self::PageTampered => "page_tampered",
+            Self::ChecksumMismatch => "checksum_mismatch",
+            Self::PageIdMismatch => "page_id_mismatch",
+            Self::PageTransactionOutOfBounds => "page_transaction_out_of_bounds",
+            Self::ReachablePageOutOfBounds => "reachable_page_out_of_bounds",
+            Self::TreeDepthMismatch => "tree_depth_mismatch",
+            Self::PageMerkleMismatch => "page_merkle_mismatch",
+            Self::SlotMerkleRootMismatch => "slot_merkle_root_mismatch",
+            Self::PageCountMetadataMismatch => "page_count_metadata_mismatch",
+            Self::KeyOrderViolation => "key_order_violation",
+            Self::KeyRangeViolation => "key_range_violation",
+            Self::MalformedPage => "malformed_page",
+            Self::MalformedOverflowReference => "malformed_overflow_reference",
+            Self::OverflowLengthOutOfBounds => "overflow_length_out_of_bounds",
+            Self::OverflowPageDataLengthOutOfBounds => "overflow_page_data_length_out_of_bounds",
+            Self::OverflowChainLengthMismatch => "overflow_chain_length_mismatch",
+            Self::OverflowChainPageCountOutOfBounds => "overflow_chain_page_count_out_of_bounds",
+            Self::OverflowDigestMismatch => "overflow_digest_mismatch",
+            Self::DuplicatePageRef => "duplicate_page_ref",
+            Self::EntryCountMismatch => "entry_count_mismatch",
+            Self::NamedTableEntryCountMismatch => "named_table_entry_count_mismatch",
+            Self::MalformedTableDescriptor => "malformed_table_descriptor",
+            Self::InvalidTableDescriptor => "invalid_table_descriptor",
+            Self::NamedTableHashCollision => "named_table_hash_collision",
+            Self::DuplicateNamedTableSlotHash => "duplicate_named_table_slot_hash",
+            Self::InvalidPageType => "invalid_page_type",
+            Self::PendingFreeEntryCountOutOfBounds => "pending_free_entry_count_out_of_bounds",
+            Self::PendingFreePageOutOfBounds => "pending_free_page_out_of_bounds",
+            Self::PendingFreeEntryOutOfBounds => "pending_free_entry_out_of_bounds",
+            Self::PendingFreeTransactionOutOfBounds => "pending_free_transaction_out_of_bounds",
+            Self::DuplicatePendingFreeEntry => "duplicate_pending_free_entry",
+            Self::PendingFreeEntryStillReachable => "pending_free_entry_still_reachable",
+        }
+    }
+}
+
+fn integrity_error_kind(error: &IntegrityError) -> &'static str {
+    let kind = match error {
+        IntegrityError::CommitSlotChecksumMismatch { .. } => {
+            PyIntegrityErrorKind::CommitSlotChecksumMismatch
+        }
+        IntegrityError::CommitSlotMacMismatch { .. } => PyIntegrityErrorKind::CommitSlotMacMismatch,
+        IntegrityError::CommitSlotDowngrade { .. } => PyIntegrityErrorKind::CommitSlotDowngrade,
+        IntegrityError::CommitSlotUnknownFormat { .. } => {
+            PyIntegrityErrorKind::CommitSlotUnknownFormat
+        }
+        IntegrityError::CommitSlotUnknownMerkleScheme { .. } => {
+            PyIntegrityErrorKind::CommitSlotUnknownMerkleScheme
+        }
+        IntegrityError::PageReadFailed { .. } => PyIntegrityErrorKind::PageReadFailed,
+        IntegrityError::PageTampered(_) => PyIntegrityErrorKind::PageTampered,
+        IntegrityError::ChecksumMismatch(_) => PyIntegrityErrorKind::ChecksumMismatch,
+        IntegrityError::PageIdMismatch { .. } => PyIntegrityErrorKind::PageIdMismatch,
+        IntegrityError::PageTransactionOutOfBounds { .. } => {
+            PyIntegrityErrorKind::PageTransactionOutOfBounds
+        }
+        IntegrityError::ReachablePageOutOfBounds { .. } => {
+            PyIntegrityErrorKind::ReachablePageOutOfBounds
+        }
+        IntegrityError::TreeDepthMismatch { .. } => PyIntegrityErrorKind::TreeDepthMismatch,
+        IntegrityError::PageMerkleMismatch { .. } => PyIntegrityErrorKind::PageMerkleMismatch,
+        IntegrityError::SlotMerkleRootMismatch { .. } => {
+            PyIntegrityErrorKind::SlotMerkleRootMismatch
+        }
+        IntegrityError::PageCountMetadataMismatch { .. } => {
+            PyIntegrityErrorKind::PageCountMetadataMismatch
+        }
+        IntegrityError::KeyOrderViolation { .. } => PyIntegrityErrorKind::KeyOrderViolation,
+        IntegrityError::KeyRangeViolation { .. } => PyIntegrityErrorKind::KeyRangeViolation,
+        IntegrityError::MalformedPage { .. } => PyIntegrityErrorKind::MalformedPage,
+        IntegrityError::MalformedOverflowReference { .. } => {
+            PyIntegrityErrorKind::MalformedOverflowReference
+        }
+        IntegrityError::OverflowLengthOutOfBounds { .. } => {
+            PyIntegrityErrorKind::OverflowLengthOutOfBounds
+        }
+        IntegrityError::OverflowPageDataLengthOutOfBounds { .. } => {
+            PyIntegrityErrorKind::OverflowPageDataLengthOutOfBounds
+        }
+        IntegrityError::OverflowChainLengthMismatch { .. } => {
+            PyIntegrityErrorKind::OverflowChainLengthMismatch
+        }
+        IntegrityError::OverflowChainPageCountOutOfBounds { .. } => {
+            PyIntegrityErrorKind::OverflowChainPageCountOutOfBounds
+        }
+        IntegrityError::OverflowDigestMismatch { .. } => {
+            PyIntegrityErrorKind::OverflowDigestMismatch
+        }
+        IntegrityError::DuplicatePageRef(_) => PyIntegrityErrorKind::DuplicatePageRef,
+        IntegrityError::EntryCountMismatch { .. } => PyIntegrityErrorKind::EntryCountMismatch,
+        IntegrityError::NamedTableEntryCountMismatch { .. } => {
+            PyIntegrityErrorKind::NamedTableEntryCountMismatch
+        }
+        IntegrityError::MalformedTableDescriptor { .. } => {
+            PyIntegrityErrorKind::MalformedTableDescriptor
+        }
+        IntegrityError::InvalidTableDescriptor { .. } => {
+            PyIntegrityErrorKind::InvalidTableDescriptor
+        }
+        IntegrityError::NamedTableHashCollision { .. } => {
+            PyIntegrityErrorKind::NamedTableHashCollision
+        }
+        IntegrityError::DuplicateNamedTableSlotHash { .. } => {
+            PyIntegrityErrorKind::DuplicateNamedTableSlotHash
+        }
+        IntegrityError::InvalidPageType { .. } => PyIntegrityErrorKind::InvalidPageType,
+        IntegrityError::PendingFreeEntryCountOutOfBounds { .. } => {
+            PyIntegrityErrorKind::PendingFreeEntryCountOutOfBounds
+        }
+        IntegrityError::PendingFreePageOutOfBounds { .. } => {
+            PyIntegrityErrorKind::PendingFreePageOutOfBounds
+        }
+        IntegrityError::PendingFreeEntryOutOfBounds { .. } => {
+            PyIntegrityErrorKind::PendingFreeEntryOutOfBounds
+        }
+        IntegrityError::PendingFreeTransactionOutOfBounds { .. } => {
+            PyIntegrityErrorKind::PendingFreeTransactionOutOfBounds
+        }
+        IntegrityError::DuplicatePendingFreeEntry { .. } => {
+            PyIntegrityErrorKind::DuplicatePendingFreeEntry
+        }
+        IntegrityError::PendingFreeEntryStillReachable { .. } => {
+            PyIntegrityErrorKind::PendingFreeEntryStillReachable
+        }
+    };
+    kind.as_str()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PyIntegrityErrorKind;
+
+    #[test]
+    fn every_public_integrity_kind_name_is_pinned() {
+        use PyIntegrityErrorKind as K;
+        let cases = [
+            (
+                K::CommitSlotChecksumMismatch,
+                "commit_slot_checksum_mismatch",
+            ),
+            (K::CommitSlotMacMismatch, "commit_slot_mac_mismatch"),
+            (K::CommitSlotDowngrade, "commit_slot_downgrade"),
+            (K::CommitSlotUnknownFormat, "commit_slot_unknown_format"),
+            (
+                K::CommitSlotUnknownMerkleScheme,
+                "commit_slot_unknown_merkle_scheme",
+            ),
+            (K::PageReadFailed, "page_read_failed"),
+            (K::PageTampered, "page_tampered"),
+            (K::ChecksumMismatch, "checksum_mismatch"),
+            (K::PageIdMismatch, "page_id_mismatch"),
+            (
+                K::PageTransactionOutOfBounds,
+                "page_transaction_out_of_bounds",
+            ),
+            (K::ReachablePageOutOfBounds, "reachable_page_out_of_bounds"),
+            (K::TreeDepthMismatch, "tree_depth_mismatch"),
+            (K::PageMerkleMismatch, "page_merkle_mismatch"),
+            (K::SlotMerkleRootMismatch, "slot_merkle_root_mismatch"),
+            (K::PageCountMetadataMismatch, "page_count_metadata_mismatch"),
+            (K::KeyOrderViolation, "key_order_violation"),
+            (K::KeyRangeViolation, "key_range_violation"),
+            (K::MalformedPage, "malformed_page"),
+            (
+                K::MalformedOverflowReference,
+                "malformed_overflow_reference",
+            ),
+            (
+                K::OverflowLengthOutOfBounds,
+                "overflow_length_out_of_bounds",
+            ),
+            (
+                K::OverflowPageDataLengthOutOfBounds,
+                "overflow_page_data_length_out_of_bounds",
+            ),
+            (
+                K::OverflowChainLengthMismatch,
+                "overflow_chain_length_mismatch",
+            ),
+            (
+                K::OverflowChainPageCountOutOfBounds,
+                "overflow_chain_page_count_out_of_bounds",
+            ),
+            (K::OverflowDigestMismatch, "overflow_digest_mismatch"),
+            (K::DuplicatePageRef, "duplicate_page_ref"),
+            (K::EntryCountMismatch, "entry_count_mismatch"),
+            (
+                K::NamedTableEntryCountMismatch,
+                "named_table_entry_count_mismatch",
+            ),
+            (K::MalformedTableDescriptor, "malformed_table_descriptor"),
+            (K::InvalidTableDescriptor, "invalid_table_descriptor"),
+            (K::NamedTableHashCollision, "named_table_hash_collision"),
+            (
+                K::DuplicateNamedTableSlotHash,
+                "duplicate_named_table_slot_hash",
+            ),
+            (K::InvalidPageType, "invalid_page_type"),
+            (
+                K::PendingFreeEntryCountOutOfBounds,
+                "pending_free_entry_count_out_of_bounds",
+            ),
+            (
+                K::PendingFreePageOutOfBounds,
+                "pending_free_page_out_of_bounds",
+            ),
+            (
+                K::PendingFreeEntryOutOfBounds,
+                "pending_free_entry_out_of_bounds",
+            ),
+            (
+                K::PendingFreeTransactionOutOfBounds,
+                "pending_free_transaction_out_of_bounds",
+            ),
+            (K::DuplicatePendingFreeEntry, "duplicate_pending_free_entry"),
+            (
+                K::PendingFreeEntryStillReachable,
+                "pending_free_entry_still_reachable",
+            ),
+        ];
+        for (kind, expected) in cases {
+            assert_eq!(kind.as_str(), expected);
+        }
     }
 }
 
@@ -396,17 +747,22 @@ impl PyDatabase {
         params: Option<Vec<Py<PyAny>>>,
     ) -> PyResult<Py<PyAny>> {
         let values = to_values(py, &params)?;
-        self.cell()?.with_dependent(|_owner, conn| {
-            let res = match &values {
-                Some(v) => conn.execute_params(sql, v),
-                None => conn.execute(sql),
-            };
-            match res.map_err(to_pyerr)? {
-                ExecutionResult::RowsAffected(n) => (n as i64).into_py_any(py),
-                ExecutionResult::Query(qr) => PyQueryResult::from(qr).into_py_any(py),
-                ExecutionResult::Ok => Ok(py.None()),
-            }
-        })
+        let sql = sql.to_owned();
+        let shared = Arc::clone(self.shared_conn()?);
+        let result = py
+            .detach(move || {
+                let cell = shared.cell.lock();
+                cell.with_dependent(|_owner, conn| match &values {
+                    Some(v) => conn.execute_params(&sql, v),
+                    None => conn.execute(&sql),
+                })
+            })
+            .map_err(to_pyerr)?;
+        match result {
+            ExecutionResult::RowsAffected(n) => (n as i64).into_py_any(py),
+            ExecutionResult::Query(qr) => PyQueryResult::from(qr).into_py_any(py),
+            ExecutionResult::Ok => Ok(py.None()),
+        }
     }
 
     /// Run a query (optionally with positional params) and return all rows.
@@ -418,60 +774,84 @@ impl PyDatabase {
         params: Option<Vec<Py<PyAny>>>,
     ) -> PyResult<PyQueryResult> {
         let values = to_values(py, &params)?;
-        self.cell()?.with_dependent(|_owner, conn| {
-            let qr = match &values {
-                Some(v) => conn.query_params(sql, v),
-                None => conn.query(sql),
-            };
-            qr.map(PyQueryResult::from).map_err(to_pyerr)
+        let sql = sql.to_owned();
+        let shared = Arc::clone(self.shared_conn()?);
+        py.detach(move || {
+            let cell = shared.cell.lock();
+            cell.with_dependent(|_owner, conn| match &values {
+                Some(v) => conn.query_params(&sql, v),
+                None => conn.query(&sql),
+            })
         })
+        .map(PyQueryResult::from)
+        .map_err(to_pyerr)
     }
 
     /// Execute `;`-separated statements; returns one result per completed statement.
     /// Stops and raises at the first error (completed statements persist).
     fn execute_script(&self, py: Python<'_>, sql: &str) -> PyResult<Vec<Py<PyAny>>> {
-        self.cell()?.with_dependent(|_owner, conn| {
-            let exec = conn.execute_script(sql);
-            let mut out = Vec::with_capacity(exec.completed.len());
-            for r in exec.completed {
-                out.push(match r {
-                    ExecutionResult::RowsAffected(n) => (n as i64).into_py_any(py)?,
-                    ExecutionResult::Query(qr) => PyQueryResult::from(qr).into_py_any(py)?,
-                    ExecutionResult::Ok => py.None(),
-                });
-            }
-            match exec.error {
-                Some(e) => Err(to_pyerr(e)),
-                None => Ok(out),
-            }
-        })
+        let sql = sql.to_owned();
+        let shared = Arc::clone(self.shared_conn()?);
+        let exec = py.detach(move || {
+            let cell = shared.cell.lock();
+            cell.with_dependent(|_owner, conn| conn.execute_script(&sql))
+        });
+        let mut out = Vec::with_capacity(exec.completed.len());
+        for result in exec.completed {
+            out.push(match result {
+                ExecutionResult::RowsAffected(n) => (n as i64).into_py_any(py)?,
+                ExecutionResult::Query(qr) => PyQueryResult::from(qr).into_py_any(py)?,
+                ExecutionResult::Ok => py.None(),
+            });
+        }
+        match exec.error {
+            Some(error) => Err(to_pyerr(error)),
+            None => Ok(out),
+        }
+    }
+
+    /// Install a token for subsequent SQL, memory, and integrity work on every
+    /// handle sharing this database, or clear it. A tripped token stays tripped.
+    #[pyo3(signature = (token=None))]
+    fn set_cancel(&self, token: Option<PyRef<'_, PyCancelToken>>) -> PyResult<()> {
+        self.database()?
+            .set_cancel(token.map(|token| token.inner.clone()));
+        Ok(())
     }
 
     /// Names of the user tables.
-    fn tables(&self) -> PyResult<Vec<String>> {
-        Ok(self.cell()?.with_dependent(|_owner, conn| conn.tables()))
+    fn tables(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+        let shared = Arc::clone(self.shared_conn()?);
+        Ok(py.detach(move || {
+            let cell = shared.cell.lock();
+            cell.with_dependent(|_owner, conn| conn.tables())
+        }))
     }
 
     /// Whether an explicit transaction is open.
     fn in_transaction(&self) -> PyResult<bool> {
-        Ok(self
-            .cell()?
-            .with_dependent(|_owner, conn| conn.in_transaction()))
+        self.with_connection(|conn| conn.in_transaction())
     }
 
     /// Open the memory engine over this database (shares the underlying storage).
-    fn memory(&self) -> PyResult<PyMemory> {
+    fn memory(&self, py: Python<'_>) -> PyResult<PyMemory> {
+        let db = self.database()?;
         if let Some(engine) = self.memory.get() {
             return Ok(PyMemory::from_engine(Arc::clone(engine)));
         }
-        let engine = shared_engine(self.cell()?.borrow_owner())?;
+        let engine = py.detach(move || shared_engine(&db))?;
         let _ = self.memory.set(Arc::clone(&engine));
         Ok(PyMemory::from_engine(engine))
     }
 
+    /// Open model-free inventory, verification, and erasure for existing memory data.
+    fn memory_maintenance(&self, py: Python<'_>) -> PyResult<PyMemoryMaintenance> {
+        PyMemoryMaintenance::open(py, self.database()?)
+    }
+
     /// Storage statistics: `{tree_depth, entry_count, total_pages, high_water_mark, merkle_root}`.
     fn stats(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let s = self.cell()?.borrow_owner().stats();
+        let s = self.database()?.stats();
         let d = PyDict::new(py);
         d.set_item("tree_depth", s.tree_depth)?;
         d.set_item("entry_count", s.entry_count)?;
@@ -481,49 +861,67 @@ impl PyDatabase {
         d.into_py_any(py)
     }
 
-    /// Verify page integrity: `{ok, pages_checked, error_count}`.
-    fn integrity_check(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let r = self
-            .cell()?
-            .borrow_owner()
-            .integrity_check()
+    /// Verify page integrity. Returns counts plus every finding's stable kind,
+    /// message, and tamper classification. `quiet=True` writes no audit entry.
+    #[pyo3(signature = (quiet=false))]
+    fn integrity_check(&self, py: Python<'_>, quiet: bool) -> PyResult<Py<PyAny>> {
+        let db = self.database()?;
+        let r = py
+            .detach(move || {
+                if quiet {
+                    db.integrity_check_quiet()
+                } else {
+                    db.integrity_check()
+                }
+            })
             .map_err(to_pyerr)?;
         let d = PyDict::new(py);
         d.set_item("ok", r.is_ok())?;
         d.set_item("pages_checked", r.pages_checked)?;
         d.set_item("error_count", r.errors.len())?;
+        d.set_item("tampered_count", r.tampered().count())?;
+        let errors = PyList::empty(py);
+        for error in &r.errors {
+            let item = PyDict::new(py);
+            item.set_item("kind", integrity_error_kind(error))?;
+            item.set_item("message", error.to_string())?;
+            item.set_item("tampered", error.is_tamper())?;
+            errors.append(item)?;
+        }
+        d.set_item("errors", errors)?;
         d.into_py_any(py)
     }
 
     /// Write a consistent encrypted copy of the database to `dest`.
-    fn backup(&self, dest: &str) -> PyResult<()> {
-        self.cell()?
-            .borrow_owner()
-            .backup(std::path::Path::new(dest))
+    fn backup(&self, py: Python<'_>, dest: &str) -> PyResult<()> {
+        let db = self.database()?;
+        let dest = dest.to_owned();
+        py.detach(move || db.backup(std::path::Path::new(&dest)))
             .map_err(to_pyerr)
     }
 
     /// Write a compacted (free-space-reclaimed) copy of the database to `dest`.
-    fn compact(&self, dest: &str) -> PyResult<()> {
-        self.cell()?
-            .borrow_owner()
-            .compact(std::path::Path::new(dest))
+    fn compact(&self, py: Python<'_>, dest: &str) -> PyResult<()> {
+        let db = self.database()?;
+        let dest = dest.to_owned();
+        py.detach(move || db.compact(std::path::Path::new(&dest)))
             .map_err(to_pyerr)
     }
 
     /// Whether `passphrase` unwraps this database, read from the key file.
-    fn verify_passphrase(&self, passphrase: &str) -> PyResult<bool> {
-        self.cell()?
-            .borrow_owner()
-            .verify_passphrase(passphrase.as_bytes())
+    fn verify_passphrase(&self, py: Python<'_>, passphrase: &str) -> PyResult<bool> {
+        let db = self.database()?;
+        let passphrase = Zeroizing::new(passphrase.as_bytes().to_owned());
+        py.detach(move || db.verify_passphrase(&passphrase))
             .map_err(to_pyerr)
     }
 
     /// Re-wrap the root key under a new passphrase (data is not re-encrypted).
-    fn change_passphrase(&self, old: &str, new: &str) -> PyResult<()> {
-        self.cell()?
-            .borrow_owner()
-            .change_passphrase(old.as_bytes(), new.as_bytes())
+    fn change_passphrase(&self, py: Python<'_>, old: &str, new: &str) -> PyResult<()> {
+        let db = self.database()?;
+        let old = Zeroizing::new(old.as_bytes().to_owned());
+        let new = Zeroizing::new(new.as_bytes().to_owned());
+        py.detach(move || db.change_passphrase(&old, &new))
             .map_err(to_pyerr)
     }
 
@@ -531,13 +929,15 @@ impl PyDatabase {
     /// segment so a later cold open LOADs it instead of rebuilding by full scan.
     /// Returns the segment manifest dict.
     fn persist_ann_index(&self, py: Python<'_>, table: &str, column: &str) -> PyResult<Py<PyAny>> {
-        // Build off a fresh connection on a detached thread: the scan/PRISM build
-        // can take minutes, so it must not hold the GIL (persist is refused inside
-        // an open transaction anyway, so a throwaway connection is equivalent).
-        let db = self.cell()?.borrow_owner().clone();
+        // Keep this handle's transaction state and schema while releasing the GIL;
+        // a fresh connection would bypass the explicit-transaction refusal.
+        let shared = Arc::clone(self.shared_conn()?);
         let (table, column) = (table.to_string(), column.to_string());
         let info = py
-            .detach(move || Connection::open(&db)?.persist_ann_index(&table, &column))
+            .detach(move || {
+                let cell = shared.cell.lock();
+                cell.with_dependent(|_owner, conn| conn.persist_ann_index(&table, &column))
+            })
             .map_err(to_pyerr)?;
         ann_segment_info_dict(py, &info)?.into_py_any(py)
     }
@@ -550,29 +950,39 @@ impl PyDatabase {
         table: &str,
         column: &str,
     ) -> PyResult<Option<Py<PyAny>>> {
-        self.cell()?.with_dependent(|_owner, conn| {
-            match conn.ann_cache_status(table, column).map_err(to_pyerr)? {
-                None => Ok(None),
-                Some((src, generation)) => {
-                    let d = ann_index_source_dict(py, &src)?;
-                    d.set_item("generation", generation)?;
-                    Ok(Some(d.into_py_any(py)?))
-                }
+        let shared = Arc::clone(self.shared_conn()?);
+        let (table, column) = (table.to_owned(), column.to_owned());
+        let status = py
+            .detach(move || {
+                let cell = shared.cell.lock();
+                cell.with_dependent(|_owner, conn| conn.ann_cache_status(&table, &column))
+            })
+            .map_err(to_pyerr)?;
+        match status {
+            None => Ok(None),
+            Some((src, generation)) => {
+                let d = ann_index_source_dict(py, &src)?;
+                d.set_item("generation", generation)?;
+                Ok(Some(d.into_py_any(py)?))
             }
-        })
+        }
     }
 
     /// Export an encrypted key escrow (under its own `backup_pass`) for disaster
     /// recovery; restore later with `restore_key_from_backup` if the DB passphrase
     /// is lost. Requires the current DB passphrase.
-    fn export_key_backup(&self, db_pass: &str, backup_pass: &str, dest: &str) -> PyResult<()> {
-        self.cell()?
-            .borrow_owner()
-            .export_key_backup(
-                db_pass.as_bytes(),
-                backup_pass.as_bytes(),
-                std::path::Path::new(dest),
-            )
+    fn export_key_backup(
+        &self,
+        py: Python<'_>,
+        db_pass: &str,
+        backup_pass: &str,
+        dest: &str,
+    ) -> PyResult<()> {
+        let db = self.database()?;
+        let db_pass = Zeroizing::new(db_pass.as_bytes().to_owned());
+        let backup_pass = Zeroizing::new(backup_pass.as_bytes().to_owned());
+        let dest = dest.to_owned();
+        py.detach(move || db.export_key_backup(&db_pass, &backup_pass, std::path::Path::new(&dest)))
             .map_err(to_pyerr)
     }
 
@@ -580,28 +990,34 @@ impl PyDatabase {
     /// database at `db_path`. Static: no open handle needed.
     #[staticmethod]
     fn restore_key_from_backup(
+        py: Python<'_>,
         backup: &str,
         backup_pass: &str,
         new_db_pass: &str,
         db_path: &str,
     ) -> PyResult<()> {
-        Database::restore_key_from_backup(
-            std::path::Path::new(backup),
-            backup_pass.as_bytes(),
-            new_db_pass.as_bytes(),
-            std::path::Path::new(db_path),
-        )
+        let backup = backup.to_owned();
+        let backup_pass = Zeroizing::new(backup_pass.as_bytes().to_owned());
+        let new_db_pass = Zeroizing::new(new_db_pass.as_bytes().to_owned());
+        let db_path = db_path.to_owned();
+        py.detach(move || {
+            Database::restore_key_from_backup(
+                std::path::Path::new(&backup),
+                &backup_pass,
+                &new_db_pass,
+                std::path::Path::new(&db_path),
+            )
+        })
         .map_err(to_pyerr)
     }
 
-    /// Verify the tamper-evident audit log (on by default for file databases):
-    /// `{entries_verified, chain_valid, chain_break_at}`.
+    /// Verify the live audit segment's HMAC chain (on by default for file
+    /// databases): `{entries_verified, chain_valid, chain_break_at}`. This
+    /// single-segment check does not authenticate the mutable header count or
+    /// provide an anti-rollback guarantee.
     fn verify_audit_log(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let r = self
-            .cell()?
-            .borrow_owner()
-            .verify_audit_log()
-            .map_err(to_pyerr)?;
+        let db = self.database()?;
+        let r = py.detach(move || db.verify_audit_log()).map_err(to_pyerr)?;
         let d = PyDict::new(py);
         d.set_item("entries_verified", r.entries_verified)?;
         d.set_item("chain_valid", r.chain_valid)?;
@@ -609,21 +1025,21 @@ impl PyDatabase {
         d.into_py_any(py)
     }
 
-    /// Path of the tamper-evident audit log, or `None` if disabled (in-memory DBs).
+    /// Path of the live HMAC-chained audit segment, or `None` if disabled
+    /// (in-memory DBs).
     fn audit_log_path(&self) -> PyResult<Option<String>> {
         Ok(self
-            .cell()?
-            .borrow_owner()
+            .database()?
             .audit_log_path()
             .map(|p| p.to_string_lossy().into_owned()))
     }
 
     /// Release this handle's connection and database reference. Later calls raise.
     /// Other handles over the same file are unaffected; the file is released once
-    /// the last of them, and any engine they built, has dropped.
+    /// the last of them, and any memory or maintenance capability they built, has dropped.
     fn close(&mut self) {
         self.conn = None;
-        // Drop the cached engine too, or closing would not release the database.
+        // Drop this handle's cached engine; separately returned capabilities retain theirs.
         self.memory.take();
     }
 
@@ -633,8 +1049,9 @@ impl PyDatabase {
         self.conn.is_none()
     }
 
-    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        slf
+    fn __enter__(slf: PyRef<'_, Self>) -> PyResult<PyRef<'_, Self>> {
+        slf.ensure_owner_thread()?;
+        Ok(slf)
     }
 
     #[pyo3(signature = (_exc_type=None, _exc_value=None, _traceback=None))]
@@ -761,7 +1178,8 @@ fn parse_argon2_profile(s: &str) -> PyResult<Argon2Profile> {
 }
 
 /// Create-time security/durability knobs for [`connect`] (all optional).
-#[pyclass(name = "DatabaseOptions")]
+#[derive(Clone, Copy)]
+#[pyclass(name = "DatabaseOptions", skip_from_py_object)]
 pub(crate) struct PyDatabaseOptions {
     secure_delete: bool,
     cache_size: Option<usize>,
@@ -808,15 +1226,28 @@ impl PyDatabaseOptions {
 #[pyfunction]
 #[pyo3(signature = (path=None, *, key, create=None, region_keys=false, options=None))]
 pub(crate) fn connect(
+    py: Python<'_>,
     path: Option<String>,
     key: &str,
     create: Option<bool>,
     region_keys: bool,
     options: Option<&PyDatabaseOptions>,
 ) -> PyResult<PyDatabase> {
+    let key = Zeroizing::new(key.as_bytes().to_owned());
+    let options = options.copied();
+    py.detach(move || connect_detached(path, key, create, region_keys, options))
+}
+
+fn connect_detached(
+    path: Option<String>,
+    key: Zeroizing<Vec<u8>>,
+    create: Option<bool>,
+    region_keys: bool,
+    options: Option<PyDatabaseOptions>,
+) -> PyResult<PyDatabase> {
     let configure = |mut b: DatabaseBuilder| {
-        b = b.passphrase(key.as_bytes()).enable_region_keys(region_keys);
-        if let Some(o) = options {
+        b = b.passphrase(&key).enable_region_keys(region_keys);
+        if let Some(o) = options.as_ref() {
             b = b.enable_secure_delete(o.secure_delete);
             if let Some(c) = o.cache_size {
                 b = b.cache_size(c);
@@ -856,7 +1287,7 @@ pub(crate) fn connect(
             &mut open,
             &ident,
             p,
-            key,
+            &key,
             region_keys,
             options.is_some(),
             create,
@@ -891,7 +1322,7 @@ pub(crate) fn connect(
                 conn: std::sync::Weak::new(),
                 owner_thread: std::thread::current().id(),
                 key_file: file_hash(owner.key_path())?,
-                passphrase: passphrase_digest(key),
+                passphrase: passphrase_digest(&key),
             },
         );
     }

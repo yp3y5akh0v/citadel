@@ -12,7 +12,7 @@ if sys.platform == "win32":
             os.add_dll_directory(_cuda_bin)
 
 from citadeldb import agent, exceptions, mcp, memory, vector
-from citadeldb._core import Database, DatabaseOptions, QueryResult, __version__, connect
+from citadeldb._core import CancelToken, Database, DatabaseOptions, QueryResult, __version__, connect
 from citadeldb.agent import Agent, BeliefGraph, Goal, LLMClient
 from citadeldb.exceptions import (
     AgentError,
@@ -29,14 +29,20 @@ from citadeldb.memory import (
     CandleEmbedder,
     CrossEncoder,
     EvictionPolicy,
+    MemoryMaintenance,
+    MemoryRegionInfo,
+    MemoryRegionInventory,
     MockEmbedder,
     MockReranker,
     RecallOptions,
+    ReembedReport,
+    RegionIdentity,
 )
 from citadeldb.vector import Filter, VectorIndex
 
 __all__ = [
     "connect",
+    "CancelToken",
     "Database",
     "DatabaseOptions",
     "QueryResult",
@@ -47,7 +53,12 @@ __all__ = [
     "CandleEmbedder",
     "CrossEncoder",
     "EvictionPolicy",
+    "MemoryMaintenance",
+    "MemoryRegionInfo",
+    "MemoryRegionInventory",
     "RecallOptions",
+    "ReembedReport",
+    "RegionIdentity",
     "Agent",
     "LLMClient",
     "Goal",

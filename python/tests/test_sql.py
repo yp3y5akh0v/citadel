@@ -3,7 +3,11 @@
 import datetime as dt
 import gc
 import os
+import subprocess
+import sys
 import tempfile
+import threading
+import time
 
 import pytest
 
@@ -100,8 +104,34 @@ def test_admin_stats_integrity():
     db.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
     st = db.stats()
     assert "entry_count" in st and isinstance(st["merkle_root"], bytes)
-    ic = db.integrity_check()
+    ic = db.integrity_check(quiet=True)
     assert ic["ok"] is True and ic["error_count"] == 0
+    assert ic["tampered_count"] == 0 and ic["errors"] == []
+
+
+def test_cancel_token_is_one_shot_and_can_interrupt_a_running_query():
+    db = fresh()
+    db.execute("CREATE TABLE cancel_rows(id INTEGER PRIMARY KEY)")
+    values = ", ".join(f"({i})" for i in range(5000))
+    db.execute(f"INSERT INTO cancel_rows VALUES {values}")
+    token = citadeldb.CancelToken()
+    db.set_cancel(token)
+
+    def cancel_soon():
+        time.sleep(0.02)
+        token.cancel()
+
+    stopper = threading.Thread(target=cancel_soon)
+    stopper.start()
+    with pytest.raises(citadeldb.OperationalError, match="cancel"):
+        db.query("SELECT SUM(a.id * b.id) FROM cancel_rows a CROSS JOIN cancel_rows b")
+    stopper.join()
+    assert token.is_cancelled is True
+    with pytest.raises(citadeldb.OperationalError, match="cancel"):
+        db.query("SELECT 1")
+
+    db.set_cancel(None)
+    assert db.query("SELECT 1").rows == [(1,)]
 
 
 def test_backup_and_change_passphrase():
@@ -132,18 +162,18 @@ def test_a_rekey_is_honoured_by_the_open_file_table():
         citadeldb.connect(path, key="old")
 
 
-def test_a_restored_key_file_is_honoured_by_the_open_file_table():
-    """Restoring rewrites the key file behind every handle; a digest would miss it."""
+def test_restore_refuses_to_race_an_open_database():
     d = tempfile.mkdtemp()
     path, backup = os.path.join(d, "restore.cdl"), os.path.join(d, "escrow.bin")
     db = citadeldb.connect(path, key="old", create=True)
     db.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
     db.export_key_backup("old", "escrow-pass", backup)
-    citadeldb.Database.restore_key_from_backup(backup, "escrow-pass", "new", path)
+    with pytest.raises(citadeldb.OperationalError, match="locked"):
+        citadeldb.Database.restore_key_from_backup(backup, "escrow-pass", "new", path)
 
-    assert citadeldb.connect(path, key="new").tables() == ["t"]
+    assert db.tables() == ["t"]
     with pytest.raises(citadeldb.EncryptionError):
-        citadeldb.connect(path, key="old")
+        citadeldb.connect(path, key="new")
 
 
 def test_verify_passphrase_reads_the_key_file():
@@ -183,6 +213,50 @@ def test_a_file_this_process_still_holds_reopens_onto_the_live_database():
     # One engine per database, so the region the closed handle made is still there.
     assert again.memory().count("r", "k") == 0
     assert again.is_closed is False
+
+
+def test_database_rejects_foreign_thread_use_but_can_be_destroyed_there(tmp_path):
+    path = str(tmp_path / "foreign-drop.cdl")
+    db = citadeldb.connect(path, key="pw", create=True, region_keys=True)
+    memory = db.memory()
+    memory.create_region("r", citadeldb.MockEmbedder(8))
+    maintenance = db.memory_maintenance()
+    holder = [db, memory, maintenance]
+    del db, memory, maintenance
+    outcome = []
+
+    def use_then_drop_final_reference():
+        handle, memory, maintenance = holder
+        for operation in (handle.tables, handle.memory):
+            try:
+                operation()
+            except BaseException as error:
+                outcome.append((type(error), str(error)))
+        outcome.append(memory.count("r", "fact"))
+        outcome.append(maintenance.count("r"))
+        holder.clear()
+        del handle, memory, maintenance
+        gc.collect()
+
+    worker = threading.Thread(target=use_then_drop_final_reference)
+    worker.start()
+    worker.join()
+
+    assert len(outcome) == 4
+    assert all(item[0] is citadeldb.ProgrammingError for item in outcome[:2])
+    assert all("thread that opened" in item[1] for item in outcome[:2])
+    assert outcome[2:] == [0, 0]
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import citadeldb, sys; db = citadeldb.connect(sys.argv[1], key='pw'); db.close()",
+            path,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert probe.returncode == 0, probe.stderr
 
 
 def test_errors():
@@ -289,6 +363,15 @@ def test_db_ann_persist_and_status():
     assert isinstance(info["segment_b3"], bytes) and info["n"] == 40
     status = db.ann_cache_status("items", "emb")
     assert status is not None and status["source"] in ("loaded", "built")
+
+
+def test_db_ann_persist_refuses_the_handle_owning_an_explicit_transaction():
+    db = fresh()
+    db.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, emb VECTOR(3))")
+    db.execute("BEGIN")
+    with pytest.raises(citadeldb.DataError, match="explicit transaction"):
+        db.persist_ann_index("items", "emb")
+    db.execute("ROLLBACK")
 
 
 def test_connect_options_secure_delete_and_fips_kdf():

@@ -2,6 +2,7 @@
 
 import os
 import tempfile
+import threading
 
 import pytest
 
@@ -15,6 +16,31 @@ def mem_db(**kw):
 def region(mem, name="r", dim=64):
     mem.create_region(name, citadeldb.MockEmbedder(dim))
     return name
+
+
+@pytest.mark.parametrize(
+    "method",
+    [
+        "create_region",
+        "create_encrypted_region",
+        "attach_existing_region",
+        "reembed_region",
+    ],
+)
+def test_memory_regions_require_an_explicit_embedder(tmp_path, method):
+    db = citadeldb.connect(
+        str(tmp_path / f"{method}.cdl"), key="k", create=True, region_keys=True
+    )
+    mem = db.memory()
+    with pytest.raises(TypeError, match="embedder"):
+        getattr(mem, method)("missing")
+    assert mem.region("missing") is None
+
+
+@pytest.mark.parametrize("dim", [True, -1, 0, 65_536])
+def test_mock_embedder_rejects_dimensions_the_memory_format_cannot_store(dim):
+    with pytest.raises(ValueError, match="positive integer"):
+        citadeldb.MockEmbedder(dim)
 
 
 def test_remember_recall_payload():
@@ -31,6 +57,41 @@ def test_remember_recall_payload():
     sky = [h for h in hits if "sky" in h.text]
     assert sky and sky[0].payload == {"src": "x"}
     assert sky[0].kind == "fact" and sky[0].immutable is False
+
+
+def test_cancel_from_another_python_thread_interrupts_a_memory_batch():
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingEmbedder:
+        dim = 8
+        metric = "cosine"
+        model_id = "blocking-test"
+
+        def embed(self, texts):
+            entered.set()
+            assert release.wait(5), "cancellation thread did not release the embedder"
+            return [[0.0] * self.dim for _ in texts]
+
+    db = citadeldb.connect(key="k")
+    mem = db.memory()
+    mem.create_region("r", BlockingEmbedder())
+    token = citadeldb.CancelToken()
+    db.set_cancel(token)
+
+    def cancel_during_embedding():
+        assert entered.wait(5), "memory operation never reached the embedder"
+        token.cancel()
+        release.set()
+
+    stopper = threading.Thread(target=cancel_during_embedding)
+    stopper.start()
+    with pytest.raises(citadeldb.OperationalError, match="cancel"):
+        mem.remember_batch("r", [{"kind": "fact", "text": "item"}])
+    stopper.join()
+
+    db.set_cancel(None)
+    assert mem.count("r", "fact") == 0
 
 
 def test_recall_kinds_filter():
@@ -134,6 +195,54 @@ def test_byo_python_embedder():
     assert len(hits) == 1 and hits[0].text == "abcd"
 
 
+@pytest.mark.parametrize("attribute", ["embed", "embed_queries"])
+def test_region_rejects_a_non_callable_embedder_method(attribute):
+    class Invalid:
+        dim = 8
+        metric = "cosine"
+        model_id = "invalid"
+
+        def embed(self, texts):
+            return [[0.0] * self.dim for _ in texts]
+
+    setattr(Invalid, attribute, None)
+    mem = citadeldb.connect(key="k").memory()
+
+    with pytest.raises(TypeError, match=attribute):
+        mem.create_region("r", Invalid())
+    assert mem.region("r") is None
+
+
+@pytest.mark.parametrize(
+    ("attribute", "value", "message"),
+    [
+        ("dim", True, "positive integer"),
+        ("dim", -1, "positive integer"),
+        ("dim", 0, "positive integer"),
+        ("dim", 65_536, "65535"),
+        ("metric", "unknown", "unknown embedding metric"),
+        ("model_id", "  ", "nonblank"),
+        ("model_id", "default", "unknown.*default"),
+        ("model_id", "UNKNOWN", "unknown.*default"),
+    ],
+)
+def test_region_rejects_invalid_embedder_metadata(attribute, value, message):
+    class Invalid:
+        dim = 8
+        metric = "cosine"
+        model_id = "invalid"
+
+        def embed(self, texts):
+            return [[0.0] * self.dim for _ in texts]
+
+    setattr(Invalid, attribute, value)
+    mem = citadeldb.connect(key="k").memory()
+
+    with pytest.raises(ValueError, match=message):
+        mem.create_region("r", Invalid())
+    assert mem.region("r") is None
+
+
 def test_evolve():
     mem = mem_db()
     region(mem)
@@ -218,6 +327,50 @@ def test_set_reranker_python_object_reorders():
     assert mem.recall("r", text="alpha", k=2)[0].id == pure  # fusion: pure match first
     mem.set_reranker(ByLength(), strategy="replace")
     assert mem.recall("r", text="alpha", k=2)[0].id == long_  # ByLength flips to the longer
+
+
+@pytest.mark.parametrize("rrf_k", [0.0, -1.0, float("nan"), float("inf")])
+def test_set_reranker_rejects_an_invalid_rrf_constant_before_installing(rrf_k):
+    mem = mem_db()
+    with pytest.raises(ValueError, match="finite and greater than zero"):
+        mem.set_reranker(citadeldb.MockReranker(), rrf_k=rrf_k)
+
+
+@pytest.mark.parametrize("model_id", ["", "   "])
+def test_set_reranker_rejects_invalid_python_metadata(model_id):
+    class Invalid:
+        def rerank(self, query, passages):
+            return [0.0] * len(passages)
+
+    Invalid.model_id = model_id
+    mem = mem_db()
+    with pytest.raises(ValueError, match="nonblank"):
+        mem.set_reranker(Invalid())
+
+
+def test_set_reranker_rejects_a_non_callable_python_method():
+    class Invalid:
+        model_id = "invalid"
+        rerank = None
+
+    mem = mem_db()
+    with pytest.raises(TypeError, match="callable rerank"):
+        mem.set_reranker(Invalid())
+
+
+def test_python_reranker_rejects_non_finite_scores():
+    class Invalid:
+        model_id = "invalid-score"
+
+        def rerank(self, query, passages):
+            return [float("nan")] * len(passages)
+
+    mem = mem_db()
+    region(mem)
+    mem.remember("r", {"kind": "fact", "text": "alpha"})
+    mem.set_reranker(Invalid(), strategy="replace")
+    with pytest.raises(citadeldb.OperationalError, match="non-finite score"):
+        mem.recall("r", text="alpha", k=1)
 
 
 def test_memory_ann_persist_and_status():
