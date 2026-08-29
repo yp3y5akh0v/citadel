@@ -88,8 +88,13 @@ for finding in report["errors"]:
 
 ## MCP
 
-`pip install citadeldb-mcp` exposes the memory engine to Claude Desktop, Cursor, and
-any Model Context Protocol client.
+`pip install citadeldb-mcp` installs the server executable for Claude Desktop,
+Cursor, and other Model Context Protocol clients. Server invocations require an
+explicit embedder; use `--embedder mock` only for intentional keyword-only recall.
+
+The main `citadeldb` wheel exposes
+`citadeldb.mcp.serve("memory.cdl", embedder="mock")` for programmatic keyword-only
+serving; set `CITADEL_KEY` before calling it.
 
 Full documentation is at [citadeldb.dev](https://citadeldb.dev); source and the Rust
 API are in the [main repository](https://github.com/yp3y5akh0v/citadel).

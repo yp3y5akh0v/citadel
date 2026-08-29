@@ -5,10 +5,11 @@ use std::path::Path;
 use std::sync::Arc;
 
 use citadel::{Argon2Profile, DatabaseBuilder};
-use citadel_mem::{Embedder, MemoryEngine, MockEmbedder};
+use citadel_mem::{Embedder, EmbeddingMetric, MemoryEngine, MockEmbedder};
+use zeroize::Zeroizing;
 
-/// MockEmbedder dim; real embedders take their dim from the model.
-const EMBED_DIM: usize = 256;
+/// Default mock dimension when the region has no persisted identity.
+const DEFAULT_MOCK_DIM: usize = 256;
 
 /// Resolved configuration for serving one region.
 #[derive(Debug)]
@@ -23,46 +24,143 @@ pub struct ServeConfig {
     pub reranker_dir: Option<String>,
 }
 
-impl Default for ServeConfig {
-    fn default() -> Self {
-        Self {
-            db: String::new(),
-            region: String::from("default"),
-            encrypted: true,
-            embedder: String::from("mock"),
-            model_dir: None,
-            models_dir: None,
-            reranker: None,
-            reranker_dir: None,
+#[derive(Debug)]
+struct ModelSelection<'a> {
+    embedder: &'a str,
+    #[cfg(feature = "candle-embed")]
+    reranker: Option<&'a str>,
+}
+
+fn validate_serve_config(config: &ServeConfig) -> Result<ModelSelection<'_>, String> {
+    if config.db.trim().is_empty() {
+        return Err("--db needs a non-empty path".to_string());
+    }
+    if config.region.trim().is_empty() {
+        return Err("--region needs a non-empty name".to_string());
+    }
+    let embedder = config.embedder.trim();
+    if embedder.is_empty() {
+        return Err("--embedder needs a non-empty name".to_string());
+    }
+    for (flag, value) in [
+        ("--model-dir", config.model_dir.as_deref()),
+        ("--models-dir", config.models_dir.as_deref()),
+        ("--reranker-dir", config.reranker_dir.as_deref()),
+    ] {
+        if value.is_some_and(|value| value.trim().is_empty()) {
+            return Err(format!("{flag} needs a non-empty path"));
         }
     }
+    let reranker = config.reranker.as_deref().map(str::trim);
+    if reranker == Some("") {
+        return Err("--reranker needs a non-empty name".to_string());
+    }
+
+    #[cfg(not(feature = "candle-embed"))]
+    if config.model_dir.is_some() || reranker.is_some() || config.reranker_dir.is_some() {
+        return Err(
+            "--model-dir, --reranker, and --reranker-dir need a build with --features \
+             candle-embed (semantic embeddings + reranking)"
+                .to_string(),
+        );
+    }
+    #[cfg(not(feature = "hub"))]
+    if config.models_dir.is_some() {
+        return Err(
+            "--models-dir needs a build with --features hub (model download support)".to_string(),
+        );
+    }
+
+    validate_embedder_name(embedder)?;
+    #[cfg(feature = "candle-embed")]
+    if let Some(name) = reranker {
+        reranker_spec(name).ok_or_else(|| unknown_reranker(name))?;
+    }
+    if config.reranker_dir.is_some() && reranker.is_none() {
+        return Err("--reranker-dir requires --reranker".to_string());
+    }
+    if config.model_dir.is_some() && embedder == "mock" {
+        return Err("--model-dir has no effect with --embedder mock".to_string());
+    }
+    #[cfg(all(feature = "candle-embed", not(feature = "hub")))]
+    if embedder != "mock" && config.model_dir.is_none() {
+        return Err(format!(
+            "embedder '{embedder}' requires --model-dir (this build has no `hub` download \
+             support)"
+        ));
+    }
+    #[cfg(all(feature = "candle-embed", not(feature = "hub")))]
+    if let Some(name) = reranker.filter(|_| config.reranker_dir.is_none()) {
+        return Err(format!(
+            "reranker '{name}' requires --reranker-dir (this build has no `hub` download \
+             support)"
+        ));
+    }
+    #[cfg(feature = "hub")]
+    if config.models_dir.is_some()
+        && !((embedder != "mock" && config.model_dir.is_none())
+            || (reranker.is_some() && config.reranker_dir.is_none()))
+    {
+        return Err("--models-dir has no model or reranker to resolve".to_string());
+    }
+
+    Ok(ModelSelection {
+        embedder,
+        #[cfg(feature = "candle-embed")]
+        reranker,
+    })
 }
 
 /// Open (or create) the database, attach the region, and run the MCP stdio
 /// loop. The passphrase is read from `CITADEL_KEY`. Blocks until the client
 /// closes stdin.
 pub fn serve_with_config(config: &ServeConfig) -> Result<(), String> {
-    let key = std::env::var("CITADEL_KEY")
-        .map_err(|_| "set CITADEL_KEY to the database passphrase".to_string())?;
+    let selection = validate_serve_config(config)?;
+    let key = Zeroizing::new(
+        std::env::var("CITADEL_KEY")
+            .map_err(|_| "set CITADEL_KEY to the database passphrase".to_string())?,
+    );
+    if key.is_empty() {
+        return Err("CITADEL_KEY must not be empty".to_string());
+    }
+    let embedder_name = selection.embedder;
 
-    let mut builder = DatabaseBuilder::new(&config.db)
-        .passphrase(key.as_bytes())
-        .argon2_profile(Argon2Profile::Iot);
-    // Encrypted regions seal each atom under its own key; that needs region
-    // wrap keys.
-    if config.encrypted {
-        builder = builder.enable_region_keys(true);
-    }
-    let db = if Path::new(&config.db).exists() {
-        builder.open()
+    // Authenticate an existing vault before loading potentially large models. For a
+    // new path the order is reversed, so a bad model can never leave a vault artifact.
+    let existing_database = if Path::new(&config.db).exists() {
+        Some(
+            database_builder(config, key.as_bytes())
+                .open()
+                .map_err(|e| format!("open database {}: {e}", config.db))?,
+        )
     } else {
-        builder.create()
-    }
-    .map_err(|e| format!("open database {}: {e}", config.db))?;
+        None
+    };
+
+    let embedder = if embedder_name == "mock" {
+        None
+    } else {
+        Some(build_real_embedder(embedder_name, config)?)
+    };
+    #[cfg(feature = "candle-embed")]
+    let reranker = selection
+        .reranker
+        .map(|name| build_reranker(name, config).map(|reranker| (name, reranker)))
+        .transpose()?;
+    let db = match existing_database {
+        Some(database) => database,
+        None => database_builder(config, key.as_bytes())
+            .create()
+            .map_err(|e| format!("open database {}: {e}", config.db))?,
+    };
+    drop(key);
 
     let mem = MemoryEngine::open(Arc::new(db)).map_err(|e| format!("open memory engine: {e}"))?;
+    let embedder = match embedder {
+        Some(embedder) => embedder,
+        None => build_mock_embedder(&mem, &config.region)?,
+    };
 
-    let embedder = build_embedder(config)?;
     if config.encrypted {
         mem.create_encrypted_region(&config.region, embedder)
             .map_err(|e| format!("attach encrypted region '{}': {e}", config.region))?;
@@ -79,17 +177,26 @@ pub fn serve_with_config(config: &ServeConfig) -> Result<(), String> {
         } else {
             "plaintext"
         },
-        config.embedder,
+        embedder_name,
         config.db
     );
     #[cfg(feature = "candle-embed")]
-    if let Some(name) = &config.reranker {
+    if let Some((name, reranker)) = reranker {
         use citadel_mem::RerankStrategy;
-        let reranker = build_reranker(name, config)?;
         mem.set_reranker(reranker, RerankStrategy::default());
         eprintln!("citadeldb-mcp: reranker={name} (rrf)");
     }
     crate::serve_stdio(Arc::new(mem), &config.region).map_err(|e| format!("serve: {e}"))
+}
+
+fn database_builder(config: &ServeConfig, key: &[u8]) -> DatabaseBuilder {
+    let mut builder = DatabaseBuilder::new(&config.db)
+        .passphrase(key)
+        .argon2_profile(Argon2Profile::Iot);
+    if config.encrypted {
+        builder = builder.enable_region_keys(true);
+    }
+    builder
 }
 
 /// Dispatch the `pull` subcommand, otherwise serve a region over stdio.
@@ -102,15 +209,33 @@ pub fn run(argv: &[String]) -> Result<(), String> {
 
 /// Parse serve argv into a [`ServeConfig`].
 fn parse_serve_config(argv: &[String]) -> Result<ServeConfig, String> {
-    let mut config = ServeConfig::default();
     let mut db = None;
+    let mut region = String::from("default");
+    let mut encrypted = true;
+    let mut embedder = None;
+    #[cfg(feature = "candle-embed")]
+    let mut model_dir = None;
+    #[cfg(not(feature = "candle-embed"))]
+    let model_dir = None;
+    #[cfg(feature = "hub")]
+    let mut models_dir = None;
+    #[cfg(not(feature = "hub"))]
+    let models_dir = None;
+    #[cfg(feature = "candle-embed")]
+    let mut reranker = None;
+    #[cfg(not(feature = "candle-embed"))]
+    let reranker = None;
+    #[cfg(feature = "candle-embed")]
+    let mut reranker_dir = None;
+    #[cfg(not(feature = "candle-embed"))]
+    let reranker_dir = None;
     let mut it = argv.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--db" => db = Some(it.next().ok_or("--db needs a path")?.clone()),
-            "--region" => config.region = it.next().ok_or("--region needs a name")?.clone(),
+            "--region" => region = it.next().ok_or("--region needs a name")?.clone(),
             "--region-mode" => {
-                config.encrypted = match it.next().map(String::as_str) {
+                encrypted = match it.next().map(String::as_str) {
                     Some("encrypted") => true,
                     Some("plaintext") => false,
                     other => {
@@ -121,22 +246,22 @@ fn parse_serve_config(argv: &[String]) -> Result<ServeConfig, String> {
                     }
                 };
             }
-            "--embedder" => config.embedder = it.next().ok_or("--embedder needs a name")?.clone(),
+            "--embedder" => embedder = Some(it.next().ok_or("--embedder needs a name")?.clone()),
             #[cfg(feature = "candle-embed")]
             "--model-dir" => {
-                config.model_dir = Some(it.next().ok_or("--model-dir needs a path")?.clone())
+                model_dir = Some(it.next().ok_or("--model-dir needs a path")?.clone())
             }
             #[cfg(feature = "hub")]
             "--models-dir" => {
-                config.models_dir = Some(it.next().ok_or("--models-dir needs a path")?.clone())
+                models_dir = Some(it.next().ok_or("--models-dir needs a path")?.clone())
             }
             #[cfg(feature = "candle-embed")]
             "--reranker" => {
-                config.reranker = Some(it.next().ok_or("--reranker needs a name")?.clone())
+                reranker = Some(it.next().ok_or("--reranker needs a name")?.clone())
             }
             #[cfg(feature = "candle-embed")]
             "--reranker-dir" => {
-                config.reranker_dir = Some(it.next().ok_or("--reranker-dir needs a path")?.clone())
+                reranker_dir = Some(it.next().ok_or("--reranker-dir needs a path")?.clone())
             }
             #[cfg(not(feature = "candle-embed"))]
             "--model-dir" | "--reranker" | "--reranker-dir" => {
@@ -153,8 +278,25 @@ fn parse_serve_config(argv: &[String]) -> Result<ServeConfig, String> {
             other => return Err(format!("unknown argument: {other}")),
         }
     }
-    config.db = db.ok_or("--db <path> is required")?;
-    Ok(config)
+    let db = db.ok_or("--db <path> is required")?;
+    let embedder = embedder.ok_or(
+        "--embedder <name> is required; choose a semantic model or pass \
+         --embedder mock explicitly for keyword-only recall",
+    )?;
+    let embedder = embedder.trim();
+    if embedder.is_empty() {
+        return Err("--embedder needs a non-empty name".to_string());
+    }
+    Ok(ServeConfig {
+        db,
+        region,
+        encrypted,
+        embedder: embedder.to_string(),
+        model_dir,
+        models_dir,
+        reranker,
+        reranker_dir,
+    })
 }
 
 /// `pull <model> [--models-dir <dir>]`: explicitly download a public model.
@@ -184,19 +326,38 @@ fn run_pull(_argv: &[String]) -> Result<(), String> {
     Err("`pull` needs a build with --features hub (model download support)".to_string())
 }
 
-/// Build the `--embedder`; never downloads and never silently falls back to
-/// mock.
-fn build_embedder(config: &ServeConfig) -> Result<Arc<dyn Embedder>, String> {
-    match config.embedder.as_str() {
-        "mock" => {
-            eprintln!(
-                "citadeldb-mcp: WARNING mock embedder - keyword-only recall, not semantic. \
-                 For semantic recall run `citadeldb-mcp pull e5-large`, then restart with \
-                 --embedder e5-large (or pass --model-dir to a local model)."
-            );
-            Ok(Arc::new(MockEmbedder::new(EMBED_DIM)))
-        }
-        name => build_real_embedder(name, config),
+fn build_mock_embedder(mem: &MemoryEngine, region: &str) -> Result<Arc<dyn Embedder>, String> {
+    let identity = mem
+        .stored_region_identity(region)
+        .map_err(|e| format!("inspect region '{region}': {e}"))?;
+    let (dim, metric) = identity.map_or((DEFAULT_MOCK_DIM, EmbeddingMetric::Cosine), |identity| {
+        (usize::from(identity.dim()), identity.metric())
+    });
+    eprintln!(
+        "citadeldb-mcp: WARNING mock embedder (dim={dim}, metric={metric:?}) - keyword-only \
+         recall, not semantic. \
+         For semantic recall run `citadeldb-mcp pull e5-large`, then restart with \
+         --embedder e5-large (or pass --model-dir to a local model)."
+    );
+    Ok(Arc::new(MockEmbedder::with_metric(dim, metric)))
+}
+
+fn validate_embedder_name(name: &str) -> Result<(), String> {
+    if name == "mock" {
+        return Ok(());
+    }
+    #[cfg(feature = "candle-embed")]
+    {
+        model_spec(name)
+            .map(|_| ())
+            .ok_or_else(|| unknown_embedder(name))
+    }
+    #[cfg(not(feature = "candle-embed"))]
+    {
+        Err(format!(
+            "embedder '{name}' needs a build with --features candle-embed (or `hub` for \
+             downloads); this binary has only the mock embedder"
+        ))
     }
 }
 
@@ -338,18 +499,32 @@ fn build_reranker(
 #[cfg(feature = "hub")]
 fn resolve_models_dir(override_dir: Option<&str>) -> Result<std::path::PathBuf, String> {
     use std::path::PathBuf;
+
     if let Some(dir) = override_dir {
+        if dir.trim().is_empty() {
+            return Err("--models-dir needs a non-empty path".to_string());
+        }
         return Ok(PathBuf::from(dir));
     }
-    if let Ok(dir) = std::env::var("CITADEL_MODELS_DIR") {
+    if let Some(dir) = std::env::var_os("CITADEL_MODELS_DIR") {
+        if os_string_is_blank(&dir) {
+            return Err("CITADEL_MODELS_DIR must not be empty".to_string());
+        }
         return Ok(PathBuf::from(dir));
     }
-    let home = std::env::var("USERPROFILE")
-        .or_else(|_| std::env::var("HOME"))
-        .map_err(|_| {
+    let home = ["USERPROFILE", "HOME"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .find(|value| !os_string_is_blank(value))
+        .ok_or_else(|| {
             "cannot locate home directory - set CITADEL_MODELS_DIR or pass --models-dir".to_string()
         })?;
     Ok(PathBuf::from(home).join(".citadel").join("models"))
+}
+
+#[cfg(feature = "hub")]
+fn os_string_is_blank(value: &std::ffi::OsStr) -> bool {
+    value.is_empty() || value.to_str().is_some_and(|value| value.trim().is_empty())
 }
 
 /// Error for a `pull` name that is neither a known embedder nor reranker.
@@ -461,6 +636,74 @@ fn download_file(url: &str, target: &Path) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    fn mock_config() -> super::ServeConfig {
+        super::ServeConfig {
+            db: "m.cdl".into(),
+            region: "default".into(),
+            encrypted: true,
+            embedder: "mock".into(),
+            model_dir: None,
+            models_dir: None,
+            reranker: None,
+            reranker_dir: None,
+        }
+    }
+
+    #[test]
+    fn direct_config_rejects_options_that_would_be_ignored() {
+        let mut config = mock_config();
+        config.model_dir = Some("   ".into());
+        let error = super::validate_serve_config(&config).unwrap_err();
+        assert!(error.contains("non-empty path"), "{error}");
+
+        let mut config = mock_config();
+        config.reranker_dir = Some("reranker".into());
+        let error = super::validate_serve_config(&config).unwrap_err();
+        #[cfg(feature = "candle-embed")]
+        assert!(error.contains("requires --reranker"), "{error}");
+        #[cfg(not(feature = "candle-embed"))]
+        assert!(error.contains("candle-embed"), "{error}");
+
+        let mut config = mock_config();
+        config.model_dir = Some("model".into());
+        let error = super::validate_serve_config(&config).unwrap_err();
+        #[cfg(feature = "candle-embed")]
+        assert!(error.contains("no effect"), "{error}");
+        #[cfg(not(feature = "candle-embed"))]
+        assert!(error.contains("candle-embed"), "{error}");
+
+        #[cfg(feature = "hub")]
+        {
+            let mut config = mock_config();
+            config.models_dir = Some("models".into());
+            let error = super::validate_serve_config(&config).unwrap_err();
+            assert!(error.contains("no model or reranker"), "{error}");
+        }
+    }
+
+    #[cfg(not(feature = "hub"))]
+    #[test]
+    fn direct_config_rejects_a_models_directory_without_hub() {
+        let mut config = mock_config();
+        config.models_dir = Some("models".into());
+        let error = super::validate_serve_config(&config).unwrap_err();
+        assert!(error.contains("--features hub"), "{error}");
+    }
+
+    #[cfg(feature = "candle-embed")]
+    #[test]
+    fn direct_config_validates_catalog_names_before_serving() {
+        let mut config = mock_config();
+        config.embedder = "not-a-model".into();
+        let error = super::validate_serve_config(&config).unwrap_err();
+        assert!(error.contains("unknown embedder"), "{error}");
+
+        let mut config = mock_config();
+        config.reranker = Some("not-a-reranker".into());
+        let error = super::validate_serve_config(&config).unwrap_err();
+        assert!(error.contains("unknown reranker"), "{error}");
+    }
+
     #[cfg(feature = "candle-embed")]
     #[test]
     fn model_spec_maps_known_names_and_rejects_unknown() {
@@ -502,16 +745,37 @@ mod tests {
         use super::resolve_models_dir;
         let dir = resolve_models_dir(Some("/tmp/custom-models")).unwrap();
         assert_eq!(dir, std::path::PathBuf::from("/tmp/custom-models"));
+
+        let error = resolve_models_dir(Some("   ")).unwrap_err();
+        assert!(error.contains("non-empty path"), "{error}");
     }
 
     #[test]
-    fn parse_serve_config_defaults_and_overrides() {
+    fn parse_serve_config_requires_an_embedder_and_preserves_other_defaults() {
         use super::parse_serve_config;
-        let a = parse_serve_config(&["--db".into(), "m.cdl".into()]).unwrap();
+        let err = parse_serve_config(&["--db".into(), "m.cdl".into()]).unwrap_err();
+        assert!(err.contains("--embedder <name> is required"), "{err}");
+
+        let a = parse_serve_config(&[
+            "--db".into(),
+            "m.cdl".into(),
+            "--embedder".into(),
+            "mock".into(),
+        ])
+        .unwrap();
         assert_eq!(a.db, "m.cdl");
         assert_eq!(a.region, "default");
         assert!(a.encrypted, "encrypted is the default");
-        assert_eq!(a.embedder, "mock", "mock is the default embedder");
+        assert_eq!(a.embedder, "mock");
+
+        let err = parse_serve_config(&[
+            "--db".into(),
+            "m.cdl".into(),
+            "--embedder".into(),
+            "   ".into(),
+        ])
+        .unwrap_err();
+        assert!(err.contains("non-empty"), "{err}");
 
         let a = parse_serve_config(&[
             "--db".into(),
@@ -542,6 +806,8 @@ mod tests {
         let a = parse_serve_config(&[
             "--db".into(),
             "m.cdl".into(),
+            "--embedder".into(),
+            "mock".into(),
             "--reranker".into(),
             "ms-marco-minilm".into(),
             "--reranker-dir".into(),
@@ -559,6 +825,8 @@ mod tests {
         let err = parse_serve_config(&[
             "--db".into(),
             "m.cdl".into(),
+            "--embedder".into(),
+            "mock".into(),
             "--model-dir".into(),
             "/m".into(),
         ])

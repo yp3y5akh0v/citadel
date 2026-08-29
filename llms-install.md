@@ -18,8 +18,9 @@ keys.
 
 ## Recommended: semantic embedder + reranker
 
-Without them, recall is keyword-only through a mock embedder. For semantic recall,
-pull both models once (models are never downloaded automatically):
+For semantic recall, pull both models once (models are never downloaded
+automatically). Keyword-only recall remains available by explicitly selecting
+`--embedder mock`:
 
 ```sh
 uvx citadeldb-mcp pull e5-large
@@ -49,8 +50,8 @@ Add this to the MCP settings file (for Cline: `cline_mcp_settings.json`):
 - `CITADEL_KEY` (required): the encryption passphrase.
 - `--db` (required): path to the encrypted region file, created on first run. Use an
   absolute path to keep it stable.
-- `--embedder e5-large`: semantic recall. Omit it (and skip the pulls) for
-  keyword-only recall.
+- `--embedder` (required): use `e5-large` for semantic recall or explicitly select
+  `mock` for keyword-only recall.
 - `--reranker ms-marco-minilm`: cross-encoder reranking for higher recall precision.
   Requires the pull above.
 
@@ -77,6 +78,8 @@ the stored fact.
 
 - `uvx: command not found` - install `uv` (see Prerequisites) and reopen the terminal.
 - Server exits immediately - `CITADEL_KEY` is unset or empty; set it under `env`.
+- Server reports that `--embedder` is required - choose a semantic model or pass
+  `--embedder mock` intentionally for keyword-only recall.
 - Recall behaves like plain keyword search - the `e5-large` model was not pulled, or
   the `--embedder e5-large` flag is missing. Run `uvx citadeldb-mcp pull e5-large`.
 - `--reranker` errors - the `ms-marco-minilm` model was not pulled; run

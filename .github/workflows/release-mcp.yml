@@ -87,7 +87,13 @@ jobs:
           code=$?
           set -e
           cat out.txt
-          # Missing CITADEL_KEY is the expected failure; anything else is a real bug.
+          test "$code" -eq 1
+          grep -q -- "--embedder <name> is required" out.txt
+          set +e
+          citadeldb-mcp --db test.cdl --embedder mock > out.txt 2>&1
+          code=$?
+          set -e
+          cat out.txt
           test "$code" -eq 1
           grep -q "set CITADEL_KEY" out.txt
 

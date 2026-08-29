@@ -427,7 +427,7 @@
   }
 }{% endraw %}</pre>
       </div>
-      <p class="bench-note">One-time setup: <code>citadeldb-mcp pull e5-large</code> and <code>pull ms-marco-minilm</code> download the embedder and reranker (the best-recall config; models are never fetched automatically - omit both for keyword-only recall). Recall hits carry provenance, per-hit integrity verdicts, and <code>memory://atom/{id}</code> resource links.</p>
+      <p class="bench-note">One-time setup: <code>citadeldb-mcp pull e5-large</code> and <code>pull ms-marco-minilm</code> download the embedder and reranker (the best-recall config; models are never fetched automatically). Every server invocation must select an embedder; use <code>--embedder mock</code> explicitly for keyword-only recall. Recall hits carry provenance, per-hit integrity verdicts, and <code>memory://atom/{id}</code> resource links.</p>
     </div>
   </div>
 </section>
