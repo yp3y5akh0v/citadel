@@ -1370,6 +1370,19 @@ fn a_cancelled_reembed_is_refused_and_then_resumable() {
         "the refusal must name the way out, got {message}"
     );
 
+    let wrong_target = engine
+        .reembed_region(
+            "notes",
+            Arc::new(NamedEmbedder::new(DIM as usize, "model-c")),
+            None,
+        )
+        .expect_err("a different pipeline must not resume committed model-b vectors");
+    let message = wrong_target.to_string();
+    assert!(
+        message.contains("model-b") && message.contains("finish that one"),
+        "the refusal must identify the durable target, got {message}"
+    );
+
     engine
         .reembed_region(
             "notes",

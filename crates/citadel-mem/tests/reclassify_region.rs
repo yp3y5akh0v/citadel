@@ -121,11 +121,8 @@ fn reclassifying_ends_an_attachment_the_new_label_contradicts() {
     let engine = MemoryEngine::open(Arc::clone(&db)).unwrap();
 
     engine
-        .attach_existing_region(
-            REGION,
-            Arc::new(citadel_mem::MockEmbedder::new(DIM as usize)),
-        )
-        .expect("the mock label matches the mock embedder");
+        .attach_existing_region(REGION, Arc::new(NamedEmbedder::new(DIM as usize, "mock")))
+        .expect("the legacy mock label matches the legacy fixture embedder");
 
     engine
         .reclassify_region(REGION, REAL_MODEL.to_string())
@@ -154,10 +151,7 @@ fn reclassifying_to_the_attached_model_keeps_it_attached() {
     let engine = MemoryEngine::open(Arc::clone(&db)).unwrap();
 
     engine
-        .attach_existing_region(
-            REGION,
-            Arc::new(citadel_mem::MockEmbedder::new(DIM as usize)),
-        )
+        .attach_existing_region(REGION, Arc::new(NamedEmbedder::new(DIM as usize, "mock")))
         .unwrap();
     engine
         .reclassify_region(REGION, "mock".to_string())

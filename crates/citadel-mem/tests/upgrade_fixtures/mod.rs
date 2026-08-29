@@ -106,7 +106,7 @@ pub fn seed_ordinary_region(db: &Arc<Database>, region: &str, atoms: &[&str]) {
 /// vectors the caller supplied.
 pub fn seed_shim_region(db: &Arc<Database>, region: &str, atoms: &[&str]) {
     let engine = MemoryEngine::open(Arc::clone(db)).expect("engine");
-    let embedder = Arc::new(MockEmbedder::new(32));
+    let embedder = Arc::new(NamedEmbedder::new(32, "mock"));
     engine
         .create_region(region, embedder)
         .expect("create region");

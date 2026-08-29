@@ -23,7 +23,7 @@ def test_an_existing_encrypted_region_can_be_maintained_without_its_embedder(tmp
 
     regions = maintenance.regions()
     assert [(r.name, r.dim, r.metric, r.encrypted, r.model_id) for r in regions] == [
-        ("notes", 8, "cosine", True, "mock")
+        ("notes", 8, "cosine", True, "mock-fnv1a-bow-v1")
     ]
     inventory = maintenance.inventory()
     assert [(item.region.name, item.live_atoms, item.unavailable) for item in inventory] == [

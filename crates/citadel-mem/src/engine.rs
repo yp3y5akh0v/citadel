@@ -2296,13 +2296,11 @@ impl MemoryEngine {
     /// vectors from a real model. Nothing about those stores is damaged; their
     /// provenance simply lies.
     ///
-    /// **Deliberately not automatic.** The engine cannot tell a region whose
-    /// vectors really came from `MockEmbedder` - a real mock user, whose data is
-    /// meaningless and should stay labelled - from one where an integration
-    /// mislabelled real vectors. Only the caller knows, so only the caller may
-    /// assert it. What the engine does instead is refuse the mismatched attach
-    /// with a message naming this call, which turns a silent breakage into an
-    /// instructed one.
+    /// **Deliberately not automatic.** The historical `"mock"` label identifies
+    /// both genuine old `MockEmbedder` vectors and integrations that mislabelled
+    /// real vectors. Only the caller knows whether to name the current mock
+    /// pipeline, name the real model, or re-embed. The engine refuses a
+    /// mismatched attach with a message naming this call instead of guessing.
     ///
     /// An attachment the new label contradicts is detached. Re-attach with the
     /// model the region now names.
@@ -10341,16 +10339,7 @@ fn checked_embedder_dim(embedder: &dyn Embedder) -> Result<u16> {
 }
 
 fn normalize_model_id(model_id: &str) -> Result<String> {
-    let model_id = model_id.trim();
-    if model_id.is_empty() {
-        return Err(MemError::Invalid("model id must not be empty".into()));
-    }
-    if model_id.eq_ignore_ascii_case("unknown") || model_id.eq_ignore_ascii_case("default") {
-        return Err(MemError::Invalid(format!(
-            "model id '{model_id}' is a placeholder; supply the embedder's stable model id"
-        )));
-    }
-    Ok(model_id.to_owned())
+    crate::embed::normalize_model_id_label(model_id).map_err(MemError::Invalid)
 }
 
 /// Embedded, validated, serialized column values for one atom insert.

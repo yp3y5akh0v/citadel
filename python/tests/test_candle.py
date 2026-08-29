@@ -1,6 +1,7 @@
 """In-process Candle embedder (opt-in: needs a candle-embed build + local model)."""
 
 import os
+import re
 
 import pytest
 
@@ -18,7 +19,9 @@ pytestmark = pytest.mark.skipif(
 def test_candle_embedder_loads_and_embeds():
     emb = citadeldb.CandleEmbedder(MODEL, preset="e5-large")
     assert emb.dim == 1024 and emb.metric == "cosine"
-    assert emb.model_id == "e5-large"
+    assert re.fullmatch(
+        r"e5-large@citadel-candle-v1-p1:[0-9a-f]{64}", emb.model_id
+    )
     v = emb.embed(["a", "b c d"])
     assert len(v) == 2 and len(v[0]) == 1024
 

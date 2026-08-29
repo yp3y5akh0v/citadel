@@ -107,9 +107,8 @@ the `openai` package, so the stored payload is never normalised: function calls,
 items and multi-part content all round-trip unchanged. Only a plain-text projection of
 `content` is derived, for search ranking.
 
-`embedder=` is required. There is no default: a session that quietly substituted `MockEmbedder`
-would rank lexically while recording `mock` as the model that wrote its vectors, and neither of
-those is something you can find out from the outside. `MockEmbedder` needs no download and is
+`embedder=` is required. There is no default: quietly substituting `MockEmbedder` would change
+ranking semantics and persist different provenance. `MockEmbedder` needs no download and is
 enough to run an agent and to test, so pass it explicitly if that is what you want. `search`
 only becomes semantically useful with a real embedder. `CandleEmbedder`
 is not in the default `citadeldb` wheel and needs a source build (`maturin build --features

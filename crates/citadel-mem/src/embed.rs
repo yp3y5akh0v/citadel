@@ -14,10 +14,26 @@ pub enum EmbedError {
     Backend(String),
 }
 
+pub(crate) fn normalize_model_id_label(model_id: &str) -> Result<String, String> {
+    let model_id = model_id.trim();
+    if model_id.is_empty() {
+        return Err("model id must not be empty".into());
+    }
+    if model_id.eq_ignore_ascii_case("unknown") || model_id.eq_ignore_ascii_case("default") {
+        return Err(format!(
+            "model id '{model_id}' is a placeholder; supply the embedder's stable model id"
+        ));
+    }
+    Ok(model_id.to_owned())
+}
+
 /// Sync, bring-your-own embedding backend: text -> fixed-dim vectors.
 pub trait Embedder: Send + Sync {
     fn dim(&self) -> usize;
     fn metric(&self) -> EmbeddingMetric;
+    /// Durable identity of the vector-producing pipeline. Together with
+    /// [`dim`](Self::dim) and [`metric`](Self::metric), the same value promises
+    /// that stored texts produce compatible vectors.
     fn model_id(&self) -> &str;
     /// Embed a batch of stored texts (the passage side), one vector per input,
     /// each of length `dim()`.
@@ -83,7 +99,7 @@ impl Embedder for MockEmbedder {
     }
 
     fn model_id(&self) -> &str {
-        "mock"
+        "mock-fnv1a-bow-v1"
     }
 
     fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
@@ -158,6 +174,20 @@ mod tests {
             "empty text -> zero vector"
         );
         assert_eq!(e.metric(), EmbeddingMetric::L2);
-        assert_eq!(e.model_id(), "mock");
+        assert_eq!(e.model_id(), "mock-fnv1a-bow-v1");
+    }
+
+    #[test]
+    fn mock_pipeline_has_a_stable_known_answer() {
+        let e = MockEmbedder::new(32);
+        assert_eq!(e.model_id(), "mock-fnv1a-bow-v1");
+        assert_eq!(
+            e.embed(&["citadel mock known answer alpha alpha"]).unwrap()[0],
+            [
+                0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 1.0, 0.0, 0.0, 0.0,
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+            ],
+            "changing the mock identity or vector algorithm requires a new versioned model id"
+        );
     }
 }
