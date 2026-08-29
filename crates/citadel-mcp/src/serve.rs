@@ -369,31 +369,31 @@ fn unknown_embedder(name: &str) -> String {
     )
 }
 
-/// Built-in model catalog: CLI name -> (preset config, HuggingFace repo id).
+/// Built-in model catalog: CLI name -> inference config + pinned Hub snapshot.
 #[cfg(feature = "candle-embed")]
-fn model_spec(name: &str) -> Option<(citadel_mem::CandleConfig, &'static str)> {
+fn model_spec(
+    name: &str,
+) -> Option<(
+    citadel_mem::CandleConfig,
+    &'static crate::model_cache::SnapshotSpec,
+)> {
     use citadel_mem::CandleConfig;
-    Some(match name {
-        "e5-large" => (CandleConfig::e5_large(), "intfloat/e5-large"),
-        "e5-large-v2" => (CandleConfig::e5_large_v2(), "intfloat/e5-large-v2"),
-        "bge-small" => (CandleConfig::bge_small(), "BAAI/bge-small-en-v1.5"),
-        "bge-base" => (CandleConfig::bge_base(), "BAAI/bge-base-en-v1.5"),
-        "bge-large" => (CandleConfig::bge_large(), "BAAI/bge-large-en-v1.5"),
-        "minilm" => (
-            CandleConfig::minilm_l6(),
-            "sentence-transformers/all-MiniLM-L6-v2",
-        ),
+    let config = match name {
+        "e5-large" => CandleConfig::e5_large(),
+        "e5-large-v2" => CandleConfig::e5_large_v2(),
+        "bge-small" => CandleConfig::bge_small(),
+        "bge-base" => CandleConfig::bge_base(),
+        "bge-large" => CandleConfig::bge_large(),
+        "minilm" => CandleConfig::minilm_l6(),
         _ => return None,
-    })
+    };
+    Some((config, crate::model_cache::embedder_snapshot(name)?))
 }
 
-/// Built-in cross-encoder reranker catalog: CLI name -> HuggingFace repo id.
+/// Built-in cross-encoder reranker catalog.
 #[cfg(feature = "candle-embed")]
-fn reranker_spec(name: &str) -> Option<&'static str> {
-    match name {
-        "ms-marco-minilm" => Some("cross-encoder/ms-marco-MiniLM-L-6-v2"),
-        _ => None,
-    }
+fn reranker_spec(name: &str) -> Option<&'static crate::model_cache::SnapshotSpec> {
+    crate::model_cache::reranker_snapshot(name)
 }
 
 /// Error for a `--reranker`/`pull` name that is not a known reranker.
@@ -406,22 +406,21 @@ fn unknown_reranker(name: &str) -> String {
 #[cfg(feature = "hub")]
 fn build_real_embedder(name: &str, config: &ServeConfig) -> Result<Arc<dyn Embedder>, String> {
     use citadel_mem::CandleEmbedder;
-    let (cfg, _repo) = model_spec(name).ok_or_else(|| unknown_embedder(name))?;
-    let dir = match &config.model_dir {
-        Some(dir) => std::path::PathBuf::from(dir),
-        None => {
-            let cached = resolve_models_dir(config.models_dir.as_deref())?.join(name);
-            if !cached.join("model.safetensors").exists() {
-                return Err(format!(
-                    "embedder '{name}' is not downloaded - run `citadeldb-mcp pull {name}` first, \
-                     or pass --model-dir <dir> to a local model"
-                ));
-            }
-            cached
-        }
+    let (cfg, snapshot) = model_spec(name).ok_or_else(|| unknown_embedder(name))?;
+    let embedder = if let Some(dir) = &config.model_dir {
+        CandleEmbedder::from_dir(dir, cfg)
+            .map_err(|e| format!("load embedder '{name}' from {dir}: {e}"))?
+    } else {
+        let root = resolve_models_dir(config.models_dir.as_deref())?;
+        let crate::model_cache::ModelArtifacts {
+            config,
+            tokenizer,
+            weights,
+            dir,
+        } = crate::model_cache::load_snapshot(&root, snapshot)?;
+        CandleEmbedder::from_bytes(&config, &tokenizer, weights, cfg)
+            .map_err(|e| format!("load embedder '{name}' from {}: {e}", dir.display()))?
     };
-    let embedder = CandleEmbedder::from_dir(&dir, cfg)
-        .map_err(|e| format!("load embedder '{name}' from {}: {e}", dir.display()))?;
     Ok(Arc::new(embedder))
 }
 
@@ -430,7 +429,7 @@ fn build_real_embedder(name: &str, config: &ServeConfig) -> Result<Arc<dyn Embed
 #[cfg(all(feature = "candle-embed", not(feature = "hub")))]
 fn build_real_embedder(name: &str, config: &ServeConfig) -> Result<Arc<dyn Embedder>, String> {
     use citadel_mem::CandleEmbedder;
-    let (cfg, _repo) = model_spec(name).ok_or_else(|| unknown_embedder(name))?;
+    let (cfg, _snapshot) = model_spec(name).ok_or_else(|| unknown_embedder(name))?;
     let dir = config.model_dir.as_deref().ok_or_else(|| {
         format!("embedder '{name}' requires --model-dir (this build has no `hub` download support)")
     })?;
@@ -456,22 +455,21 @@ fn build_reranker(
     config: &ServeConfig,
 ) -> Result<Arc<dyn citadel_mem::Reranker>, String> {
     use citadel_mem::CrossEncoder;
-    reranker_spec(name).ok_or_else(|| unknown_reranker(name))?;
-    let dir = match &config.reranker_dir {
-        Some(dir) => std::path::PathBuf::from(dir),
-        None => {
-            let cached = resolve_models_dir(config.models_dir.as_deref())?.join(name);
-            if !cached.join("model.safetensors").exists() {
-                return Err(format!(
-                    "reranker '{name}' is not downloaded - run `citadeldb-mcp pull {name}` first, \
-                     or pass --reranker-dir <dir> to a local model"
-                ));
-            }
-            cached
-        }
+    let snapshot = reranker_spec(name).ok_or_else(|| unknown_reranker(name))?;
+    let reranker = if let Some(dir) = &config.reranker_dir {
+        CrossEncoder::ms_marco_minilm_l6(dir)
+            .map_err(|e| format!("load reranker '{name}' from {dir}: {e}"))?
+    } else {
+        let root = resolve_models_dir(config.models_dir.as_deref())?;
+        let crate::model_cache::ModelArtifacts {
+            config,
+            tokenizer,
+            weights,
+            dir,
+        } = crate::model_cache::load_snapshot(&root, snapshot)?;
+        CrossEncoder::from_bytes(&config, &tokenizer, weights, "ms-marco-MiniLM-L-6-v2", 512)
+            .map_err(|e| format!("load reranker '{name}' from {}: {e}", dir.display()))?
     };
-    let reranker = CrossEncoder::ms_marco_minilm_l6(&dir)
-        .map_err(|e| format!("load reranker '{name}' from {}: {e}", dir.display()))?;
     Ok(Arc::new(reranker))
 }
 
@@ -540,12 +538,12 @@ fn unknown_pullable(name: &str) -> String {
 /// implicit.
 #[cfg(feature = "hub")]
 pub fn pull_model(name: &str, models_dir: Option<&str>) -> Result<(), String> {
-    let repo = model_spec(name)
-        .map(|(_, r)| r)
+    let snapshot = model_spec(name)
+        .map(|(_, snapshot)| snapshot)
         .or_else(|| reranker_spec(name))
         .ok_or_else(|| unknown_pullable(name))?;
-    let dest = resolve_models_dir(models_dir)?.join(name);
-    download_model(repo, &dest)?;
+    let root = resolve_models_dir(models_dir)?;
+    let dest = crate::model_cache::pull_snapshot(&root, snapshot)?;
     eprintln!("citadeldb-mcp: pulled '{name}' to {}", dest.display());
     let flag = if reranker_spec(name).is_some() {
         "--reranker"
@@ -553,84 +551,6 @@ pub fn pull_model(name: &str, models_dir: Option<&str>) -> Result<(), String> {
         "--embedder"
     };
     eprintln!("citadeldb-mcp: serve it with `{flag} {name}`");
-    Ok(())
-}
-
-/// The files that make up a Candle BERT model on the Hugging Face Hub.
-#[cfg(feature = "hub")]
-const MODEL_FILES: [&str; 3] = ["config.json", "tokenizer.json", "model.safetensors"];
-
-/// Public Hub URL for one file of `repo` at the default revision.
-#[cfg(feature = "hub")]
-fn hub_url(repo: &str, file: &str) -> String {
-    format!("https://huggingface.co/{repo}/resolve/main/{file}")
-}
-
-/// Download every model file of `repo` into `dest`, creating it if needed.
-#[cfg(feature = "hub")]
-fn download_model(repo: &str, dest: &Path) -> Result<(), String> {
-    std::fs::create_dir_all(dest).map_err(|e| format!("create {}: {e}", dest.display()))?;
-    eprintln!("citadeldb-mcp: pulling '{repo}' from huggingface.co");
-    for file in MODEL_FILES {
-        download_file(&hub_url(repo, file), &dest.join(file))?;
-    }
-    Ok(())
-}
-
-/// Stream URL to a `.partial` sibling, rename on success; no half-written
-/// files.
-#[cfg(feature = "hub")]
-fn download_file(url: &str, target: &Path) -> Result<(), String> {
-    use std::io::{Read, Write};
-
-    let resp = ureq::get(url)
-        .call()
-        .map_err(|e| format!("GET {url}: {e}"))?;
-    let total: u64 = resp
-        .header("Content-Length")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-
-    let mut partial = target.as_os_str().to_owned();
-    partial.push(".partial");
-    let partial = std::path::PathBuf::from(partial);
-    let name = target.file_name().unwrap_or_default().to_string_lossy();
-
-    let mut reader = resp.into_reader();
-    let mut file = std::io::BufWriter::new(
-        std::fs::File::create(&partial)
-            .map_err(|e| format!("create {}: {e}", partial.display()))?,
-    );
-    let mut buf = [0u8; 64 * 1024];
-    let mut done: u64 = 0;
-    let mut last_pct = u64::MAX;
-    loop {
-        let n = reader
-            .read(&mut buf)
-            .map_err(|e| format!("read {url}: {e}"))?;
-        if n == 0 {
-            break;
-        }
-        file.write_all(&buf[..n])
-            .map_err(|e| format!("write {}: {e}", partial.display()))?;
-        done += n as u64;
-        if let Some(pct) = (done * 100).checked_div(total) {
-            if pct != last_pct {
-                eprint!("\r  {name} {pct}%");
-                let _ = std::io::stderr().flush();
-                last_pct = pct;
-            }
-        }
-    }
-    file.flush()
-        .map_err(|e| format!("flush {}: {e}", partial.display()))?;
-    drop(file);
-    if total > 0 {
-        eprintln!();
-    } else {
-        eprintln!("  {name} ({done} bytes)");
-    }
-    std::fs::rename(&partial, target).map_err(|e| format!("finalize {}: {e}", target.display()))?;
     Ok(())
 }
 
@@ -708,13 +628,27 @@ mod tests {
     #[test]
     fn model_spec_maps_known_names_and_rejects_unknown() {
         use super::model_spec;
-        let (cfg, repo) = model_spec("bge-small").expect("bge-small is known");
-        assert_eq!(repo, "BAAI/bge-small-en-v1.5");
-        assert_eq!(cfg.model_id, "bge-small-en-v1.5");
-        assert_eq!(
-            model_spec("minilm").unwrap().1,
-            "sentence-transformers/all-MiniLM-L6-v2"
-        );
+        let expected = [
+            ("e5-large", "e5-large", "intfloat/e5-large"),
+            ("e5-large-v2", "e5-large-v2", "intfloat/e5-large-v2"),
+            ("bge-small", "bge-small-en-v1.5", "BAAI/bge-small-en-v1.5"),
+            ("bge-base", "bge-base-en-v1.5", "BAAI/bge-base-en-v1.5"),
+            ("bge-large", "bge-large-en-v1.5", "BAAI/bge-large-en-v1.5"),
+            (
+                "minilm",
+                "all-MiniLM-L6-v2",
+                "sentence-transformers/all-MiniLM-L6-v2",
+            ),
+        ];
+        for (name, model_id, repo) in expected {
+            let (config, snapshot) = model_spec(name).unwrap();
+            assert_eq!(
+                config.model_id, model_id,
+                "wrong inference config for {name}"
+            );
+            assert_eq!(snapshot.name, name, "wrong cache snapshot for {name}");
+            assert_eq!(snapshot.repo, repo, "wrong repository for {name}");
+        }
         assert!(model_spec("does-not-exist").is_none());
     }
 
@@ -723,20 +657,10 @@ mod tests {
     fn reranker_spec_maps_known_name_and_rejects_unknown() {
         use super::reranker_spec;
         assert_eq!(
-            reranker_spec("ms-marco-minilm"),
+            reranker_spec("ms-marco-minilm").map(|snapshot| snapshot.repo),
             Some("cross-encoder/ms-marco-MiniLM-L-6-v2")
         );
         assert!(reranker_spec("does-not-exist").is_none());
-    }
-
-    #[cfg(feature = "hub")]
-    #[test]
-    fn hub_url_builds_resolve_url() {
-        use super::hub_url;
-        assert_eq!(
-            hub_url("BAAI/bge-small-en-v1.5", "model.safetensors"),
-            "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/main/model.safetensors"
-        );
     }
 
     #[cfg(feature = "hub")]

@@ -1,6 +1,8 @@
 //! Model Context Protocol (MCP) server for Citadel: exposes a [`citadel_mem`] region as
 //! MCP tools over a synchronous JSON-RPC 2.0 stdio transport (no tokio, no SDK).
 
+#[cfg(feature = "candle-embed")]
+mod model_cache;
 pub mod protocol;
 pub mod serve;
 pub mod server;
