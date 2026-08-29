@@ -2,6 +2,7 @@
 name = "citadeldb-sql-json-path"
 version.workspace = true
 edition = "2021"
+rust-version.workspace = true
 description = "Vendored SQL/JSON Path implementation for Citadel. Forked from sql-json-path (RisingWave Labs, Apache-2.0)."
 license = "Apache-2.0"
 repository = "https://github.com/yp3y5akh0v/citadel"

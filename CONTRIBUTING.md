@@ -12,8 +12,8 @@ easier to settle the approach before the work.
 The toolchain is pinned in `rust-toolchain.toml`, so local checks match CI:
 
 ```
-rustup toolchain install                        # 1.97.0 + clippy, rustfmt, wasm32
-rustup toolchain install 1.88 --profile minimal # the MSRV job
+rustup toolchain install                        # 1.98.0 + clippy, rustfmt, wasm32
+rustup toolchain install 1.95 --profile minimal # the MSRV job
 ```
 
 `citadeldb-python` is a pyo3 crate. It is a workspace member but not a
@@ -36,7 +36,7 @@ The test job runs after `fmt` and `clippy` pass.
 ```
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo +1.88 check --workspace --exclude citadeldb-python
+cargo +1.95 check --workspace --locked
 cargo test --workspace          # CI runs this on Linux, Windows and macOS
 ```
 
@@ -67,6 +67,13 @@ Two more legs run only on Linux:
 ```
 cargo test --workspace --features citadeldb/io-uring
 cargo test --workspace -p citadeldb --test fips --features citadeldb/fips
+```
+
+From a non-Linux host, run the io-uring suite in its pinned container:
+
+```
+docker build -f Dockerfile.test -t citadeldb-test .
+docker run --rm --security-opt seccomp=unconfined citadeldb-test
 ```
 
 No CI job builds the benchmark binaries, so run this yourself if you touch
