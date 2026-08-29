@@ -8,10 +8,18 @@ that destroy the key, not just the row.
 pip install citadeldb-langgraph
 ```
 
+Requires `langgraph>=0.2.32,<2` and `langgraph-checkpoint>=2.0.19,<5`.
+The checkpoint package owns the `TTLConfig` surface used by this adapter.
+
 ```python
+import citadeldb
 from citadeldb_langgraph import CitadelStore
 
-store = CitadelStore("memory.cdl", key="your-passphrase")
+store = CitadelStore(
+    "memory.cdl",
+    key="your-passphrase",
+    embedder=citadeldb.MockEmbedder(dim=64),  # see Notes for a real model
+)
 
 store.put(("users", "alice"), "profile", {"city": "Berlin", "pet": "Mochi"})
 print(store.get(("users", "alice"), "profile").value)
@@ -21,7 +29,7 @@ print(store.get(("users", "alice"), "profile").value)
 Pass it to a graph the same way as any other store:
 
 ```python
-graph = builder.compile(store=store)   # `builder` is your StateGraph
+graph = builder.compile(store=store)  # `builder` is your StateGraph
 ```
 
 ## Search is ranked recall, not a `LIKE`
@@ -37,9 +45,14 @@ store.search(("notes",), query="why did the release break?", limit=1)
 # [Item(namespace=['notes'], key='n1', value={'text': 'the deployment failed ...'}, ...)]
 ```
 
-The default `MockEmbedder` is a hashed bag-of-words, so out of the box the vector half is
-lexical: it ranks on shared wording, not on meaning. Pass a real embedder (see Notes) to
-match a question against a differently worded answer.
+`MockEmbedder` is a hashed bag-of-words, so with it the vector half is lexical: it ranks on
+shared wording, not on meaning. Pass a real embedder (see Notes) to match a question against
+a differently worded answer.
+
+`index=False` omits a value from ranked semantic recall, though it can still appear without a
+score when filling the requested window. `index=[...]` restricts searchable text to those JSON
+paths. Citadel concatenates the selected strings into one vector per value; unlike LangGraph's
+reference store, it does not embed each selected string separately and max-pool their scores.
 
 ## Deletes destroy the key
 
@@ -54,14 +67,14 @@ store.delete(("users", "alice"), "profile")
 `forget_namespace` does the same for a whole subtree:
 
 ```python
-store.forget_namespace(("users", "alice"))   # returns the number of values erased
+store.forget_namespace(("users", "alice"))  # returns the number of values erased
 ```
 
 ## TTL
 
 ```python
-store.put(("session",), "token", {"v": 1}, ttl=60.0)     # minutes
-store.get(("session",), "token", refresh_ttl=True)       # extends the lifetime
+store.put(("session",), "token", {"v": 1}, ttl=60.0)  # minutes
+store.get(("session",), "token", refresh_ttl=True)  # extends the lifetime
 ```
 
 A refresh preserves both `created_at` and `updated_at`, so reading never looks like a write.
@@ -72,16 +85,21 @@ Citadel is embedded and one process owns the file. A path already open on this t
 under the same passphrase, is shared, so this can sit on the same database as another
 Citadel adapter; construct them on the same thread.
 
-`MockEmbedder` is the default and needs no download, which is enough to build and test a
-graph. For semantic recall pass a real embedder. `CandleEmbedder` is not in the default
-`citadeldb` wheel and needs a source build (`maturin build --features candle-embed`); any
-object exposing `dim`, `metric`, `model_id`, `embed` and `embed_queries` works too:
+`embedder=` is required. There is no default: a store that quietly substituted `MockEmbedder`
+would rank lexically while recording `mock` as the model that wrote its vectors, and neither
+of those is something you can find out from the outside. `MockEmbedder` needs no download and
+is enough to build and test a graph, so pass it explicitly if that is what you want. For
+semantic recall pass a real embedder. `CandleEmbedder` is not in the default `citadeldb` wheel
+and needs a source build (`maturin build --features candle-embed`); any object exposing `dim`,
+`metric`, `model_id` and `embed` works too; `embed_queries` is optional.
 
-A region is pinned to its embedder's width and model id when created, so an existing file
-cannot be upgraded in place:
+A region is pinned to its embedder's width and model id when created. Changing model means
+re-embedding from the stored text. CitadelDB 2.1's `Memory.reembed_region` does that in place,
+keeping every atom id and therefore every edge.
 
 ```python
 import citadeldb
+
 store = CitadelStore(
     "memory-e5.cdl",
     key="your-passphrase",

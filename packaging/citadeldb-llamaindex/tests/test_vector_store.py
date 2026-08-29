@@ -1,4 +1,7 @@
 import pytest
+from citadeldb_llamaindex import CitadelVectorStore
+from citadeldb_llamaindex.vector_store import DEFAULT_REGION, KIND, _model_id
+from llama_index.core.embeddings import MockEmbedding
 from llama_index.core.schema import NodeRelationship, RelatedNodeInfo, TextNode
 from llama_index.core.vector_stores.types import (
     BasePydanticVectorStore,
@@ -10,10 +13,9 @@ from llama_index.core.vector_stores.types import (
     VectorStoreQueryMode,
 )
 
-from citadeldb_llamaindex import CitadelVectorStore
-from citadeldb_llamaindex.vector_store import DEFAULT_REGION, KIND
-
 DIM = 8
+EMBED_MODEL = MockEmbedding(embed_dim=DIM)
+EMBED_MODEL.model_name = "llamaindex-mock-8"
 
 
 def vec(axis: int) -> list[float]:
@@ -33,23 +35,35 @@ def node(nid, text, axis, *, meta=None, ref=None):
 @pytest.fixture()
 def store(tmp_path):
     # Each test gets its own file: a store is a corpus, not a scratch pad.
-    return CitadelVectorStore(str(tmp_path / "v.cdl"), key="test-passphrase", dim=DIM)
+    return CitadelVectorStore(
+        str(tmp_path / "v.cdl"),
+        key="test-passphrase",
+        embed_model=EMBED_MODEL,
+        dim=DIM,
+    )
+
+
+def test_count_does_not_materialize_node_content(store):
+    class CountOnly:
+        def count(self, region, kind):
+            assert region == store._region and kind == KIND
+            return 37
+
+        def fetch(self, *args, **kwargs):
+            raise AssertionError("count must not fetch or decrypt nodes")
+
+    store._mem = CountOnly()
+    assert store.count() == 37
 
 
 def query(axis, k=10, **kw):
     return VectorStoreQuery(query_embedding=vec(axis), similarity_top_k=k, **kw)
 
 
-# ---- conformance ---------------------------------------------------------
-
-
 def test_is_a_pydantic_vector_store(store):
     assert isinstance(store, BasePydanticVectorStore)
     assert store.stores_text is True
     assert store.client is not None
-
-
-# ---- the embedding contract ----------------------------------------------
 
 
 def test_the_supplied_vector_is_the_one_stored(store):
@@ -72,7 +86,13 @@ def test_similarity_never_exceeds_one_at_a_realistic_width(tmp_path):
     import random
 
     wide = 1536
-    s = CitadelVectorStore(str(tmp_path / "wide.cdl"), key="pw", dim=wide)
+    s = CitadelVectorStore(
+        str(tmp_path / "wide.cdl"),
+        key="pw",
+        embed_model=MockEmbedding(embed_dim=wide),
+        dim=wide,
+        model_id="llamaindex-wide-mock",
+    )
     nodes = []
     for seed in range(10):
         r = random.Random(seed)
@@ -85,10 +105,16 @@ def test_similarity_never_exceeds_one_at_a_realistic_width(tmp_path):
         assert res.similarities[0] <= 1.0, (n.node_id, res.similarities[0])
 
 
-def test_a_node_without_an_embedding_names_the_fix(store):
+def test_a_node_without_an_embedding_uses_the_store_model(store):
     bare = TextNode(id_="bare", text="no vector")
-    with pytest.raises(ValueError, match="no embedding"):
-        store.add([bare])
+    store.add([bare])
+    result = store.query(
+        VectorStoreQuery(
+            query_embedding=EMBED_MODEL.get_query_embedding("no vector"),
+            similarity_top_k=1,
+        )
+    )
+    assert result.ids == ["bare"]
 
 
 def test_a_wrong_width_embedding_names_the_fix(store):
@@ -96,9 +122,6 @@ def test_a_wrong_width_embedding_names_the_fix(store):
     wide.embedding = [0.1, 0.2, 0.3]
     with pytest.raises(ValueError, match="dim=3"):
         store.add([wide])
-
-
-# ---- round-trip ----------------------------------------------------------
 
 
 def test_text_and_metadata_round_trip(store):
@@ -125,9 +148,6 @@ def test_text_is_not_stored_twice(store):
     assert raw.text == "unique body text"
 
 
-# ---- query ---------------------------------------------------------------
-
-
 def test_similarity_orders_results(store):
     store.add([node("near", "a", 0), node("far", "b", 7)])
     res = store.query(query(0, k=2))
@@ -144,6 +164,13 @@ def test_top_k_zero_is_empty(store):
     store.add([node("z", "t", 0)])
     res = store.query(query(0, k=0))
     assert res.ids == [] and res.nodes == []
+
+
+def test_empty_framework_allowlists_are_unrestricted(store):
+    """VectorStoreIndex passes node_ids=[] when stores_text is true."""
+    store.add([node("present", "text", 0, ref="doc")])
+    assert store.query(query(0, node_ids=[])).ids == ["present"]
+    assert store.query(query(0, doc_ids=[])).ids == ["present"]
 
 
 def test_a_query_without_an_embedding_is_refused(store):
@@ -166,19 +193,18 @@ def test_query_narrows_by_doc_ids(store):
     assert store.query(query(0, doc_ids=["doc-b"])).ids == ["c2"]
 
 
-# ---- filters -------------------------------------------------------------
-
-
 def filters(*fs, condition=FilterCondition.AND):
     return MetadataFilters(filters=list(fs), condition=condition)
 
 
 def seeded(store):
-    store.add([
-        node("x1", "one", 0, meta={"cat": "x", "n": 1}),
-        node("y2", "two", 1, meta={"cat": "y", "n": 2}),
-        node("z3", "three", 2, meta={"cat": "z", "n": 3}),
-    ])
+    store.add(
+        [
+            node("x1", "one", 0, meta={"cat": "x", "n": 1}),
+            node("y2", "two", 1, meta={"cat": "y", "n": 2}),
+            node("z3", "three", 2, meta={"cat": "z", "n": 3}),
+        ]
+    )
     return store
 
 
@@ -229,6 +255,16 @@ def test_not_does_not_push_equality_into_the_scan(store):
     assert sorted(store.query(query(0, filters=f)).ids) == ["y2", "z3"]
 
 
+def test_not_rejects_a_row_when_any_leaf_matches(store):
+    seeded(store)
+    f = filters(
+        MetadataFilter(key="cat", value="x", operator=FilterOperator.EQ),
+        MetadataFilter(key="n", value=2, operator=FilterOperator.EQ),
+        condition=FilterCondition.NOT,
+    )
+    assert store.query(query(0, filters=f)).ids == ["z3"]
+
+
 def test_a_pushed_filter_agrees_with_an_unpushed_one(store):
     """Pushdown must narrow, never decide: both paths answer the same."""
     seeded(store)
@@ -236,8 +272,10 @@ def test_a_pushed_filter_agrees_with_an_unpushed_one(store):
     unpushed = filters(
         MetadataFilter(key="cat", value="z", operator=FilterOperator.TEXT_MATCH)
     )
-    assert store.query(query(0, filters=pushed)).ids == \
-        store.query(query(0, filters=unpushed)).ids
+    assert (
+        store.query(query(0, filters=pushed)).ids
+        == store.query(query(0, filters=unpushed)).ids
+    )
 
 
 def test_a_numeric_filter_is_not_decided_by_the_pushdown(store):
@@ -268,20 +306,46 @@ def test_an_unpushable_filter_survives_a_window_of_other_rows(store):
     """TEXT_MATCH cannot be pushed, so it is settled after ranking; the only
     matching row must still be found under a corpus that outranks it."""
     store.add([node("gold", "the needle", 1, meta={"cat": "zebra"})])
-    store.add([node(f"c{i}", f"nearer {i}", 0, meta={"cat": "other"}) for i in range(400)])
+    store.add(
+        [node(f"c{i}", f"nearer {i}", 0, meta={"cat": "other"}) for i in range(400)]
+    )
     unpushable = filters(
         MetadataFilter(key="cat", value="zeb", operator=FilterOperator.TEXT_MATCH)
     )
     assert store.query(query(0, k=1, filters=unpushable)).ids == ["gold"]
 
 
-# ---- reads and deletes ---------------------------------------------------
-
-
 def test_get_nodes_by_id(store):
     seeded(store)
     got = store.get_nodes(node_ids=["y2"])
     assert [n.node_id for n in got] == ["y2"]
+
+
+def test_get_and_delete_many_ids_scan_the_encrypted_region_once(store):
+    nodes = [node(f"many-{i}", f"text {i}", i % DIM) for i in range(12)]
+    store.add(nodes)
+    inner = store._mem
+
+    class CountingMemory:
+        def __init__(self):
+            self.fetches = 0
+
+        def __getattr__(self, name):
+            return getattr(inner, name)
+
+        def fetch(self, *args, **kwargs):
+            self.fetches += 1
+            return inner.fetch(*args, **kwargs)
+
+    counted = CountingMemory()
+    store._mem = counted
+    ids = [n.node_id for n in nodes]
+    assert {n.node_id for n in store.get_nodes(node_ids=ids)} == set(ids)
+    assert counted.fetches == 1
+
+    counted.fetches = 0
+    store.delete_nodes(node_ids=ids)
+    assert counted.fetches == 1
 
 
 def test_get_nodes_by_filter(store):
@@ -291,11 +355,13 @@ def test_get_nodes_by_filter(store):
 
 
 def test_delete_removes_a_whole_document(store):
-    store.add([
-        node("p1", "a", 0, ref="doc-1"),
-        node("p2", "b", 1, ref="doc-1"),
-        node("p3", "c", 2, ref="doc-2"),
-    ])
+    store.add(
+        [
+            node("p1", "a", 0, ref="doc-1"),
+            node("p2", "b", 1, ref="doc-1"),
+            node("p3", "c", 2, ref="doc-2"),
+        ]
+    )
     store.delete("doc-1")
     assert sorted(store.query(query(0, k=9)).ids) == ["p3"]
 
@@ -330,10 +396,76 @@ def test_deleting_nothing_is_not_an_error(store):
 
 def test_a_passphrase_is_required(tmp_path):
     with pytest.raises(ValueError, match="passphrase"):
-        CitadelVectorStore(str(tmp_path / "nokey.cdl"), key="")
+        CitadelVectorStore(
+            str(tmp_path / "nokey.cdl"), key="", embed_model=EMBED_MODEL, dim=DIM
+        )
 
 
-# ---- async ---------------------------------------------------------------
+def test_an_embedder_is_required_before_a_vault_is_created(tmp_path):
+    with pytest.raises(TypeError, match="embed_model"):
+        CitadelVectorStore(str(tmp_path / "no-model.cdl"), key="pw", dim=DIM)
+    with pytest.raises(ValueError, match="embed_model"):
+        CitadelVectorStore(
+            str(tmp_path / "invalid-model.cdl"), key="pw", embed_model=object(), dim=DIM
+        )
+    with pytest.raises(ValueError, match="65535"):
+        CitadelVectorStore(
+            str(tmp_path / "wide-model.cdl"),
+            key="pw",
+            embed_model=EMBED_MODEL,
+            dim=65_536,
+        )
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_an_unnamed_embedder_requires_explicit_provenance(tmp_path):
+    unnamed = MockEmbedding(embed_dim=DIM)
+    with pytest.raises(ValueError, match="model_id"):
+        CitadelVectorStore(
+            str(tmp_path / "missing.cdl"), key="pw", embed_model=unnamed, dim=DIM
+        )
+    with pytest.raises(ValueError, match="model_id"):
+        CitadelVectorStore(
+            str(tmp_path / "invalid.cdl"),
+            key="pw",
+            embed_model=unnamed,
+            dim=DIM,
+            model_id=123,
+        )
+    assert list(tmp_path.iterdir()) == []
+
+    store = CitadelVectorStore(
+        str(tmp_path / "named.cdl"),
+        key="pw",
+        embed_model=unnamed,
+        dim=DIM,
+        model_id="deployment-a",
+    )
+    assert store.count() == 0
+
+
+def test_model_id_attribute_is_preferred_and_reserved_names_are_rejected():
+    named = type(
+        "NamedEmbedding",
+        (),
+        {"model_id": "protocol-id", "model_name": "framework-id"},
+    )()
+    assert _model_id(named, None) == "protocol-id"
+    assert _model_id(object(), "  deployment-a  ") == "deployment-a"
+
+    fallback = type(
+        "FallbackEmbedding",
+        (),
+        {"model_id": "default", "model_name": "framework-id"},
+    )()
+    assert _model_id(fallback, None) == "framework-id"
+
+    for reserved in ("", "unknown", "DEFAULT"):
+        invalid = type("InvalidEmbedding", (), {"model_id": reserved})()
+        with pytest.raises(ValueError, match="model_id"):
+            _model_id(invalid, None)
+        with pytest.raises(ValueError, match="model_id"):
+            _model_id(object(), reserved)
 
 
 async def test_async_surface_round_trips(store):
@@ -364,12 +496,6 @@ async def test_the_event_loop_is_not_blocked(store):
     await store.aquery(query(0, k=5))
     ticker.cancel()
     assert ticks > 1, "the loop made no progress during a store call"
-
-
-# ---- through LlamaIndex's own layer --------------------------------------
-
-
-# ---- edges ---------------------------------------------------------------
 
 
 def test_re_adding_the_same_node_id_replaces_it(store):
@@ -428,11 +554,15 @@ def test_nested_and_list_metadata_round_trip(store):
 
 
 def test_contains_filter_on_a_list(store):
-    store.add([
-        node("t1", "a", 0, meta={"tags": ["red", "blue"]}),
-        node("t2", "b", 1, meta={"tags": ["green"]}),
-    ])
-    f = filters(MetadataFilter(key="tags", value="blue", operator=FilterOperator.CONTAINS))
+    store.add(
+        [
+            node("t1", "a", 0, meta={"tags": ["red", "blue"]}),
+            node("t2", "b", 1, meta={"tags": ["green"]}),
+        ]
+    )
+    f = filters(
+        MetadataFilter(key="tags", value="blue", operator=FilterOperator.CONTAINS)
+    )
     assert store.query(query(0, filters=f)).ids == ["t1"]
 
 
@@ -451,8 +581,12 @@ def test_unicode_round_trips(store):
 def test_two_stores_share_one_database_file(tmp_path):
     """The composition the shared-handle work exists to allow."""
     path = str(tmp_path / "shared.cdl")
-    a = CitadelVectorStore(path, key="pw", region="corpus_a", dim=DIM)
-    b = CitadelVectorStore(path, key="pw", region="corpus_b", dim=DIM)
+    a = CitadelVectorStore(
+        path, key="pw", embed_model=EMBED_MODEL, region="corpus_a", dim=DIM
+    )
+    b = CitadelVectorStore(
+        path, key="pw", embed_model=EMBED_MODEL, region="corpus_b", dim=DIM
+    )
     a.add([node("a1", "in a", 0)])
     b.add([node("b1", "in b", 0)])
     assert a.query(query(0, k=5)).ids == ["a1"]
@@ -470,12 +604,12 @@ def test_it_survives_a_reopen(tmp_path):
     import gc
 
     p = str(tmp_path / "reopen.cdl")
-    first = CitadelVectorStore(p, key="pw", dim=DIM)
+    first = CitadelVectorStore(p, key="pw", embed_model=EMBED_MODEL, dim=DIM)
     first.add([node("n1", "the disk was full", 0, meta={"page": 3})])
     del first
     gc.collect()
 
-    again = CitadelVectorStore(p, key="pw", dim=DIM)
+    again = CitadelVectorStore(p, key="pw", embed_model=EMBED_MODEL, dim=DIM)
     assert again.count() == 1
     got = again.get_nodes(node_ids=["n1"])[0]
     assert got.get_content() == "the disk was full" and got.metadata["page"] == 3
@@ -489,20 +623,22 @@ def test_a_wrong_passphrase_cannot_reopen(tmp_path):
     import citadeldb
 
     p = str(tmp_path / "enc.cdl")
-    first = CitadelVectorStore(p, key="right", dim=DIM)
+    first = CitadelVectorStore(p, key="right", embed_model=EMBED_MODEL, dim=DIM)
     first.add([node("n1", "the disk was full", 0)])
     del first
     gc.collect()
 
     with pytest.raises(citadeldb.EncryptionError):
-        CitadelVectorStore(p, key="wrong", dim=DIM)
+        CitadelVectorStore(p, key="wrong", embed_model=EMBED_MODEL, dim=DIM)
 
 
 def test_concurrent_writes_all_land(tmp_path):
     """Indexing pipelines share one engine across threads."""
     import concurrent.futures as cf
 
-    s = CitadelVectorStore(str(tmp_path / "conc.cdl"), key="pw", dim=DIM)
+    s = CitadelVectorStore(
+        str(tmp_path / "conc.cdl"), key="pw", embed_model=EMBED_MODEL, dim=DIM
+    )
     with cf.ThreadPoolExecutor(max_workers=4) as ex:
         list(ex.map(lambda i: s.add([node(f"c{i}", f"body {i}", i % DIM)]), range(40)))
     assert s.count() == 40
@@ -511,17 +647,86 @@ def test_concurrent_writes_all_land(tmp_path):
 def test_end_to_end_through_vector_store_index(tmp_path):
     """The ABC is only half the integration; this drives LlamaIndex itself."""
     from llama_index.core import StorageContext, VectorStoreIndex
-    from llama_index.core.embeddings import MockEmbedding
     from llama_index.core.schema import Document
 
     embed = MockEmbedding(embed_dim=DIM)
-    store = CitadelVectorStore(str(tmp_path / "e2e.cdl"), key="pw", dim=DIM)
+    store = CitadelVectorStore(
+        str(tmp_path / "e2e.cdl"),
+        key="pw",
+        embed_model=embed,
+        dim=DIM,
+        model_id="llamaindex-e2e-mock",
+    )
     index = VectorStoreIndex.from_documents(
-        [Document(text="the deploy failed because the disk was full"),
-         Document(text="lunch plans for friday")],
+        [
+            Document(text="the deploy failed because the disk was full"),
+            Document(text="lunch plans for friday"),
+        ],
         storage_context=StorageContext.from_defaults(vector_store=store),
         embed_model=embed,
     )
     hits = index.as_retriever(similarity_top_k=2).retrieve("why did the release break?")
     assert hits, "retrieval through VectorStoreIndex returned nothing"
     assert store.count() == 2
+
+
+def test_hybrid_retriever_sends_both_keyword_and_vector_evidence(tmp_path):
+    from llama_index.core import StorageContext, VectorStoreIndex
+    from llama_index.core.schema import Document
+
+    embed = MockEmbedding(embed_dim=DIM)
+    store = CitadelVectorStore(
+        str(tmp_path / "hybrid.cdl"),
+        key="pw",
+        embed_model=embed,
+        dim=DIM,
+        model_id="llamaindex-hybrid-mock",
+    )
+    index = VectorStoreIndex.from_documents(
+        [Document(text="unique deployment incident"), Document(text="lunch plans")],
+        storage_context=StorageContext.from_defaults(vector_store=store),
+        embed_model=embed,
+    )
+    inner = store._mem
+
+    class RecordingMemory:
+        def __init__(self):
+            self.recall_kwargs = []
+
+        def __getattr__(self, name):
+            return getattr(inner, name)
+
+        def recall(self, *args, **kwargs):
+            self.recall_kwargs.append(kwargs)
+            return inner.recall(*args, **kwargs)
+
+    recorded = RecordingMemory()
+    store._mem = recorded
+    hits = index.as_retriever(
+        similarity_top_k=2,
+        vector_store_query_mode=VectorStoreQueryMode.HYBRID,
+    ).retrieve("unique deployment")
+
+    assert hits
+    assert recorded.recall_kwargs[-1]["text"] == "unique deployment"
+    assert "embedding" in recorded.recall_kwargs[-1]
+
+
+def test_hybrid_similarities_report_the_fused_ranking(store):
+    store.add(
+        [
+            node("keyword", "quasar quasar quasar", 0),
+            node("plain", "ordinary text", 0),
+        ]
+    )
+    result = store.query(
+        VectorStoreQuery(
+            query_embedding=vec(0),
+            query_str="quasar",
+            similarity_top_k=2,
+            mode=VectorStoreQueryMode.HYBRID,
+        )
+    )
+
+    assert result.ids == ["keyword", "plain"]
+    assert result.similarities[0] > result.similarities[1]

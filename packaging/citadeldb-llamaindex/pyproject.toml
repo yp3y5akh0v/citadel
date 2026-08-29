@@ -18,7 +18,8 @@ classifiers = [
   "Topic :: Database",
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-dependencies = ["citadeldb>=2.0,<3", "llama-index-core>=0.12,<0.15"]
+# The precomputed vector needs the `embedding` field added in citadeldb 2.0.
+dependencies = ["citadeldb>=2.0,<3", "llama-index-core>=0.13.1,<0.15"]
 
 [project.optional-dependencies]
 test = ["pytest>=8", "pytest-asyncio>=0.23"]

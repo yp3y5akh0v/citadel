@@ -1,12 +1,43 @@
+import hashlib
 import random
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from crewai.memory.storage.backend import MemoryRecord, StorageBackend
-
 from citadeldb_crewai import CitadelBackend
+from citadeldb_crewai.backend import KIND, _require_embedder
+from crewai.memory.storage.backend import MemoryRecord, ScopeInfo, StorageBackend
+from crewai.memory.storage.factory import (
+    resolve_memory_storage,
+    set_memory_storage_factory,
+)
 
 DIM = 1536
+
+
+class DeterministicEmbedder:
+    metric = "cosine"
+
+    def __init__(self, dim: int) -> None:
+        self.dim = dim
+        self.model_id = f"test-{dim}"
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        return [
+            [
+                hashlib.sha256(text.lower().encode()).digest()[i % 32] / 255.0
+                for i in range(self.dim)
+            ]
+            for text in texts
+        ]
+
+    def embed_queries(self, texts: list[str]) -> list[list[float]]:
+        return self.embed(texts)
+
+    def __call__(self, texts: list[str]) -> list[list[float]]:
+        return self.embed(texts)
+
+
+EMBEDDER = DeterministicEmbedder(DIM)
 
 
 def vec(seed: int) -> list[float]:
@@ -18,7 +49,20 @@ def vec(seed: int) -> list[float]:
 def backend(tmp_path_factory):
     # Citadel takes an exclusive lock, so the whole module shares one handle.
     path = tmp_path_factory.mktemp("crew") / "m.cdl"
-    return CitadelBackend(str(path), key="test-passphrase")
+    return CitadelBackend(str(path), key="test-passphrase", embedder=EMBEDDER)
+
+
+def test_unscoped_count_does_not_materialize_records(backend, monkeypatch):
+    class CountOnly:
+        def count(self, region, kind):
+            assert region == backend._region and kind == KIND
+            return 37
+
+        def fetch(self, *args, **kwargs):
+            raise AssertionError("unscoped count must not fetch or decrypt records")
+
+    monkeypatch.setattr(backend, "_mem", CountOnly())
+    assert backend.count() == 37
 
 
 def rec(rid, content, scope="/", **kw):
@@ -27,6 +71,19 @@ def rec(rid, content, scope="/", **kw):
 
 def test_satisfies_the_protocol(backend):
     assert isinstance(backend, StorageBackend)
+
+
+def test_required_crewai_storage_api_is_importable():
+    assert all(
+        callable(symbol)
+        for symbol in (
+            MemoryRecord,
+            ScopeInfo,
+            StorageBackend,
+            resolve_memory_storage,
+            set_memory_storage_factory,
+        )
+    )
 
 
 def test_save_and_get(backend):
@@ -61,12 +118,29 @@ def test_a_metadata_only_update_keeps_the_stored_vector(backend):
 
     stored = backend.get_record("kv")
     assert stored.embedding is None, "a record read back carries no vector"
-    backend.update(stored.model_copy(update={"metadata": {"reviewed": True}}))
+    backend.update(
+        stored.model_copy(update={"metadata": {"reviewed": True}, "importance": 0.9})
+    )
 
     assert backend.get_record("kv").metadata == {"reviewed": True}
+    assert backend.get_record("kv").importance == pytest.approx(0.9)
     still = backend.search(vec(11), scope_prefix="/kv", limit=1)
     assert [r.id for r, _ in still] == ["kv"]
     assert still[0][1] == pytest.approx(1.0, abs=1e-3), "the stored vector was replaced"
+
+
+def test_embedder_model_id_is_normalized_without_mutating_the_caller():
+    original = DeterministicEmbedder(8)
+    original.model_id = "  stable-model  "
+
+    normalized, dim = _require_embedder(original)
+
+    assert dim == 8
+    assert normalized is not original
+    assert normalized.model_id == "stable-model"
+    assert original.model_id == "  stable-model  "
+    assert normalized.dim == original.dim
+    assert normalized.embed(["delegated"]) == original.embed(["delegated"])
 
 
 def test_importance_survives_a_ranked_read(backend):
@@ -78,21 +152,62 @@ def test_importance_survives_a_ranked_read(backend):
     assert got.importance == pytest.approx(0.25)
 
 
+def test_storage_search_leaves_importance_for_crewai_to_score(tmp_path):
+    b = CitadelBackend(str(tmp_path / "importance.cdl"), key="pw", embedder=EMBEDDER)
+    query = [1.0, 0.0] + [0.0] * (DIM - 2)
+    nearest = query
+    important = [0.9, (1.0 - 0.9**2) ** 0.5] + [0.0] * (DIM - 2)
+    distant = [-1.0, 0.0] + [0.0] * (DIM - 2)
+    b.save(
+        [
+            rec("nearest", "nearest", scope="/rank", importance=0.0, embedding=nearest),
+            rec(
+                "important",
+                "important",
+                scope="/rank",
+                importance=1.0,
+                embedding=important,
+            ),
+            rec("distant", "distant", scope="/rank", importance=0.0, embedding=distant),
+        ]
+    )
+
+    hits = b.search(query, scope_prefix="/rank", limit=3)
+    assert [record.id for record, _ in hits[:2]] == ["nearest", "important"]
+    assert hits[0][1] > hits[1][1]
+    assert hits[1][0].importance == 1.0
+
+
 def test_a_filtered_search_finds_a_record_under_a_window_of_others(tmp_path):
     """Category, metadata and score are settled after ranking, so a fixed k
     answers short whenever the only matching record ranks below it."""
-    b = CitadelBackend(str(tmp_path / "window.cdl"), key="pw", dim=DIM)
-    b.save([rec(f"c{i}", f"chaff {i}", scope="/w", embedding=vec(1)) for i in range(400)])
-    b.save([rec("gold", "the needle", scope="/w", categories=["incident"],
-                embedding=vec(2))])
+    b = CitadelBackend(str(tmp_path / "window.cdl"), key="pw", embedder=EMBEDDER)
+    b.save(
+        [rec(f"c{i}", f"chaff {i}", scope="/w", embedding=vec(1)) for i in range(400)]
+    )
+    b.save(
+        [
+            rec(
+                "gold",
+                "the needle",
+                scope="/w",
+                categories=["incident"],
+                embedding=vec(2),
+            )
+        ]
+    )
     hits = b.search(vec(1), scope_prefix="/w", categories=["incident"], limit=1)
     assert [r.id for r, _ in hits] == ["gold"]
 
 
-def test_a_negatively_correlated_record_is_not_dropped_by_the_default_threshold(backend):
+def test_a_negatively_correlated_record_is_not_dropped_by_the_default_threshold(
+    backend,
+):
     """crewai always passes min_score=0.0 meaning "no threshold", so a score
     below the documented [0, 1] domain would silently discard real matches."""
-    backend.save([rec("neg", "opposite", scope="/neg", embedding=[1.0] + [0.0] * (DIM - 1))])
+    backend.save(
+        [rec("neg", "opposite", scope="/neg", embedding=[1.0] + [0.0] * (DIM - 1))]
+    )
     found = backend.search(
         [-1.0] + [0.0] * (DIM - 1), scope_prefix="/neg", limit=10, min_score=0.0
     )
@@ -119,15 +234,21 @@ def test_search_returns_scored_records(backend):
 def test_supplied_embedding_is_the_one_stored(backend):
     """A regression would re-embed text into an unrelated vector space."""
     backend.save([rec("e1", "supplied", scope="/emb", embedding=vec(11))])
-    (_, score), = backend.search(vec(11), scope_prefix="/emb", limit=1)
-    assert score == pytest.approx(1.0, abs=1e-3), f"stored vector is not the supplied one ({score})"
+    ((_, score),) = backend.search(vec(11), scope_prefix="/emb", limit=1)
+    assert score == pytest.approx(1.0, abs=1e-3), (
+        f"stored vector is not the supplied one ({score})"
+    )
 
 
 def test_records_with_identical_content_keep_their_own_vectors(backend):
     """Vectors were once matched by text, so duplicates could swap them."""
-    backend.save([rec("dup1", "identical text", scope="/dup", embedding=vec(21)),
-                  rec("dup2", "identical text", scope="/dup", embedding=vec(22))])
-    (found, score), = backend.search(vec(22), scope_prefix="/dup", limit=1)
+    backend.save(
+        [
+            rec("dup1", "identical text", scope="/dup", embedding=vec(21)),
+            rec("dup2", "identical text", scope="/dup", embedding=vec(22)),
+        ]
+    )
+    ((found, score),) = backend.search(vec(22), scope_prefix="/dup", limit=1)
     assert found.id == "dup2", "a duplicate content record took the wrong vector"
     assert score == pytest.approx(1.0, abs=1e-3)
 
@@ -135,7 +256,9 @@ def test_records_with_identical_content_keep_their_own_vectors(backend):
 def test_score_never_exceeds_one_at_a_realistic_width(tmp_path):
     """A score above 1 slips past min_score; narrow widths hide it."""
     wide = 1536
-    b = CitadelBackend(str(tmp_path / "wide.cdl"), key="pw", dim=wide)
+    b = CitadelBackend(
+        str(tmp_path / "wide.cdl"), key="pw", embedder=DeterministicEmbedder(wide)
+    )
     vectors = []
     for seed in range(10):
         r = random.Random(seed)
@@ -143,7 +266,7 @@ def test_score_never_exceeds_one_at_a_realistic_width(tmp_path):
         vectors.append(v)
         b.save([rec(f"w{seed}", "x", scope="/w", embedding=v)])
     for i, v in enumerate(vectors):
-        (_found, score), = b.search(v, scope_prefix="/w", limit=1)
+        ((_found, score),) = b.search(v, scope_prefix="/w", limit=1)
         assert score <= 1.0, (i, score)
 
 
@@ -152,8 +275,59 @@ def test_record_without_an_embedding_is_still_saved(backend):
     assert backend.get_record("e2").content == "no vector"
 
 
+def test_bulk_save_and_delete_do_not_repeat_encrypted_scans(tmp_path):
+    b = CitadelBackend(str(tmp_path / "bulk.cdl"), key="pw", embedder=EMBEDDER)
+    inner = b._mem
+
+    class CountingMemory:
+        def __init__(self):
+            self.fetches = 0
+            self.batches = 0
+
+        def __getattr__(self, name):
+            return getattr(inner, name)
+
+        def fetch(self, *args, **kwargs):
+            self.fetches += 1
+            return inner.fetch(*args, **kwargs)
+
+        def remember_replacing_keyed_batch(self, *args, **kwargs):
+            self.batches += 1
+            return inner.remember_replacing_keyed_batch(*args, **kwargs)
+
+    counted = CountingMemory()
+    b._mem = counted
+    b.save(
+        [
+            rec(f"bulk-{i}", f"body {i}", scope="/bulk", embedding=vec(i))
+            for i in range(12)
+        ]
+    )
+    assert counted.fetches == 0
+    assert counted.batches == 1
+
+    assert b.delete(record_ids=[f"bulk-{i}" for i in range(12)]) == 12
+    assert counted.fetches == 1
+
+    counted.fetches = 0
+    b.save([rec(f"generated-{i}", f"body {i}") for i in range(12)])
+    assert counted.fetches == 1
+
+
+def test_a_record_without_a_vector_is_embedded_by_the_backend(backend):
+    backend.save([rec("nov", "never embedded", scope="/quiet")])
+    backend.save([rec("emb", "really embedded", scope="/quiet", embedding=vec(21))])
+
+    assert backend.get_record("nov").content == "never embedded"
+    assert {r.id for r in backend.list_records(scope_prefix="/quiet")} == {"nov", "emb"}
+
+    query = EMBEDDER.embed_queries(["never embedded"])[0]
+    hits = backend.search(query, scope_prefix="/quiet", limit=2)
+    assert hits[0][0].id == "nov"
+
+
 def test_dimension_mismatch_names_the_fix(backend):
-    with pytest.raises(ValueError, match="dim=3"):
+    with pytest.raises(ValueError, match="3-dimension embedder"):
         backend.save([rec("e3", "short", scope="/bad", embedding=[0.1, 0.2, 0.3])])
 
 
@@ -173,21 +347,49 @@ def test_scope_prefix_is_not_a_string_prefix(backend):
 
 
 def test_search_filters_by_category_and_metadata(backend):
-    backend.save([rec("c1", "x", scope="/c", categories=["bug"], metadata={"env": "prod"},
-                      embedding=vec(4))])
-    backend.save([rec("c2", "y", scope="/c", categories=["chore"], metadata={"env": "dev"},
-                      embedding=vec(4))])
-    by_cat = {r.id for r, _ in backend.search(vec(4), scope_prefix="/c", categories=["bug"],
-                                              limit=10)}
+    backend.save(
+        [
+            rec(
+                "c1",
+                "x",
+                scope="/c",
+                categories=["bug"],
+                metadata={"env": "prod"},
+                embedding=vec(4),
+            )
+        ]
+    )
+    backend.save(
+        [
+            rec(
+                "c2",
+                "y",
+                scope="/c",
+                categories=["chore"],
+                metadata={"env": "dev"},
+                embedding=vec(4),
+            )
+        ]
+    )
+    by_cat = {
+        r.id
+        for r, _ in backend.search(
+            vec(4), scope_prefix="/c", categories=["bug"], limit=10
+        )
+    }
     assert by_cat == {"c1"}
-    by_meta = {r.id for r, _ in backend.search(vec(4), scope_prefix="/c",
-                                               metadata_filter={"env": "dev"}, limit=10)}
+    by_meta = {
+        r.id
+        for r, _ in backend.search(
+            vec(4), scope_prefix="/c", metadata_filter={"env": "dev"}, limit=10
+        )
+    }
     assert by_meta == {"c2"}
 
 
 def test_a_scope_buried_under_another_is_still_found(tmp_path):
     """Discarding after the scan spends the budget on the crowded scope."""
-    b = CitadelBackend(str(tmp_path / "buried.cdl"), key="pw", dim=DIM)
+    b = CitadelBackend(str(tmp_path / "buried.cdl"), key="pw", embedder=EMBEDDER)
     # Nearest to the query, and enough of them to fill the scan.
     b.save([rec(f"n{i}", "x", scope="/noisy", embedding=vec(7)) for i in range(60)])
     b.save([rec("wanted", "y", scope="/quiet", embedding=vec(7))])
@@ -205,6 +407,19 @@ def test_count_and_list_categories(backend):
     backend.save([rec("k2", "b", scope="/cat", categories=["x"])])
     assert backend.count("/cat") == 2
     assert backend.list_categories("/cat") == {"x": 2, "y": 1}
+
+
+def test_list_records_is_newest_first_before_pagination(tmp_path):
+    b = CitadelBackend(str(tmp_path / "ordered.cdl"), key="pw", embedder=EMBEDDER)
+    b.save(
+        [
+            rec("new", "latest", scope="/ordered", created_at=datetime(2025, 1, 1)),
+            rec("old", "earliest", scope="/ordered", created_at=datetime(2020, 1, 1)),
+            rec("mid", "middle", scope="/ordered", created_at=datetime(2023, 1, 1)),
+        ]
+    )
+    assert [r.id for r in b.list_records("/ordered")] == ["new", "mid", "old"]
+    assert [r.id for r in b.list_records("/ordered", limit=1, offset=1)] == ["mid"]
 
 
 def test_list_scopes_returns_immediate_children(backend):
@@ -227,7 +442,7 @@ def test_get_scope_info(backend):
 def test_the_root_scope_covers_every_record(tmp_path):
     """An ancestor list starts one level down, so no nested record names root."""
     # Its own file: the shared backend accumulates records from every other test.
-    only = CitadelBackend(str(tmp_path / "root.cdl"), key="pw", dim=DIM)
+    only = CitadelBackend(str(tmp_path / "root.cdl"), key="pw", embedder=EMBEDDER)
     only.save([rec("g1", "a", scope="/")])
     only.save([rec("g2", "b", scope="/deep")])
     only.save([rec("g3", "c", scope="/deep/deeper")])
@@ -245,23 +460,32 @@ def test_delete_by_record_id(backend):
 
 
 def test_delete_by_category(backend):
-    backend.save([rec("dc1", "a", scope="/dc", categories=["drop"]),
-                  rec("dc2", "b", scope="/dc", categories=["keep"])])
+    backend.save(
+        [
+            rec("dc1", "a", scope="/dc", categories=["drop"]),
+            rec("dc2", "b", scope="/dc", categories=["keep"]),
+        ]
+    )
     assert backend.delete(scope_prefix="/dc", categories=["drop"]) == 1
     assert backend.get_record("dc2") is not None
 
 
 def test_delete_by_metadata(backend):
-    backend.save([rec("dm1", "a", scope="/dm", metadata={"env": "prod"}),
-                  rec("dm2", "b", scope="/dm", metadata={"env": "dev"})])
+    backend.save(
+        [
+            rec("dm1", "a", scope="/dm", metadata={"env": "prod"}),
+            rec("dm2", "b", scope="/dm", metadata={"env": "dev"}),
+        ]
+    )
     assert backend.delete(scope_prefix="/dm", metadata_filter={"env": "prod"}) == 1
     assert backend.get_record("dm2") is not None
 
 
 def test_delete_older_than(backend):
     old = datetime.now(timezone.utc) - timedelta(days=30)
-    backend.save([rec("o1", "old", scope="/age", created_at=old),
-                  rec("o2", "new", scope="/age")])
+    backend.save(
+        [rec("o1", "old", scope="/age", created_at=old), rec("o2", "new", scope="/age")]
+    )
     cutoff = datetime.now(timezone.utc) - timedelta(days=1)
     assert backend.delete(scope_prefix="/age", older_than=cutoff) == 1
     assert backend.get_record("o2") is not None
@@ -292,20 +516,12 @@ def test_timestamps_are_naive_utc(backend):
 
 
 def test_end_to_end_through_crewai_memory(tmp_path):
-    import hashlib
-
     from crewai.memory.unified_memory import Memory
 
     dim = 64
-
-    def embed(texts):
-        return [
-            [hashlib.sha256(t.lower().encode()).digest()[i % 32] / 255.0 for i in range(dim)]
-            for t in texts
-        ]
-
-    b = CitadelBackend(str(tmp_path / "e2e.cdl"), key="pw", dim=dim)
-    memory = Memory(storage=b, embedder=embed)
+    embedder = DeterministicEmbedder(dim)
+    b = CitadelBackend(str(tmp_path / "e2e.cdl"), key="pw", embedder=embedder)
+    memory = Memory(storage=b, embedder=embedder)
     memory.remember("the deploy failed because the disk was full", scope="/ops")
     memory.remember("the intern reset the staging database", scope="/ops")
     memory.drain_writes()
@@ -321,13 +537,13 @@ def test_end_to_end_through_crewai_memory(tmp_path):
 
 def test_use_citadel_claims_the_default_and_declines_deliberate_backends(tmp_path):
     """CrewAI consults the factory for every spec, including foreign ones."""
-    from crewai.memory.storage.factory import resolve_memory_storage, set_memory_storage_factory
-
     from citadeldb_crewai import use_citadel
 
     try:
-        b = use_citadel(str(tmp_path / "hook.cdl"), key="pw")
-        assert resolve_memory_storage("lancedb") is b, "the default spec must reach Citadel"
+        b = use_citadel(str(tmp_path / "hook.cdl"), key="pw", embedder=EMBEDDER)
+        assert resolve_memory_storage("lancedb") is b, (
+            "the default spec must reach Citadel"
+        )
         assert resolve_memory_storage("citadel") is b
         assert resolve_memory_storage("qdrant-edge") is None
         assert resolve_memory_storage("./some/lancedb/path") is None
@@ -340,9 +556,33 @@ def test_a_passphrase_is_required(tmp_path):
     from citadeldb_crewai import use_citadel
 
     with pytest.raises(ValueError, match="passphrase"):
-        CitadelBackend(str(tmp_path / "nokey.cdl"))
+        CitadelBackend(str(tmp_path / "nokey.cdl"), embedder=EMBEDDER)
     with pytest.raises(ValueError, match="passphrase"):
-        use_citadel(str(tmp_path / "nokey2.cdl"))
+        use_citadel(str(tmp_path / "nokey2.cdl"), embedder=EMBEDDER)
+
+
+def test_an_embedder_is_required_before_a_vault_is_created(tmp_path):
+    with pytest.raises(TypeError, match="embedder"):
+        CitadelBackend(str(tmp_path / "no-model.cdl"), key="pw")
+    partial = type(
+        "PartialEmbedder",
+        (),
+        {"dim": 8, "metric": "cosine", "embed": lambda self, texts: []},
+    )()
+    with pytest.raises(TypeError, match="model_id"):
+        CitadelBackend(str(tmp_path / "invalid-model.cdl"), key="pw", embedder=partial)
+    partial.model_id = "default"
+    with pytest.raises(TypeError, match="unknown.*default"):
+        CitadelBackend(
+            str(tmp_path / "placeholder-model.cdl"), key="pw", embedder=partial
+        )
+    wrong_metric = DeterministicEmbedder(8)
+    wrong_metric.metric = "l2"
+    with pytest.raises(TypeError, match="metric must be cosine"):
+        CitadelBackend(
+            str(tmp_path / "wrong-metric.cdl"), key="pw", embedder=wrong_metric
+        )
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_it_survives_a_reopen(tmp_path):
@@ -350,12 +590,12 @@ def test_it_survives_a_reopen(tmp_path):
     import gc
 
     p = str(tmp_path / "reopen.cdl")
-    first = CitadelBackend(p, key="pw", dim=DIM)
+    first = CitadelBackend(p, key="pw", embedder=EMBEDDER)
     first.save([rec("r1", "the disk was full", scope="/ops", embedding=vec(1))])
     del first
     gc.collect()
 
-    again = CitadelBackend(p, key="pw", dim=DIM)
+    again = CitadelBackend(p, key="pw", embedder=EMBEDDER)
     assert again.count("/ops") == 1
     assert again.get_record("r1").content == "the disk was full"
     hits = again.search(vec(1), scope_prefix="/ops", limit=1)
@@ -368,25 +608,29 @@ def test_a_wrong_passphrase_cannot_reopen(tmp_path):
     import citadeldb
 
     p = str(tmp_path / "enc.cdl")
-    first = CitadelBackend(p, key="right", dim=DIM)
+    first = CitadelBackend(p, key="right", embedder=EMBEDDER)
     first.save([rec("r1", "the disk was full", embedding=vec(1))])
     del first
     gc.collect()
 
     with pytest.raises(citadeldb.EncryptionError):
-        CitadelBackend(p, key="wrong", dim=DIM)
+        CitadelBackend(p, key="wrong", embedder=EMBEDDER)
 
 
 def test_concurrent_writes_all_land(tmp_path):
     """Crews run agents in parallel; the engine is shared across threads."""
     import concurrent.futures as cf
 
-    b = CitadelBackend(str(tmp_path / "conc.cdl"), key="pw", dim=DIM)
+    b = CitadelBackend(str(tmp_path / "conc.cdl"), key="pw", embedder=EMBEDDER)
     with cf.ThreadPoolExecutor(max_workers=4) as ex:
-        list(ex.map(
-            lambda i: b.save([rec(f"c{i}", f"body {i}", scope="/c", embedding=vec(i))]),
-            range(40),
-        ))
+        list(
+            ex.map(
+                lambda i: b.save(
+                    [rec(f"c{i}", f"body {i}", scope="/c", embedding=vec(i))]
+                ),
+                range(40),
+            )
+        )
     assert b.count("/c") == 40
 
 
@@ -406,8 +650,10 @@ def test_the_event_loop_is_not_blocked(backend):
         ticker = asyncio.create_task(tick())
         await asyncio.sleep(0)
         await backend.asave(
-            [rec(f"loop{i}", f"body {i}", scope="/loop", embedding=vec(i))
-             for i in range(40)]
+            [
+                rec(f"loop{i}", f"body {i}", scope="/loop", embedding=vec(i))
+                for i in range(40)
+            ]
         )
         await backend.asearch(vec(0), scope_prefix="/loop", limit=5)
         ticker.cancel()

@@ -20,7 +20,7 @@ classifiers = [
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 # A record replaces under its own id, which needs the keyed write added in 2.0.
-dependencies = ["citadeldb>=2.0,<3", "crewai>=1.0"]
+dependencies = ["citadeldb>=2.0,<3", "crewai>=1.14.7,<2"]
 
 [project.optional-dependencies]
 test = ["pytest>=8"]

@@ -1,15 +1,18 @@
 import pytest
+from citadeldb_langchain import CitadelVectorStore
+from citadeldb_langchain.vector_store import KIND, _model_id
 from langchain_core.documents import Document
 from langchain_core.embeddings import DeterministicFakeEmbedding
 from langchain_core.vectorstores import VectorStore
 
-from citadeldb_langchain import CitadelVectorStore
-
 DIM = 16
+MODEL_ID = "deterministic-fake-16"
 
 
 def embedder():
-    return DeterministicFakeEmbedding(size=DIM)
+    embedding = DeterministicFakeEmbedding(size=DIM)
+    object.__setattr__(embedding, "model_name", MODEL_ID)
+    return embedding
 
 
 @pytest.fixture()
@@ -18,7 +21,17 @@ def store(tmp_path):
     return CitadelVectorStore(embedder(), str(tmp_path / "v.cdl"), key="pw", dim=DIM)
 
 
-# ---- conformance ---------------------------------------------------------
+def test_count_does_not_materialize_document_content(store):
+    class CountOnly:
+        def count(self, region, kind):
+            assert region == store._region and kind == KIND
+            return 37
+
+        def fetch(self, *args, **kwargs):
+            raise AssertionError("count must not fetch or decrypt documents")
+
+    store._mem = CountOnly()
+    assert store.count() == 37
 
 
 def test_is_a_vector_store(store):
@@ -33,13 +46,57 @@ def test_dimension_is_inferred_when_not_given(tmp_path):
     assert s.count() == 1
 
 
-# ---- writes --------------------------------------------------------------
-
-
 def test_add_texts_returns_ids_and_stores(store):
     ids = store.add_texts(["alpha", "beta"])
     assert len(ids) == 2 and all(ids)
     assert store.count() == 2
+
+
+@pytest.mark.parametrize("returned", [1, 3])
+def test_a_malformed_embedding_batch_is_rejected_without_partial_writes(
+    tmp_path, returned
+):
+    class MalformedEmbedding:
+        model_id = "malformed-batch"
+
+        def embed_documents(self, texts):
+            return [[0.0] * DIM for _ in range(returned)]
+
+        def embed_query(self, text):
+            return [0.0] * DIM
+
+    s = CitadelVectorStore(
+        MalformedEmbedding(),
+        str(tmp_path / f"malformed-{returned}.cdl"),
+        key="pw",
+        dim=DIM,
+    )
+    with pytest.raises(ValueError, match=rf"{returned} vectors for 2 texts"):
+        s.add_texts(["one", "two"], ids=["one", "two"])
+    assert s.count() == 0
+
+
+async def test_async_malformed_embedding_batch_is_rejected_without_partial_writes(
+    tmp_path,
+):
+    class MalformedEmbedding:
+        model_id = "async-malformed-batch"
+
+        def embed_documents(self, texts):
+            return [[0.0] * DIM for _ in texts]
+
+        async def aembed_documents(self, texts):
+            return [[0.0] * DIM]
+
+        def embed_query(self, text):
+            return [0.0] * DIM
+
+    s = CitadelVectorStore(
+        MalformedEmbedding(), str(tmp_path / "async-malformed.cdl"), key="pw", dim=DIM
+    )
+    with pytest.raises(ValueError, match="1 vectors for 2 texts"):
+        await s.aadd_texts(["one", "two"], ids=["one", "two"])
+    assert s.count() == 0
 
 
 def test_supplied_ids_are_used(store):
@@ -94,9 +151,6 @@ def test_adding_nothing_is_not_an_error(store):
     assert store.count() == 0
 
 
-# ---- search --------------------------------------------------------------
-
-
 def test_similarity_search_finds_the_nearest(store):
     store.add_texts(["the deploy failed", "lunch on friday"], ids=["a", "b"])
     got = store.similarity_search("the deploy failed", k=1)
@@ -105,7 +159,7 @@ def test_similarity_search_finds_the_nearest(store):
 
 def test_scores_are_similarity_not_distance(store):
     store.add_texts(["exactly this"], ids=["a"])
-    (_doc, score), = store.similarity_search_with_score("exactly this", k=1)
+    ((_doc, score),) = store.similarity_search_with_score("exactly this", k=1)
     assert score == pytest.approx(1.0, abs=1e-3)
 
 
@@ -146,9 +200,6 @@ def test_metadata_filter_narrows(store):
 def test_a_filter_matching_nothing_returns_nothing(store):
     store.add_texts(["one"], metadatas=[{"cat": "x"}], ids=["a"])
     assert store.similarity_search("one", k=5, filter={"cat": "absent"}) == []
-
-
-# ---- reads and deletes ---------------------------------------------------
 
 
 def test_the_id_paths_read_the_region_once(store, monkeypatch):
@@ -218,7 +269,64 @@ def test_a_passphrase_is_required(tmp_path):
         CitadelVectorStore(embedder(), str(tmp_path / "k.cdl"), key="", dim=DIM)
 
 
-# ---- construction --------------------------------------------------------
+def test_an_embedding_model_is_validated_before_a_vault_is_created(tmp_path):
+    with pytest.raises(TypeError, match="embed_documents"):
+        CitadelVectorStore(
+            object(), str(tmp_path / "invalid-model.cdl"), key="pw", dim=DIM
+        )
+    with pytest.raises(ValueError, match="65535"):
+        CitadelVectorStore(
+            embedder(), str(tmp_path / "wide-model.cdl"), key="pw", dim=65_536
+        )
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_an_unnamed_embedding_requires_explicit_provenance(tmp_path):
+    unnamed = DeterministicFakeEmbedding(size=DIM)
+    with pytest.raises(ValueError, match="model_id"):
+        CitadelVectorStore(unnamed, str(tmp_path / "missing.cdl"), key="pw", dim=DIM)
+    with pytest.raises(ValueError, match="model_id"):
+        CitadelVectorStore(
+            unnamed,
+            str(tmp_path / "invalid.cdl"),
+            key="pw",
+            dim=DIM,
+            model_id=123,
+        )
+    assert list(tmp_path.iterdir()) == []
+
+    store = CitadelVectorStore(
+        unnamed,
+        str(tmp_path / "named.cdl"),
+        key="pw",
+        dim=DIM,
+        model_id="deployment-a",
+    )
+    assert store.count() == 0
+
+
+def test_model_id_attribute_is_preferred_and_reserved_names_are_rejected():
+    named = type(
+        "NamedEmbedding",
+        (),
+        {"model_id": "protocol-id", "model": "framework-id"},
+    )()
+    assert _model_id(named, None) == "protocol-id"
+    assert _model_id(object(), "  deployment-a  ") == "deployment-a"
+
+    fallback = type(
+        "FallbackEmbedding",
+        (),
+        {"model_id": "default", "model": "framework-id"},
+    )()
+    assert _model_id(fallback, None) == "framework-id"
+
+    for reserved in ("", "unknown", "DEFAULT"):
+        invalid = type("InvalidEmbedding", (), {"model_id": reserved})()
+        with pytest.raises(ValueError, match="model_id"):
+            _model_id(invalid, None)
+        with pytest.raises(ValueError, match="model_id"):
+            _model_id(object(), reserved)
 
 
 def test_from_texts_builds_a_populated_store(tmp_path):
@@ -229,7 +337,26 @@ def test_from_texts_builds_a_populated_store(tmp_path):
     assert s.similarity_search("alpha", k=1)[0].page_content == "alpha"
 
 
-# ---- edges ---------------------------------------------------------------
+def test_from_texts_forwards_constructor_kwargs_and_explicit_provenance(tmp_path):
+    class ConstructorProbe(CitadelVectorStore):
+        def __init__(self, *args, marker, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.marker = marker
+
+    unnamed = DeterministicFakeEmbedding(size=DIM)
+    marker = object()
+    s = ConstructorProbe.from_texts(
+        ["alpha"],
+        unnamed,
+        path=str(tmp_path / "explicit.cdl"),
+        key="pw",
+        dim=DIM,
+        model_id="deployment-a",
+        marker=marker,
+    )
+    assert s.marker is marker
+    assert s.count() == 1
+    assert s.similarity_search("alpha", k=1)[0].page_content == "alpha"
 
 
 def test_duplicate_ids_within_one_call_keep_the_last(store):
@@ -240,10 +367,12 @@ def test_duplicate_ids_within_one_call_keep_the_last(store):
 
 
 def test_duplicate_ids_across_documents_keep_the_last(store):
-    store.add_documents([
-        Document(id="d", page_content="one"),
-        Document(id="d", page_content="two"),
-    ])
+    store.add_documents(
+        [
+            Document(id="d", page_content="one"),
+            Document(id="d", page_content="two"),
+        ]
+    )
     assert store.count() == 1
     assert store.get_by_ids(["d"])[0].page_content == "two"
 
@@ -299,13 +428,15 @@ def test_two_stores_share_one_database_file(tmp_path):
 
 def test_a_wrong_width_vector_names_the_fix(tmp_path):
     """A store opened for one model must refuse another model's vectors."""
-    s = CitadelVectorStore(DeterministicFakeEmbedding(size=8), str(tmp_path / "w.cdl"),
-                           key="pw", dim=DIM)
+    s = CitadelVectorStore(
+        DeterministicFakeEmbedding(size=8),
+        str(tmp_path / "w.cdl"),
+        key="pw",
+        dim=DIM,
+        model_id="deterministic-fake-8",
+    )
     with pytest.raises(ValueError, match="dim=8"):
         s.add_texts(["mismatched"])
-
-
-# ---- async ---------------------------------------------------------------
 
 
 def test_mmr_search_works(store):
@@ -319,14 +450,18 @@ def test_mmr_search_works(store):
 def test_mmr_by_vector_works(store):
     store.add_texts(["alpha one", "alpha two"], ids=["a", "b"])
     vector = store.embeddings.embed_query("alpha")
-    assert len(store.max_marginal_relevance_search_by_vector(vector, k=2, fetch_k=2)) == 2
+    assert (
+        len(store.max_marginal_relevance_search_by_vector(vector, k=2, fetch_k=2)) == 2
+    )
 
 
 def test_mmr_respects_a_filter(store):
     store.add_texts(
         ["one", "two"], metadatas=[{"cat": "x"}, {"cat": "y"}], ids=["a", "b"]
     )
-    got = store.max_marginal_relevance_search("one", k=2, fetch_k=5, filter={"cat": "y"})
+    got = store.max_marginal_relevance_search(
+        "one", k=2, fetch_k=5, filter={"cat": "y"}
+    )
     assert [d.id for d in got] == ["b"]
 
 
@@ -388,6 +523,52 @@ def test_a_wrong_passphrase_cannot_reopen(tmp_path):
 
     with pytest.raises(citadeldb.EncryptionError):
         CitadelVectorStore(embedder(), p, key="wrong", dim=DIM)
+
+
+def test_existing_vault_authenticates_before_dimension_probe(tmp_path):
+    import gc
+
+    import citadeldb
+
+    path = str(tmp_path / "auth-before-probe.cdl")
+    first = CitadelVectorStore(embedder(), path, key="right", dim=DIM)
+    del first
+    gc.collect()
+
+    class ProbeEmbedding:
+        model_id = "probe-model"
+
+        def __init__(self):
+            self.probes = 0
+
+        def embed_documents(self, texts):
+            return [[0.0] * DIM for _ in texts]
+
+        def embed_query(self, text):
+            self.probes += 1
+            return [0.0] * DIM
+
+    embedding = ProbeEmbedding()
+    with pytest.raises(citadeldb.EncryptionError):
+        CitadelVectorStore(embedding, path, key="wrong")
+    assert embedding.probes == 0
+
+
+def test_failed_dimension_probe_leaves_no_vault_artifacts(tmp_path):
+    class ExplodingEmbedding:
+        model_id = "exploding-probe"
+
+        def embed_documents(self, texts):
+            return [[0.0] * DIM for _ in texts]
+
+        def embed_query(self, text):
+            raise RuntimeError("dimension probe failed")
+
+    with pytest.raises(RuntimeError, match="dimension probe failed"):
+        CitadelVectorStore(
+            ExplodingEmbedding(), str(tmp_path / "probe-failed.cdl"), key="pw"
+        )
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_concurrent_writes_all_land(tmp_path):

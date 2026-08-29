@@ -9,10 +9,16 @@ pip install citadeldb-openai-agents
 ```
 
 ```python
+import citadeldb
 from agents import Agent, Runner
 from citadeldb_openai_agents import CitadelSession
 
-session = CitadelSession("user-123", "agent.cdl", key="your-passphrase")
+session = CitadelSession(
+    "user-123",
+    "agent.cdl",
+    key="your-passphrase",
+    embedder=citadeldb.MockEmbedder(dim=64),  # see Notes for a real model
+)
 
 agent = Agent(name="assistant", instructions="Be brief.")
 result = await Runner.run(agent, "remember my dog is called Mochi", session=session)
@@ -28,9 +34,14 @@ Citadel is embedded and one connection owns the file, so sessions are minted fro
 rather than each opening the database:
 
 ```python
+import citadeldb
 from citadeldb_openai_agents import CitadelSessionStore
 
-store = CitadelSessionStore("agent.cdl", key="your-passphrase")
+store = CitadelSessionStore(
+    "agent.cdl",
+    key="your-passphrase",
+    embedder=citadeldb.MockEmbedder(dim=64),
+)
 alice = store.session("user-alice")
 bob = store.session("user-bob")
 ```
@@ -60,10 +71,12 @@ Beyond the protocol, a session can be searched with Citadel's hybrid recall, whi
 on vector distance, keyword rank and recency rather than on an exact match:
 
 ```python
-await session.add_items([
-    {"role": "user", "content": "the deployment failed because the disk was full"},
-    {"role": "user", "content": "lunch plans for friday"},
-])
+await session.add_items(
+    [
+        {"role": "user", "content": "the deployment failed because the disk was full"},
+        {"role": "user", "content": "lunch plans for friday"},
+    ]
+)
 
 await session.search("why did the release break?", limit=1)
 # [{'content': 'the deployment failed because the disk was full', 'role': 'user'}]
@@ -74,7 +87,14 @@ Nothing in the SDK calls this. `Runner` only ever uses the four protocol methods
 ## TTL
 
 ```python
-store = CitadelSessionStore("agent.cdl", key="your-passphrase", ttl=86400)  # seconds
+import citadeldb
+
+store = CitadelSessionStore(
+    "agent.cdl",
+    key="your-passphrase",
+    embedder=citadeldb.MockEmbedder(dim=64),
+    ttl=86400,  # seconds
+)
 ```
 
 Expired items stop being returned and are skipped by the storage engine itself, so a
@@ -87,14 +107,21 @@ the `openai` package, so the stored payload is never normalised: function calls,
 items and multi-part content all round-trip unchanged. Only a plain-text projection of
 `content` is derived, for search ranking.
 
-`MockEmbedder` is the default and needs no download, which is enough to run an agent and
-to test. `search` only becomes semantically useful with a real embedder. `CandleEmbedder`
+`embedder=` is required. There is no default: a session that quietly substituted `MockEmbedder`
+would rank lexically while recording `mock` as the model that wrote its vectors, and neither of
+those is something you can find out from the outside. `MockEmbedder` needs no download and is
+enough to run an agent and to test, so pass it explicitly if that is what you want. `search`
+only becomes semantically useful with a real embedder. `CandleEmbedder`
 is not in the default `citadeldb` wheel and needs a source build (`maturin build --features
 candle-embed`); any object exposing `dim`, `metric`, `model_id`, `embed` and `embed_queries`
 works too:
 
+A session created with `store=` inherits that store's database, region, embedder, and TTL;
+passing any of those options alongside `store=` is rejected instead of silently ignoring it.
+
 ```python
 import citadeldb
+
 store = CitadelSessionStore(
     "agent.cdl",
     key="your-passphrase",

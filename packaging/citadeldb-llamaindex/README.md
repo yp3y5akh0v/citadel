@@ -8,16 +8,26 @@ that destroy the key, not just the row.
 pip install citadeldb-llamaindex
 ```
 
+Requires `llama-index-core>=0.13.1`; that is the first release carrying the
+metadata-filter evaluator used to match LlamaIndex's filter semantics.
+
 ```python
-from llama_index.core import Document, StorageContext, VectorStoreIndex
+from llama_index.core import Document, Settings, StorageContext, VectorStoreIndex
 from citadeldb_llamaindex import CitadelVectorStore
 
-store = CitadelVectorStore("corpus.cdl", key="your-passphrase", dim=1536)
+embed_model = Settings.embed_model
+store = CitadelVectorStore(
+    "corpus.cdl",
+    key="your-passphrase",
+    embed_model=embed_model,
+    dim=1536,
+)
 documents = [Document(text="the deployment failed because the disk was full")]
 
 index = VectorStoreIndex.from_documents(
     documents,
     storage_context=StorageContext.from_defaults(vector_store=store),
+    embed_model=embed_model,
 )
 
 index.as_query_engine().query("why did the release break?")
@@ -25,6 +35,9 @@ index.as_query_engine().query("why did the release break?")
 
 `dim` must match your embedding model: 1536 for OpenAI `text-embedding-3-small`, 3072 for
 `text-embedding-3-large`, 1024 for `e5-large`.
+Models exposing `model_id`, `model_name`, or `model` record that identity automatically,
+in that order. For a custom model without any of those attributes, pass a stable
+`model_id=` explicitly; Citadel refuses to guess from the Python class name.
 
 ## Deletes destroy the key
 
@@ -32,9 +45,9 @@ Every node is sealed under its own key. Deleting destroys that key and then remo
 row, so any ciphertext surviving elsewhere stays unreadable.
 
 ```python
-index.delete_ref_doc("doc-42")          # every node from that document
-store.forget_document("doc-42")         # the same, returning a count for the record
-store.clear()                           # the whole corpus
+index.delete_ref_doc("doc-42")  # every node from that document
+store.forget_document("doc-42")  # the same, returning a count for the record
+store.clear()  # the whole corpus
 ```
 
 The node's key is gone, not just its entry in an index.
@@ -52,13 +65,17 @@ JSON-type exact.
 
 ```python
 from llama_index.core.vector_stores.types import (
-    FilterOperator, MetadataFilter, MetadataFilters,
+    FilterOperator,
+    MetadataFilter,
+    MetadataFilters,
 )
 
 index.as_retriever(
-    filters=MetadataFilters(filters=[
-        MetadataFilter(key="year", value=2026, operator=FilterOperator.EQ),
-    ])
+    filters=MetadataFilters(
+        filters=[
+            MetadataFilter(key="year", value=2026, operator=FilterOperator.EQ),
+        ]
+    )
 ).retrieve("...")
 ```
 
@@ -68,9 +85,11 @@ pushed leaf would drop rows the filter keeps.
 
 ## Notes
 
-LlamaIndex embeds before it calls a store, so a node arrives with its vector already
-computed and that vector is written straight onto the atom. Nothing here re-embeds, so
-writes and queries stay in one vector space.
+LlamaIndex normally embeds before it calls a store, so a node's supplied vector is written
+straight onto the atom. The store requires the same `embed_model` as an explicit constructor
+argument; if a node arrives without a vector, Citadel uses that model instead of opening a
+degraded region or inventing a placeholder. Pass the same object to the index and
+store so every write and query stays in one vector space.
 
 The node is stored whole, minus its text, which is kept once as the atom's searchable
 content and restored on read. Metadata, relationships and node type all round-trip.

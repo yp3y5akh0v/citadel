@@ -172,9 +172,14 @@ pip install citadeldb-langgraph
 ```
 
 ```python
+import citadeldb
 from citadeldb_langgraph import CitadelStore
 
-store = CitadelStore("agent.cdl", key="your-passphrase")
+store = CitadelStore(
+    "agent.cdl",
+    key="your-passphrase",
+    embedder=citadeldb.MockEmbedder(dim=64),  # replace with your production model
+)
 store.put(("users", "alice"), "prefs", {"theme": "dark"})
 store.search(("users",))                     # every namespace under users/
 store.forget_namespace(("users", "alice"))   # cryptographic erasure, returns a count

@@ -154,7 +154,9 @@ jobs:
       - name: Build the wheel
         run: maturin build --profile dev --out dist
       - name: Install the wheel
-        run: pip install --no-index --find-links dist citadeldb
+        run: |
+          pip install --no-index --find-links dist citadeldb
+          python -c "from importlib.metadata import version; print('citadeldb==' + version('citadeldb'))" > "$RUNNER_TEMP/citadeldb-constraint.txt"
       - name: pytest
         run: pytest python/tests -q
       - name: mypy (stubs + facades)
@@ -165,9 +167,9 @@ jobs:
       # it fails here instead of at release.
       - name: langgraph store
         run: |
-          pip install ./packaging/citadeldb-langgraph
+          pip install --constraint "$RUNNER_TEMP/citadeldb-constraint.txt" ./packaging/citadeldb-langgraph
           pytest packaging/citadeldb-langgraph/tests -q
       - name: crewai backend
         run: |
-          pip install ./packaging/citadeldb-crewai
+          pip install --constraint "$RUNNER_TEMP/citadeldb-constraint.txt" ./packaging/citadeldb-crewai
           pytest packaging/citadeldb-crewai/tests -q

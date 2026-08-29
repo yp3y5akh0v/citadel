@@ -1,14 +1,20 @@
 """Google ADK memory service over an encrypted Citadel region."""
+
 from __future__ import annotations
 
 import asyncio
 import functools
+import threading
 from collections.abc import Mapping, Sequence
 from datetime import datetime
+from operator import index
 from typing import TYPE_CHECKING, Any
 
 import citadeldb
-from google.adk.memory.base_memory_service import BaseMemoryService, SearchMemoryResponse
+from google.adk.memory.base_memory_service import (
+    BaseMemoryService,
+    SearchMemoryResponse,
+)
 from google.adk.memory.memory_entry import MemoryEntry
 from google.genai import types
 
@@ -21,8 +27,55 @@ DEFAULT_PATH = "adk_memory.cdl"
 DEFAULT_REGION = "adk_memory"
 # A scope is read whole and filtered in Python; recall over-fetches too.
 PAGE = 10_000
+_SESSION_LOCKS = tuple(threading.Lock() for _ in range(256))
 # `search_memory` takes no limit, so the service owns one; raise it on the constructor.
 DEFAULT_SEARCH_LIMIT = 64
+_METRICS = {"cosine", "cos", "l2", "euclidean", "ip", "inner", "inner_product", "dot"}
+
+
+class _NormalizedEmbedder:
+    def __init__(self, embedder: Any, model_id: str) -> None:
+        self._embedder = embedder
+        self.model_id = model_id
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._embedder, name)
+
+
+def _require_embedder(embedder: Any) -> Any:
+    raw_dim = getattr(embedder, "dim", None)
+    try:
+        dim = index(raw_dim)
+    except TypeError as error:
+        raise TypeError(
+            "embedder dim must be a positive integer no greater than 65535"
+        ) from error
+    if isinstance(raw_dim, bool) or not 1 <= dim <= 65_535:
+        raise TypeError("embedder dim must be a positive integer no greater than 65535")
+    metric = getattr(embedder, "metric", None)
+    if not isinstance(metric, str) or metric.lower() not in _METRICS:
+        raise TypeError("embedder metric must be cosine, l2, or inner")
+    model_id = getattr(embedder, "model_id", None)
+    if (
+        not isinstance(model_id, str)
+        or not model_id.strip()
+        or model_id.strip().lower() in {"unknown", "default"}
+    ):
+        raise TypeError(
+            "embedder model_id must be a nonblank string other than 'unknown' or 'default'"
+        )
+    if not callable(getattr(embedder, "embed", None)):
+        raise TypeError("embedder must provide a callable embed(texts) method")
+    missing = object()
+    embed_queries = getattr(embedder, "embed_queries", missing)
+    if embed_queries is not missing and not callable(embed_queries):
+        raise TypeError("embedder embed_queries attribute must be callable")
+    normalized = model_id.strip()
+    return (
+        embedder
+        if normalized == model_id
+        else _NormalizedEmbedder(embedder, normalized)
+    )
 
 
 def _page(mem: Any, region: str, criterion: dict[str, Any] | None = None) -> list[Any]:
@@ -30,11 +83,15 @@ def _page(mem: Any, region: str, criterion: dict[str, Any] | None = None) -> lis
     out: list[Any] = []
     after = None
     while True:
-        got = mem.fetch(region, KIND, payload_filter=criterion, limit=PAGE, after_id=after)
+        got = mem.fetch(
+            region, KIND, payload_filter=criterion, limit=PAGE, after_id=after
+        )
         out.extend(got)
         if len(got) < PAGE:
             return out
         after = got[-1].id
+
+
 # ADK partitions memory by (app_name, user_id); nothing crosses that boundary.
 _UNKNOWN_SESSION = "__unknown_session_id__"
 
@@ -64,7 +121,7 @@ def _memory_key(*parts: str) -> str:
     return "".join(f"{len(p)}\x1f{p}" for p in parts)
 
 
-def _write_events(
+def _write_events_locked(
     mem: Any,
     region: str,
     app_name: str,
@@ -79,9 +136,7 @@ def _write_events(
     # Read before the write, so the erase below cannot take a row this call just
     # made. Rows superseded by the keyed write are already gone by then, and
     # forgetting an id twice is a no-op.
-    prior = (
-        _page(mem, region, scope | {"sid": session_id}) if replace_session else []
-    )
+    prior = _page(mem, region, scope | {"sid": session_id}) if replace_session else []
     keyed: dict[str, dict[str, Any]] = {}
     anonymous: list[dict[str, Any]] = []
     for event in events:
@@ -129,6 +184,32 @@ def _write_events(
             mem.forget(region, [h.id for h in stale])
 
 
+def _write_events(
+    mem: Any,
+    region: str,
+    app_name: str,
+    user_id: str,
+    session_id: str,
+    events: Sequence[Event],
+    custom_metadata: Mapping[str, object] | None,
+    *,
+    replace_session: bool = False,
+) -> None:
+    key = (region, app_name, user_id, session_id)
+    lock = _SESSION_LOCKS[hash(key) % len(_SESSION_LOCKS)]
+    with lock:
+        _write_events_locked(
+            mem,
+            region,
+            app_name,
+            user_id,
+            session_id,
+            events,
+            custom_metadata,
+            replace_session=replace_session,
+        )
+
+
 def _write_memories(
     mem: Any,
     region: str,
@@ -171,7 +252,10 @@ def _write_memories(
         # erase this replaces could not prevent.
         mem.remember_replacing_keyed_batch(
             region,
-            [(atom, _memory_key(app_name, user_id, eid)) for eid, atom in keyed.items()],
+            [
+                (atom, _memory_key(app_name, user_id, eid))
+                for eid, atom in keyed.items()
+            ],
         )
     if anonymous:
         mem.remember_batch(region, anonymous)
@@ -209,12 +293,13 @@ class CitadelMemoryService(BaseMemoryService):
         path: str = DEFAULT_PATH,
         key: str = "",
         *,
+        embedder: Any,
         region: str = DEFAULT_REGION,
-        embedder: Any | None = None,
         search_limit: int = DEFAULT_SEARCH_LIMIT,
     ) -> None:
         if not key:
             raise ValueError("a passphrase is required: conversations are the payload")
+        embedder = _require_embedder(embedder)
         self._search_limit = search_limit
         try:
             self._db = citadeldb.connect(path, key=key, region_keys=True)
@@ -228,17 +313,11 @@ class CitadelMemoryService(BaseMemoryService):
         self._mem = self._db.memory()
         self._region = region
         # Idempotent for a region of the same width, so a dim clash raises here.
-        self._mem.create_encrypted_region(
-            region, embedder or citadeldb.MockEmbedder(dim=64)
-        )
-
-    # ---- storage helpers --------------------------------------------------
+        self._mem.create_encrypted_region(region, embedder)
 
     def _owned(self, app_name: str, user_id: str) -> list[Any]:
         """Every atom for one (app, user). Served by the payload index."""
         return _page(self._mem, self._region, _scope(app_name, user_id))
-
-    # ---- the abstract surface --------------------------------------------
 
     async def add_session_to_memory(self, session: Session) -> None:
         await asyncio.to_thread(
@@ -267,8 +346,6 @@ class CitadelMemoryService(BaseMemoryService):
             query,
             self._search_limit,
         )
-
-    # ---- optional surface the reference refuses ---------------------------
 
     async def add_events_to_memory(
         self,
@@ -308,8 +385,6 @@ class CitadelMemoryService(BaseMemoryService):
             memories,
             custom_metadata,
         )
-
-    # ---- beyond the protocol ----------------------------------------------
 
     def forget_user(self, app_name: str, user_id: str) -> int:
         """Destroy everything one user owns, returning the number erased."""

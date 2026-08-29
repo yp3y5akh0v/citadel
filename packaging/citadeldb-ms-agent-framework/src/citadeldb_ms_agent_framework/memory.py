@@ -1,11 +1,15 @@
 """ContextProvider over an encrypted Citadel region."""
+
 from __future__ import annotations
 
 import asyncio
-from typing import Any, ClassVar, Sequence
+from collections.abc import Sequence
+from typing import Any, ClassVar
 
 import citadeldb
 from agent_framework import ContextProvider, Message
+
+from ._embedder import require_embedder
 
 KIND = "memory"
 DEFAULT_PATH = "agent_memory.cdl"
@@ -18,11 +22,15 @@ def _page(mem: Any, region: str, criterion: dict[str, Any]) -> list[Any]:
     out: list[Any] = []
     after = None
     while True:
-        got = mem.fetch(region, KIND, payload_filter=criterion, limit=PAGE, after_id=after)
+        got = mem.fetch(
+            region, KIND, payload_filter=criterion, limit=PAGE, after_id=after
+        )
         out.extend(got)
         if len(got) < PAGE:
             return out
         after = got[-1].id
+
+
 # Roles worth remembering; tool traffic is transcript detail, not knowledge.
 _REMEMBERED_ROLES = ("user", "assistant", "system")
 
@@ -89,16 +97,17 @@ class CitadelContextProvider(ContextProvider):
         path: str = DEFAULT_PATH,
         key: str = "",
         *,
+        embedder: Any,
         source_id: str = DEFAULT_SOURCE_ID,
         scope: str = "default",
         region: str = DEFAULT_REGION,
-        embedder: Any | None = None,
         limit: int = 5,
         context_prompt: str = DEFAULT_CONTEXT_PROMPT,
     ) -> None:
         super().__init__(source_id)
         if not key:
             raise ValueError("a passphrase is required: memories are the payload")
+        embedder = require_embedder(embedder)
         self.scope = scope
         self.limit = limit
         self.context_prompt = context_prompt
@@ -114,11 +123,7 @@ class CitadelContextProvider(ContextProvider):
         self._mem = self._db.memory()
         self._region = region
         # Idempotent for a region of the same width, so a dim clash raises here.
-        self._mem.create_encrypted_region(
-            region, embedder or citadeldb.MockEmbedder(dim=64)
-        )
-
-    # ---- the pipeline hooks ----------------------------------------------
+        self._mem.create_encrypted_region(region, embedder)
 
     async def before_run(
         self, *, agent: Any, session: Any, context: Any, state: dict[str, Any]
@@ -155,8 +160,6 @@ class CitadelContextProvider(ContextProvider):
             await asyncio.to_thread(
                 _remember, self._mem, self._region, self.scope, texts
             )
-
-    # ---- beyond the pipeline ---------------------------------------------
 
     async def forget(self) -> int:
         """Destroy this scope's memories, returning the number erased."""
