@@ -18,30 +18,84 @@ enum citadel_error_t
   : int32_t
 #endif // __cplusplus
  {
-    Ok = 0,
-    InvalidArgument = -1,
-    IoError = -2,
-    BadPassphrase = -3,
-    DatabaseLocked = -4,
-    DatabaseCorrupted = -5,
-    PageTampered = -6,
-    TransactionTooLarge = -7,
-    KeyTooLarge = -8,
-    ValueTooLarge = -9,
-    TableNotFound = -10,
-    TableAlreadyExists = -11,
-    KeyFileMismatch = -12,
-    PassphraseRequired = -13,
-    NoWriteTransaction = -14,
-    WriteTransactionActive = -15,
-    SqlError = -16,
-    NamedTableHashCollision = -17,
-    Interrupted = -18,
-    TransactionFailed = -19,
-    InternalPanic = -99,
+    CITADEL_ERROR_T_OK = 0,
+    CITADEL_ERROR_T_INVALID_ARGUMENT = -1,
+    CITADEL_ERROR_T_IO_ERROR = -2,
+    CITADEL_ERROR_T_BAD_PASSPHRASE = -3,
+    CITADEL_ERROR_T_DATABASE_LOCKED = -4,
+    CITADEL_ERROR_T_DATABASE_CORRUPTED = -5,
+    CITADEL_ERROR_T_PAGE_TAMPERED = -6,
+    CITADEL_ERROR_T_TRANSACTION_TOO_LARGE = -7,
+    CITADEL_ERROR_T_KEY_TOO_LARGE = -8,
+    CITADEL_ERROR_T_VALUE_TOO_LARGE = -9,
+    CITADEL_ERROR_T_TABLE_NOT_FOUND = -10,
+    CITADEL_ERROR_T_TABLE_ALREADY_EXISTS = -11,
+    CITADEL_ERROR_T_KEY_FILE_MISMATCH = -12,
+    CITADEL_ERROR_T_PASSPHRASE_REQUIRED = -13,
+    CITADEL_ERROR_T_NO_WRITE_TRANSACTION = -14,
+    CITADEL_ERROR_T_WRITE_TRANSACTION_ACTIVE = -15,
+    CITADEL_ERROR_T_SQL_ERROR = -16,
+    CITADEL_ERROR_T_NAMED_TABLE_HASH_COLLISION = -17,
+    CITADEL_ERROR_T_INTERRUPTED = -18,
+    CITADEL_ERROR_T_TRANSACTION_FAILED = -19,
+    CITADEL_ERROR_T_REGION_IN_USE = -20,
+    CITADEL_ERROR_T_ATOM_IN_USE = -21,
+    CITADEL_ERROR_T_INTERNAL_PANIC = -99,
 };
 #ifndef __cplusplus
 typedef int32_t citadel_error_t;
+#endif // __cplusplus
+
+/**
+ * Stable category for one integrity finding.
+ */
+enum CitadelIntegrityErrorKind
+#ifdef __cplusplus
+  : int32_t
+#endif // __cplusplus
+ {
+    CITADEL_INTEGRITY_ERROR_KIND_UNKNOWN = -1,
+    CITADEL_INTEGRITY_ERROR_KIND_COMMIT_SLOT_CHECKSUM_MISMATCH = 0,
+    CITADEL_INTEGRITY_ERROR_KIND_COMMIT_SLOT_MAC_MISMATCH = 1,
+    CITADEL_INTEGRITY_ERROR_KIND_COMMIT_SLOT_DOWNGRADE = 2,
+    CITADEL_INTEGRITY_ERROR_KIND_COMMIT_SLOT_UNKNOWN_FORMAT = 3,
+    CITADEL_INTEGRITY_ERROR_KIND_PAGE_READ_FAILED = 4,
+    CITADEL_INTEGRITY_ERROR_KIND_PAGE_TAMPERED = 5,
+    CITADEL_INTEGRITY_ERROR_KIND_CHECKSUM_MISMATCH = 6,
+    CITADEL_INTEGRITY_ERROR_KIND_KEY_ORDER_VIOLATION = 7,
+    CITADEL_INTEGRITY_ERROR_KIND_DUPLICATE_PAGE_REF = 8,
+    CITADEL_INTEGRITY_ERROR_KIND_ENTRY_COUNT_MISMATCH = 9,
+    CITADEL_INTEGRITY_ERROR_KIND_NAMED_TABLE_ENTRY_COUNT_MISMATCH = 10,
+    CITADEL_INTEGRITY_ERROR_KIND_MALFORMED_TABLE_DESCRIPTOR = 11,
+    CITADEL_INTEGRITY_ERROR_KIND_NAMED_TABLE_HASH_COLLISION = 12,
+    CITADEL_INTEGRITY_ERROR_KIND_DUPLICATE_NAMED_TABLE_SLOT_HASH = 13,
+    CITADEL_INTEGRITY_ERROR_KIND_INVALID_PAGE_TYPE = 14,
+    CITADEL_INTEGRITY_ERROR_KIND_PENDING_FREE_ENTRY_COUNT_OUT_OF_BOUNDS = 15,
+    CITADEL_INTEGRITY_ERROR_KIND_KEY_RANGE_VIOLATION = 16,
+    CITADEL_INTEGRITY_ERROR_KIND_MALFORMED_PAGE = 17,
+    CITADEL_INTEGRITY_ERROR_KIND_PAGE_ID_MISMATCH = 18,
+    CITADEL_INTEGRITY_ERROR_KIND_PAGE_TRANSACTION_OUT_OF_BOUNDS = 19,
+    CITADEL_INTEGRITY_ERROR_KIND_REACHABLE_PAGE_OUT_OF_BOUNDS = 20,
+    CITADEL_INTEGRITY_ERROR_KIND_MALFORMED_OVERFLOW_REFERENCE = 21,
+    CITADEL_INTEGRITY_ERROR_KIND_OVERFLOW_LENGTH_OUT_OF_BOUNDS = 22,
+    CITADEL_INTEGRITY_ERROR_KIND_OVERFLOW_PAGE_DATA_LENGTH_OUT_OF_BOUNDS = 23,
+    CITADEL_INTEGRITY_ERROR_KIND_OVERFLOW_CHAIN_LENGTH_MISMATCH = 24,
+    CITADEL_INTEGRITY_ERROR_KIND_OVERFLOW_CHAIN_PAGE_COUNT_OUT_OF_BOUNDS = 25,
+    CITADEL_INTEGRITY_ERROR_KIND_INVALID_TABLE_DESCRIPTOR = 26,
+    CITADEL_INTEGRITY_ERROR_KIND_PENDING_FREE_PAGE_OUT_OF_BOUNDS = 27,
+    CITADEL_INTEGRITY_ERROR_KIND_PENDING_FREE_ENTRY_OUT_OF_BOUNDS = 28,
+    CITADEL_INTEGRITY_ERROR_KIND_PENDING_FREE_TRANSACTION_OUT_OF_BOUNDS = 29,
+    CITADEL_INTEGRITY_ERROR_KIND_DUPLICATE_PENDING_FREE_ENTRY = 30,
+    CITADEL_INTEGRITY_ERROR_KIND_PENDING_FREE_ENTRY_STILL_REACHABLE = 31,
+    CITADEL_INTEGRITY_ERROR_KIND_TREE_DEPTH_MISMATCH = 32,
+    CITADEL_INTEGRITY_ERROR_KIND_PAGE_MERKLE_MISMATCH = 33,
+    CITADEL_INTEGRITY_ERROR_KIND_SLOT_MERKLE_ROOT_MISMATCH = 34,
+    CITADEL_INTEGRITY_ERROR_KIND_PAGE_COUNT_METADATA_MISMATCH = 35,
+    CITADEL_INTEGRITY_ERROR_KIND_OVERFLOW_DIGEST_MISMATCH = 36,
+    CITADEL_INTEGRITY_ERROR_KIND_COMMIT_SLOT_UNKNOWN_MERKLE_SCHEME = 37,
+};
+#ifndef __cplusplus
+typedef int32_t CitadelIntegrityErrorKind;
 #endif // __cplusplus
 
 /**
@@ -52,31 +106,41 @@ enum CitadelValueType
   : int32_t
 #endif // __cplusplus
  {
-    Null = 0,
-    Integer = 1,
-    Real = 2,
-    Text = 3,
-    Blob = 4,
-    Boolean = 5,
-    Date = 6,
-    Time = 7,
-    Timestamp = 8,
-    Interval = 9,
-    Json = 10,
-    Jsonb = 11,
-    TsVector = 12,
-    TsQuery = 13,
-    Array = 14,
-    Vector = 15,
+    CITADEL_VALUE_TYPE_NULL = 0,
+    CITADEL_VALUE_TYPE_INTEGER = 1,
+    CITADEL_VALUE_TYPE_REAL = 2,
+    CITADEL_VALUE_TYPE_TEXT = 3,
+    CITADEL_VALUE_TYPE_BLOB = 4,
+    CITADEL_VALUE_TYPE_BOOLEAN = 5,
+    CITADEL_VALUE_TYPE_DATE = 6,
+    CITADEL_VALUE_TYPE_TIME = 7,
+    CITADEL_VALUE_TYPE_TIMESTAMP = 8,
+    CITADEL_VALUE_TYPE_INTERVAL = 9,
+    CITADEL_VALUE_TYPE_JSON = 10,
+    CITADEL_VALUE_TYPE_JSONB = 11,
+    CITADEL_VALUE_TYPE_TS_VECTOR = 12,
+    CITADEL_VALUE_TYPE_TS_QUERY = 13,
+    CITADEL_VALUE_TYPE_ARRAY = 14,
+    CITADEL_VALUE_TYPE_VECTOR = 15,
 };
 #ifndef __cplusplus
 typedef int32_t CitadelValueType;
 #endif // __cplusplus
 
 /**
+ * Opaque, thread-safe, one-shot cancellation token.
+ */
+typedef struct CitadelCancelToken CitadelCancelToken;
+
+/**
  * Opaque database handle.
  */
 typedef struct CitadelDb CitadelDb;
+
+/**
+ * Opaque result from an integrity walk.
+ */
+typedef struct CitadelIntegrityResult CitadelIntegrityResult;
 
 /**
  * Opaque read transaction handle.
@@ -116,8 +180,8 @@ extern "C" {
  * Get the last error message for the current thread.
  *
  * Returns a pointer to a null-terminated UTF-8 string. The pointer is
- * valid until the next citadel_* call on this thread. Returns NULL if
- * no error occurred.
+ * valid until the next function returning `citadel_error_t` is called
+ * on this thread. Returns NULL if no error occurred.
  */
 CITADEL_API const char *citadel_last_error_message(void);
 
@@ -139,7 +203,7 @@ CITADEL_API const char *citadel_version(void);
  * - `out`: receives the database handle on success
  *
  * # Returns
- * `CITADEL_OK` on success, error code on failure.
+ * `CITADEL_ERROR_T_OK` on success, error code on failure.
  */
 CITADEL_API
 citadel_error_t citadel_create(const char *path,
@@ -159,7 +223,7 @@ citadel_error_t citadel_create(const char *path,
  * - `out`: receives the database handle on success
  *
  * # Returns
- * `CITADEL_OK` on success, error code on failure.
+ * `CITADEL_ERROR_T_OK` on success, error code on failure.
  */
 CITADEL_API
 citadel_error_t citadel_open(const char *path,
@@ -176,9 +240,41 @@ citadel_error_t citadel_open(const char *path,
 CITADEL_API void citadel_close(struct CitadelDb *db);
 
 /**
+ * Allocate a fresh, untripped cancellation token.
+ */
+CITADEL_API citadel_error_t citadel_cancel_token_new(struct CitadelCancelToken **out);
+
+/**
+ * Trip a live cancellation token. Safe to call more than once or from another thread.
+ */
+CITADEL_API citadel_error_t citadel_cancel_token_cancel(const struct CitadelCancelToken *token);
+
+/**
+ * Return 1 when a cancellation token has been tripped, otherwise 0.
+ */
+CITADEL_API int32_t citadel_cancel_token_is_cancelled(const struct CitadelCancelToken *token);
+
+/**
+ * Free a cancellation token. Accepts NULL. The caller must ensure no other
+ * thread is accessing the handle.
+ */
+CITADEL_API void citadel_cancel_token_free(struct CitadelCancelToken *token);
+
+/**
+ * Install a clone of `token` for subsequent work, or clear it with NULL.
+ *
+ * The caller may free its token after this call. Install a fresh token before
+ * beginning the operation or direct transaction it should govern.
+ */
+CITADEL_API
+citadel_error_t citadel_set_cancel(const struct CitadelDb *db,
+                                   const struct CitadelCancelToken *token);
+
+/**
  * Begin a read-only transaction.
  *
  * Multiple read transactions can be active simultaneously.
+ * The returned handle retains the database; `db` may be closed first.
  */
 CITADEL_API citadel_error_t citadel_read_begin(struct CitadelDb *db, struct CitadelReadTxn **out);
 
@@ -195,7 +291,7 @@ CITADEL_API void citadel_read_end(struct CitadelReadTxn *txn);
  * On success, `*out_val` and `*out_val_len` are set. The memory is
  * allocated by Citadel and must be freed with `citadel_free_bytes`.
  * If the key is not found, `*out_val` is set to NULL and
- * `*out_val_len` to 0, and the function returns `CITADEL_OK`.
+ * `*out_val_len` to 0, and the function returns `CITADEL_ERROR_T_OK`.
  */
 CITADEL_API
 citadel_error_t citadel_read_get(struct CitadelReadTxn *txn,
@@ -220,14 +316,15 @@ citadel_error_t citadel_read_table_get(struct CitadelReadTxn *txn,
  * Begin a read-write transaction.
  *
  * Only one write transaction can be active at a time.
+ * The returned handle retains the database; `db` may be closed first.
  */
 CITADEL_API citadel_error_t citadel_write_begin(struct CitadelDb *db, struct CitadelWriteTxn **out);
 
 /**
  * Commit a write transaction.
  *
- * On success the handle is consumed and freed. On failure the
- * transaction is still valid and can be retried or aborted.
+ * The handle is consumed and freed whether commit succeeds or fails. A failed
+ * commit has already rolled back; do not pass the pointer to another function.
  */
 CITADEL_API citadel_error_t citadel_write_commit(struct CitadelWriteTxn *txn);
 
@@ -331,8 +428,7 @@ citadel_error_t citadel_write_table_get(struct CitadelWriteTxn *txn,
 /**
  * Open a SQL connection on a database.
  *
- * The connection borrows the database - the database must outlive the
- * connection.
+ * The returned connection retains the database; `db` may be closed first.
  */
 CITADEL_API citadel_error_t citadel_sql_open(struct CitadelDb *db, struct CitadelSqlConn **out);
 
@@ -398,7 +494,7 @@ CITADEL_API uint64_t citadel_sql_row_count(const struct CitadelSqlResult *result
 /**
  * Get the type of a value in a query result cell.
  *
- * Returns `CITADEL_VALUE_NULL` for out-of-bounds access.
+ * Returns `CITADEL_VALUE_TYPE_NULL` for out-of-bounds access.
  */
 CITADEL_API
 CitadelValueType citadel_sql_value_type(const struct CitadelSqlResult *result,
@@ -428,10 +524,10 @@ double citadel_sql_value_real(const struct CitadelSqlResult *result,
 /**
  * Get a text value from a query result cell.
  *
- * Returns a pointer to a null-terminated UTF-8 string. The pointer is
- * valid for the lifetime of the result. Returns NULL for NULL values
- * or type mismatch. `*out_len` is set to the string length (excluding
- * null terminator). `out_len` can be NULL.
+ * Returns UTF-8 bytes followed by a terminal NUL. The pointer is valid
+ * for the lifetime of the result. Text may contain embedded NULs, so use
+ * `out_len` rather than `strlen`. Returns NULL for NULL values or type
+ * mismatch. `out_len` can be NULL.
  */
 CITADEL_API
 const char *citadel_sql_value_text(const struct CitadelSqlResult *result,
@@ -460,6 +556,60 @@ const uint8_t *citadel_sql_value_blob(const struct CitadelSqlResult *result,
  * the allocating function.
  */
 CITADEL_API void citadel_free_bytes(uint8_t *ptr, uintptr_t len);
+
+/**
+ * Walk both commit slots and all reachable pages.
+ *
+ * Integrity findings are returned in `out` with `CITADEL_ERROR_T_OK`; failures that
+ * prevent the walk from running are returned as an error code. Pass nonzero
+ * `quiet` to avoid writing an audit-log entry for the inspection itself.
+ */
+CITADEL_API
+citadel_error_t citadel_integrity_check(const struct CitadelDb *db,
+                                        int32_t quiet,
+                                        struct CitadelIntegrityResult **out);
+
+/**
+ * Free an integrity result. Accepts NULL.
+ */
+CITADEL_API void citadel_integrity_result_free(struct CitadelIntegrityResult *result);
+
+/**
+ * Return the number of pages examined by an integrity walk.
+ */
+CITADEL_API uint64_t citadel_integrity_pages_checked(const struct CitadelIntegrityResult *result);
+
+/**
+ * Return the number of integrity findings.
+ */
+CITADEL_API uintptr_t citadel_integrity_error_count(const struct CitadelIntegrityResult *result);
+
+/**
+ * Return the number of findings classified as byte tampering.
+ */
+CITADEL_API uintptr_t citadel_integrity_tampered_count(const struct CitadelIntegrityResult *result);
+
+/**
+ * Return one finding's stable category. Out-of-range indexes return
+ * `CITADEL_INTEGRITY_ERROR_KIND_UNKNOWN`.
+ */
+CITADEL_API
+CitadelIntegrityErrorKind citadel_integrity_error_kind(const struct CitadelIntegrityResult *result,
+                                                       uintptr_t index);
+
+/**
+ * Return one finding's message, valid until the result is freed.
+ */
+CITADEL_API
+const char *citadel_integrity_error_message(const struct CitadelIntegrityResult *result,
+                                            uintptr_t index);
+
+/**
+ * Return 1 when one finding represents altered bytes, otherwise 0.
+ */
+CITADEL_API
+int32_t citadel_integrity_error_is_tampered(const struct CitadelIntegrityResult *result,
+                                            uintptr_t index);
 
 /**
  * Get database statistics.

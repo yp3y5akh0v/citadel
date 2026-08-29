@@ -11,8 +11,9 @@ use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::ptr;
 use std::slice;
+use std::sync::Arc;
 
-use citadel::{Database, DatabaseBuilder};
+use citadel::{CancelToken, Database, DatabaseBuilder, IntegrityError};
 use citadel_sql::{Connection, ExecutionResult, Value};
 
 /// Error codes returned by all citadel_* functions.
@@ -39,6 +40,8 @@ pub enum CitadelError {
     NamedTableHashCollision = -17,
     Interrupted = -18,
     TransactionFailed = -19,
+    RegionInUse = -20,
+    AtomInUse = -21,
     InternalPanic = -99,
 }
 
@@ -64,27 +67,92 @@ impl Default for CitadelConfig {
 
 /// Opaque database handle.
 pub struct CitadelDb {
-    db: Database,
+    db: Arc<Database>,
+}
+
+/// Opaque, thread-safe, one-shot cancellation token.
+pub struct CitadelCancelToken {
+    token: CancelToken,
+}
+
+/// Stable category for one integrity finding.
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CitadelIntegrityErrorKind {
+    Unknown = -1,
+    CommitSlotChecksumMismatch = 0,
+    CommitSlotMacMismatch = 1,
+    CommitSlotDowngrade = 2,
+    CommitSlotUnknownFormat = 3,
+    PageReadFailed = 4,
+    PageTampered = 5,
+    ChecksumMismatch = 6,
+    KeyOrderViolation = 7,
+    DuplicatePageRef = 8,
+    EntryCountMismatch = 9,
+    NamedTableEntryCountMismatch = 10,
+    MalformedTableDescriptor = 11,
+    NamedTableHashCollision = 12,
+    DuplicateNamedTableSlotHash = 13,
+    InvalidPageType = 14,
+    PendingFreeEntryCountOutOfBounds = 15,
+    KeyRangeViolation = 16,
+    MalformedPage = 17,
+    PageIdMismatch = 18,
+    PageTransactionOutOfBounds = 19,
+    ReachablePageOutOfBounds = 20,
+    MalformedOverflowReference = 21,
+    OverflowLengthOutOfBounds = 22,
+    OverflowPageDataLengthOutOfBounds = 23,
+    OverflowChainLengthMismatch = 24,
+    OverflowChainPageCountOutOfBounds = 25,
+    InvalidTableDescriptor = 26,
+    PendingFreePageOutOfBounds = 27,
+    PendingFreeEntryOutOfBounds = 28,
+    PendingFreeTransactionOutOfBounds = 29,
+    DuplicatePendingFreeEntry = 30,
+    PendingFreeEntryStillReachable = 31,
+    TreeDepthMismatch = 32,
+    PageMerkleMismatch = 33,
+    SlotMerkleRootMismatch = 34,
+    PageCountMetadataMismatch = 35,
+    OverflowDigestMismatch = 36,
+    CommitSlotUnknownMerkleScheme = 37,
+}
+
+struct CitadelIntegrityFinding {
+    kind: CitadelIntegrityErrorKind,
+    message: CString,
+    tampered: bool,
+}
+
+/// Opaque result from an integrity walk.
+pub struct CitadelIntegrityResult {
+    pages_checked: u64,
+    findings: Vec<CitadelIntegrityFinding>,
 }
 
 /// Opaque read transaction handle.
 pub struct CitadelReadTxn {
     txn: citadel::txn::read_txn::ReadTxn<'static>,
+    _db: Arc<Database>,
 }
 
 /// Opaque write transaction handle.
 pub struct CitadelWriteTxn {
     txn: Option<citadel::txn::write_txn::WriteTxn<'static>>,
+    _db: Arc<Database>,
 }
 
 /// Opaque SQL connection handle.
 pub struct CitadelSqlConn {
     conn: Connection<'static>,
+    _db: Arc<Database>,
 }
 
 /// Opaque SQL result handle.
 pub struct CitadelSqlResult {
-    columns: Vec<String>,
+    columns: Vec<CString>,
     rows: Vec<Vec<Value>>,
     rows_affected: u64,
     is_query: bool,
@@ -96,7 +164,7 @@ thread_local! {
 
 fn set_last_error(msg: &str) {
     LAST_ERROR.with(|e| {
-        *e.borrow_mut() = CString::new(msg).ok();
+        *e.borrow_mut() = Some(c_string_for_ffi(msg.to_owned()));
     });
 }
 
@@ -108,7 +176,12 @@ fn clear_last_error() {
 
 fn map_error(err: &citadel_core::Error) -> CitadelError {
     match err {
-        citadel_core::Error::Io(_) => CitadelError::IoError,
+        citadel_core::Error::Io(_)
+        | citadel_core::Error::AuditFailureAfterOperation { .. }
+        | citadel_core::Error::DurabilityFailureAfterOperation { .. }
+        | citadel_core::Error::DurabilityAndAuditFailureAfterOperation { .. } => {
+            CitadelError::IoError
+        }
         citadel_core::Error::BadPassphrase => CitadelError::BadPassphrase,
         citadel_core::Error::DatabaseLocked => CitadelError::DatabaseLocked,
         citadel_core::Error::DatabaseCorrupted => CitadelError::DatabaseCorrupted,
@@ -121,7 +194,9 @@ fn map_error(err: &citadel_core::Error) -> CitadelError {
         citadel_core::Error::NamedTableHashCollision { .. } => {
             CitadelError::NamedTableHashCollision
         }
-        citadel_core::Error::KeyFileMismatch => CitadelError::KeyFileMismatch,
+        citadel_core::Error::KeyFileMismatch | citadel_core::Error::InvalidKeyFileMagic => {
+            CitadelError::KeyFileMismatch
+        }
         citadel_core::Error::KeyFileIntegrity => CitadelError::BadPassphrase,
         citadel_core::Error::KeyUnwrapFailed => CitadelError::BadPassphrase,
         citadel_core::Error::PassphraseRequired => CitadelError::PassphraseRequired,
@@ -129,8 +204,39 @@ fn map_error(err: &citadel_core::Error) -> CitadelError {
         citadel_core::Error::WriteTransactionActive => CitadelError::WriteTransactionActive,
         citadel_core::Error::Interrupted => CitadelError::Interrupted,
         citadel_core::Error::TransactionFailed => CitadelError::TransactionFailed,
-        _ => CitadelError::IoError,
+        citadel_core::Error::RegionInUse { .. } => CitadelError::RegionInUse,
+        citadel_core::Error::AtomInUse { .. } => CitadelError::AtomInUse,
+        citadel_core::Error::ChecksumMismatch(_)
+        | citadel_core::Error::InvalidPageType(_, _)
+        | citadel_core::Error::InvalidMagic { .. }
+        | citadel_core::Error::SlotDowngradeDetected
+        | citadel_core::Error::LegacySlotWriteOnV1File
+        | citadel_core::Error::PageOutOfBounds(_)
+        | citadel_core::Error::CorruptOverflowChain(_)
+        | citadel_core::Error::RegionSealTampered
+        | citadel_core::Error::RegionStoreCorrupt(_) => CitadelError::DatabaseCorrupted,
+        citadel_core::Error::BufferPoolFull
+        | citadel_core::Error::Sync(_)
+        | citadel_core::Error::FipsViolation(_) => CitadelError::IoError,
+        citadel_core::Error::UnsupportedVersion(_)
+        | citadel_core::Error::UnsupportedCipher(_)
+        | citadel_core::Error::UnsupportedKdf(_)
+        | citadel_core::Error::RegionKeysDisabled
+        | citadel_core::Error::RegionKeysRequireFile => CitadelError::InvalidArgument,
     }
+}
+
+fn c_string_for_ffi(text: String) -> CString {
+    CString::new(text.replace('\0', "\\0")).expect("embedded NULs were escaped")
+}
+
+fn prepare_sql_rows_for_ffi(mut rows: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
+    for value in rows.iter_mut().flatten() {
+        if let Value::Text(text) = value {
+            text.push('\0');
+        }
+    }
+    rows
 }
 
 fn map_core_error(err: citadel_core::Error) -> CitadelError {
@@ -144,6 +250,101 @@ fn map_sql_error(err: citadel_sql::SqlError) -> CitadelError {
     match err {
         citadel_sql::SqlError::Storage(e) => map_error(&e),
         _ => CitadelError::SqlError,
+    }
+}
+
+fn integrity_error_kind(error: &IntegrityError) -> CitadelIntegrityErrorKind {
+    match error {
+        IntegrityError::CommitSlotChecksumMismatch { .. } => {
+            CitadelIntegrityErrorKind::CommitSlotChecksumMismatch
+        }
+        IntegrityError::CommitSlotMacMismatch { .. } => {
+            CitadelIntegrityErrorKind::CommitSlotMacMismatch
+        }
+        IntegrityError::CommitSlotDowngrade { .. } => {
+            CitadelIntegrityErrorKind::CommitSlotDowngrade
+        }
+        IntegrityError::CommitSlotUnknownFormat { .. } => {
+            CitadelIntegrityErrorKind::CommitSlotUnknownFormat
+        }
+        IntegrityError::CommitSlotUnknownMerkleScheme { .. } => {
+            CitadelIntegrityErrorKind::CommitSlotUnknownMerkleScheme
+        }
+        IntegrityError::PageReadFailed { .. } => CitadelIntegrityErrorKind::PageReadFailed,
+        IntegrityError::PageTampered(_) => CitadelIntegrityErrorKind::PageTampered,
+        IntegrityError::ChecksumMismatch(_) => CitadelIntegrityErrorKind::ChecksumMismatch,
+        IntegrityError::PageIdMismatch { .. } => CitadelIntegrityErrorKind::PageIdMismatch,
+        IntegrityError::PageTransactionOutOfBounds { .. } => {
+            CitadelIntegrityErrorKind::PageTransactionOutOfBounds
+        }
+        IntegrityError::ReachablePageOutOfBounds { .. } => {
+            CitadelIntegrityErrorKind::ReachablePageOutOfBounds
+        }
+        IntegrityError::TreeDepthMismatch { .. } => CitadelIntegrityErrorKind::TreeDepthMismatch,
+        IntegrityError::PageMerkleMismatch { .. } => CitadelIntegrityErrorKind::PageMerkleMismatch,
+        IntegrityError::SlotMerkleRootMismatch { .. } => {
+            CitadelIntegrityErrorKind::SlotMerkleRootMismatch
+        }
+        IntegrityError::PageCountMetadataMismatch { .. } => {
+            CitadelIntegrityErrorKind::PageCountMetadataMismatch
+        }
+        IntegrityError::KeyOrderViolation { .. } => CitadelIntegrityErrorKind::KeyOrderViolation,
+        IntegrityError::KeyRangeViolation { .. } => CitadelIntegrityErrorKind::KeyRangeViolation,
+        IntegrityError::MalformedPage { .. } => CitadelIntegrityErrorKind::MalformedPage,
+        IntegrityError::MalformedOverflowReference { .. } => {
+            CitadelIntegrityErrorKind::MalformedOverflowReference
+        }
+        IntegrityError::OverflowLengthOutOfBounds { .. } => {
+            CitadelIntegrityErrorKind::OverflowLengthOutOfBounds
+        }
+        IntegrityError::OverflowPageDataLengthOutOfBounds { .. } => {
+            CitadelIntegrityErrorKind::OverflowPageDataLengthOutOfBounds
+        }
+        IntegrityError::OverflowChainLengthMismatch { .. } => {
+            CitadelIntegrityErrorKind::OverflowChainLengthMismatch
+        }
+        IntegrityError::OverflowChainPageCountOutOfBounds { .. } => {
+            CitadelIntegrityErrorKind::OverflowChainPageCountOutOfBounds
+        }
+        IntegrityError::OverflowDigestMismatch { .. } => {
+            CitadelIntegrityErrorKind::OverflowDigestMismatch
+        }
+        IntegrityError::DuplicatePageRef(_) => CitadelIntegrityErrorKind::DuplicatePageRef,
+        IntegrityError::EntryCountMismatch { .. } => CitadelIntegrityErrorKind::EntryCountMismatch,
+        IntegrityError::NamedTableEntryCountMismatch { .. } => {
+            CitadelIntegrityErrorKind::NamedTableEntryCountMismatch
+        }
+        IntegrityError::MalformedTableDescriptor { .. } => {
+            CitadelIntegrityErrorKind::MalformedTableDescriptor
+        }
+        IntegrityError::InvalidTableDescriptor { .. } => {
+            CitadelIntegrityErrorKind::InvalidTableDescriptor
+        }
+        IntegrityError::NamedTableHashCollision { .. } => {
+            CitadelIntegrityErrorKind::NamedTableHashCollision
+        }
+        IntegrityError::DuplicateNamedTableSlotHash { .. } => {
+            CitadelIntegrityErrorKind::DuplicateNamedTableSlotHash
+        }
+        IntegrityError::InvalidPageType { .. } => CitadelIntegrityErrorKind::InvalidPageType,
+        IntegrityError::PendingFreeEntryCountOutOfBounds { .. } => {
+            CitadelIntegrityErrorKind::PendingFreeEntryCountOutOfBounds
+        }
+        IntegrityError::PendingFreePageOutOfBounds { .. } => {
+            CitadelIntegrityErrorKind::PendingFreePageOutOfBounds
+        }
+        IntegrityError::PendingFreeEntryOutOfBounds { .. } => {
+            CitadelIntegrityErrorKind::PendingFreeEntryOutOfBounds
+        }
+        IntegrityError::PendingFreeTransactionOutOfBounds { .. } => {
+            CitadelIntegrityErrorKind::PendingFreeTransactionOutOfBounds
+        }
+        IntegrityError::DuplicatePendingFreeEntry { .. } => {
+            CitadelIntegrityErrorKind::DuplicatePendingFreeEntry
+        }
+        IntegrityError::PendingFreeEntryStillReachable { .. } => {
+            CitadelIntegrityErrorKind::PendingFreeEntryStillReachable
+        }
     }
 }
 
@@ -164,8 +365,8 @@ macro_rules! ffi_guard {
 /// Get the last error message for the current thread.
 ///
 /// Returns a pointer to a null-terminated UTF-8 string. The pointer is
-/// valid until the next citadel_* call on this thread. Returns NULL if
-/// no error occurred.
+/// valid until the next function returning `citadel_error_t` is called
+/// on this thread. Returns NULL if no error occurred.
 #[no_mangle]
 pub extern "C" fn citadel_last_error_message() -> *const c_char {
     LAST_ERROR.with(|e| match e.borrow().as_ref() {
@@ -192,7 +393,7 @@ pub extern "C" fn citadel_version() -> *const c_char {
 /// - `out`: receives the database handle on success
 ///
 /// # Returns
-/// `CITADEL_OK` on success, error code on failure.
+/// `CITADEL_ERROR_T_OK` on success, error code on failure.
 #[no_mangle]
 pub extern "C" fn citadel_create(
     path: *const c_char,
@@ -236,7 +437,7 @@ pub extern "C" fn citadel_create(
 
         match builder.create() {
             Ok(db) => {
-                let handle = Box::new(CitadelDb { db });
+                let handle = Box::new(CitadelDb { db: Arc::new(db) });
                 unsafe { *out = Box::into_raw(handle) };
                 CitadelError::Ok
             }
@@ -255,7 +456,7 @@ pub extern "C" fn citadel_create(
 /// - `out`: receives the database handle on success
 ///
 /// # Returns
-/// `CITADEL_OK` on success, error code on failure.
+/// `CITADEL_ERROR_T_OK` on success, error code on failure.
 #[no_mangle]
 pub extern "C" fn citadel_open(
     path: *const c_char,
@@ -290,7 +491,7 @@ pub extern "C" fn citadel_open(
 
         match builder.open() {
             Ok(db) => {
-                let handle = Box::new(CitadelDb { db });
+                let handle = Box::new(CitadelDb { db: Arc::new(db) });
                 unsafe { *out = Box::into_raw(handle) };
                 CitadelError::Ok
             }
@@ -311,9 +512,84 @@ pub extern "C" fn citadel_close(db: *mut CitadelDb) {
     }
 }
 
+/// Allocate a fresh, untripped cancellation token.
+#[no_mangle]
+pub extern "C" fn citadel_cancel_token_new(out: *mut *mut CitadelCancelToken) -> CitadelError {
+    ffi_guard!({
+        if out.is_null() {
+            set_last_error("null pointer argument");
+            return CitadelError::InvalidArgument;
+        }
+        unsafe { *out = ptr::null_mut() };
+        let token = Box::new(CitadelCancelToken {
+            token: CancelToken::new(),
+        });
+        unsafe { *out = Box::into_raw(token) };
+        CitadelError::Ok
+    })
+}
+
+/// Trip a live cancellation token. Safe to call more than once or from another thread.
+#[no_mangle]
+pub extern "C" fn citadel_cancel_token_cancel(token: *const CitadelCancelToken) -> CitadelError {
+    ffi_guard!({
+        if token.is_null() {
+            set_last_error("null pointer argument");
+            return CitadelError::InvalidArgument;
+        }
+        unsafe { &*token }.token.cancel();
+        CitadelError::Ok
+    })
+}
+
+/// Return 1 when a cancellation token has been tripped, otherwise 0.
+#[no_mangle]
+pub extern "C" fn citadel_cancel_token_is_cancelled(token: *const CitadelCancelToken) -> i32 {
+    if token.is_null() {
+        return 0;
+    }
+    i32::from(unsafe { &*token }.token.is_cancelled())
+}
+
+/// Free a cancellation token. Accepts NULL. The caller must ensure no other
+/// thread is accessing the handle.
+#[no_mangle]
+pub extern "C" fn citadel_cancel_token_free(token: *mut CitadelCancelToken) {
+    if !token.is_null() {
+        let _ = panic::catch_unwind(AssertUnwindSafe(|| {
+            unsafe { drop(Box::from_raw(token)) };
+        }));
+    }
+}
+
+/// Install a clone of `token` for subsequent work, or clear it with NULL.
+///
+/// The caller may free its token after this call. Install a fresh token before
+/// beginning the operation or direct transaction it should govern.
+#[no_mangle]
+pub extern "C" fn citadel_set_cancel(
+    db: *const CitadelDb,
+    token: *const CitadelCancelToken,
+) -> CitadelError {
+    ffi_guard!({
+        if db.is_null() {
+            set_last_error("null pointer argument");
+            return CitadelError::InvalidArgument;
+        }
+        let token = if token.is_null() {
+            None
+        } else {
+            Some(unsafe { &*token }.token.clone())
+        };
+        unsafe { &*db }.db.set_cancel(token);
+        CitadelError::Ok
+    })
+}
+
 /// Begin a read-only transaction.
 ///
 /// Multiple read transactions can be active simultaneously.
+/// The returned handle retains the database; `db` may be closed first.
 #[no_mangle]
 pub extern "C" fn citadel_read_begin(
     db: *mut CitadelDb,
@@ -325,12 +601,13 @@ pub extern "C" fn citadel_read_begin(
             return CitadelError::InvalidArgument;
         }
 
-        let db_ref = unsafe { &*db };
-        // Safety: transmute to 'static - caller must ensure db outlives txn.
-        let txn = db_ref.db.begin_read();
+        let db_owner = Arc::clone(&unsafe { &*db }.db);
+        // The handle owns `db_owner`, so the manager borrowed by the
+        // transaction stays alive until after the transaction is dropped.
+        let txn = db_owner.begin_read();
         let txn: citadel::txn::read_txn::ReadTxn<'static> = unsafe { std::mem::transmute(txn) };
 
-        let handle = Box::new(CitadelReadTxn { txn });
+        let handle = Box::new(CitadelReadTxn { txn, _db: db_owner });
         unsafe { *out = Box::into_raw(handle) };
         CitadelError::Ok
     })
@@ -353,7 +630,7 @@ pub extern "C" fn citadel_read_end(txn: *mut CitadelReadTxn) {
 /// On success, `*out_val` and `*out_val_len` are set. The memory is
 /// allocated by Citadel and must be freed with `citadel_free_bytes`.
 /// If the key is not found, `*out_val` is set to NULL and
-/// `*out_val_len` to 0, and the function returns `CITADEL_OK`.
+/// `*out_val_len` to 0, and the function returns `CITADEL_ERROR_T_OK`.
 #[no_mangle]
 pub extern "C" fn citadel_read_get(
     txn: *mut CitadelReadTxn,
@@ -448,6 +725,7 @@ pub extern "C" fn citadel_read_table_get(
 /// Begin a read-write transaction.
 ///
 /// Only one write transaction can be active at a time.
+/// The returned handle retains the database; `db` may be closed first.
 #[no_mangle]
 pub extern "C" fn citadel_write_begin(
     db: *mut CitadelDb,
@@ -459,14 +737,17 @@ pub extern "C" fn citadel_write_begin(
             return CitadelError::InvalidArgument;
         }
 
-        let db_ref = unsafe { &*db };
-        let txn = match db_ref.db.begin_write() {
+        let db_owner = Arc::clone(&unsafe { &*db }.db);
+        let txn = match db_owner.begin_write() {
             Ok(t) => t,
             Err(e) => return map_core_error(e),
         };
         let txn: citadel::txn::write_txn::WriteTxn<'static> = unsafe { std::mem::transmute(txn) };
 
-        let handle = Box::new(CitadelWriteTxn { txn: Some(txn) });
+        let handle = Box::new(CitadelWriteTxn {
+            txn: Some(txn),
+            _db: db_owner,
+        });
         unsafe { *out = Box::into_raw(handle) };
         CitadelError::Ok
     })
@@ -474,8 +755,8 @@ pub extern "C" fn citadel_write_begin(
 
 /// Commit a write transaction.
 ///
-/// On success the handle is consumed and freed. On failure the
-/// transaction is still valid and can be retried or aborted.
+/// The handle is consumed and freed whether commit succeeds or fails. A failed
+/// commit has already rolled back; do not pass the pointer to another function.
 #[no_mangle]
 pub extern "C" fn citadel_write_commit(txn: *mut CitadelWriteTxn) -> CitadelError {
     ffi_guard!({
@@ -484,8 +765,10 @@ pub extern "C" fn citadel_write_commit(txn: *mut CitadelWriteTxn) -> CitadelErro
             return CitadelError::InvalidArgument;
         }
 
-        let txn_ref = unsafe { &mut *txn };
-        let inner = match txn_ref.txn.take() {
+        // Take ownership before calling Rust commit. The box then drops on
+        // success, ordinary error, or a caught panic.
+        let mut txn_handle = unsafe { Box::from_raw(txn) };
+        let inner = match txn_handle.txn.take() {
             Some(t) => t,
             None => {
                 set_last_error("transaction already consumed");
@@ -494,16 +777,8 @@ pub extern "C" fn citadel_write_commit(txn: *mut CitadelWriteTxn) -> CitadelErro
         };
 
         match inner.commit() {
-            Ok(()) => {
-                unsafe { drop(Box::from_raw(txn)) };
-                CitadelError::Ok
-            }
-            Err(e) => {
-                // Commit failed - transaction was consumed by commit()
-                // (it takes self), so we free the handle.
-                unsafe { drop(Box::from_raw(txn)) };
-                map_core_error(e)
-            }
+            Ok(()) => CitadelError::Ok,
+            Err(e) => map_core_error(e),
         }
     })
 }
@@ -863,8 +1138,7 @@ pub extern "C" fn citadel_write_table_get(
 
 /// Open a SQL connection on a database.
 ///
-/// The connection borrows the database - the database must outlive the
-/// connection.
+/// The returned connection retains the database; `db` may be closed first.
 #[no_mangle]
 pub extern "C" fn citadel_sql_open(
     db: *mut CitadelDb,
@@ -876,14 +1150,17 @@ pub extern "C" fn citadel_sql_open(
             return CitadelError::InvalidArgument;
         }
 
-        let db_ref = unsafe { &*db };
-        let conn = match Connection::open(&db_ref.db) {
+        let db_owner = Arc::clone(&unsafe { &*db }.db);
+        let conn = match Connection::open(&db_owner) {
             Ok(c) => c,
             Err(e) => return map_sql_error(e),
         };
         let conn: Connection<'static> = unsafe { std::mem::transmute(conn) };
 
-        let handle = Box::new(CitadelSqlConn { conn });
+        let handle = Box::new(CitadelSqlConn {
+            conn,
+            _db: db_owner,
+        });
         unsafe { *out = Box::into_raw(handle) };
         CitadelError::Ok
     })
@@ -941,8 +1218,8 @@ pub extern "C" fn citadel_sql_execute(
                             is_query: false,
                         },
                         ExecutionResult::Query(qr) => CitadelSqlResult {
-                            columns: qr.columns,
-                            rows: qr.rows,
+                            columns: qr.columns.into_iter().map(c_string_for_ffi).collect(),
+                            rows: prepare_sql_rows_for_ffi(qr.rows),
                             rows_affected: 0,
                             is_query: true,
                         },
@@ -1021,19 +1298,9 @@ pub extern "C" fn citadel_sql_column_name(
         return ptr::null();
     }
     let r = unsafe { &*result };
-    match r.columns.get(col as usize) {
-        Some(name) => COLUMN_NAME_BUF.with(|buf| {
-            let cstr = CString::new(name.as_str()).unwrap_or_default();
-            let ptr = cstr.as_ptr();
-            *buf.borrow_mut() = Some(cstr);
-            ptr
-        }),
-        None => ptr::null(),
-    }
-}
-
-thread_local! {
-    static COLUMN_NAME_BUF: RefCell<Option<CString>> = const { RefCell::new(None) };
+    r.columns
+        .get(col as usize)
+        .map_or(ptr::null(), |name| name.as_ptr())
 }
 
 /// Get the number of rows in a query result.
@@ -1070,7 +1337,7 @@ pub enum CitadelValueType {
 
 /// Get the type of a value in a query result cell.
 ///
-/// Returns `CITADEL_VALUE_NULL` for out-of-bounds access.
+/// Returns `CITADEL_VALUE_TYPE_NULL` for out-of-bounds access.
 #[no_mangle]
 pub extern "C" fn citadel_sql_value_type(
     result: *const CitadelSqlResult,
@@ -1144,10 +1411,10 @@ pub extern "C" fn citadel_sql_value_real(
 
 /// Get a text value from a query result cell.
 ///
-/// Returns a pointer to a null-terminated UTF-8 string. The pointer is
-/// valid for the lifetime of the result. Returns NULL for NULL values
-/// or type mismatch. `*out_len` is set to the string length (excluding
-/// null terminator). `out_len` can be NULL.
+/// Returns UTF-8 bytes followed by a terminal NUL. The pointer is valid
+/// for the lifetime of the result. Text may contain embedded NULs, so use
+/// `out_len` rather than `strlen`. Returns NULL for NULL values or type
+/// mismatch. `out_len` can be NULL.
 #[no_mangle]
 pub extern "C" fn citadel_sql_value_text(
     result: *const CitadelSqlResult,
@@ -1161,15 +1428,11 @@ pub extern "C" fn citadel_sql_value_text(
     let r = unsafe { &*result };
     match r.rows.get(row as usize).and_then(|r| r.get(col as usize)) {
         Some(Value::Text(s)) => {
+            let text_len = s.len().saturating_sub(1);
             if !out_len.is_null() {
-                unsafe { *out_len = s.len() };
+                unsafe { *out_len = text_len };
             }
-            TEXT_VALUE_BUF.with(|buf| {
-                let cstr = CString::new(s.as_str()).unwrap_or_default();
-                let ptr = cstr.as_ptr();
-                *buf.borrow_mut() = Some(cstr);
-                ptr
-            })
+            s.as_ptr().cast()
         }
         _ => {
             if !out_len.is_null() {
@@ -1178,10 +1441,6 @@ pub extern "C" fn citadel_sql_value_text(
             ptr::null()
         }
     }
-}
-
-thread_local! {
-    static TEXT_VALUE_BUF: RefCell<Option<CString>> = const { RefCell::new(None) };
 }
 
 /// Get a blob value from a query result cell.
@@ -1226,6 +1485,139 @@ pub extern "C" fn citadel_free_bytes(ptr: *mut u8, len: usize) {
             };
         }));
     }
+}
+
+/// Walk both commit slots and all reachable pages.
+///
+/// Integrity findings are returned in `out` with `CITADEL_ERROR_T_OK`; failures that
+/// prevent the walk from running are returned as an error code. Pass nonzero
+/// `quiet` to avoid writing an audit-log entry for the inspection itself.
+#[no_mangle]
+pub extern "C" fn citadel_integrity_check(
+    db: *const CitadelDb,
+    quiet: i32,
+    out: *mut *mut CitadelIntegrityResult,
+) -> CitadelError {
+    ffi_guard!({
+        if db.is_null() || out.is_null() {
+            set_last_error("null pointer argument");
+            return CitadelError::InvalidArgument;
+        }
+        unsafe { *out = ptr::null_mut() };
+        let db = &unsafe { &*db }.db;
+        let report = match if quiet == 0 {
+            db.integrity_check()
+        } else {
+            db.integrity_check_quiet()
+        } {
+            Ok(report) => report,
+            Err(error) => return map_core_error(error),
+        };
+        let mut findings = Vec::with_capacity(report.errors.len());
+        for error in report.errors {
+            let message = c_string_for_ffi(error.to_string());
+            findings.push(CitadelIntegrityFinding {
+                kind: integrity_error_kind(&error),
+                message,
+                tampered: error.is_tamper(),
+            });
+        }
+        let result = Box::new(CitadelIntegrityResult {
+            pages_checked: report.pages_checked,
+            findings,
+        });
+        unsafe { *out = Box::into_raw(result) };
+        CitadelError::Ok
+    })
+}
+
+/// Free an integrity result. Accepts NULL.
+#[no_mangle]
+pub extern "C" fn citadel_integrity_result_free(result: *mut CitadelIntegrityResult) {
+    if !result.is_null() {
+        let _ = panic::catch_unwind(AssertUnwindSafe(|| {
+            unsafe { drop(Box::from_raw(result)) };
+        }));
+    }
+}
+
+/// Return the number of pages examined by an integrity walk.
+#[no_mangle]
+pub extern "C" fn citadel_integrity_pages_checked(result: *const CitadelIntegrityResult) -> u64 {
+    if result.is_null() {
+        0
+    } else {
+        unsafe { &*result }.pages_checked
+    }
+}
+
+/// Return the number of integrity findings.
+#[no_mangle]
+pub extern "C" fn citadel_integrity_error_count(result: *const CitadelIntegrityResult) -> usize {
+    if result.is_null() {
+        0
+    } else {
+        unsafe { &*result }.findings.len()
+    }
+}
+
+/// Return the number of findings classified as byte tampering.
+#[no_mangle]
+pub extern "C" fn citadel_integrity_tampered_count(result: *const CitadelIntegrityResult) -> usize {
+    if result.is_null() {
+        return 0;
+    }
+    unsafe { &*result }
+        .findings
+        .iter()
+        .filter(|finding| finding.tampered)
+        .count()
+}
+
+/// Return one finding's stable category. Out-of-range indexes return
+/// `CITADEL_INTEGRITY_ERROR_KIND_UNKNOWN`.
+#[no_mangle]
+pub extern "C" fn citadel_integrity_error_kind(
+    result: *const CitadelIntegrityResult,
+    index: usize,
+) -> CitadelIntegrityErrorKind {
+    if result.is_null() {
+        return CitadelIntegrityErrorKind::Unknown;
+    }
+    unsafe { &*result }
+        .findings
+        .get(index)
+        .map_or(CitadelIntegrityErrorKind::Unknown, |finding| finding.kind)
+}
+
+/// Return one finding's message, valid until the result is freed.
+#[no_mangle]
+pub extern "C" fn citadel_integrity_error_message(
+    result: *const CitadelIntegrityResult,
+    index: usize,
+) -> *const c_char {
+    if result.is_null() {
+        return ptr::null();
+    }
+    unsafe { &*result }
+        .findings
+        .get(index)
+        .map_or(ptr::null(), |finding| finding.message.as_ptr())
+}
+
+/// Return 1 when one finding represents altered bytes, otherwise 0.
+#[no_mangle]
+pub extern "C" fn citadel_integrity_error_is_tampered(
+    result: *const CitadelIntegrityResult,
+    index: usize,
+) -> i32 {
+    if result.is_null() {
+        return 0;
+    }
+    unsafe { &*result }
+        .findings
+        .get(index)
+        .map_or(0, |finding| i32::from(finding.tampered))
 }
 
 /// Get database statistics.

@@ -43,6 +43,11 @@ jobs:
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Verify generated C header is current
+        run: |
+          git diff --exit-code -- crates/citadel-ffi/citadel.h
+          cc -x c -std=c17 -Wall -Wextra -Werror -fsyntax-only crates/citadel-ffi/citadel.h
+          c++ -x c++ -std=c++17 -Wall -Wextra -Werror -fsyntax-only crates/citadel-ffi/citadel.h
 
   # The locked workspace must compile on the declared rust-version.
   msrv:
