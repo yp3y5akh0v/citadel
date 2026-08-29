@@ -277,7 +277,7 @@ published systems are in
 - **Audit log** - HMAC-SHA256 chained, tamper-evident
 - **Hot backup** - Consistent snapshots via MVCC, no write blocking
 - **Overflow pages** - Large values handled transparently, no size limits
-- **Cross-platform** - Windows, Linux, macOS. Python, C FFI (37 functions), and WebAssembly bindings
+- **Cross-platform** - Windows, Linux, macOS. Python, C FFI, and WebAssembly bindings
 - **5,200+ tests** - Unit, integration, torture tests across 21 crates
 
 ## Speed benchmarks
@@ -593,7 +593,7 @@ What the at-rest integrity machinery does and does not guarantee against an atta
 
 ### C / C++
 
-Static or dynamic library with auto-generated `citadel.h` (cbindgen). All 37 functions are panic-safe.
+Static or dynamic library with auto-generated `citadel.h` (cbindgen). Exported entry points are panic-safe.
 
 ```c
 #include "citadel.h"

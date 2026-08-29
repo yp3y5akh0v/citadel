@@ -25,6 +25,7 @@ citadel-core = { workspace = true }
 citadel-sql = { workspace = true }
 
 [dev-dependencies]
+cbindgen = "0.27"
 tempfile = "3"
 
 [build-dependencies]

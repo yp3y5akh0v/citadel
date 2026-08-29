@@ -21,5 +21,9 @@ include = [
 [fn]
 prefix = "CITADEL_API"
 
+[enum]
+prefix_with_name = true
+rename_variants = "ScreamingSnakeCase"
+
 [parse]
 parse_deps = false
