@@ -17,13 +17,18 @@ Two providers for two jobs, matching how the framework's own Redis integration i
 
 ```python
 from agent_framework import Agent
+import citadeldb
 from citadeldb_ms_agent_framework import CitadelContextProvider, CitadelHistoryProvider
 
+embedder = citadeldb.MockEmbedder(dim=64)
+
 agent = Agent(
-    client=chat_client,          # any agent_framework chat client
+    client=chat_client,  # any agent_framework chat client
     context_providers=[
-        CitadelHistoryProvider("agent.cdl", key="your-passphrase"),
-        CitadelContextProvider("agent.cdl", key="your-passphrase", scope="user-123"),
+        CitadelHistoryProvider("agent.cdl", key="your-passphrase", embedder=embedder),
+        CitadelContextProvider(
+            "agent.cdl", key="your-passphrase", scope="user-123", embedder=embedder
+        ),
     ],
 )
 ```
@@ -37,11 +42,13 @@ message. The built-in `FileHistoryProvider` writes plaintext JSONL or MessagePac
 ## Deletes destroy the key
 
 ```python
-history = CitadelHistoryProvider("agent.cdl", key="your-passphrase")
-memory = CitadelContextProvider("agent.cdl", key="your-passphrase", scope="user-123")
+history = CitadelHistoryProvider("agent.cdl", key="your-passphrase", embedder=embedder)
+memory = CitadelContextProvider(
+    "agent.cdl", key="your-passphrase", scope="user-123", embedder=embedder
+)
 
-await history.forget("session-42")   # returns the number erased
-await memory.forget()                # this provider's whole scope
+await history.forget("session-42")  # returns the number erased
+await memory.forget()  # this provider's whole scope
 ```
 
 Clearing a conversation destroys each message's own key and then deletes its row, so any
@@ -54,7 +61,12 @@ handle loading and storing according to its configuration flags, so an audit-onl
 evaluation-only provider works as documented:
 
 ```python
-CitadelHistoryProvider("agent.cdl", key="your-passphrase", load_messages=False)  # stores, never loads
+CitadelHistoryProvider(
+    "agent.cdl",
+    key="your-passphrase",
+    embedder=embedder,
+    load_messages=False,
+)  # stores, never loads
 ```
 
 Messages round-trip through the framework's own serialization, so roles, author names,
@@ -63,11 +75,14 @@ multi-part contents and `additional_properties` all survive.
 ## Context provider
 
 Recalls with Citadel's hybrid search: vector distance, keyword rank and recency, fused
-into one score. The default `MockEmbedder` is lexical; pass `embedder=` a real one to
-match across wording.
+into one score. `embedder=` is required and has no default: one substituted quietly would rank
+lexically while recording `mock` as the model that wrote the vectors. `MockEmbedder` is lexical
+and needs no download; pass a real model to match across wording.
 
 ```python
-memory = CitadelContextProvider("agent.cdl", key="your-passphrase", scope="user-123", limit=5)
+memory = CitadelContextProvider(
+    "agent.cdl", key="your-passphrase", scope="user-123", limit=5, embedder=embedder
+)
 ```
 
 Memories are scoped rather than session-bound, so a later conversation can recall an

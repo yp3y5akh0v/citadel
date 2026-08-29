@@ -1,9 +1,10 @@
 """CrewAI StorageBackend over an encrypted Citadel region."""
+
 from __future__ import annotations
 
 import asyncio
-import hashlib
 from datetime import datetime, timezone
+from operator import index
 from typing import Any
 
 import citadeldb
@@ -11,29 +12,56 @@ from crewai.memory.storage.backend import MemoryRecord, ScopeInfo
 
 KIND = "mem"
 PAGE = 10_000
-# OpenAI text-embedding-3-small. CrewAI's own default is now 3-large, so an
-# unconfigured crew passes dim=3072.
-DEFAULT_DIM = 1536
+_COSINE_METRICS = {"cosine", "cos"}
 
 
-class _PlaceholderEmbedder:
-    """Fixes the region's dimension; CrewAI supplies the vectors."""
+class _NormalizedEmbedder:
+    def __init__(self, embedder: Any, model_id: str) -> None:
+        self._embedder = embedder
+        self.model_id = model_id
 
-    metric = "cosine"
-    model_id = "crewai-supplied"
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._embedder, name)
 
-    def __init__(self, dim: int) -> None:
-        self.dim = dim
 
-    def embed(self, texts: list[str]) -> list[list[float]]:
-        return [self._placeholder(t) for t in texts]
-
-    def embed_queries(self, texts: list[str]) -> list[list[float]]:
-        return self.embed(texts)
-
-    def _placeholder(self, text: str) -> list[float]:
-        digest = hashlib.sha256(text.encode()).digest()
-        return [digest[i % len(digest)] / 255.0 for i in range(self.dim)]
+def _require_embedder(embedder: Any) -> tuple[Any, int]:
+    raw_dim = getattr(embedder, "dim", None)
+    try:
+        dim = index(raw_dim)
+    except TypeError as error:
+        raise TypeError(
+            "embedder dim must be a positive integer no greater than 65535"
+        ) from error
+    if isinstance(raw_dim, bool) or not 1 <= dim <= 65_535:
+        raise TypeError("embedder dim must be a positive integer no greater than 65535")
+    metric = getattr(embedder, "metric", None)
+    if not isinstance(metric, str) or metric.lower() not in _COSINE_METRICS:
+        raise TypeError(
+            "embedder metric must be cosine because CrewAI scores are normalized "
+            "cosine similarities"
+        )
+    model_id = getattr(embedder, "model_id", None)
+    if (
+        not isinstance(model_id, str)
+        or not model_id.strip()
+        or model_id.strip().lower() in {"unknown", "default"}
+    ):
+        raise TypeError(
+            "embedder model_id must be a nonblank string other than 'unknown' or 'default'"
+        )
+    if not callable(getattr(embedder, "embed", None)):
+        raise TypeError("embedder must provide a callable embed(texts) method")
+    missing = object()
+    embed_queries = getattr(embedder, "embed_queries", missing)
+    if embed_queries is not missing and not callable(embed_queries):
+        raise TypeError("embedder embed_queries attribute must be callable")
+    normalized = model_id.strip()
+    return (
+        embedder
+        if normalized == model_id
+        else _NormalizedEmbedder(embedder, normalized),
+        dim,
+    )
 
 
 def _scope_parts(scope: str) -> list[str]:
@@ -41,7 +69,7 @@ def _scope_parts(scope: str) -> list[str]:
 
 
 def _ancestors(scope: str) -> list[str]:
-    """JSONB containment makes ancestors an indexed lookup, not a scan."""
+    """Every normalized ancestor of a scope, including the scope itself."""
     parts = _scope_parts(scope)
     return ["/" + "/".join(parts[: i + 1]) for i in range(len(parts))] or ["/"]
 
@@ -64,7 +92,9 @@ def _micros(dt: datetime | None) -> int:
 def _dt(micros: int | None) -> datetime | None:
     if not micros:
         return None
-    return datetime.fromtimestamp(micros / 1_000_000, tz=timezone.utc).replace(tzinfo=None)
+    return datetime.fromtimestamp(micros / 1_000_000, tz=timezone.utc).replace(
+        tzinfo=None
+    )
 
 
 # A Database is pinned to its opening thread, so workers take Memory, not self.
@@ -76,7 +106,7 @@ def _by_id(mem: Any, region: str, record_id: str):
 
 
 def _scan(mem: Any, region: str, scope_prefix: str | None) -> list[Any]:
-    """Every record, or every record under a scope; prefix rides the index."""
+    """Every record, or every record under a scope."""
     scope = _norm(scope_prefix) if scope_prefix else "/"
     # Root is every record, and no nested record lists it: an ancestor list starts
     # one level down, so filtering on it there would return the root's own only.
@@ -105,9 +135,7 @@ def _keep(
         meta = p.get("metadata", {})
         if any(meta.get(k) != v for k, v in metadata_filter.items()):
             return False
-    if older_than and (p.get("created_at") or 0) >= _micros(older_than):
-        return False
-    return True
+    return older_than is None or (p.get("created_at") or 0) < _micros(older_than)
 
 
 def _to_record(hit) -> MemoryRecord:
@@ -130,8 +158,32 @@ def _to_record(hit) -> MemoryRecord:
 
 
 def _save(mem: Any, region: str, dim: int, records: list[MemoryRecord]) -> None:
-    for r in records:
-        existing = _by_id(mem, region, r.id)
+    # Encrypted payload filters run after decryption, so one pass beats one
+    # region scan per record. A repeated id in one call keeps the last value.
+    latest = {record.id: record for record in records}
+    if not latest:
+        return
+    for r in latest.values():
+        if r.embedding is not None and len(r.embedding) != dim:
+            raise ValueError(
+                f"crew supplied a {len(r.embedding)}-dimension embedding but this "
+                f"region is {dim}. Pass the same {len(r.embedding)}-dimension "
+                f"embedder to the backend and your crew."
+            )
+    needs_existing = {r.id for r in latest.values() if r.embedding is None}
+    existing_by_id = (
+        {
+            h.payload["rid"]: h
+            for h in _scan(mem, region, None)
+            if h.payload.get("rid") in needs_existing
+        }
+        if needs_existing
+        else {}
+    )
+    payload_updates: list[tuple[int, dict[str, Any]]] = []
+    pending: list[tuple[dict[str, Any], str]] = []
+    for r in latest.values():
+        existing = existing_by_id.get(r.id)
         scope = _norm(r.scope)
         payload = {
             "rid": r.id,
@@ -148,13 +200,10 @@ def _save(mem: Any, region: str, dim: int, records: list[MemoryRecord]) -> None:
             "private": r.private,
         }
         if r.embedding is None and existing is not None and existing.text == r.content:
-            # A metadata-only edit, which is what Memory.update() produces: it
-            # reads a record back, changes a field and saves it, and a record
-            # read back carries no embedding. Rewriting the atom would swap the
-            # crew's vector for a placeholder derived from the unchanged text,
-            # so edit the payload in place and leave the vector alone. Changed
-            # content is a different case: no stored vector still describes it.
-            mem.update_atom_payload(region, existing.id, payload)
+            # Memory.update() saves a read-back record, which carries no
+            # embedding. The stored vector still describes unchanged content;
+            # CrewAI reads importance from the payload and scores it after search.
+            payload_updates.append((existing.id, payload))
             continue
         atom: dict[str, Any] = {
             "kind": KIND,
@@ -165,16 +214,12 @@ def _save(mem: Any, region: str, dim: int, records: list[MemoryRecord]) -> None:
         }
         # The vector rides its own atom so duplicate content cannot swap them.
         if r.embedding is not None:
-            if len(r.embedding) != dim:
-                raise ValueError(
-                    f"crew supplied a {len(r.embedding)}-dimension embedding but this "
-                    f"region is {dim}. Build the backend with dim={len(r.embedding)} "
-                    f"to match your crew's embedding model."
-                )
             atom["embedding"] = list(r.embedding)
-        # Keyed on the record id, so the write supersedes any stored version in
-        # one transaction rather than racing a separate read and erase.
-        mem.remember_replacing_keyed(region, atom, r.id)
+        pending.append((atom, r.id))
+    if pending:
+        mem.remember_replacing_keyed_batch(region, pending)
+    for atom_id, payload in payload_updates:
+        mem.update_atom_payload(region, atom_id, payload)
 
 
 def _search(
@@ -188,10 +233,14 @@ def _search(
     min_score: float,
 ) -> list[tuple[MemoryRecord, float]]:
     want = _norm(scope_prefix) if scope_prefix else None
-    options = (
-        citadeldb.RecallOptions(payload_filter={"anc": [want]})
-        if want and want != "/"
-        else None
+    criterion: dict[str, Any] = {}
+    if want and want != "/":
+        criterion["anc"] = [want]
+    # StorageBackend.search returns semantic similarity. CrewAI applies recency
+    # and importance itself in compute_composite_score after this call.
+    options = citadeldb.RecallOptions(
+        payload_filter=criterion or None,
+        weights=(1.0, 0.0, 0.0, 0.0),
     )
 
     def surviving(hits: list[Any]) -> list[tuple[MemoryRecord, float]]:
@@ -215,8 +264,9 @@ def _search(
     # until `limit` records survive them or the region runs out.
     k = max(limit, 32)
     while True:
-        hits = mem.recall(region, embedding=query_embedding, k=k, kinds=[KIND],
-                          options=options)
+        hits = mem.recall(
+            region, embedding=query_embedding, k=k, kinds=[KIND], options=options
+        )
         out = surviving(hits)
         if len(out) >= limit or len(hits) < k:
             return out[:limit]
@@ -233,7 +283,10 @@ def _delete(
     metadata_filter: dict[str, Any] | None,
 ) -> int:
     if record_ids is not None:
-        doomed = [h for rid in record_ids if (h := _by_id(mem, region, rid))]
+        wanted = set(record_ids)
+        if not wanted:
+            return 0
+        doomed = [h for h in _scan(mem, region, None) if h.payload.get("rid") in wanted]
     else:
         doomed = [
             h
@@ -254,11 +307,12 @@ class CitadelBackend:
         path: str = "crew_memory.cdl",
         key: str = "",
         *,
+        embedder: Any,
         region: str = "memory",
-        dim: int = DEFAULT_DIM,
     ) -> None:
         if not key:
             raise ValueError("a passphrase is required: memories are the payload")
+        embedder, dim = _require_embedder(embedder)
         try:
             self._db = citadeldb.connect(path, key=key, region_keys=True)
         except citadeldb.OperationalError as e:
@@ -270,11 +324,9 @@ class CitadelBackend:
             ) from e
         self._mem = self._db.memory()
         self._region = region
-        self._embedder = _PlaceholderEmbedder(dim)
+        self._dim = dim
         # Idempotent for a region of the same width, so a dim clash raises here.
-        self._mem.create_encrypted_region(region, self._embedder)
-
-    # ---- helpers ----------------------------------------------------------
+        self._mem.create_encrypted_region(region, embedder)
 
     def _by_id(self, record_id: str):
         return _by_id(self._mem, self._region, record_id)
@@ -298,15 +350,11 @@ class CitadelBackend:
             private=p.get("private", False),
         )
 
-    # ---- writes -----------------------------------------------------------
-
     def save(self, records: list[MemoryRecord]) -> None:
-        _save(self._mem, self._region, self._embedder.dim, records)
+        _save(self._mem, self._region, self._dim, records)
 
     def update(self, record: MemoryRecord) -> None:
         self.save([record])
-
-    # ---- reads ------------------------------------------------------------
 
     def get_record(self, record_id: str) -> MemoryRecord | None:
         hit = self._by_id(record_id)
@@ -322,17 +370,29 @@ class CitadelBackend:
         min_score: float = 0.0,
     ) -> list[tuple[MemoryRecord, float]]:
         return _search(
-            self._mem, self._region, query_embedding, scope_prefix, categories,
-            metadata_filter, limit, min_score,
+            self._mem,
+            self._region,
+            query_embedding,
+            scope_prefix,
+            categories,
+            metadata_filter,
+            limit,
+            min_score,
         )
 
     def list_records(
         self, scope_prefix: str | None = None, limit: int = 200, offset: int = 0
     ) -> list[MemoryRecord]:
-        hits = self._scan(scope_prefix)
-        return [self._record(h) for h in hits[offset : offset + limit]]
+        records = [self._record(h) for h in self._scan(scope_prefix)]
+        records.sort(
+            key=lambda record: (record.created_at is not None, record.created_at),
+            reverse=True,
+        )
+        return records[offset : offset + limit]
 
     def count(self, scope_prefix: str | None = None) -> int:
+        if scope_prefix is None:
+            return self._mem.count(self._region, KIND)
         return len(self._scan(scope_prefix))
 
     def list_categories(self, scope_prefix: str | None = None) -> dict[str, int]:
@@ -356,7 +416,9 @@ class CitadelBackend:
     def get_scope_info(self, scope: str) -> ScopeInfo:
         want = _norm(scope)
         hits = self._scan(want)
-        stamps = [h.payload.get("created_at") for h in hits if h.payload.get("created_at")]
+        stamps = [
+            h.payload.get("created_at") for h in hits if h.payload.get("created_at")
+        ]
         cats = {c for h in hits for c in h.payload.get("categories", [])}
         return ScopeInfo(
             path=want,
@@ -368,8 +430,6 @@ class CitadelBackend:
             child_scopes=self.list_scopes(want),
         )
 
-    # ---- deletes ----------------------------------------------------------
-
     def delete(
         self,
         scope_prefix: str | None = None,
@@ -379,20 +439,22 @@ class CitadelBackend:
         metadata_filter: dict[str, Any] | None = None,
     ) -> int:
         return _delete(
-            self._mem, self._region, scope_prefix, categories, record_ids,
-            older_than, metadata_filter,
+            self._mem,
+            self._region,
+            scope_prefix,
+            categories,
+            record_ids,
+            older_than,
+            metadata_filter,
         )
 
     def reset(self, scope_prefix: str | None = None) -> None:
         self.delete(scope_prefix=scope_prefix)
 
-    # ---- async ------------------------------------------------------------
     # The bindings are sync, so a worker thread keeps the event loop free.
 
     async def asave(self, records: list[MemoryRecord]) -> None:
-        await asyncio.to_thread(
-            _save, self._mem, self._region, self._embedder.dim, records
-        )
+        await asyncio.to_thread(_save, self._mem, self._region, self._dim, records)
 
     async def asearch(
         self,

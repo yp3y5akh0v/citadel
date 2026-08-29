@@ -1,7 +1,9 @@
 """LlamaIndex vector store over an encrypted Citadel region."""
+
 from __future__ import annotations
 
 import asyncio
+from operator import index
 from typing import Any
 
 import citadeldb
@@ -37,6 +39,60 @@ _SUPPORTED_MODES = (VectorStoreQueryMode.DEFAULT, VectorStoreQueryMode.HYBRID)
 # A Database is pinned to its opening thread, so workers take Memory, not self.
 
 
+def _model_id(embed_model: Any, override: str | None) -> str:
+    values = (
+        (override,)
+        if override is not None
+        else tuple(
+            getattr(embed_model, attr, None)
+            for attr in ("model_id", "model_name", "model")
+        )
+    )
+    for value in values:
+        name = value
+        if isinstance(name, str):
+            name = name.strip()
+            if name and name.lower() not in {"unknown", "default"}:
+                return name
+    if override is not None:
+        raise ValueError(
+            "model_id must be a nonblank string other than 'unknown' or 'default'"
+        )
+    raise ValueError(
+        "model_id is required when the LlamaIndex model does not expose a specific "
+        "model_id, model_name, or model"
+    )
+
+
+def _embedding_dim(value: Any) -> int:
+    try:
+        dim = index(value)
+    except TypeError as error:
+        raise ValueError(
+            "dim must be a positive integer no greater than 65535"
+        ) from error
+    if isinstance(value, bool) or not 1 <= dim <= 65_535:
+        raise ValueError("dim must be a positive integer no greater than 65535")
+    return dim
+
+
+class _LlamaIndexEmbedder:
+    """Expose one LlamaIndex model through Citadel's embedder protocol."""
+
+    metric = "cosine"
+
+    def __init__(self, embed_model: Any, dim: int, model_id: str) -> None:
+        self._embed_model = embed_model
+        self.dim = dim
+        self.model_id = model_id
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        return self._embed_model.get_text_embedding_batch(texts)
+
+    def embed_queries(self, texts: list[str]) -> list[list[float]]:
+        return [self._embed_model.get_query_embedding(text) for text in texts]
+
+
 def _pushdown(filters: MetadataFilters | None) -> dict[str, Any] | None:
     """Equality leaves of a top-level AND; this narrows and never decides.
 
@@ -63,6 +119,16 @@ def _keep(hits: list[Any], filters: MetadataFilters | None) -> list[Any]:
     if filters is None or not filters.filters:
         return hits
     by_id = {h.payload["nid"]: h.payload.get("meta", {}) for h in hits}
+    if filters.condition == FilterCondition.NOT:
+        # build_metadata_filter_fn first appears in 0.13.1, but that release's
+        # evaluator does not yet handle NOT. Match the later reference semantics:
+        # a NOT group survives only when none of its leaves match.
+        positive = MetadataFilters(
+            filters=filters.filters,
+            condition=FilterCondition.OR,
+        )
+        matches = build_metadata_filter_fn(lambda nid: by_id.get(nid, {}), positive)
+        return [h for h in hits if not matches(h.payload["nid"])]
     matches = build_metadata_filter_fn(lambda nid: by_id.get(nid, {}), filters)
     return [h for h in hits if matches(h.payload["nid"])]
 
@@ -104,7 +170,9 @@ def _fetch(mem: Any, region: str, criterion: dict[str, Any] | None) -> list[Any]
     out: list[Any] = []
     after = None
     while True:
-        page = mem.fetch(region, KIND, payload_filter=criterion, limit=PAGE, after_id=after)
+        page = mem.fetch(
+            region, KIND, payload_filter=criterion, limit=PAGE, after_id=after
+        )
         out.extend(page)
         if len(page) < PAGE:
             return out
@@ -115,25 +183,17 @@ def _add(mem: Any, region: str, dim: int, nodes: list[BaseNode]) -> list[str]:
     atoms: dict[str, dict[str, Any]] = {}
     ids: list[str] = []
     for node in nodes:
-        if node.embedding is None:
-            raise ValueError(
-                f"node {node.node_id} has no embedding. LlamaIndex embeds before it "
-                f"calls a store, so index through VectorStoreIndex or set "
-                f"node.embedding yourself."
-            )
-        if len(node.embedding) != dim:
+        if node.embedding is not None and len(node.embedding) != dim:
             raise ValueError(
                 f"node {node.node_id} has a {len(node.embedding)}-dimension embedding "
                 f"but this region is {dim}. Build the store with "
                 f"dim={len(node.embedding)} to match your embedding model."
             )
         # An id repeated in one call keeps its last value, like the reference.
-        atoms[node.node_id] = {
+        atom = {
             "kind": KIND,
             # What recall matches on, and the text the node is rebuilt with.
             "text": node.get_content(metadata_mode=MetadataMode.NONE) or "",
-            # Storing the framework's vector keeps one vector space.
-            "embedding": list(node.embedding),
             "payload": {
                 "nid": node.node_id,
                 "ref": node.ref_doc_id or "",
@@ -141,6 +201,10 @@ def _add(mem: Any, region: str, dim: int, nodes: list[BaseNode]) -> list[str]:
                 "meta": node_to_metadata_dict(node, remove_text=True),
             },
         }
+        if node.embedding is not None:
+            # Storing the framework's vector keeps one vector space.
+            atom["embedding"] = list(node.embedding)
+        atoms[node.node_id] = atom
         ids.append(node.node_id)
     if not atoms:
         return ids
@@ -173,8 +237,15 @@ def _selected(
     """Atoms named by `node_ids`, narrowed by `filters`. Both may be absent."""
     if node_ids is not None:
         wanted = set(node_ids)
-        # One indexed lookup per id beats scanning a region to find a handful.
-        hits = [h for nid in wanted for h in _fetch(mem, region, {"nid": nid})]
+        if not wanted:
+            return []
+        # Encrypted payloads cannot use the plaintext JSON index. Scan and
+        # decrypt the region once rather than once per requested id.
+        hits = [
+            h
+            for h in _fetch(mem, region, _pushdown(filters))
+            if h.payload.get("nid") in wanted
+        ]
     else:
         hits = _fetch(mem, region, _pushdown(filters))
     return _keep(hits, filters)
@@ -196,9 +267,7 @@ def _clear(mem: Any, region: str) -> int:
     return _erase(mem, region, _fetch(mem, region, None))
 
 
-def _query(
-    mem: Any, region: str, query: VectorStoreQuery
-) -> VectorStoreQueryResult:
+def _query(mem: Any, region: str, query: VectorStoreQuery) -> VectorStoreQueryResult:
     if query.mode not in _SUPPORTED_MODES:
         raise NotImplementedError(
             f"query mode {query.mode} is not supported; Citadel serves "
@@ -206,17 +275,15 @@ def _query(
         )
     if query.query_embedding is None:
         raise ValueError(
-            "query_embedding is required: this store does not embed, so the query "
-            "vector has to come from the index's embed_model"
+            "query_embedding is required by LlamaIndex's vector-store query contract; "
+            "it must come from the index's embed_model"
         )
     top_k = max(query.similarity_top_k, 0)
     if top_k == 0:
         return VectorStoreQueryResult(nodes=[], similarities=[], ids=[])
 
     criterion = _pushdown(query.filters)
-    options = (
-        citadeldb.RecallOptions(payload_filter=criterion) if criterion else None
-    )
+    options = citadeldb.RecallOptions(payload_filter=criterion) if criterion else None
 
     def surviving(hits: list[Any]) -> list[Any]:
         hits = _keep(hits, query.filters)
@@ -228,20 +295,22 @@ def _query(
             hits = [h for h in hits if h.payload.get("ref") in allowed]
         return hits
 
-    hits = _ranked(
-        mem,
-        region,
-        want=top_k,
-        surviving=surviving,
-        embedding=query.query_embedding,
-        kinds=[KIND],
-        options=options,
-    )
+    recall: dict[str, Any] = {
+        "embedding": query.query_embedding,
+        "kinds": [KIND],
+        "options": options,
+    }
+    if query.mode == VectorStoreQueryMode.HYBRID and query.query_str:
+        recall["text"] = query.query_str
+    hits = _ranked(mem, region, want=top_k, surviving=surviving, **recall)
     return VectorStoreQueryResult(
         nodes=[_node_of(h) for h in hits],
-        # Distance can dip below zero at real widths; cosine cannot exceed 1.
         similarities=[
-            min(1.0, 1.0 - h.distance) if h.distance is not None else h.score
+            h.score
+            if query.mode == VectorStoreQueryMode.HYBRID
+            else min(1.0, 1.0 - h.distance)
+            if h.distance is not None
+            else h.score
             for h in hits
         ],
         ids=[h.payload["nid"] for h in hits],
@@ -258,19 +327,31 @@ class CitadelVectorStore(BasePydanticVectorStore):
     _mem: Any = PrivateAttr(default=None)
     _region: str = PrivateAttr(default=DEFAULT_REGION)
     _dim: int = PrivateAttr(default=DEFAULT_DIM)
+    _embed_model: Any = PrivateAttr(default=None)
+    _model_id: str = PrivateAttr(default="")
 
     def __init__(
         self,
         path: str = DEFAULT_PATH,
         key: str = "",
         *,
+        embed_model: Any,
         region: str = DEFAULT_REGION,
         dim: int = DEFAULT_DIM,
+        model_id: str | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         if not key:
             raise ValueError("a passphrase is required: the corpus is the payload")
+        dim = _embedding_dim(dim)
+        if not callable(
+            getattr(embed_model, "get_text_embedding_batch", None)
+        ) or not callable(getattr(embed_model, "get_query_embedding", None)):
+            raise ValueError(
+                "embed_model must provide get_text_embedding_batch and get_query_embedding"
+            )
+        model_id = _model_id(embed_model, model_id)
         try:
             self._db = citadeldb.connect(path, key=key, region_keys=True)
         except citadeldb.OperationalError as e:
@@ -283,8 +364,12 @@ class CitadelVectorStore(BasePydanticVectorStore):
         self._mem = self._db.memory()
         self._region = region
         self._dim = dim
+        self._embed_model = embed_model
+        self._model_id = model_id
         # Idempotent for a region of the same width, so a dim clash raises here.
-        self._mem.create_encrypted_region(region, citadeldb.MockEmbedder(dim=dim))
+        self._mem.create_encrypted_region(
+            region, _LlamaIndexEmbedder(embed_model, dim, model_id)
+        )
 
     @classmethod
     def class_name(cls) -> str:
@@ -295,8 +380,6 @@ class CitadelVectorStore(BasePydanticVectorStore):
         """The Citadel memory engine backing this store."""
         return self._mem
 
-    # ---- the abstract surface --------------------------------------------
-
     def add(self, nodes: list[BaseNode], **kwargs: Any) -> list[str]:
         return _add(self._mem, self._region, self._dim, list(nodes))
 
@@ -305,8 +388,6 @@ class CitadelVectorStore(BasePydanticVectorStore):
 
     def query(self, query: VectorStoreQuery, **kwargs: Any) -> VectorStoreQueryResult:
         return _query(self._mem, self._region, query)
-
-    # ---- the optional surface --------------------------------------------
 
     def get_nodes(
         self,
@@ -326,7 +407,6 @@ class CitadelVectorStore(BasePydanticVectorStore):
     def clear(self) -> None:
         _clear(self._mem, self._region)
 
-    # ---- async -----------------------------------------------------------
     # The bindings are sync, so a worker thread keeps the event loop free.
 
     async def async_add(self, nodes: list[BaseNode], **kwargs: Any) -> list[str]:
@@ -364,11 +444,9 @@ class CitadelVectorStore(BasePydanticVectorStore):
     async def aclear(self) -> None:
         await asyncio.to_thread(_clear, self._mem, self._region)
 
-    # ---- beyond the protocol ---------------------------------------------
-
     def forget_document(self, ref_doc_id: str) -> int:
         """Destroy a source document's nodes, returning the number erased."""
         return _delete_ref(self._mem, self._region, ref_doc_id)
 
     def count(self) -> int:
-        return len(_fetch(self._mem, self._region, None))
+        return self._mem.count(self._region, KIND)

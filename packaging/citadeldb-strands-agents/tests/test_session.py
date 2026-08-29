@@ -1,15 +1,19 @@
 """Tests for CitadelSessionManager, asserted against FileSessionManager."""
+
 import concurrent.futures as cf
 import gc
 import os
 import tempfile
 
+import citadeldb
 import pytest
+from citadeldb_strands_agents import CitadelSessionManager
+from citadeldb_strands_agents.session import _require_embedder
 from strands.session.file_session_manager import FileSessionManager
 from strands.types.exceptions import SessionException
 from strands.types.session import Session, SessionAgent, SessionMessage, SessionType
 
-from citadeldb_strands_agents import CitadelSessionManager
+MOCK = citadeldb.MockEmbedder(dim=64)
 
 SID = "s1"
 AID = "a1"
@@ -20,7 +24,7 @@ def path(name="s.cdl"):
 
 
 def mgr(p=None, session_id=SID):
-    return CitadelSessionManager(session_id, p or path(), "pw")
+    return CitadelSessionManager(session_id, p or path(), "pw", embedder=MOCK)
 
 
 def ref(session_id=SID):
@@ -45,9 +49,6 @@ def seeded(m, n=3):
     return m
 
 
-# ---- construction mirrors the shipped managers ---------------------------
-
-
 def test_it_is_both_a_repository_and_a_manager():
     from strands.session.session_manager import SessionManager
     from strands.session.session_repository import SessionRepository
@@ -65,10 +66,7 @@ def test_constructing_it_creates_the_session_like_the_reference():
 
 def test_a_passphrase_is_required():
     with pytest.raises(ValueError, match="passphrase"):
-        CitadelSessionManager(SID, path(), "")
-
-
-# ---- session / agent / message contracts vs the reference ----------------
+        CitadelSessionManager(SID, path(), "", embedder=MOCK)
 
 
 def test_creating_a_duplicate_session_raises_like_the_reference():
@@ -116,9 +114,6 @@ def test_listing_messages_for_an_unknown_agent_raises_like_the_reference():
             store.list_messages(SID, "ghost")
 
 
-# ---- ordering and pagination --------------------------------------------
-
-
 def test_messages_come_back_in_conversation_order():
     m = seeded(mgr(), 5)
     assert [x.message_id for x in m.list_messages(SID, AID)] == [0, 1, 2, 3, 4]
@@ -139,9 +134,6 @@ def test_pagination_matches_the_reference():
         assert ours == theirs, (limit, offset, ours, theirs)
 
 
-# ---- no duplicates on repeat writes -------------------------------------
-
-
 def test_updating_a_message_does_not_duplicate_it():
     m = seeded(mgr(), 3)
     for text in ("one", "two", "three"):
@@ -157,9 +149,6 @@ def test_updating_an_agent_does_not_duplicate_it():
         a.state = {"n": 1}
         m.update_agent(SID, a)
     assert m.read_agent(SID, AID).state == {"n": 1}
-
-
-# ---- redaction: the reason to use an encrypted store --------------------
 
 
 def test_the_reference_keeps_the_redacted_text_on_disk():
@@ -234,9 +223,6 @@ def test_created_at_survives_an_update_like_the_reference():
         assert store.read_message(SID, AID, 0).created_at == first.created_at
 
 
-# ---- erasure -------------------------------------------------------------
-
-
 def test_forget_session_destroys_everything_it_owns():
     p = path()
     m = seeded(mgr(p), 3)
@@ -249,18 +235,16 @@ def test_forgetting_an_unknown_session_is_zero():
     assert mgr().forget_session("never") == 0
 
 
-# ---- persistence ---------------------------------------------------------
-
-
 def test_it_survives_a_reopen():
     p = path()
     first = seeded(mgr(p), 3)
-    first.update_agent(SID, SessionAgent(agent_id=AID, state={"k": "v"},
-                                         conversation_manager_state={}))
+    first.update_agent(
+        SID, SessionAgent(agent_id=AID, state={"k": "v"}, conversation_manager_state={})
+    )
     del first
     gc.collect()
 
-    again = CitadelSessionManager(SID, p, "pw")
+    again = CitadelSessionManager(SID, p, "pw", embedder=MOCK)
     assert again.read_session(SID) is not None
     assert again.read_agent(SID, AID).state == {"k": "v"}
     assert [x.message_id for x in again.list_messages(SID, AID)] == [0, 1, 2]
@@ -274,10 +258,7 @@ def test_a_wrong_passphrase_cannot_reopen():
     del first
     gc.collect()
     with pytest.raises(citadeldb.EncryptionError):
-        CitadelSessionManager(SID, p, "wrong")
-
-
-# ---- concurrency ---------------------------------------------------------
+        CitadelSessionManager(SID, p, "wrong", embedder=MOCK)
 
 
 def test_concurrent_message_writes_all_land():
@@ -295,7 +276,9 @@ def test_a_message_id_is_stored_once_however_often_it_is_written():
     m.create_message(SID, AID, msg(7, "from handler two"))
     stored = m.list_messages(SID, AID)
     assert [s.message_id for s in stored] == [7]
-    assert m.read_message(SID, AID, 7).message["content"][0]["text"] == "from handler two"
+    assert (
+        m.read_message(SID, AID, 7).message["content"][0]["text"] == "from handler two"
+    )
 
 
 def test_concurrent_writes_of_one_message_id_leave_one_record():
@@ -305,13 +288,10 @@ def test_concurrent_writes_of_one_message_id_leave_one_record():
     assert [s.message_id for s in m.list_messages(SID, AID)] == [3]
 
 
-# ---- scoping and content shapes -----------------------------------------
-
-
 def test_sessions_and_agents_are_scoped_exactly():
     p = path()
-    m = CitadelSessionManager("sess", p, "pw")
-    other = CitadelSessionManager("sess-2", p, "pw")
+    m = CitadelSessionManager("sess", p, "pw", embedder=MOCK)
+    other = CitadelSessionManager("sess-2", p, "pw", embedder=MOCK)
     m.create_agent("sess", agent())
     other.create_agent("sess-2", agent())
     m.create_message("sess", AID, msg(0, "mine"))
@@ -346,17 +326,66 @@ def test_agent_state_named_like_internal_fields_round_trips():
 
 def test_a_message_with_no_text_is_storable():
     m = seeded(mgr(), 0)
-    m.create_message(SID, AID, SessionMessage(
-        message={"role": "assistant", "content": []}, message_id=0
-    ))
+    m.create_message(
+        SID,
+        AID,
+        SessionMessage(message={"role": "assistant", "content": []}, message_id=0),
+    )
     assert len(m.list_messages(SID, AID)) == 1
 
 
 def test_two_managers_share_one_database_file():
     p = path()
-    a = CitadelSessionManager("sa", p, "pw")
-    b = CitadelSessionManager("sb", p, "pw")
+    a = CitadelSessionManager("sa", p, "pw", embedder=MOCK)
+    b = CitadelSessionManager("sb", p, "pw", embedder=MOCK)
     a.create_agent("sa", agent())
     a.create_message("sa", AID, msg(0, "in a"))
     assert a.read_session("sa") is not None and b.read_session("sb") is not None
     assert b.read_session("sa") is not None, "one file, both sessions visible"
+
+
+def test_an_embedder_is_required(tmp_path):
+    with pytest.raises(TypeError, match="embedder"):
+        CitadelSessionManager(SID, str(tmp_path / "no-embedder.cdl"), "pw")
+    partial = type(
+        "PartialEmbedder",
+        (),
+        {"dim": 8, "metric": "cosine", "embed": lambda self, texts: []},
+    )()
+    with pytest.raises(TypeError, match="model_id"):
+        CitadelSessionManager(
+            SID, str(tmp_path / "invalid-embedder.cdl"), "pw", embedder=partial
+        )
+    partial.model_id = "default"
+    with pytest.raises(TypeError, match="unknown.*default"):
+        CitadelSessionManager(
+            SID, str(tmp_path / "placeholder-embedder.cdl"), "pw", embedder=partial
+        )
+    artifacts = list(tmp_path.iterdir())
+    assert artifacts == [], f"invalid construction created vault sidecars: {artifacts}"
+
+
+def test_embedder_model_id_is_normalized_without_mutating_the_caller(tmp_path):
+    embedder = type(
+        "PaddedEmbedder",
+        (),
+        {
+            "dim": 8,
+            "metric": "cosine",
+            "model_id": "  stable-model  ",
+            "embed": lambda self, texts: [[0.0] * 8 for _ in texts],
+        },
+    )()
+
+    normalized = _require_embedder(embedder)
+
+    assert normalized.model_id == "stable-model"
+    assert embedder.model_id == "  stable-model  "
+    assert len(normalized.embed(["probe"])[0]) == 8
+
+    path = str(tmp_path / "normalized.cdl")
+    first = CitadelSessionManager("s", path, "pw", embedder=embedder)
+    first._db.close()
+    embedder.model_id = "stable-model"
+    second = CitadelSessionManager("s", path, "pw", embedder=embedder)
+    second._db.close()

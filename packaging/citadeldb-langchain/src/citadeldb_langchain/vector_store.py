@@ -1,9 +1,13 @@
 """LangChain vector store over an encrypted Citadel region."""
+
 from __future__ import annotations
 
 import asyncio
 import uuid
-from typing import Any, Iterable, Sequence
+from collections.abc import Iterable, Sequence
+from operator import index
+from pathlib import Path
+from typing import Any
 
 import citadeldb
 from langchain_core.documents import Document
@@ -21,12 +25,69 @@ _DIM_PROBE = "dimension probe"
 # A Database is pinned to its opening thread, so workers take Memory, not self.
 
 
+def _model_id(embedding: Embeddings, override: str | None) -> str:
+    """Resolve stable vector provenance without guessing from a class name."""
+    values = (
+        (override,)
+        if override is not None
+        else tuple(
+            getattr(embedding, attr, None)
+            for attr in ("model_id", "model", "model_name")
+        )
+    )
+    for value in values:
+        name = value
+        if isinstance(name, str):
+            name = name.strip()
+            if name and name.lower() not in {"unknown", "default"}:
+                return name
+    if override is not None:
+        raise ValueError(
+            "model_id must be a nonblank string other than 'unknown' or 'default'"
+        )
+    raise ValueError(
+        "model_id is required when the LangChain embedding does not expose a specific "
+        "model_id, model, or model_name"
+    )
+
+
+class _LangChainEmbedder:
+    """Expose one LangChain model through Citadel's embedder protocol."""
+
+    metric = "cosine"
+
+    def __init__(self, embedding: Embeddings, dim: int, model_id: str) -> None:
+        self._embedding = embedding
+        self.dim = dim
+        self.model_id = model_id
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        return self._embedding.embed_documents(texts)
+
+    def embed_queries(self, texts: list[str]) -> list[list[float]]:
+        return [self._embedding.embed_query(text) for text in texts]
+
+
+def _embedding_dim(value: Any) -> int:
+    try:
+        dim = index(value)
+    except TypeError as error:
+        raise ValueError(
+            "dim must be a positive integer no greater than 65535"
+        ) from error
+    if isinstance(value, bool) or not 1 <= dim <= 65_535:
+        raise ValueError("dim must be a positive integer no greater than 65535")
+    return dim
+
+
 def _fetch(mem: Any, region: str, criterion: dict[str, Any] | None) -> list[Any]:
     """Page to the end: one fetch is bounded, and a partial erase must not look whole."""
     out: list[Any] = []
     after = None
     while True:
-        page = mem.fetch(region, KIND, payload_filter=criterion, limit=PAGE, after_id=after)
+        page = mem.fetch(
+            region, KIND, payload_filter=criterion, limit=PAGE, after_id=after
+        )
         out.extend(page)
         if len(page) < PAGE:
             return out
@@ -56,6 +117,10 @@ def _write(
     metadatas: list[dict[str, Any]],
     vectors: list[list[float]],
 ) -> list[str]:
+    if len(vectors) != len(ids):
+        raise ValueError(
+            f"the embedding model returned {len(vectors)} vectors for {len(ids)} texts"
+        )
     for i, v in enumerate(vectors):
         if len(v) != dim:
             raise ValueError(
@@ -132,9 +197,7 @@ def _search(
         if metadata_filter
         else None
     )
-    hits = mem.recall(
-        region, embedding=embedding, k=k, kinds=[KIND], options=options
-    )
+    hits = mem.recall(region, embedding=embedding, k=k, kinds=[KIND], options=options)
     return [(_document(h), _similarity(h)) for h in hits]
 
 
@@ -197,31 +260,45 @@ class CitadelVectorStore(VectorStore):
         *,
         region: str = DEFAULT_REGION,
         dim: int | None = None,
+        model_id: str | None = None,
     ) -> None:
         if not key:
             raise ValueError("a passphrase is required: the corpus is the payload")
+        if not callable(getattr(embedding, "embed_documents", None)) or not callable(
+            getattr(embedding, "embed_query", None)
+        ):
+            raise TypeError("embedding must provide embed_documents and embed_query")
         self._embedding = embedding
-        # One probe so callers need not know their model's width.
-        self._dim = dim if dim is not None else len(embedding.embed_query(_DIM_PROBE))
-        try:
-            self._db = citadeldb.connect(path, key=key, region_keys=True)
-        except citadeldb.OperationalError as e:
-            if "locked" not in str(e):
-                raise
-            raise RuntimeError(
-                f"{path} is open in another process. Citadel is embedded, so one "
-                f"process owns the file."
-            ) from e
+        self._model_id = _model_id(embedding, model_id)
+
+        def connect(create: bool | None = None):
+            try:
+                return citadeldb.connect(path, key=key, create=create, region_keys=True)
+            except citadeldb.OperationalError as e:
+                if "locked" not in str(e):
+                    raise
+                raise RuntimeError(
+                    f"{path} is open in another process. Citadel is embedded, so one "
+                    f"process owns the file."
+                ) from e
+
+        is_file = path not in {"", ":memory:"}
+        existing = dim is None and is_file and Path(path).exists()
+        self._db = connect(False) if existing else None
+        inferred = dim if dim is not None else len(embedding.embed_query(_DIM_PROBE))
+        self._dim = _embedding_dim(inferred)
+        if self._db is None:
+            self._db = connect(True if dim is None and is_file else None)
         self._mem = self._db.memory()
         self._region = region
         # Idempotent for a region of the same width, so a dim clash raises here.
-        self._mem.create_encrypted_region(region, citadeldb.MockEmbedder(dim=self._dim))
+        self._mem.create_encrypted_region(
+            region, _LangChainEmbedder(embedding, self._dim, self._model_id)
+        )
 
     @property
     def embeddings(self) -> Embeddings:
         return self._embedding
-
-    # ---- writes -----------------------------------------------------------
 
     def add_texts(
         self,
@@ -242,20 +319,28 @@ class CitadelVectorStore(VectorStore):
     def delete(self, ids: list[str] | None = None, **kwargs: Any) -> bool:
         return _delete(self._mem, self._region, ids)
 
-    # ---- reads ------------------------------------------------------------
-
     def get_by_ids(self, ids: Sequence[str], /) -> list[Document]:
         return _get_by_ids(self._mem, self._region, ids)
 
     def similarity_search(
-        self, query: str, k: int = 4, *, filter: dict[str, Any] | None = None, **kwargs: Any
+        self,
+        query: str,
+        k: int = 4,
+        *,
+        filter: dict[str, Any] | None = None,
+        **kwargs: Any,
     ) -> list[Document]:
         return [
             doc for doc, _ in self.similarity_search_with_score(query, k, filter=filter)
         ]
 
     def similarity_search_with_score(
-        self, query: str, k: int = 4, *, filter: dict[str, Any] | None = None, **kwargs: Any
+        self,
+        query: str,
+        k: int = 4,
+        *,
+        filter: dict[str, Any] | None = None,
+        **kwargs: Any,
     ) -> list[tuple[Document, float]]:
         return _search(
             self._mem, self._region, self._embedding.embed_query(query), k, filter
@@ -269,7 +354,9 @@ class CitadelVectorStore(VectorStore):
         filter: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> list[Document]:
-        return [doc for doc, _ in _search(self._mem, self._region, embedding, k, filter)]
+        return [
+            doc for doc, _ in _search(self._mem, self._region, embedding, k, filter)
+        ]
 
     # `as_retriever(search_type="mmr")` reaches these; the base class raises.
 
@@ -287,7 +374,8 @@ class CitadelVectorStore(VectorStore):
         if not candidates:
             return []
         docs = [doc for doc, _ in candidates]
-        # Recall returns documents, not vectors, so candidates are re-embedded.
+        # Recall does not expose stored ANN vectors. Re-embedding avoids duplicating
+        # every high-dimensional vector in the encrypted JSON payload.
         vectors = self._embedding.embed_documents([d.page_content for d in docs])
         chosen = _mmr_indices(embedding, vectors, k=k, lambda_mult=lambda_mult)
         return [docs[i] for i in chosen]
@@ -310,7 +398,6 @@ class CitadelVectorStore(VectorStore):
         """Scores are cosine similarity; relevance only clamps to [0, 1]."""
         return lambda score: max(0.0, min(1.0, score))
 
-    # ---- async ------------------------------------------------------------
     # The bindings are sync, so a worker thread keeps the event loop free.
 
     async def aadd_texts(
@@ -337,15 +424,18 @@ class CitadelVectorStore(VectorStore):
         return await asyncio.to_thread(_get_by_ids, self._mem, self._region, list(ids))
 
     async def asimilarity_search(
-        self, query: str, k: int = 4, *, filter: dict[str, Any] | None = None, **kwargs: Any
+        self,
+        query: str,
+        k: int = 4,
+        *,
+        filter: dict[str, Any] | None = None,
+        **kwargs: Any,
     ) -> list[Document]:
         vector = await self._embedding.aembed_query(query)
         pairs = await asyncio.to_thread(
             _search, self._mem, self._region, vector, k, filter
         )
         return [doc for doc, _ in pairs]
-
-    # ---- construction -----------------------------------------------------
 
     @classmethod
     def from_texts(
@@ -359,17 +449,24 @@ class CitadelVectorStore(VectorStore):
         key: str = "",
         region: str = DEFAULT_REGION,
         dim: int | None = None,
+        model_id: str | None = None,
         **kwargs: Any,
     ) -> CitadelVectorStore:
-        store = cls(embedding, path, key, region=region, dim=dim)
+        store = cls(
+            embedding,
+            path,
+            key,
+            region=region,
+            dim=dim,
+            model_id=model_id,
+            **kwargs,
+        )
         store.add_texts(texts, metadatas, ids=ids)
         return store
-
-    # ---- beyond the interface ---------------------------------------------
 
     def clear(self) -> int:
         """Destroy every document's key, returning the number erased."""
         return _clear(self._mem, self._region)
 
     def count(self) -> int:
-        return len(_fetch(self._mem, self._region, None))
+        return self._mem.count(self._region, KIND)

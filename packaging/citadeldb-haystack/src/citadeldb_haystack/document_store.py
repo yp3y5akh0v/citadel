@@ -1,36 +1,128 @@
 """Haystack DocumentStore over an encrypted Citadel region."""
+
 from __future__ import annotations
 
 import asyncio
-import hashlib
+import threading
 from dataclasses import replace
-from typing import Any
+from operator import index
+from typing import Any, Literal
 
 import citadeldb
 from haystack import default_from_dict, default_to_dict
+from haystack.core.serialization import component_to_dict
 from haystack.dataclasses import Document
 from haystack.document_stores.errors import DuplicateDocumentError
 from haystack.document_stores.types import DuplicatePolicy
-from haystack.utils import Secret, deserialize_secrets_inplace
+from haystack.utils import Secret, deserialize_secrets_inplace, expit
 from haystack.utils.filters import document_matches_filter
+
+try:
+    from haystack.utils.deserialization import (
+        deserialize_component_inplace as _deserialize_component_inplace,
+    )
+except ImportError:  # Haystack 2.9-2.28
+    from haystack.core.serialization import component_from_dict, import_class_by_name
+
+    def _deserialize_component_inplace(data: dict[str, Any], key: str) -> None:
+        serialized = data[key]
+        cls = import_class_by_name(serialized["type"])
+        data[key] = component_from_dict(cls, serialized, key)
+
 
 KIND = "doc"
 DEFAULT_PATH = "haystack.cdl"
 DEFAULT_REGION = "documents"
+_DEFAULT_KEY = Secret.from_env_var("CITADEL_KEY")
 # The default width of Haystack's own embedders and of its conformance fixtures.
 DEFAULT_DIM = 768
 PAGE = 10_000
 # Haystack prefixes metadata fields; bare names address the document.
 _META_PREFIX = "meta."
+_SIMILARITY_METRICS = {"cosine": "cosine", "dot_product": "inner"}
 
 
 # A Database is pinned to its opening thread, so workers take Memory, not self.
 
 
-def _placeholder(text: str, dim: int) -> list[float]:
-    """A deterministic vector for a document Haystack did not embed."""
-    digest = hashlib.sha256(text.encode()).digest()
-    return [digest[i % len(digest)] / 255.0 for i in range(dim)]
+def _model_id(embedder: Any, override: str | None) -> str:
+    values = (
+        (override,)
+        if override is not None
+        else tuple(
+            getattr(embedder, attr, None)
+            for attr in ("model_id", "model", "model_name")
+        )
+    )
+    for value in values:
+        name = value
+        if isinstance(name, str):
+            name = name.strip()
+            if name and name.lower() not in {"unknown", "default"}:
+                return name
+    if override is not None:
+        raise ValueError(
+            "model_id must be a nonblank string other than 'unknown' or 'default'"
+        )
+    raise ValueError(
+        "model_id is required when the Haystack embedder does not expose a specific "
+        "model_id, model, or model_name"
+    )
+
+
+def _embedding_dim(value: Any) -> int:
+    try:
+        dim = index(value)
+    except TypeError as error:
+        raise ValueError(
+            "dim must be a positive integer no greater than 65535"
+        ) from error
+    if isinstance(value, bool) or not 1 <= dim <= 65_535:
+        raise ValueError("dim must be a positive integer no greater than 65535")
+    return dim
+
+
+def _similarity_function(value: str) -> tuple[str, str]:
+    if value not in _SIMILARITY_METRICS:
+        raise ValueError(
+            "embedding_similarity_function must be 'cosine' or 'dot_product'"
+        )
+    return value, _SIMILARITY_METRICS[value]
+
+
+class _HaystackEmbedder:
+    """Expose one Haystack text embedder through Citadel's batch protocol."""
+
+    def __init__(self, embedder: Any, dim: int, model_id: str, metric: str) -> None:
+        self._embedder = embedder
+        self.dim = dim
+        self.model_id = model_id
+        self.metric = metric
+        self._warm_up = getattr(embedder, "warm_up", None)
+        self._warm_lock = threading.Lock()
+        self._warmed = not callable(self._warm_up)
+
+    def _ensure_warm(self) -> None:
+        if self._warmed:
+            return
+        with self._warm_lock:
+            if not self._warmed:
+                self._warm_up()
+                self._warmed = True
+
+    def _one(self, text: str) -> list[float]:
+        self._ensure_warm()
+        result = self._embedder.run(text=text)
+        vector = result.get("embedding")
+        if not isinstance(vector, list):
+            raise ValueError("the Haystack embedder did not return an 'embedding' list")
+        return vector
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        return [self._one(text) for text in texts]
+
+    def embed_queries(self, texts: list[str]) -> list[list[float]]:
+        return self.embed(texts)
 
 
 def _fetch(mem: Any, region: str, criterion: dict[str, Any] | None) -> list[Any]:
@@ -38,7 +130,9 @@ def _fetch(mem: Any, region: str, criterion: dict[str, Any] | None) -> list[Any]
     out: list[Any] = []
     after = None
     while True:
-        page = mem.fetch(region, KIND, payload_filter=criterion, limit=PAGE, after_id=after)
+        page = mem.fetch(
+            region, KIND, payload_filter=criterion, limit=PAGE, after_id=after
+        )
         out.extend(page)
         if len(page) < PAGE:
             return out
@@ -78,7 +172,7 @@ def _pushdown(filters: dict[str, Any] | None) -> dict[str, Any] | None:
             # absent, which containment cannot express at all.
             and isinstance(c.get("value"), str)
         ):
-            path = tuple(p for p in field[len(_META_PREFIX):].split(".") if p)
+            path = tuple(p for p in field[len(_META_PREFIX) :].split(".") if p)
             if path:
                 leaves.append((path, c["value"]))
     eq = _needle(leaves)
@@ -98,7 +192,8 @@ def _needle(leaves: list[tuple[tuple[str, ...], Any]]) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for path, value in leaves:
         if any(
-            other is not path and (other[: len(path)] == path or path[: len(other)] == other)
+            other is not path
+            and (other[: len(path)] == path or path[: len(other)] == other)
             for other, _ in leaves
         ):
             continue
@@ -123,32 +218,30 @@ def _atom(doc: Document, dim: int) -> dict[str, Any]:
             f"this region is {dim}. Build the store with dim={len(doc.embedding)} to "
             f"match your embedding model."
         )
-    return {
+    atom = {
         "kind": KIND,
         "text": doc.content or "",
-        "embedding": (
-            list(doc.embedding)
-            if doc.embedding is not None
-            else _placeholder(doc.content or doc.id, dim)
-        ),
-        # Unflattened so the document round-trips whole. `emb` records whether
-        # the vector above is Haystack's or the placeholder, which is what keeps
-        # a hash of the text out of embedding_retrieval's answers.
+        # Unflattened so the document round-trips whole.
         "payload": {
             "did": doc.id,
-            "emb": doc.embedding is not None,
             "doc": doc.to_dict(flatten=False),
         },
     }
+    if doc.embedding is not None:
+        atom["embedding"] = list(doc.embedding)
+    return atom
 
 
 def _write(
     mem: Any,
     region: str,
     dim: int,
+    embedder: _HaystackEmbedder,
     documents: list[Document],
     policy: DuplicatePolicy,
 ) -> int:
+    if not documents:
+        return 0
     if policy == DuplicatePolicy.NONE:
         policy = DuplicatePolicy.FAIL  # as InMemoryDocumentStore defaults
 
@@ -156,14 +249,16 @@ def _write(
     # the keyed write below supersedes whatever the id already named.
     seen: set[str] = set()
     if policy != DuplicatePolicy.OVERWRITE:
-        # A live id set: a second copy in one batch collides like a stored one.
+        wanted = {doc.id for doc in documents}
+        # Encrypted payload filters cannot avoid decrypting the region, so build
+        # the live id set in one pass rather than one pass per input document.
         seen = {
             h.payload["did"]
-            for doc in documents
-            for h in _fetch(mem, region, {"did": doc.id})
+            for h in _fetch(mem, region, None)
+            if h.payload.get("did") in wanted
         }
     written = len(documents)
-    atoms: dict[str, dict[str, Any]] = {}
+    accepted: dict[str, Document] = {}
     for doc in documents:
         if policy != DuplicatePolicy.OVERWRITE and doc.id in seen:
             if policy == DuplicatePolicy.FAIL:
@@ -171,8 +266,16 @@ def _write(
             written -= 1  # SKIP: the copy already accepted stands
             continue
         # Last copy of an id in one batch wins, as the reference's dict does.
-        atoms[doc.id] = _atom(doc, dim)
+        accepted[doc.id] = doc
         seen.add(doc.id)
+    atoms: dict[str, dict[str, Any]] = {}
+    for did, doc in accepted.items():
+        atom = _atom(doc, dim)
+        if doc.embedding is None:
+            generated = embedder._one(doc.content or "")
+            atom["embedding"] = generated
+            atom["payload"]["generated_embedding"] = generated
+        atoms[did] = atom
     if atoms:
         # Keyed on the document id and committed as one transaction: two writers
         # of one id supersede rather than each adding a row, which a read out
@@ -186,15 +289,16 @@ def _write(
 
 def _delete(mem: Any, region: str, document_ids: list[str]) -> int:
     # Contracted not to fail on an id that is not present.
+    wanted = set(document_ids)
     return _erase(
         mem,
         region,
-        [h for did in dict.fromkeys(document_ids) for h in _fetch(mem, region, {"did": did})],
+        [h for h in _fetch(mem, region, None) if h.payload.get("did") in wanted],
     )
 
 
 def _count(mem: Any, region: str) -> int:
-    return len(_fetch(mem, region, None))
+    return mem.count(region, KIND)
 
 
 class CitadelDocumentStore:
@@ -203,18 +307,35 @@ class CitadelDocumentStore:
     def __init__(
         self,
         path: str = DEFAULT_PATH,
-        key: Secret | str = Secret.from_env_var("CITADEL_KEY"),
+        key: Secret | str = _DEFAULT_KEY,
         *,
+        embedder: Any,
         region: str = DEFAULT_REGION,
         dim: int = DEFAULT_DIM,
+        model_id: str | None = None,
+        embedding_similarity_function: Literal["cosine", "dot_product"] = "dot_product",
     ) -> None:
         self._key = Secret.from_token(key) if isinstance(key, str) else key
         passphrase = self._key.resolve_value()
         if not passphrase:
             raise ValueError("a passphrase is required: the corpus is the payload")
+        dim = _embedding_dim(dim)
+        if not callable(getattr(embedder, "run", None)):
+            raise ValueError(
+                "embedder must be a Haystack text embedder with run(text=...)"
+            )
+        model_id = _model_id(embedder, model_id)
+        embedding_similarity_function, metric = _similarity_function(
+            embedding_similarity_function
+        )
+        memory_embedder = _HaystackEmbedder(embedder, dim, model_id, metric)
         self._path = path
         self._region = region
         self._dim = dim
+        self._model_id = model_id
+        self._embedder = embedder
+        self._memory_embedder = memory_embedder
+        self.embedding_similarity_function = embedding_similarity_function
         try:
             self._db = citadeldb.connect(path, key=passphrase, region_keys=True)
         except citadeldb.OperationalError as e:
@@ -226,9 +347,7 @@ class CitadelDocumentStore:
             ) from e
         self._mem = self._db.memory()
         # Idempotent for a region of the same width, so a dim clash raises here.
-        self._mem.create_encrypted_region(region, citadeldb.MockEmbedder(dim=dim))
-
-    # ---- serialization ----------------------------------------------------
+        self._mem.create_encrypted_region(region, memory_embedder)
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize for a pipeline file; a literal passphrase refuses."""
@@ -236,16 +355,18 @@ class CitadelDocumentStore:
             self,
             path=self._path,
             key=self._key.to_dict(),
+            embedder=component_to_dict(self._embedder, name="embedder"),
             region=self._region,
             dim=self._dim,
+            model_id=self._model_id,
+            embedding_similarity_function=self.embedding_similarity_function,
         )
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> CitadelDocumentStore:
         deserialize_secrets_inplace(data["init_parameters"], keys=["key"])
+        _deserialize_component_inplace(data["init_parameters"], key="embedder")
         return default_from_dict(cls, data)
-
-    # ---- the protocol -----------------------------------------------------
 
     def count_documents(self) -> int:
         return _count(self._mem, self._region)
@@ -260,12 +381,18 @@ class CitadelDocumentStore:
             not isinstance(d, Document) for d in documents
         ):
             raise ValueError("Please provide a list of Documents.")
-        return _write(self._mem, self._region, self._dim, documents, policy)
+        return _write(
+            self._mem,
+            self._region,
+            self._dim,
+            self._memory_embedder,
+            documents,
+            policy,
+        )
 
     def delete_documents(self, document_ids: list[str]) -> None:
         _delete(self._mem, self._region, document_ids)
 
-    # ---- async ------------------------------------------------------------
     # The bindings are sync, so a worker thread keeps the event loop free.
 
     async def count_documents_async(self) -> int:
@@ -284,29 +411,36 @@ class CitadelDocumentStore:
         ):
             raise ValueError("Please provide a list of Documents.")
         return await asyncio.to_thread(
-            _write, self._mem, self._region, self._dim, documents, policy
+            _write,
+            self._mem,
+            self._region,
+            self._dim,
+            self._memory_embedder,
+            documents,
+            policy,
         )
 
     async def delete_documents_async(self, document_ids: list[str]) -> None:
         await asyncio.to_thread(_delete, self._mem, self._region, document_ids)
 
-    # ---- beyond the protocol ----------------------------------------------
-
     def embedding_retrieval(
         self,
         query_embedding: list[float],
-        top_k: int = 10,
         filters: dict[str, Any] | None = None,
+        top_k: int = 10,
+        scale_score: bool = False,
+        return_embedding: bool = False,
     ) -> list[Document]:
         """Documents ranked by recall, best first, with their score set.
 
-        Only documents Haystack embedded take part, as its own store does: an
-        unembedded one carries a hash of its text, and ranking that against a
-        real query vector produces a plausible score with no meaning behind it.
+        Documents without a supplied vector are embedded by the store's model.
         """
-        criterion = _pushdown(filters) or {}
-        criterion = {**criterion, "emb": True}
-        options = citadeldb.RecallOptions(payload_filter=criterion)
+        if not query_embedding or not isinstance(query_embedding[0], float):
+            raise ValueError("query_embedding should be a non-empty list of floats.")
+        criterion = _pushdown(filters)
+        options = (
+            citadeldb.RecallOptions(payload_filter=criterion) if criterion else None
+        )
 
         def surviving(hits: list[Any]) -> list[Document]:
             out: list[Document] = []
@@ -314,13 +448,31 @@ class CitadelDocumentStore:
                 doc = _document(h)
                 if filters and not document_matches_filter(filters, doc):
                     continue
+                if h.distance is None:
+                    score = h.score
+                elif self.embedding_similarity_function == "dot_product":
+                    score = -h.distance
+                else:
+                    score = max(-1.0, min(1.0, 1.0 - h.distance))
+                if scale_score:
+                    score = (
+                        expit(score / 100.0)
+                        if self.embedding_similarity_function == "dot_product"
+                        else (score + 1.0) / 2.0
+                    )
+                returned_embedding = None
+                if return_embedding:
+                    returned_embedding = (
+                        doc.embedding
+                        if doc.embedding is not None
+                        else h.payload.get("generated_embedding")
+                    )
                 # Mutating a shared Document would affect other pipeline steps.
                 out.append(
                     replace(
                         doc,
-                        score=min(1.0, 1.0 - h.distance)
-                        if h.distance is not None
-                        else h.score,
+                        score=score,
+                        embedding=returned_embedding,
                     )
                 )
             return out

@@ -1,10 +1,12 @@
 """OpenAI Agents SDK sessions over an encrypted Citadel region."""
+
 from __future__ import annotations
 
 import asyncio
 import json
 import time
-from typing import TYPE_CHECKING, Any
+from operator import index
+from typing import TYPE_CHECKING, Any, cast
 
 import citadeldb
 from agents.memory.session_settings import (
@@ -21,6 +23,59 @@ DEFAULT_PATH = "agent_sessions.cdl"
 DEFAULT_REGION = "sessions"
 # fetch is id-ascending and its limit takes oldest rows, so window in Python.
 PAGE = 10_000
+_METRICS = {"cosine", "cos", "l2", "euclidean", "ip", "inner", "inner_product", "dot"}
+
+
+class _Unset:
+    pass
+
+
+_UNSET = _Unset()
+
+
+class _NormalizedEmbedder:
+    def __init__(self, embedder: Any, model_id: str) -> None:
+        self._embedder = embedder
+        self.model_id = model_id
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._embedder, name)
+
+
+def _require_embedder(embedder: Any) -> Any:
+    raw_dim = getattr(embedder, "dim", None)
+    try:
+        dim = index(raw_dim)
+    except TypeError as error:
+        raise TypeError(
+            "embedder dim must be a positive integer no greater than 65535"
+        ) from error
+    if isinstance(raw_dim, bool) or not 1 <= dim <= 65_535:
+        raise TypeError("embedder dim must be a positive integer no greater than 65535")
+    metric = getattr(embedder, "metric", None)
+    if not isinstance(metric, str) or metric.lower() not in _METRICS:
+        raise TypeError("embedder metric must be cosine, l2, or inner")
+    model_id = getattr(embedder, "model_id", None)
+    if (
+        not isinstance(model_id, str)
+        or not model_id.strip()
+        or model_id.strip().lower() in {"unknown", "default"}
+    ):
+        raise TypeError(
+            "embedder model_id must be a nonblank string other than 'unknown' or 'default'"
+        )
+    if not callable(getattr(embedder, "embed", None)):
+        raise TypeError("embedder must provide a callable embed(texts) method")
+    missing = object()
+    embed_queries = getattr(embedder, "embed_queries", missing)
+    if embed_queries is not missing and not callable(embed_queries):
+        raise TypeError("embedder embed_queries attribute must be callable")
+    normalized = model_id.strip()
+    return (
+        embedder
+        if normalized == model_id
+        else _NormalizedEmbedder(embedder, normalized)
+    )
 
 
 def _page(mem: Any, region: str, criterion: dict[str, Any] | None = None) -> list[Any]:
@@ -28,7 +83,9 @@ def _page(mem: Any, region: str, criterion: dict[str, Any] | None = None) -> lis
     out: list[Any] = []
     after = None
     while True:
-        got = mem.fetch(region, KIND, payload_filter=criterion, limit=PAGE, after_id=after)
+        got = mem.fetch(
+            region, KIND, payload_filter=criterion, limit=PAGE, after_id=after
+        )
         out.extend(got)
         if len(got) < PAGE:
             return out
@@ -61,12 +118,13 @@ class CitadelSessionStore:
         path: str,
         key: str,
         *,
+        embedder: Any,
         region: str = DEFAULT_REGION,
-        embedder: Any | None = None,
         ttl: float | None = None,
     ) -> None:
         if not key:
             raise ValueError("a passphrase is required: transcripts are the payload")
+        embedder = _require_embedder(embedder)
         try:
             self._db = citadeldb.connect(path, key=key, region_keys=True)
         except citadeldb.OperationalError as e:
@@ -80,11 +138,7 @@ class CitadelSessionStore:
         self._region = region
         self._ttl = ttl
         # Idempotent for a region of the same width, so a dim clash raises here.
-        self._mem.create_encrypted_region(
-            region, embedder or citadeldb.MockEmbedder(dim=64)
-        )
-
-    # ---- session minting --------------------------------------------------
+        self._mem.create_encrypted_region(region, embedder)
 
     def session(
         self,
@@ -92,9 +146,7 @@ class CitadelSessionStore:
         *,
         session_settings: SessionSettings | dict[str, Any] | None = None,
     ) -> CitadelSession:
-        return CitadelSession(
-            session_id, store=self, session_settings=session_settings
-        )
+        return CitadelSession(session_id, store=self, session_settings=session_settings)
 
     def session_ids(self) -> list[str]:
         """Every session holding at least one item, sorted."""
@@ -104,8 +156,6 @@ class CitadelSessionStore:
     def close(self) -> None:
         """Release this store's handle; other holders of the file keep theirs."""
         self._db.close()
-
-    # ---- storage ----------------------------------------------------------
 
     def items(self, session_id: str) -> list[Any]:
         """Every atom for one session, oldest first."""
@@ -214,14 +264,14 @@ class CitadelSession:
     def __init__(
         self,
         session_id: str,
-        db_path: str = DEFAULT_PATH,
-        key: str = "",
+        db_path: str | _Unset = _UNSET,
+        key: str | _Unset = _UNSET,
         *,
         store: CitadelSessionStore | None = None,
         session_settings: SessionSettings | dict[str, Any] | None = None,
-        region: str = DEFAULT_REGION,
-        embedder: Any | None = None,
-        ttl: float | None = None,
+        region: str | _Unset = _UNSET,
+        embedder: Any = _UNSET,
+        ttl: float | None | _Unset = _UNSET,
     ) -> None:
         self.session_id = session_id
         # The protocol reads this attribute directly, so None must stay None.
@@ -230,16 +280,45 @@ class CitadelSession:
             if session_settings is not None
             else None
         )
-        # Building a store per session is cheap: they share one open database.
-        self._store = store or CitadelSessionStore(
-            db_path, key, region=region, embedder=embedder, ttl=ttl
-        )
+        if store is None:
+            if embedder is _UNSET or embedder is None:
+                raise TypeError("embedder is required when store is not provided")
+            resolved_path = DEFAULT_PATH if db_path is _UNSET else cast(str, db_path)
+            resolved_key = "" if key is _UNSET else cast(str, key)
+            resolved_region = DEFAULT_REGION if region is _UNSET else cast(str, region)
+            resolved_ttl = None if ttl is _UNSET else cast(float | None, ttl)
+            # Building a store per session is cheap: they share one open database.
+            store = CitadelSessionStore(
+                resolved_path,
+                resolved_key,
+                region=resolved_region,
+                embedder=embedder,
+                ttl=resolved_ttl,
+            )
+        else:
+            conflicting = [
+                name
+                for name, supplied in (
+                    ("db_path", db_path is not _UNSET),
+                    ("key", key is not _UNSET),
+                    ("region", region is not _UNSET),
+                    ("embedder", embedder is not _UNSET),
+                    ("ttl", ttl is not _UNSET),
+                )
+                if supplied
+            ]
+            if conflicting:
+                joined = ", ".join(conflicting)
+                raise TypeError(
+                    f"{joined} cannot be supplied with store; the store owns its "
+                    "database, region, embedder, and retention policy"
+                )
+        self._store = store
         # Held directly so a dispatched call never touches the pinned store.
         self._mem = self._store._mem
         self._region = self._store._region
         self._ttl = self._store._ttl
 
-    # ---- the protocol surface ---------------------------------------------
     # The bindings are sync, so a worker thread keeps the event loop free.
 
     async def get_items(self, limit: int | None = None) -> list[TResponseInputItem]:
@@ -256,14 +335,10 @@ class CitadelSession:
         )
 
     async def pop_item(self) -> TResponseInputItem | None:
-        return await asyncio.to_thread(
-            _pop, self._mem, self._region, self.session_id
-        )
+        return await asyncio.to_thread(_pop, self._mem, self._region, self.session_id)
 
     async def clear_session(self) -> None:
         await asyncio.to_thread(_clear, self._mem, self._region, self.session_id)
-
-    # ---- beyond the protocol ----------------------------------------------
 
     async def search(self, query: str, *, limit: int = 5) -> list[TResponseInputItem]:
         """Items from this session ranked by hybrid recall, best first."""

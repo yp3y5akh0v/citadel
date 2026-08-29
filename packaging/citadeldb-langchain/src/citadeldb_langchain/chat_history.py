@@ -1,8 +1,11 @@
 """LangChain chat message history over an encrypted Citadel region."""
+
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Sequence
+from collections.abc import Sequence
+from operator import index
+from typing import Any
 
 import citadeldb
 from langchain_core.chat_history import BaseChatMessageHistory
@@ -12,6 +15,52 @@ KIND = "message"
 DEFAULT_PATH = "langchain_history.cdl"
 DEFAULT_REGION = "chat_history"
 PAGE = 10_000
+_METRICS = {"cosine", "cos", "l2", "euclidean", "ip", "inner", "inner_product", "dot"}
+
+
+class _NormalizedEmbedder:
+    def __init__(self, embedder: Any, model_id: str) -> None:
+        self._embedder = embedder
+        self.model_id = model_id
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._embedder, name)
+
+
+def _require_embedder(embedder: Any) -> Any:
+    raw_dim = getattr(embedder, "dim", None)
+    try:
+        dim = index(raw_dim)
+    except TypeError as error:
+        raise TypeError(
+            "embedder dim must be a positive integer no greater than 65535"
+        ) from error
+    if isinstance(raw_dim, bool) or not 1 <= dim <= 65_535:
+        raise TypeError("embedder dim must be a positive integer no greater than 65535")
+    metric = getattr(embedder, "metric", None)
+    if not isinstance(metric, str) or metric.lower() not in _METRICS:
+        raise TypeError("embedder metric must be cosine, l2, or inner")
+    model_id = getattr(embedder, "model_id", None)
+    if (
+        not isinstance(model_id, str)
+        or not model_id.strip()
+        or model_id.strip().lower() in {"unknown", "default"}
+    ):
+        raise TypeError(
+            "embedder model_id must be a nonblank string other than 'unknown' or 'default'"
+        )
+    if not callable(getattr(embedder, "embed", None)):
+        raise TypeError("embedder must provide a callable embed(texts) method")
+    missing = object()
+    embed_queries = getattr(embedder, "embed_queries", missing)
+    if embed_queries is not missing and not callable(embed_queries):
+        raise TypeError("embedder embed_queries attribute must be callable")
+    normalized = model_id.strip()
+    return (
+        embedder
+        if normalized == model_id
+        else _NormalizedEmbedder(embedder, normalized)
+    )
 
 
 def _page(mem: Any, region: str, session_id: str) -> list[Any]:
@@ -19,8 +68,9 @@ def _page(mem: Any, region: str, session_id: str) -> list[Any]:
     out: list[Any] = []
     after = None
     while True:
-        got = mem.fetch(region, KIND, payload_filter={"sid": session_id}, limit=PAGE,
-                        after_id=after)
+        got = mem.fetch(
+            region, KIND, payload_filter={"sid": session_id}, limit=PAGE, after_id=after
+        )
         out.extend(got)
         if len(got) < PAGE:
             return out
@@ -81,11 +131,12 @@ class CitadelChatMessageHistory(BaseChatMessageHistory):
         path: str = DEFAULT_PATH,
         key: str = "",
         *,
+        embedder: Any,
         region: str = DEFAULT_REGION,
-        embedder: Any | None = None,
     ) -> None:
         if not key:
             raise ValueError("a passphrase is required: transcripts are the payload")
+        embedder = _require_embedder(embedder)
         self.session_id = session_id
         try:
             self._db = citadeldb.connect(path, key=key, region_keys=True)
@@ -99,9 +150,7 @@ class CitadelChatMessageHistory(BaseChatMessageHistory):
         self._mem = self._db.memory()
         self._region = region
         # Idempotent for a region of the same width, so a dim clash raises here.
-        self._mem.create_encrypted_region(
-            region, embedder or citadeldb.MockEmbedder(dim=64)
-        )
+        self._mem.create_encrypted_region(region, embedder)
 
     @property
     def messages(self) -> list[BaseMessage]:
@@ -113,7 +162,6 @@ class CitadelChatMessageHistory(BaseChatMessageHistory):
     def clear(self) -> None:
         _clear(self._mem, self._region, self.session_id)
 
-    # ---- async ------------------------------------------------------------
     # The bindings are sync, so a worker thread keeps the event loop free.
 
     async def aget_messages(self) -> list[BaseMessage]:
@@ -128,8 +176,6 @@ class CitadelChatMessageHistory(BaseChatMessageHistory):
 
     async def aclear(self) -> None:
         await asyncio.to_thread(_clear, self._mem, self._region, self.session_id)
-
-    # ---- beyond the interface ---------------------------------------------
 
     def forget(self) -> int:
         """Destroy this session's messages, returning the number erased."""

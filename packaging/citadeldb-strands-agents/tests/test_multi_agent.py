@@ -1,13 +1,16 @@
 """Multi-agent state and the manager paths the framework drives."""
+
 import os
 import tempfile
 
+import citadeldb
 import pytest
+from citadeldb_strands_agents import CitadelSessionManager
 from strands.session.file_session_manager import FileSessionManager
 from strands.types.exceptions import SessionException
 from strands.types.session import SessionAgent, SessionMessage
 
-from citadeldb_strands_agents import CitadelSessionManager
+MOCK = citadeldb.MockEmbedder(dim=64)
 
 SID, AID = "s1", "a1"
 
@@ -17,7 +20,7 @@ def path(name="s.cdl"):
 
 
 def mgr(p=None, session_id=SID):
-    return CitadelSessionManager(session_id, p or path(), "pw")
+    return CitadelSessionManager(session_id, p or path(), "pw", embedder=MOCK)
 
 
 def ref(session_id=SID):
@@ -46,9 +49,6 @@ class FakeMultiAgent:
 
     def deserialize_state(self, state):
         self._state = dict(state)
-
-
-# ---- multi-agent state: the base class raises without these --------------
 
 
 def test_multi_agent_state_round_trips():
@@ -80,6 +80,24 @@ def test_updating_multi_agent_state_does_not_duplicate():
     assert m.read_multi_agent(SID, "swarm-1")["step"] == 5
 
 
+def test_agent_and_multi_agent_with_the_same_id_do_not_alias():
+    m = mgr()
+    shared_id = "shared"
+    session_agent = agent(shared_id)
+    session_agent.state = {"owner": "agent", "version": 1}
+    swarm = FakeMultiAgent(shared_id, {"owner": "multi", "version": 1})
+    m.create_agent(SID, session_agent)
+    m.create_multi_agent(SID, swarm)
+
+    session_agent.state["version"] = 2
+    swarm._state["version"] = 2
+    m.update_agent(SID, session_agent)
+    m.update_multi_agent(SID, swarm)
+
+    assert m.read_agent(SID, shared_id).state == {"owner": "agent", "version": 2}
+    assert m.read_multi_agent(SID, shared_id) == {"owner": "multi", "version": 2}
+
+
 def test_the_manager_hook_initializes_multi_agent_state():
     """initialize_multi_agent creates on first sight and restores afterwards."""
     p = path()
@@ -92,7 +110,7 @@ def test_the_manager_hook_initializes_multi_agent_state():
     import gc
 
     gc.collect()
-    again = CitadelSessionManager(SID, p, "pw")
+    again = CitadelSessionManager(SID, p, "pw", embedder=MOCK)
     restored = FakeMultiAgent(state={"step": 0})
     again.initialize_multi_agent(restored)
     assert restored._state["step"] == 7, "multi-agent state did not restore"
@@ -105,29 +123,28 @@ def test_forget_session_also_destroys_multi_agent_state():
     assert m.read_multi_agent(SID, "swarm-1") is None
 
 
-# ---- the path an Agent actually takes ------------------------------------
-
-
 def test_an_agent_restores_its_history_through_the_manager():
     """initialize() is what Agent construction calls."""
     from strands import Agent
 
     p = path()
     first = mgr(p)
-    a = Agent(agent_id=AID, session_manager=first, messages=[
-        {"role": "user", "content": [{"text": "remembered turn"}]}
-    ])
+    a = Agent(
+        agent_id=AID,
+        session_manager=first,
+        messages=[{"role": "user", "content": [{"text": "remembered turn"}]}],
+    )
     first.sync_agent(a)
     del a, first
 
     import gc
 
     gc.collect()
-    again = CitadelSessionManager(SID, p, "pw")
+    again = CitadelSessionManager(SID, p, "pw", embedder=MOCK)
     restored = Agent(agent_id=AID, session_manager=again)
-    assert any(
-        "remembered turn" in str(m) for m in restored.messages
-    ), f"history did not restore: {restored.messages}"
+    assert any("remembered turn" in str(m) for m in restored.messages), (
+        f"history did not restore: {restored.messages}"
+    )
 
 
 def test_agent_state_survives_a_restore():
@@ -143,12 +160,9 @@ def test_agent_state_survives_a_restore():
     import gc
 
     gc.collect()
-    again = CitadelSessionManager(SID, p, "pw")
+    again = CitadelSessionManager(SID, p, "pw", embedder=MOCK)
     restored = Agent(agent_id=AID, session_manager=again)
     assert restored.state.get("locale") == "en-GB"
-
-
-# ---- list_messages slice edges vs the reference --------------------------
 
 
 def seeded(store, n=4):
@@ -171,9 +185,6 @@ def test_listing_an_agent_with_no_messages_is_empty_like_the_reference():
     for store in (m, r):
         store.create_agent(SID, agent())
         assert store.list_messages(SID, AID) == []
-
-
-# ---- an update that fails must not lose the record ----------------------
 
 
 def test_a_failed_update_leaves_the_original_readable():

@@ -4,8 +4,10 @@ Distribution packages built from this workspace. Each adapter is versioned from 
 tag and `citadeldb-mcp` from the workspace crate version; each is built and published by
 its own workflow under [`.github/workflows/`](../.github/workflows).
 
-Every adapter requires `citadeldb>=2.0,<3`. Their test jobs build that wheel in-run and
-install it with `--find-links`, so they never wait on PyPI and the release order is free.
+Every adapter requires `citadeldb>=2.0,<3`. Requiring an explicit embedder is an
+adapter-side contract and uses the region APIs already released in 2.0.
+Their test jobs build the core wheel in-run and constrain adapter dependency resolution
+to that exact version, so PyPI cannot silently replace the wheel under test.
 
 ## Agent framework adapters
 
@@ -44,18 +46,28 @@ handle onto the database this process already holds instead, so two adapters can
 one encrypted file rather than needing a file each:
 
 ```python
+import citadeldb
 from citadeldb_langgraph import CitadelStore
 from citadeldb_openai_agents import CitadelSession
 
 PATH, KEY = "agent.cdl", "your-passphrase"
+# No adapter defaults an embedder: one substituted quietly would rank lexically
+# while recording `mock` as the model that wrote the vectors.
+EMB = citadeldb.MockEmbedder(dim=64)
 
-store = CitadelStore(PATH, key=KEY)                          # LangGraph state
-session = CitadelSession("user-123", db_path=PATH, key=KEY)  # Agents SDK transcripts
+store = CitadelStore(PATH, key=KEY, embedder=EMB)            # LangGraph state
+session = CitadelSession(                                    # Agents SDK transcripts
+    "user-123", db_path=PATH, key=KEY, embedder=EMB
+)
 ```
 
 There is one database here, not two. Each adapter writes to its own region inside it
 (`store` and `sessions` by default), so the state and the transcripts stay separate without
 a second database to open, back up or erase.
+
+Treat a region as owned by one adapter family. Multiple adapter types may reuse the same
+database, but they must use distinct region names: their record kinds, keyed identities,
+and payload schemas are not an interchange format and can overlap.
 
 Every adapter keeps the constructor shape of the framework it plugs into, which is why
 `CitadelSession` takes the session id first: the SDK's own `SQLiteSession(session_id,

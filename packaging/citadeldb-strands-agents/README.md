@@ -8,11 +8,22 @@ redaction that removes the redacted content rather than annotating it.
 pip install citadeldb-strands-agents
 ```
 
+Requires `strands-agents>=1.15,<2`; 1.15 is the first release carrying the
+multi-agent session API implemented by this manager.
+
 ```python
+import citadeldb
 from strands import Agent
 from citadeldb_strands_agents import CitadelSessionManager
 
-sessions = CitadelSessionManager("user-123", "sessions.cdl", key="your-passphrase")
+sessions = CitadelSessionManager(
+    "user-123",
+    "sessions.cdl",
+    key="your-passphrase",
+    # Required, and no default. This manager reads sessions by key and exposes
+    # no semantic-recall operation, so an explicit mock avoids unused model work.
+    embedder=citadeldb.MockEmbedder(dim=64),
+)
 agent = Agent(session_manager=sessions)
 ```
 
@@ -37,8 +48,8 @@ replacement carries the redaction in place of the original.
 
 ```python
 after = sessions.read_message("user-123", agent.agent_id, 0)
-after.to_message()      # {'content': [{'text': '[REDACTED]'}], 'role': 'user'}
-after.message           # the redaction, not the original
+after.to_message()  # {'content': [{'text': '[REDACTED]'}], 'role': 'user'}
+after.message  # the redaction, not the original
 ```
 
 An ordinary update is unaffected: only a message carrying a redaction drops its original.
@@ -46,7 +57,7 @@ An ordinary update is unaffected: only a message carrying a redaction drops its 
 ## Erasure
 
 ```python
-sessions.forget_session("user-123")   # returns the number of records erased
+sessions.forget_session("user-123")  # returns the number of records erased
 ```
 
 Strands has no delete in its repository protocol. This destroys the session, its agents

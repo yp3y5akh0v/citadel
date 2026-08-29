@@ -19,11 +19,11 @@ classifiers = [
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 # The precomputed vector needs the `embedding` field added in citadeldb 2.0.
-dependencies = ["citadeldb>=2.0,<3", "langchain-core>=0.3,<2"]
+dependencies = ["citadeldb>=2.0,<3", "langchain-core>=0.3.22,<2"]
 
 [project.optional-dependencies]
 # langchain-tests carries the suite that test_conformance.py runs.
-test = ["pytest>=8", "pytest-asyncio>=0.23", "langchain-tests>=0.3"]
+test = ["pytest>=8", "pytest-asyncio>=0.23", "langchain-tests>=0.3.6,<2"]
 
 [project.urls]
 Homepage = "https://citadeldb.dev"

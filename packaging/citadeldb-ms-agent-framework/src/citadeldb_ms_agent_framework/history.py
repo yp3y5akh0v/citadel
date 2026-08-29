@@ -1,11 +1,15 @@
 """HistoryProvider over an encrypted Citadel region."""
+
 from __future__ import annotations
 
 import asyncio
-from typing import Any, ClassVar, Sequence
+from collections.abc import Sequence
+from typing import Any, ClassVar
 
 import citadeldb
 from agent_framework import HistoryProvider, Message
+
+from ._embedder import require_embedder
 
 KIND = "message"
 DEFAULT_PATH = "agent_history.cdl"
@@ -18,12 +22,15 @@ def _page(mem: Any, region: str, session_id: str) -> list[Any]:
     out: list[Any] = []
     after = None
     while True:
-        got = mem.fetch(region, KIND, payload_filter={"sid": session_id}, limit=PAGE,
-                        after_id=after)
+        got = mem.fetch(
+            region, KIND, payload_filter={"sid": session_id}, limit=PAGE, after_id=after
+        )
         out.extend(got)
         if len(got) < PAGE:
             return out
         after = got[-1].id
+
+
 # session_id is optional in the protocol; keep unattributed history together.
 DEFAULT_SESSION = "default"
 
@@ -41,7 +48,9 @@ def _load(mem: Any, region: str, session_id: str) -> list[Message]:
     return [Message.from_dict(h.payload["msg"]) for h in hits]
 
 
-def _append(mem: Any, region: str, session_id: str, messages: Sequence[Message]) -> None:
+def _append(
+    mem: Any, region: str, session_id: str, messages: Sequence[Message]
+) -> None:
     atoms = [
         {
             "kind": KIND,
@@ -85,9 +94,9 @@ class CitadelHistoryProvider(HistoryProvider):
         path: str = DEFAULT_PATH,
         key: str = "",
         *,
+        embedder: Any,
         source_id: str = DEFAULT_SOURCE_ID,
         region: str = DEFAULT_REGION,
-        embedder: Any | None = None,
         load_messages: bool = True,
         store_inputs: bool = True,
         store_context_messages: bool = False,
@@ -104,6 +113,7 @@ class CitadelHistoryProvider(HistoryProvider):
         )
         if not key:
             raise ValueError("a passphrase is required: transcripts are the payload")
+        embedder = require_embedder(embedder)
         try:
             self._db = citadeldb.connect(path, key=key, region_keys=True)
         except citadeldb.OperationalError as e:
@@ -116,15 +126,16 @@ class CitadelHistoryProvider(HistoryProvider):
         self._mem = self._db.memory()
         self._region = region
         # Idempotent for a region of the same width, so a dim clash raises here.
-        self._mem.create_encrypted_region(
-            region, embedder or citadeldb.MockEmbedder(dim=64)
-        )
+        self._mem.create_encrypted_region(region, embedder)
 
-    # ---- the abstract surface --------------------------------------------
     # The bindings are sync, so a worker thread keeps the event loop free.
 
     async def get_messages(
-        self, session_id: str | None, *, state: dict[str, Any] | None = None, **kwargs: Any
+        self,
+        session_id: str | None,
+        *,
+        state: dict[str, Any] | None = None,
+        **kwargs: Any,
     ) -> list[Message]:
         return await asyncio.to_thread(
             _load, self._mem, self._region, session_id or DEFAULT_SESSION
@@ -147,14 +158,17 @@ class CitadelHistoryProvider(HistoryProvider):
             list(messages),
         )
 
-    # ---- beyond the protocol ---------------------------------------------
-
     async def search(
         self, session_id: str | None, query: str, *, limit: int = 5
     ) -> list[Message]:
         """Messages from one session ranked by hybrid recall, best first."""
         return await asyncio.to_thread(
-            _recall, self._mem, self._region, session_id or DEFAULT_SESSION, query, limit
+            _recall,
+            self._mem,
+            self._region,
+            session_id or DEFAULT_SESSION,
+            query,
+            limit,
         )
 
     async def forget(self, session_id: str | None) -> int:

@@ -91,7 +91,8 @@ jobs:
           set -e
           pip install pytest numpy
           pip install --no-index --find-links core-dist citadeldb
-          pip install dist/*.whl
+          python -c "from importlib.metadata import version; print('citadeldb==' + version('citadeldb'))" > "$RUNNER_TEMP/citadeldb-constraint.txt"
+          pip install --constraint "$RUNNER_TEMP/citadeldb-constraint.txt" dist/*.whl
           # Scratch dir so tests import the installed wheel, not ./src.
           mkdir -p /tmp/run && cp -r tests /tmp/run/
           cd /tmp/run && pytest tests -q

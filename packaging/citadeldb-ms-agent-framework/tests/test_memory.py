@@ -1,7 +1,10 @@
+import citadeldb
 import pytest
 from agent_framework import AgentSession, ContextProvider, Message, SessionContext
-
 from citadeldb_ms_agent_framework import CitadelContextProvider
+from citadeldb_ms_agent_framework._embedder import require_embedder
+
+MOCK = citadeldb.MockEmbedder(dim=64)
 
 
 @pytest.fixture(scope="module")
@@ -13,7 +16,7 @@ def path(tmp_path_factory):
 @pytest.fixture()
 def provider(path, request):
     return CitadelContextProvider(
-        path, "pw", source_id=request.node.name, scope=request.node.name
+        path, "pw", embedder=MOCK, source_id=request.node.name, scope=request.node.name
     )
 
 
@@ -32,9 +35,6 @@ async def turn(provider, texts, session_id="s"):
     )
 
 
-# ---- conformance ---------------------------------------------------------
-
-
 def test_is_a_context_provider(provider):
     assert isinstance(provider, ContextProvider)
     assert provider.source_id
@@ -42,10 +42,7 @@ def test_is_a_context_provider(provider):
 
 def test_a_passphrase_is_required(tmp_path):
     with pytest.raises(ValueError, match="passphrase"):
-        CitadelContextProvider(str(tmp_path / "k.cdl"), "")
-
-
-# ---- recall --------------------------------------------------------------
+        CitadelContextProvider(str(tmp_path / "k.cdl"), "", embedder=MOCK)
 
 
 async def test_a_restated_fact_does_not_crowd_out_the_rest_of_the_scope(provider):
@@ -61,7 +58,9 @@ async def test_a_restated_fact_does_not_crowd_out_the_rest_of_the_scope(provider
     await provider.before_run(
         agent=None, session=AgentSession(session_id="s"), context=ctx, state={}
     )
-    delivered = "\n".join(m.text for m in ctx.get_messages(sources={provider.source_id}))
+    delivered = "\n".join(
+        m.text for m in ctx.get_messages(sources={provider.source_id})
+    )
     assert delivered.count("the disk was full") == 1, "duplicates reached the model"
     for n in range(4):
         assert f"unrelated note {n}" in delivered, (
@@ -83,8 +82,12 @@ async def test_a_memory_is_recalled_into_the_context(provider):
 async def test_a_scope_buried_under_another_is_still_recalled(path, request):
     """Discarding after the scan spends the budget on the crowded scope."""
     name = request.node.name
-    noisy = CitadelContextProvider(path, "pw", source_id=f"{name}-n", scope=f"{name}-n")
-    quiet = CitadelContextProvider(path, "pw", source_id=name, scope=name)
+    noisy = CitadelContextProvider(
+        path, "pw", embedder=MOCK, source_id=f"{name}-n", scope=f"{name}-n"
+    )
+    quiet = CitadelContextProvider(
+        path, "pw", embedder=MOCK, source_id=name, scope=name
+    )
     # Ranked above the target for this query, and enough of them to fill the scan.
     await turn(noisy, [f"why did the release break run {i}" for i in range(60)])
     await turn(quiet, ["the deploy failed because the disk was full"])
@@ -109,22 +112,29 @@ async def test_the_context_prompt_frames_the_memories(provider):
 
 
 async def test_recall_is_capped_by_limit(path):
-    p = CitadelContextProvider(path, "pw", source_id="cap", scope="cap", limit=2)
+    p = CitadelContextProvider(
+        path, "pw", embedder=MOCK, source_id="cap", scope="cap", limit=2
+    )
     await turn(p, [f"fact number {i}" for i in range(6)])
     ctx = context([msg("fact")])
     await p.before_run(
         agent=None, session=AgentSession(session_id="s"), context=ctx, state={}
     )
     added = ctx.get_messages(sources={p.source_id})
-    recalled = added[0].text.removeprefix(
-        CitadelContextProvider.DEFAULT_CONTEXT_PROMPT
-    ).strip().splitlines()
+    recalled = (
+        added[0]
+        .text.removeprefix(CitadelContextProvider.DEFAULT_CONTEXT_PROMPT)
+        .strip()
+        .splitlines()
+    )
     assert len(recalled) == 2, recalled
 
 
 async def test_a_repeated_fact_does_not_spend_the_whole_budget(path):
     """A fact repeated across turns is stored each time, and it is one fact."""
-    p = CitadelContextProvider(path, "pw", source_id="dedup", scope="dedup", limit=5)
+    p = CitadelContextProvider(
+        path, "pw", embedder=MOCK, source_id="dedup", scope="dedup", limit=5
+    )
     for _ in range(5):
         await turn(p, ["my dog is called Mochi"])
     await turn(p, ["I live in Berlin"])
@@ -133,9 +143,12 @@ async def test_a_repeated_fact_does_not_spend_the_whole_budget(path):
     await p.before_run(
         agent=None, session=AgentSession(session_id="s"), context=ctx, state={}
     )
-    recalled = ctx.get_messages(sources={p.source_id})[0].text.removeprefix(
-        CitadelContextProvider.DEFAULT_CONTEXT_PROMPT
-    ).strip().splitlines()
+    recalled = (
+        ctx.get_messages(sources={p.source_id})[0]
+        .text.removeprefix(CitadelContextProvider.DEFAULT_CONTEXT_PROMPT)
+        .strip()
+        .splitlines()
+    )
     assert len(recalled) == len(set(recalled)), recalled
     assert any("Mochi" in r for r in recalled)
     assert any("Berlin" in r for r in recalled)
@@ -158,9 +171,6 @@ async def test_an_empty_input_recalls_nothing(provider):
     assert ctx.get_messages(sources={provider.source_id}) == []
 
 
-# ---- what gets remembered ------------------------------------------------
-
-
 async def test_memories_outlive_the_session_that_made_them(provider):
     """Cross-session recall is this provider's job, not the history one's."""
     await turn(provider, ["learned in session one"], session_id="one")
@@ -173,8 +183,8 @@ async def test_memories_outlive_the_session_that_made_them(provider):
 
 
 async def test_scopes_do_not_see_each_other(path):
-    a = CitadelContextProvider(path, "pw", source_id="sa", scope="alice")
-    b = CitadelContextProvider(path, "pw", source_id="sb", scope="bob")
+    a = CitadelContextProvider(path, "pw", embedder=MOCK, source_id="sa", scope="alice")
+    b = CitadelContextProvider(path, "pw", embedder=MOCK, source_id="sb", scope="bob")
     await turn(a, ["alice's private note"])
     ctx = context([msg("private note")])
     await b.before_run(
@@ -189,9 +199,6 @@ async def test_a_turn_with_no_text_remembers_nothing(provider):
         agent=None, session=AgentSession(session_id="s"), context=ctx, state={}
     )
     assert await provider.forget() == 0
-
-
-# ---- erasure -------------------------------------------------------------
 
 
 async def test_forget_destroys_the_scope(provider):
@@ -209,12 +216,12 @@ async def test_it_survives_a_reopen(tmp_path):
     import gc
 
     p = str(tmp_path / "reopen.cdl")
-    first = CitadelContextProvider(p, "pw", scope="u")
+    first = CitadelContextProvider(p, "pw", embedder=MOCK, scope="u")
     await turn(first, ["the deployment failed because the disk was full"])
     del first
     gc.collect()
 
-    again = CitadelContextProvider(p, "pw", scope="u")
+    again = CitadelContextProvider(p, "pw", embedder=MOCK, scope="u")
     ctx = context([msg("why did the release break?")])
     await again.before_run(
         agent=None, session=AgentSession(session_id="s"), context=ctx, state={}
@@ -226,16 +233,13 @@ async def test_forgetting_nothing_is_zero_not_an_error(provider):
     assert await provider.forget() == 0
 
 
-# ---- the two providers together ------------------------------------------
-
-
 async def test_it_shares_a_database_with_the_history_provider(tmp_path):
     """The pairing the framework's own Redis integration ships, on one file."""
     from citadeldb_ms_agent_framework import CitadelHistoryProvider
 
     p = str(tmp_path / "both.cdl")
-    memory = CitadelContextProvider(p, "pw", scope="u1")
-    history = CitadelHistoryProvider(p, "pw")
+    memory = CitadelContextProvider(p, "pw", embedder=MOCK, scope="u1")
+    history = CitadelHistoryProvider(p, "pw", embedder=MOCK)
     await turn(memory, ["remembered across sessions"])
     await history.save_messages("s", [msg("this exact turn")])
     assert len(await history.get_messages("s")) == 1
@@ -262,3 +266,50 @@ async def test_the_event_loop_is_not_blocked(provider):
     )
     ticker.cancel()
     assert ticks > 1, "the loop made no progress during a provider call"
+
+
+def test_an_embedder_is_required_before_the_vault_is_created(tmp_path):
+    with pytest.raises(TypeError, match="embedder"):
+        CitadelContextProvider(str(tmp_path / "no-embedder.cdl"), "pw")
+    partial = type(
+        "PartialEmbedder",
+        (),
+        {"dim": 8, "metric": "cosine", "embed": lambda self, texts: []},
+    )()
+    with pytest.raises(TypeError, match="model_id"):
+        CitadelContextProvider(
+            str(tmp_path / "invalid-embedder.cdl"), "pw", embedder=partial
+        )
+    partial.model_id = "default"
+    with pytest.raises(TypeError, match="unknown.*default"):
+        CitadelContextProvider(
+            str(tmp_path / "placeholder-embedder.cdl"), "pw", embedder=partial
+        )
+    artifacts = list(tmp_path.iterdir())
+    assert artifacts == [], f"invalid construction created vault sidecars: {artifacts}"
+
+
+def test_embedder_model_id_is_normalized_without_mutating_the_caller(tmp_path):
+    embedder = type(
+        "PaddedEmbedder",
+        (),
+        {
+            "dim": 8,
+            "metric": "cosine",
+            "model_id": "  stable-model  ",
+            "embed": lambda self, texts: [[0.0] * 8 for _ in texts],
+        },
+    )()
+
+    normalized = require_embedder(embedder)
+
+    assert normalized.model_id == "stable-model"
+    assert embedder.model_id == "  stable-model  "
+    assert len(normalized.embed(["probe"])[0]) == 8
+
+    path = str(tmp_path / "normalized.cdl")
+    first = CitadelContextProvider(path, "pw", embedder=embedder)
+    first._db.close()
+    embedder.model_id = "stable-model"
+    second = CitadelContextProvider(path, "pw", embedder=embedder)
+    second._db.close()
