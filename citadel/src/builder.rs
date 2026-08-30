@@ -4,7 +4,9 @@ use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 
-use citadel_core::types::{Argon2Profile, CipherId, KdfAlgorithm, SyncMode};
+#[cfg(all(not(target_arch = "wasm32"), feature = "audit-log"))]
+use citadel_core::types::CipherId;
+use citadel_core::types::{Argon2Profile, KdfAlgorithm, SyncMode};
 use citadel_core::{Error, Result, DEFAULT_BUFFER_POOL_SIZE, PBKDF2_MIN_ITERATIONS};
 #[cfg(not(target_arch = "wasm32"))]
 use citadel_core::{FILE_HEADER_SIZE, KEY_FILE_SIZE};
@@ -15,7 +17,7 @@ use citadel_crypto::key_manager::{
 #[cfg(not(target_arch = "wasm32"))]
 use citadel_crypto::key_manager::{open_key_file, open_key_file_with_region_keys};
 use citadel_crypto::page_cipher::compute_dek_id;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(any(not(target_arch = "wasm32"), feature = "audit-log"))]
 use citadel_io::durable;
 #[cfg(not(target_arch = "wasm32"))]
 use citadel_io::file_lock;
@@ -27,8 +29,10 @@ use citadel_io::traits::PageIO;
 use citadel_txn::manager::TxnManager;
 use zeroize::Zeroizing;
 
+#[cfg(any(not(target_arch = "wasm32"), feature = "audit-log"))]
+use crate::database::atomic_write_for_operation;
 #[cfg(not(target_arch = "wasm32"))]
-use crate::database::{atomic_write_for_operation, CreatedFileGuard};
+use crate::database::CreatedFileGuard;
 use crate::database::{Database, KeyFileState};
 
 /// Builder for creating or opening a Citadel database.

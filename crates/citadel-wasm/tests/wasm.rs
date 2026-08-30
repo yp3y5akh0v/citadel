@@ -1,7 +1,19 @@
 #![cfg(target_arch = "wasm32")]
 
+use citadel::{Argon2Profile, DatabaseBuilder};
 use citadel_wasm::{CellValue, CitadelDb, ScriptOutcome};
 use wasm_bindgen_test::wasm_bindgen_test;
+
+#[wasm_bindgen_test]
+fn in_memory_format_upgrade_remains_available() {
+    let db = DatabaseBuilder::new("")
+        .passphrase(b"pass")
+        .argon2_profile(Argon2Profile::Iot)
+        .create_in_memory()
+        .unwrap();
+
+    assert!(db.upgrade_format().unwrap().slots_flagged);
+}
 
 #[wasm_bindgen_test]
 fn create_execute_query_round_trip() {

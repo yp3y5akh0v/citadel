@@ -10,7 +10,7 @@ Every page is encrypted at rest with AES-256-CTR + HMAC-SHA256. Runs entirely in
 npm install @citadeldb/wasm
 ```
 
-## Usage
+## Browser usage
 
 ```js
 import init, { CitadelDb } from "@citadeldb/wasm";
@@ -51,6 +51,21 @@ const stats = db.stats();
 
 // Cleanup
 db.free();
+```
+
+## Node.js initialization
+
+The web-target package must receive the Wasm bytes explicitly in Node.js because Node does not fetch `file:` URLs.
+
+```js
+import { readFile } from "node:fs/promises";
+import init, { CitadelDb } from "@citadeldb/wasm";
+
+const entry = import.meta.resolve("@citadeldb/wasm");
+const wasmUrl = new URL("./citadel_wasm_bg.wasm", entry);
+await init({ module_or_path: await readFile(wasmUrl) });
+
+const db = new CitadelDb("my-passphrase");
 ```
 
 ## API
