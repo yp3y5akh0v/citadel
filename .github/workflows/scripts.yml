@@ -1,7 +1,7 @@
 name: Scripts
 
-# The main CI has scripts/** in paths-ignore, so a broken release script used to
-# merge green. This is the cheap guard: syntax only, no build.
+# Fast syntax and release-inventory checks for script and packaging changes.
+# Main CI also runs because release tooling must not merge against a broken tree.
 on:
   push:
     branches: [master]

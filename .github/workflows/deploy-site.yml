@@ -32,7 +32,7 @@ jobs:
         run: rustup toolchain install
 
       - name: Install wasm-pack
-        run: cargo install wasm-pack --locked
+        run: cargo install wasm-pack --version 0.14.0 --locked
 
       - name: Install binaryen (provides wasm-opt)
         run: sudo apt-get update && sudo apt-get install -y binaryen

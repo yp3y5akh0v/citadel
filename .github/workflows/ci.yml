@@ -6,7 +6,6 @@ on:
     paths-ignore:
       - '**.md'
       - 'site/**'
-      - 'scripts/**'
       - 'LICENSE-*'
       - '.github/FUNDING.yml'
       - '.github/*.png'
@@ -16,7 +15,6 @@ on:
     paths-ignore:
       - '**.md'
       - 'site/**'
-      - 'scripts/**'
       - 'LICENSE-*'
       - '.github/FUNDING.yml'
       - '.github/*.png'
@@ -144,6 +142,31 @@ jobs:
       # required-features hide these bins from --all-targets, so nothing else builds them.
       - name: membench binaries
         run: cargo check -p citadeldb-membench --features openai,candle-embed --bins
+
+  wasm:
+    needs: [fmt, clippy]
+    runs-on: ubuntu-latest
+    name: wasm bindings
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: wasm
+      - name: Install WASM tooling
+        run: |
+          cargo install wasm-pack --version 0.14.0 --locked
+          sudo apt-get update
+          sudo apt-get install -y binaryen
+      - name: Compile every WASM binding target
+        run: cargo check -p citadeldb-wasm --all-targets --target wasm32-unknown-unknown --locked
+      - name: Run WASM bindings in Node.js
+        run: wasm-pack test --node crates/citadel-wasm
+      - name: Build and inspect the npm package
+        run: |
+          bash scripts/publish-wasm.sh
+          npm pack ./crates/citadel-wasm/pkg --dry-run --ignore-scripts
 
   # Build the wheel, run pytest, and type-check the stubs/facades.
   python:

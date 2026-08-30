@@ -6,7 +6,7 @@ const root = execSync("git rev-parse --show-toplevel", { encoding: "utf8" }).tri
 const pkg = join(root, "crates", "citadel-wasm", "pkg");
 
 // Build wasm package. Size opt level is scoped here so native builds keep speed.
-execSync("wasm-pack build crates/citadel-wasm --target web --release --scope citadeldb", {
+execSync("wasm-pack build crates/citadel-wasm --target web --release --scope citadeldb -- --locked", {
   cwd: root,
   stdio: "inherit",
   env: { ...process.env, CARGO_PROFILE_RELEASE_OPT_LEVEL: "z" },
@@ -16,12 +16,12 @@ execSync("wasm-pack build crates/citadel-wasm --target web --release --scope cit
 const manifest = JSON.parse(readFileSync(join(pkg, "package.json"), "utf8"));
 
 manifest.name = "@citadeldb/wasm";
-manifest.files = [
-  "citadel_wasm_bg.wasm",
-  "citadel_wasm.js",
-  "citadel_wasm.d.ts",
-  "LICENSE-APACHE",
-];
+if (!Array.isArray(manifest.files)) {
+  throw new Error("wasm-pack package.json did not contain a files list");
+}
+if (!manifest.files.includes("LICENSE-APACHE")) {
+  manifest.files.push("LICENSE-APACHE");
+}
 manifest.sideEffects = ["./citadel_wasm.js", "./snippets/*"];
 
 writeFileSync(join(pkg, "package.json"), JSON.stringify(manifest, null, 2) + "\n");

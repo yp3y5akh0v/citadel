@@ -621,7 +621,9 @@ citadel_close(db);
 Install with `npm install @citadeldb/wasm`.
 
 ```js
-import { CitadelDb } from "@citadeldb/wasm";
+import init, { CitadelDb } from "@citadeldb/wasm";
+
+await init();
 
 const db = new CitadelDb("secret");
 db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);");
@@ -633,7 +635,7 @@ const result = db.query("SELECT * FROM t;");
 db.put(new Uint8Array([1, 2, 3]), new Uint8Array([4, 5, 6]));
 ```
 
-Build: `wasm-pack build crates/citadel-wasm --target web`
+Build the npm package: `bash scripts/publish-wasm.sh`
 
 ### Python
 

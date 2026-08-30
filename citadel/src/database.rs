@@ -331,7 +331,6 @@ impl KeyFileState {
         self.trusted.serialize()
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn replace_trusted(
         &mut self,
         path: &Path,
@@ -342,7 +341,6 @@ impl KeyFileState {
             .into_result(operation)
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     fn replace_trusted_outcome(
         &mut self,
         path: &Path,
@@ -351,7 +349,6 @@ impl KeyFileState {
         self.replace_trusted_with(path, replacement, durable::atomic_write_with_status)
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     fn replace_trusted_with(
         &mut self,
         path: &Path,
@@ -377,14 +374,12 @@ impl KeyFileState {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug)]
 enum PublishedWriteOutcome {
     Durable,
     DurabilityUnconfirmed(std::io::Error),
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 impl PublishedWriteOutcome {
     fn into_result(self, operation: &'static str) -> Result<()> {
         match self {
@@ -396,7 +391,7 @@ impl PublishedWriteOutcome {
     }
 }
 
-#[cfg(all(not(target_arch = "wasm32"), feature = "audit-log"))]
+#[cfg(feature = "audit-log")]
 fn finish_audited_operation(
     operation: &'static str,
     publication: PublishedWriteOutcome,
@@ -421,7 +416,6 @@ fn finish_audited_operation(
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn atomic_write_outcome(path: &Path, bytes: &[u8]) -> Result<PublishedWriteOutcome> {
     match durable::atomic_write_with_status(path, bytes) {
         Ok(()) => Ok(PublishedWriteOutcome::Durable),
@@ -432,7 +426,6 @@ fn atomic_write_outcome(path: &Path, bytes: &[u8]) -> Result<PublishedWriteOutco
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn atomic_write_for_operation(
     path: &Path,
     bytes: &[u8],
@@ -2047,7 +2040,7 @@ impl Database {
         }
     }
 
-    #[cfg(feature = "audit-log")]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "audit-log"))]
     fn log_audit_with_path(
         &self,
         operation: &'static str,
