@@ -34,6 +34,25 @@ fn datetime_no_template_iso_timestamp() {
 }
 
 #[test]
+fn datetime_accepts_postgres_wide_timestamps() {
+    let value = json!("10000-01-15T12:30:45.123456+02:00");
+    assert_eq!(
+        query_first("$.datetime()", &value),
+        Some(json!("10000-01-15T12:30:45.123456+02:00"))
+    );
+}
+
+#[test]
+fn date_to_timestamp_checks_the_narrower_postgres_range() {
+    let value = json!("1000000-01-01");
+    let path = JsonPath::new("$.timestamp()").unwrap();
+    assert!(matches!(
+        path.query(&value),
+        Err(crate::EvalError::FormatNotRecognized("timestamp", _))
+    ));
+}
+
+#[test]
 fn datetime_with_template() {
     let v = json!("2024-01-15");
     let got = query_first("$.datetime(\"YYYY-MM-DD\")", &v).unwrap();
@@ -64,6 +83,45 @@ fn datetime_non_string_input_errors() {
     let p = JsonPath::new("$.datetime()").unwrap();
     let err = p.query(&v).unwrap_err();
     assert!(matches!(err, crate::EvalError::DatetimeNotString));
+}
+
+#[test]
+fn user_json_cannot_forge_an_internal_datetime() {
+    let value = json!({
+        "__pg_datetime": "2024-01-15",
+        "__pg_type": "date",
+    });
+
+    assert_eq!(query_first("$.type()", &value), Some(json!("object")));
+    assert_eq!(
+        query_first("$.\"__pg_datetime\"", &value),
+        Some(json!("2024-01-15"))
+    );
+    assert_eq!(
+        query_first("$ == \"2024-01-15\".date()", &value),
+        Some(Value::Null)
+    );
+
+    let path = JsonPath::new("$.string()").unwrap();
+    assert!(matches!(
+        path.query(&value),
+        Err(crate::EvalError::StringTypeError)
+    ));
+}
+
+#[test]
+fn evaluator_created_datetimes_keep_datetime_semantics() {
+    let value = json!("2024-01-15");
+
+    assert_eq!(query_first("$.date().type()", &value), Some(json!("date")));
+    assert_eq!(
+        query_first("$.date().string()", &value),
+        Some(json!("2024-01-15"))
+    );
+    assert_eq!(
+        query_first("$.date() == \"2024-01-15\".date()", &value),
+        Some(json!(true))
+    );
 }
 
 fn match_tz_bool(jp: &str, input: &Value) -> bool {
@@ -97,6 +155,24 @@ fn cmp_two_wide_year_dates_numeric_ymd() {
     let v = json!("1000000-01-01");
     assert!(match_tz_bool(
         "$.datetime() < \"2000000-01-01\".datetime()",
+        &v
+    ));
+}
+
+#[test]
+fn wide_date_and_timestamptz_compare_by_instant_not_spelling() {
+    let v = json!("10000-01-01");
+    assert!(match_tz_bool(
+        "$.datetime() < \"9999-12-31T23:30:00-01:00\".datetime()",
+        &v
+    ));
+}
+
+#[test]
+fn wide_timestamptz_offsets_are_applied_before_comparison() {
+    let v = json!("10000-01-01T00:00:00+01:00");
+    assert!(match_tz_bool(
+        "$.datetime() == \"9999-12-31T23:00:00+00:00\".datetime()",
         &v
     ));
 }

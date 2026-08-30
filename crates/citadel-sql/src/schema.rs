@@ -92,6 +92,10 @@ pub struct SchemaManager {
     /// from inside `&self` methods. Bounded by `(active triggers × transition aliases)`.
     transition_schemas: std::cell::RefCell<FxHashMap<String, &'static TableSchema>>,
     generation: u64,
+    /// First volatile persisted expression from a legacy catalog. Maintained
+    /// with table registration/removal so executor entry points can reject in
+    /// O(1) without rescanning every schema on the statement hot path.
+    legacy_volatile_definition: Option<String>,
     /// Per-Database shared cache (e.g. ANN indexes). Cloned from the Database
     /// when the Connection opens; all Connections to the same DB share entries.
     /// Tests created via `empty()` get their own isolated cache.
@@ -140,6 +144,7 @@ impl SchemaManager {
             temp_aliases: FxHashMap::default(),
             transition_schemas: std::cell::RefCell::new(FxHashMap::default()),
             generation: 0,
+            legacy_volatile_definition: None,
             sql_caches: Arc::new(Mutex::new(FxHashMap::default())),
             dml_dirty_tables: std::cell::RefCell::new(FxHashSet::default()),
             dml_append_tables: std::cell::RefCell::new(FxHashMap::default()),
@@ -356,6 +361,9 @@ impl SchemaManager {
             return Err(e);
         }
 
+        let legacy_volatile_definition = tables
+            .values()
+            .find_map(TableSchema::volatile_persisted_expression);
         let mut mgr = Self {
             tables,
             views,
@@ -365,6 +373,7 @@ impl SchemaManager {
             temp_aliases: FxHashMap::default(),
             transition_schemas: std::cell::RefCell::new(FxHashMap::default()),
             generation: 0,
+            legacy_volatile_definition,
             sql_caches: db.sql_cache_handle(),
             dml_dirty_tables: std::cell::RefCell::new(FxHashSet::default()),
             dml_append_tables: std::cell::RefCell::new(FxHashMap::default()),
@@ -446,9 +455,21 @@ impl SchemaManager {
         self.generation
     }
 
+    pub(crate) fn legacy_volatile_definition(&self) -> Option<&str> {
+        self.legacy_volatile_definition.as_deref()
+    }
+
+    fn refresh_legacy_volatile_definition(&mut self) {
+        self.legacy_volatile_definition = self
+            .tables
+            .values()
+            .find_map(TableSchema::volatile_persisted_expression);
+    }
+
     pub fn register(&mut self, schema: TableSchema) {
         let lower = schema.name.to_ascii_lowercase();
         self.tables.insert(lower, schema);
+        self.refresh_legacy_volatile_definition();
         self.generation += 1;
     }
 
@@ -456,6 +477,7 @@ impl SchemaManager {
         let lower = name.to_ascii_lowercase();
         let result = self.tables.remove(&lower);
         if result.is_some() {
+            self.refresh_legacy_volatile_definition();
             self.generation += 1;
         }
         result
@@ -802,6 +824,7 @@ impl SchemaManager {
             self.generation = self.generation.max(snap.generation) + 1;
         }
         self.tables = snap.tables;
+        self.refresh_legacy_volatile_definition();
         self.views = snap.views;
         self.triggers = snap.triggers;
         self.matviews = snap.matviews;

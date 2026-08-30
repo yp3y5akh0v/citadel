@@ -51,6 +51,24 @@ fn eval_literal() {
 }
 
 #[test]
+fn eval_context_timezone_reaches_jsonpath() {
+    let columns = test_columns();
+    let column_map = ColumnMap::new(&columns);
+    let row = test_row();
+    let expression = crate::parser::parse_sql_expr(
+        "JSONB_PATH_QUERY_FIRST_TZ(\
+         CAST('\"2023-08-15T12:34:56+05:30\"' AS JSONB), \
+         '$.time().string()')",
+    )
+    .unwrap();
+    let timezone = crate::datetime::resolve_timezone("+10:00").unwrap();
+    let context = EvalCtx::new(&column_map, &row).with_session_tz(Some(timezone));
+
+    let value = eval_expr(&expression, &context).unwrap();
+    assert_eq!(value, crate::json::text_to_jsonb(r#""17:04:56""#).unwrap());
+}
+
+#[test]
 fn eval_column_ref() {
     let cols = test_columns();
     let cm = ColumnMap::new(&cols);

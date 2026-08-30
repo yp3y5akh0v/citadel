@@ -770,9 +770,12 @@ dependencies = [
  "jiff",
  "libtest-mimic",
  "nom",
+ "num-bigint",
+ "num-integer",
  "regex",
  "rustc-hash",
  "serde_json",
+ "sha2",
  "thiserror 2.0.18",
 ]
 

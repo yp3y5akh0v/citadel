@@ -307,3 +307,60 @@ fn multibyte_offset_is_rejected_not_panicked() {
     assert!(resolve_timezone("-\u{20AC}a").is_err());
     assert!(resolve_timezone("+\u{00B1}\u{00B1}").is_err());
 }
+
+#[test]
+fn fixed_offset_format_round_trips_subminute_offsets() {
+    for seconds in [-57_599, -1, 0, 1, 57_599] {
+        let rendered = format_timezone_offset(seconds);
+        let parsed = resolve_timezone(&rendered).unwrap();
+        assert_eq!(
+            parsed.to_fixed_offset().unwrap().seconds(),
+            seconds,
+            "{rendered}"
+        );
+    }
+    assert!(resolve_timezone("+00:00:").is_err());
+    assert!(resolve_timezone("+00:00:60").is_err());
+    assert!(resolve_timezone("+00:00:01:02").is_err());
+}
+
+#[test]
+#[cfg(panic = "unwind")]
+fn scoped_transaction_clock_restores_after_unwind() {
+    set_txn_clock(Some(111));
+    let panic = std::panic::catch_unwind(|| {
+        with_txn_clock(Some(222), || panic!("injected clock-scope panic"));
+    });
+    assert!(panic.is_err());
+    assert_eq!(txn_or_clock_micros(), 111);
+    set_txn_clock(None);
+}
+
+#[test]
+fn current_local_fields_use_the_scoped_named_timezone() {
+    let timezone = resolve_timezone("America/New_York").unwrap();
+    for (instant, expected) in [
+        ("2023-01-15T04:30:00Z", "2023-01-14 23:30:00"),
+        ("2023-08-15T04:30:00Z", "2023-08-15 00:30:00"),
+    ] {
+        let timestamp = parse_timestamp(instant).unwrap();
+        with_txn_clock(Some(timestamp), || {
+            with_session_timezone(timezone.clone(), || {
+                let local = current_local_timestamp_micros().unwrap();
+                assert_eq!(format_timestamp(local), expected);
+                assert_eq!(current_date_days().unwrap(), ts_split(local).0);
+                assert_eq!(current_local_time_micros().unwrap(), ts_split(local).1);
+            });
+        });
+    }
+}
+
+#[test]
+fn transaction_statement_and_wall_clocks_are_distinct() {
+    with_txn_clock(Some(111), || {
+        with_statement_clock(Some(222), || {
+            assert_eq!(txn_or_clock_micros(), 111);
+            assert_eq!(statement_or_clock_micros(), 222);
+        });
+    });
+}

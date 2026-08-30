@@ -359,7 +359,38 @@ pub(crate) fn operand_collation(
     collation_of(expr).or_else(|| column_collation(expr, col_map))
 }
 
+thread_local! {
+    static JSONPATH_OVERRIDE_CTX: std::cell::Cell<*const ()> =
+        const { std::cell::Cell::new(std::ptr::null()) };
+}
+
 pub fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
+    let Some(timezone) = ctx.session_tz.as_ref() else {
+        return eval_expr_inner(expr, ctx);
+    };
+    let identity = std::ptr::from_ref(ctx).cast::<()>();
+    JSONPATH_OVERRIDE_CTX.with(|slot| {
+        if slot.get() == identity {
+            return eval_expr_inner(expr, ctx);
+        }
+        struct Guard<'a> {
+            slot: &'a std::cell::Cell<*const ()>,
+            previous: *const (),
+        }
+        impl Drop for Guard<'_> {
+            fn drop(&mut self) {
+                self.slot.set(self.previous);
+            }
+        }
+        let previous = slot.replace(identity);
+        let _guard = Guard { slot, previous };
+        crate::datetime::with_session_timezone(timezone.clone(), || {
+            crate::json::with_jsonpath_timezone(timezone, || eval_expr_inner(expr, ctx))
+        })
+    })
+}
+
+fn eval_expr_inner(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
     match expr {
         Expr::Literal(v) => Ok(v.clone()),
 
@@ -2083,6 +2114,68 @@ pub(crate) fn is_volatile_function_expr(name_upper: &str, args: &[Expr]) -> bool
         }
 }
 
+fn literal_jsonpath_text(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Literal(Value::Text(path)) => Some(path),
+        // These wrappers do not make a literal path dynamic.
+        Expr::Cast { expr, .. } | Expr::Collate { expr, .. } => literal_jsonpath_text(expr),
+        _ => None,
+    }
+}
+
+fn jsonpath_argument_depends_on_session_context(expr: Option<&Expr>) -> bool {
+    let Some(path) = expr.and_then(literal_jsonpath_text) else {
+        // Parameters, columns and computed paths can contain a temporal method
+        // at runtime, so callers that need an immutable/cacheable answer must
+        // fail closed.
+        return true;
+    };
+    sql_json_path::JsonPath::new(path)
+        .map(|path| path.depends_on_session_context_without_tz())
+        // An invalid literal will fail at execution; treating it as dependent
+        // keeps validation conservative without duplicating parser errors here.
+        .unwrap_or(true)
+}
+
+/// Whether a SQL/JSON function call can depend on the session time zone or
+/// transaction date.
+///
+/// `_TZ` entry points are always classified as dependent. Standard entry
+/// points inspect their literal path; dynamic paths fail closed.
+pub(crate) fn is_session_dependent_jsonpath_function(name_upper: &str, args: &[Expr]) -> bool {
+    if matches!(
+        name_upper,
+        "JSONB_PATH_EXISTS_TZ"
+            | "JSONB_PATH_MATCH_TZ"
+            | "JSONB_PATH_QUERY_TZ"
+            | "JSONB_PATH_QUERY_FIRST_TZ"
+            | "JSONB_PATH_QUERY_ARRAY_TZ"
+    ) {
+        return true;
+    }
+    matches!(
+        name_upper,
+        "JSON_EXISTS"
+            | "JSON_VALUE"
+            | "JSON_QUERY"
+            | "JSONB_PATH_EXISTS"
+            | "JSONB_PATH_MATCH"
+            | "JSONB_PATH_QUERY_FIRST"
+            | "JSONB_PATH_QUERY_ARRAY"
+    ) && jsonpath_argument_depends_on_session_context(args.get(1))
+}
+
+/// Whether a SQL/JSON path operator can depend on session context.
+pub(crate) fn is_session_dependent_jsonpath_op(op: &BinOp, path: &Expr) -> bool {
+    match op {
+        BinOp::JsonPathExistsTz | BinOp::JsonPathMatchTz => true,
+        BinOp::JsonPathExists | BinOp::JsonPathMatch => {
+            jsonpath_argument_depends_on_session_context(Some(path))
+        }
+        _ => false,
+    }
+}
+
 fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Value> {
     let evaluated: Vec<Value> = args
         .iter()
@@ -2463,26 +2556,43 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
                 )),
             }
         }
-        "NOW" | "CURRENT_TIMESTAMP" | "LOCALTIMESTAMP" => {
+        "NOW" => {
             check_args(name, &evaluated, 0)?;
             Ok(Value::Timestamp(crate::datetime::txn_or_clock_micros()))
         }
+        "CURRENT_TIMESTAMP" => {
+            let precision = current_time_precision(name, &evaluated)?;
+            let timestamp = crate::datetime::txn_or_clock_micros();
+            precision
+                .map(|precision| crate::datetime::round_time_precision(timestamp, precision))
+                .transpose()
+                .map(|rounded| Value::Timestamp(rounded.unwrap_or(timestamp)))
+        }
+        "LOCALTIMESTAMP" => {
+            let precision = current_time_precision(name, &evaluated)?;
+            let timestamp = crate::datetime::current_local_timestamp_micros()?;
+            precision
+                .map(|precision| crate::datetime::round_time_precision(timestamp, precision))
+                .transpose()
+                .map(|rounded| Value::Timestamp(rounded.unwrap_or(timestamp)))
+        }
         "CURRENT_DATE" => {
             check_args(name, &evaluated, 0)?;
-            Ok(Value::Date(crate::datetime::ts_to_date_floor(
-                crate::datetime::txn_or_clock_micros(),
-            )))
+            crate::datetime::current_date_days().map(Value::Date)
         }
         "CURRENT_TIME" | "LOCALTIME" => {
-            check_args(name, &evaluated, 0)?;
-            Ok(Value::Time(
-                crate::datetime::ts_split(crate::datetime::txn_or_clock_micros()).1,
-            ))
+            let precision = current_time_precision(name, &evaluated)?;
+            let time = crate::datetime::current_local_time_micros()?;
+            precision
+                .map(|precision| crate::datetime::round_time_precision(time, precision))
+                .transpose()
+                .map(|rounded| Value::Time(rounded.unwrap_or(time)))
         }
         "CLOCK_TIMESTAMP" | "STATEMENT_TIMESTAMP" | "TRANSACTION_TIMESTAMP" => {
             check_args(name, &evaluated, 0)?;
             let ts = match name {
                 "CLOCK_TIMESTAMP" => crate::datetime::now_micros(),
+                "STATEMENT_TIMESTAMP" => crate::datetime::statement_or_clock_micros(),
                 _ => crate::datetime::txn_or_clock_micros(),
             };
             Ok(Value::Timestamp(ts))
@@ -2586,8 +2696,7 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
                         })
                     }
                 };
-                // Implicit reference: today at midnight UTC.
-                let today = crate::datetime::today_days();
+                let today = crate::datetime::today_days()?;
                 let midnight = crate::datetime::date_to_ts(today);
                 let (m, d, u) = crate::datetime::age(midnight, ts)?;
                 return Ok(Value::Interval {
@@ -2783,9 +2892,7 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
         }
         "DATE" => {
             if evaluated.is_empty() {
-                return Err(SqlError::InvalidValue(
-                    "DATE requires at least 1 argument".into(),
-                ));
+                return crate::datetime::today_days().map(Value::Date);
             }
             if evaluated[0].is_null() {
                 return Ok(Value::Null);
@@ -2793,7 +2900,7 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
             let d = match &evaluated[0] {
                 Value::Date(d) => *d,
                 Value::Timestamp(t) => crate::datetime::ts_to_date_floor(*t),
-                Value::Text(s) if s.eq_ignore_ascii_case("now") => crate::datetime::today_days(),
+                Value::Text(s) if s.eq_ignore_ascii_case("now") => crate::datetime::today_days()?,
                 Value::Text(s) => crate::datetime::parse_date(s)?,
                 Value::Integer(n) => {
                     crate::datetime::ts_to_date_floor(*n * crate::datetime::MICROS_PER_SEC)
@@ -2809,9 +2916,7 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
         }
         "TIME" => {
             if evaluated.is_empty() {
-                return Err(SqlError::InvalidValue(
-                    "TIME requires at least 1 argument".into(),
-                ));
+                return crate::datetime::current_time_micros().map(Value::Time);
             }
             if evaluated[0].is_null() {
                 return Ok(Value::Null);
@@ -2820,7 +2925,7 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
                 Value::Time(t) => *t,
                 Value::Timestamp(t) => crate::datetime::ts_split(*t).1,
                 Value::Text(s) if s.eq_ignore_ascii_case("now") => {
-                    crate::datetime::current_time_micros()
+                    crate::datetime::current_time_micros()?
                 }
                 Value::Text(s) => crate::datetime::parse_time(s)?,
                 other => {
@@ -2834,9 +2939,7 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
         }
         "DATETIME" => {
             if evaluated.is_empty() {
-                return Err(SqlError::InvalidValue(
-                    "DATETIME requires at least 1 argument".into(),
-                ));
+                return crate::datetime::current_local_timestamp_micros().map(Value::Timestamp);
             }
             if evaluated[0].is_null() {
                 return Ok(Value::Null);
@@ -2844,7 +2947,9 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
             let t = match &evaluated[0] {
                 Value::Timestamp(t) => *t,
                 Value::Date(d) => crate::datetime::date_to_ts(*d),
-                Value::Text(s) if s.eq_ignore_ascii_case("now") => crate::datetime::now_micros(),
+                Value::Text(s) if s.eq_ignore_ascii_case("now") => {
+                    crate::datetime::current_local_timestamp_micros()?
+                }
                 Value::Text(s) => crate::datetime::parse_timestamp(s)?,
                 Value::Integer(n) => n * crate::datetime::MICROS_PER_SEC,
                 other => {
@@ -3688,6 +3793,24 @@ fn check_args(name: &str, args: &[Value], expected: usize) -> Result<()> {
         )))
     } else {
         Ok(())
+    }
+}
+
+fn current_time_precision(name: &str, args: &[Value]) -> Result<Option<u32>> {
+    match args {
+        [] => Ok(None),
+        [Value::Integer(precision)] if (0..=6).contains(precision) => Ok(Some(*precision as u32)),
+        [Value::Integer(precision)] => Err(SqlError::InvalidValue(format!(
+            "{name} precision {precision} must be between 0 and 6"
+        ))),
+        [_] => Err(SqlError::TypeMismatch {
+            expected: "INTEGER precision".into(),
+            got: args[0].data_type().to_string(),
+        }),
+        _ => Err(SqlError::InvalidValue(format!(
+            "{name} requires zero or one argument, got {}",
+            args.len()
+        ))),
     }
 }
 

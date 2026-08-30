@@ -98,6 +98,41 @@ fn stmt_mutates_schema(stmt: &Statement) -> bool {
     }
 }
 
+pub(crate) fn reject_legacy_volatile_schema(schema: &SchemaManager) -> Result<()> {
+    match schema.legacy_volatile_definition() {
+        Some(definition) => Err(SqlError::Unsupported(format!(
+            "legacy catalog recovery required: {definition}; only DROP INDEX, DROP TABLE, or ALTER TABLE DROP COLUMN is allowed until every volatile persisted expression is removed"
+        ))),
+        None => Ok(()),
+    }
+}
+
+fn legacy_recovery_statement(stmt: &Statement) -> bool {
+    matches!(
+        stmt,
+        Statement::DropIndex(_)
+            | Statement::DropTable(_)
+            | Statement::Commit
+            | Statement::Rollback
+            // Connection resolves this and permits only an evaluation-equivalent
+            // no-op while recovery mode is active. Direct executor callers have
+            // no session state and reject it as unsupported later.
+            | Statement::SetTimezone { .. }
+    ) || matches!(
+        stmt,
+        Statement::AlterTable(alter)
+            if matches!(&alter.op, AlterTableOp::DropColumn { .. })
+    )
+}
+
+pub(crate) fn guard_legacy_volatile_schema(schema: &SchemaManager, stmt: &Statement) -> Result<()> {
+    if legacy_recovery_statement(stmt) {
+        Ok(())
+    } else {
+        reject_legacy_volatile_schema(schema)
+    }
+}
+
 fn query_body_mutates(body: &QueryBody) -> bool {
     match body {
         QueryBody::Insert(_) | QueryBody::Update(_) | QueryBody::Delete(_) => true,
@@ -437,6 +472,7 @@ pub fn execute(
     stmt: &Statement,
     params: &[Value],
 ) -> Result<ExecutionResult> {
+    guard_legacy_volatile_schema(schema, stmt)?;
     check_cancelled(db.cancel_token().as_ref())?;
     if !stmt_mutates(stmt) {
         return execute_autocommit_inner(db, schema, stmt, params);
@@ -531,7 +567,7 @@ fn execute_autocommit_inner(
         | Statement::Savepoint(_)
         | Statement::ReleaseSavepoint(_)
         | Statement::RollbackTo(_)
-        | Statement::SetTimezone(_) => Err(SqlError::Unsupported(
+        | Statement::SetTimezone { .. } => Err(SqlError::Unsupported(
             "transaction / session control handled by Connection".into(),
         )),
     }
@@ -543,6 +579,7 @@ pub fn execute_with_read(
     stmt: &Statement,
     _params: &[Value],
 ) -> Result<ExecutionResult> {
+    guard_legacy_volatile_schema(schema, stmt)?;
     check_cancelled(rtx.cancel_token())?;
     match stmt {
         Statement::Select(sq) => cte::exec_select_query_with_read(rtx, schema, sq),
@@ -591,7 +628,7 @@ pub fn execute_with_read(
         | Statement::Savepoint(_)
         | Statement::ReleaseSavepoint(_)
         | Statement::RollbackTo(_)
-        | Statement::SetTimezone(_) => Err(SqlError::Unsupported(
+        | Statement::SetTimezone { .. } => Err(SqlError::Unsupported(
             "transaction / session control handled by Connection".into(),
         )),
     }
@@ -604,6 +641,7 @@ pub fn execute_in_txn(
     stmt: &Statement,
     params: &[Value],
 ) -> Result<ExecutionResult> {
+    guard_legacy_volatile_schema(schema, stmt)?;
     wtx.check_usable().map_err(SqlError::Storage)?;
     // Refused at the door, so nothing ran and there is nothing to poison.
     check_cancelled(wtx.cancel_token())?;
@@ -701,7 +739,7 @@ fn execute_in_txn_inner(
         | Statement::Savepoint(_)
         | Statement::ReleaseSavepoint(_)
         | Statement::RollbackTo(_)
-        | Statement::SetTimezone(_) => {
+        | Statement::SetTimezone { .. } => {
             Err(SqlError::Unsupported("nested transaction control".into()))
         }
     }
@@ -943,6 +981,81 @@ mod cancellation_entry_tests {
         assert_interrupted(execute_in_txn(&mut wtx, &mut schema, &control, &[]));
         assert_interrupted(exec_insert_in_txn(&mut wtx, &schema, insert, &[]));
         wtx.abort();
+    }
+}
+
+#[cfg(test)]
+mod legacy_catalog_entry_tests {
+    use super::*;
+    use citadel::{Argon2Profile, DatabaseBuilder};
+
+    fn assert_recovery_required<T>(outcome: Result<T>) {
+        let error = match outcome {
+            Err(error) => error,
+            Ok(_) => panic!("legacy volatile catalog reached a public executor lane"),
+        };
+        let message = error.to_string();
+        assert!(message.contains("legacy catalog recovery required"));
+        assert!(message.contains("legacy_random_idx"));
+        assert!(message.contains("volatile function RANDOM()"));
+    }
+
+    #[test]
+    fn every_public_executor_entry_enforces_legacy_recovery_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DatabaseBuilder::new(dir.path().join("entry-legacy.citadel"))
+            .passphrase(b"entry-legacy-passphrase")
+            .argon2_profile(Argon2Profile::Iot)
+            .create()
+            .unwrap();
+        let conn = crate::Connection::open(&db).unwrap();
+        conn.execute("CREATE TABLE legacy_random (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        conn.execute("CREATE INDEX legacy_random_idx ON legacy_random (id)")
+            .unwrap();
+
+        // Simulate a catalog written before immutable expression-index
+        // validation existed.
+        let mut legacy = conn.table_schema("legacy_random").unwrap();
+        let index = legacy
+            .indices
+            .iter_mut()
+            .find(|index| index.name == "legacy_random_idx")
+            .unwrap();
+        index.keys = vec![crate::types::IndexKey::Expr {
+            expr: crate::parser::parse_sql_expr("RANDOM()").unwrap(),
+            original_sql: "RANDOM()".into(),
+        }];
+        drop(conn);
+        let mut wtx = db.begin_write().unwrap();
+        SchemaManager::save_schema(&mut wtx, &legacy).unwrap();
+        wtx.commit().unwrap();
+
+        let mut schema = SchemaManager::load(&db).unwrap();
+        let select = crate::parser::parse_sql("SELECT 1").unwrap();
+        assert_recovery_required(execute(&db, &mut schema, &select, &[]));
+
+        let mut rtx = db.begin_read();
+        assert_recovery_required(execute_with_read(&mut rtx, &schema, &select, &[]));
+        drop(rtx);
+
+        let insert_stmt = crate::parser::parse_sql("INSERT INTO legacy_random VALUES (1)").unwrap();
+        let Statement::Insert(insert) = &insert_stmt else {
+            panic!("expected INSERT")
+        };
+        let mut wtx = db.begin_write().unwrap();
+        assert_recovery_required(execute_in_txn(&mut wtx, &mut schema, &select, &[]));
+        assert_recovery_required(exec_insert_in_txn(&mut wtx, &schema, insert, &[]));
+        wtx.abort();
+
+        let drop_index = crate::parser::parse_sql("DROP INDEX legacy_random_idx").unwrap();
+        execute(&db, &mut schema, &drop_index, &[]).unwrap();
+        assert!(schema.legacy_volatile_definition().is_none());
+        let ExecutionResult::Query(result) = execute(&db, &mut schema, &select, &[]).unwrap()
+        else {
+            panic!("expected query result after recovery")
+        };
+        assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
     }
 }
 

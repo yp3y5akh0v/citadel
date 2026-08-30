@@ -97,6 +97,246 @@ fn schema_roundtrip() {
 }
 
 #[test]
+fn legacy_schema_loads_and_marks_volatile_generated_expressions() {
+    use crate::parser::{parse_sql_expr, GeneratedKind};
+
+    let sql = "RANDOM()";
+    let mut columns = vec![
+        col("id", DataType::Integer, false, 0),
+        col("g", DataType::Real, true, 1),
+    ];
+    columns[1].generated_sql = Some(sql.into());
+    columns[1].generated_expr = Some(parse_sql_expr(sql).unwrap());
+    columns[1].generated_kind = Some(GeneratedKind::Stored);
+    let schema = TableSchema::new(
+        "legacy_generated".into(),
+        columns,
+        vec![0],
+        vec![],
+        vec![],
+        vec![],
+    );
+
+    let mut legacy_bytes = schema.serialize();
+    legacy_bytes[0] = 5; // First schema version that persisted generated expressions.
+    let restored = TableSchema::deserialize(&legacy_bytes).unwrap();
+    assert_eq!(
+        restored.volatile_persisted_expression(),
+        Some("generated column \"legacy_generated.g\" calls volatile function RANDOM()".into())
+    );
+}
+
+#[test]
+fn legacy_schema_loads_and_marks_volatile_expression_index_keys() {
+    use crate::parser::parse_sql_expr;
+
+    let sql = "RANDOM()";
+    let schema = TableSchema::new(
+        "legacy_expression_index".into(),
+        vec![col("id", DataType::Integer, false, 0)],
+        vec![0],
+        vec![IndexDef {
+            name: "legacy_expr_idx".into(),
+            keys: vec![IndexKey::Expr {
+                expr: parse_sql_expr(sql).unwrap(),
+                original_sql: sql.into(),
+            }],
+            unique: false,
+            predicate_sql: None,
+            predicate_expr: None,
+            kind: IndexKind::BTree,
+            ann_filter_cols: vec![],
+        }],
+        vec![],
+        vec![],
+    );
+
+    let mut legacy_bytes = schema.serialize();
+    legacy_bytes[0] = 12; // First schema version that persisted expression-index keys.
+    let restored = TableSchema::deserialize(&legacy_bytes).unwrap();
+    assert_eq!(
+        restored.volatile_persisted_expression(),
+        Some(
+            "expression key of index \"legacy_expr_idx\" on table \"legacy_expression_index\" calls volatile function RANDOM()"
+                .into()
+        )
+    );
+}
+
+#[test]
+fn legacy_schema_loads_and_marks_volatile_partial_index_predicates() {
+    use crate::parser::parse_sql_expr;
+
+    let sql = "id > RANDOM()";
+    let schema = TableSchema::new(
+        "legacy_partial_index".into(),
+        vec![col("id", DataType::Integer, false, 0)],
+        vec![0],
+        vec![IndexDef::from_column_lists(
+            "legacy_partial_idx".into(),
+            vec![0],
+            vec![],
+            false,
+            Some(sql.into()),
+            Some(parse_sql_expr(sql).unwrap()),
+            IndexKind::BTree,
+        )],
+        vec![],
+        vec![],
+    );
+
+    let mut legacy_bytes = schema.serialize();
+    legacy_bytes[0] = 6; // First schema version that persisted partial-index predicates.
+    let restored = TableSchema::deserialize(&legacy_bytes).unwrap();
+    assert_eq!(
+        restored.volatile_persisted_expression(),
+        Some(
+            "predicate of partial index \"legacy_partial_idx\" on table \"legacy_partial_index\" calls volatile function RANDOM()"
+                .into()
+        )
+    );
+}
+
+#[test]
+fn legacy_session_dependent_jsonpath_loads_but_is_identified_for_utc_guard() {
+    use crate::parser::{parse_sql_expr, GeneratedKind};
+
+    let generated_sql = r#"JSONB_PATH_MATCH_TZ(j, '$.timestamp_tz()')"#;
+    let mut columns = vec![
+        col("id", DataType::Integer, false, 0),
+        col("j", DataType::Jsonb, true, 1),
+        col("g", DataType::Boolean, true, 2),
+    ];
+    columns[2].generated_sql = Some(generated_sql.into());
+    columns[2].generated_expr = Some(parse_sql_expr(generated_sql).unwrap());
+    columns[2].generated_kind = Some(GeneratedKind::Stored);
+    let generated = TableSchema::new(
+        "legacy_generated".into(),
+        columns,
+        vec![0],
+        vec![],
+        vec![],
+        vec![],
+    );
+    let mut generated_bytes = generated.serialize();
+    generated_bytes[0] = 5;
+    let restored_generated = TableSchema::deserialize(&generated_bytes).unwrap();
+    assert_eq!(
+        restored_generated.session_dependent_persisted_expression(),
+        Some("generated column \"legacy_generated.g\"".into())
+    );
+
+    let key_sql = r#"JSONB_PATH_QUERY_FIRST(j, '$.time_tz()')"#;
+    let expression_index = TableSchema::new(
+        "legacy_expression_index".into(),
+        vec![
+            col("id", DataType::Integer, false, 0),
+            col("j", DataType::Jsonb, true, 1),
+        ],
+        vec![0],
+        vec![IndexDef {
+            name: "legacy_expr_idx".into(),
+            keys: vec![IndexKey::Expr {
+                expr: parse_sql_expr(key_sql).unwrap(),
+                original_sql: key_sql.into(),
+            }],
+            unique: false,
+            predicate_sql: None,
+            predicate_expr: None,
+            kind: IndexKind::BTree,
+            ann_filter_cols: vec![],
+        }],
+        vec![],
+        vec![],
+    );
+    let mut expression_bytes = expression_index.serialize();
+    expression_bytes[0] = 12;
+    let restored_expression = TableSchema::deserialize(&expression_bytes).unwrap();
+    assert_eq!(
+        restored_expression.session_dependent_persisted_expression(),
+        Some(
+            "expression key of index \"legacy_expr_idx\" on table \"legacy_expression_index\""
+                .into()
+        )
+    );
+
+    let predicate_sql = r#"JSONB_PATH_EXISTS(j, '$.time_tz()')"#;
+    let partial_index = TableSchema::new(
+        "legacy_partial_index".into(),
+        vec![
+            col("id", DataType::Integer, false, 0),
+            col("j", DataType::Jsonb, true, 1),
+        ],
+        vec![0],
+        vec![IndexDef::from_column_lists(
+            "legacy_partial_idx".into(),
+            vec![0],
+            vec![],
+            false,
+            Some(predicate_sql.into()),
+            Some(parse_sql_expr(predicate_sql).unwrap()),
+            IndexKind::BTree,
+        )],
+        vec![],
+        vec![],
+    );
+    let mut predicate_bytes = partial_index.serialize();
+    predicate_bytes[0] = 6;
+    let restored_predicate = TableSchema::deserialize(&predicate_bytes).unwrap();
+    assert_eq!(
+        restored_predicate.session_dependent_persisted_expression(),
+        Some(
+            "predicate of partial index \"legacy_partial_idx\" on table \"legacy_partial_index\""
+                .into()
+        )
+    );
+}
+
+#[test]
+fn immutable_persisted_schema_expressions_still_roundtrip() {
+    use crate::parser::{parse_sql_expr, GeneratedKind};
+
+    let generated_sql = "LOWER(name)";
+    let mut columns = vec![
+        col("id", DataType::Integer, false, 0),
+        col("name", DataType::Text, true, 1),
+        col("payload", DataType::Jsonb, true, 2),
+        col("normalized", DataType::Text, true, 3),
+    ];
+    columns[3].generated_sql = Some(generated_sql.into());
+    columns[3].generated_expr = Some(parse_sql_expr(generated_sql).unwrap());
+    columns[3].generated_kind = Some(GeneratedKind::Stored);
+
+    let key_sql = "JSONB_PATH_QUERY_FIRST(payload, '$.account')";
+    let predicate_sql = "JSONB_PATH_MATCH(payload, '$.active == true')";
+    let schema = TableSchema::new(
+        "safe_schema".into(),
+        columns,
+        vec![0],
+        vec![IndexDef {
+            name: "safe_idx".into(),
+            keys: vec![IndexKey::Expr {
+                expr: parse_sql_expr(key_sql).unwrap(),
+                original_sql: key_sql.into(),
+            }],
+            unique: false,
+            predicate_sql: Some(predicate_sql.into()),
+            predicate_expr: Some(parse_sql_expr(predicate_sql).unwrap()),
+            kind: IndexKind::BTree,
+            ann_filter_cols: vec![],
+        }],
+        vec![],
+        vec![],
+    );
+
+    let restored = TableSchema::deserialize(&schema.serialize()).unwrap();
+    assert!(restored.columns[3].generated_expr.is_some());
+    assert!(matches!(restored.indices[0].keys[0], IndexKey::Expr { .. }));
+    assert!(restored.indices[0].predicate_expr.is_some());
+    assert!(restored.session_dependent_persisted_expression().is_none());
+}
+
+#[test]
 fn schema_roundtrip_with_indices() {
     let schema = TableSchema::new(
         "orders".into(),

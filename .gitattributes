@@ -2,3 +2,5 @@
 crates/citadel-ffi/citadel.h text eol=lf
 # cargo-generated; pinned to LF.
 Cargo.lock text eol=lf
+# PostgreSQL corpus bytes are pinned by a known-answer test.
+crates/sql-json-path/tests/jsonb_jsonpath.out text eol=lf -whitespace
