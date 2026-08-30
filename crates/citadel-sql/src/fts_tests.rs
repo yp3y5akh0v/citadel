@@ -11,43 +11,81 @@ fn many_lexeme_vector(count: usize) -> Arc<[u8]> {
     builder.build()
 }
 
+fn run_on_bounded_tsquery_stack(test: impl FnOnce() + Send + 'static) {
+    std::thread::Builder::new()
+        .name("bounded-stack-tsquery".into())
+        .stack_size(1024 * 1024)
+        .spawn(test)
+        .expect("failed to spawn bounded-stack tsquery test")
+        .join()
+        .expect("bounded-stack tsquery test panicked");
+}
+
 #[test]
 fn deeply_nested_text_queries_are_rejected_before_the_stack_is_exhausted() {
-    let not_chain = format!("{}term", "!".repeat(MAX_TSQUERY_DEPTH + 32));
-    let error = parse_tsquery(&not_chain).expect_err("deep NOT chain was accepted");
-    assert!(error.to_string().contains("complexity limit"));
+    run_on_bounded_tsquery_stack(|| {
+        let not_chain = format!("{}term", "!".repeat(MAX_TSQUERY_DEPTH));
+        let error = parse_tsquery(&not_chain).expect_err("deep NOT chain was accepted");
+        assert!(error.to_string().contains("complexity limit"));
 
-    let parenthesized = format!(
-        "{}term{}",
-        "(".repeat(MAX_TSQUERY_DEPTH + 32),
-        ")".repeat(MAX_TSQUERY_DEPTH + 32)
-    );
-    let error = parse_tsquery(&parenthesized).expect_err("deep parentheses were accepted");
-    assert!(error.to_string().contains("complexity limit"));
+        let parenthesized = format!(
+            "{}term{}",
+            "(".repeat(MAX_TSQUERY_DEPTH),
+            ")".repeat(MAX_TSQUERY_DEPTH)
+        );
+        let error = parse_tsquery(&parenthesized).expect_err("deep parentheses were accepted");
+        assert!(error.to_string().contains("complexity limit"));
+    });
+}
+
+#[test]
+fn maximum_tsquery_depth_is_accepted_on_a_bounded_stack() {
+    run_on_bounded_tsquery_stack(|| {
+        let operators = MAX_TSQUERY_DEPTH - 1;
+        let not_chain = format!("{}term", "!".repeat(operators));
+        let ast = parse_tsquery(&not_chain).expect("maximum-depth NOT chain was rejected");
+        let encoded = ast.encode().expect("maximum-depth AST was not encoded");
+        let decoded = TsQueryAst::decode(&encoded).expect("maximum-depth AST was not decoded");
+        assert_eq!(
+            display_ast(&decoded),
+            format!("{}'term'", "!".repeat(operators))
+        );
+
+        let parenthesized = format!("{}term{}", "(".repeat(operators), ")".repeat(operators));
+        parse_tsquery(&parenthesized).expect("maximum-depth parentheses were rejected");
+
+        let mut wire = vec![TSQ_TAG_NOT; operators];
+        wire.extend_from_slice(&[TSQ_TAG_LEXEME, 1, 0, b'x', 0, 0]);
+        TsQueryAst::decode(&wire).expect("maximum-depth wire query was rejected");
+    });
 }
 
 #[test]
 fn deeply_nested_wire_queries_are_rejected_before_recursive_decode() {
-    let mut bytes = vec![TSQ_TAG_NOT; MAX_TSQUERY_DEPTH + 32];
-    bytes.extend_from_slice(&[TSQ_TAG_LEXEME, 1, 0, b'x', 0, 0]);
+    run_on_bounded_tsquery_stack(|| {
+        let mut bytes = vec![TSQ_TAG_NOT; MAX_TSQUERY_DEPTH];
+        bytes.extend_from_slice(&[TSQ_TAG_LEXEME, 1, 0, b'x', 0, 0]);
 
-    let error = TsQueryAst::decode(&bytes).expect_err("deep wire query was accepted");
-    assert!(error.to_string().contains("complexity limit"));
+        let error = TsQueryAst::decode(&bytes).expect_err("deep wire query was accepted");
+        assert!(error.to_string().contains("complexity limit"));
+    });
 }
 
 #[test]
 fn public_encode_rejects_an_externally_built_deep_ast() {
-    let mut ast = TsQueryAst::Lexeme {
-        lexeme: b"term".to_vec(),
-        weight_mask: 0,
-        prefix: false,
-    };
-    for _ in 0..(MAX_TSQUERY_DEPTH + 32) {
-        ast = TsQueryAst::Not(Box::new(ast));
-    }
+    run_on_bounded_tsquery_stack(|| {
+        let mut ast = TsQueryAst::Lexeme {
+            lexeme: b"term".to_vec(),
+            weight_mask: 0,
+            prefix: false,
+        };
+        for _ in 0..MAX_TSQUERY_DEPTH {
+            ast = TsQueryAst::Not(Box::new(ast));
+        }
 
-    let error = ast.encode().expect_err("deep external AST was encoded");
-    assert!(error.to_string().contains("complexity limit"));
+        let error = ast.encode().expect_err("deep external AST was encoded");
+        assert!(error.to_string().contains("complexity limit"));
+    });
 }
 
 #[test]
