@@ -385,12 +385,15 @@ fn racing_writes_never_leak_into_the_successor() {
             std::thread::scope(|scope| {
                 let w = scope.spawn(|| {
                     barrier.wait();
-                    // Ok = landed pre-drop (swept); RegionNotFound = refused. Nothing else.
+                    // Ok = landed pre-drop (swept); either unavailable state = refused.
                     let out =
                         retry_busy(|| writer.remember(&region, AtomInput::new("fact", "racer")));
                     if let Err(e) = out {
                         assert!(
-                            matches!(e, MemError::RegionNotFound(_)),
+                            matches!(
+                                e,
+                                MemError::RegionNotFound(_) | MemError::RegionNotAttached(_)
+                            ),
                             "unexpected race outcome: {e}"
                         );
                     }
