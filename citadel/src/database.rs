@@ -2219,23 +2219,34 @@ fn atom_store_path_for(key_path: &Path) -> PathBuf {
 mod sql_cache_tests {
     use super::*;
     use crate::builder::DatabaseBuilder;
+    #[cfg(not(feature = "fips"))]
     use citadel_core::types::Argon2Profile;
+    #[cfg(feature = "fips")]
+    use citadel_core::types::KdfAlgorithm;
+
+    fn test_builder(path: PathBuf) -> DatabaseBuilder {
+        let builder = DatabaseBuilder::new(path).passphrase(b"x");
+        #[cfg(not(feature = "fips"))]
+        {
+            builder.argon2_profile(Argon2Profile::Iot)
+        }
+        #[cfg(feature = "fips")]
+        {
+            builder
+                .kdf_algorithm(KdfAlgorithm::Pbkdf2HmacSha256)
+                .pbkdf2_iterations(600_000)
+        }
+    }
 
     fn open_db(dir: &Path) -> Database {
-        DatabaseBuilder::new(dir.join("test.db"))
-            .passphrase(b"x")
-            .argon2_profile(Argon2Profile::Iot)
-            .create()
-            .unwrap()
+        test_builder(dir.join("test.db")).create().unwrap()
     }
 
     #[test]
     fn read_and_destruction_paths_do_not_manufacture_missing_key_sidecars() {
         let dir = tempfile::tempdir().unwrap();
-        let db = DatabaseBuilder::new(dir.path().join("keys.db"))
-            .passphrase(b"x")
+        let db = test_builder(dir.path().join("keys.db"))
             .enable_region_keys(true)
-            .argon2_profile(Argon2Profile::Iot)
             .create()
             .unwrap();
         let region_path = db.region_store_path();

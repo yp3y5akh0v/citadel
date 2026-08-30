@@ -104,6 +104,9 @@ jobs:
         with:
           key: ${{ matrix.name }}
       - run: cargo test --workspace ${{ matrix.features }}
+      - name: Test FIPS library configuration
+        if: matrix.name == 'linux-fips'
+        run: cargo test -p citadeldb --lib --features fips
 
   # Opt-in backends the default workspace test skips; also proves wasm cfg-away.
   ai-backends:
