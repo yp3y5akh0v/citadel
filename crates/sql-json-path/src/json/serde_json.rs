@@ -143,4 +143,8 @@ impl<'a> ObjectRef<'a> for &'a Map<String, Value> {
     fn list_value(self) -> Vec<Self::JsonRef> {
         self.values().collect()
     }
+
+    fn identity(self) -> usize {
+        std::ptr::from_ref(self).addr()
+    }
 }

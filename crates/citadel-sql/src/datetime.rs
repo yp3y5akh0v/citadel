@@ -14,6 +14,7 @@ pub const MICROS_PER_SEC: i64 = 1_000_000;
 pub const MICROS_PER_MIN: i64 = 60 * MICROS_PER_SEC;
 pub const MICROS_PER_HOUR: i64 = 60 * MICROS_PER_MIN;
 pub const MICROS_PER_DAY: i64 = 24 * MICROS_PER_HOUR;
+const MAX_TIMEZONE_OFFSET_SECONDS: i32 = 15 * 3_600 + 59 * 60 + 59;
 
 /// i64 µs / 86_400_000_000 wraps to i32 for max representable date: ~292k years.
 pub const DATE_INFINITY_DAYS: i32 = i32::MAX;
@@ -553,9 +554,8 @@ pub fn resolve_timezone(zone: &str) -> Result<TimeZone> {
         return Ok(tz);
     }
     if let Some(offset) = parse_iso_fixed_offset(trimmed) {
-        return jiff::tz::Offset::from_seconds(offset)
-            .map(TimeZone::fixed)
-            .map_err(|e| SqlError::InvalidTimezone(format!("{zone}: {e}")));
+        return fixed_timezone(offset)
+            .map_err(|error| SqlError::InvalidTimezone(format!("{zone}: {error}")));
     }
     let lower = trimmed.to_ascii_lowercase();
     if lower.starts_with("utc+")
@@ -572,7 +572,32 @@ pub fn resolve_timezone(zone: &str) -> Result<TimeZone> {
     )))
 }
 
-/// Parse `Z`, `UTC`, `+HH:MM`, `-HH:MM`, `+HHMM`, `+HH` into signed seconds.
+pub fn fixed_timezone(offset_seconds: i32) -> Result<TimeZone> {
+    if offset_seconds.unsigned_abs() > MAX_TIMEZONE_OFFSET_SECONDS as u32 {
+        return Err(SqlError::InvalidTimezone(format!(
+            "UTC offset {} is outside PostgreSQL's -15:59:59..+15:59:59 range",
+            format_timezone_offset(offset_seconds)
+        )));
+    }
+    jiff::tz::Offset::from_seconds(offset_seconds)
+        .map(TimeZone::fixed)
+        .map_err(|error| SqlError::InvalidTimezone(error.to_string()))
+}
+
+pub fn format_timezone_offset(offset_seconds: i32) -> String {
+    let sign = if offset_seconds < 0 { '-' } else { '+' };
+    let absolute = offset_seconds.unsigned_abs();
+    let hours = absolute / 3_600;
+    let minutes = (absolute % 3_600) / 60;
+    let seconds = absolute % 60;
+    if seconds == 0 {
+        format!("{sign}{hours:02}:{minutes:02}")
+    } else {
+        format!("{sign}{hours:02}:{minutes:02}:{seconds:02}")
+    }
+}
+
+/// Parse `Z`, `UTC`, `+HH:MM[:SS]`, `-HH:MM[:SS]`, `+HHMM`, or `+HH`.
 fn parse_iso_fixed_offset(s: &str) -> Option<i32> {
     if s.eq_ignore_ascii_case("z") || s.eq_ignore_ascii_case("utc") {
         return Some(0);
@@ -587,22 +612,31 @@ fn parse_iso_fixed_offset(s: &str) -> Option<i32> {
         _ => return None,
     };
     let rest = &s[1..];
-    let (hh, mm) = if let Some((h, m)) = rest.split_once(':') {
-        (h, m)
+    let (hh, mm, ss) = if rest.contains(':') {
+        let mut fields = rest.split(':');
+        let hours = fields.next()?;
+        let minutes = fields.next()?;
+        let seconds = fields.next();
+        if seconds.is_some_and(str::is_empty) || fields.next().is_some() {
+            return None;
+        }
+        (hours, minutes, seconds.unwrap_or("00"))
     } else if rest.len() == 4 {
         // len() counts bytes, so a multi-byte char can put index 2 mid-character.
-        rest.split_at_checked(2)?
+        let (hours, minutes) = rest.split_at_checked(2)?;
+        (hours, minutes, "00")
     } else if rest.len() == 2 {
-        (rest, "00")
+        (rest, "00", "00")
     } else {
         return None;
     };
     let h: i32 = hh.parse().ok()?;
     let m: i32 = mm.parse().ok()?;
-    if !(0..=23).contains(&h) || !(0..=59).contains(&m) {
+    let s: i32 = ss.parse().ok()?;
+    if !(0..=23).contains(&h) || !(0..=59).contains(&m) || !(0..=59).contains(&s) {
         return None;
     }
-    Some(sign * (h * 3600 + m * 60))
+    Some(sign * (h * 3600 + m * 60 + s))
 }
 
 pub fn format_interval(months: i32, days: i32, micros: i64) -> String {
@@ -663,19 +697,60 @@ pub fn now_micros() -> i64 {
 thread_local! {
     /// Scoped txn-start timestamp for PG-exact CURRENT_TIMESTAMP (stable per txn).
     static TXN_CLOCK: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
+    /// Scoped statement-start timestamp for PG-exact STATEMENT_TIMESTAMP.
+    static STATEMENT_CLOCK: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
+    /// Session time zone for current-date/time functions evaluated by the executor.
+    static SESSION_TIMEZONE: std::cell::RefCell<Option<TimeZone>> = const {
+        std::cell::RefCell::new(None)
+    };
 }
 
-/// Install a txn-start timestamp for the duration of `f`. Restores the previous
-/// value on return (nested-safe).
+/// Install a txn-start timestamp for the duration of `f`.
 pub fn with_txn_clock<R>(ts: Option<i64>, f: impl FnOnce() -> R) -> R {
-    TXN_CLOCK.with(|slot| {
-        let prev = slot.replace(ts);
-        let r = f();
-        slot.set(prev);
-        r
-    })
+    struct Guard(Option<i64>);
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            TXN_CLOCK.with(|slot| slot.set(self.0));
+        }
+    }
+
+    let previous = TXN_CLOCK.with(|slot| slot.replace(ts));
+    let _guard = Guard(previous);
+    f()
 }
 
+/// Install a statement-start timestamp for the duration of `f`.
+pub fn with_statement_clock<R>(ts: Option<i64>, f: impl FnOnce() -> R) -> R {
+    struct Guard(Option<i64>);
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            STATEMENT_CLOCK.with(|slot| slot.set(self.0));
+        }
+    }
+
+    let previous = STATEMENT_CLOCK.with(|slot| slot.replace(ts));
+    let _guard = Guard(previous);
+    f()
+}
+
+/// Install the connection's session time zone for the duration of `f`.
+pub fn with_session_timezone<R>(timezone: TimeZone, f: impl FnOnce() -> R) -> R {
+    struct Guard(Option<TimeZone>);
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            SESSION_TIMEZONE.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+
+    let previous = SESSION_TIMEZONE.with(|slot| slot.borrow_mut().replace(timezone));
+    let _guard = Guard(previous);
+    f()
+}
+
+#[cfg(test)]
 pub fn set_txn_clock(ts: Option<i64>) {
     TXN_CLOCK.with(|slot| slot.set(ts));
 }
@@ -686,12 +761,78 @@ pub fn txn_or_clock_micros() -> i64 {
     TXN_CLOCK.with(|slot| slot.get()).unwrap_or_else(now_micros)
 }
 
-pub fn today_days() -> i32 {
-    ts_to_date_floor(now_micros())
+/// Read the statement-start clock if one is installed, else a fresh clock.
+pub fn statement_or_clock_micros() -> i64 {
+    STATEMENT_CLOCK
+        .with(|slot| slot.get())
+        .unwrap_or_else(now_micros)
 }
 
-pub fn current_time_micros() -> i64 {
-    ts_split(now_micros()).1
+fn session_timezone() -> TimeZone {
+    SESSION_TIMEZONE.with(|slot| slot.borrow().clone().unwrap_or(TimeZone::UTC))
+}
+
+fn local_parts(micros: i64) -> Result<(i32, i64)> {
+    let timestamp = JTimestamp::from_microsecond(micros)
+        .map_err(|error| SqlError::InvalidTimestampLiteral(error.to_string()))?;
+    let zoned = timestamp.to_zoned(session_timezone());
+    let date = ymd_to_days(zoned.year() as i32, zoned.month() as u8, zoned.day() as u8)
+        .ok_or(SqlError::IntegerOverflow)?;
+    let time = hmsn_to_micros(
+        zoned.hour() as u8,
+        zoned.minute() as u8,
+        zoned.second() as u8,
+        (zoned.subsec_nanosecond() / 1_000) as u32,
+    )
+    .ok_or(SqlError::IntegerOverflow)?;
+    Ok((date, time))
+}
+
+/// Transaction-start date in the current session time zone.
+pub fn current_date_days() -> Result<i32> {
+    local_parts(txn_or_clock_micros()).map(|(date, _)| date)
+}
+
+/// Transaction-start local time in the current session time zone.
+pub fn current_local_time_micros() -> Result<i64> {
+    local_parts(txn_or_clock_micros()).map(|(_, time)| time)
+}
+
+/// Transaction-start local timestamp, represented as a zone-less wall clock.
+pub fn current_local_timestamp_micros() -> Result<i64> {
+    let (date, time) = local_parts(txn_or_clock_micros())?;
+    (date as i64)
+        .checked_mul(MICROS_PER_DAY)
+        .and_then(|value| value.checked_add(time))
+        .ok_or(SqlError::IntegerOverflow)
+}
+
+pub fn round_time_precision(micros: i64, precision: u32) -> Result<i64> {
+    if precision > 6 {
+        return Err(SqlError::InvalidValue(format!(
+            "time precision {precision} must be between 0 and 6"
+        )));
+    }
+    let quantum = 10_i64.pow(6 - precision);
+    if quantum == 1 {
+        return Ok(micros);
+    }
+    let half = quantum / 2;
+    let adjusted = if micros >= 0 {
+        micros.checked_add(half)
+    } else {
+        micros.checked_sub(half)
+    }
+    .ok_or(SqlError::IntegerOverflow)?;
+    Ok(adjusted / quantum * quantum)
+}
+
+pub fn today_days() -> Result<i32> {
+    current_date_days()
+}
+
+pub fn current_time_micros() -> Result<i64> {
+    current_local_time_micros()
 }
 
 pub fn add_interval_to_timestamp(ts: i64, months: i32, days: i32, micros: i64) -> Result<i64> {

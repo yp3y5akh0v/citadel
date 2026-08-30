@@ -15,10 +15,12 @@
 //
 // This file has been modified by Citadel contributors.
 
+use rustc_hash::FxHashMap;
 use serde_json::Number;
 
 use crate::{
     ast::*,
+    datetime::{DatetimeKind, ParsedDatetime},
     json::{ArrayRef, Cow, Json, JsonRef, ObjectRef},
 };
 
@@ -60,16 +62,12 @@ pub enum Error {
     MethodNotNumeric(&'static str),
     #[error("jsonpath item method .size() can only be applied to an array")]
     SizeNotArray,
-    #[error("jsonpath item method .double() can only be applied to a string or numeric value")]
-    DoubleTypeError,
-    #[error("numeric argument of jsonpath item method .double() is out of range for type double precision")]
-    DoubleOutOfRange,
-    #[error("string argument of jsonpath item method .double() is not a valid representation of a double precision number")]
-    InvalidDouble,
     #[error("jsonpath item method .keyvalue() can only be applied to an object")]
     KeyValueNotObject,
     #[error("division by zero")]
     DivisionByZero,
+    #[error("value overflows numeric format")]
+    NumericOverflow,
     #[error("single boolean result is expected")]
     ExpectSingleBoolean,
     #[error("jsonpath item method .datetime() can only be applied to a string")]
@@ -96,6 +94,34 @@ pub enum Error {
     InvalidDatetimeTemplate(Box<str>),
     #[error("template directive {0} is not supported by jsonpath")]
     UnsupportedDatetimeDirective(Box<str>),
+    #[error("jsonpath item method .{0}() can only be applied to a string or numeric value")]
+    NumericConversionType(&'static str),
+    #[error("argument \"{0}\" of jsonpath item method .{1}() is invalid for type {2}")]
+    InvalidConversion(Box<str>, &'static str, &'static str),
+    #[error(
+        "jsonpath item method .boolean() can only be applied to a boolean, string, or numeric value"
+    )]
+    BooleanTypeError,
+    #[error("jsonpath item method .string() can only be applied to a boolean, string, numeric, or datetime value")]
+    StringTypeError,
+    #[error("jsonpath item method .{0}() can only be applied to a string")]
+    DatetimeMethodNotString(&'static str),
+    /// Takes the raw input; the quotes belong to this format string, unlike
+    /// [`Error::DatetimeFormatNotRecognized`], whose argument arrives pre-quoted.
+    #[error("{0} format is not recognized: \"{1}\"")]
+    FormatNotRecognized(&'static str, Box<str>),
+    #[error("NaN or Infinity is not allowed for jsonpath item method .{0}()")]
+    NanOrInfinity(&'static str),
+    #[error("NUMERIC precision {0} must be between 1 and 1000")]
+    NumericPrecisionOutOfBounds(i64),
+    #[error("NUMERIC scale {0} must be between -1000 and 1000")]
+    NumericScaleOutOfBounds(i64),
+    #[error("precision of jsonpath item method .decimal() is out of range for type integer")]
+    DecimalPrecisionOutOfRange,
+    #[error("scale of jsonpath item method .decimal() is out of range for type integer")]
+    DecimalScaleOutOfRange,
+    #[error("time precision of jsonpath item method .{0}() is out of range for type integer")]
+    TimePrecisionOutOfRange(&'static str),
 }
 
 impl Error {
@@ -200,43 +226,178 @@ impl Truth {
     }
 }
 
-fn unwrap_datetime_markers<'a, T: JsonRef<'a>>(
-    set: Vec<Cow<'a, T::Owned>>,
-) -> Vec<Cow<'a, T::Owned>> {
-    let mut out = Vec::with_capacity(set.len());
-    for c in set {
-        let owned = c.into_owned();
-        let is_marker = check_marker::<T::Owned>(&owned);
-        if let Some(iso) = is_marker {
-            out.push(Cow::Owned(<T::Owned as crate::json::Json>::from_string(
-                &iso,
-            )));
-        } else {
-            out.push(Cow::Owned(owned));
-        }
-    }
-    out
+#[derive(Debug)]
+enum EvalItem<'a, T: Json + 'a> {
+    Json(Cow<'a, T>),
+    Datetime(ParsedDatetime),
 }
 
-fn check_marker<J: crate::json::Json>(v: &J) -> Option<String> {
-    crate::datetime::extract_marker(v.as_ref()).map(|(iso, _)| iso)
+impl<'a, T: Json> EvalItem<'a, T> {
+    fn borrowed(value: T::Borrowed<'a>) -> Self {
+        Self::Json(Cow::Borrowed(value))
+    }
+
+    fn owned(value: T) -> Self {
+        Self::Json(Cow::Owned(value))
+    }
+
+    fn as_json<'b>(&'b self) -> Option<T::Borrowed<'b>>
+    where
+        'a: 'b,
+    {
+        match self {
+            Self::Json(value) => Some(value.as_ref()),
+            Self::Datetime(_) => None,
+        }
+    }
+
+    fn as_current<'b>(&'b self) -> Current<'b, T>
+    where
+        'a: 'b,
+    {
+        match self {
+            Self::Json(value) => Current::Json(value.as_ref()),
+            Self::Datetime(value) => Current::Datetime(value),
+        }
+    }
+
+    fn into_owned<'b>(self) -> EvalItem<'b, T> {
+        match self {
+            Self::Json(value) => EvalItem::owned(value.into_owned()),
+            Self::Datetime(value) => EvalItem::Datetime(value),
+        }
+    }
+
+    fn into_output(self) -> Cow<'a, T> {
+        match self {
+            Self::Json(value) => value,
+            Self::Datetime(value) => Cow::Owned(T::from_string(&value.iso)),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum Current<'a, T: Json + 'a> {
+    Json(T::Borrowed<'a>),
+    Datetime(&'a ParsedDatetime),
+}
+
+impl<T: Json> Copy for Current<'_, T> {}
+
+impl<T: Json> Clone for Current<'_, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<'a, T: Json> Current<'a, T> {
+    fn as_json(self) -> Option<T::Borrowed<'a>> {
+        match self {
+            Self::Json(value) => Some(value),
+            Self::Datetime(_) => None,
+        }
+    }
+
+    fn as_datetime(self) -> Option<&'a ParsedDatetime> {
+        match self {
+            Self::Json(_) => None,
+            Self::Datetime(value) => Some(value),
+        }
+    }
+
+    fn to_item(self) -> EvalItem<'a, T> {
+        match self {
+            Self::Json(value) => EvalItem::borrowed(value),
+            Self::Datetime(value) => EvalItem::Datetime(value.clone()),
+        }
+    }
+}
+
+fn into_outputs<'a, T: Json>(set: Vec<EvalItem<'a, T>>) -> Vec<Cow<'a, T>> {
+    set.into_iter().map(EvalItem::into_output).collect()
+}
+
+#[derive(Debug, Default)]
+struct ObjectIds {
+    next: i64,
+    by_identity: FxHashMap<usize, i64>,
+}
+
+impl ObjectIds {
+    fn id_for(&mut self, identity: usize) -> i64 {
+        if let Some(id) = self.by_identity.get(&identity) {
+            return *id;
+        }
+        self.next = self
+            .next
+            .checked_add(1)
+            .expect("one JSONPath evaluation cannot contain more than i64::MAX objects");
+        self.by_identity.insert(identity, self.next);
+        self.next
+    }
 }
 
 impl JsonPath {
-    /// Evaluate the JSON path against the given JSON value.
-    pub fn query<'a, T: JsonRef<'a>>(&self, value: T) -> Result<Vec<Cow<'a, T::Owned>>> {
+    /// Set the session time zone the `_tz` entry points resolve against.
+    ///
+    /// PostgreSQL reads `SET TIME ZONE`; without this the zone is UTC, which is what
+    /// PostgreSQL itself falls back to when `TimeZone` is unset.
+    #[must_use]
+    pub fn with_session_tz(mut self, tz: jiff::tz::TimeZone) -> Self {
+        self.session_tz = Some(tz);
+        self
+    }
+
+    /// Set the transaction-start date used by time-to-timetz conversions.
+    ///
+    /// PostgreSQL resolves a bare `time` using the current date in the session zone,
+    /// because that zone's UTC offset may depend on daylight saving time.
+    #[must_use]
+    pub fn with_session_date(mut self, date: jiff::civil::Date) -> Self {
+        self.session_date = Some(date);
+        self
+    }
+
+    /// The zone `_tz` evaluation resolves against, defaulting to UTC as PostgreSQL does.
+    fn tz(&self) -> &jiff::tz::TimeZone {
+        static UTC: jiff::tz::TimeZone = jiff::tz::TimeZone::UTC;
+        self.session_tz.as_ref().unwrap_or(&UTC)
+    }
+
+    fn date(&self) -> jiff::civil::Date {
+        self.session_date
+            .unwrap_or_else(|| jiff::Timestamp::now().to_zoned(self.tz().clone()).date())
+    }
+
+    fn evaluate<'a, T: JsonRef<'a>>(
+        &self,
+        value: T,
+        vars: T,
+        first: bool,
+        use_tz: bool,
+        silent: bool,
+    ) -> Result<Vec<Cow<'a, T::Owned>>> {
+        let object_ids = std::cell::RefCell::new(ObjectIds::default());
         Evaluator {
             root: value,
-            current: value,
-            vars: T::null(),
-            array: T::null(),
+            current: Current::Json(value),
+            vars,
+            array_len: None,
             mode: self.mode,
-            first: false,
-            use_tz: false,
-            silent: false,
+            session_tz: self.tz(),
+            session_date: self.date(),
+            object_ids: &object_ids,
+            first,
+            use_tz,
+            silent,
         }
         .eval_expr_or_predicate(&self.expr)
-        .map(unwrap_datetime_markers::<T>)
+        .map(into_outputs)
+    }
+
+    /// Evaluate the JSON path against the given JSON value.
+    pub fn query<'a, T: JsonRef<'a>>(&self, value: T) -> Result<Vec<Cow<'a, T::Owned>>> {
+        self.evaluate(value, T::null(), false, false, false)
     }
 
     /// Evaluate the JSON path against the given JSON value with variables.
@@ -248,35 +409,13 @@ impl JsonPath {
         if !vars.is_object() {
             return Err(Error::VarsNotObject);
         }
-        Evaluator {
-            root: value,
-            current: value,
-            vars,
-            array: T::null(),
-            mode: self.mode,
-            first: false,
-            use_tz: false,
-            silent: false,
-        }
-        .eval_expr_or_predicate(&self.expr)
-        .map(unwrap_datetime_markers::<T>)
+        self.evaluate(value, vars, false, false, false)
     }
 
     /// Evaluate the JSON path against the given JSON value.
     pub fn query_first<'a, T: JsonRef<'a>>(&self, value: T) -> Result<Option<Cow<'a, T::Owned>>> {
-        Evaluator {
-            root: value,
-            current: value,
-            vars: T::null(),
-            array: T::null(),
-            mode: self.mode,
-            first: true,
-            use_tz: false,
-            silent: false,
-        }
-        .eval_expr_or_predicate(&self.expr)
-        .map(unwrap_datetime_markers::<T>)
-        .map(|set| set.into_iter().next())
+        self.evaluate(value, T::null(), true, false, false)
+            .map(|set| set.into_iter().next())
     }
 
     /// Evaluate the JSON path against the given JSON value with variables.
@@ -288,19 +427,8 @@ impl JsonPath {
         if !vars.is_object() {
             return Err(Error::VarsNotObject);
         }
-        Evaluator {
-            root: value,
-            current: value,
-            vars,
-            array: T::null(),
-            mode: self.mode,
-            first: true,
-            use_tz: false,
-            silent: false,
-        }
-        .eval_expr_or_predicate(&self.expr)
-        .map(unwrap_datetime_markers::<T>)
-        .map(|set| set.into_iter().next())
+        self.evaluate(value, vars, true, false, false)
+            .map(|set| set.into_iter().next())
     }
 
     /// Checks whether the JSON path returns any item for the specified JSON value.
@@ -317,18 +445,7 @@ impl JsonPath {
     // ---- Citadel `_tz` entry points -----------------------------------
 
     pub fn query_tz<'a, T: JsonRef<'a>>(&self, value: T) -> Result<Vec<Cow<'a, T::Owned>>> {
-        Evaluator {
-            root: value,
-            current: value,
-            vars: T::null(),
-            array: T::null(),
-            mode: self.mode,
-            first: false,
-            use_tz: true,
-            silent: false,
-        }
-        .eval_expr_or_predicate(&self.expr)
-        .map(unwrap_datetime_markers::<T>)
+        self.evaluate(value, T::null(), false, true, false)
     }
 
     pub fn query_with_vars_tz<'a, T: JsonRef<'a>>(
@@ -339,37 +456,15 @@ impl JsonPath {
         if !vars.is_object() {
             return Err(Error::VarsNotObject);
         }
-        Evaluator {
-            root: value,
-            current: value,
-            vars,
-            array: T::null(),
-            mode: self.mode,
-            first: false,
-            use_tz: true,
-            silent: false,
-        }
-        .eval_expr_or_predicate(&self.expr)
-        .map(unwrap_datetime_markers::<T>)
+        self.evaluate(value, vars, false, true, false)
     }
 
     pub fn query_first_tz<'a, T: JsonRef<'a>>(
         &self,
         value: T,
     ) -> Result<Option<Cow<'a, T::Owned>>> {
-        Evaluator {
-            root: value,
-            current: value,
-            vars: T::null(),
-            array: T::null(),
-            mode: self.mode,
-            first: true,
-            use_tz: true,
-            silent: false,
-        }
-        .eval_expr_or_predicate(&self.expr)
-        .map(unwrap_datetime_markers::<T>)
-        .map(|set| set.into_iter().next())
+        self.evaluate(value, T::null(), true, true, false)
+            .map(|set| set.into_iter().next())
     }
 
     pub fn query_first_with_vars_tz<'a, T: JsonRef<'a>>(
@@ -380,19 +475,8 @@ impl JsonPath {
         if !vars.is_object() {
             return Err(Error::VarsNotObject);
         }
-        Evaluator {
-            root: value,
-            current: value,
-            vars,
-            array: T::null(),
-            mode: self.mode,
-            first: true,
-            use_tz: true,
-            silent: false,
-        }
-        .eval_expr_or_predicate(&self.expr)
-        .map(unwrap_datetime_markers::<T>)
-        .map(|set| set.into_iter().next())
+        self.evaluate(value, vars, true, true, false)
+            .map(|set| set.into_iter().next())
     }
 
     pub fn exists_tz<'a, T: JsonRef<'a>>(&self, value: T) -> Result<bool> {
@@ -407,18 +491,7 @@ impl JsonPath {
     // ---- Citadel `_silent` entry points -------------------------------
 
     pub fn query_silent<'a, T: JsonRef<'a>>(&self, value: T) -> Result<Vec<Cow<'a, T::Owned>>> {
-        Evaluator {
-            root: value,
-            current: value,
-            vars: T::null(),
-            array: T::null(),
-            mode: self.mode,
-            first: false,
-            use_tz: false,
-            silent: true,
-        }
-        .eval_expr_or_predicate(&self.expr)
-        .map(unwrap_datetime_markers::<T>)
+        self.evaluate(value, T::null(), false, false, true)
     }
 
     pub fn query_with_vars_silent<'a, T: JsonRef<'a>>(
@@ -429,37 +502,15 @@ impl JsonPath {
         if !vars.is_object() {
             return Err(Error::VarsNotObject);
         }
-        Evaluator {
-            root: value,
-            current: value,
-            vars,
-            array: T::null(),
-            mode: self.mode,
-            first: false,
-            use_tz: false,
-            silent: true,
-        }
-        .eval_expr_or_predicate(&self.expr)
-        .map(unwrap_datetime_markers::<T>)
+        self.evaluate(value, vars, false, false, true)
     }
 
     pub fn query_first_silent<'a, T: JsonRef<'a>>(
         &self,
         value: T,
     ) -> Result<Option<Cow<'a, T::Owned>>> {
-        Evaluator {
-            root: value,
-            current: value,
-            vars: T::null(),
-            array: T::null(),
-            mode: self.mode,
-            first: true,
-            use_tz: false,
-            silent: true,
-        }
-        .eval_expr_or_predicate(&self.expr)
-        .map(unwrap_datetime_markers::<T>)
-        .map(|set| set.into_iter().next())
+        self.evaluate(value, T::null(), true, false, true)
+            .map(|set| set.into_iter().next())
     }
 
     pub fn query_first_with_vars_silent<'a, T: JsonRef<'a>>(
@@ -470,19 +521,8 @@ impl JsonPath {
         if !vars.is_object() {
             return Err(Error::VarsNotObject);
         }
-        Evaluator {
-            root: value,
-            current: value,
-            vars,
-            array: T::null(),
-            mode: self.mode,
-            first: true,
-            use_tz: false,
-            silent: true,
-        }
-        .eval_expr_or_predicate(&self.expr)
-        .map(unwrap_datetime_markers::<T>)
-        .map(|set| set.into_iter().next())
+        self.evaluate(value, vars, true, false, true)
+            .map(|set| set.into_iter().next())
     }
 
     pub fn exists_silent<'a, T: JsonRef<'a>>(&self, value: T) -> Result<bool> {
@@ -497,13 +537,13 @@ impl JsonPath {
 
 /// Evaluation context.
 #[derive(Debug, Clone, Copy)]
-struct Evaluator<'a, T: Json + 'a> {
+struct Evaluator<'a, 'p, T: Json + 'a> {
     /// The current value referenced by `@`.
-    current: T::Borrowed<'a>,
+    current: Current<'a, T>,
     /// The root value referenced by `$`.
     root: T::Borrowed<'a>,
-    /// The innermost array value referenced by `last`.
-    array: T::Borrowed<'a>,
+    /// The length of the innermost array referenced by `last`.
+    array_len: Option<usize>,
     /// An object containing the variables referenced by `$var`.
     vars: T::Borrowed<'a>,
     /// The path mode.
@@ -512,6 +552,12 @@ struct Evaluator<'a, T: Json + 'a> {
     /// Only return the first result.
     first: bool,
     use_tz: bool,
+    /// Zone the `_tz` entry points resolve against. Held by reference so the evaluator
+    /// stays `Copy`; `TimeZone` is not.
+    session_tz: &'p jiff::tz::TimeZone,
+    /// Transaction-start date in `session_tz`, used by time-to-timetz casts.
+    session_date: jiff::civil::Date,
+    object_ids: &'p std::cell::RefCell<ObjectIds>,
     silent: bool,
 }
 
@@ -551,7 +597,7 @@ macro_rules! lax {
     };
 }
 
-impl<'a, T: Json> Evaluator<'a, T> {
+impl<'a, 'p, T: Json> Evaluator<'a, 'p, T> {
     /// Returns true if the evaluator is in lax mode.
     fn is_lax(&self) -> bool {
         matches!(self.mode, Mode::Lax)
@@ -563,7 +609,7 @@ impl<'a, T: Json> Evaluator<'a, T> {
     }
 
     /// Creates a new evaluator with the given current value.
-    fn with_current<'b>(&self, current: T::Borrowed<'b>) -> Evaluator<'b, T>
+    fn with_current<'b>(&self, current: Current<'b, T>) -> Evaluator<'b, 'p, T>
     where
         'a: 'b,
     {
@@ -571,8 +617,11 @@ impl<'a, T: Json> Evaluator<'a, T> {
             current,
             root: T::borrow(self.root),
             vars: T::borrow(self.vars),
-            array: T::borrow(self.array),
+            array_len: self.array_len,
             mode: self.mode,
+            session_tz: self.session_tz,
+            session_date: self.session_date,
+            object_ids: self.object_ids,
             first: self.first,
             use_tz: self.use_tz,
             silent: self.silent,
@@ -604,12 +653,12 @@ impl<'a, T: Json> Evaluator<'a, T> {
     }
 
     /// Evaluates the expression or predicate.
-    fn eval_expr_or_predicate(&self, expr: &ExprOrPredicate) -> Result<Vec<Cow<'a, T>>> {
+    fn eval_expr_or_predicate(&self, expr: &ExprOrPredicate) -> Result<Vec<EvalItem<'a, T>>> {
         match expr {
             ExprOrPredicate::Expr(expr) => self.eval_expr(expr),
             ExprOrPredicate::Pred(pred) => self
                 .eval_predicate(pred)
-                .map(|t| vec![Cow::Owned(t.to_json())]),
+                .map(|t| vec![EvalItem::owned(t.to_json())]),
         }
     }
 
@@ -625,7 +674,14 @@ impl<'a, T: Json> Evaluator<'a, T> {
                 // Each SQL/JSON item in one SQL/JSON sequence is compared to each item in the other SQL/JSON sequence.
                 'product: for r in right.iter() {
                     for l in left.iter() {
-                        let res = eval_compare::<T>(*op, l.as_ref(), r.as_ref(), self.use_tz)?;
+                        let res = eval_compare::<T>(
+                            *op,
+                            l,
+                            r,
+                            self.use_tz,
+                            self.session_tz,
+                            self.session_date,
+                        )?;
                         if res.is_unknown() && !self.is_lax() {
                             return Ok(Truth::Unknown);
                         }
@@ -664,10 +720,10 @@ impl<'a, T: Json> Evaluator<'a, T> {
             Predicate::StartsWith(expr, prefix) => {
                 let set = lax!(self, self.all().eval_expr(expr));
                 let prefix = self.eval_value(prefix)?;
-                let prefix = prefix.as_ref().as_str().unwrap();
+                let prefix = prefix.as_json().and_then(JsonRef::as_str).unwrap();
                 let mut result = Truth::False;
                 for v in set {
-                    let res = match v.as_ref().as_str() {
+                    let res = match v.as_json().and_then(JsonRef::as_str) {
                         Some(s) => s.starts_with(prefix).into(),
                         None => Truth::Unknown,
                     };
@@ -685,7 +741,7 @@ impl<'a, T: Json> Evaluator<'a, T> {
                 let set = lax!(self, self.all().eval_expr(expr));
                 let mut result = Truth::False;
                 for v in set {
-                    let res = match v.as_ref().as_str() {
+                    let res = match v.as_json().and_then(JsonRef::as_str) {
                         Some(s) => regex.is_match(s).into(),
                         None => Truth::Unknown,
                     };
@@ -703,7 +759,7 @@ impl<'a, T: Json> Evaluator<'a, T> {
     }
 
     /// Evaluates the expression.
-    fn eval_expr(&self, expr: &Expr) -> Result<Vec<Cow<'a, T>>> {
+    fn eval_expr(&self, expr: &Expr) -> Result<Vec<EvalItem<'a, T>>> {
         match expr {
             Expr::PathPrimary(primary) => self.eval_path_primary(primary),
             Expr::Accessor(base, op) => {
@@ -711,17 +767,13 @@ impl<'a, T: Json> Evaluator<'a, T> {
                 let mut new_set = vec![];
                 for v in &set {
                     match v {
-                        Cow::Owned(v) => {
-                            let sset = self.with_current(v.as_ref()).eval_accessor_op(op)?;
-                            new_set.extend(
-                                // the returned set requires lifetime 'a,
-                                // however, elements in `sset` only have lifetime 'b < 'v = 'set < 'a
-                                // therefore, we need to convert them to owned values
-                                sset.into_iter().map(|cow| Cow::Owned(cow.into_owned())),
-                            )
-                        }
-                        Cow::Borrowed(v) => {
-                            new_set.extend(self.with_current(*v).eval_accessor_op(op)?);
+                        EvalItem::Json(Cow::Borrowed(value)) => new_set.extend(
+                            self.with_current(Current::Json(*value))
+                                .eval_accessor_op(op)?,
+                        ),
+                        EvalItem::Json(Cow::Owned(_)) | EvalItem::Datetime(_) => {
+                            let set = self.with_current(v.as_current()).eval_accessor_op(op)?;
+                            new_set.extend(set.into_iter().map(EvalItem::into_owned));
                         }
                     }
                     if self.is_first() && !new_set.is_empty() {
@@ -735,18 +787,23 @@ impl<'a, T: Json> Evaluator<'a, T> {
                 let mut new_set = Vec::with_capacity(set.len());
                 let item_skip = self.silent && self.is_lax();
                 'outer: for v in set {
-                    let v = v.as_ref();
+                    let Some(v) = v.as_json() else {
+                        if item_skip {
+                            continue;
+                        }
+                        return Err(Error::UnaryOperandNotNumeric(*op));
+                    };
                     if v.is_array() && self.is_lax() {
                         for v in v.as_array().unwrap().list() {
                             match eval_unary_op(*op, v) {
-                                Ok(r) => new_set.push(Cow::Owned(r)),
+                                Ok(r) => new_set.push(EvalItem::owned(r)),
                                 Err(_) if item_skip => break 'outer,
                                 Err(e) => return Err(e),
                             }
                         }
                     } else {
                         match eval_unary_op(*op, v) {
-                            Ok(r) => new_set.push(Cow::Owned(r)),
+                            Ok(r) => new_set.push(EvalItem::owned(r)),
                             Err(e) if item_skip && e.can_silent() => continue,
                             Err(e) => return Err(e),
                         }
@@ -764,55 +821,58 @@ impl<'a, T: Json> Evaluator<'a, T> {
                     return Err(Error::RightOperandNotNumeric(*op));
                 }
                 // unwrap left if it is an array
+                let left = left[0].as_json().ok_or(Error::LeftOperandNotNumeric(*op))?;
                 let left = if self.is_lax() {
-                    if let Some(array) = left[0].as_ref().as_array() {
+                    if let Some(array) = left.as_array() {
                         if array.len() != 1 {
                             return Err(Error::LeftOperandNotNumeric(*op));
                         }
                         array.get(0).unwrap()
                     } else {
-                        left[0].as_ref()
+                        left
                     }
                 } else {
-                    left[0].as_ref()
+                    left
                 };
                 // unwrap right if it is an array
+                let right = right[0]
+                    .as_json()
+                    .ok_or(Error::RightOperandNotNumeric(*op))?;
                 let right = if self.is_lax() {
-                    if let Some(array) = right[0].as_ref().as_array() {
+                    if let Some(array) = right.as_array() {
                         if array.len() != 1 {
                             return Err(Error::RightOperandNotNumeric(*op));
                         }
                         array.get(0).unwrap()
                     } else {
-                        right[0].as_ref()
+                        right
                     }
                 } else {
-                    right[0].as_ref()
+                    right
                 };
-                Ok(vec![Cow::Owned(eval_binary_op(*op, left, right)?)])
+                Ok(vec![EvalItem::owned(eval_binary_op(*op, left, right)?)])
             }
         }
     }
 
     /// Evaluates the path primary.
-    fn eval_path_primary(&self, primary: &PathPrimary) -> Result<Vec<Cow<'a, T>>> {
+    fn eval_path_primary(&self, primary: &PathPrimary) -> Result<Vec<EvalItem<'a, T>>> {
         match primary {
-            PathPrimary::Root => Ok(vec![Cow::Borrowed(self.root)]),
-            PathPrimary::Current => Ok(vec![Cow::Borrowed(self.current)]),
+            PathPrimary::Root => Ok(vec![EvalItem::borrowed(self.root)]),
+            PathPrimary::Current => Ok(vec![self.current.to_item()]),
             PathPrimary::Value(v) => Ok(vec![self.eval_value(v)?]),
             PathPrimary::Last => {
-                let array = self
-                    .array
-                    .as_array()
+                let len = self
+                    .array_len
                     .expect("LAST is allowed only in array subscripts");
-                Ok(vec![Cow::Owned(T::from_i64(array.len() as i64 - 1))])
+                Ok(vec![EvalItem::owned(T::from_i64(len as i64 - 1))])
             }
             PathPrimary::ExprOrPred(expr) => self.eval_expr_or_predicate(expr),
         }
     }
 
     /// Evaluates the accessor operator.
-    fn eval_accessor_op(&self, op: &AccessorOp) -> Result<Vec<Cow<'a, T>>> {
+    fn eval_accessor_op(&self, op: &AccessorOp) -> Result<Vec<EvalItem<'a, T>>> {
         match op {
             AccessorOp::MemberWildcard => self.eval_member_wildcard(),
             AccessorOp::DescendantMemberWildcard(levels) => {
@@ -826,25 +886,33 @@ impl<'a, T: Json> Evaluator<'a, T> {
         }
     }
 
-    fn eval_member_wildcard(&self) -> Result<Vec<Cow<'a, T>>> {
-        let set = match self.current.as_array() {
+    fn eval_member_wildcard(&self) -> Result<Vec<EvalItem<'a, T>>> {
+        let current = lax!(self, self.current.as_json(), Error::WildcardMemberAccess);
+        let set = match current.as_array() {
             Some(array) if self.is_lax() => array.list(),
-            _ => vec![self.current],
+            _ => vec![current],
         };
         let mut new_set = vec![];
         for v in set {
             let object = lax!(self, v.as_object(), Error::WildcardMemberAccess);
             for v in object.list_value() {
-                new_set.push(Cow::Borrowed(v));
+                new_set.push(EvalItem::borrowed(v));
             }
         }
         Ok(new_set)
     }
 
-    fn eval_descendant_member_wildcard(&self, levels: &LevelRange) -> Result<Vec<Cow<'a, T>>> {
-        let mut set = match self.current.as_array() {
+    fn eval_descendant_member_wildcard(&self, levels: &LevelRange) -> Result<Vec<EvalItem<'a, T>>> {
+        let Some(current) = self.current.as_json() else {
+            return Ok(if levels.to_range(0).contains(&0) {
+                vec![self.current.to_item()]
+            } else {
+                vec![]
+            });
+        };
+        let mut set = match current.as_array() {
             Some(array) if self.is_lax() => array.list(),
-            _ => vec![self.current],
+            _ => vec![current],
         };
         // expand all levels
         // level i is set[level_start[i] .. level_start[i+1]]
@@ -866,27 +934,37 @@ impl<'a, T: Json> Evaluator<'a, T> {
         let last_level = level_start.len() - 2;
         let level_range = levels.to_range(last_level);
         let set_range = level_start[level_range.start]..level_start[level_range.end];
-        let new_set = set[set_range].iter().cloned().map(Cow::Borrowed).collect();
+        let new_set = set[set_range]
+            .iter()
+            .cloned()
+            .map(EvalItem::borrowed)
+            .collect();
         Ok(new_set)
     }
 
-    fn eval_element_wildcard(&self) -> Result<Vec<Cow<'a, T>>> {
-        if !self.current.is_array() && self.is_lax() {
+    fn eval_element_wildcard(&self) -> Result<Vec<EvalItem<'a, T>>> {
+        let current = self.current.as_json();
+        if current.is_none_or(|value| !value.is_array()) && self.is_lax() {
             // wrap the current value into an array
-            return Ok(vec![Cow::Borrowed(self.current)]);
+            return Ok(vec![self.current.to_item()]);
         }
-        let array = lax!(self, self.current.as_array(), Error::WildcardArrayAccess);
+        let array = lax!(
+            self,
+            current.and_then(JsonRef::as_array),
+            Error::WildcardArrayAccess
+        );
         if self.is_first() && !self.silent {
-            return Ok(array.get(0).map(Cow::Borrowed).into_iter().collect());
+            return Ok(array.get(0).map(EvalItem::borrowed).into_iter().collect());
         }
-        Ok(array.list().into_iter().map(Cow::Borrowed).collect())
+        Ok(array.list().into_iter().map(EvalItem::borrowed).collect())
     }
 
     /// Evaluates the member accessor.
-    fn eval_member(&self, name: &str) -> Result<Vec<Cow<'a, T>>> {
-        let set = match self.current.as_array() {
+    fn eval_member(&self, name: &str) -> Result<Vec<EvalItem<'a, T>>> {
+        let current = lax!(self, self.current.as_json(), Error::MemberAccess);
+        let set = match current.as_array() {
             Some(array) if self.is_lax() => array.list(),
-            _ => vec![self.current],
+            _ => vec![current],
         };
         let mut new_set = vec![];
         for v in set {
@@ -901,28 +979,35 @@ impl<'a, T: Json> Evaluator<'a, T> {
                 None if self.is_lax() => return Ok(vec![]),
                 None => return Err(Error::NoKey(name.into())),
             };
-            new_set.push(Cow::Borrowed(elem));
+            new_set.push(EvalItem::borrowed(elem));
         }
         Ok(new_set)
     }
 
     /// Evaluates the element accessor.
-    fn eval_element_accessor(&self, indices: &[ArrayIndex]) -> Result<Vec<Cow<'a, T>>> {
+    fn eval_element_accessor(&self, indices: &[ArrayIndex]) -> Result<Vec<EvalItem<'a, T>>> {
         // wrap the scalar value into an array in lax mode
-        enum ArrayOrScalar<'a, T: JsonRef<'a>> {
-            Array(T::Array),
-            Scalar(T),
+        enum ArrayOrScalar<'a, T: Json + 'a> {
+            Array(<T::Borrowed<'a> as JsonRef<'a>>::Array),
+            Scalar(Current<'a, T>),
         }
-        impl<'a, T: JsonRef<'a>> ArrayOrScalar<'a, T> {
-            fn get(&self, index: usize) -> Option<T> {
+        impl<'a, T: Json> ArrayOrScalar<'a, T> {
+            fn len(&self) -> usize {
                 match self {
-                    ArrayOrScalar::Array(array) => array.get(index),
-                    ArrayOrScalar::Scalar(scalar) if index == 0 => Some(*scalar),
+                    Self::Array(array) => array.len(),
+                    Self::Scalar(_) => 1,
+                }
+            }
+
+            fn get(&self, index: usize) -> Option<EvalItem<'a, T>> {
+                match self {
+                    Self::Array(array) => array.get(index).map(EvalItem::borrowed),
+                    Self::Scalar(scalar) if index == 0 => Some(scalar.to_item()),
                     _ => None,
                 }
             }
         }
-        let array = match self.current.as_array() {
+        let array = match self.current.as_json().and_then(JsonRef::as_array) {
             Some(array) => ArrayOrScalar::Array(array),
             None if self.is_lax() => ArrayOrScalar::Scalar(self.current),
             None => return Err(Error::ArrayAccess),
@@ -933,18 +1018,20 @@ impl<'a, T: Json> Evaluator<'a, T> {
                 // errors in this closure can not be ignored
                 let set = Self {
                     // update `array` context
-                    array: self.current,
+                    array_len: Some(array.len()),
                     ..*self
                 }
                 .eval_expr(expr)?;
                 if set.len() != 1 {
                     return Err(Error::ArrayIndexNotNumeric);
                 }
-                set[0]
-                    .as_ref()
-                    .as_number()
+                let number = set[0]
+                    .as_json()
                     .ok_or(Error::ArrayIndexNotNumeric)?
-                    .to_i64()
+                    .as_number()
+                    .ok_or(Error::ArrayIndexNotNumeric)?;
+                crate::numeric::trunc_to_i32_exact(&number.to_string())
+                    .map(i64::from)
                     .ok_or(Error::ArrayIndexOutOfRange)
             };
             match index {
@@ -953,7 +1040,7 @@ impl<'a, T: Json> Evaluator<'a, T> {
                     let index =
                         lax!(self, index.try_into().ok(), Error::ArrayIndexOutOfBounds; continue);
                     let elem = lax!(self, array.get(index), Error::ArrayIndexOutOfBounds; continue);
-                    elems.push(Cow::Borrowed(elem));
+                    elems.push(elem);
                 }
                 ArrayIndex::Slice(begin, end) => {
                     let begin = eval_index(begin)?;
@@ -970,7 +1057,7 @@ impl<'a, T: Json> Evaluator<'a, T> {
                     }
                     for i in begin..=end {
                         let elem = lax!(self, array.get(i), Error::ArrayIndexOutOfBounds; break);
-                        elems.push(Cow::Borrowed(elem));
+                        elems.push(elem);
                     }
                 }
             }
@@ -978,15 +1065,15 @@ impl<'a, T: Json> Evaluator<'a, T> {
         Ok(elems)
     }
 
-    fn eval_filter_expr(&self, pred: &Predicate) -> Result<Vec<Cow<'a, T>>> {
-        let set = match self.current.as_array() {
-            Some(array) if self.is_lax() => array.list(),
+    fn eval_filter_expr(&self, pred: &Predicate) -> Result<Vec<EvalItem<'a, T>>> {
+        let set = match self.current.as_json().and_then(JsonRef::as_array) {
+            Some(array) if self.is_lax() => array.list().into_iter().map(Current::Json).collect(),
             _ => vec![self.current],
         };
         let mut new_set = vec![];
         for v in set {
             if self.with_current(v).eval_predicate(pred)?.is_true() {
-                new_set.push(Cow::Borrowed(v));
+                new_set.push(v.to_item());
                 if self.is_first() {
                     break;
                 }
@@ -996,15 +1083,17 @@ impl<'a, T: Json> Evaluator<'a, T> {
     }
 
     /// Evaluates the item method.
-    fn eval_method(&self, method: &Method) -> Result<Vec<Cow<'a, T>>> {
+    fn eval_method(&self, method: &Method) -> Result<Vec<EvalItem<'a, T>>> {
         // unwrap the current value if it is an array
-        if self.current.is_array()
-            && self.is_lax()
-            && !matches!(method, Method::Size | Method::Type)
+        if let Some(array) = self
+            .current
+            .as_json()
+            .and_then(JsonRef::as_array)
+            .filter(|_| self.is_lax() && !matches!(method, Method::Size | Method::Type))
         {
             let mut new_set = vec![];
-            for v in self.current.as_array().unwrap().list() {
-                new_set.extend(self.with_current(v).eval_method(method)?);
+            for v in array.list() {
+                new_set.extend(self.with_current(Current::Json(v)).eval_method(method)?);
             }
             return Ok(new_set);
         }
@@ -1019,42 +1108,234 @@ impl<'a, T: Json> Evaluator<'a, T> {
             Method::Datetime { template } => self
                 .eval_method_datetime(template.as_deref())
                 .map(|v| vec![v]),
+            Method::Bigint => self.eval_method_integer::<i64>("bigint").map(|v| vec![v]),
+            Method::Integer => self.eval_method_integer::<i32>("integer").map(|v| vec![v]),
+            Method::Number => self
+                .eval_method_numeric("number", None, None)
+                .map(|v| vec![v]),
+            Method::Decimal { precision, scale } => self
+                .eval_method_numeric("decimal", *precision, *scale)
+                .map(|v| vec![v]),
+            Method::String => self.eval_method_string().map(|v| vec![v]),
+            Method::Boolean => self.eval_method_boolean().map(|v| vec![v]),
+            Method::Date => self
+                .eval_method_datetime_kind("date", DatetimeKind::Date, None)
+                .map(|v| vec![v]),
+            Method::Time { precision } => self
+                .eval_method_datetime_kind("time", DatetimeKind::Time, *precision)
+                .map(|v| vec![v]),
+            Method::TimeTz { precision } => self
+                .eval_method_datetime_kind("time_tz", DatetimeKind::TimeTz, *precision)
+                .map(|v| vec![v]),
+            Method::Timestamp { precision } => self
+                .eval_method_datetime_kind("timestamp", DatetimeKind::Timestamp, *precision)
+                .map(|v| vec![v]),
+            Method::TimestampTz { precision } => self
+                .eval_method_datetime_kind("timestamp_tz", DatetimeKind::TimestampTz, *precision)
+                .map(|v| vec![v]),
         }
     }
 
-    fn eval_method_datetime(&self, template: Option<&str>) -> Result<Cow<'a, T>> {
-        let input = self.current.as_str().ok_or(Error::DatetimeNotString)?;
+    fn eval_method_datetime(&self, template: Option<&str>) -> Result<EvalItem<'a, T>> {
+        let input = self
+            .current
+            .as_json()
+            .and_then(JsonRef::as_str)
+            .ok_or(Error::DatetimeNotString)?;
         let parsed = match template {
             None => crate::datetime::iso::try_13_formats(input)?,
             Some(t) => crate::datetime::template::parse_apply(input, t)?,
         };
-        Ok(Cow::Owned(parsed.to_marker_object::<T>()))
+        Ok(EvalItem::Datetime(parsed))
     }
 
-    fn eval_method_type(&self) -> Result<Cow<'a, T>> {
-        if let Some((_, kind)) = crate::datetime::extract_marker(self.current) {
-            return Ok(Cow::Owned(T::from_string(kind.as_str())));
+    /// `.date()` / `.time()` / `.time_tz()` / `.timestamp()` / `.timestamp_tz()`.
+    ///
+    /// Parses with the same ISO list as `.datetime()`, then resolves the parsed kind
+    /// against the requested one per PostgreSQL's `executeDateTimeMethod` switch.
+    fn eval_method_datetime_kind(
+        &self,
+        method: &'static str,
+        target: crate::datetime::DatetimeKind,
+        precision: Option<i64>,
+    ) -> Result<EvalItem<'a, T>> {
+        let input = self
+            .current
+            .as_json()
+            .and_then(JsonRef::as_str)
+            .ok_or(Error::DatetimeMethodNotString(method))?;
+        let precision = match precision {
+            None => None,
+            Some(p) => {
+                // numeric_int4_opt_error runs before the clamp, so a value outside int4
+                // fails here instead of saturating to the maximum precision.
+                let p = i32::try_from(p).map_err(|_| Error::TimePrecisionOutOfRange(method))?;
+                // PostgreSQL clamps an in-range but over-large precision with a
+                // warning; there is no warning channel here, so clamp silently.
+                Some(p.clamp(0, 6) as u8)
+            }
+        };
+        let parsed = crate::datetime::iso::try_13_formats(input)
+            .map_err(|_| Error::FormatNotRecognized(method, input.into()))?;
+        let cast = crate::datetime::iso::cast_kind(
+            parsed,
+            target,
+            input,
+            method,
+            self.use_tz,
+            self.session_tz,
+            self.session_date,
+        )?;
+        let rounded = match precision {
+            None => cast,
+            Some(p) => crate::datetime::iso::round_fractional(cast, p)?,
+        };
+        Ok(EvalItem::Datetime(rounded))
+    }
+
+    /// `.bigint()` / `.integer()`.
+    ///
+    /// Numbers round; strings must be an exact integer. PostgreSQL routes the two
+    /// through different C functions, so the JSON type decides the answer: the number
+    /// `1.23` yields `1`, while the string `"1.23"` is an error.
+    fn eval_method_integer<I>(&self, method: &'static str) -> Result<EvalItem<'a, T>>
+    where
+        I: TryFrom<i64> + Into<i64>,
+    {
+        let current = self.current.as_json();
+        if let Some(s) = current.and_then(JsonRef::as_str) {
+            let parsed = if method == "bigint" {
+                crate::numeric::parse_pg_i64(s)
+            } else {
+                crate::numeric::parse_pg_i32(s).map(i64::from)
+            };
+            let value = parsed
+                .and_then(|value| I::try_from(value).ok())
+                .ok_or_else(|| Error::InvalidConversion(s.into(), method, method))?;
+            Ok(EvalItem::owned(T::from_i64(value.into())))
+        } else if let Some(n) = current.and_then(JsonRef::as_number) {
+            let shown = shown_number(&n);
+            let value = crate::numeric::round_to_i64_exact(&n.to_string())
+                .and_then(|v| I::try_from(v).ok())
+                .ok_or_else(|| Error::InvalidConversion(shown.into(), method, method))?;
+            Ok(EvalItem::owned(T::from_i64(value.into())))
+        } else {
+            Err(Error::NumericConversionType(method))
         }
-        let s = if self.current.is_null() {
+    }
+
+    /// `.number()` and `.decimal([precision [, scale]])`.
+    ///
+    /// Both canonicalise first, as PostgreSQL does with `numeric_out`; only then is a
+    /// typmod applied. Going through `f64` would lose exact integers wider than 53 bits.
+    fn eval_method_numeric(
+        &self,
+        method: &'static str,
+        precision: Option<i64>,
+        scale: Option<i64>,
+    ) -> Result<EvalItem<'a, T>> {
+        let current = self.current.as_json();
+        let canonical = if let Some(n) = current.and_then(JsonRef::as_number) {
+            let raw = n.to_string();
+            crate::numeric::canonical(&raw)
+                .ok_or_else(|| Error::InvalidConversion(raw.into(), method, "numeric"))?
+        } else if let Some(s) = current.and_then(JsonRef::as_str) {
+            if crate::numeric::is_numeric_nan_or_inf(s) {
+                return Err(Error::NanOrInfinity(method));
+            }
+            crate::numeric::canonical(s)
+                .ok_or_else(|| Error::InvalidConversion(s.into(), method, "numeric"))?
+        } else {
+            return Err(Error::NumericConversionType(method));
+        };
+
+        let Some(precision) = precision else {
+            return numeric_value(&canonical, method);
+        };
+        // The argument is carried as i64 so an out-of-range value reaches evaluation and
+        // reports its own error, as PostgreSQL does via numeric_int4_opt_error.
+        let precision = i32::try_from(precision).map_err(|_| Error::DecimalPrecisionOutOfRange)?;
+        let scale = i32::try_from(scale.unwrap_or(0)).map_err(|_| Error::DecimalScaleOutOfRange)?;
+        if !(1..=1000).contains(&precision) {
+            return Err(Error::NumericPrecisionOutOfBounds(i64::from(precision)));
+        }
+        if !(-1000..=1000).contains(&scale) {
+            return Err(Error::NumericScaleOutOfBounds(i64::from(scale)));
+        }
+        let applied = crate::numeric::apply_typmod(&canonical, precision, scale)
+            .ok_or_else(|| Error::InvalidConversion(canonical.into(), method, "numeric"))?;
+        numeric_value(&applied, method)
+    }
+
+    /// `.boolean()`.
+    ///
+    /// Unlike `.bigint()`/`.integer()` this does not round: PostgreSQL converts through
+    /// `int4in`, so `1.23` is an error rather than `1`.
+    fn eval_method_boolean(&self) -> Result<EvalItem<'a, T>> {
+        let current = self.current.as_json();
+        let value = if let Some(b) = current.and_then(JsonRef::as_bool) {
+            b
+        } else if let Some(n) = current.and_then(JsonRef::as_number) {
+            let shown = shown_number(&n);
+            let as_int = crate::numeric::numeric_to_i32_exact(&n.to_string())
+                .ok_or_else(|| Error::InvalidConversion(shown.into(), "boolean", "boolean"))?;
+            as_int != 0
+        } else if let Some(s) = current.and_then(JsonRef::as_str) {
+            crate::numeric::parse_pg_bool(s)
+                .ok_or_else(|| Error::InvalidConversion(s.into(), "boolean", "boolean"))?
+        } else {
+            return Err(Error::BooleanTypeError);
+        };
+        Ok(EvalItem::owned(T::bool(value)))
+    }
+
+    /// `.string()`.
+    fn eval_method_string(&self) -> Result<EvalItem<'a, T>> {
+        if let Some(datetime) = self.current.as_datetime() {
+            return Ok(EvalItem::owned(T::from_string(&datetime.iso)));
+        }
+        let current = self.current.as_json().expect("datetime handled above");
+        if current.is_string() {
+            return Ok(EvalItem::borrowed(current));
+        }
+        if let Some(n) = current.as_number() {
+            return Ok(EvalItem::owned(T::from_string(&shown_number(&n))));
+        }
+        if let Some(b) = current.as_bool() {
+            return Ok(EvalItem::owned(T::from_string(if b {
+                "true"
+            } else {
+                "false"
+            })));
+        }
+        Err(Error::StringTypeError)
+    }
+
+    fn eval_method_type(&self) -> Result<EvalItem<'a, T>> {
+        if let Some(datetime) = self.current.as_datetime() {
+            return Ok(EvalItem::owned(T::from_string(datetime.kind.as_str())));
+        }
+        let current = self.current.as_json().expect("datetime handled above");
+        let s = if current.is_null() {
             "null"
-        } else if self.current.is_bool() {
+        } else if current.is_bool() {
             "boolean"
-        } else if self.current.is_number() {
+        } else if current.is_number() {
             "number"
-        } else if self.current.is_string() {
+        } else if current.is_string() {
             "string"
-        } else if self.current.is_array() {
+        } else if current.is_array() {
             "array"
-        } else if self.current.is_object() {
+        } else if current.is_object() {
             "object"
         } else {
             unreachable!()
         };
-        Ok(Cow::Owned(T::from_string(s)))
+        Ok(EvalItem::owned(T::from_string(s)))
     }
 
-    fn eval_method_size(&self) -> Result<Cow<'a, T>> {
-        let size = if let Some(array) = self.current.as_array() {
+    fn eval_method_size(&self) -> Result<EvalItem<'a, T>> {
+        let size = if let Some(array) = self.current.as_json().and_then(JsonRef::as_array) {
             // The size of an SQL/JSON array is the number of elements in the array.
             array.len()
         } else if self.is_lax() {
@@ -1063,69 +1344,77 @@ impl<'a, T: Json> Evaluator<'a, T> {
         } else {
             return Err(Error::SizeNotArray);
         };
-        Ok(Cow::Owned(T::from_u64(size as u64)))
+        Ok(EvalItem::owned(T::from_u64(size as u64)))
     }
 
-    fn eval_method_double(&self) -> Result<Cow<'a, T>> {
-        if let Some(s) = self.current.as_str() {
-            let n = s.parse::<f64>().map_err(|_| Error::InvalidDouble)?;
-            if n.is_infinite() || n.is_nan() {
-                return Err(Error::InvalidDouble);
+    /// PostgreSQL `jpiDouble`. Strings pass through `float8in` and then
+    /// `float8_numeric`, while numeric inputs are only checked for float8 range.
+    fn eval_method_double(&self) -> Result<EvalItem<'a, T>> {
+        let current = self.current.as_json();
+        if let Some(s) = current.and_then(JsonRef::as_str) {
+            if crate::numeric::is_nan_or_inf(s) {
+                return Err(Error::NanOrInfinity("double"));
             }
-            Ok(Cow::Owned(T::from_f64(n)))
-        } else if self.current.is_number() {
-            let n = self
-                .current
-                .as_number()
-                .and_then(|n| n.as_f64())
-                .ok_or(Error::DoubleOutOfRange)?;
-            if n.is_infinite() || n.is_nan() {
-                return Err(Error::DoubleOutOfRange);
-            }
-            Ok(Cow::Borrowed(self.current))
+            let value = crate::numeric::parse_pg_finite_float8(s)
+                .ok_or_else(|| Error::InvalidConversion(s.into(), "double", "double precision"))?;
+            let canonical = crate::numeric::pg_float8_to_numeric(value)
+                .expect("a finite float8 always converts to numeric");
+            numeric_value(&canonical, "double")
+        } else if let Some(n) = current.and_then(JsonRef::as_number) {
+            let raw = n.to_string();
+            let canonical = crate::numeric::canonical(&raw).ok_or_else(|| {
+                Error::InvalidConversion(raw.into(), "double", "double precision")
+            })?;
+            crate::numeric::parse_pg_finite_float8(&canonical).ok_or_else(|| {
+                Error::InvalidConversion(canonical.into(), "double", "double precision")
+            })?;
+            Ok(EvalItem::borrowed(
+                self.current.as_json().expect("number checked above"),
+            ))
         } else {
-            Err(Error::DoubleTypeError)
+            Err(Error::NumericConversionType("double"))
         }
     }
 
-    fn eval_method_ceiling(&self) -> Result<Cow<'a, T>> {
+    fn eval_method_ceiling(&self) -> Result<EvalItem<'a, T>> {
         let n = self
             .current
-            .as_number()
+            .as_json()
+            .and_then(JsonRef::as_number)
             .ok_or(Error::MethodNotNumeric("ceiling"))?;
-        Ok(Cow::Owned(T::from_number(n.ceil())))
+        Ok(EvalItem::owned(T::from_number(n.ceil()?)))
     }
 
-    fn eval_method_floor(&self) -> Result<Cow<'a, T>> {
+    fn eval_method_floor(&self) -> Result<EvalItem<'a, T>> {
         let n = self
             .current
-            .as_number()
+            .as_json()
+            .and_then(JsonRef::as_number)
             .ok_or(Error::MethodNotNumeric("floor"))?;
-        Ok(Cow::Owned(T::from_number(n.floor())))
+        Ok(EvalItem::owned(T::from_number(n.floor()?)))
     }
 
-    fn eval_method_abs(&self) -> Result<Cow<'a, T>> {
+    fn eval_method_abs(&self) -> Result<EvalItem<'a, T>> {
         let n = self
             .current
-            .as_number()
+            .as_json()
+            .and_then(JsonRef::as_number)
             .ok_or(Error::MethodNotNumeric("abs"))?;
-        Ok(Cow::Owned(T::from_number(n.abs())))
+        Ok(EvalItem::owned(T::from_number(n.abs()?)))
     }
 
-    fn eval_method_keyvalue(&self) -> Result<Vec<Cow<'a, T>>> {
-        use std::hash::Hasher;
-        let object = self.current.as_object().ok_or(Error::KeyValueNotObject)?;
-        let mut hasher = rustc_hash::FxHasher::default();
+    fn eval_method_keyvalue(&self) -> Result<Vec<EvalItem<'a, T>>> {
+        let object = self
+            .current
+            .as_json()
+            .and_then(JsonRef::as_object)
+            .ok_or(Error::KeyValueNotObject)?;
+        let id = self.object_ids.borrow_mut().id_for(object.identity());
         let entries: Vec<_> = object.list();
-        for (k, _) in &entries {
-            hasher.write(k.as_bytes());
-            hasher.write_u8(0);
-        }
-        let id = hasher.finish() as i64;
         Ok(entries
             .into_iter()
             .map(|(k, v)| {
-                Cow::Owned(T::object([
+                EvalItem::owned(T::object([
                     ("key", T::from_string(k)),
                     ("value", v.to_owned()),
                     ("id", T::from_i64(id)),
@@ -1135,13 +1424,13 @@ impl<'a, T: Json> Evaluator<'a, T> {
     }
 
     /// Evaluates the scalar value.
-    fn eval_value(&self, value: &Value) -> Result<Cow<'a, T>> {
+    fn eval_value(&self, value: &Value) -> Result<EvalItem<'a, T>> {
         Ok(match value {
-            Value::Null => Cow::Owned(T::null()),
-            Value::Boolean(b) => Cow::Owned(T::bool(*b)),
-            Value::Number(n) => Cow::Owned(T::from_number(n.clone())),
-            Value::String(s) => Cow::Owned(T::from_string(s)),
-            Value::Variable(v) => Cow::Borrowed(self.get_variable(v)?),
+            Value::Null => EvalItem::owned(T::null()),
+            Value::Boolean(b) => EvalItem::owned(T::bool(*b)),
+            Value::Number(n) => EvalItem::owned(T::from_number(n.clone())),
+            Value::String(s) => EvalItem::owned(T::from_string(s)),
+            Value::Variable(v) => EvalItem::borrowed(self.get_variable(v)?),
         })
     }
 }
@@ -1151,16 +1440,33 @@ impl<'a, T: Json> Evaluator<'a, T> {
 /// Return unknown if the values are not comparable.
 fn eval_compare<T: Json>(
     op: CompareOp,
-    left: T::Borrowed<'_>,
-    right: T::Borrowed<'_>,
+    left: &EvalItem<'_, T>,
+    right: &EvalItem<'_, T>,
     use_tz: bool,
+    session_tz: &jiff::tz::TimeZone,
+    session_date: jiff::civil::Date,
 ) -> Result<Truth> {
     use CompareOp::*;
-    let left_marker = crate::datetime::extract_marker(left);
-    let right_marker = crate::datetime::extract_marker(right);
-    if left_marker.is_some() || right_marker.is_some() {
-        return eval_compare_datetime(op, left_marker, right_marker, use_tz);
+    let left_datetime = match left {
+        EvalItem::Datetime(value) => Some(value),
+        EvalItem::Json(_) => None,
+    };
+    let right_datetime = match right {
+        EvalItem::Datetime(value) => Some(value),
+        EvalItem::Json(_) => None,
+    };
+    if left_datetime.is_some() || right_datetime.is_some() {
+        return eval_compare_datetime(
+            op,
+            left_datetime,
+            right_datetime,
+            use_tz,
+            session_tz,
+            session_date,
+        );
     }
+    let left = left.as_json().expect("datetime handled above");
+    let right = right.as_json().expect("datetime handled above");
     // arrays and objects are not comparable
     if left.is_array() || left.is_object() || right.is_array() || right.is_object() {
         return Ok(Truth::Unknown);
@@ -1176,12 +1482,12 @@ fn eval_compare<T: Json>(
     }
     if let (Some(left), Some(right)) = (left.as_number(), right.as_number()) {
         return Ok(match op {
-            Eq => left.equal(&right),
-            Ne => !left.equal(&right),
-            Gt => right.less_than(&left),
-            Ge => !left.less_than(&right),
-            Lt => left.less_than(&right),
-            Le => !right.less_than(&left),
+            Eq => left.equal(&right)?,
+            Ne => !left.equal(&right)?,
+            Gt => right.less_than(&left)?,
+            Ge => !left.less_than(&right)?,
+            Lt => left.less_than(&right)?,
+            Le => !right.less_than(&left)?,
         }
         .into());
     }
@@ -1193,14 +1499,18 @@ fn eval_compare<T: Json>(
 
 fn eval_compare_datetime(
     op: CompareOp,
-    left: Option<(String, crate::datetime::DatetimeKind)>,
-    right: Option<(String, crate::datetime::DatetimeKind)>,
+    left: Option<&ParsedDatetime>,
+    right: Option<&ParsedDatetime>,
     use_tz: bool,
+    session_tz: &jiff::tz::TimeZone,
+    session_date: jiff::civil::Date,
 ) -> Result<Truth> {
     use crate::datetime::DatetimeKind as K;
-    let (Some((l_iso, l_kind)), Some((r_iso, r_kind))) = (left, right) else {
+    let (Some(left), Some(right)) = (left, right) else {
         return Ok(Truth::Unknown);
     };
+    let (l_iso, l_kind) = (left.iso.as_str(), left.kind);
+    let (r_iso, r_kind) = (right.iso.as_str(), right.kind);
     let needs_tz = match (l_kind, r_kind) {
         (a, b) if a == b => false,
         (K::Date, K::Timestamp) | (K::Timestamp, K::Date) => false,
@@ -1228,7 +1538,15 @@ fn eval_compare_datetime(
             to.into(),
         ));
     }
-    let ord = match compare_datetime_kinds(&l_iso, l_kind, &r_iso, r_kind, use_tz) {
+    let ord = match compare_datetime_kinds(
+        l_iso,
+        l_kind,
+        r_iso,
+        r_kind,
+        use_tz,
+        session_tz,
+        session_date,
+    ) {
         Some(o) => o,
         None => return Ok(Truth::Unknown),
     };
@@ -1250,6 +1568,8 @@ fn compare_datetime_kinds(
     r_iso: &str,
     r_kind: crate::datetime::DatetimeKind,
     use_tz: bool,
+    session_tz: &jiff::tz::TimeZone,
+    session_date: jiff::civil::Date,
 ) -> Option<std::cmp::Ordering> {
     use crate::datetime::DatetimeKind as K;
     if l_kind == r_kind {
@@ -1257,11 +1577,13 @@ fn compare_datetime_kinds(
             K::Date | K::Timestamp => return cmp_date_or_ts(l_iso, l_kind, r_iso, r_kind),
             K::Time => return Some(l_iso.cmp(r_iso)),
             K::TimestampTz => {
-                let l_inst = to_instant(l_iso, l_kind)?;
-                let r_inst = to_instant(r_iso, r_kind)?;
+                let l_inst = to_instant(l_iso, l_kind, session_tz)?;
+                let r_inst = to_instant(r_iso, r_kind, session_tz)?;
                 return Some(l_inst.cmp(&r_inst));
             }
-            K::TimeTz => return cmp_timetz_pair(l_iso, l_kind, r_iso, r_kind),
+            K::TimeTz => {
+                return cmp_timetz_pair(l_iso, l_kind, r_iso, r_kind, session_tz, session_date)
+            }
         }
     }
     if matches!(
@@ -1291,28 +1613,29 @@ fn compare_datetime_kinds(
         {
             return None;
         }
-        return cmp_timetz_pair(l_iso, l_kind, r_iso, r_kind);
+        return cmp_timetz_pair(l_iso, l_kind, r_iso, r_kind, session_tz, session_date);
     }
     // Date/Timestamp/TimestampTz cross-comparisons: same general rule.
     if !use_tz {
         return None;
     }
-    // Wide-year (> 4 digits) exceeds jiff's range; fall back to numeric
-    // Y/M/D + lexical time-suffix compare. Pathological "both wide-year
-    // TimestampTz with asymmetric offsets at same Y/M/D" is out of scope.
-    if has_wide_year(l_iso) || has_wide_year(r_iso) {
-        return cmp_date_or_ts(l_iso, l_kind, r_iso, r_kind);
-    }
-    let l_inst = to_instant(l_iso, l_kind)?;
-    let r_inst = to_instant(r_iso, r_kind)?;
+    let l_inst = to_instant(l_iso, l_kind, session_tz)?;
+    let r_inst = to_instant(r_iso, r_kind, session_tz)?;
     Some(l_inst.cmp(&r_inst))
 }
 
-fn has_wide_year(iso: &str) -> bool {
-    match iso.find('-') {
-        Some(idx) => idx > 4,
-        None => false,
-    }
+/// Render a number for an error message the way PostgreSQL does, i.e. after
+/// `numeric_out`, so `1e1000` is quoted expanded rather than as the source literal.
+fn shown_number(n: &Number) -> String {
+    let raw = n.to_string();
+    crate::numeric::canonical(&raw).unwrap_or(raw)
+}
+
+/// Rebuild a JSON number from a canonical decimal string, preserving every digit.
+fn numeric_value<'a, T: Json>(value: &str, method: &'static str) -> Result<EvalItem<'a, T>> {
+    let n: Number = serde_json::from_str(value)
+        .map_err(|_| Error::InvalidConversion(value.into(), method, "numeric"))?;
+    Ok(EvalItem::owned(T::from_number(n)))
 }
 
 fn cmp_date_or_ts(
@@ -1322,38 +1645,23 @@ fn cmp_date_or_ts(
     r_kind: crate::datetime::DatetimeKind,
 ) -> Option<std::cmp::Ordering> {
     use crate::datetime::DatetimeKind as K;
-    let (ly, lm, ld, l_time) = parse_ymd_and_time(l_iso)?;
-    let (ry, rm, rd, r_time) = parse_ymd_and_time(r_iso)?;
-    match (ly, lm, ld).cmp(&(ry, rm, rd)) {
-        std::cmp::Ordering::Equal => {}
-        ord => return Some(ord),
-    }
-    let l_t = if l_kind == K::Date {
-        "T00:00:00"
-    } else {
-        l_time
+    let (l_date, l_time) = match l_kind {
+        K::Date => (crate::datetime::pg::Date::parse(l_iso)?, 0),
+        K::Timestamp => {
+            let value = crate::datetime::pg::DateTime::parse(l_iso)?;
+            (value.date, value.micros_of_day)
+        }
+        _ => return None,
     };
-    let r_t = if r_kind == K::Date {
-        "T00:00:00"
-    } else {
-        r_time
+    let (r_date, r_time) = match r_kind {
+        K::Date => (crate::datetime::pg::Date::parse(r_iso)?, 0),
+        K::Timestamp => {
+            let value = crate::datetime::pg::DateTime::parse(r_iso)?;
+            (value.date, value.micros_of_day)
+        }
+        _ => return None,
     };
-    Some(l_t.cmp(r_t))
-}
-
-fn parse_ymd_and_time(iso: &str) -> Option<(u64, u32, u32, &str)> {
-    let dash1 = iso.find('-')?;
-    let year: u64 = iso[..dash1].parse().ok()?;
-    let rest = &iso[dash1 + 1..];
-    let dash2 = rest.find('-')?;
-    let month: u32 = rest[..dash2].parse().ok()?;
-    let after_dash = &rest[dash2 + 1..];
-    let day_end = after_dash
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(after_dash.len());
-    let day: u32 = after_dash[..day_end].parse().ok()?;
-    let time_part = &after_dash[day_end..];
-    Some((year, month, day, time_part))
+    Some((l_date, l_time).cmp(&(r_date, r_time)))
 }
 
 fn cmp_timetz_pair(
@@ -1361,9 +1669,11 @@ fn cmp_timetz_pair(
     l_kind: crate::datetime::DatetimeKind,
     r_iso: &str,
     r_kind: crate::datetime::DatetimeKind,
+    session_tz: &jiff::tz::TimeZone,
+    session_date: jiff::civil::Date,
 ) -> Option<std::cmp::Ordering> {
-    let (l_wall, l_off) = parse_time_pair(l_iso, l_kind)?;
-    let (r_wall, r_off) = parse_time_pair(r_iso, r_kind)?;
+    let (l_wall, l_off) = parse_time_pair(l_iso, l_kind, session_tz, session_date)?;
+    let (r_wall, r_off) = parse_time_pair(r_iso, r_kind, session_tz, session_date)?;
     let l_utc = l_wall - l_off;
     let r_utc = r_wall - r_off;
     let ord = l_utc.cmp(&r_utc);
@@ -1373,94 +1683,70 @@ fn cmp_timetz_pair(
     Some(r_off.cmp(&l_off))
 }
 
-fn parse_time_pair(iso: &str, kind: crate::datetime::DatetimeKind) -> Option<(i64, i64)> {
+fn parse_time_pair(
+    iso: &str,
+    kind: crate::datetime::DatetimeKind,
+    session_tz: &jiff::tz::TimeZone,
+    session_date: jiff::civil::Date,
+) -> Option<(i64, i64)> {
     use crate::datetime::DatetimeKind as K;
     match kind {
         K::Time => {
-            let t: jiff::civil::Time = iso.parse().ok()?;
-            Some((time_to_seconds(t), 0))
+            let wall = crate::datetime::iso::parse_pg_time_nanos(iso)?;
+            let dt = datetime_for_time(session_date, wall)?;
+            let offset = crate::datetime::iso::resolve_pg_offset(session_tz, dt).seconds();
+            Some((wall, i64::from(offset) * NANOS_PER_SECOND))
         }
         K::TimeTz => {
-            let (time_part, off_part) = split_offset(iso)?;
-            let t: jiff::civil::Time = time_part.parse().ok()?;
-            let off = parse_offset(off_part)?.seconds() as i64;
-            Some((time_to_seconds(t), off))
+            let (time_part, off_part) = crate::datetime::iso::split_iso_offset(iso)?;
+            let wall = crate::datetime::iso::parse_pg_time_nanos(time_part)?;
+            let off = i64::from(parse_offset(off_part)?.seconds()) * NANOS_PER_SECOND;
+            Some((wall, off))
         }
         _ => None,
     }
 }
 
-fn time_to_seconds(t: jiff::civil::Time) -> i64 {
-    i64::from(t.hour()) * 3600 + i64::from(t.minute()) * 60 + i64::from(t.second())
+const NANOS_PER_SECOND: i64 = 1_000_000_000;
+
+fn datetime_for_time(date: jiff::civil::Date, nanos: i64) -> Option<jiff::civil::DateTime> {
+    let (date, nanos) = if nanos == 86_400 * NANOS_PER_SECOND {
+        (date.tomorrow().ok()?, 0)
+    } else {
+        (date, nanos)
+    };
+    let hour = nanos / (3_600 * NANOS_PER_SECOND);
+    let minute = (nanos / (60 * NANOS_PER_SECOND)) % 60;
+    let second = (nanos / NANOS_PER_SECOND) % 60;
+    let subsecond = nanos % NANOS_PER_SECOND;
+    Some(date.at(
+        i8::try_from(hour).ok()?,
+        i8::try_from(minute).ok()?,
+        i8::try_from(second).ok()?,
+        i32::try_from(subsecond).ok()?,
+    ))
 }
 
-fn to_instant(iso: &str, kind: crate::datetime::DatetimeKind) -> Option<jiff::Timestamp> {
+fn to_instant(
+    iso: &str,
+    kind: crate::datetime::DatetimeKind,
+    session_tz: &jiff::tz::TimeZone,
+) -> Option<i128> {
     use crate::datetime::DatetimeKind as K;
     match kind {
-        K::Date => {
-            let d: jiff::civil::Date = iso.parse().ok()?;
-            let dt = d.at(0, 0, 0, 0);
-            dt.to_zoned(jiff::tz::TimeZone::UTC)
-                .ok()
-                .map(|z| z.timestamp())
-        }
-        K::Time => {
-            // Promote to today's date at this time, UTC.
-            let t: jiff::civil::Time = iso.parse().ok()?;
-            let today = jiff::civil::date(1970, 1, 1);
-            let dt = today.at(t.hour(), t.minute(), t.second(), t.subsec_nanosecond());
-            dt.to_zoned(jiff::tz::TimeZone::UTC)
-                .ok()
-                .map(|z| z.timestamp())
-        }
-        K::TimeTz => {
-            // ISO form "HH:MM:SS+HH:MM" — split offset and parse time.
-            let (time_part, off_part) = split_offset(iso)?;
-            let t: jiff::civil::Time = time_part.parse().ok()?;
-            let off = parse_offset(off_part)?;
-            let today = jiff::civil::date(1970, 1, 1);
-            let dt = today.at(t.hour(), t.minute(), t.second(), t.subsec_nanosecond());
-            let zoned = dt.to_zoned(jiff::tz::TimeZone::fixed(off)).ok()?;
-            Some(zoned.timestamp())
-        }
-        K::Timestamp => {
-            let dt: jiff::civil::DateTime = iso.parse().ok()?;
-            dt.to_zoned(jiff::tz::TimeZone::UTC)
-                .ok()
-                .map(|z| z.timestamp())
-        }
+        K::Date => crate::datetime::pg::wide_date_instant(iso, session_tz),
+        K::Timestamp => crate::datetime::pg::local_instant(iso, session_tz).map(i128::from),
         K::TimestampTz => {
-            let (dt_part, off_part) = split_offset(iso)?;
-            let dt: jiff::civil::DateTime = dt_part.parse().ok()?;
+            let (dt_part, off_part) = crate::datetime::iso::split_iso_offset(iso)?;
             let off = parse_offset(off_part)?;
-            let zoned = dt.to_zoned(jiff::tz::TimeZone::fixed(off)).ok()?;
-            Some(zoned.timestamp())
+            crate::datetime::pg::fixed_offset_instant(dt_part, off.seconds()).map(i128::from)
         }
+        K::Time | K::TimeTz => None,
     }
-}
-
-fn split_offset(s: &str) -> Option<(&str, &str)> {
-    // Look for last `+`/`-` (skipping the leading negative-year sign).
-    let bytes = s.as_bytes();
-    for i in (1..bytes.len()).rev() {
-        if bytes[i] == b'+' || bytes[i] == b'-' {
-            return Some((&s[..i], &s[i..]));
-        }
-    }
-    None
 }
 
 fn parse_offset(s: &str) -> Option<jiff::tz::Offset> {
-    // "+HH:MM" or "-HH:MM" — already normalized by our renderer.
-    let bytes = s.as_bytes();
-    if bytes.len() != 6 || (bytes[0] != b'+' && bytes[0] != b'-') {
-        return None;
-    }
-    let sign = if bytes[0] == b'-' { -1 } else { 1 };
-    let h: i8 = std::str::from_utf8(&bytes[1..3]).ok()?.parse().ok()?;
-    let m: i8 = std::str::from_utf8(&bytes[4..6]).ok()?.parse().ok()?;
-    let total_min = sign * (i32::from(h) * 60 + i32::from(m));
-    jiff::tz::Offset::from_seconds(total_min * 60).ok()
+    crate::datetime::iso::parse_iso_offset(s)
 }
 
 /// Evaluate the unary operator.
@@ -1468,7 +1754,7 @@ fn eval_unary_op<T: Json>(op: UnaryOp, value: T::Borrowed<'_>) -> Result<T> {
     let n = value.as_number().ok_or(Error::UnaryOperandNotNumeric(op))?;
     Ok(match op {
         UnaryOp::Plus => value.to_owned(),
-        UnaryOp::Minus => T::from_number(n.neg()),
+        UnaryOp::Minus => T::from_number(n.neg()?),
     })
 }
 
@@ -1481,9 +1767,9 @@ fn eval_binary_op<T: Json>(
     let left = left.as_number().ok_or(Error::LeftOperandNotNumeric(op))?;
     let right = right.as_number().ok_or(Error::RightOperandNotNumeric(op))?;
     Ok(T::from_number(match op {
-        BinaryOp::Add => left.add(&right),
-        BinaryOp::Sub => left.sub(&right),
-        BinaryOp::Mul => left.mul(&right),
+        BinaryOp::Add => left.add(&right)?,
+        BinaryOp::Sub => left.sub(&right)?,
+        BinaryOp::Mul => left.mul(&right)?,
         BinaryOp::Div => left.div(&right)?,
         BinaryOp::Rem => left.rem(&right)?,
     }))
@@ -1504,221 +1790,92 @@ fn compare_ord<T: Ord>(op: CompareOp, left: T, right: T) -> bool {
 
 /// Extension methods for `Number`.
 pub trait NumberExt: Sized {
-    fn equal(&self, other: &Self) -> bool;
-    fn less_than(&self, other: &Self) -> bool;
-    fn neg(&self) -> Self;
-    fn add(&self, other: &Self) -> Self;
-    fn sub(&self, other: &Self) -> Self;
-    fn mul(&self, other: &Self) -> Self;
+    fn equal(&self, other: &Self) -> Result<bool>;
+    fn less_than(&self, other: &Self) -> Result<bool>;
+    fn neg(&self) -> Result<Self>;
+    fn add(&self, other: &Self) -> Result<Self>;
+    fn sub(&self, other: &Self) -> Result<Self>;
+    fn mul(&self, other: &Self) -> Result<Self>;
     fn div(&self, other: &Self) -> Result<Self>;
     fn rem(&self, other: &Self) -> Result<Self>;
-    fn ceil(&self) -> Self;
-    fn floor(&self) -> Self;
-    fn abs(&self) -> Self;
-    fn to_i64(&self) -> Option<i64>;
+    fn ceil(&self) -> Result<Self>;
+    fn floor(&self) -> Result<Self>;
+    fn abs(&self) -> Result<Self>;
 }
 
 impl NumberExt for Number {
-    fn equal(&self, other: &Self) -> bool {
-        // The original `Eq` implementation of `Number` does not work
-        // if the two numbers have different types. (i64, u64, f64)
-        self.as_f64().unwrap() == other.as_f64().unwrap()
+    fn equal(&self, other: &Self) -> Result<bool> {
+        Ok(exact_numeric_order(self, other)? == std::cmp::Ordering::Equal)
     }
 
-    fn less_than(&self, other: &Self) -> bool {
-        self.as_f64().unwrap() < other.as_f64().unwrap()
+    fn less_than(&self, other: &Self) -> Result<bool> {
+        Ok(exact_numeric_order(self, other)? == std::cmp::Ordering::Less)
     }
 
-    fn neg(&self) -> Self {
-        if let Some(n) = self.as_i64() {
-            Number::from(-n)
-        } else if let Some(n) = self.as_f64() {
-            Number::from_f64(-n).unwrap()
-        } else {
-            // `as_f64` should always return a value
-            unreachable!()
-        }
+    fn neg(&self) -> Result<Self> {
+        exact_number(crate::numeric::neg_exact(&self.to_string()))
     }
 
-    fn add(&self, other: &Self) -> Self {
-        if let (Some(a), Some(b)) = (self.as_i64(), other.as_i64()) {
-            Number::from(a + b)
-        } else if let (Some(a), Some(b)) = (self.as_f64(), other.as_f64()) {
-            Number::from_f64(a + b).unwrap()
-        } else {
-            unreachable!()
-        }
+    fn add(&self, other: &Self) -> Result<Self> {
+        exact_number(crate::numeric::add_exact(
+            &self.to_string(),
+            &other.to_string(),
+        ))
     }
 
-    fn sub(&self, other: &Self) -> Self {
-        if let (Some(a), Some(b)) = (self.as_i64(), other.as_i64()) {
-            Number::from(a - b)
-        } else if let (Some(a), Some(b)) = (self.as_f64(), other.as_f64()) {
-            Number::from_f64(a - b).unwrap()
-        } else {
-            unreachable!()
-        }
+    fn sub(&self, other: &Self) -> Result<Self> {
+        exact_number(crate::numeric::sub_exact(
+            &self.to_string(),
+            &other.to_string(),
+        ))
     }
 
-    fn mul(&self, other: &Self) -> Self {
-        if let (Some(a), Some(b)) = (self.as_i64(), other.as_i64()) {
-            Number::from(a * b)
-        } else if let (Some(a), Some(b)) = (self.as_f64(), other.as_f64()) {
-            Number::from_f64(a * b).unwrap()
-        } else {
-            unreachable!()
-        }
+    fn mul(&self, other: &Self) -> Result<Self> {
+        exact_number(crate::numeric::mul_exact(
+            &self.to_string(),
+            &other.to_string(),
+        ))
     }
 
     fn div(&self, other: &Self) -> Result<Self> {
-        if let (Some(a), Some(b)) = (self.as_f64(), other.as_f64()) {
-            if b == 0.0 {
-                return Err(Error::DivisionByZero);
-            }
-            Ok(Number::from_f64(a / b).unwrap())
-        } else {
-            unreachable!()
-        }
+        exact_number(crate::numeric::div_exact(
+            &self.to_string(),
+            &other.to_string(),
+        ))
     }
 
     fn rem(&self, other: &Self) -> Result<Self> {
-        if let (Some(a), Some(b)) = (self.as_i64(), other.as_i64()) {
-            if b == 0 {
-                return Err(Error::DivisionByZero);
-            }
-            return Ok(Number::from(a % b));
-        }
-        if let Some(r) = exact_decimal_rem(self, other) {
-            return Ok(r);
-        }
-        if let (Some(a), Some(b)) = (self.as_f64(), other.as_f64()) {
-            if b == 0.0 {
-                return Err(Error::DivisionByZero);
-            }
-            Ok(Number::from_f64(a % b).unwrap())
-        } else {
-            unreachable!()
-        }
+        exact_number(crate::numeric::rem_exact(
+            &self.to_string(),
+            &other.to_string(),
+        ))
     }
 
-    fn ceil(&self) -> Self {
-        if self.is_f64() {
-            Number::from(self.as_f64().unwrap().ceil() as i64)
-        } else {
-            self.clone()
-        }
+    fn ceil(&self) -> Result<Self> {
+        exact_number(crate::numeric::ceil_exact(&self.to_string()))
     }
 
-    fn floor(&self) -> Self {
-        if self.is_f64() {
-            Number::from(self.as_f64().unwrap().floor() as i64)
-        } else {
-            self.clone()
-        }
+    fn floor(&self) -> Result<Self> {
+        exact_number(crate::numeric::floor_exact(&self.to_string()))
     }
 
-    fn abs(&self) -> Self {
-        if let Some(n) = self.as_i64() {
-            Number::from(n.abs())
-        } else if let Some(n) = self.as_f64() {
-            Number::from_f64(n.abs()).unwrap()
-        } else {
-            unreachable!()
-        }
-    }
-
-    /// Converts to json integer if possible.
-    /// Float values are truncated.
-    /// Returns `None` if the value is out of range.
-    /// Range: [-2^53 + 1, 2^53 - 1]
-    fn to_i64(&self) -> Option<i64> {
-        const INT_MIN: i64 = -(1 << 53) + 1;
-        const INT_MAX: i64 = (1 << 53) - 1;
-        if let Some(i) = self.as_i64() {
-            if (INT_MIN..=INT_MAX).contains(&i) {
-                Some(i)
-            } else {
-                None
-            }
-        } else if let Some(f) = self.as_f64() {
-            if (INT_MIN as f64..=INT_MAX as f64).contains(&f) {
-                Some(f as i64)
-            } else {
-                None
-            }
-        } else {
-            unreachable!()
-        }
+    fn abs(&self) -> Result<Self> {
+        exact_number(crate::numeric::abs_exact(&self.to_string()))
     }
 }
 
-fn exact_decimal_rem(a: &Number, b: &Number) -> Option<Number> {
-    let (a_int, a_scale) = decimal_parts(&a.to_string())?;
-    let (b_int, b_scale) = decimal_parts(&b.to_string())?;
-    let scale = a_scale.max(b_scale);
-    let a_pow = 10_i128.checked_pow((scale - a_scale) as u32)?;
-    let b_pow = 10_i128.checked_pow((scale - b_scale) as u32)?;
-    let a_scaled = a_int.checked_mul(a_pow)?;
-    let b_scaled = b_int.checked_mul(b_pow)?;
-    if b_scaled == 0 {
-        return None;
-    }
-    let r = a_scaled % b_scaled;
-    let s = render_decimal(r, scale);
-    if scale == 0 {
-        Some(Number::from(s.parse::<i64>().ok()?))
-    } else {
-        Number::from_f64(s.parse::<f64>().ok()?)
-    }
+fn exact_numeric_order(left: &Number, right: &Number) -> Result<std::cmp::Ordering> {
+    crate::numeric::compare_exact(&left.to_string(), &right.to_string())
+        .ok_or(Error::NumericOverflow)
 }
 
-fn decimal_parts(s: &str) -> Option<(i128, usize)> {
-    if s.contains('e') || s.contains('E') {
-        return None;
-    }
-    let (sign, body) = match s.strip_prefix('-') {
-        Some(rest) => (-1_i128, rest),
-        None => (1_i128, s),
-    };
-    let (int_str, frac_str) = match body.split_once('.') {
-        Some((i, f)) => (i, f),
-        None => (body, ""),
-    };
-    let scale = frac_str.len();
-    let int_part: i128 = if int_str.is_empty() {
-        0
-    } else {
-        int_str.parse().ok()?
-    };
-    let frac_part: i128 = if frac_str.is_empty() {
-        0
-    } else {
-        frac_str.parse().ok()?
-    };
-    let pow = 10_i128.checked_pow(scale as u32)?;
-    let scaled = int_part.checked_mul(pow)?.checked_add(frac_part)?;
-    Some((sign * scaled, scale))
-}
-
-fn render_decimal(r: i128, scale: usize) -> String {
-    if scale == 0 {
-        return r.to_string();
-    }
-    let neg = r < 0;
-    let abs = r.unsigned_abs().to_string();
-    let padded = if abs.len() <= scale {
-        format!("0.{:0>width$}", abs, width = scale)
-    } else {
-        let dot = abs.len() - scale;
-        format!("{}.{}", &abs[..dot], &abs[dot..])
-    };
-    let mut trimmed = padded.trim_end_matches('0').to_string();
-    if trimmed.ends_with('.') {
-        trimmed.pop();
-    }
-    if neg && trimmed != "0" {
-        format!("-{trimmed}")
-    } else {
-        trimmed
-    }
+fn exact_number(
+    value: std::result::Result<String, crate::numeric::NumericArithmeticError>,
+) -> Result<Number> {
+    let value = value.map_err(|error| match error {
+        crate::numeric::NumericArithmeticError::DivisionByZero => Error::DivisionByZero,
+        crate::numeric::NumericArithmeticError::Invalid
+        | crate::numeric::NumericArithmeticError::Overflow => Error::NumericOverflow,
+    })?;
+    serde_json::from_str(&value).map_err(|_| Error::NumericOverflow)
 }

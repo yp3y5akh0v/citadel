@@ -17,12 +17,16 @@
 //!
 //! Forked from `sql-json-path` v0.1.1 (RisingWave Labs). Citadel uses only
 //! the `serde_json` backend; the upstream `simd-json` / `jsonbb` backends
-//! were dropped during vendoring. See `NOTICE` for full attribution.
+//! were dropped during vendoring. The fork implements the SQL:2023 numeric,
+//! boolean, string, and datetime item methods, with explicit session-zone and
+//! transaction-date context for PostgreSQL-compatible `_tz` evaluation. See
+//! `NOTICE` for full attribution.
 
 mod ast;
 mod datetime;
 mod eval;
 pub mod json;
+mod numeric;
 mod parser;
 
 pub use ast::JsonPath;

@@ -10,18 +10,13 @@
 
 //! PG SQL/JSON Path `.datetime()` method support.
 
-use crate::json::{Json, ObjectRef};
-
 pub(crate) mod iso;
+pub(crate) mod pg;
 pub(crate) mod template;
+pub(crate) mod tzabbrev;
 
 #[cfg(test)]
 mod tests;
-
-// `__pg_` prefix chosen to be vanishingly rare in production JSONB so the
-// marker can't collide with user data — documented in `NOTICE`.
-pub(crate) const MARKER_VALUE_KEY: &str = "__pg_datetime";
-pub(crate) const MARKER_TYPE_KEY: &str = "__pg_type";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DatetimeKind {
@@ -58,32 +53,4 @@ impl DatetimeKind {
 pub(crate) struct ParsedDatetime {
     pub(crate) iso: String,
     pub(crate) kind: DatetimeKind,
-}
-
-impl ParsedDatetime {
-    pub(crate) fn to_marker_object<T: Json>(&self) -> T {
-        T::object([
-            (MARKER_VALUE_KEY, T::from_string(&self.iso)),
-            (MARKER_TYPE_KEY, T::from_string(self.kind.as_tag())),
-        ])
-    }
-}
-
-pub(crate) fn extract_marker<'b, T: crate::json::JsonRef<'b>>(
-    v: T,
-) -> Option<(String, DatetimeKind)> {
-    let obj = v.as_object()?;
-    if obj.len() != 2 {
-        return None;
-    }
-    let iso = obj.get(MARKER_VALUE_KEY)?.as_str()?.to_string();
-    let kind = match obj.get(MARKER_TYPE_KEY)?.as_str()? {
-        "date" => DatetimeKind::Date,
-        "time" => DatetimeKind::Time,
-        "timetz" => DatetimeKind::TimeTz,
-        "timestamp" => DatetimeKind::Timestamp,
-        "timestamptz" => DatetimeKind::TimestampTz,
-        _ => return None,
-    };
-    Some((iso, kind))
 }

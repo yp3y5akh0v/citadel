@@ -32,7 +32,10 @@ pub enum Statement {
     Savepoint(String),
     ReleaseSavepoint(String),
     RollbackTo(String),
-    SetTimezone(String),
+    SetTimezone {
+        zone: TimezoneValue,
+        local: bool,
+    },
     Explain {
         inner: Box<Statement>,
         /// `EXPLAIN ANALYZE`: run the statement and report measured time and
@@ -46,6 +49,14 @@ pub enum BeginAccessMode {
     Default,
     ReadWrite,
     ReadOnly,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TimezoneValue {
+    Default,
+    Local,
+    Named(String),
+    OffsetSeconds(i32),
 }
 
 #[derive(Debug, Clone)]
@@ -1387,6 +1398,162 @@ fn explain_option_bool(name: &str, arg: Option<&sp::Expr>) -> Result<bool> {
     }
 }
 
+fn convert_timezone_value(value: &sp::Expr) -> Result<TimezoneValue> {
+    fn offset_from_hours(raw: &str) -> Result<TimezoneValue> {
+        let (negative, unsigned) = match raw.as_bytes().first() {
+            Some(b'-') => (true, &raw[1..]),
+            Some(b'+') => (false, &raw[1..]),
+            _ => (false, raw),
+        };
+        let (mantissa, exponent) =
+            unsigned
+                .split_once(['e', 'E'])
+                .map_or((unsigned, 0_i64), |(mantissa, exponent)| {
+                    exponent
+                        .parse::<i64>()
+                        .map(|exponent| (mantissa, exponent))
+                        .unwrap_or((mantissa, i64::MAX))
+                });
+        if exponent == i64::MAX {
+            return Err(SqlError::InvalidTimezone(format!(
+                "{raw}: invalid numeric offset"
+            )));
+        }
+        let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+        if (whole.is_empty() && fraction.is_empty())
+            || !whole
+                .bytes()
+                .chain(fraction.bytes())
+                .all(|byte| byte.is_ascii_digit())
+        {
+            return Err(SqlError::InvalidTimezone(format!(
+                "{raw}: invalid numeric offset"
+            )));
+        }
+
+        let digits = format!("{whole}{fraction}");
+        let digits = digits.trim_start_matches('0');
+        if digits.is_empty() {
+            return Ok(TimezoneValue::OffsetSeconds(0));
+        }
+        let scale = i64::try_from(fraction.len())
+            .ok()
+            .and_then(|fraction_len| fraction_len.checked_sub(exponent))
+            .ok_or_else(|| {
+                SqlError::InvalidTimezone(format!("{raw}: numeric offset is out of range"))
+            })?;
+
+        // Multiply the decimal mantissa by 3600 as decimal digits, then shift
+        // its decimal point. This preserves truncation toward zero without an
+        // f64 rounding boundary turning a sub-second offset into a whole one.
+        let mut product = Vec::with_capacity(digits.len() + 4);
+        let mut carry = 0_u32;
+        for digit in digits.bytes().rev() {
+            let value = u32::from(digit - b'0') * 3_600 + carry;
+            product.push((value % 10) as u8 + b'0');
+            carry = value / 10;
+        }
+        while carry != 0 {
+            product.push((carry % 10) as u8 + b'0');
+            carry /= 10;
+        }
+        product.reverse();
+
+        let integer_len = if scale <= 0 {
+            let trailing_zeros = usize::try_from(scale.unsigned_abs()).map_err(|_| {
+                SqlError::InvalidTimezone(format!("{raw}: numeric offset is out of range"))
+            })?;
+            if product.len().saturating_add(trailing_zeros) > 10 {
+                return Err(SqlError::InvalidTimezone(format!(
+                    "{raw}: numeric offset is out of range"
+                )));
+            }
+            product.resize(product.len() + trailing_zeros, b'0');
+            product.len()
+        } else {
+            product
+                .len()
+                .saturating_sub(usize::try_from(scale).unwrap_or(usize::MAX))
+        };
+        let seconds = if integer_len == 0 {
+            0
+        } else {
+            std::str::from_utf8(&product[..integer_len])
+                .ok()
+                .and_then(|value| value.parse::<i64>().ok())
+                .ok_or_else(|| {
+                    SqlError::InvalidTimezone(format!("{raw}: numeric offset is out of range"))
+                })?
+        };
+        let seconds = if negative { -seconds } else { seconds };
+        let seconds = i32::try_from(seconds).map_err(|_| {
+            SqlError::InvalidTimezone(format!("{raw}: numeric offset is out of range"))
+        })?;
+        crate::datetime::fixed_timezone(seconds)?;
+        Ok(TimezoneValue::OffsetSeconds(seconds))
+    }
+
+    match value {
+        sp::Expr::Identifier(ident) if ident.value.eq_ignore_ascii_case("default") => {
+            Ok(TimezoneValue::Default)
+        }
+        sp::Expr::Identifier(ident) if ident.value.eq_ignore_ascii_case("local") => {
+            Ok(TimezoneValue::Local)
+        }
+        sp::Expr::Value(value) => match &value.value {
+            sp::Value::SingleQuotedString(zone) | sp::Value::DoubleQuotedString(zone) => {
+                Ok(TimezoneValue::Named(zone.clone()))
+            }
+            sp::Value::Number(hours, _) => offset_from_hours(hours),
+            other => Ok(TimezoneValue::Named(other.to_string())),
+        },
+        sp::Expr::UnaryOp { op, expr } => {
+            let sp::Expr::Value(value) = expr.as_ref() else {
+                return Err(SqlError::Parse(format!(
+                    "SET TIME ZONE expects a numeric offset after {op}, got: {expr}"
+                )));
+            };
+            let sp::Value::Number(hours, _) = &value.value else {
+                return Err(SqlError::Parse(format!(
+                    "SET TIME ZONE expects a numeric offset after {op}, got: {expr}"
+                )));
+            };
+            match op {
+                sp::UnaryOperator::Plus => offset_from_hours(hours),
+                sp::UnaryOperator::Minus => offset_from_hours(&format!("-{hours}")),
+                _ => Err(SqlError::Parse(format!(
+                    "SET TIME ZONE expects a signed numeric offset, got: {value}"
+                ))),
+            }
+        }
+        sp::Expr::Interval(interval) => {
+            let Expr::Literal(Value::Interval {
+                months,
+                days,
+                micros,
+            }) = convert_interval_expr(interval)?
+            else {
+                unreachable!("interval conversion returns an interval literal");
+            };
+            if months != 0 || days != 0 {
+                return Err(SqlError::InvalidTimezone(
+                    "time zone intervals cannot contain months or days".into(),
+                ));
+            }
+            let seconds = i32::try_from(micros / crate::datetime::MICROS_PER_SEC)
+                .map_err(|_| SqlError::InvalidTimezone("time zone interval is out of range".into()))?;
+            crate::datetime::fixed_timezone(seconds)?;
+            Ok(TimezoneValue::OffsetSeconds(seconds))
+        }
+        sp::Expr::Identifier(ident) => Ok(TimezoneValue::Named(ident.value.clone())),
+        other => {
+            Err(SqlError::Parse(format!(
+                "SET TIME ZONE expects DEFAULT, LOCAL, a string literal, or an identifier, got: {other}"
+            )))
+        }
+    }
+}
+
 fn convert_statement(stmt: sp::Statement) -> Result<Statement> {
     match stmt {
         sp::Statement::CreateTable(ct) => convert_create_table(ct),
@@ -1492,22 +1659,25 @@ fn convert_statement(stmt: sp::Statement) -> Result<Statement> {
         sp::Statement::ReleaseSavepoint { name } => {
             Ok(Statement::ReleaseSavepoint(name.value.to_ascii_lowercase()))
         }
-        sp::Statement::Set(sp::Set::SetTimeZone { value, .. }) => {
-            // Accept a string literal or bare identifier (PG allows `SET TIME ZONE UTC`).
-            let zone = match value {
-                sp::Expr::Value(v) => match &v.value {
-                    sp::Value::SingleQuotedString(s) => s.clone(),
-                    sp::Value::DoubleQuotedString(s) => s.clone(),
-                    other => other.to_string(),
-                },
-                sp::Expr::Identifier(ident) => ident.value.clone(),
-                other => {
-                    return Err(SqlError::Parse(format!(
-                        "SET TIME ZONE expects a string literal or identifier, got: {other}"
-                    )))
-                }
+        sp::Statement::Set(sp::Set::SetTimeZone { local, value }) => {
+            let zone = convert_timezone_value(&value)?;
+            Ok(Statement::SetTimezone { zone, local })
+        }
+        sp::Statement::Set(sp::Set::SingleAssignment {
+            scope,
+            variable,
+            values,
+            ..
+        }) if object_name_to_string(&variable).eq_ignore_ascii_case("timezone") => {
+            let [value] = values.as_slice() else {
+                return Err(SqlError::Parse(
+                    "SET TIMEZONE expects exactly one value".into(),
+                ));
             };
-            Ok(Statement::SetTimezone(zone))
+            Ok(Statement::SetTimezone {
+                zone: convert_timezone_value(value)?,
+                local: scope == Some(sp::ContextModifier::Local),
+            })
         }
         sp::Statement::Explain {
             statement,
@@ -1692,49 +1862,89 @@ fn convert_column_def(
     Ok((spec, fk_def, is_primary_key, is_unique))
 }
 
-fn reject_volatile_in_generated(expr: &Expr) -> Result<()> {
-    fn walk(e: &Expr) -> Result<()> {
-        match e {
+enum NonImmutableExpr {
+    VolatileFunction(String),
+    SessionDependentJsonPath,
+}
+
+fn find_non_immutable_expr(expr: &Expr) -> Option<NonImmutableExpr> {
+    let mut violation = None;
+    visit_expr(expr, &mut |candidate| {
+        if violation.is_some() {
+            return;
+        }
+        match candidate {
             Expr::Function { name, args, .. } => {
                 let upper = name.to_ascii_uppercase();
                 if crate::eval::is_volatile_function_expr(&upper, args) {
-                    return Err(SqlError::Unsupported(format!(
-                        "volatile function {name}() not allowed in GENERATED expression"
-                    )));
+                    violation = Some(NonImmutableExpr::VolatileFunction(name.clone()));
+                } else if crate::eval::is_session_dependent_jsonpath_function(&upper, args) {
+                    violation = Some(NonImmutableExpr::SessionDependentJsonPath);
                 }
-                for a in args {
-                    walk(a)?;
-                }
-                Ok(())
             }
-            Expr::BinaryOp { left, right, .. } => {
-                walk(left)?;
-                walk(right)
+            Expr::BinaryOp { op, right, .. }
+                if crate::eval::is_session_dependent_jsonpath_op(op, right) =>
+            {
+                violation = Some(NonImmutableExpr::SessionDependentJsonPath);
             }
-            Expr::UnaryOp { expr, .. } => walk(expr),
-            Expr::Cast { expr, .. } => walk(expr),
-            Expr::Case {
-                operand,
-                conditions,
-                else_result,
-            } => {
-                if let Some(o) = operand {
-                    walk(o)?;
-                }
-                for (cond, res) in conditions {
-                    walk(cond)?;
-                    walk(res)?;
-                }
-                if let Some(e) = else_result {
-                    walk(e)?;
-                }
-                Ok(())
-            }
-            Expr::Coalesce(items) => items.iter().try_for_each(walk),
-            _ => Ok(()),
+            _ => {}
         }
+    });
+    violation
+}
+
+pub(crate) fn expr_uses_session_dependent_jsonpath(expr: &Expr) -> bool {
+    let mut dependent = false;
+    visit_expr(expr, &mut |candidate| {
+        if dependent {
+            return;
+        }
+        match candidate {
+            Expr::Function { name, args, .. } => {
+                dependent = crate::eval::is_session_dependent_jsonpath_function(
+                    &name.to_ascii_uppercase(),
+                    args,
+                );
+            }
+            Expr::BinaryOp { op, right, .. } => {
+                dependent = crate::eval::is_session_dependent_jsonpath_op(op, right);
+            }
+            _ => {}
+        }
+    });
+    dependent
+}
+
+pub(crate) fn volatile_function_in_expr(expr: &Expr) -> Option<String> {
+    let mut volatile = None;
+    visit_expr(expr, &mut |candidate| {
+        if volatile.is_some() {
+            return;
+        }
+        if let Expr::Function { name, args, .. } = candidate {
+            let upper = name.to_ascii_uppercase();
+            if crate::eval::is_volatile_function_expr(&upper, args) {
+                volatile = Some(name.clone());
+            }
+        }
+    });
+    volatile
+}
+
+pub(crate) fn reject_non_immutable_expr(expr: &Expr, context: &str) -> Result<()> {
+    match find_non_immutable_expr(expr) {
+        Some(NonImmutableExpr::VolatileFunction(name)) => Err(SqlError::Unsupported(format!(
+            "volatile function {name}() not allowed in {context}"
+        ))),
+        Some(NonImmutableExpr::SessionDependentJsonPath) => Err(SqlError::Unsupported(format!(
+            "session-time-zone-dependent JSON path evaluation not allowed in {context}"
+        ))),
+        None => Ok(()),
     }
-    walk(expr)
+}
+
+fn reject_volatile_in_generated(expr: &Expr) -> Result<()> {
+    reject_non_immutable_expr(expr, "GENERATED expression")
 }
 
 fn convert_create_table(ct: sp::CreateTable) -> Result<Statement> {
@@ -2011,6 +2221,9 @@ fn convert_create_index(ci: sp::CreateIndex) -> Result<Statement> {
                 )
             }
         };
+        if let Some((expr, _)) = &expr_entry {
+            reject_non_immutable_expr(expr, "index expression")?;
+        }
         columns.push(name);
         collations.push(coll);
         key_exprs.push(expr_entry);
@@ -2283,6 +2496,17 @@ fn validate_partial_index_predicate(expr: &Expr) -> Result<()> {
         }
     });
     if let Some(reason) = bad {
+        return Err(SqlError::Unsupported(format!(
+            "partial index predicate cannot contain {reason}"
+        )));
+    }
+    if let Some(violation) = find_non_immutable_expr(expr) {
+        let reason = match violation {
+            NonImmutableExpr::VolatileFunction(_) => "non-deterministic functions",
+            NonImmutableExpr::SessionDependentJsonPath => {
+                "session-time-zone-dependent JSON path evaluation"
+            }
+        };
         return Err(SqlError::Unsupported(format!(
             "partial index predicate cannot contain {reason}"
         )));
@@ -3588,7 +3812,11 @@ fn convert_interval_expr(iv: &sp::Interval) -> Result<Expr> {
         }
     };
 
-    let with_unit = if let Some(field) = &iv.leading_field {
+    let qualified_clock =
+        raw.contains(':') && matches!(iv.leading_field.as_ref(), Some(sp::DateTimeField::Hour));
+    let with_unit = if qualified_clock {
+        raw
+    } else if let Some(field) = &iv.leading_field {
         let unit_name = match field {
             sp::DateTimeField::Year => "years",
             sp::DateTimeField::Month => "months",

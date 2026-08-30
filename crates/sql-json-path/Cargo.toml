@@ -18,6 +18,8 @@ path = "src/lib.rs"
 [dependencies]
 jiff = { workspace = true }
 nom = "7"
+num-bigint = "0.4"
+num-integer = "0.1"
 regex = "1"
 rustc-hash = { workspace = true }
 serde_json = { workspace = true, features = ["arbitrary_precision"] }
@@ -25,6 +27,7 @@ thiserror = "2"
 
 [dev-dependencies]
 libtest-mimic = "0.6"
+sha2 = { workspace = true }
 
 [[test]]
 name = "pg_jsonb_jsonpath"

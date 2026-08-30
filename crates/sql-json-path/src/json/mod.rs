@@ -213,6 +213,13 @@ pub trait ObjectRef<'a>: Copy {
     /// Returns all values in the object.
     fn list_value(self) -> Vec<Self::JsonRef>;
 
+    /// Identity of this object for the duration of the containing JSON value.
+    ///
+    /// SQL/JSON's `.keyvalue()` uses this to give every pair from one object the
+    /// same id while keeping distinct objects separate, even when their contents
+    /// are equal.
+    fn identity(self) -> usize;
+
     /// Returns `true` if the array is empty.
     fn is_empty(self) -> bool {
         self.len() == 0

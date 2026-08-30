@@ -1655,6 +1655,7 @@ pub fn exec_insert_in_txn(
 ) -> Result<ExecutionResult> {
     // This public lane is also called directly, without `Connection::guarded`
     // or `execute_in_txn` around it.
+    super::reject_legacy_volatile_schema(schema)?;
     wtx.check_usable().map_err(SqlError::Storage)?;
     super::check_cancelled(wtx.cancel_token())?;
     let mutation_marker = wtx.mutation_marker();

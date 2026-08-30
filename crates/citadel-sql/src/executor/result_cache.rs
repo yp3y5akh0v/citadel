@@ -376,6 +376,9 @@ fn cacheable_expr(ctx: &mut WalkCtx<'_>, expr: &Expr) -> bool {
             if crate::eval::is_volatile_function(&upper, args.len()) {
                 return false;
             }
+            if crate::eval::is_session_dependent_jsonpath_function(&upper, args) {
+                return false;
+            }
             // Stricter than the shared check: 'now' can also arrive from
             // column data at runtime; only literal first args are provably safe.
             if matches!(upper.as_str(), "DATE" | "TIME" | "DATETIME") {
@@ -397,7 +400,8 @@ fn cacheable_expr(ctx: &mut WalkCtx<'_>, expr: &Expr) -> bool {
             if matches!(
                 op,
                 BinOp::VectorL2 | BinOp::VectorInner | BinOp::VectorCosine
-            ) {
+            ) || crate::eval::is_session_dependent_jsonpath_op(op, right)
+            {
                 return false;
             }
             cacheable_expr(ctx, left) && cacheable_expr(ctx, right)

@@ -5917,8 +5917,13 @@ fn is_streamable_scalar(expr: &Expr) -> bool {
     match expr {
         Expr::Literal(_) | Expr::Column(_) | Expr::QualifiedColumn { .. } => true,
         Expr::BinaryOp { left, op, right } => {
-            !matches!(op, BinOp::JsonPathExistsTz | BinOp::JsonPathMatchTz)
-                && is_streamable_scalar(left)
+            !matches!(
+                op,
+                BinOp::JsonPathExists
+                    | BinOp::JsonPathMatch
+                    | BinOp::JsonPathExistsTz
+                    | BinOp::JsonPathMatchTz
+            ) && is_streamable_scalar(left)
                 && is_streamable_scalar(right)
         }
         Expr::UnaryOp { expr, .. } | Expr::IsNull(expr) | Expr::IsNotNull(expr) => {

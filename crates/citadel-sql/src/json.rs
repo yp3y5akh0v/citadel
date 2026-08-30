@@ -8,6 +8,62 @@ use crate::types::Value;
 const CANCEL_CHECK_INTERVAL: usize = 256;
 const JSON_READ_CHUNK: usize = 8 * 1024;
 
+#[derive(Clone)]
+pub(crate) struct JsonPathSessionContext {
+    pub(crate) timezone: jiff::tz::TimeZone,
+    pub(crate) date: jiff::civil::Date,
+}
+
+thread_local! {
+    static JSONPATH_SESSION_CONTEXT: std::cell::RefCell<Option<JsonPathSessionContext>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) fn with_jsonpath_session_context<R>(
+    context: JsonPathSessionContext,
+    operation: impl FnOnce() -> R,
+) -> R {
+    struct Guard(Option<JsonPathSessionContext>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            JSONPATH_SESSION_CONTEXT.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+
+    let previous = JSONPATH_SESSION_CONTEXT.with(|slot| slot.borrow_mut().replace(context));
+    let _guard = Guard(previous);
+    operation()
+}
+
+pub(crate) fn with_jsonpath_timezone<R>(
+    timezone: &jiff::tz::TimeZone,
+    operation: impl FnOnce() -> R,
+) -> R {
+    let timestamp = crate::datetime::txn_or_clock_micros();
+    let date = jiff::Timestamp::from_microsecond(timestamp)
+        .expect("SQL statement clock must be a valid timestamp")
+        .to_zoned(timezone.clone())
+        .date();
+    with_jsonpath_session_context(
+        JsonPathSessionContext {
+            timezone: timezone.clone(),
+            date,
+        },
+        operation,
+    )
+}
+
+fn parse_json_path(path: &str) -> Result<sql_json_path::JsonPath> {
+    let mut path = sql_json_path::JsonPath::new(path)
+        .map_err(|e| SqlError::InvalidValue(format!("invalid JSON path: {e}")))?;
+    if let Some(context) = JSONPATH_SESSION_CONTEXT.with(|slot| slot.borrow().clone()) {
+        path = path
+            .with_session_tz(context.timezone)
+            .with_session_date(context.date);
+    }
+    Ok(path)
+}
+
 struct JsonWork<'a> {
     cancel: Option<&'a CancelToken>,
     completed: usize,
@@ -2001,8 +2057,7 @@ fn jp_query(
     vars: Option<&serde_json::Value>,
     silent: bool,
 ) -> Result<Vec<serde_json::Value>> {
-    let jp = sql_json_path::JsonPath::new(path_str)
-        .map_err(|e| SqlError::InvalidValue(format!("invalid JSON path: {e}")))?;
+    let jp = parse_json_path(path_str)?;
     let result = match vars {
         Some(v) => jp.query_with_vars(j, v),
         None => jp.query(j),
@@ -2020,8 +2075,7 @@ fn jp_query_first(
     vars: Option<&serde_json::Value>,
     silent: bool,
 ) -> Result<Option<serde_json::Value>> {
-    let jp = sql_json_path::JsonPath::new(path_str)
-        .map_err(|e| SqlError::InvalidValue(format!("invalid JSON path: {e}")))?;
+    let jp = parse_json_path(path_str)?;
     let result = match vars {
         Some(v) => jp.query_first_with_vars(j, v),
         None => jp.query_first(j),
@@ -2039,8 +2093,7 @@ fn jp_exists(
     vars: Option<&serde_json::Value>,
     silent: bool,
 ) -> Result<Option<bool>> {
-    let jp = sql_json_path::JsonPath::new(path_str)
-        .map_err(|e| SqlError::InvalidValue(format!("invalid JSON path: {e}")))?;
+    let jp = parse_json_path(path_str)?;
     let result = match vars {
         Some(v) => jp.exists_with_vars(j, v),
         None => jp.exists(j),
@@ -2287,8 +2340,7 @@ fn jp_query_tz(
     vars: Option<&serde_json::Value>,
     silent: bool,
 ) -> Result<Vec<serde_json::Value>> {
-    let jp = sql_json_path::JsonPath::new(path_str)
-        .map_err(|e| SqlError::InvalidValue(format!("invalid JSON path: {e}")))?;
+    let jp = parse_json_path(path_str)?;
     let result = match vars {
         Some(v) => jp.query_with_vars_tz(j, v),
         None => jp.query_tz(j),
@@ -2306,8 +2358,7 @@ fn jp_query_first_tz(
     vars: Option<&serde_json::Value>,
     silent: bool,
 ) -> Result<Option<serde_json::Value>> {
-    let jp = sql_json_path::JsonPath::new(path_str)
-        .map_err(|e| SqlError::InvalidValue(format!("invalid JSON path: {e}")))?;
+    let jp = parse_json_path(path_str)?;
     let result = match vars {
         Some(v) => jp.query_first_with_vars_tz(j, v),
         None => jp.query_first_tz(j),
@@ -2325,8 +2376,7 @@ fn jp_exists_tz(
     vars: Option<&serde_json::Value>,
     silent: bool,
 ) -> Result<Option<bool>> {
-    let jp = sql_json_path::JsonPath::new(path_str)
-        .map_err(|e| SqlError::InvalidValue(format!("invalid JSON path: {e}")))?;
+    let jp = parse_json_path(path_str)?;
     let result = match vars {
         Some(v) => jp.exists_with_vars_tz(j, v),
         None => jp.exists_tz(j),

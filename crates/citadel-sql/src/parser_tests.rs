@@ -1152,6 +1152,133 @@ fn generated_accepts_date_of_column() {
 }
 
 #[test]
+fn generated_rejects_session_dependent_jsonpath() {
+    let err = parse_sql(
+        r#"CREATE TABLE t (
+            id INTEGER PRIMARY KEY,
+            j JSONB,
+            g BOOLEAN GENERATED ALWAYS AS (
+                JSONB_PATH_MATCH_TZ(
+                    j,
+                    '$.timestamp() == "2023-08-15T04:00:00+00:00".timestamp_tz()'
+                )
+            ) STORED
+        )"#,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        SqlError::Unsupported(msg)
+            if msg.contains("session-time-zone-dependent JSON path")
+                && msg.contains("GENERATED expression")
+    ));
+}
+
+#[test]
+fn expression_index_rejects_volatile_and_session_dependent_keys() {
+    let volatile = parse_sql("CREATE INDEX i ON t (RANDOM())").unwrap_err();
+    assert!(matches!(
+        volatile,
+        SqlError::Unsupported(msg)
+            if msg.contains("volatile function") && msg.contains("index expression")
+    ));
+
+    for sql in [
+        r#"CREATE INDEX i ON t (
+            (j @@ '$.time_tz().string() == "17:04:56+10:00"')
+        )"#,
+        r#"CREATE INDEX i ON t (
+            JSONB_PATH_QUERY_FIRST_TZ(j, '$.time()') COLLATE BINARY
+        )"#,
+    ] {
+        let err = parse_sql(sql).unwrap_err();
+        assert!(matches!(
+            err,
+            SqlError::Unsupported(msg)
+                if msg.contains("session-time-zone-dependent JSON path")
+                    && msg.contains("index expression")
+        ));
+    }
+}
+
+#[test]
+fn partial_index_rejects_standard_and_tz_jsonpath_evaluation() {
+    for sql in [
+        r#"CREATE INDEX i ON t (id) WHERE
+            JSONB_PATH_MATCH(
+                j,
+                '$.time_tz().string() == "17:04:56+10:00"'
+            )"#,
+        r#"CREATE INDEX i ON t (id) WHERE
+            j @@_tz '$.timestamp() == "2023-08-15T04:00:00+00:00".timestamp_tz()'"#,
+    ] {
+        let err = parse_sql(sql).unwrap_err();
+        assert!(matches!(
+            err,
+            SqlError::Unsupported(msg)
+                if msg.contains("session-time-zone-dependent JSON path")
+                    && msg.contains("partial index predicate")
+        ));
+    }
+}
+
+#[test]
+fn immutable_expression_and_json_predicate_remain_indexable() {
+    assert!(parse_sql("CREATE INDEX i_lower ON t (LOWER(email))").is_ok());
+    assert!(parse_sql(r#"CREATE INDEX i_json ON t (id) WHERE j @> '{"active": true}'"#).is_ok());
+    assert!(
+        parse_sql("CREATE INDEX i_path_key ON t ((JSONB_PATH_QUERY_FIRST(j, '$.profile')))")
+            .is_ok()
+    );
+    assert!(
+        parse_sql("CREATE INDEX i_path_pred ON t (id) WHERE JSONB_PATH_EXISTS(j, '$.active')")
+            .is_ok()
+    );
+    assert!(parse_sql(
+        "CREATE INDEX i_path_compare ON t (id) WHERE \
+         JSONB_PATH_MATCH(j, '$.priority == 1')"
+    )
+    .is_ok());
+    assert!(parse_sql(
+        "CREATE INDEX i_path_operator_compare ON t (id) WHERE \
+         j @@ '$.priority == 1'"
+    )
+    .is_ok());
+    assert!(
+        parse_sql("CREATE INDEX i_path_date ON t ((JSONB_PATH_QUERY_FIRST(j, '$.date()')))")
+            .is_ok()
+    );
+    assert!(parse_sql(
+        "CREATE INDEX i_path_date_compare ON t (id) WHERE \
+         JSONB_PATH_MATCH(j, '$.a.date() < $.b.date()')"
+    )
+    .is_ok());
+    assert!(parse_sql(
+        "CREATE INDEX i_variable_path ON t (id) WHERE \
+         JSONB_PATH_MATCH(j, '$.priority == $minimum', '{\"minimum\":1}'::JSONB)"
+    )
+    .is_ok());
+    assert!(parse_sql(
+        "CREATE TABLE path_generated (id INTEGER PRIMARY KEY, j JSONB, \
+         g BOOLEAN GENERATED ALWAYS AS (JSONB_PATH_EXISTS(j, '$.active')) STORED)"
+    )
+    .is_ok());
+}
+
+#[test]
+fn dynamic_jsonpath_is_not_accepted_as_immutable() {
+    let error =
+        parse_sql("CREATE INDEX i_dynamic_path ON t ((JSONB_PATH_QUERY_FIRST(j, path_column)))")
+            .unwrap_err();
+    assert!(matches!(
+        error,
+        SqlError::Unsupported(message)
+            if message.contains("session-time-zone-dependent JSON path")
+                && message.contains("index expression")
+    ));
+}
+
+#[test]
 fn create_index_predicate_rejects_aggregate() {
     let err = parse_sql("CREATE INDEX i ON t (c) WHERE c > sum(c)").unwrap_err();
     assert!(matches!(err, SqlError::Unsupported(msg) if msg.contains("aggregates")));

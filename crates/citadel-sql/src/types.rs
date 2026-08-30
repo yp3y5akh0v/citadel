@@ -1344,6 +1344,93 @@ impl Clone for TableSchema {
 }
 
 impl TableSchema {
+    /// Describe the first persisted expression whose value can change with the
+    /// session time zone or transaction date.
+    ///
+    /// Current DDL rejects these definitions. This scan exists for catalogs
+    /// written by older builds so they can still be opened at the historical
+    /// UTC default and explicitly remediated.
+    pub(crate) fn session_dependent_persisted_expression(&self) -> Option<String> {
+        for column in &self.columns {
+            if column
+                .generated_expr
+                .as_ref()
+                .is_some_and(crate::parser::expr_uses_session_dependent_jsonpath)
+            {
+                return Some(format!(
+                    "generated column \"{}.{}\"",
+                    self.name, column.name
+                ));
+            }
+        }
+        for index in &self.indices {
+            if index.keys.iter().any(|key| match key {
+                IndexKey::Expr { expr, .. } => {
+                    crate::parser::expr_uses_session_dependent_jsonpath(expr)
+                }
+                IndexKey::Column { .. } => false,
+            }) {
+                return Some(format!(
+                    "expression key of index \"{}\" on table \"{}\"",
+                    index.name, self.name
+                ));
+            }
+            if index
+                .predicate_expr
+                .as_ref()
+                .is_some_and(crate::parser::expr_uses_session_dependent_jsonpath)
+            {
+                return Some(format!(
+                    "predicate of partial index \"{}\" on table \"{}\"",
+                    index.name, self.name
+                ));
+            }
+        }
+        None
+    }
+
+    /// Describe the first persisted expression that calls a volatile SQL
+    /// function. Older catalogs could contain these even though current DDL
+    /// rejects them. Connections use this to enter a DROP-only recovery mode,
+    /// preventing the unsafe index/generated expression from being evaluated.
+    pub(crate) fn volatile_persisted_expression(&self) -> Option<String> {
+        for column in &self.columns {
+            if let Some(function) = column
+                .generated_expr
+                .as_ref()
+                .and_then(crate::parser::volatile_function_in_expr)
+            {
+                return Some(format!(
+                    "generated column \"{}.{}\" calls volatile function {function}()",
+                    self.name, column.name
+                ));
+            }
+        }
+        for index in &self.indices {
+            for key in &index.keys {
+                if let IndexKey::Expr { expr, .. } = key {
+                    if let Some(function) = crate::parser::volatile_function_in_expr(expr) {
+                        return Some(format!(
+                            "expression key of index \"{}\" on table \"{}\" calls volatile function {function}()",
+                            index.name, self.name
+                        ));
+                    }
+                }
+            }
+            if let Some(function) = index
+                .predicate_expr
+                .as_ref()
+                .and_then(crate::parser::volatile_function_in_expr)
+            {
+                return Some(format!(
+                    "predicate of partial index \"{}\" on table \"{}\" calls volatile function {function}()",
+                    index.name, self.name
+                ));
+            }
+        }
+        None
+    }
+
     pub fn new(
         name: String,
         columns: Vec<ColumnDef>,

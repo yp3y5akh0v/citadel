@@ -24,7 +24,7 @@ use citadel_txn::write_txn::{WriteTxn, WriteTxnSnapshot};
 use crate::error::{Result, SqlError};
 use crate::executor;
 use crate::parser;
-use crate::parser::{BeginAccessMode, Statement};
+use crate::parser::{BeginAccessMode, Statement, TimezoneValue};
 use crate::prepared::PreparedStatement;
 use crate::schema::{SchemaManager, SchemaSnapshot};
 use crate::types::{ExecutionResult, QueryResult, TableSchema, Value};
@@ -32,6 +32,34 @@ use crate::types::{ExecutionResult, QueryResult, TableSchema, Value};
 const DEFAULT_CACHE_CAPACITY: usize = 64;
 const DEFERRED_TEMP_DROPS_CACHE_KEY: &str = "citadel-sql:internal:deferred-temp-drops:v1";
 static PENDING_TEMP_DROP_QUEUES: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+thread_local! {
+    static LATE_CANCEL_HOOK: RefCell<Option<citadel::CancelToken>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+struct LateCancelGuard;
+
+#[cfg(test)]
+impl Drop for LateCancelGuard {
+    fn drop(&mut self) {
+        LATE_CANCEL_HOOK.with(|hook| *hook.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+fn cancel_after_statement(token: citadel::CancelToken) -> LateCancelGuard {
+    LATE_CANCEL_HOOK.with(|hook| *hook.borrow_mut() = Some(token));
+    LateCancelGuard
+}
+
+#[cfg(test)]
+fn trip_late_cancel_hook() {
+    if let Some(token) = LATE_CANCEL_HOOK.with(|hook| hook.borrow_mut().take()) {
+        token.cancel();
+    }
+}
 
 #[derive(Default)]
 struct DeferredTempDrops {
@@ -165,37 +193,6 @@ fn defer_temp_drops(db: &Database, temp_names: Vec<String>) {
 pub struct ScriptExecution {
     pub completed: Vec<ExecutionResult>,
     pub error: Option<SqlError>,
-}
-
-fn parse_fixed_offset(s: &str) -> Option<()> {
-    let s = s.trim();
-    if s.eq_ignore_ascii_case("z") || s.eq_ignore_ascii_case("utc") {
-        return Some(());
-    }
-    let bytes = s.as_bytes();
-    if bytes.is_empty() {
-        return None;
-    }
-    if !matches!(bytes[0], b'+' | b'-') {
-        return None;
-    }
-    let rest = &s[1..];
-    let (hh, mm) = if let Some((h, m)) = rest.split_once(':') {
-        (h, m)
-    } else if rest.len() == 4 {
-        // len() counts bytes, so a multi-byte char can put index 2 mid-character.
-        rest.split_at_checked(2)?
-    } else if rest.len() == 2 {
-        (rest, "00")
-    } else {
-        return None;
-    };
-    let h: u32 = hh.parse().ok()?;
-    let m: u32 = mm.parse().ok()?;
-    if h > 23 || m > 59 {
-        return None;
-    }
-    Some(())
 }
 
 fn rewrite_show_triggers(sql: &str) -> Option<String> {
@@ -455,12 +452,35 @@ pub(crate) struct CacheEntry {
 struct SavepointEntry {
     name: String,
     snapshot: Option<SavepointSnapshot>,
+    timezone: SessionTimezone,
+    timezone_after_commit: SessionTimezone,
 }
 
 struct SavepointSnapshot {
     wtx_snap: WriteTxnSnapshot,
     schema_snap: SchemaSnapshot,
     temp_table_names_len: usize,
+}
+
+#[derive(Clone)]
+struct SessionTimezone {
+    name: String,
+    zone: jiff::tz::TimeZone,
+}
+
+impl SessionTimezone {
+    fn utc() -> Self {
+        Self {
+            name: "UTC".to_owned(),
+            zone: jiff::tz::TimeZone::UTC,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct TransactionTimezone {
+    before: SessionTimezone,
+    after_commit: SessionTimezone,
 }
 
 /// Active transaction held by a Connection. `None` outside BEGIN/COMMIT;
@@ -499,7 +519,8 @@ pub(crate) struct ConnectionInner<'a> {
     savepoint_stack: Vec<SavepointEntry>,
     pub(crate) stmt_cache: LruCache<String, CacheEntry>,
     txn_start_ts: Option<i64>,
-    session_timezone: String,
+    session_timezone: SessionTimezone,
+    transaction_timezone: Option<TransactionTimezone>,
     /// Namespaces TEMP tables as `__temp_<id>_<name>`. Cleaned up on Connection
     /// drop.
     temp_id: u64,
@@ -531,7 +552,8 @@ impl<'a> Connection<'a> {
                 savepoint_stack: Vec::new(),
                 stmt_cache,
                 txn_start_ts: None,
-                session_timezone: "UTC".to_string(),
+                session_timezone: SessionTimezone::utc(),
+                transaction_timezone: None,
                 temp_id,
                 temp_table_names: Vec::new(),
             }),
@@ -546,13 +568,16 @@ impl<'a> Connection<'a> {
     /// Returns the session time-zone (IANA name or fixed offset). Default
     /// `"UTC"`.
     pub fn session_timezone(&self) -> String {
-        self.inner.borrow().session_timezone.clone()
+        self.inner.borrow().session_timezone.name.clone()
     }
 
     /// Set the session time-zone. Accepts IANA names, ISO-8601 offsets,
     /// `"UTC"`, `"Z"`.
     pub fn set_session_timezone(&self, tz: &str) -> Result<()> {
-        self.inner.borrow_mut().set_session_timezone_impl(tz)
+        let timezone = TimezoneValue::Named(tz.to_owned());
+        self.inner
+            .borrow_mut()
+            .set_session_timezone_impl(&timezone, false)
     }
 
     /// A miss that another connection's DDL would explain, so it is worth reloading for.
@@ -733,6 +758,7 @@ impl<'a> Connection<'a> {
             ));
         }
         let inner = self.inner.borrow();
+        executor::reject_legacy_volatile_schema(&inner.schema)?;
         let lower = table.to_ascii_lowercase();
         if inner.schema.resolve_temp(&lower) != lower {
             return Err(SqlError::InvalidValue(
@@ -769,20 +795,76 @@ impl<'a> ConnectionInner<'a> {
         self.active_txn.is_active()
     }
 
-    fn set_session_timezone_impl(&mut self, tz: &str) -> Result<()> {
-        let upper = tz.to_ascii_uppercase();
-        if (upper.starts_with("UTC+") || upper.starts_with("UTC-")) && tz.len() > 3 {
-            return Err(SqlError::InvalidTimezone(format!(
-                "'{tz}' is ambiguous; use ISO-8601 offset (e.g. '+05:00') or named zone (e.g. 'Etc/GMT-5')"
+    fn jsonpath_session_context(&self, timestamp: i64) -> crate::json::JsonPathSessionContext {
+        let date = jiff::Timestamp::from_microsecond(timestamp)
+            .expect("SQL statement clock must be a valid timestamp")
+            .to_zoned(self.session_timezone.zone.clone())
+            .date();
+        crate::json::JsonPathSessionContext {
+            timezone: self.session_timezone.zone.clone(),
+            date,
+        }
+    }
+
+    fn set_session_timezone_impl(&mut self, value: &TimezoneValue, local: bool) -> Result<()> {
+        if local && self.active_txn.is_none() {
+            return Err(SqlError::NoActiveTransaction);
+        }
+        let timezone = match value {
+            TimezoneValue::Default | TimezoneValue::Local => SessionTimezone::utc(),
+            TimezoneValue::Named(tz) => SessionTimezone {
+                name: tz.trim().to_owned(),
+                zone: crate::datetime::resolve_timezone(tz)?,
+            },
+            TimezoneValue::OffsetSeconds(seconds) => SessionTimezone {
+                name: crate::datetime::format_timezone_offset(*seconds),
+                zone: crate::datetime::fixed_timezone(*seconds)?,
+            },
+        };
+        let evaluation_noop = timezone.zone == self.session_timezone.zone;
+        if self.schema.legacy_volatile_definition().is_some() {
+            if evaluation_noop {
+                return Ok(());
+            }
+            executor::reject_legacy_volatile_schema(&self.schema)?;
+        }
+        if let Some(definition) = self
+            .schema
+            .all_schemas()
+            .find_map(TableSchema::session_dependent_persisted_expression)
+        {
+            if evaluation_noop {
+                return Ok(());
+            }
+            return Err(SqlError::Unsupported(format!(
+                "cannot change the session time zone while {definition} uses session-dependent JSON path evaluation; rewrite or drop/recreate that definition first"
             )));
         }
-        if jiff::tz::TimeZone::get(tz).is_err() && parse_fixed_offset(tz).is_none() {
-            return Err(SqlError::InvalidTimezone(format!(
-                "{tz}: not a known IANA zone or ISO-8601 offset (e.g. '+05:00', 'UTC', 'America/New_York')"
-            )));
+        self.session_timezone = timezone.clone();
+        if !local {
+            if let Some(transaction) = &mut self.transaction_timezone {
+                transaction.after_commit = timezone;
+            }
         }
-        self.session_timezone = tz.to_string();
         Ok(())
+    }
+
+    fn begin_timezone_transaction(&mut self) {
+        debug_assert!(self.transaction_timezone.is_none());
+        self.transaction_timezone = Some(TransactionTimezone {
+            before: self.session_timezone.clone(),
+            after_commit: self.session_timezone.clone(),
+        });
+    }
+
+    fn finish_timezone_transaction(&mut self, committed: bool) {
+        if let Some(transaction) = self.transaction_timezone.take() {
+            self.session_timezone = if committed {
+                transaction.after_commit
+            } else {
+                transaction.before
+            };
+        }
     }
 
     fn execute_impl(&mut self, db: &'a Database, sql: &str) -> Result<ExecutionResult> {
@@ -825,10 +907,10 @@ impl<'a> ConnectionInner<'a> {
         }
 
         let wtx = db.begin_write().map_err(SqlError::Storage)?;
-        let ts = crate::datetime::txn_or_clock_micros();
+        let ts = crate::datetime::now_micros();
         self.active_txn = ActiveTxn::Write(wtx);
+        self.begin_timezone_transaction();
         self.txn_start_ts = Some(ts);
-        crate::datetime::set_txn_clock(Some(ts));
 
         let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut results = Vec::with_capacity(stmts.len());
@@ -856,6 +938,7 @@ impl<'a> ConnectionInner<'a> {
                 }
                 _ => Err(SqlError::NoActiveTransaction),
             };
+            self.finish_timezone_transaction(commit.is_ok());
             self.reset_txn_state();
             try_drain_deferred_temp_drops(db);
             match commit {
@@ -887,7 +970,6 @@ impl<'a> ConnectionInner<'a> {
     fn reset_txn_state(&mut self) {
         self.clear_savepoint_state();
         self.txn_start_ts = None;
-        crate::datetime::set_txn_clock(None);
     }
 
     fn abort_active_txn(&mut self, db: &'a Database) {
@@ -899,6 +981,7 @@ impl<'a> ConnectionInner<'a> {
             fresh.adopt_temp_aliases(&self.schema);
             self.schema = fresh;
         }
+        self.finish_timezone_transaction(false);
         self.reset_txn_state();
         try_drain_deferred_temp_drops(db);
     }
@@ -988,15 +1071,16 @@ impl<'a> ConnectionInner<'a> {
         if parsed.is_empty() {
             return Ok(Vec::new());
         }
+        executor::reject_legacy_volatile_schema(&self.schema)?;
 
         let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
         // `begin_write` inherits the handle token. Recovery is the exceptional
         // case: clear it before the first storage operation.
         wtx.set_cancel(None);
-        let ts = crate::datetime::txn_or_clock_micros();
+        let ts = crate::datetime::now_micros();
         self.active_txn = ActiveTxn::Write(wtx);
+        self.begin_timezone_transaction();
         self.txn_start_ts = Some(ts);
-        crate::datetime::set_txn_clock(Some(ts));
 
         let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut values = Vec::with_capacity(parsed.len());
@@ -1007,6 +1091,7 @@ impl<'a> ConnectionInner<'a> {
                         if let ActiveTxn::Write(wtx) = self.active_txn.take() {
                             wtx.abort();
                         }
+                        self.finish_timezone_transaction(false);
                         self.reset_txn_state();
                         try_drain_deferred_temp_drops(db);
                         return Err(error);
@@ -1027,6 +1112,7 @@ impl<'a> ConnectionInner<'a> {
                 }
                 _ => Err(SqlError::NoActiveTransaction),
             };
+            self.finish_timezone_transaction(result.is_ok());
             self.reset_txn_state();
             try_drain_deferred_temp_drops(db);
             result
@@ -1052,6 +1138,10 @@ impl<'a> ConnectionInner<'a> {
     ) -> Result<ExecutionResult> {
         use executor::compile::ActiveTxnRef;
         self.guarded(db, AtTheDoor::Refuse, stmt, |conn| {
+            let statement_timestamp = crate::datetime::now_micros();
+            let transaction_timestamp = conn.txn_start_ts.unwrap_or(statement_timestamp);
+            let timezone = conn.session_timezone.zone.clone();
+            let jsonpath_context = conn.jsonpath_session_context(transaction_timestamp);
             let schema = &conn.schema;
             let exec = || {
                 if params.is_empty() {
@@ -1062,14 +1152,17 @@ impl<'a> ConnectionInner<'a> {
                     })
                 }
             };
-            if plan.needs_txn_clock() {
-                let cached_ts = conn
-                    .txn_start_ts
-                    .or_else(|| Some(crate::datetime::now_micros()));
-                crate::datetime::with_txn_clock(cached_ts, exec)
-            } else {
-                exec()
-            }
+            crate::datetime::with_session_timezone(timezone, || {
+                crate::datetime::with_statement_clock(Some(statement_timestamp), || {
+                    if plan.needs_txn_clock() {
+                        crate::datetime::with_txn_clock(Some(transaction_timestamp), || {
+                            crate::json::with_jsonpath_session_context(jsonpath_context, exec)
+                        })
+                    } else {
+                        crate::json::with_jsonpath_session_context(jsonpath_context, exec)
+                    }
+                })
+            })
         })
     }
 
@@ -1161,19 +1254,36 @@ impl<'a> ConnectionInner<'a> {
             if !conn.savepoint_stack.is_empty() && executor::stmt_mutates(stmt) {
                 conn.capture_pending_snapshots();
             }
+            let statement_timestamp = crate::datetime::now_micros();
+            let transaction_timestamp = conn.txn_start_ts.unwrap_or(statement_timestamp);
+            let timezone = conn.session_timezone.zone.clone();
+            let jsonpath_context = conn.jsonpath_session_context(transaction_timestamp);
             let schema = &conn.schema;
             let txn = match &mut conn.active_txn {
                 ActiveTxn::Write(wtx) => ActiveTxnRef::Write(wtx),
                 ActiveTxn::Read(rtx) => ActiveTxnRef::Read(rtx),
                 ActiveTxn::None => ActiveTxnRef::None,
             };
-            if params.is_empty() || !plan.uses_scoped_params() {
-                plan.execute(db, schema, stmt, params, txn)
-            } else {
-                crate::eval::with_scoped_params(params, || {
+            let execute = || {
+                if params.is_empty() || !plan.uses_scoped_params() {
                     plan.execute(db, schema, stmt, params, txn)
+                } else {
+                    crate::eval::with_scoped_params(params, || {
+                        plan.execute(db, schema, stmt, params, txn)
+                    })
+                }
+            };
+            crate::datetime::with_session_timezone(timezone, || {
+                crate::datetime::with_statement_clock(Some(statement_timestamp), || {
+                    if plan.needs_txn_clock() {
+                        crate::datetime::with_txn_clock(Some(transaction_timestamp), || {
+                            crate::json::with_jsonpath_session_context(jsonpath_context, execute)
+                        })
+                    } else {
+                        crate::json::with_jsonpath_session_context(jsonpath_context, execute)
+                    }
                 })
-            }
+            })
         })
     }
 
@@ -1190,6 +1300,7 @@ impl<'a> ConnectionInner<'a> {
     where
         F: FnOnce(&mut Self) -> Result<ExecutionResult>,
     {
+        executor::guard_legacy_volatile_schema(&self.schema, stmt)?;
         // Retry before the statement so a tripped user token cannot strand
         // internal cleanup. If this connection owns the writer, the bounded
         // attempt simply defers until the post-statement retry below.
@@ -1224,8 +1335,11 @@ impl<'a> ConnectionInner<'a> {
         } else {
             None
         };
-        let timezone_before = if explicit && matches!(stmt, Statement::SetTimezone(_)) {
-            Some(self.session_timezone.clone())
+        let timezone_before = if explicit && matches!(stmt, Statement::SetTimezone { .. }) {
+            Some((
+                self.session_timezone.clone(),
+                self.transaction_timezone.clone(),
+            ))
         } else {
             None
         };
@@ -1245,14 +1359,17 @@ impl<'a> ConnectionInner<'a> {
         } else {
             run(self)
         };
+        #[cfg(test)]
+        trip_late_cancel_hook();
         // An explicit transaction has not committed, so a late cancel can still
         // be reported and the transaction refused. Autocommit is excluded:
         // checking after its commit would flag a write that is already durable.
         if explicit && outcome.is_ok() {
             if let Some(t) = &token {
                 if let Err(err) = t.check() {
-                    if let Some(timezone) = timezone_before {
+                    if let Some((timezone, transaction_timezone)) = timezone_before {
                         self.session_timezone = timezone;
+                        self.transaction_timezone = transaction_timezone;
                     }
                     outcome = Err(SqlError::Storage(err));
                 }
@@ -1296,15 +1413,24 @@ impl<'a> ConnectionInner<'a> {
         stmt: &Statement,
         params: &[Value],
     ) -> Result<ExecutionResult> {
-        let cached_ts = self
-            .txn_start_ts
-            .or_else(|| Some(crate::datetime::now_micros()));
-        crate::datetime::with_txn_clock(cached_ts, || {
-            if params.is_empty() {
-                self.dispatch_inner(db, stmt, params)
-            } else {
-                crate::eval::with_scoped_params(params, || self.dispatch_inner(db, stmt, params))
-            }
+        let statement_timestamp = crate::datetime::now_micros();
+        let transaction_timestamp = self.txn_start_ts.unwrap_or(statement_timestamp);
+        let timezone = self.session_timezone.zone.clone();
+        let jsonpath_context = self.jsonpath_session_context(transaction_timestamp);
+        crate::datetime::with_session_timezone(timezone, || {
+            crate::datetime::with_statement_clock(Some(statement_timestamp), || {
+                crate::datetime::with_txn_clock(Some(transaction_timestamp), || {
+                    crate::json::with_jsonpath_session_context(jsonpath_context, || {
+                        if params.is_empty() {
+                            self.dispatch_inner(db, stmt, params)
+                        } else {
+                            crate::eval::with_scoped_params(params, || {
+                                self.dispatch_inner(db, stmt, params)
+                            })
+                        }
+                    })
+                })
+            })
         })
     }
 
@@ -1319,7 +1445,7 @@ impl<'a> ConnectionInner<'a> {
                 if self.active_txn.is_active() {
                     return Err(SqlError::TransactionAlreadyActive);
                 }
-                let ts = crate::datetime::txn_or_clock_micros();
+                let ts = crate::datetime::now_micros();
                 match access_mode {
                     BeginAccessMode::ReadOnly => {
                         let rtx = db.begin_read();
@@ -1330,8 +1456,8 @@ impl<'a> ConnectionInner<'a> {
                         self.active_txn = ActiveTxn::Write(wtx);
                     }
                 }
+                self.begin_timezone_transaction();
                 self.txn_start_ts = Some(ts);
-                crate::datetime::set_txn_clock(Some(ts));
                 Ok(ExecutionResult::Ok)
             }
             Statement::Commit => {
@@ -1353,6 +1479,7 @@ impl<'a> ConnectionInner<'a> {
                 // A refused COMMIT ends the transaction as surely as a
                 // successful one, so returning early would strand the frozen
                 // clock, savepoint stack and rolled-back schema edits.
+                self.finish_timezone_transaction(outcome.is_ok());
                 self.reset_txn_state();
                 match outcome {
                     Ok(()) => Ok(ExecutionResult::Ok),
@@ -1370,25 +1497,29 @@ impl<'a> ConnectionInner<'a> {
                 }
             }
             Statement::Rollback => {
-                match self.active_txn.take() {
+                let reload = match self.active_txn.take() {
                     ActiveTxn::None => return Err(SqlError::NoActiveTransaction),
                     ActiveTxn::Write(wtx) => {
                         wtx.abort();
-                        let mut fresh = SchemaManager::load_ignoring_cancel(db)?;
-                        fresh.bump_generation_past(self.schema.generation());
-                        fresh.adopt_temp_aliases(&self.schema);
-                        self.schema = fresh;
+                        Some(SchemaManager::load_ignoring_cancel(db))
                     }
-                    ActiveTxn::Read(_rtx) => {}
-                }
+                    ActiveTxn::Read(_rtx) => None,
+                };
+                self.finish_timezone_transaction(false);
                 self.reset_txn_state();
+                if let Some(reload) = reload {
+                    let mut fresh = reload?;
+                    fresh.bump_generation_past(self.schema.generation());
+                    fresh.adopt_temp_aliases(&self.schema);
+                    self.schema = fresh;
+                }
                 Ok(ExecutionResult::Ok)
             }
             Statement::Savepoint(name) => self.do_savepoint(name),
             Statement::ReleaseSavepoint(name) => self.do_release(name),
             Statement::RollbackTo(name) => self.do_rollback_to(name),
-            Statement::SetTimezone(zone) => {
-                self.set_session_timezone_impl(zone)?;
+            Statement::SetTimezone { zone, local } => {
+                self.set_session_timezone_impl(zone, *local)?;
                 Ok(ExecutionResult::Ok)
             }
             Statement::CreateTable(ct) if ct.temporary => {
@@ -1462,9 +1593,17 @@ impl<'a> ConnectionInner<'a> {
             return Err(SqlError::NoActiveTransaction);
         }
 
+        let timezone_after_commit = self
+            .transaction_timezone
+            .as_ref()
+            .map(|state| state.after_commit.clone())
+            .unwrap_or_else(|| self.session_timezone.clone());
+
         self.savepoint_stack.push(SavepointEntry {
             name: name.to_string(),
             snapshot: None,
+            timezone: self.session_timezone.clone(),
+            timezone_after_commit,
         });
 
         Ok(ExecutionResult::Ok)
@@ -1531,9 +1670,13 @@ impl<'a> ConnectionInner<'a> {
 
         self.savepoint_stack.truncate(idx + 1);
         let entry = self.savepoint_stack.last_mut().unwrap();
-        let snapshot = match entry.snapshot.take() {
-            Some(s) => s,
-            None => return Ok(ExecutionResult::Ok),
+        let snapshot = entry.snapshot.take();
+        self.session_timezone = entry.timezone.clone();
+        if let Some(transaction) = &mut self.transaction_timezone {
+            transaction.after_commit = entry.timezone_after_commit.clone();
+        }
+        let Some(snapshot) = snapshot else {
+            return Ok(ExecutionResult::Ok);
         };
 
         let wtx = match self.active_txn.as_write_mut() {
@@ -2153,6 +2296,162 @@ mod tests {
         // Four BYTES but three chars, so the +HHMM split lands mid-character.
         assert!(conn.execute("SET TIME ZONE '+\u{20AC}a'").is_err());
         assert!(conn.set_session_timezone("-\u{20AC}a").is_err());
+        assert_eq!(conn.session_timezone(), "UTC");
+    }
+
+    #[test]
+    fn legacy_session_dependent_schema_opens_at_utc_until_remediated() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("CREATE TABLE legacy_path (id INTEGER PRIMARY KEY, j JSONB, g BOOLEAN)")
+            .unwrap();
+
+        // Simulate a catalog written before persistent-expression validation
+        // existed. Current DDL deliberately cannot create this definition.
+        let sql = "JSONB_PATH_EXISTS_TZ(j, '$.timestamp_tz()')";
+        let mut legacy = conn.table_schema("legacy_path").unwrap();
+        legacy.columns[2].generated_sql = Some(sql.into());
+        legacy.columns[2].generated_expr = Some(parser::parse_sql_expr(sql).unwrap());
+        legacy.columns[2].generated_kind = Some(parser::GeneratedKind::Stored);
+        drop(conn);
+        let mut wtx = db.begin_write().unwrap();
+        SchemaManager::save_schema(&mut wtx, &legacy).unwrap();
+        wtx.commit().unwrap();
+
+        let conn = Connection::open(&db).expect("legacy vault must remain openable at UTC");
+        assert_eq!(conn.session_timezone(), "UTC");
+        let error = conn
+            .execute("SET TIME ZONE 'America/New_York'")
+            .expect_err("legacy generated expression allowed a session-zone change");
+        let message = error.to_string();
+        assert!(message.contains("generated column \"legacy_path.g\""));
+        assert!(message.contains("rewrite or drop/recreate"));
+        assert_eq!(conn.session_timezone(), "UTC");
+
+        conn.execute("BEGIN").unwrap();
+        assert!(conn.execute("SET LOCAL TIME ZONE '+10:00'").is_err());
+        conn.execute("ROLLBACK").unwrap();
+
+        conn.execute("DROP TABLE legacy_path").unwrap();
+        conn.execute("SET TIME ZONE 'America/New_York'").unwrap();
+        assert_eq!(conn.session_timezone(), "America/New_York");
+    }
+
+    #[test]
+    fn legacy_volatile_expression_index_opens_in_drop_only_recovery_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("CREATE TABLE legacy_random (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        conn.execute("CREATE INDEX legacy_random_idx ON legacy_random (id)")
+            .unwrap();
+
+        let mut legacy = conn.table_schema("legacy_random").unwrap();
+        let index = legacy
+            .indices
+            .iter_mut()
+            .find(|index| index.name == "legacy_random_idx")
+            .unwrap();
+        index.keys = vec![crate::types::IndexKey::Expr {
+            expr: parser::parse_sql_expr("RANDOM()").unwrap(),
+            original_sql: "RANDOM()".into(),
+        }];
+        drop(conn);
+        let mut wtx = db.begin_write().unwrap();
+        SchemaManager::save_schema(&mut wtx, &legacy).unwrap();
+        wtx.commit().unwrap();
+
+        let conn = Connection::open(&db).expect("volatile legacy catalog must remain openable");
+        conn.execute("SET TIME ZONE 'UTC'")
+            .expect("evaluation-equivalent connection initialization must remain safe");
+        let timezone_error = conn
+            .execute("SET TIME ZONE 'America/New_York'")
+            .expect_err("legacy volatile catalog allowed a session-zone change");
+        assert!(timezone_error
+            .to_string()
+            .contains("legacy catalog recovery required"));
+        let error = conn
+            .query("SELECT 1")
+            .expect_err("unsafe legacy index was exposed to normal execution");
+        let message = error.to_string();
+        assert!(message.contains("legacy catalog recovery required"));
+        assert!(message.contains("legacy_random_idx"));
+        assert!(message.contains("volatile function RANDOM()"));
+        assert!(message.contains("only DROP INDEX, DROP TABLE, or ALTER TABLE DROP COLUMN"));
+
+        conn.execute("DROP INDEX legacy_random_idx").unwrap();
+        assert_eq!(
+            conn.query("SELECT 1").unwrap().rows,
+            vec![vec![Value::Integer(1)]]
+        );
+    }
+
+    #[test]
+    fn a_connection_does_not_inherit_an_unrelated_clock_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        let unrelated = crate::datetime::parse_timestamp("2000-01-01 00:00:00").unwrap();
+
+        let actual = crate::datetime::with_txn_clock(Some(unrelated), || {
+            conn.query("SELECT CURRENT_TIMESTAMP").unwrap().rows[0][0].clone()
+        });
+
+        assert_ne!(actual, Value::Timestamp(unrelated));
+    }
+
+    #[test]
+    fn transaction_lifecycle_does_not_replace_an_ambient_clock_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        let unrelated = crate::datetime::parse_timestamp("2000-01-01 00:00:00").unwrap();
+        let expression = crate::parser::Expr::Function {
+            name: "CURRENT_TIMESTAMP".into(),
+            args: Vec::new(),
+            distinct: false,
+        };
+        let columns = crate::eval::ColumnMap::new(&[]);
+        let direct_eval = || {
+            crate::eval::eval_expr(&expression, &crate::eval::EvalCtx::new(&columns, &[])).unwrap()
+        };
+
+        crate::datetime::with_txn_clock(Some(unrelated), || {
+            conn.execute("BEGIN").unwrap();
+            assert_eq!(direct_eval(), Value::Timestamp(unrelated));
+            assert_ne!(
+                conn.query("SELECT CURRENT_TIMESTAMP").unwrap().rows[0][0],
+                Value::Timestamp(unrelated)
+            );
+            assert_eq!(direct_eval(), Value::Timestamp(unrelated));
+            conn.execute("COMMIT").unwrap();
+            assert_eq!(direct_eval(), Value::Timestamp(unrelated));
+        });
+    }
+
+    #[test]
+    fn late_cancellation_restores_a_timezone_change_before_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("BEGIN").unwrap();
+
+        let token = citadel::CancelToken::new();
+        db.set_cancel(Some(token.clone()));
+        let _late_cancel = cancel_after_statement(token);
+        let error = conn
+            .execute("SET TIME ZONE '+10:00'")
+            .expect_err("the late cancellation was not observed");
+        assert!(matches!(
+            error,
+            SqlError::Storage(citadel_core::Error::Interrupted)
+        ));
+        assert_eq!(conn.session_timezone(), "UTC");
+
+        db.set_cancel(None);
+        conn.execute("COMMIT").unwrap();
         assert_eq!(conn.session_timezone(), "UTC");
     }
 

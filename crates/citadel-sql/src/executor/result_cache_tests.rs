@@ -89,6 +89,55 @@ fn cacheable_refuses_volatile_and_unknown() {
 }
 
 #[test]
+fn jsonpath_cacheability_is_path_aware() {
+    let s = schema_with_t();
+    assert!(cacheable(
+        &s,
+        r#"SELECT JSONB_PATH_QUERY_FIRST('{"profile":{"id":1}}'::JSONB, '$.profile')"#
+    ));
+    assert!(cacheable(
+        &s,
+        r#"SELECT '{"active":true}'::JSONB @? '$.active'"#
+    ));
+    assert!(cacheable(
+        &s,
+        r#"SELECT JSONB_PATH_MATCH('{"priority":1}'::JSONB, '$.priority == 1')"#
+    ));
+    assert!(cacheable(
+        &s,
+        r#"SELECT '{"priority":1}'::JSONB @@ '$.priority == 1'"#
+    ));
+    assert!(cacheable(
+        &s,
+        r#"SELECT JSONB_PATH_QUERY_FIRST('"2024-01-01"'::JSONB, '$.date()')"#
+    ));
+    assert!(cacheable(
+        &s,
+        r#"SELECT JSONB_PATH_MATCH('{"a":"2024-01-01","b":"2024-01-02"}'::JSONB, '$.a.date() < $.b.date()')"#
+    ));
+    assert!(cacheable(
+        &s,
+        r#"SELECT JSONB_PATH_MATCH('{"priority":1}'::JSONB, '$.priority == $minimum', '{"minimum":1}'::JSONB)"#
+    ));
+
+    // TimestampTz-to-TimeTz is the one cast that reads session context even
+    // through a standard entry point.
+    assert!(!cacheable(
+        &s,
+        r#"SELECT JSONB_PATH_QUERY_FIRST('"2024-01-01T00:00:00+00:00"'::JSONB, '$.time_tz()')"#
+    ));
+    // `_TZ` entry points and paths supplied at runtime always fail closed.
+    assert!(!cacheable(
+        &s,
+        r#"SELECT JSONB_PATH_EXISTS_TZ('{"active":true}'::JSONB, '$.active')"#
+    ));
+    assert!(!cacheable(
+        &s,
+        r#"SELECT JSONB_PATH_EXISTS('{"active":true}'::JSONB, $1)"#
+    ));
+}
+
+#[test]
 fn params_match_is_bit_exact() {
     assert!(params_match(
         &[Value::Real(1.5), Value::Integer(2)],

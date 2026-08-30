@@ -28,6 +28,91 @@ use serde_json::Number;
 pub struct JsonPath {
     pub(crate) mode: Mode,
     pub(crate) expr: ExprOrPredicate,
+    /// Zone the `_tz` entry points resolve against. `None` is UTC, which is what
+    /// PostgreSQL uses when `TimeZone` is unset.
+    pub(crate) session_tz: Option<jiff::tz::TimeZone>,
+    /// Date used by time-to-timetz casts. PostgreSQL uses the transaction-start
+    /// date in the session zone; `None` derives today's date when evaluation starts.
+    pub(crate) session_date: Option<jiff::civil::Date>,
+}
+
+impl JsonPath {
+    /// Whether evaluating this path through a standard (non-`_tz`) entry point
+    /// can depend on the session time zone or transaction date.
+    ///
+    /// In standard mode, datetime parsing and comparison are deterministic or
+    /// reject a context-requiring cross-kind operation before reading context.
+    /// The sole exception is `.time_tz()`: PostgreSQL's TimestampTz-to-TimeTz
+    /// cast resolves the timestamp in the session zone even without `_tz`.
+    /// `_tz` callers must classify the entry point itself as dependent.
+    pub fn depends_on_session_context_without_tz(&self) -> bool {
+        expr_or_predicate_depends_on_session_context(&self.expr)
+    }
+}
+
+fn expr_or_predicate_depends_on_session_context(expr: &ExprOrPredicate) -> bool {
+    match expr {
+        ExprOrPredicate::Expr(expr) => expr_depends_on_session_context(expr),
+        ExprOrPredicate::Pred(predicate) => predicate_depends_on_session_context(predicate),
+    }
+}
+
+fn expr_depends_on_session_context(expr: &Expr) -> bool {
+    match expr {
+        Expr::PathPrimary(primary) => primary_depends_on_session_context(primary),
+        Expr::Accessor(base, accessor) => {
+            expr_depends_on_session_context(base) || accessor_depends_on_session_context(accessor)
+        }
+        Expr::UnaryOp(_, expr) => expr_depends_on_session_context(expr),
+        Expr::BinaryOp(_, left, right) => {
+            expr_depends_on_session_context(left) || expr_depends_on_session_context(right)
+        }
+    }
+}
+
+fn primary_depends_on_session_context(primary: &PathPrimary) -> bool {
+    match primary {
+        PathPrimary::ExprOrPred(expr) => expr_or_predicate_depends_on_session_context(expr),
+        PathPrimary::Root | PathPrimary::Current | PathPrimary::Last | PathPrimary::Value(_) => {
+            false
+        }
+    }
+}
+
+fn accessor_depends_on_session_context(accessor: &AccessorOp) -> bool {
+    match accessor {
+        AccessorOp::Element(indices) => indices.iter().any(|index| match index {
+            ArrayIndex::Index(expr) => expr_depends_on_session_context(expr),
+            ArrayIndex::Slice(start, end) => {
+                expr_depends_on_session_context(start) || expr_depends_on_session_context(end)
+            }
+        }),
+        AccessorOp::FilterExpr(predicate) => predicate_depends_on_session_context(predicate),
+        AccessorOp::Method(method) => matches!(method, Method::TimeTz { .. }),
+        AccessorOp::MemberWildcard
+        | AccessorOp::DescendantMemberWildcard(_)
+        | AccessorOp::ElementWildcard
+        | AccessorOp::Member(_) => false,
+    }
+}
+
+fn predicate_depends_on_session_context(predicate: &Predicate) -> bool {
+    match predicate {
+        Predicate::Compare(_, left, right) => {
+            expr_depends_on_session_context(left) || expr_depends_on_session_context(right)
+        }
+        Predicate::Exists(expr) => expr_depends_on_session_context(expr),
+        Predicate::And(left, right) | Predicate::Or(left, right) => {
+            predicate_depends_on_session_context(left)
+                || predicate_depends_on_session_context(right)
+        }
+        Predicate::Not(predicate) | Predicate::IsUnknown(predicate) => {
+            predicate_depends_on_session_context(predicate)
+        }
+        Predicate::StartsWith(expr, _) | Predicate::LikeRegex(expr, _) => {
+            expr_depends_on_session_context(expr)
+        }
+    }
 }
 
 /// The mode of JSON Path.
@@ -230,6 +315,42 @@ pub enum Method {
     Datetime {
         template: Option<String>,
     },
+    /// `.bigint()` converts a string or numeric to a 64-bit integer, rounding a fraction.
+    Bigint,
+    /// `.integer()` converts a string or numeric to a 32-bit integer, rounding a fraction.
+    Integer,
+    /// `.number()` converts a string or numeric to an exact numeric value.
+    Number,
+    /// `.decimal([precision [, scale]])` converts to numeric under an optional typmod.
+    ///
+    /// Arguments are held as `i64` because PostgreSQL range-checks them during evaluation,
+    /// not while parsing; a value outside `i32` must reach eval to report its own error.
+    Decimal {
+        precision: Option<i64>,
+        scale: Option<i64>,
+    },
+    /// `.string()` converts a boolean, numeric or datetime to a character string.
+    String,
+    /// `.boolean()` converts a boolean, string or exact integer to a boolean.
+    Boolean,
+    /// `.date()` converts a string to a date. Takes no argument.
+    Date,
+    /// `.time([precision])` converts a string to time without time zone.
+    Time {
+        precision: Option<i64>,
+    },
+    /// `.time_tz([precision])` converts a string to time with time zone.
+    TimeTz {
+        precision: Option<i64>,
+    },
+    /// `.timestamp([precision])` converts a string to timestamp without time zone.
+    Timestamp {
+        precision: Option<i64>,
+    },
+    /// `.timestamp_tz([precision])` converts a string to timestamp with time zone.
+    TimestampTz {
+        precision: Option<i64>,
+    },
 }
 
 impl PathPrimary {
@@ -423,8 +544,22 @@ impl Display for AccessorOp {
                 write!(f, "]")
             }
             Self::FilterExpr(expr) => write!(f, "?({expr})"),
+            // Argument-carrying methods must each be named here: the catch-all renders
+            // `.{method}()` and would silently drop them, breaking path round-tripping.
             Self::Method(method) => match method {
                 Method::Datetime { template: Some(t) } => write!(f, ".datetime(\"{t}\")"),
+                Method::Decimal {
+                    precision: Some(p),
+                    scale: Some(s),
+                } => write!(f, ".decimal({p},{s})"),
+                Method::Decimal {
+                    precision: Some(p),
+                    scale: None,
+                } => write!(f, ".decimal({p})"),
+                Method::Time { precision: Some(p) } => write!(f, ".time({p})"),
+                Method::TimeTz { precision: Some(p) } => write!(f, ".time_tz({p})"),
+                Method::Timestamp { precision: Some(p) } => write!(f, ".timestamp({p})"),
+                Method::TimestampTz { precision: Some(p) } => write!(f, ".timestamp_tz({p})"),
                 _ => write!(f, ".{method}()"),
             },
         }
@@ -507,6 +642,17 @@ impl Display for Method {
             Self::Abs => write!(f, "abs"),
             Self::Keyvalue => write!(f, "keyvalue"),
             Self::Datetime { .. } => write!(f, "datetime"),
+            Self::Bigint => write!(f, "bigint"),
+            Self::Integer => write!(f, "integer"),
+            Self::Number => write!(f, "number"),
+            Self::Decimal { .. } => write!(f, "decimal"),
+            Self::String => write!(f, "string"),
+            Self::Boolean => write!(f, "boolean"),
+            Self::Date => write!(f, "date"),
+            Self::Time { .. } => write!(f, "time"),
+            Self::TimeTz { .. } => write!(f, "time_tz"),
+            Self::Timestamp { .. } => write!(f, "timestamp"),
+            Self::TimestampTz { .. } => write!(f, "timestamp_tz"),
         }
     }
 }
@@ -616,3 +762,43 @@ impl PartialEq for Regex {
 }
 
 impl Eq for Regex {}
+
+#[cfg(test)]
+mod dependency_tests {
+    use super::JsonPath;
+
+    #[test]
+    fn standard_context_independent_paths_remain_independent() {
+        for input in [
+            "$.account.profile",
+            "$.items[*].size()",
+            "$ ? (exists (@.enabled))",
+            "$.items[1 + 2]",
+            "$ ? (@.priority == 1)",
+            "$ ? (@.priority == $minimum)",
+            "$.created.datetime()",
+            "$.created.date()",
+            "$.created.time()",
+            "$.created.timestamp()",
+            "$.created.timestamp_tz()",
+            "$ ? (@.left.date() == @.right.date())",
+        ] {
+            let path = JsonPath::new(input).unwrap();
+            assert!(
+                !path.depends_on_session_context_without_tz(),
+                "standard context-independent path was marked dependent: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn time_tz_method_depends_on_standard_session_context() {
+        for input in ["$.created.time_tz()", "$ ? (exists (@.created.time_tz()))"] {
+            let path = JsonPath::new(input).unwrap();
+            assert!(
+                path.depends_on_session_context_without_tz(),
+                "dependent path was missed: {input}"
+            );
+        }
+    }
+}
