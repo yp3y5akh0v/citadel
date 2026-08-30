@@ -273,12 +273,12 @@ published systems are in
 - **CLI** - SQL shell with tab completion, syntax highlighting, 27 dot-commands (.backup, .verify, .upgrade, .rekey, .sync, .dump, ...)
 - **3-tier key hierarchy** - Passphrase -> Argon2id -> Master Key -> AES-KW -> REK -> HKDF -> DEK + MAC
 - **Cryptographic forgetting** - Erase data by destroying its key, not by overwriting: whole-store, and per-region / per-atom via [citadeldb-mem](https://github.com/yp3y5akh0v/citadel/tree/HEAD/crates/citadel-mem). A forgotten region or atom is unrecoverable
-- **FIPS 140-3** - PBKDF2-HMAC-SHA256 + AES-256-CTR when compliance requires it
-- **Audit log** - HMAC-SHA256 chained, tamper-evident
+- **FIPS-oriented at-rest profile** - PBKDF2-HMAC-SHA256 + AES-256-CTR for database storage; not a claim of whole-product validation
+- **Audit log** - HMAC-SHA256 chained within files and across retained v2 generations; retained-history verification detects record edits and broken retained links, but there is no external anti-rollback anchor
 - **Hot backup** - Consistent snapshots via MVCC, no write blocking
 - **Overflow pages** - Large values handled transparently, no size limits
 - **Cross-platform** - Windows, Linux, macOS. Python, C FFI, and WebAssembly bindings
-- **5,200+ tests** - Unit, integration, torture tests across 21 crates
+- **Thousands of tests** - Unit, integration, and torture tests across 21 crates
 
 ## Speed benchmarks
 
@@ -517,7 +517,7 @@ Reproduce with `cargo bench -p citadeldb-sql --bench h2h_bench`
 
 **No plaintext on disk.** Every page is encrypted before writing and authenticated before reading.
 
-**Separate key file.** Encryption keys live in `{dbname}.citadel-keys`, not inside the database. The passphrase derives a master key in memory via Argon2id (or PBKDF2 in FIPS mode) and never touches disk.
+**Separate key file.** Encryption keys live in `{dbname}.citadel-keys`, not inside the database. The passphrase derives a master key in memory via Argon2id (or PBKDF2 in the FIPS-oriented at-rest profile) and never touches disk.
 
 **Key backup.** Export an encrypted key backup with a separate recovery passphrase. Restore access without re-encrypting the entire database.
 
@@ -667,8 +667,8 @@ cargo build --release
 
 | Flag | Description |
 |------|-------------|
-| `audit-log` | HMAC-chained tamper-evident audit log (default: on) |
-| `fips` | FIPS 140-3: PBKDF2 + AES-256-CTR only |
+| `audit-log` | HMAC-SHA256-chained audit log (default: on); no external anti-rollback anchor |
+| `fips` | At-rest PBKDF2 + AES-256-CTR profile; not whole-product validation |
 | `io-uring` | Linux io_uring async I/O |
 
 ## License

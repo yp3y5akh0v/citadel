@@ -12,6 +12,44 @@ pip install citadeldb
 
 The only runtime dependency is NumPy; embeddings are bring-your-own.
 
+## Repairing memory-model provenance
+
+`CandleEmbedder.model_id` binds the friendly model name to the exact model,
+tokenizer, and configuration bytes, the selected preset, and Citadel's embedding
+pipeline revision. `MockEmbedder` records a versioned algorithm identity instead of
+a generic `mock` label. A legacy region carrying an earlier identity will not attach
+to the current embedder automatically.
+
+If—and only if—the embedder is exactly the one that produced the stored vectors,
+update the recorded provenance and reattach. For a region created with the old mock
+identity, use its original dimension and metric (replace these example values):
+
+```python
+embedder = citadeldb.MockEmbedder(dim=64, metric="cosine")
+mem.reclassify_region("chat", embedder.model_id)
+mem.attach_existing_region("chat", embedder)
+```
+
+For a Candle region, builds with the `candle-embed` feature can perform the same
+repair when the model files and preset are unchanged:
+
+```python
+embedder = citadeldb.CandleEmbedder("/path/to/model", preset="e5-large")
+mem.reclassify_region("chat", embedder.model_id)
+mem.attach_existing_region("chat", embedder)
+```
+
+`reclassify_region` changes provenance only; it does not verify or recompute vectors.
+If the embedder changed, or you cannot prove it is unchanged, recompute the vectors
+instead:
+
+```python
+report = mem.reembed_region("chat", embedder)
+```
+
+Re-embedding refuses a vector-bearing atom whose original text was not stored,
+because such a vector cannot be recomputed safely.
+
 ## Memory
 
 ```python
