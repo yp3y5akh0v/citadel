@@ -1763,6 +1763,33 @@ struct AuditFileDiscovery {
     suspicious_numeric_name: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuditGenerationName {
+    Unrelated,
+    Suspicious,
+    Generation(u32),
+}
+
+fn classify_audit_generation_name(base_name: &[u8], candidate_name: &[u8]) -> AuditGenerationName {
+    let Some(suffix) = candidate_name
+        .strip_prefix(base_name)
+        .and_then(|suffix| suffix.strip_prefix(b"."))
+    else {
+        return AuditGenerationName::Unrelated;
+    };
+    if suffix.is_empty() || !suffix.iter().all(|b| b.is_ascii_digit()) {
+        return AuditGenerationName::Unrelated;
+    }
+    let suffix = std::str::from_utf8(suffix).expect("ASCII digits are valid UTF-8");
+    let Ok(generation) = suffix.parse::<u32>() else {
+        return AuditGenerationName::Suspicious;
+    };
+    if generation == 0 || suffix != generation.to_string() {
+        return AuditGenerationName::Suspicious;
+    }
+    AuditGenerationName::Generation(generation)
+}
+
 fn invalid_audit_data(message: impl Into<String>) -> citadel_core::Error {
     citadel_core::Error::Io(std::io::Error::new(
         std::io::ErrorKind::InvalidData,
@@ -1797,24 +1824,14 @@ fn discover_audit_files_from_live(live: &Path) -> citadel_core::Result<AuditFile
         let entry = entry?;
         let name = entry.file_name();
         let name = name.as_encoded_bytes();
-        let Some(suffix) = name
-            .strip_prefix(base_name)
-            .and_then(|suffix| suffix.strip_prefix(b"."))
-        else {
-            continue;
+        let generation = match classify_audit_generation_name(base_name, name) {
+            AuditGenerationName::Unrelated => continue,
+            AuditGenerationName::Suspicious => {
+                suspicious_numeric_name = true;
+                continue;
+            }
+            AuditGenerationName::Generation(generation) => generation,
         };
-        if suffix.is_empty() || !suffix.iter().all(|b| b.is_ascii_digit()) {
-            continue;
-        }
-        let suffix = std::str::from_utf8(suffix).expect("ASCII digits are valid UTF-8");
-        let Ok(generation) = suffix.parse::<u32>() else {
-            suspicious_numeric_name = true;
-            continue;
-        };
-        if generation == 0 || suffix != generation.to_string() {
-            suspicious_numeric_name = true;
-            continue;
-        }
         if !entry.file_type()?.is_file() {
             suspicious_numeric_name = true;
             continue;
@@ -3710,27 +3727,26 @@ mod tests {
             .contains("rotation recovery is pending"));
     }
 
-    #[cfg(unix)]
     #[test]
     fn non_unicode_audit_basenames_never_share_generations() {
-        use std::os::unix::ffi::OsStringExt;
+        let first = b"\xff.citadel-audit";
+        let second = b"\xfe.citadel-audit";
+        assert_eq!(
+            String::from_utf8_lossy(first),
+            String::from_utf8_lossy(second),
+            "precondition: lossy conversion aliases the distinct basenames"
+        );
 
-        let dir = tempfile::tempdir().unwrap();
-        let mut first_name = vec![0xff];
-        first_name.extend_from_slice(b".citadel-audit");
-        let first = dir.path().join(std::ffi::OsString::from_vec(first_name));
-        fs::write(&first, b"first live").unwrap();
-
-        let mut second_name = vec![0xfe];
-        second_name.extend_from_slice(b".citadel-audit.1");
-        let second = dir.path().join(std::ffi::OsString::from_vec(second_name));
-        fs::write(&second, b"other vault generation").unwrap();
-
-        let discovery = discover_audit_files_from_live(&first).unwrap();
-        assert!(!discovery.suspicious_numeric_name);
-        assert_eq!(discovery.files.len(), 1);
-        assert_eq!(discovery.files[0].generation, 0);
-        assert_eq!(discovery.files[0].path, first);
+        let mut second_generation = second.to_vec();
+        second_generation.extend_from_slice(b".1");
+        assert_eq!(
+            classify_audit_generation_name(first, &second_generation),
+            AuditGenerationName::Unrelated
+        );
+        assert_eq!(
+            classify_audit_generation_name(second, &second_generation),
+            AuditGenerationName::Generation(1)
+        );
     }
 
     #[test]
