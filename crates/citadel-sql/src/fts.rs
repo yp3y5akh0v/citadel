@@ -356,10 +356,9 @@ pub const TSQ_TAG_PHRASE: u8 = 4;
 
 pub const TSQ_FLAG_PREFIX: u8 = 0x01;
 
-// Keep every recursive consumer below a depth that is safe on the smallest
-// supported thread stack. The node cap also bounds adversarial, broadly
-// branching inputs without restricting ordinary search expressions.
-const MAX_TSQUERY_DEPTH: usize = 256;
+// Keep recursive consumers within the 1 MiB stack budget exercised by the
+// depth tests. The node cap also bounds adversarial, broadly branching inputs.
+const MAX_TSQUERY_DEPTH: usize = 64;
 const MAX_TSQUERY_NODES: usize = 4_096;
 
 fn lexeme_length_error(len: usize) -> SqlError {
