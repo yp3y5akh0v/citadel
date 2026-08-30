@@ -114,7 +114,7 @@
     <div class="feat">
       <svg class="feat-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="4" y="10" width="16" height="11" rx="1"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/><circle cx="12" cy="15.5" r="1.2" fill="currentColor"/></svg>
       <h3>Encrypted at rest</h3>
-      <p>AES-256-CTR + HMAC-SHA256 per page, verified before decryption. Fresh random IV on every write. ChaCha20 available.</p>
+      <p>AES-256-CTR + HMAC-SHA256 per page, verified before decryption. Fresh random IV on every write.</p>
     </div>
     <div class="feat">
       <svg class="feat-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><ellipse cx="12" cy="6" rx="8" ry="2.5"/><path d="M4 6v6c0 1.4 3.6 2.5 8 2.5s8-1.1 8-2.5V6"/><path d="M4 12v6c0 1.4 3.6 2.5 8 2.5s8-1.1 8-2.5v-6"/></svg>
@@ -502,7 +502,7 @@
       <div class="arch-row multi">
         <div><span class="crate">citadel-txn</span><span class="desc">transactions</span></div>
         <div><span class="crate">citadel-sync</span><span class="desc">replication</span></div>
-        <div><span class="crate">citadel-crypto</span><span class="desc">keys / ciphers</span></div>
+        <div><span class="crate">citadel-crypto</span><span class="desc">key hierarchy / at-rest encryption</span></div>
       </div>
       <div class="arch-row double">
         <div><span class="crate">citadel-buffer</span><span class="desc">SIEVE buffer pool</span></div>
@@ -756,8 +756,8 @@
       <p>Noise <code>NNpsk0_25519_ChaChaPoly_BLAKE2s</code> with a 256-bit PSK. Ephemeral Curve25519 keys per session; compromise of one doesn't leak prior traffic.</p>
     </div>
     <div class="sec-card">
-      <h4><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M12 3v9l6 3"/></svg>FIPS 140-3 mode</h4>
-      <p>A feature flag swaps Argon2id for PBKDF2-HMAC-SHA256 (600,000+ iterations) with AES-256-CTR only, for compliance environments.</p>
+      <h4><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M12 3v9l6 3"/></svg>FIPS-oriented at-rest profile</h4>
+      <p>A feature flag uses PBKDF2-HMAC-SHA256 (600,000+ iterations) with AES-256-CTR for database storage. This is not a claim of whole-product validation.</p>
     </div>
   </div>
 </section>

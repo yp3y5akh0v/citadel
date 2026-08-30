@@ -1,6 +1,12 @@
+use citadel::core::{HKDF_INFO_BACKUP_MAC, KEY_BACKUP_SIZE};
+use citadel::crypto::kdf::derive_mk;
+use citadel::crypto::key_backup::KeyBackup;
 #[cfg(not(feature = "fips"))]
 use citadel::Argon2Profile;
 use citadel::{Database, DatabaseBuilder, KdfAlgorithm};
+use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 use std::path::Path;
 #[cfg(unix)]
 use std::path::PathBuf;
@@ -23,6 +29,31 @@ fn create_test_db(dir: &Path, passphrase: &[u8]) -> Database {
         .kdf_algorithm(KdfAlgorithm::Pbkdf2HmacSha256)
         .pbkdf2_iterations(600_000);
     builder.create().unwrap()
+}
+
+fn rewrite_backup_as_released_id_one(path: &Path, passphrase: &[u8]) {
+    let bytes = std::fs::read(path).unwrap();
+    let mut image: [u8; KEY_BACKUP_SIZE] = bytes.try_into().unwrap();
+    let backup = KeyBackup::deserialize(&image).unwrap();
+    let backup_key = derive_mk(
+        backup.kdf_algorithm,
+        passphrase,
+        &backup.backup_salt,
+        backup.kdf_param1,
+        backup.kdf_param2,
+        backup.kdf_param3,
+    )
+    .unwrap();
+    let hkdf = Hkdf::<Sha256>::new(Some(&[0u8; 32]), &*backup_key);
+    let mut mac_key = [0u8; 32];
+    hkdf.expand(HKDF_INFO_BACKUP_MAC, &mut mac_key).unwrap();
+
+    image[16] = 1;
+    image[18..20].copy_from_slice(&0u16.to_le_bytes());
+    let mut mac = Hmac::<Sha256>::new_from_slice(&mac_key).unwrap();
+    mac.update(&image[..92]);
+    image[92..124].copy_from_slice(&mac.finalize().into_bytes());
+    std::fs::write(path, image).unwrap();
 }
 
 #[cfg(not(feature = "fips"))]
@@ -73,6 +104,41 @@ fn export_and_restore_roundtrip() {
     let mut rtx = db.begin_read();
     assert_eq!(rtx.get(b"key1").unwrap(), Some(b"value1".to_vec()));
     assert_eq!(rtx.get(b"key2").unwrap(), Some(b"value2".to_vec()));
+}
+
+#[test]
+fn a_released_id_one_backup_restores_to_a_canonical_aes_key_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_passphrase = b"database-password";
+    let backup_passphrase = b"backup-password";
+    let new_passphrase = b"new-database-password";
+    let data_path = dir.path().join("test.citadel");
+    let key_path = citadel::default_key_path(&data_path);
+    let backup_path = dir.path().join("released-id-one.backup");
+
+    let db = create_test_db(dir.path(), db_passphrase);
+    let mut write = db.begin_write().unwrap();
+    write.insert(b"key", b"value").unwrap();
+    write.commit().unwrap();
+    db.export_key_backup(db_passphrase, backup_passphrase, &backup_path)
+        .unwrap();
+    drop(db);
+
+    rewrite_backup_as_released_id_one(&backup_path, backup_passphrase);
+    assert_eq!(std::fs::read(&backup_path).unwrap()[16], 1);
+    std::fs::remove_file(&key_path).unwrap();
+    Database::restore_key_from_backup(&backup_path, backup_passphrase, new_passphrase, &data_path)
+        .unwrap();
+
+    assert_eq!(std::fs::read(&key_path).unwrap()[44], 0);
+    let restored = DatabaseBuilder::new(&data_path)
+        .passphrase(new_passphrase)
+        .open()
+        .unwrap();
+    assert_eq!(
+        restored.begin_read().get(b"key").unwrap(),
+        Some(b"value".to_vec())
+    );
 }
 
 #[test]

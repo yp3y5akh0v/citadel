@@ -77,7 +77,7 @@ jobs:
             features: "--features citadeldb/io-uring"
             name: linux-iouring
           - os: ubuntu-latest
-            features: "-p citadeldb --test fips --features citadeldb/fips"
+            features: "-p citadeldb --test fips --test cipher_selector_retirement --test key_backup --features citadeldb/fips"
             name: linux-fips
           - os: windows-latest
             features: ""

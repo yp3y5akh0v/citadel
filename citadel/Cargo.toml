@@ -43,6 +43,9 @@ tempfile = "3"
 blake3 = { workspace = true }
 criterion = { workspace = true }
 mimalloc = { workspace = true }
+hkdf = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
 
 [[bench]]
 name = "kv_bench"

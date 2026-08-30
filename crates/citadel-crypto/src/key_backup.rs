@@ -14,6 +14,9 @@ use crate::kdf::derive_mk;
 use crate::key_manager::{key_file_flags_valid, unwrap_rek, wrap_rek};
 
 type HmacSha256 = Hmac<Sha256>;
+// Released selectors recorded ID 1 after a ChaCha20 request, but the backed-up
+// REK protected data that was encrypted with AES-256-CTR.
+const LEGACY_AES_CIPHER_ID: u8 = 1;
 
 /// Encrypted key backup file (124 bytes fixed).
 #[derive(Clone)]
@@ -21,7 +24,7 @@ pub struct KeyBackup {
     pub magic: u32,
     pub version: u32,
     pub file_id: u64,
-    pub cipher_id: CipherId,
+    encoded_cipher_id: u8,
     pub kdf_algorithm: KdfAlgorithm,
     /// Authenticated key-file format requirements carried through restore.
     pub key_file_flags: u16,
@@ -41,7 +44,7 @@ impl KeyBackup {
         buf[0..4].copy_from_slice(&self.magic.to_le_bytes());
         buf[4..8].copy_from_slice(&self.version.to_le_bytes());
         buf[8..16].copy_from_slice(&self.file_id.to_le_bytes());
-        buf[16] = self.cipher_id as u8;
+        buf[16] = self.encoded_cipher_id;
         buf[17] = self.kdf_algorithm as u8;
         buf[18..20].copy_from_slice(&self.key_file_flags.to_le_bytes());
         buf[20..24].copy_from_slice(&self.kdf_param1.to_le_bytes());
@@ -69,8 +72,10 @@ impl KeyBackup {
             return Err(citadel_core::Error::UnsupportedVersion(version));
         }
 
-        let cipher_id =
-            CipherId::from_u8(buf[16]).ok_or(citadel_core::Error::UnsupportedCipher(buf[16]))?;
+        let encoded_cipher_id = match buf[16] {
+            0 | LEGACY_AES_CIPHER_ID => buf[16],
+            value => return Err(citadel_core::Error::UnsupportedCipher(value)),
+        };
 
         let kdf_algorithm =
             KdfAlgorithm::from_u8(buf[17]).ok_or(citadel_core::Error::UnsupportedKdf(buf[17]))?;
@@ -84,7 +89,7 @@ impl KeyBackup {
             magic,
             version,
             file_id: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
-            cipher_id,
+            encoded_cipher_id,
             kdf_algorithm,
             key_file_flags,
             kdf_param1: u32::from_le_bytes(buf[20..24].try_into().unwrap()),
@@ -108,11 +113,24 @@ impl KeyBackup {
         }
     }
 
-    /// Recompute and set the HMAC field.
+    /// Recompute and set the HMAC field. The caller must authenticate the
+    /// current image before invoking this mutator; it does not verify the
+    /// existing HMAC.
     pub fn update_hmac(&mut self, bek: &[u8; KEY_SIZE]) {
+        self.encoded_cipher_id = CipherId::Aes256Ctr as u8;
         let mac_key = derive_backup_mac_key(bek);
         let data = self.serialize();
         self.hmac = compute_backup_mac(&mac_key, &data[..92]);
+    }
+
+    #[cfg(test)]
+    fn has_legacy_cipher_encoding(&self) -> bool {
+        self.encoded_cipher_id == LEGACY_AES_CIPHER_ID
+    }
+
+    /// The cipher that actually protects the database represented by this backup.
+    pub fn cipher_id(&self) -> CipherId {
+        CipherId::Aes256Ctr
     }
 }
 
@@ -142,7 +160,6 @@ pub fn create_key_backup(
     rek: &[u8; KEY_SIZE],
     backup_passphrase: &[u8],
     file_id: u64,
-    cipher_id: CipherId,
     kdf_algorithm: KdfAlgorithm,
     kdf_param1: u32,
     kdf_param2: u32,
@@ -170,7 +187,7 @@ pub fn create_key_backup(
         magic: KEY_BACKUP_MAGIC,
         version: KEY_BACKUP_VERSION,
         file_id,
-        cipher_id,
+        encoded_cipher_id: CipherId::Aes256Ctr as u8,
         kdf_algorithm,
         key_file_flags,
         kdf_param1,
@@ -213,7 +230,7 @@ pub fn restore_rek_from_backup(
         rek: *rek,
         keys,
         file_id: backup.file_id,
-        cipher_id: backup.cipher_id,
+        cipher_id: CipherId::Aes256Ctr,
         kdf_algorithm: backup.kdf_algorithm,
         key_file_flags: backup.key_file_flags,
         kdf_param1: backup.kdf_param1,

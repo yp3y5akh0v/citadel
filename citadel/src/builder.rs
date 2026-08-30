@@ -57,7 +57,6 @@ pub struct DatabaseBuilder {
     passphrase: Option<Zeroizing<Vec<u8>>>,
     argon2_profile: Argon2Profile,
     cache_size: usize,
-    cipher: CipherId,
     kdf_algorithm: KdfAlgorithm,
     pbkdf2_iterations: u32,
     sync_mode: SyncMode,
@@ -75,7 +74,6 @@ impl DatabaseBuilder {
             passphrase: None,
             argon2_profile: Argon2Profile::Desktop,
             cache_size: DEFAULT_BUFFER_POOL_SIZE,
-            cipher: CipherId::Aes256Ctr,
             kdf_algorithm: KdfAlgorithm::Argon2id,
             pbkdf2_iterations: PBKDF2_MIN_ITERATIONS,
             sync_mode: SyncMode::Full,
@@ -108,14 +106,10 @@ impl DatabaseBuilder {
         self
     }
 
-    pub fn cipher(mut self, cipher: CipherId) -> Self {
-        self.cipher = cipher;
-        self
-    }
-
     /// Set the key derivation function algorithm.
     ///
-    /// Default: `Argon2id`. Use `Pbkdf2HmacSha256` for FIPS 140-3 compliance.
+    /// Default: `Argon2id`. Use `Pbkdf2HmacSha256` for the FIPS-oriented
+    /// at-rest profile.
     /// When using PBKDF2, the Argon2 profile is ignored and iterations are
     /// controlled by `pbkdf2_iterations()`.
     pub fn kdf_algorithm(mut self, algorithm: KdfAlgorithm) -> Self {
@@ -234,11 +228,6 @@ impl DatabaseBuilder {
         if self.kdf_algorithm != KdfAlgorithm::Pbkdf2HmacSha256 {
             return Err(Error::FipsViolation(
                 "FIPS mode requires PBKDF2-HMAC-SHA256 (Argon2id is not NIST approved)".into(),
-            ));
-        }
-        if self.cipher == CipherId::ChaCha20 {
-            return Err(Error::FipsViolation(
-                "FIPS mode requires AES-256-CTR (ChaCha20 is not NIST approved)".into(),
             ));
         }
         Ok(())
@@ -456,7 +445,7 @@ impl DatabaseBuilder {
 
         #[cfg(feature = "audit-log")]
         let event = {
-            let detail = vec![self.cipher as u8, self.kdf_algorithm as u8];
+            let detail = vec![CipherId::Aes256Ctr as u8, self.kdf_algorithm as u8];
             Some((crate::audit::AuditEventType::DatabaseCreated, detail))
         };
         #[cfg(not(feature = "audit-log"))]
@@ -618,7 +607,6 @@ impl DatabaseBuilder {
             let (kf, keys, region) = create_key_file_with_region_keys(
                 passphrase,
                 file_id,
-                self.cipher,
                 self.kdf_algorithm,
                 m_cost,
                 t_cost,
@@ -629,7 +617,6 @@ impl DatabaseBuilder {
             let (kf, keys) = create_key_file(
                 passphrase,
                 file_id,
-                self.cipher,
                 self.kdf_algorithm,
                 m_cost,
                 t_cost,

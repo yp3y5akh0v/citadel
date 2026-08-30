@@ -20,7 +20,7 @@ I did not want encryption as a layer on top. In Citadel there is no code path th
 
 Citadel derives its keys in three steps:
 
-1. Your **passphrase** derives a master key with Argon2id (or PBKDF2 for FIPS).
+1. Your **passphrase** derives a master key with Argon2id (or PBKDF2 in the FIPS-oriented at-rest profile).
 2. The master key unwraps a **root key** with AES Key Wrap.
 3. The root key derives the **data** and **MAC** keys with HKDF.
 

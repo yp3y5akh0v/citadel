@@ -96,6 +96,7 @@ pub enum AuditDetail {
     Created {
         cipher: citadel_core::types::CipherId,
         kdf: citadel_core::types::KdfAlgorithm,
+        legacy_cipher_encoding: bool,
     },
     /// Where a backup, key export or compaction wrote to.
     Path(String),
@@ -121,9 +122,13 @@ impl AuditDetail {
                 }
             }
             AuditEventType::DatabaseCreated => match detail {
-                [c, k] => match (CipherId::from_u8(*c), KdfAlgorithm::from_u8(*k)) {
-                    (Some(cipher), Some(kdf)) => Self::Created { cipher, kdf },
-                    _ => raw(),
+                [c @ (0 | 1), k] => match KdfAlgorithm::from_u8(*k) {
+                    Some(kdf) => Self::Created {
+                        cipher: CipherId::Aes256Ctr,
+                        kdf,
+                        legacy_cipher_encoding: *c == 1,
+                    },
+                    None => raw(),
                 },
                 _ => raw(),
             },
@@ -154,7 +159,20 @@ impl std::fmt::Display for AuditDetail {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Empty => Ok(()),
-            Self::Created { cipher, kdf } => write!(f, "{}, {}", cipher.as_str(), kdf.as_str()),
+            Self::Created {
+                cipher,
+                kdf,
+                legacy_cipher_encoding: false,
+            } => write!(f, "{}, {}", cipher.as_str(), kdf.as_str()),
+            Self::Created {
+                kdf,
+                legacy_cipher_encoding: true,
+                ..
+            } => write!(
+                f,
+                "legacy ChaCha20 request recorded; effective AES-256-CTR, {}",
+                kdf.as_str()
+            ),
             Self::Path(p) => write!(f, "{p:?}"),
             Self::IntegrityErrors(0) => write!(f, "no errors"),
             Self::IntegrityErrors(1) => write!(f, "1 error"),

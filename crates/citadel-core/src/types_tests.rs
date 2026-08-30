@@ -39,8 +39,7 @@ fn page_flags() {
 #[test]
 fn cipher_id_roundtrip() {
     assert_eq!(CipherId::from_u8(0), Some(CipherId::Aes256Ctr));
-    assert_eq!(CipherId::from_u8(1), Some(CipherId::ChaCha20));
-    assert_eq!(CipherId::from_u8(2), None);
+    assert_eq!(CipherId::from_u8(1), None);
 }
 
 #[test]
@@ -62,7 +61,6 @@ fn cipher_id_labels_every_variant() {
         assert!(!c.as_str().is_empty(), "{c:?} has no label");
     }
     assert_eq!(CipherId::Aes256Ctr.as_str(), "AES-256-CTR");
-    assert_eq!(CipherId::ChaCha20.as_str(), "ChaCha20");
 }
 
 #[test]

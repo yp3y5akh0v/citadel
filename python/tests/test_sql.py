@@ -385,6 +385,12 @@ def test_connect_options_secure_delete_and_fips_kdf():
     assert db2.query("SELECT COUNT(*) FROM t").rows[0][0] == 1
 
 
+@pytest.mark.parametrize("cipher", ["aes256ctr", "chacha20"])
+def test_database_options_rejects_the_removed_cipher_selector(cipher):
+    with pytest.raises(TypeError, match="cipher"):
+        citadeldb.DatabaseOptions(cipher=cipher)
+
+
 def test_audit_log_verify_and_key_backup_restore():
     d = tempfile.mkdtemp()
     path = os.path.join(d, "a.cdl")

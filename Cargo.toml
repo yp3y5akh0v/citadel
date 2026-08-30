@@ -77,7 +77,6 @@ citadel-cli = { package = "citadeldb-cli", path = "citadel-cli", version = "2.0.
 
 aes = "0.8"
 ctr = "0.9"
-chacha20 = "0.9"
 hmac = "0.12"
 sha2 = "0.10"
 hkdf = "0.12"
