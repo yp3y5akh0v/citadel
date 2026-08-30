@@ -30,6 +30,10 @@ pub fn default_key_path(data_path: &Path) -> PathBuf {
 #[non_exhaustive]
 pub struct KeyFileInfo {
     pub cipher: CipherId,
+    /// The serialized file carries ID 1 from the removed selector; its pages
+    /// were nevertheless written with AES-256-CTR. Inspection does not verify
+    /// the key-file MAC; [`Database::key_file`](crate::Database::key_file) does.
+    pub legacy_cipher_encoding: bool,
     pub kdf: KdfAlgorithm,
     /// Argon2 memory cost in KiB, or the PBKDF2 iteration count.
     pub kdf_m_cost: u32,
@@ -45,7 +49,8 @@ pub struct KeyFileInfo {
 impl KeyFileInfo {
     pub(crate) fn from_key_file(kf: &citadel_crypto::key_manager::KeyFile) -> Self {
         Self {
-            cipher: kf.cipher_id,
+            cipher: kf.cipher_id(),
+            legacy_cipher_encoding: kf.has_legacy_cipher_encoding(),
             kdf: kf.kdf_algorithm,
             kdf_m_cost: kf.argon2_m_cost,
             kdf_t_cost: kf.argon2_t_cost,

@@ -1539,7 +1539,6 @@ impl Database {
             &rek,
             backup_passphrase,
             kf.file_id,
-            kf.cipher_id,
             kf.kdf_algorithm,
             kf.argon2_m_cost,
             kf.argon2_t_cost,
@@ -1579,13 +1578,12 @@ impl Database {
         new_db_passphrase: &[u8],
         db_path: &Path,
     ) -> Result<()> {
-        use citadel_core::{
-            FILE_HEADER_SIZE, HEADER_FLAG_SLOTS_V1, KEY_BACKUP_SIZE, KEY_FILE_MAGIC,
-            KEY_FILE_VERSION, MAC_SIZE, WRAPPED_KEY_SIZE,
-        };
+        use citadel_core::{FILE_HEADER_SIZE, HEADER_FLAG_SLOTS_V1, KEY_BACKUP_SIZE};
         use citadel_crypto::kdf::{derive_mk, generate_salt};
         use citadel_crypto::key_backup::restore_rek_from_backup;
-        use citadel_crypto::key_manager::{wrap_rek, KeyFile, KEY_FILE_FLAG_SLOTS_V1_REQUIRED};
+        use citadel_crypto::key_manager::{
+            create_key_file_from_wrapped_rek, wrap_rek, KEY_FILE_FLAG_SLOTS_V1_REQUIRED,
+        };
         use citadel_crypto::page_cipher::compute_dek_id;
         use citadel_io::file_manager::{FileHeader, SlotFormat};
 
@@ -1689,30 +1687,19 @@ impl Database {
             restored_flags |= citadel_crypto::key_manager::KEY_FILE_FLAG_AUDIT_V2_REQUIRED;
         }
 
-        let mut new_kf = KeyFile {
-            magic: KEY_FILE_MAGIC,
-            version: KEY_FILE_VERSION,
-            file_id: restored.file_id,
-            argon2_salt: new_salt,
-            argon2_m_cost: restored.kdf_param1,
-            argon2_t_cost: restored.kdf_param2,
-            argon2_p_cost: restored.kdf_param3,
-            cipher_id: restored.cipher_id,
-            kdf_algorithm: restored.kdf_algorithm,
-            flags: restored_flags,
-            wrapped_rek: new_wrapped,
-            current_epoch: restored.epoch,
-            prev_wrapped_rek: [0u8; WRAPPED_KEY_SIZE],
-            prev_epoch: 0,
-            rotation_active: false,
-            file_mac: [0u8; MAC_SIZE],
-        };
-        if new_kf.slots_v1_required() {
-            let auth_key = KeyFileAuthKey::from_database_mac_key(&restored.keys.mac_key);
-            new_kf.update_mac_with_auth_key(&auth_key);
-        } else {
-            new_kf.update_mac(&new_mk)?;
-        }
+        let new_kf = create_key_file_from_wrapped_rek(
+            restored.file_id,
+            new_salt,
+            restored.kdf_algorithm,
+            restored.kdf_param1,
+            restored.kdf_param2,
+            restored.kdf_param3,
+            restored_flags,
+            new_wrapped,
+            restored.epoch,
+            &new_mk,
+            &restored.keys.mac_key,
+        )?;
 
         let key_path = resolve_key_path_for(db_path);
         if durable::path_entry_exists(&key_path)? {
@@ -1874,11 +1861,18 @@ impl Database {
 
         if let Some(state) = key_file_state.as_mut() {
             let current = self.read_unchanged_key_file(state)?;
-            if !current.slots_v1_required() || (audit_v2_ready && !current.audit_v2_required()) {
+            if current.has_legacy_cipher_encoding()
+                || !current.slots_v1_required()
+                || (audit_v2_ready && !current.audit_v2_required())
+            {
                 let mut protected = current;
-                protected.require_v1_slots(&state.auth_key);
+                if !protected.slots_v1_required() {
+                    protected.require_v1_slots(&state.auth_key);
+                }
                 if audit_v2_ready {
                     protected.require_audit_v2(&state.auth_key);
+                } else {
+                    protected.update_mac_with_auth_key(&state.auth_key);
                 }
                 state.replace_trusted(
                     &self.key_path,
@@ -2295,7 +2289,6 @@ mod sql_cache_tests {
         let (current, keys) = citadel_crypto::key_manager::create_key_file(
             b"password",
             7,
-            citadel_core::types::CipherId::Aes256Ctr,
             citadel_core::types::KdfAlgorithm::Argon2id,
             64,
             1,

@@ -44,7 +44,7 @@ pub fn derive_mk_with_profile(
     )
 }
 
-/// Derive a Master Key using PBKDF2-HMAC-SHA256 (FIPS 140-3 approved).
+/// Derive a Master Key using PBKDF2-HMAC-SHA256.
 pub fn derive_mk_pbkdf2(
     passphrase: &[u8],
     salt: &[u8; ARGON2_SALT_SIZE],

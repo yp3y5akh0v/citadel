@@ -99,7 +99,6 @@ class DatabaseOptions:
         secure_delete: bool = ...,
         cache_size: int | None = ...,
         sync_mode: str | None = ...,
-        cipher: str | None = ...,
         kdf: str | None = ...,
         pbkdf2_iterations: int | None = ...,
         argon2_profile: str | None = ...,

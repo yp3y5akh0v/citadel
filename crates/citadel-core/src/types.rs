@@ -108,14 +108,12 @@ impl PageFlags {
 #[repr(u8)]
 pub enum CipherId {
     Aes256Ctr = 0,
-    ChaCha20 = 1,
 }
 
 impl CipherId {
     pub fn from_u8(v: u8) -> Option<Self> {
         match v {
             0 => Some(Self::Aes256Ctr),
-            1 => Some(Self::ChaCha20),
             _ => None,
         }
     }
@@ -124,7 +122,6 @@ impl CipherId {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Aes256Ctr => "AES-256-CTR",
-            Self::ChaCha20 => "ChaCha20",
         }
     }
 }

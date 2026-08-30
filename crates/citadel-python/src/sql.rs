@@ -3,8 +3,7 @@
 use std::sync::Arc;
 
 use citadel::{
-    Argon2Profile, CancelToken, CipherId, Database, DatabaseBuilder, IntegrityError, KdfAlgorithm,
-    SyncMode,
+    Argon2Profile, CancelToken, Database, DatabaseBuilder, IntegrityError, KdfAlgorithm, SyncMode,
 };
 use citadel_mem::MemoryEngine;
 use citadel_sql::{datetime, Connection, ExecutionResult, QueryResult, Value};
@@ -1146,16 +1145,6 @@ fn parse_sync_mode(s: &str) -> PyResult<SyncMode> {
     }
 }
 
-fn parse_cipher(s: &str) -> PyResult<CipherId> {
-    match s.to_ascii_lowercase().as_str() {
-        "aes256ctr" | "aes-256-ctr" => Ok(CipherId::Aes256Ctr),
-        "chacha20" => Ok(CipherId::ChaCha20),
-        other => Err(PyValueError::new_err(format!(
-            "unknown cipher '{other}' (aes256ctr|chacha20)"
-        ))),
-    }
-}
-
 fn parse_kdf(s: &str) -> PyResult<KdfAlgorithm> {
     match s.to_ascii_lowercase().as_str() {
         "argon2id" => Ok(KdfAlgorithm::Argon2id),
@@ -1184,7 +1173,6 @@ pub(crate) struct PyDatabaseOptions {
     secure_delete: bool,
     cache_size: Option<usize>,
     sync_mode: Option<SyncMode>,
-    cipher: Option<CipherId>,
     kdf: Option<KdfAlgorithm>,
     pbkdf2_iterations: Option<u32>,
     argon2_profile: Option<Argon2Profile>,
@@ -1192,17 +1180,16 @@ pub(crate) struct PyDatabaseOptions {
 
 #[pymethods]
 impl PyDatabaseOptions {
-    /// `secure_delete` zero-fills freed pages; `cipher`="aes256ctr"|"chacha20";
-    /// `kdf`="argon2id"|"pbkdf2" (the FIPS path) with `pbkdf2_iterations`;
+    /// `secure_delete` zero-fills freed pages; `kdf`="argon2id"|"pbkdf2"
+    /// (the FIPS-oriented at-rest profile) with `pbkdf2_iterations`;
     /// `argon2_profile`="iot"|"desktop"|"server"; `cache_size`=buffer-pool pages;
     /// `sync_mode`="full"|"normal"|"off".
     #[new]
-    #[pyo3(signature = (*, secure_delete=false, cache_size=None, sync_mode=None, cipher=None, kdf=None, pbkdf2_iterations=None, argon2_profile=None))]
+    #[pyo3(signature = (*, secure_delete=false, cache_size=None, sync_mode=None, kdf=None, pbkdf2_iterations=None, argon2_profile=None))]
     fn new(
         secure_delete: bool,
         cache_size: Option<usize>,
         sync_mode: Option<&str>,
-        cipher: Option<&str>,
         kdf: Option<&str>,
         pbkdf2_iterations: Option<u32>,
         argon2_profile: Option<&str>,
@@ -1211,7 +1198,6 @@ impl PyDatabaseOptions {
             secure_delete,
             cache_size,
             sync_mode: sync_mode.map(parse_sync_mode).transpose()?,
-            cipher: cipher.map(parse_cipher).transpose()?,
             kdf: kdf.map(parse_kdf).transpose()?,
             pbkdf2_iterations,
             argon2_profile: argon2_profile.map(parse_argon2_profile).transpose()?,
@@ -1254,9 +1240,6 @@ fn connect_detached(
             }
             if let Some(s) = o.sync_mode {
                 b = b.sync_mode(s);
-            }
-            if let Some(c) = o.cipher {
-                b = b.cipher(c);
             }
             if let Some(k) = o.kdf {
                 b = b.kdf_algorithm(k);

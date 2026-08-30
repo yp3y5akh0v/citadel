@@ -262,7 +262,6 @@ fn pbkdf2_backup_and_integrity() {
 
 #[cfg(feature = "fips")]
 mod fips_tests {
-    use citadel::core::types::CipherId;
     use citadel::{DatabaseBuilder, KdfAlgorithm};
 
     #[test]
@@ -286,20 +285,6 @@ mod fips_tests {
             .cache_size(64)
             .create();
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn fips_rejects_chacha20() {
-        let dir = tempfile::tempdir().unwrap();
-        let result = DatabaseBuilder::new(dir.path().join("fips_chacha.citadel"))
-            .passphrase(b"test")
-            .kdf_algorithm(KdfAlgorithm::Pbkdf2HmacSha256)
-            .pbkdf2_iterations(600_000)
-            .cipher(CipherId::ChaCha20)
-            .cache_size(64)
-            .create();
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("FIPS"), "error should mention FIPS: {err}");
     }
 
     #[test]

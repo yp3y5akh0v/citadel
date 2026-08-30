@@ -196,8 +196,22 @@ mod audit {
             AuditDetail::Created {
                 cipher: CipherId::Aes256Ctr,
                 kdf: KdfAlgorithm::Argon2id,
+                legacy_cipher_encoding: false,
             }
         );
+        let legacy = AuditDetail::decode(
+            AuditEventType::DatabaseCreated,
+            &[1, KdfAlgorithm::Argon2id as u8],
+        );
+        assert_eq!(
+            legacy,
+            AuditDetail::Created {
+                cipher: CipherId::Aes256Ctr,
+                kdf: KdfAlgorithm::Argon2id,
+                legacy_cipher_encoding: true,
+            }
+        );
+        assert!(legacy.to_string().contains("effective AES-256-CTR"));
 
         let path = "/tmp/backup.citadel";
         let mut encoded = (path.len() as u16).to_le_bytes().to_vec();

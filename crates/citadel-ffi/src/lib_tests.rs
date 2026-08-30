@@ -1006,7 +1006,86 @@ fn config_defaults() {
     let cfg = CitadelConfig::default();
     assert_eq!(cfg.cache_size, 256);
     assert_eq!(cfg.argon2_profile, 1);
-    assert_eq!(cfg.cipher_id, 0);
+    assert!(cfg._reserved.iter().all(|byte| *byte == 0));
+}
+
+#[test]
+fn config_layout_preserves_the_c_abi() {
+    assert_eq!(std::mem::size_of::<CitadelConfig>(), 32);
+    assert_eq!(std::mem::align_of::<CitadelConfig>(), 4);
+    assert_eq!(std::mem::offset_of!(CitadelConfig, cache_size), 0);
+    assert_eq!(std::mem::offset_of!(CitadelConfig, argon2_profile), 4);
+    assert_eq!(std::mem::offset_of!(CitadelConfig, _reserved), 5);
+}
+
+#[test]
+fn config_rejects_nonzero_reserved_bytes() {
+    for reserved_index in [0, 26] {
+        let (dir, cpath) = temp_path();
+        let path = dir.path().join("test.citadel");
+        let mut cfg = CitadelConfig::default();
+        cfg._reserved[reserved_index] = 1;
+        let mut db = ptr::null_mut();
+        let result = citadel_create(
+            cpath.as_ptr(),
+            b"secret".as_ptr(),
+            b"secret".len(),
+            &cfg,
+            &mut db,
+        );
+
+        assert_eq!(result, CitadelError::InvalidArgument);
+        assert!(db.is_null());
+        assert!(!path.exists());
+    }
+}
+
+#[test]
+fn open_rejects_the_removed_cipher_selector() {
+    let (_dir, cpath) = temp_path();
+    let passphrase = b"secret";
+    let mut db = ptr::null_mut();
+    assert_eq!(
+        citadel_create(
+            cpath.as_ptr(),
+            passphrase.as_ptr(),
+            passphrase.len(),
+            ptr::null(),
+            &mut db,
+        ),
+        CitadelError::Ok
+    );
+    citadel_close(db);
+
+    for reserved_index in [0, 26] {
+        let mut cfg = CitadelConfig::default();
+        cfg._reserved[reserved_index] = 1;
+        let mut reopened = ptr::null_mut();
+        assert_eq!(
+            citadel_open(
+                cpath.as_ptr(),
+                passphrase.as_ptr(),
+                passphrase.len(),
+                &cfg,
+                &mut reopened,
+            ),
+            CitadelError::InvalidArgument
+        );
+        assert!(reopened.is_null());
+    }
+
+    let mut reopened = ptr::null_mut();
+    assert_eq!(
+        citadel_open(
+            cpath.as_ptr(),
+            passphrase.as_ptr(),
+            passphrase.len(),
+            ptr::null(),
+            &mut reopened,
+        ),
+        CitadelError::Ok
+    );
+    citadel_close(reopened);
 }
 
 #[test]

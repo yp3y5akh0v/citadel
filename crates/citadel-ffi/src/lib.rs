@@ -45,13 +45,13 @@ pub enum CitadelError {
     InternalPanic = -99,
 }
 
-/// Opaque database configuration.
+/// Database configuration. Zero-initialize this structure before setting
+/// fields; every reserved byte must remain zero.
 #[repr(C)]
 pub struct CitadelConfig {
     pub cache_size: u32,
     pub argon2_profile: u8,
-    pub cipher_id: u8,
-    _reserved: [u8; 26],
+    _reserved: [u8; 27],
 }
 
 impl Default for CitadelConfig {
@@ -59,10 +59,17 @@ impl Default for CitadelConfig {
         Self {
             cache_size: 256,
             argon2_profile: 1,
-            cipher_id: 0,
-            _reserved: [0; 26],
+            _reserved: [0; 27],
         }
     }
+}
+
+fn validate_config(config: &CitadelConfig) -> Result<(), CitadelError> {
+    if config._reserved.iter().any(|byte| *byte != 0) {
+        set_last_error("reserved configuration bytes must be zero");
+        return Err(CitadelError::InvalidArgument);
+    }
+    Ok(())
 }
 
 /// Opaque database handle.
@@ -421,6 +428,9 @@ pub extern "C" fn citadel_create(
 
         if !config.is_null() {
             let cfg = unsafe { &*config };
+            if let Err(error) = validate_config(cfg) {
+                return error;
+            }
             if cfg.cache_size > 0 {
                 builder = builder.cache_size(cfg.cache_size as usize);
             }
@@ -428,10 +438,6 @@ pub extern "C" fn citadel_create(
                 0 => builder.argon2_profile(citadel::Argon2Profile::Iot),
                 2 => builder.argon2_profile(citadel::Argon2Profile::Server),
                 _ => builder.argon2_profile(citadel::Argon2Profile::Desktop),
-            };
-            builder = match cfg.cipher_id {
-                1 => builder.cipher(citadel::CipherId::ChaCha20),
-                _ => builder.cipher(citadel::CipherId::Aes256Ctr),
             };
         }
 
@@ -484,6 +490,9 @@ pub extern "C" fn citadel_open(
 
         if !config.is_null() {
             let cfg = unsafe { &*config };
+            if let Err(error) = validate_config(cfg) {
+                return error;
+            }
             if cfg.cache_size > 0 {
                 builder = builder.cache_size(cfg.cache_size as usize);
             }

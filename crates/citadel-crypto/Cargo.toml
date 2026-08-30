@@ -29,10 +29,6 @@ zeroize = { workspace = true }
 rand = { workspace = true }
 cipher = { workspace = true }
 
-[dependencies.chacha20]
-workspace = true
-optional = true
-
 [dependencies.pbkdf2]
 workspace = true
 
@@ -40,9 +36,7 @@ workspace = true
 criterion = { workspace = true }
 
 [features]
-default = ["aes-cipher"]
-aes-cipher = []
-chacha = ["dep:chacha20"]
+default = []
 fips = []
 
 [[bench]]

@@ -1,5 +1,7 @@
 """Guard that _core.pyi stays in sync with the compiled module."""
 
+import ast
+import inspect
 import re
 from pathlib import Path
 
@@ -38,6 +40,21 @@ def test_public_types_are_documented():
     }
     undocumented = runtime - declared
     assert not undocumented, f"_core types missing from the stub: {sorted(undocumented)}"
+
+
+def test_database_options_signature_matches_stub():
+    tree = ast.parse(stub_text())
+    options = next(
+        node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "DatabaseOptions"
+    )
+    initializer = next(
+        node
+        for node in options.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "__init__"
+    )
+    stub_parameters = [argument.arg for argument in initializer.args.kwonlyargs]
+    runtime_parameters = list(inspect.signature(_core.DatabaseOptions).parameters)
+    assert runtime_parameters == stub_parameters
 
 
 def test_stub_methods_cover_runtime():

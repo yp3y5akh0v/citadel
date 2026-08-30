@@ -163,13 +163,13 @@ typedef struct CitadelSqlResult CitadelSqlResult;
 typedef struct CitadelWriteTxn CitadelWriteTxn;
 
 /**
- * Opaque database configuration.
+ * Database configuration. Zero-initialize this structure before setting
+ * fields; every reserved byte must remain zero.
  */
 typedef struct CitadelConfig {
     uint32_t cache_size;
     uint8_t argon2_profile;
-    uint8_t cipher_id;
-    uint8_t _reserved[26];
+    uint8_t _reserved[27];
 } CitadelConfig;
 
 #ifdef __cplusplus

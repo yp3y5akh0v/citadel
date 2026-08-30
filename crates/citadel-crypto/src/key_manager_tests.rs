@@ -1,5 +1,11 @@
 use super::*;
 
+fn mark_as_id_one_with_current_auth(key_file: &mut KeyFile, keys: &DerivedKeys) {
+    key_file.encoded_cipher_id = LEGACY_AES_CIPHER_ID;
+    let auth_key = KeyFileAuthKey::from_database_mac_key(&keys.mac_key);
+    key_file.file_mac = compute_file_mac(&auth_key.0, &key_file.serialize()[..140]);
+}
+
 #[test]
 fn key_file_data_mac_info_has_stable_known_answer() {
     let auth_key = KeyFileAuthKey::from_database_mac_key(&[0x42; KEY_SIZE]);
@@ -15,7 +21,7 @@ fn key_file_data_mac_info_has_stable_known_answer() {
 }
 
 #[test]
-fn key_file_policy_layout_has_a_stable_known_answer() {
+fn legacy_cipher_marker_and_canonical_rewrite_have_stable_known_answers() {
     let mut key_file = KeyFile {
         magic: KEY_FILE_MAGIC,
         version: KEY_FILE_VERSION,
@@ -24,7 +30,7 @@ fn key_file_policy_layout_has_a_stable_known_answer() {
         argon2_m_cost: 0x1112_1314,
         argon2_t_cost: 0x2122_2324,
         argon2_p_cost: 0x3132_3334,
-        cipher_id: CipherId::ChaCha20,
+        encoded_cipher_id: LEGACY_AES_CIPHER_ID,
         kdf_algorithm: KdfAlgorithm::Pbkdf2HmacSha256,
         flags: KEY_FILE_FLAG_SLOTS_V1_REQUIRED | KEY_FILE_FLAG_AUDIT_V2_REQUIRED,
         wrapped_rek: [0x22; WRAPPED_KEY_SIZE],
@@ -46,29 +52,61 @@ fn key_file_policy_layout_has_a_stable_known_answer() {
     );
 
     let auth_key = KeyFileAuthKey::from_database_mac_key(&[0x42; KEY_SIZE]);
-    key_file.update_mac_with_auth_key(&auth_key);
+    let legacy_mac = compute_file_mac(&auth_key.0, &key_file.serialize()[..140]);
     assert_eq!(
-        key_file.file_mac,
+        legacy_mac,
         [
             0x7c, 0x97, 0x66, 0x65, 0x66, 0x51, 0x25, 0xcf, 0xa7, 0xfd, 0x50, 0xe7, 0xfb, 0xdf,
             0x5f, 0x56, 0xc7, 0xfe, 0x68, 0x1a, 0xb0, 0x6c, 0x4f, 0x97, 0x7c, 0x04, 0x96, 0xb0,
             0x5c, 0xf3, 0xe3, 0x5d,
         ]
     );
+    key_file.file_mac = legacy_mac;
+    key_file.verify_mac_with_auth_key(&auth_key).unwrap();
+    assert!(key_file.has_legacy_cipher_encoding());
+
+    key_file.update_mac_with_auth_key(&auth_key);
+    assert_eq!(key_file.cipher_id(), CipherId::Aes256Ctr);
+    assert_eq!(key_file.serialize()[44], CipherId::Aes256Ctr as u8);
+    assert_eq!(
+        key_file.file_mac,
+        [
+            0x33, 0x3c, 0xd1, 0xa3, 0x89, 0x30, 0xf0, 0x16, 0x88, 0x59, 0x97, 0xe6, 0x9d, 0xf7,
+            0x56, 0xe8, 0x3a, 0xb7, 0xb3, 0x45, 0x78, 0xf9, 0x75, 0x46, 0x66, 0x8b, 0x8d, 0x8a,
+            0x30, 0xeb, 0x1a, 0x48,
+        ]
+    );
+}
+
+#[test]
+fn unknown_cipher_id_is_rejected() {
+    let mut buf = [0u8; KEY_FILE_SIZE];
+    buf[0..4].copy_from_slice(&KEY_FILE_MAGIC.to_le_bytes());
+    buf[4..8].copy_from_slice(&KEY_FILE_VERSION.to_le_bytes());
+    buf[44] = 2;
+
+    assert!(matches!(
+        KeyFile::deserialize(&buf),
+        Err(citadel_core::Error::UnsupportedCipher(2))
+    ));
+}
+
+#[test]
+fn changing_only_the_cipher_marker_fails_authentication() {
+    let passphrase = b"authenticated-marker";
+    let (key_file, _) = create_key_file(passphrase, 42, KdfAlgorithm::Argon2id, 64, 1, 1).unwrap();
+    let mut image = key_file.serialize();
+    image[44] = LEGACY_AES_CIPHER_ID;
+
+    assert!(matches!(
+        open_key_file(&image, passphrase, 42),
+        Err(citadel_core::Error::KeyFileIntegrity)
+    ));
 }
 
 #[test]
 fn noncanonical_rotation_flag_is_rejected_before_mac_verification() {
-    let (key_file, _) = create_key_file(
-        b"password",
-        42,
-        CipherId::Aes256Ctr,
-        KdfAlgorithm::Argon2id,
-        64,
-        1,
-        1,
-    )
-    .unwrap();
+    let (key_file, _) = create_key_file(b"password", 42, KdfAlgorithm::Argon2id, 64, 1, 1).unwrap();
     let mut serialized = key_file.serialize();
     serialized[136] = 2;
 
@@ -80,16 +118,7 @@ fn noncanonical_rotation_flag_is_rejected_before_mac_verification() {
 
 #[test]
 fn nonzero_key_file_padding_is_rejected_before_mac_verification() {
-    let (key_file, _) = create_key_file(
-        b"password",
-        42,
-        CipherId::Aes256Ctr,
-        KdfAlgorithm::Argon2id,
-        64,
-        1,
-        1,
-    )
-    .unwrap();
+    let (key_file, _) = create_key_file(b"password", 42, KdfAlgorithm::Argon2id, 64, 1, 1).unwrap();
     let mut serialized = key_file.serialize();
     serialized[137] = 1;
 
@@ -104,7 +133,6 @@ fn key_file_serialize_deserialize_roundtrip() {
     let (kf, _keys) = create_key_file(
         b"test-password",
         0x1234567890ABCDEF,
-        CipherId::Aes256Ctr,
         KdfAlgorithm::Argon2id,
         64,
         1,
@@ -119,7 +147,8 @@ fn key_file_serialize_deserialize_roundtrip() {
     assert_eq!(deserialized.magic, KEY_FILE_MAGIC);
     assert_eq!(deserialized.version, KEY_FILE_VERSION);
     assert_eq!(deserialized.file_id, 0x1234567890ABCDEF);
-    assert_eq!(deserialized.cipher_id, CipherId::Aes256Ctr);
+    assert_eq!(deserialized.cipher_id(), CipherId::Aes256Ctr);
+    assert_eq!(serialized[44], CipherId::Aes256Ctr as u8);
     assert_eq!(deserialized.kdf_algorithm, KdfAlgorithm::Argon2id);
     assert!(deserialized.slots_v1_required());
     assert!(deserialized.audit_v2_required());
@@ -132,7 +161,6 @@ fn key_file_serialize_deserialize_pbkdf2() {
     let (kf, _keys) = create_key_file(
         b"test-password",
         0xDEAD,
-        CipherId::Aes256Ctr,
         KdfAlgorithm::Pbkdf2HmacSha256,
         600_000,
         0,
@@ -150,16 +178,7 @@ fn key_file_serialize_deserialize_pbkdf2() {
 
 #[test]
 fn backward_compat_zero_byte_is_argon2id() {
-    let (kf, _) = create_key_file(
-        b"test",
-        42,
-        CipherId::Aes256Ctr,
-        KdfAlgorithm::Argon2id,
-        64,
-        1,
-        1,
-    )
-    .unwrap();
+    let (kf, _) = create_key_file(b"test", 42, KdfAlgorithm::Argon2id, 64, 1, 1).unwrap();
 
     let serialized = kf.serialize();
     assert_eq!(serialized[45], 0x00); // Argon2id = 0
@@ -169,16 +188,8 @@ fn backward_compat_zero_byte_is_argon2id() {
 
 #[test]
 fn key_file_mac_verification() {
-    let (kf, _keys) = create_key_file(
-        b"test-password",
-        42,
-        CipherId::Aes256Ctr,
-        KdfAlgorithm::Argon2id,
-        64,
-        1,
-        1,
-    )
-    .unwrap();
+    let (kf, _keys) =
+        create_key_file(b"test-password", 42, KdfAlgorithm::Argon2id, 64, 1, 1).unwrap();
 
     let mk = crate::kdf::derive_mk_argon2id(
         b"test-password",
@@ -232,22 +243,52 @@ fn open_key_file_correct_password() {
     let passphrase = b"correct-horse-battery-staple";
     let file_id = 0xDEAD_BEEF;
 
-    let (kf, keys1) = create_key_file(
-        passphrase,
-        file_id,
-        CipherId::Aes256Ctr,
-        KdfAlgorithm::Argon2id,
-        64,
-        1,
-        1,
-    )
-    .unwrap();
+    let (kf, keys1) =
+        create_key_file(passphrase, file_id, KdfAlgorithm::Argon2id, 64, 1, 1).unwrap();
 
     let serialized = kf.serialize();
     let (_kf2, keys2) = open_key_file(&serialized, passphrase, file_id).unwrap();
 
     assert_eq!(keys1.dek, keys2.dek);
     assert_eq!(keys1.mac_key, keys2.mac_key);
+}
+
+#[test]
+fn released_id_one_key_file_opens_as_aes() {
+    let passphrase = b"released-id-one";
+    let file_id = 0xC1A0;
+    let (mut key_file, expected) =
+        create_key_file(passphrase, file_id, KdfAlgorithm::Argon2id, 64, 1, 1).unwrap();
+    let master_key = derive_mk(
+        key_file.kdf_algorithm,
+        passphrase,
+        &key_file.argon2_salt,
+        key_file.argon2_m_cost,
+        key_file.argon2_t_cost,
+        key_file.argon2_p_cost,
+    )
+    .unwrap();
+    key_file.flags = 0;
+    key_file.encoded_cipher_id = LEGACY_AES_CIPHER_ID;
+    key_file.file_mac = compute_file_mac(
+        &derive_keyfile_mac_key(&master_key),
+        &key_file.serialize()[..140],
+    );
+    let released_image = key_file.serialize();
+
+    let (mut opened, actual) = open_key_file(&released_image, passphrase, file_id).unwrap();
+
+    assert_eq!(released_image[44], LEGACY_AES_CIPHER_ID);
+    assert_eq!(opened.serialize(), released_image);
+    assert!(!opened.slots_v1_required());
+    assert!(opened.has_legacy_cipher_encoding());
+    assert_eq!(opened.cipher_id(), CipherId::Aes256Ctr);
+    assert_eq!(actual.dek, expected.dek);
+    assert_eq!(actual.mac_key, expected.mac_key);
+
+    opened.update_mac(&master_key).unwrap();
+    assert_eq!(opened.serialize()[44], CipherId::Aes256Ctr as u8);
+    opened.verify_mac(&master_key).unwrap();
 }
 
 #[test]
@@ -258,7 +299,6 @@ fn open_key_file_pbkdf2() {
     let (kf, keys1) = create_key_file(
         passphrase,
         file_id,
-        CipherId::Aes256Ctr,
         KdfAlgorithm::Pbkdf2HmacSha256,
         600_000,
         0,
@@ -275,16 +315,8 @@ fn open_key_file_pbkdf2() {
 
 #[test]
 fn open_key_file_wrong_password() {
-    let (kf, _) = create_key_file(
-        b"correct-password",
-        42,
-        CipherId::Aes256Ctr,
-        KdfAlgorithm::Argon2id,
-        64,
-        1,
-        1,
-    )
-    .unwrap();
+    let (kf, _) =
+        create_key_file(b"correct-password", 42, KdfAlgorithm::Argon2id, 64, 1, 1).unwrap();
 
     let serialized = kf.serialize();
     let result = open_key_file(&serialized, b"wrong-password", 42);
@@ -294,16 +326,8 @@ fn open_key_file_wrong_password() {
 #[test]
 fn released_zero_flag_key_file_still_opens() {
     let passphrase = b"legacy-password";
-    let (mut kf, expected) = create_key_file(
-        passphrase,
-        42,
-        CipherId::Aes256Ctr,
-        KdfAlgorithm::Argon2id,
-        64,
-        1,
-        1,
-    )
-    .unwrap();
+    let (mut kf, expected) =
+        create_key_file(passphrase, 42, KdfAlgorithm::Argon2id, 64, 1, 1).unwrap();
     let mk = crate::kdf::derive_mk_argon2id(
         passphrase,
         &kf.argon2_salt,
@@ -326,16 +350,7 @@ fn released_zero_flag_key_file_still_opens() {
 
 #[test]
 fn clearing_authenticated_v1_requirement_is_detected() {
-    let (kf, _) = create_key_file(
-        b"password",
-        42,
-        CipherId::Aes256Ctr,
-        KdfAlgorithm::Argon2id,
-        64,
-        1,
-        1,
-    )
-    .unwrap();
+    let (kf, _) = create_key_file(b"password", 42, KdfAlgorithm::Argon2id, 64, 1, 1).unwrap();
     let mut serialized = kf.serialize();
     serialized[46..48].copy_from_slice(&0u16.to_le_bytes());
 
@@ -345,37 +360,21 @@ fn clearing_authenticated_v1_requirement_is_detected() {
 
 #[test]
 fn flagged_key_file_mac_update_rejects_a_wrong_master_key_without_mutation() {
-    let (mut key_file, _) = create_key_file(
-        b"password",
-        42,
-        CipherId::Aes256Ctr,
-        KdfAlgorithm::Argon2id,
-        64,
-        1,
-        1,
-    )
-    .unwrap();
-    let before = key_file.file_mac;
+    let (mut key_file, keys) =
+        create_key_file(b"password", 42, KdfAlgorithm::Argon2id, 64, 1, 1).unwrap();
+    mark_as_id_one_with_current_auth(&mut key_file, &keys);
+    let before = key_file.serialize();
 
     assert!(matches!(
         key_file.update_mac(&[0x42; KEY_SIZE]),
         Err(citadel_core::Error::KeyFileIntegrity)
     ));
-    assert_eq!(key_file.file_mac, before);
+    assert_eq!(key_file.serialize(), before);
 }
 
 #[test]
 fn flagged_key_file_verification_reports_a_wrong_passphrase() {
-    let (key_file, _) = create_key_file(
-        b"password",
-        42,
-        CipherId::Aes256Ctr,
-        KdfAlgorithm::Argon2id,
-        64,
-        1,
-        1,
-    )
-    .unwrap();
+    let (key_file, _) = create_key_file(b"password", 42, KdfAlgorithm::Argon2id, 64, 1, 1).unwrap();
 
     assert!(matches!(
         key_file.verify_mac(&[0x42; KEY_SIZE]),
@@ -386,16 +385,7 @@ fn flagged_key_file_verification_reports_a_wrong_passphrase() {
 #[test]
 fn setting_authenticated_v1_requirement_on_a_legacy_mac_is_detected() {
     let passphrase = b"password";
-    let (mut kf, _) = create_key_file(
-        passphrase,
-        42,
-        CipherId::Aes256Ctr,
-        KdfAlgorithm::Argon2id,
-        64,
-        1,
-        1,
-    )
-    .unwrap();
+    let (mut kf, _) = create_key_file(passphrase, 42, KdfAlgorithm::Argon2id, 64, 1, 1).unwrap();
     let mk = crate::kdf::derive_mk_argon2id(
         passphrase,
         &kf.argon2_salt,
@@ -415,16 +405,7 @@ fn setting_authenticated_v1_requirement_on_a_legacy_mac_is_detected() {
 
 #[test]
 fn unknown_key_file_policy_flags_are_rejected() {
-    let (kf, _) = create_key_file(
-        b"password",
-        42,
-        CipherId::Aes256Ctr,
-        KdfAlgorithm::Argon2id,
-        64,
-        1,
-        1,
-    )
-    .unwrap();
+    let (kf, _) = create_key_file(b"password", 42, KdfAlgorithm::Argon2id, 64, 1, 1).unwrap();
     let mut serialized = kf.serialize();
     serialized[46..48].copy_from_slice(&0x0040u16.to_le_bytes());
 
@@ -436,16 +417,7 @@ fn unknown_key_file_policy_flags_are_rejected() {
 
 #[test]
 fn audit_v2_requirement_without_protected_slots_is_rejected() {
-    let (kf, _) = create_key_file(
-        b"password",
-        42,
-        CipherId::Aes256Ctr,
-        KdfAlgorithm::Argon2id,
-        64,
-        1,
-        1,
-    )
-    .unwrap();
+    let (kf, _) = create_key_file(b"password", 42, KdfAlgorithm::Argon2id, 64, 1, 1).unwrap();
     let mut serialized = kf.serialize();
     serialized[46..48].copy_from_slice(&KEY_FILE_FLAG_AUDIT_V2_REQUIRED.to_le_bytes());
 
@@ -457,16 +429,7 @@ fn audit_v2_requirement_without_protected_slots_is_rejected() {
 
 #[test]
 fn open_key_file_wrong_file_id() {
-    let (kf, _) = create_key_file(
-        b"password",
-        42,
-        CipherId::Aes256Ctr,
-        KdfAlgorithm::Argon2id,
-        64,
-        1,
-        1,
-    )
-    .unwrap();
+    let (kf, _) = create_key_file(b"password", 42, KdfAlgorithm::Argon2id, 64, 1, 1).unwrap();
 
     let serialized = kf.serialize();
     let result = open_key_file(&serialized, b"password", 99);
@@ -486,16 +449,7 @@ fn invalid_magic_rejected() {
 
 #[test]
 fn tampered_key_file_detected() {
-    let (kf, _) = create_key_file(
-        b"password",
-        42,
-        CipherId::Aes256Ctr,
-        KdfAlgorithm::Argon2id,
-        64,
-        1,
-        1,
-    )
-    .unwrap();
+    let (kf, _) = create_key_file(b"password", 42, KdfAlgorithm::Argon2id, 64, 1, 1).unwrap();
 
     let mut serialized = kf.serialize();
     serialized[50] ^= 0x01;
@@ -506,16 +460,7 @@ fn tampered_key_file_detected() {
 
 #[test]
 fn invalid_kdf_algorithm_rejected() {
-    let (kf, _) = create_key_file(
-        b"password",
-        42,
-        CipherId::Aes256Ctr,
-        KdfAlgorithm::Argon2id,
-        64,
-        1,
-        1,
-    )
-    .unwrap();
+    let (kf, _) = create_key_file(b"password", 42, KdfAlgorithm::Argon2id, 64, 1, 1).unwrap();
 
     let mut serialized = kf.serialize();
     serialized[45] = 0xFF; // Invalid KDF algorithm
@@ -531,21 +476,12 @@ fn pbkdf2_different_keys_from_argon2id() {
     let passphrase = b"same-password";
     let file_id = 42;
 
-    let (_, keys_argon2) = create_key_file(
-        passphrase,
-        file_id,
-        CipherId::Aes256Ctr,
-        KdfAlgorithm::Argon2id,
-        64,
-        1,
-        1,
-    )
-    .unwrap();
+    let (_, keys_argon2) =
+        create_key_file(passphrase, file_id, KdfAlgorithm::Argon2id, 64, 1, 1).unwrap();
 
     let (_, keys_pbkdf2) = create_key_file(
         passphrase,
         file_id,
-        CipherId::Aes256Ctr,
         KdfAlgorithm::Pbkdf2HmacSha256,
         600_000,
         0,

@@ -34,6 +34,9 @@ pub const KEY_FILE_FLAG_AUDIT_V2_REQUIRED: u16 = 0x0002;
 pub(crate) const KEY_FILE_KNOWN_FLAGS: u16 =
     KEY_FILE_FLAG_SLOTS_V1_REQUIRED | KEY_FILE_FLAG_AUDIT_V2_REQUIRED;
 const KEY_FILE_DATA_MAC_INFO: &[u8] = b"citadel-keyfile-data-mac-v1";
+// Released selectors recorded ID 1 after a ChaCha20 request, but the storage
+// implementation still encrypted every page and blob with AES-256-CTR.
+const LEGACY_AES_CIPHER_ID: u8 = 1;
 
 pub(crate) fn key_file_flags_valid(flags: u16) -> bool {
     flags & !KEY_FILE_KNOWN_FLAGS == 0
@@ -75,7 +78,7 @@ pub struct KeyFile {
     pub argon2_m_cost: u32,
     pub argon2_t_cost: u32,
     pub argon2_p_cost: u32,
-    pub cipher_id: CipherId,
+    encoded_cipher_id: u8,
     pub kdf_algorithm: KdfAlgorithm,
     /// Authenticated format requirements; zero for released legacy key files.
     pub flags: u16,
@@ -98,7 +101,7 @@ impl KeyFile {
         buf[32..36].copy_from_slice(&self.argon2_m_cost.to_le_bytes());
         buf[36..40].copy_from_slice(&self.argon2_t_cost.to_le_bytes());
         buf[40..44].copy_from_slice(&self.argon2_p_cost.to_le_bytes());
-        buf[44] = self.cipher_id as u8;
+        buf[44] = self.encoded_cipher_id;
         buf[45] = self.kdf_algorithm as u8;
         buf[46..48].copy_from_slice(&self.flags.to_le_bytes());
         buf[48..88].copy_from_slice(&self.wrapped_rek);
@@ -123,8 +126,10 @@ impl KeyFile {
             return Err(citadel_core::Error::UnsupportedVersion(version));
         }
 
-        let cipher_id =
-            CipherId::from_u8(buf[44]).ok_or(citadel_core::Error::UnsupportedCipher(buf[44]))?;
+        let encoded_cipher_id = match buf[44] {
+            0 | LEGACY_AES_CIPHER_ID => buf[44],
+            value => return Err(citadel_core::Error::UnsupportedCipher(value)),
+        };
 
         // Byte 45: KDF algorithm. 0x00 = Argon2id (backward compatible with
         // existing key files where this byte was reserved/zero).
@@ -152,7 +157,7 @@ impl KeyFile {
             argon2_m_cost: u32::from_le_bytes(buf[32..36].try_into().unwrap()),
             argon2_t_cost: u32::from_le_bytes(buf[36..40].try_into().unwrap()),
             argon2_p_cost: u32::from_le_bytes(buf[40..44].try_into().unwrap()),
-            cipher_id,
+            encoded_cipher_id,
             kdf_algorithm,
             flags,
             wrapped_rek: buf[48..88].try_into().unwrap(),
@@ -186,6 +191,9 @@ impl KeyFile {
     }
 
     /// Recompute and set the file MAC.
+    ///
+    /// The caller must authenticate the current image before invoking this
+    /// mutator; it does not verify the existing MAC.
     pub fn update_mac(&mut self, mk: &[u8; KEY_SIZE]) -> citadel_core::Result<()> {
         if self.slots_v1_required() {
             let rek = unwrap_rek(mk, &self.wrapped_rek)
@@ -194,6 +202,7 @@ impl KeyFile {
             let auth_key = KeyFileAuthKey::from_database_mac_key(&keys.mac_key);
             self.update_mac_with_auth_key(&auth_key);
         } else {
+            self.encoded_cipher_id = CipherId::Aes256Ctr as u8;
             self.update_mac_with_key(&derive_keyfile_mac_key(mk));
         }
         Ok(())
@@ -216,6 +225,17 @@ impl KeyFile {
         self.flags & KEY_FILE_FLAG_AUDIT_V2_REQUIRED != 0
     }
 
+    /// Whether the serialized file still carries the released ID-1 marker for
+    /// data that was always encrypted with AES-256-CTR.
+    pub fn has_legacy_cipher_encoding(&self) -> bool {
+        self.encoded_cipher_id == LEGACY_AES_CIPHER_ID
+    }
+
+    /// The cipher that actually protects this key file's database.
+    pub fn cipher_id(&self) -> CipherId {
+        CipherId::Aes256Ctr
+    }
+
     /// Verify a flagged key file with the capability retained by an open database.
     pub fn verify_mac_with_auth_key(&self, auth_key: &KeyFileAuthKey) -> citadel_core::Result<()> {
         self.verify_mac_with_key(&auth_key.0)
@@ -236,7 +256,9 @@ impl KeyFile {
     }
 
     /// Re-authenticate flagged metadata after another key-file field changes.
+    /// The caller must already have authenticated the current image.
     pub fn update_mac_with_auth_key(&mut self, auth_key: &KeyFileAuthKey) {
+        self.encoded_cipher_id = CipherId::Aes256Ctr as u8;
         self.update_mac_with_key(&auth_key.0);
     }
 }
@@ -282,7 +304,6 @@ pub fn unwrap_rek(
 pub fn create_key_file(
     passphrase: &[u8],
     file_id: u64,
-    cipher_id: CipherId,
     kdf_algorithm: KdfAlgorithm,
     m_cost: u32,
     t_cost: u32,
@@ -291,7 +312,6 @@ pub fn create_key_file(
     let (kf, keys, _region) = create_key_file_with_region_keys(
         passphrase,
         file_id,
-        cipher_id,
         kdf_algorithm,
         m_cost,
         t_cost,
@@ -307,7 +327,6 @@ pub fn create_key_file(
 pub fn create_key_file_with_region_keys(
     passphrase: &[u8],
     file_id: u64,
-    cipher_id: CipherId,
     kdf_algorithm: KdfAlgorithm,
     m_cost: u32,
     t_cost: u32,
@@ -333,7 +352,7 @@ pub fn create_key_file_with_region_keys(
         argon2_m_cost: m_cost,
         argon2_t_cost: t_cost,
         argon2_p_cost: p_cost,
-        cipher_id,
+        encoded_cipher_id: CipherId::Aes256Ctr as u8,
         kdf_algorithm,
         flags: KEY_FILE_FLAG_SLOTS_V1_REQUIRED | KEY_FILE_FLAG_AUDIT_V2_REQUIRED,
         wrapped_rek: wrapped,
@@ -347,6 +366,53 @@ pub fn create_key_file_with_region_keys(
     kf.update_mac_with_auth_key(&auth_key);
 
     Ok((kf, keys, region))
+}
+
+/// Build a canonical AES key file around a recovered wrapped REK.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn create_key_file_from_wrapped_rek(
+    file_id: u64,
+    salt: [u8; ARGON2_SALT_SIZE],
+    kdf_algorithm: KdfAlgorithm,
+    kdf_param1: u32,
+    kdf_param2: u32,
+    kdf_param3: u32,
+    flags: u16,
+    wrapped_rek: [u8; WRAPPED_KEY_SIZE],
+    epoch: u32,
+    mk: &[u8; KEY_SIZE],
+    database_mac_key: &[u8; KEY_SIZE],
+) -> citadel_core::Result<KeyFile> {
+    if !key_file_flags_valid(flags) {
+        return Err(citadel_core::Error::KeyFileIntegrity);
+    }
+
+    let mut key_file = KeyFile {
+        magic: KEY_FILE_MAGIC,
+        version: KEY_FILE_VERSION,
+        file_id,
+        argon2_salt: salt,
+        argon2_m_cost: kdf_param1,
+        argon2_t_cost: kdf_param2,
+        argon2_p_cost: kdf_param3,
+        encoded_cipher_id: CipherId::Aes256Ctr as u8,
+        kdf_algorithm,
+        flags,
+        wrapped_rek,
+        current_epoch: epoch,
+        prev_wrapped_rek: [0u8; WRAPPED_KEY_SIZE],
+        prev_epoch: 0,
+        rotation_active: false,
+        file_mac: [0u8; MAC_SIZE],
+    };
+    if key_file.slots_v1_required() {
+        let auth_key = KeyFileAuthKey::from_database_mac_key(database_mac_key);
+        key_file.update_mac_with_auth_key(&auth_key);
+    } else {
+        key_file.update_mac(mk)?;
+    }
+    Ok(key_file)
 }
 
 /// Open an existing key file with a passphrase.
