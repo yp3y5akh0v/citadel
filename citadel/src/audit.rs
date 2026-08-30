@@ -3896,11 +3896,16 @@ mod tests {
             max_rotated_files: 0,
         };
 
-        let error = match crate::DatabaseBuilder::new(&path)
+        let builder = crate::DatabaseBuilder::new(&path)
             .passphrase(b"test-passphrase")
-            .audit_config(config)
-            .create()
-        {
+            .audit_config(config);
+        // Select a FIPS-approved KDF so this test reaches audit validation.
+        #[cfg(feature = "fips")]
+        let builder = builder
+            .kdf_algorithm(citadel_core::types::KdfAlgorithm::Pbkdf2HmacSha256)
+            .pbkdf2_iterations(600_000);
+
+        let error = match builder.create() {
             Ok(_) => panic!("zero retention must be rejected before creating the database"),
             Err(error) => error,
         };
