@@ -503,7 +503,7 @@ dependencies = [
 
 [[package]]
 name = "citadeldb"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "blake3",
  "citadeldb-buffer",
@@ -527,7 +527,7 @@ dependencies = [
 
 [[package]]
 name = "citadeldb-ai"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "blake3",
  "citadeldb",
@@ -545,7 +545,7 @@ dependencies = [
 
 [[package]]
 name = "citadeldb-buffer"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "citadeldb-core",
  "citadeldb-crypto",
@@ -557,7 +557,7 @@ dependencies = [
 
 [[package]]
 name = "citadeldb-cli"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "citadeldb",
  "citadeldb-core",
@@ -576,14 +576,14 @@ dependencies = [
 
 [[package]]
 name = "citadeldb-core"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "citadeldb-crypto"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "aes",
  "aes-kw",
@@ -603,7 +603,7 @@ dependencies = [
 
 [[package]]
 name = "citadeldb-ffi"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "cbindgen",
  "citadeldb",
@@ -614,7 +614,7 @@ dependencies = [
 
 [[package]]
 name = "citadeldb-io"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "citadeldb-core",
  "hmac",
@@ -631,7 +631,7 @@ dependencies = [
 
 [[package]]
 name = "citadeldb-llm"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "blake3",
  "serde",
@@ -643,7 +643,7 @@ dependencies = [
 
 [[package]]
 name = "citadeldb-mcp"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "blake3",
  "citadeldb",
@@ -659,7 +659,7 @@ dependencies = [
 
 [[package]]
 name = "citadeldb-mem"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "blake3",
  "candle-core",
@@ -688,7 +688,7 @@ dependencies = [
 
 [[package]]
 name = "citadeldb-membench"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "citadeldb",
  "citadeldb-llm",
@@ -703,7 +703,7 @@ dependencies = [
 
 [[package]]
 name = "citadeldb-page"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "citadeldb-core",
  "xxhash-rust",
@@ -711,7 +711,7 @@ dependencies = [
 
 [[package]]
 name = "citadeldb-python"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "blake3",
  "citadeldb",
@@ -733,7 +733,7 @@ dependencies = [
 
 [[package]]
 name = "citadeldb-sql"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "blake3",
  "citadeldb",
@@ -765,7 +765,7 @@ dependencies = [
 
 [[package]]
 name = "citadeldb-sql-json-path"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "jiff",
  "libtest-mimic",
@@ -781,7 +781,7 @@ dependencies = [
 
 [[package]]
 name = "citadeldb-swe"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "citadeldb",
  "citadeldb-ai",
@@ -793,7 +793,7 @@ dependencies = [
 
 [[package]]
 name = "citadeldb-sync"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -810,7 +810,7 @@ dependencies = [
 
 [[package]]
 name = "citadeldb-txn"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "blake3",
  "citadeldb-buffer",
@@ -826,7 +826,7 @@ dependencies = [
 
 [[package]]
 name = "citadeldb-vector"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "blake3",
  "citadeldb-buffer",
@@ -843,7 +843,7 @@ dependencies = [
 
 [[package]]
 name = "citadeldb-wasm"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "citadeldb",
  "citadeldb-core",

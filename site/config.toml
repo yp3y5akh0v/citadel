@@ -17,14 +17,12 @@ name = "tags"
 [extra]
 author = "Yuriy Peysakhov"
 github = "https://github.com/yp3y5akh0v/citadel"
-version = "2.0.0"
+version = "2.1.0"
 msrv = "1.95"
 crates = 21
 published = 16
-tests = "5,200+"
 locomo = "87.2"
 locomo_ceiling = "94.5"
 longmemeval = "86.2"
 benchmarks = 58
 mcp_tools = 13
-ffi_functions = 50

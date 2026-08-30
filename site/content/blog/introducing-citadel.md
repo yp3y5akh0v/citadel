@@ -53,4 +53,4 @@ It uses no LLM to build or search memory; it stores raw turns and recalls with v
 - **Sync** - encrypted peer-to-peer diffing over the Noise protocol.
 - **Bindings** - Rust, Python, WebAssembly, a C API, and a CLI.
 
-Citadel is a Rust workspace with 5,200+ tests, and stores all data in one encrypted file. Try it in the [playground](@/demo/_index.md), or read the <a href="https://github.com/yp3y5akh0v/citadel" target="_blank" rel="noopener">source</a>.
+Citadel is a Rust workspace with thousands of tests, and stores SQL, vector, and memory records in one encrypted database file. Try it in the [playground](@/demo/_index.md), or read the <a href="https://github.com/yp3y5akh0v/citadel" target="_blank" rel="noopener">source</a>.
