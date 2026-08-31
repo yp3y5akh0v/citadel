@@ -1,11 +1,15 @@
 //! Engine primitives: keyed idempotent ingest over the identity table,
 //! snapshot-validated derived writes, and atomic dependency-closure forgetting.
 
-use std::sync::{Arc, Barrier};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, Barrier,
+};
 
 use citadel::{Argon2Profile, Database, DatabaseBuilder};
 use citadel_mem::{
-    AtomInput, EdgeKind, EvictionPolicy, MemError, MemoryEngine, MockEmbedder, SourceSnapshot,
+    AtomInput, EdgeKind, EmbedError, Embedder, EmbeddingMetric, EvictionPolicy, MemError,
+    MemoryEngine, MockEmbedder, SourceSnapshot,
 };
 use citadel_sql::{Connection, Value};
 use serde_json::json;
@@ -14,6 +18,43 @@ use sha2::{Digest, Sha256};
 const DIM: usize = 64;
 const PAST: i64 = 1_000_000; // 1970: any wall clock is past this
 const TABLE: &str = "memory_atoms_d64_cosine_enc";
+
+struct CountingEmbedder {
+    calls: Arc<AtomicUsize>,
+}
+
+impl Embedder for CountingEmbedder {
+    fn dim(&self) -> usize {
+        DIM
+    }
+
+    fn metric(&self) -> EmbeddingMetric {
+        EmbeddingMetric::Cosine
+    }
+
+    fn model_id(&self) -> &str {
+        "counting-keyed-batch-v1"
+    }
+
+    fn embed_with_cancel(
+        &self,
+        texts: &[&str],
+        cancel: Option<&citadel_core::CancelToken>,
+    ) -> Result<Vec<Vec<f32>>, EmbedError> {
+        if cancel.is_some_and(citadel_core::CancelToken::is_cancelled) {
+            return Err(EmbedError::Interrupted);
+        }
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        Ok(texts
+            .iter()
+            .map(|text| {
+                let mut vector = vec![0.0; DIM];
+                vector[text.len() % DIM] = 1.0;
+                vector
+            })
+            .collect())
+    }
+}
 
 fn build_db(dir: &std::path::Path, encrypted: bool) -> Arc<Database> {
     Arc::new(
@@ -135,14 +176,19 @@ fn keyed_ingest_separates_identical_texts_and_converges_on_retry() {
         assert!(a.inserted && b.inserted);
         assert_ne!(a.id, b.id, "identical texts under different keys");
 
-        let edges_before = eng.fetch_edges(Some(a.id), None, None).unwrap().len();
+        let edges_before = eng
+            .fetch_edges_in_region("r", Some(a.id), None, None, 10)
+            .unwrap()
+            .len();
         let retry = eng
             .remember_if_absent_keyed("r", atom(), &[src], ev.clone(), "s1:t1")
             .unwrap();
         assert!(!retry.inserted);
         assert_eq!(retry.id, a.id, "same key converges");
         assert_eq!(
-            eng.fetch_edges(Some(a.id), None, None).unwrap().len(),
+            eng.fetch_edges_in_region("r", Some(a.id), None, None, 10)
+                .unwrap()
+                .len(),
             edges_before,
             "a retry never touches the original atom's provenance"
         );
@@ -213,11 +259,16 @@ fn keyed_retry_with_any_changed_input_fails() {
                 vec![s1],
                 ev.clone(),
             ),
-            (base.clone().with_score(0.5), vec![s1], ev.clone()),
+            (base.clone().with_importance(0.5), vec![s1], ev.clone()),
             (base.clone().with_confidence(0.25), vec![s1], ev.clone()),
             (base.clone().with_created_at(123), vec![s1], ev.clone()),
             (base.clone().with_expires_at(i64::MAX), vec![s1], ev.clone()),
             (base.clone().immutable(), vec![s1], ev.clone()),
+            (
+                base.clone().with_embedding(vec![0.0; DIM]),
+                vec![s1],
+                ev.clone(),
+            ),
             (base.clone(), vec![s2], ev.clone()),
             (base.clone(), vec![s1], Some(json!({"e": 2}))),
             (base.clone(), vec![s1], None),
@@ -237,12 +288,222 @@ fn keyed_retry_with_any_changed_input_fails() {
         assert!(!again.inserted);
         assert_eq!(again.id, original.id);
         assert_eq!(
-            eng.fetch_edges(Some(original.id), None, None)
+            eng.fetch_edges_in_region("r", Some(original.id), None, None, 10)
                 .unwrap()
                 .len(),
             1
         );
     }
+}
+
+#[test]
+fn keyed_batch_replays_in_order_and_conflicts_before_any_insert() {
+    for encrypted in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = build_db(dir.path(), encrypted);
+        let eng = engine(&db, encrypted);
+        let entries = || {
+            vec![
+                (
+                    AtomInput::new("fact", "first")
+                        .with_payload(json!({"position": 1}))
+                        .with_importance(0.25),
+                    "batch/first".to_string(),
+                ),
+                (
+                    AtomInput::new("fact", "second")
+                        .with_payload(json!({"position": 2}))
+                        .with_confidence(0.75),
+                    "batch/second".to_string(),
+                ),
+            ]
+        };
+
+        let first = eng.remember_if_absent_keyed_batch("r", entries()).unwrap();
+        assert_eq!(first.len(), 2);
+        assert!(first.iter().all(|outcome| outcome.inserted));
+        assert!(first[0].id < first[1].id, "outcomes preserve input order");
+
+        let replay = eng.remember_if_absent_keyed_batch("r", entries()).unwrap();
+        assert_eq!(
+            replay.iter().map(|outcome| outcome.id).collect::<Vec<_>>(),
+            first.iter().map(|outcome| outcome.id).collect::<Vec<_>>()
+        );
+        assert!(replay.iter().all(|outcome| !outcome.inserted));
+
+        let mixed = eng
+            .remember_if_absent_keyed_batch(
+                "r",
+                vec![
+                    (
+                        AtomInput::new("fact", "second")
+                            .with_payload(json!({"position": 2}))
+                            .with_confidence(0.75),
+                        "batch/second".to_string(),
+                    ),
+                    (AtomInput::new("fact", "third"), "batch/third".to_string()),
+                    (
+                        AtomInput::new("fact", "first")
+                            .with_payload(json!({"position": 1}))
+                            .with_importance(0.25),
+                        "batch/first".to_string(),
+                    ),
+                ],
+            )
+            .unwrap();
+        assert_eq!(mixed[0], replay[1]);
+        assert!(mixed[1].inserted);
+        assert_eq!(mixed[2], replay[0]);
+
+        let before = eng.count("r", "fact").unwrap();
+        let error = eng
+            .remember_if_absent_keyed_batch(
+                "r",
+                vec![
+                    (
+                        AtomInput::new("fact", "must roll back"),
+                        "batch/fresh".to_string(),
+                    ),
+                    (
+                        AtomInput::new("fact", "changed second"),
+                        "batch/second".to_string(),
+                    ),
+                ],
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            MemError::IdempotencyConflict { atom_id } if atom_id == first[1].id
+        ));
+        assert_eq!(
+            eng.count("r", "fact").unwrap(),
+            before,
+            "a later conflict must prevent an earlier fresh entry from committing"
+        );
+
+        let fresh = eng
+            .remember_if_absent_keyed_batch(
+                "r",
+                vec![(
+                    AtomInput::new("fact", "must roll back"),
+                    "batch/fresh".to_string(),
+                )],
+            )
+            .unwrap();
+        assert!(fresh[0].inserted, "the rejected batch did not bind its key");
+    }
+}
+
+#[test]
+fn keyed_batch_rejects_missing_or_duplicate_keys_without_writing() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = build_db(dir.path(), false);
+    let eng = engine(&db, false);
+
+    for entries in [
+        vec![(AtomInput::new("fact", "empty"), String::new())],
+        vec![
+            (AtomInput::new("fact", "one"), "duplicate".to_string()),
+            (AtomInput::new("note", "two"), "duplicate".to_string()),
+        ],
+    ] {
+        assert!(matches!(
+            eng.remember_if_absent_keyed_batch("r", entries),
+            Err(MemError::Invalid(_))
+        ));
+    }
+    assert_eq!(eng.count("r", "fact").unwrap(), 0);
+    assert_eq!(eng.count("r", "note").unwrap(), 0);
+    assert_eq!(identity_rows(&db), 0);
+}
+
+#[test]
+fn keyed_single_replay_and_conflict_do_not_run_the_embedder_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = build_db(dir.path(), false);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
+    eng.create_region(
+        "r",
+        Arc::new(CountingEmbedder {
+            calls: Arc::clone(&calls),
+        }),
+    )
+    .unwrap();
+
+    let atom = || AtomInput::new("fact", "one");
+    let first = eng
+        .remember_if_absent_keyed("r", atom(), &[], None, "one")
+        .unwrap();
+    assert!(first.inserted);
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+    let replay = eng
+        .remember_if_absent_keyed("r", atom(), &[], None, "one")
+        .unwrap();
+    assert_eq!(replay.id, first.id);
+    assert!(!replay.inserted);
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        1,
+        "an identical retry resolves before embedding"
+    );
+
+    let error = eng
+        .remember_if_absent_keyed("r", AtomInput::new("fact", "changed"), &[], None, "one")
+        .unwrap_err();
+    assert!(matches!(error, MemError::IdempotencyConflict { .. }));
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        1,
+        "a conflicting retry fails before embedding"
+    );
+}
+
+#[test]
+fn keyed_batch_replay_and_conflict_do_not_run_the_embedder_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = build_db(dir.path(), false);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
+    eng.create_region(
+        "r",
+        Arc::new(CountingEmbedder {
+            calls: Arc::clone(&calls),
+        }),
+    )
+    .unwrap();
+    let entries = || {
+        vec![
+            (AtomInput::new("fact", "one"), "one".to_string()),
+            (AtomInput::new("fact", "two"), "two".to_string()),
+        ]
+    };
+
+    eng.remember_if_absent_keyed_batch("r", entries()).unwrap();
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    eng.remember_if_absent_keyed_batch("r", entries()).unwrap();
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        1,
+        "an all-replay batch resolves from its identity snapshot"
+    );
+
+    let error = eng
+        .remember_if_absent_keyed_batch(
+            "r",
+            vec![
+                (AtomInput::new("fact", "fresh"), "fresh".to_string()),
+                (AtomInput::new("fact", "changed"), "two".to_string()),
+            ],
+        )
+        .unwrap_err();
+    assert!(matches!(error, MemError::IdempotencyConflict { .. }));
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        1,
+        "preflight finds a conflict even when an earlier entry is fresh"
+    );
 }
 
 #[test]
@@ -373,7 +634,7 @@ fn checked_write_commits_only_against_the_declared_snapshot() {
             )
             .unwrap();
         let edges = eng
-            .fetch_edges(Some(fact), None, Some(EdgeKind::DerivedFrom))
+            .fetch_edges_in_region("r", Some(fact), None, Some(EdgeKind::DerivedFrom), 10)
             .unwrap();
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].dst_id, t1);
@@ -501,7 +762,7 @@ fn cascade_erases_derived_descendants_with_keys() {
     }
     assert!(eng.fetch_one("r", keep).unwrap().is_some());
     assert!(
-        eng.fetch_edges(None, None, Some(EdgeKind::DerivedFrom))
+        eng.fetch_edges_in_region("r", None, None, Some(EdgeKind::DerivedFrom), 10)
             .unwrap()
             .is_empty(),
         "no dangling provenance edges"
@@ -610,8 +871,10 @@ fn cascade_terminates_on_provenance_cycles() {
     let d2 = eng.remember("r", AtomInput::new("derived", "two")).unwrap();
     // DerivedFrom is not acyclicity-checked at link time; the closure walk
     // must terminate on the cycle and erase both members.
-    eng.link(d1, d2, EdgeKind::DerivedFrom, 1.0).unwrap();
-    eng.link(d2, d1, EdgeKind::DerivedFrom, 1.0).unwrap();
+    eng.link_in_region("r", d1, d2, EdgeKind::DerivedFrom, 1.0)
+        .unwrap();
+    eng.link_in_region("r", d2, d1, EdgeKind::DerivedFrom, 1.0)
+        .unwrap();
 
     let receipt = eng.forget_atoms_with_dependents("r", &[d1], false).unwrap();
     assert_eq!(receipt.rows_deleted, 2, "cycle members erase together");
@@ -708,7 +971,7 @@ fn cascade_survives_concurrent_derived_writers() {
     assert!(eng.fetch_one("r", root).unwrap().is_none());
     assert_eq!(eng.count("r", "derived").unwrap(), 0);
     assert!(eng
-        .fetch_edges(None, Some(root), Some(EdgeKind::DerivedFrom))
+        .fetch_edges_in_region("r", None, Some(root), Some(EdgeKind::DerivedFrom), 10)
         .unwrap()
         .is_empty());
     let audit = citadel_mem::audit_provenance(&eng, "r", "derived").unwrap();

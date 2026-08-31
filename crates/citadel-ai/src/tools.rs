@@ -17,6 +17,8 @@ use citadel_mem::{
 
 use citadel_llm::{ToolCall, ToolSpec};
 
+const MAX_PROVENANCE_EDGES: usize = 10_000;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ToolError {
     #[error("unknown tool: {0}")]
@@ -204,21 +206,9 @@ fn opt_string_vec_arg(args: &Value, key: &str, tool: &str) -> Result<Vec<String>
 }
 
 fn edge_kind(s: &str) -> Result<EdgeKind, ToolError> {
-    Ok(match s {
-        "causes" => EdgeKind::Causes,
-        "contradicts" => EdgeKind::Contradicts,
-        "refines" => EdgeKind::Refines,
-        "precedes" => EdgeKind::Precedes,
-        "supersedes" => EdgeKind::Supersedes,
-        "derived_from" => EdgeKind::DerivedFrom,
-        "depends_on" => EdgeKind::DependsOn,
-        "similar_to" => EdgeKind::SimilarTo,
-        other => {
-            return Err(ToolError::BadArgs {
-                tool: "mem_recall".into(),
-                reason: format!("unknown edge kind '{other}'"),
-            })
-        }
+    s.parse().map_err(|_| ToolError::BadArgs {
+        tool: "mem_recall".into(),
+        reason: format!("unknown edge kind '{s}'"),
     })
 }
 
@@ -396,8 +386,10 @@ impl Tool for MemRecallTool {
                     "id": h.id,
                     "kind": h.kind,
                     "text": h.text,
-                    "score": h.score,
+                    "importance": h.importance,
+                    "relevance": h.relevance,
                     "distance": h.distance,
+                    "graph_depth": h.graph_depth,
                     "created_at": h.created_at,
                     "immutable": h.immutable,
                     "payload": h.payload,
@@ -405,17 +397,33 @@ impl Tool for MemRecallTool {
             })
             .collect();
         if provenance {
+            let hit_ids = hits.iter().map(|hit| hit.id).collect::<Vec<_>>();
+            let provenance_edges = self
+                .mem
+                .fetch_edge_endpoints_from_atoms_in_region(
+                    &self.region,
+                    &hit_ids,
+                    Some(EdgeKind::DerivedFrom),
+                    MAX_PROVENANCE_EDGES + 1,
+                )
+                .map_err(|e| ToolError::Failed {
+                    tool: "mem_recall".into(),
+                    reason: e.to_string(),
+                })?;
+            if provenance_edges.len() > MAX_PROVENANCE_EDGES {
+                return Err(ToolError::Failed {
+                    tool: "mem_recall".into(),
+                    reason: format!(
+                        "provenance exceeds the {MAX_PROVENANCE_EDGES}-edge response limit"
+                    ),
+                });
+            }
+            let mut by_atom: FxHashMap<i64, Vec<i64>> = FxHashMap::default();
+            for (src_id, dst_id) in provenance_edges {
+                by_atom.entry(src_id).or_default().push(dst_id);
+            }
             for (row, hit) in rows.iter_mut().zip(hits.iter()) {
-                let sources: Vec<_> = self
-                    .mem
-                    .fetch_edges(Some(hit.id), None, Some(EdgeKind::DerivedFrom))
-                    .map_err(|e| ToolError::Failed {
-                        tool: "mem_recall".into(),
-                        reason: e.to_string(),
-                    })?
-                    .iter()
-                    .map(|e| e.dst_id)
-                    .collect();
+                let sources = by_atom.remove(&hit.id).unwrap_or_default();
                 row["derived_from"] = json!(sources);
             }
         }
@@ -463,7 +471,7 @@ impl Tool for MemRememberTool {
                     "text": {"type": "string", "description": "the content to remember"},
                     "kind": {"type": "string", "description": "atom kind (default 'fact')"},
                     "payload": {"description": "arbitrary JSON stored with the atom"},
-                    "score": {"type": "number", "description": "importance score used by recall/eviction"},
+                    "importance": {"type": "number", "description": "stored importance used by recall and eviction"},
                     "confidence": {"type": "number", "description": "confidence 0..1 used by eviction/summary"},
                     "created_at": {"type": "integer", "description": "event time in epoch micros"},
                     "expires_at": {"type": "integer", "description": "expiry time in epoch micros"},
@@ -481,8 +489,8 @@ impl Tool for MemRememberTool {
         if let Some(payload) = args.get("payload") {
             atom = atom.with_payload(payload.clone());
         }
-        if let Some(score) = opt_f32_arg(args, "score", "mem_remember")? {
-            atom = atom.with_score(score);
+        if let Some(importance) = opt_f32_arg(args, "importance", "mem_remember")? {
+            atom = atom.with_importance(importance);
         }
         if let Some(confidence) = opt_f32_arg(args, "confidence", "mem_remember")? {
             atom = atom.with_confidence(confidence);
@@ -2181,7 +2189,7 @@ mod tests {
                 "text": "pinned project fact",
                 "kind": "fact",
                 "payload": {"project": "citadel", "tag": "pinned"},
-                "score": 0.75,
+                "importance": 0.75,
                 "confidence": 0.5,
                 "created_at": 1234,
                 "expires_at": 4_102_444_800_000_000i64,
@@ -2193,7 +2201,10 @@ mod tests {
             .unwrap();
         let hit = eng.fetch_one("r", id).unwrap().unwrap();
         assert_eq!(hit.payload["project"], json!("citadel"));
-        assert_eq!(hit.score, 0.75);
+        assert_eq!(hit.importance, 0.75);
+        assert_eq!(hit.relevance, None);
+        assert_eq!(hit.distance, None);
+        assert_eq!(hit.graph_depth, None);
         assert_eq!(hit.created_at, 1234);
         assert!(hit.immutable);
 
@@ -2216,10 +2227,11 @@ mod tests {
                 "r",
                 AtomInput::new("evidence", "leaf searchable atom")
                     .with_payload(json!({"tag": "leaf", "lineage": "demo"}))
-                    .with_score(0.9),
+                    .with_importance(0.9),
             )
             .unwrap();
-        eng.link(child, parent, EdgeKind::DerivedFrom, 1.0).unwrap();
+        eng.link_in_region("r", child, parent, EdgeKind::DerivedFrom, 1.0)
+            .unwrap();
 
         let tool = MemRecallTool::new(Arc::clone(&eng), "r");
         let out = tool
@@ -2244,10 +2256,20 @@ mod tests {
                 && r["attestation"]["verdict"] == json!("plaintext_unattested")),
             "child row should include provenance and attestation: {out}"
         );
-        assert!(
-            rows.iter().any(|r| r["id"] == json!(parent)),
-            "graph expansion should include the parent atom: {out}"
-        );
+        let child_row = rows.iter().find(|r| r["id"] == json!(child)).unwrap();
+        assert_eq!(child_row["importance"], json!(0.9));
+        assert_eq!(child_row["derived_from"], json!([parent]));
+        assert!(child_row["relevance"].is_number());
+        assert!(child_row["distance"].is_number());
+        assert!(child_row["graph_depth"].is_null());
+        let parent_row = rows
+            .iter()
+            .find(|r| r["id"] == json!(parent))
+            .unwrap_or_else(|| panic!("graph expansion should include the parent atom: {out}"));
+        assert_eq!(parent_row["importance"], json!(0.0));
+        assert!(parent_row["relevance"].is_null());
+        assert!(parent_row["distance"].is_null());
+        assert_eq!(parent_row["graph_depth"], json!(1));
     }
 
     #[test]

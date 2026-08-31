@@ -103,7 +103,9 @@ def test_unindexed_values_do_not_invoke_the_embedder(tmp_path):
         def __init__(self):
             self.calls = []
 
-        def embed(self, texts):
+        def embed_with_cancel(self, texts, cancel_token):
+            if cancel_token is not None:
+                cancel_token.check()
             self.calls.extend(texts)
             return [[1.0] + [0.0] * 7 for _ in texts]
 
@@ -595,7 +597,11 @@ def test_an_embedder_is_required(tmp_path):
     partial = type(
         "PartialEmbedder",
         (),
-        {"dim": 8, "metric": "cosine", "embed": lambda self, texts: []},
+        {
+            "dim": 8,
+            "metric": "cosine",
+            "embed_with_cancel": lambda self, texts, cancel_token: [],
+        },
     )()
     with pytest.raises(TypeError, match="model_id"):
         CitadelStore(str(tmp_path / "invalid-embedder.cdl"), key="pw", embedder=partial)
@@ -616,7 +622,9 @@ def test_embedder_model_id_is_normalized_without_mutating_the_caller():
             "dim": 8,
             "metric": "cosine",
             "model_id": "  stable-model  ",
-            "embed": lambda self, texts: [[0.0] * 8 for _ in texts],
+            "embed_with_cancel": lambda self, texts, cancel_token: [
+                [0.0] * 8 for _ in texts
+            ],
         },
     )()
 
@@ -624,4 +632,4 @@ def test_embedder_model_id_is_normalized_without_mutating_the_caller():
 
     assert normalized.model_id == "stable-model"
     assert embedder.model_id == "  stable-model  "
-    assert len(normalized.embed(["probe"])[0]) == 8
+    assert len(normalized.embed_with_cancel(["probe"], None)[0]) == 8

@@ -64,12 +64,15 @@ def _require_embedder(embedder: Any) -> Any:
         raise TypeError(
             "embedder model_id must be a nonblank string other than 'unknown' or 'default'"
         )
-    if not callable(getattr(embedder, "embed", None)):
-        raise TypeError("embedder must provide a callable embed(texts) method")
+    if not callable(getattr(embedder, "embed_with_cancel", None)):
+        raise TypeError(
+            "embedder must provide a callable "
+            "embed_with_cancel(texts, cancel_token) method"
+        )
     missing = object()
-    embed_queries = getattr(embedder, "embed_queries", missing)
+    embed_queries = getattr(embedder, "embed_queries_with_cancel", missing)
     if embed_queries is not missing and not callable(embed_queries):
-        raise TypeError("embedder embed_queries attribute must be callable")
+        raise TypeError("embedder embed_queries_with_cancel attribute must be callable")
     normalized = model_id.strip()
     return (
         embedder

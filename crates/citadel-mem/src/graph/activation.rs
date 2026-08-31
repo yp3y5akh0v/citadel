@@ -50,8 +50,7 @@ fn build_diffusion(
     }
     let mut adjacency: Vec<Vec<(usize, f32)>> = vec![Vec::new(); ids.len()];
     for kind in [EdgeKind::DerivedFrom, EdgeKind::SimilarTo] {
-        for edge in eng.fetch_edges(None, None, Some(kind))? {
-            // Edge storage is global: refuse cross-region edges carrying mass in.
+        for edge in eng.fetch_all_edges_in_region(region, None, None, Some(kind))? {
             if !region_ids.contains(&edge.src_id) || !region_ids.contains(&edge.dst_id) {
                 continue;
             }

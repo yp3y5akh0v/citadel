@@ -23,8 +23,12 @@ impl Embedder for LegacyMockEmbedder {
         "mock"
     }
 
-    fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
-        self.0.embed(texts)
+    fn embed_with_cancel(
+        &self,
+        texts: &[&str],
+        cancel: Option<&citadel_core::CancelToken>,
+    ) -> Result<Vec<Vec<f32>>, EmbedError> {
+        self.0.embed_with_cancel(texts, cancel)
     }
 }
 

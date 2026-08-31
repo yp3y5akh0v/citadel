@@ -56,6 +56,33 @@ fn table_scan_iter_start_key() {
 }
 
 #[test]
+fn table_scan_iter_enforces_the_same_cumulative_budget() {
+    let mgr = create_test_manager();
+    let mut writer = mgr.begin_write().unwrap();
+    writer.create_table(b"t").unwrap();
+    writer.table_insert(b"t", b"a", b"123").unwrap();
+    writer.table_insert(b"t", b"b", b"456").unwrap();
+    writer.commit().unwrap();
+
+    let budget = crate::ReadBudget::new(3, 5);
+    let mut reader = mgr.begin_read();
+    reader.set_read_budget(Some(budget.clone()));
+    let mut iter = reader.table_scan_iter(b"t", b"").unwrap();
+    assert!(iter.next().unwrap().is_some());
+    let err = iter.next().unwrap_err();
+
+    assert!(matches!(
+        err,
+        citadel_core::Error::ReadBudgetExceeded {
+            size: 3,
+            remaining: 2,
+            ..
+        }
+    ));
+    assert_eq!(budget.remaining(), 2);
+}
+
+#[test]
 fn table_scan_iter_empty() {
     let mgr = create_test_manager();
     {

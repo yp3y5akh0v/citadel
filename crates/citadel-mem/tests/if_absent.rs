@@ -192,7 +192,13 @@ fn enriches_existing_atom_with_new_provenance() {
     assert!(!third.inserted);
 
     let edges = eng
-        .fetch_edges(Some(first.id), None, Some(EdgeKind::DerivedFrom))
+        .fetch_edges_in_region(
+            "notes",
+            Some(first.id),
+            None,
+            Some(EdgeKind::DerivedFrom),
+            10,
+        )
         .unwrap();
     assert_eq!(edges.len(), 1, "edge upsert converges");
     assert_eq!(edges[0].dst_id, src);

@@ -11,6 +11,9 @@ pip install citadeldb-langgraph
 Requires `langgraph>=0.2.32,<2` and `langgraph-checkpoint>=2.0.19,<5`.
 The checkpoint package owns the `TTLConfig` surface used by this adapter.
 
+This first example performs key-value reads only. Its explicit mock avoids model work and
+must not be reused for semantic `search`; the e5-large setup follows below.
+
 ```python
 import citadeldb
 from citadeldb_langgraph import CitadelStore
@@ -18,7 +21,7 @@ from citadeldb_langgraph import CitadelStore
 store = CitadelStore(
     "memory.cdl",
     key="your-passphrase",
-    embedder=citadeldb.MockEmbedder(dim=64),  # see Notes for a real model
+    embedder=citadeldb.MockEmbedder(dim=64),  # intentional non-semantic store
 )
 
 store.put(("users", "alice"), "profile", {"city": "Berlin", "pet": "Mochi"})
@@ -37,17 +40,27 @@ graph = builder.compile(store=store)  # `builder` is your StateGraph
 `search` runs Citadel's hybrid recall: vector distance, keyword rank and recency, fused
 into one score.
 
-```python
-store.put(("notes",), "n1", {"text": "the deployment failed because the disk was full"})
-store.put(("notes",), "n2", {"text": "lunch plans for friday"})
+The semantic example uses a local e5-large model. `CandleEmbedder` requires a
+`citadeldb` source wheel built with `--features candle-embed`; the default wheel accepts
+an equivalent real bring-your-own embedder.
 
-store.search(("notes",), query="why did the release break?", limit=1)
+```python
+semantic_store = CitadelStore(
+    "semantic-memory.cdl",
+    key="your-passphrase",
+    embedder=citadeldb.CandleEmbedder("/path/to/e5-large", preset="e5-large"),
+)
+semantic_store.put(
+    ("notes",), "n1", {"text": "the deployment failed because the disk was full"}
+)
+semantic_store.put(("notes",), "n2", {"text": "lunch plans for friday"})
+
+semantic_store.search(("notes",), query="why did the release break?", limit=1)
 # [Item(namespace=['notes'], key='n1', value={'text': 'the deployment failed ...'}, ...)]
 ```
 
-`MockEmbedder` is a hashed bag-of-words, so with it the vector half is lexical: it ranks on
-shared wording, not on meaning. Pass a real embedder (see Notes) to match a question against
-a differently worded answer.
+`MockEmbedder` is a hashed bag-of-words: it ranks on shared wording, not meaning, and is
+only appropriate for intentional lexical tests.
 
 `index=False` omits a value from ranked semantic recall, though it can still appear without a
 score when filling the requested window. `index=[...]` restricts searchable text to those JSON
@@ -85,26 +98,13 @@ Citadel is embedded and one process owns the file. A path already open on this t
 under the same passphrase, is shared, so this can sit on the same database as another
 Citadel adapter; construct them on the same thread.
 
-`embedder=` is required. There is no default: quietly substituting `MockEmbedder` would change
-ranking semantics and persist different provenance. `MockEmbedder` needs no download and
-is enough to build and test a graph, so pass it explicitly if that is what you want. For
-semantic recall pass a real embedder. `CandleEmbedder` is not in the default `citadeldb` wheel
-and needs a source build (`maturin build --features candle-embed`); any object exposing `dim`,
-`metric`, `model_id` and `embed` works too; `embed_queries` is optional.
+`embedder=` is required. There is no default: changing the model changes ranking semantics
+and persisted provenance. A bring-your-own object exposes `dim`, `metric`, `model_id`, and
+`embed_with_cancel(texts, cancel_token)`; `embed_queries_with_cancel` is optional.
 
 A region is pinned to its embedder's width and model id when created. Changing model means
 re-embedding from the stored text. CitadelDB 2.1's `Memory.reembed_region` does that in place,
 keeping every atom id and therefore every edge.
-
-```python
-import citadeldb
-
-store = CitadelStore(
-    "memory-e5.cdl",
-    key="your-passphrase",
-    embedder=citadeldb.CandleEmbedder("/path/to/e5-large", preset="e5-large"),
-)
-```
 
 ## License
 

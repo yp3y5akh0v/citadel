@@ -40,6 +40,15 @@ pub enum Error {
     #[error("value too large: {size} bytes (max {max})")]
     ValueTooLarge { size: usize, max: usize },
 
+    #[error(
+        "read materialization budget exceeded: value is {size} bytes, per-value limit is {max_value} bytes, {remaining} bytes remain"
+    )]
+    ReadBudgetExceeded {
+        size: usize,
+        max_value: usize,
+        remaining: usize,
+    },
+
     #[error("invalid magic number: expected 0x{expected:08X}, found 0x{found:08X}")]
     InvalidMagic { expected: u32, found: u32 },
 

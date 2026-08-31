@@ -16,7 +16,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::{json, Value};
 
 use citadel_mem::{
-    AtomHit, AtomId, AtomInput, EdgeKind, EvictionPolicy, EvictionReport, MemoryEngine,
+    AtomHit, AtomId, AtomInput, Edge, EdgeKind, EvictionPolicy, EvictionReport, MemoryEngine,
     RecallProfile, RecallQuery,
 };
 
@@ -33,6 +33,8 @@ const MAX_SELF_MODEL_VERSIONS: usize = 4_096;
 /// Backstop on the discovery archive scan in `top_scored` (the real bound is the
 /// discovery budget caps; a run cannot accumulate anywhere near this).
 const MAX_DISCOVERY_ATOMS: usize = 1_000_000;
+/// Page size for complete region-local edge reads.
+const EDGE_PAGE_SIZE: usize = 1_024;
 /// Canonical-encoding version stamped into every check (lets the format evolve).
 const CHECK_VERSION: u32 = 1;
 /// `prev_hash` of the first check in a chain.
@@ -576,6 +578,37 @@ impl BeliefGraph {
         }
     }
 
+    fn link(&self, src: AtomId, dst: AtomId, kind: EdgeKind, weight: f32) -> GraphResult<()> {
+        self.mem
+            .link_in_region(&self.region, src, dst, kind, weight)
+            .map_err(Into::into)
+    }
+
+    fn fetch_edges(
+        &self,
+        src: Option<AtomId>,
+        dst: Option<AtomId>,
+        kind: Option<EdgeKind>,
+    ) -> GraphResult<Vec<Edge>> {
+        let mut edges = Vec::new();
+        let mut after = None;
+        loop {
+            let page = self.mem.fetch_edges_page_in_region(
+                &self.region,
+                src,
+                dst,
+                kind,
+                after,
+                EDGE_PAGE_SIZE,
+            )?;
+            edges.extend(page.edges);
+            let Some(next_after) = page.next_after else {
+                return Ok(edges);
+            };
+            after = Some(next_after);
+        }
+    }
+
     /// Store an immutable goal atom; returns its id.
     pub fn add_goal(&self, goal: &Goal) -> GraphResult<AtomId> {
         let id = self.mem.remember(
@@ -596,9 +629,9 @@ impl BeliefGraph {
             AtomInput::new("task", &task.description).with_payload(task.to_json()),
         )?;
         for &dep in deps {
-            self.mem.link(id, dep, EdgeKind::DependsOn, 1.0)?;
+            self.link(id, dep, EdgeKind::DependsOn, 1.0)?;
         }
-        self.mem.link(id, goal_id, EdgeKind::Refines, 1.0)?;
+        self.link(id, goal_id, EdgeKind::Refines, 1.0)?;
         Ok(id)
     }
 
@@ -608,10 +641,10 @@ impl BeliefGraph {
             &self.region,
             AtomInput::new("hypothesis", &hyp.summary)
                 .with_payload(hyp.to_json())
-                .with_score(hyp.confidence)
+                .with_importance(hyp.confidence)
                 .with_confidence(hyp.confidence),
         )?;
-        self.mem.link(id, refines_goal, EdgeKind::Refines, 1.0)?;
+        self.link(id, refines_goal, EdgeKind::Refines, 1.0)?;
         Ok(id)
     }
 
@@ -621,7 +654,7 @@ impl BeliefGraph {
             &self.region,
             AtomInput::new("evidence", &ev.content).with_payload(ev.to_json()),
         )?;
-        self.mem.link(id, supports, EdgeKind::DerivedFrom, 1.0)?;
+        self.link(id, supports, EdgeKind::DerivedFrom, 1.0)?;
         Ok(id)
     }
 
@@ -631,10 +664,10 @@ impl BeliefGraph {
             &self.region,
             AtomInput::new("reflection", &refl.insight)
                 .with_payload(refl.to_json())
-                .with_score(refl.confidence)
+                .with_importance(refl.confidence)
                 .with_confidence(refl.confidence),
         )?;
-        self.mem.link(id, about, EdgeKind::DerivedFrom, 1.0)?;
+        self.link(id, about, EdgeKind::DerivedFrom, 1.0)?;
         Ok(id)
     }
 
@@ -646,7 +679,7 @@ impl BeliefGraph {
             &self.region,
             AtomInput::new(CANDIDATE_KIND, artifact)
                 .with_payload(json!({ "score": score }))
-                .with_score(score as f32),
+                .with_importance(score as f32),
         )?;
         Ok(id)
     }
@@ -680,12 +713,11 @@ impl BeliefGraph {
             &self.region,
             AtomInput::new(kind.as_str(), &candidate.text)
                 .with_payload(payload)
-                .with_score(score as f32)
+                .with_importance(score as f32)
                 .with_confidence(1.0)
                 .immutable(),
         )?;
-        self.mem
-            .link(id, candidate_atom, EdgeKind::DerivedFrom, 1.0)?;
+        self.link(id, candidate_atom, EdgeKind::DerivedFrom, 1.0)?;
         Ok(id)
     }
 
@@ -781,7 +813,7 @@ impl BeliefGraph {
                     &self.region,
                     AtomInput::new("goal_status", status.as_str()).with_payload(rec.to_json()),
                 )?;
-                self.mem.link(id, goal_id, EdgeKind::DerivedFrom, 1.0)?;
+                self.link(id, goal_id, EdgeKind::DerivedFrom, 1.0)?;
             }
         }
         Ok(())
@@ -858,9 +890,7 @@ impl BeliefGraph {
             if task.status != TaskStatus::Pending {
                 continue;
             }
-            let deps = self
-                .mem
-                .fetch_edges(Some(*id), None, Some(EdgeKind::DependsOn))?;
+            let deps = self.fetch_edges(Some(*id), None, Some(EdgeKind::DependsOn))?;
             let unblocked = deps
                 .iter()
                 .all(|e| status.get(&e.dst_id).copied() == Some(TaskStatus::Done));
@@ -895,7 +925,6 @@ impl BeliefGraph {
             .ok_or(GraphError::NoSelfModel)?;
         // Defence in depth: a correctly-resolved head has no incoming Supersedes.
         if !self
-            .mem
             .fetch_edges(None, Some(head), Some(EdgeKind::Supersedes))?
             .is_empty()
         {
@@ -907,7 +936,7 @@ impl BeliefGraph {
                 .with_payload(new_sm.to_json())
                 .immutable(),
         )?;
-        self.mem.link(new_id, head, EdgeKind::Supersedes, 1.0)?;
+        self.link(new_id, head, EdgeKind::Supersedes, 1.0)?;
         *self.self_model_head.lock().unwrap() = Some(new_id);
         Ok(new_id)
     }
@@ -952,7 +981,6 @@ impl BeliefGraph {
             return Ok(None);
         }
         let superseded: FxHashSet<AtomId> = self
-            .mem
             .fetch_edges(None, None, Some(EdgeKind::Supersedes))?
             .iter()
             .map(|e| e.dst_id)
@@ -1022,8 +1050,8 @@ impl BeliefGraph {
                 .with_confidence(confidence)
                 .immutable(),
         )?;
-        self.mem.link(id, action_atom, EdgeKind::DerivedFrom, 1.0)?;
-        self.mem.link(id, check.goal_ref, EdgeKind::Refines, 1.0)?;
+        self.link(id, action_atom, EdgeKind::DerivedFrom, 1.0)?;
+        self.link(id, check.goal_ref, EdgeKind::Refines, 1.0)?;
         *tail = Some((id, check.this_hash.clone()));
         Ok(id)
     }
@@ -1133,9 +1161,7 @@ impl BeliefGraph {
     /// `refines` edge AND the goal still immutable. O(1). Proves anchoring to the
     /// charter, NOT that the action advances the goal (undecidable).
     pub fn has_provenance(&self, action_atom: AtomId, goal_ref: AtomId) -> GraphResult<bool> {
-        let edges =
-            self.mem
-                .fetch_edges(Some(action_atom), Some(goal_ref), Some(EdgeKind::Refines))?;
+        let edges = self.fetch_edges(Some(action_atom), Some(goal_ref), Some(EdgeKind::Refines))?;
         if edges.is_empty() {
             return Ok(false);
         }
@@ -1183,15 +1209,11 @@ impl BeliefGraph {
         let mut out = Vec::new();
         for (task_id, _task) in self.tasks()? {
             let refines =
-                self.mem
-                    .fetch_edges(Some(task_id), Some(goal_id), Some(EdgeKind::Refines))?;
+                self.fetch_edges(Some(task_id), Some(goal_id), Some(EdgeKind::Refines))?;
             if refines.is_empty() {
                 continue;
             }
-            for edge in self
-                .mem
-                .fetch_edges(None, Some(task_id), Some(EdgeKind::DerivedFrom))?
-            {
+            for edge in self.fetch_edges(None, Some(task_id), Some(EdgeKind::DerivedFrom))? {
                 if let Some(hit) = self.mem.fetch_one(&self.region, edge.src_id)? {
                     if hit.kind == "evidence" {
                         let source = hit
@@ -1485,6 +1507,27 @@ mod tests {
     }
 
     #[test]
+    fn graph_edges_reject_atoms_from_another_region() {
+        let (_d, g) = graph();
+        g.mem
+            .create_region("other", Arc::new(MockEmbedder::new(64)))
+            .unwrap();
+        let local = g.add_goal(&Goal::new("local")).unwrap();
+        let foreign = g
+            .mem
+            .remember("other", AtomInput::new("goal", "foreign"))
+            .unwrap();
+
+        assert!(matches!(
+            g.link(local, foreign, EdgeKind::Refines, 1.0),
+            Err(GraphError::Mem(citadel_mem::MemError::AtomNotLive {
+                atom_id,
+                region
+            })) if atom_id == foreign && region == "agent"
+        ));
+    }
+
+    #[test]
     fn task_with_multiple_deps_waits_for_all() {
         let (_d, g) = graph();
         let goal = g.add_goal(&Goal::new("g")).unwrap();
@@ -1559,20 +1602,17 @@ mod tests {
             .unwrap();
 
         let refines = g
-            .mem
             .fetch_edges(Some(hyp), None, Some(EdgeKind::Refines))
             .unwrap();
         assert_eq!(refines.len(), 1);
         assert_eq!(refines[0].dst_id, goal);
 
         let ev_edges = g
-            .mem
             .fetch_edges(Some(ev), None, Some(EdgeKind::DerivedFrom))
             .unwrap();
         assert_eq!(ev_edges[0].dst_id, task);
 
         let refl_edges = g
-            .mem
             .fetch_edges(Some(refl), None, Some(EdgeKind::DerivedFrom))
             .unwrap();
         assert_eq!(refl_edges[0].dst_id, goal);
@@ -1615,11 +1655,24 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(g.mem.fetch_one("agent", hyp).unwrap().unwrap().score, 0.6);
-        assert_eq!(g.mem.fetch_one("agent", refl).unwrap().unwrap().score, 0.8);
-        assert_eq!(g.mem.fetch_one("agent", cand).unwrap().unwrap().score, 0.7);
         assert_eq!(
-            g.mem.fetch_one("agent", verified).unwrap().unwrap().score,
+            g.mem.fetch_one("agent", hyp).unwrap().unwrap().importance,
+            0.6
+        );
+        assert_eq!(
+            g.mem.fetch_one("agent", refl).unwrap().unwrap().importance,
+            0.8
+        );
+        assert_eq!(
+            g.mem.fetch_one("agent", cand).unwrap().unwrap().importance,
+            0.7
+        );
+        assert_eq!(
+            g.mem
+                .fetch_one("agent", verified)
+                .unwrap()
+                .unwrap()
+                .importance,
             0.9
         );
     }
@@ -1635,9 +1688,7 @@ mod tests {
             .mem
             .remember("agent", AtomInput::new("evidence", "needle leaf context"))
             .unwrap();
-        g.mem
-            .link(child, parent, EdgeKind::DerivedFrom, 1.0)
-            .unwrap();
+        g.link(child, parent, EdgeKind::DerivedFrom, 1.0).unwrap();
 
         let mut cfg = RecallProfile::semantic_only();
         cfg.graph_expand = Some(GraphExpand::new(1, vec![EdgeKind::DerivedFrom]));
@@ -1709,7 +1760,7 @@ mod tests {
                     .immutable(),
             )
             .unwrap();
-        g.mem.link(x, v1, EdgeKind::Supersedes, 1.0).unwrap();
+        g.link(x, v1, EdgeKind::Supersedes, 1.0).unwrap();
         *g.self_model_head.lock().unwrap() = None; // force a re-seed
 
         assert!(matches!(

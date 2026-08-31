@@ -115,6 +115,7 @@ fn stale_plaintext_handles_refuse_reads_mutators_and_ann_persistence() {
         ("ann_status", |e, r, _| e.ann_cache_status(r).map(drop)),
         ("update_payload", |e, r, id| {
             e.update_atom_payload(r, id, &serde_json::json!({"stale": true}))
+                .map(drop)
         }),
         ("set_importance", |e, r, id| {
             e.set_importance(r, &[(id, 0.5)]).map(drop)
@@ -123,8 +124,8 @@ fn stale_plaintext_handles_refuse_reads_mutators_and_ann_persistence() {
         ("evict", |e, r, _| {
             e.evict(
                 r,
-                EvictionPolicy::LowScore {
-                    score_threshold: 1.0,
+                EvictionPolicy::LowImportance {
+                    importance_threshold: 1.0,
                     confidence_threshold: 1.0,
                 },
             )

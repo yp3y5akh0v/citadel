@@ -157,7 +157,11 @@ def test_an_embedder_is_required(tmp_path):
     partial = type(
         "PartialEmbedder",
         (),
-        {"dim": 8, "metric": "cosine", "embed": lambda self, texts: []},
+        {
+            "dim": 8,
+            "metric": "cosine",
+            "embed_with_cancel": lambda self, texts, cancel_token: [],
+        },
     )()
     with pytest.raises(TypeError, match="model_id"):
         CitadelChatMessageHistory(
@@ -180,7 +184,9 @@ def test_embedder_model_id_is_normalized_without_mutating_the_caller():
             "dim": 8,
             "metric": "cosine",
             "model_id": "  stable-model  ",
-            "embed": lambda self, texts: [[0.0] * 8 for _ in texts],
+            "embed_with_cancel": lambda self, texts, cancel_token: [
+                [0.0] * 8 for _ in texts
+            ],
         },
     )()
 
@@ -188,4 +194,4 @@ def test_embedder_model_id_is_normalized_without_mutating_the_caller():
 
     assert normalized.model_id == "stable-model"
     assert embedder.model_id == "  stable-model  "
-    assert len(normalized.embed(["probe"])[0]) == 8
+    assert len(normalized.embed_with_cancel(["probe"], None)[0]) == 8

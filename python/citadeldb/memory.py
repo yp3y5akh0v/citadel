@@ -15,6 +15,7 @@ from citadeldb._core import (
     MockReranker,
     RecallOptions,
     ReembedReport,
+    RememberOutcome,
     RegionIdentity,
     SlotErasure,
 )
@@ -32,6 +33,7 @@ __all__ = [
     "RegionIdentity",
     "ErasureReceipt",
     "ReembedReport",
+    "RememberOutcome",
     "SlotErasure",
     "AtomAttestation",
 ]

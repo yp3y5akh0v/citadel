@@ -6,6 +6,7 @@ use citadel_core::Result;
 use citadel_page::leaf_node::OverflowRef;
 
 use crate::overflow_io;
+use crate::ReadBudget;
 
 /// Lending iterator over `(key, value)` byte pairs for a table scan.
 ///
@@ -22,6 +23,7 @@ pub struct TableIter<T: TxnScanAdapter> {
     /// The token cannot change while the iterator owns or borrows its adapter,
     /// so capture it once rather than cloning the `Arc` for every row.
     cancel: Option<citadel_core::CancelToken>,
+    budget: Option<ReadBudget>,
     cursor: Cursor,
     key_buf: Vec<u8>,
     value_buf: Vec<u8>,
@@ -50,15 +52,21 @@ pub trait TxnScanAdapter {
         None
     }
 
+    fn read_budget(&self) -> Option<&ReadBudget> {
+        None
+    }
+
     fn record_rows_scanned(&self, _rows: u64) {}
 }
 
 impl<T: TxnScanAdapter> TableIter<T> {
     pub(crate) fn new(inner: T, cursor: Cursor) -> Self {
         let cancel = inner.cancel().cloned();
+        let budget = inner.read_budget().cloned();
         Self {
             inner,
             cancel,
+            budget,
             cursor,
             key_buf: Vec::new(),
             value_buf: Vec::new(),
@@ -95,6 +103,9 @@ impl<T: TxnScanAdapter> TableIter<T> {
                     Some(ValueType::Tombstone) | None => {}
                     Some(ValueType::Inline) => {
                         let entry = cursor.current_ref_lazy(pages).unwrap();
+                        if let Some(budget) = &self.budget {
+                            budget.try_charge(entry.value.len())?;
+                        }
                         key_buf.clear();
                         key_buf.extend_from_slice(entry.key);
                         value_buf.clear();
@@ -108,8 +119,12 @@ impl<T: TxnScanAdapter> TableIter<T> {
                             key_buf.extend_from_slice(c.key);
                             OverflowRef::from_bytes(c.value)
                         };
-                        let materialized =
-                            overflow_io::read_chain_value_with_cancel(pages, &oref, cancel)?;
+                        let materialized = overflow_io::read_chain_value_with_budget(
+                            pages,
+                            &oref,
+                            cancel,
+                            self.budget.as_ref(),
+                        )?;
                         value_buf.clear();
                         value_buf.extend_from_slice(&materialized);
                         emit = true;

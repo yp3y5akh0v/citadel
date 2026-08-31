@@ -31,16 +31,24 @@ impl Embedder for NeighborSwapEmbedder {
         }
     }
 
-    fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
-        Ok(texts
-            .iter()
-            .map(|text| match (*text, self.new_space) {
+    fn embed_with_cancel(
+        &self,
+        texts: &[&str],
+        cancel: Option<&citadel_core::CancelToken>,
+    ) -> Result<Vec<Vec<f32>>, EmbedError> {
+        let mut vectors = Vec::with_capacity(texts.len());
+        for text in texts {
+            if cancel.is_some_and(citadel_core::CancelToken::is_cancelled) {
+                return Err(EmbedError::Interrupted);
+            }
+            vectors.push(match (*text, self.new_space) {
                 ("source", _) => vec![1.0, 0.0],
                 ("old-neighbor", false) | ("new-neighbor", true) => vec![0.99, 0.1],
                 ("new-neighbor", false) | ("old-neighbor", true) => vec![0.0, 1.0],
                 _ => vec![0.0, 1.0],
-            })
-            .collect())
+            });
+        }
+        Ok(vectors)
     }
 }
 
@@ -109,6 +117,27 @@ fn read_edges(db: &Arc<citadel::Database>) -> Vec<String> {
     qr.rows.iter().map(|r| format!("{r:?}")).collect()
 }
 
+fn insert_legacy_edge(
+    db: &Arc<citadel::Database>,
+    src: i64,
+    dst: i64,
+    kind: citadel_mem::EdgeKind,
+    weight: f32,
+) {
+    citadel_sql::Connection::open(db)
+        .unwrap()
+        .execute_params(
+            "INSERT INTO memory_edges (src_id, dst_id, kind, weight) VALUES ($1, $2, $3, $4)",
+            &[
+                citadel_sql::Value::Integer(src),
+                citadel_sql::Value::Integer(dst),
+                citadel_sql::Value::Text(kind.as_str().into()),
+                citadel_sql::Value::Real(weight as f64),
+            ],
+        )
+        .unwrap();
+}
+
 /// `SimilarTo` edges typed, because the weight is the thing being asserted.
 fn read_similarity_edges(db: &Arc<citadel::Database>) -> Vec<(i64, i64, f32)> {
     let conn = citadel_sql::Connection::open(db).unwrap();
@@ -175,7 +204,7 @@ fn seeded(path: &std::path::Path) -> (Arc<citadel::Database>, MemoryEngine) {
             AtomInput::new("note", "alpha beta")
                 .with_created_at(1_700_000_000_000_000)
                 .with_confidence(0.75)
-                .with_score(0.5)
+                .with_importance(0.5)
                 .with_payload(serde_json::json!({"tag": "first"})),
         )
         .unwrap();
@@ -193,7 +222,7 @@ fn seeded(path: &std::path::Path) -> (Arc<citadel::Database>, MemoryEngine) {
         .unwrap();
 
     engine
-        .link(a, b, citadel_mem::EdgeKind::Refines, 0.9)
+        .link_in_region("notes", a, b, citadel_mem::EdgeKind::Refines, 0.9)
         .unwrap();
 
     (db, engine)
@@ -395,10 +424,22 @@ fn similarity_edges_are_rebuilt_over_the_new_vectors_and_authored_edges_survive(
         .collect();
     engine.evolve("notes", ids[0], 1, 1.5).unwrap();
     engine
-        .link(ids[2], ids[1], citadel_mem::EdgeKind::SimilarTo, 0.4)
+        .link_in_region(
+            "notes",
+            ids[2],
+            ids[1],
+            citadel_mem::EdgeKind::SimilarTo,
+            0.4,
+        )
         .unwrap();
     engine
-        .link(ids[2], ids[1], citadel_mem::EdgeKind::DerivedFrom, 1.0)
+        .link_in_region(
+            "notes",
+            ids[2],
+            ids[1],
+            citadel_mem::EdgeKind::DerivedFrom,
+            1.0,
+        )
         .unwrap();
 
     let report = engine
@@ -443,9 +484,9 @@ fn similarity_edges_are_rebuilt_over_the_new_vectors_and_authored_edges_survive(
         )
         .unwrap()
         .into_iter()
-        .filter(|h| h.id != ids[0] && h.distance <= 1.5)
+        .filter(|h| h.id != ids[0] && h.distance.is_some_and(|distance| distance <= 1.5))
         .take(1)
-        .map(|h| (h.id, h.distance))
+        .filter_map(|h| h.distance.map(|distance| (h.id, distance)))
         .collect();
     assert!(
         !expected.is_empty(),
@@ -522,7 +563,13 @@ fn an_authored_similarity_edge_is_not_reclassified_as_managed() {
         .map(|r| r.id)
         .collect();
     engine
-        .link(ids[0], ids[2], citadel_mem::EdgeKind::SimilarTo, 0.0)
+        .link_in_region(
+            "notes",
+            ids[0],
+            ids[2],
+            citadel_mem::EdgeKind::SimilarTo,
+            0.0,
+        )
         .unwrap();
 
     let report = engine
@@ -618,9 +665,7 @@ fn an_authored_external_similarity_edge_survives_reembedding_its_target() {
     let outside = engine
         .remember("other", AtomInput::new("note", "outside source"))
         .unwrap();
-    engine
-        .link(outside, note, citadel_mem::EdgeKind::SimilarTo, 0.1)
-        .unwrap();
+    insert_legacy_edge(&db, outside, note, citadel_mem::EdgeKind::SimilarTo, 0.1);
 
     let report = engine
         .reembed_region(
@@ -871,15 +916,22 @@ impl citadel_mem::Embedder for BlockingEmbedder {
     fn model_id(&self) -> &str {
         self.inner.model_id()
     }
-    fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, citadel_mem::EmbedError> {
+    fn embed_with_cancel(
+        &self,
+        texts: &[&str],
+        cancel: Option<&citadel_core::CancelToken>,
+    ) -> Result<Vec<Vec<f32>>, citadel_mem::EmbedError> {
         use std::sync::atomic::Ordering;
         if self.armed.load(Ordering::SeqCst) {
             self.entered.store(true, Ordering::SeqCst);
             while !self.release.load(Ordering::SeqCst) {
+                if cancel.is_some_and(citadel_core::CancelToken::is_cancelled) {
+                    return Err(citadel_mem::EmbedError::Interrupted);
+                }
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
         }
-        self.inner.embed(texts)
+        self.inner.embed_with_cancel(texts, cancel)
     }
 }
 
@@ -976,14 +1028,19 @@ impl citadel_mem::Embedder for StoppingEmbedder {
     fn model_id(&self) -> &str {
         self.inner.model_id()
     }
-    fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, citadel_mem::EmbedError> {
+    fn embed_with_cancel(
+        &self,
+        texts: &[&str],
+        cancel: Option<&citadel_core::CancelToken>,
+    ) -> Result<Vec<Vec<f32>>, citadel_mem::EmbedError> {
         let n = self
             .calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let vectors = self.inner.embed_with_cancel(texts, cancel)?;
         if n + 1 >= self.calls_before_stop {
             self.token.cancel();
         }
-        self.inner.embed(texts)
+        Ok(vectors)
     }
 }
 
@@ -1009,8 +1066,12 @@ impl citadel_mem::Embedder for CancelAndClearDatabaseEmbedder {
         self.inner.model_id()
     }
 
-    fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, citadel_mem::EmbedError> {
-        let vectors = self.inner.embed(texts);
+    fn embed_with_cancel(
+        &self,
+        texts: &[&str],
+        cancel: Option<&citadel_core::CancelToken>,
+    ) -> Result<Vec<Vec<f32>>, citadel_mem::EmbedError> {
+        let vectors = self.inner.embed_with_cancel(texts, cancel);
         self.token.cancel();
         self.database.set_cancel(None);
         vectors
@@ -1034,11 +1095,15 @@ impl citadel_mem::Embedder for BatchRecordingEmbedder {
     fn model_id(&self) -> &str {
         self.inner.model_id()
     }
-    fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, citadel_mem::EmbedError> {
+    fn embed_with_cancel(
+        &self,
+        texts: &[&str],
+        cancel: Option<&citadel_core::CancelToken>,
+    ) -> Result<Vec<Vec<f32>>, citadel_mem::EmbedError> {
         use std::sync::atomic::Ordering;
         self.calls.fetch_add(1, Ordering::Relaxed);
         self.largest.fetch_max(texts.len(), Ordering::Relaxed);
-        self.inner.embed(texts)
+        self.inner.embed_with_cancel(texts, cancel)
     }
 }
 
@@ -1074,10 +1139,18 @@ impl citadel_mem::Embedder for ReentrantDatabaseEmbedder {
         self.inner.model_id()
     }
 
-    fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, citadel_mem::EmbedError> {
+    fn embed_with_cancel(
+        &self,
+        texts: &[&str],
+        cancel: Option<&citadel_core::CancelToken>,
+    ) -> Result<Vec<Vec<f32>>, citadel_mem::EmbedError> {
         use std::sync::atomic::Ordering;
         use std::sync::mpsc;
         use std::time::Duration;
+
+        if cancel.is_some_and(citadel_core::CancelToken::is_cancelled) {
+            return Err(citadel_mem::EmbedError::Interrupted);
+        }
 
         if !self.entered.swap(true, Ordering::SeqCst) {
             let engine = Arc::clone(&self.engine);
@@ -1171,7 +1244,7 @@ impl citadel_mem::Embedder for ReentrantDatabaseEmbedder {
                 }
             }
         }
-        self.inner.embed(texts)
+        self.inner.embed_with_cancel(texts, cancel)
     }
 }
 
@@ -1263,8 +1336,16 @@ impl citadel_mem::Embedder for CompletingReentrantEmbedder {
         self.inner.model_id()
     }
 
-    fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, citadel_mem::EmbedError> {
+    fn embed_with_cancel(
+        &self,
+        texts: &[&str],
+        cancel: Option<&citadel_core::CancelToken>,
+    ) -> Result<Vec<Vec<f32>>, citadel_mem::EmbedError> {
         use std::sync::atomic::Ordering;
+
+        if cancel.is_some_and(citadel_core::CancelToken::is_cancelled) {
+            return Err(citadel_mem::EmbedError::Interrupted);
+        }
 
         if !self.entered.swap(true, Ordering::SeqCst) {
             self.engine
@@ -1277,7 +1358,7 @@ impl citadel_mem::Embedder for CompletingReentrantEmbedder {
                     citadel_mem::EmbedError::Backend(format!("competing re-embed failed: {error}"))
                 })?;
         }
-        self.inner.embed(texts)
+        self.inner.embed_with_cancel(texts, cancel)
     }
 }
 
@@ -1929,7 +2010,7 @@ fn zero_progress_new_target_restores_the_prior_repair_mark() {
     assert_eq!(format!("{:?}", fields.rows[0][1]), "Text(\"unrelated\")");
 }
 
-/// Reweaving serializes edge writers across engines sharing one database.
+/// Reweaving serializes region-safe edge writers across engines sharing one database.
 #[test]
 fn reweave_serializes_edge_writers_across_memory_engines() {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1944,15 +2025,7 @@ fn reweave_serializes_edge_writers_across_memory_engines() {
         .collect();
     let src = ids[0];
     engine.evolve("notes", src, 1, f32::MAX).unwrap();
-    engine
-        .create_region(
-            "foreign",
-            Arc::new(NamedEmbedder::new(DIM as usize, "model-a")),
-        )
-        .unwrap();
-    let foreign = engine
-        .remember("foreign", AtomInput::new("note", "foreign target"))
-        .unwrap();
+    let target = ids[3];
     let writer_engine = MemoryEngine::open(Arc::clone(&db)).unwrap();
 
     let (entered_tx, entered_rx) = mpsc::channel();
@@ -1987,17 +2060,36 @@ fn reweave_serializes_edge_writers_across_memory_engines() {
         .recv_timeout(Duration::from_secs(5))
         .expect("reweave hook was not reached");
 
-    let (attempt_tx, attempt_rx) = mpsc::channel();
-    db.debug_set_memory_edges_acquire_hook(Some(Box::new(move || {
-        let _ = attempt_tx.send(());
-    })));
+    let (started_tx, started_rx) = mpsc::channel();
     let (done_tx, done_rx) = mpsc::channel();
     std::thread::spawn(move || {
-        done_tx
-            .send(writer_engine.link(src, foreign, citadel_mem::EdgeKind::SimilarTo, 0.7))
-            .unwrap();
+        started_tx.send(()).unwrap();
+        let result = writer_engine
+            .create_region(
+                "notes",
+                Arc::new(NamedEmbedder::new(DIM as usize, "model-b")),
+            )
+            .and_then(|_| {
+                writer_engine.link_in_region(
+                    "notes",
+                    src,
+                    target,
+                    citadel_mem::EdgeKind::SimilarTo,
+                    0.7,
+                )
+            });
+        done_tx.send(result).unwrap();
     });
-    let writer_reached_shared_lock = attempt_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+    started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the second MemoryEngine did not start its edge write");
+    assert!(
+        matches!(
+            done_rx.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ),
+        "the region-safe edge writer was not serialized behind repair"
+    );
     let repair_holds_shared_lock = db.debug_memory_edges_is_locked();
     release_tx.send(()).unwrap();
 
@@ -2006,11 +2098,6 @@ fn reweave_serializes_edge_writers_across_memory_engines() {
         .expect("re-embed thread panicked")
         .expect("re-embed failed");
     db.debug_set_memory_edges_reweave_hook(None);
-    db.debug_set_memory_edges_acquire_hook(None);
-    assert!(
-        writer_reached_shared_lock,
-        "the second MemoryEngine did not reach the shared edge guard"
-    );
     assert!(
         repair_holds_shared_lock,
         "the complete repair did not hold the Database-scoped edge guard"
@@ -2022,7 +2109,7 @@ fn reweave_serializes_edge_writers_across_memory_engines() {
     assert!(
         read_similarity_edges(&db)
             .iter()
-            .any(|&(edge_src, edge_dst, _)| edge_src == src && edge_dst == foreign),
+            .any(|&(edge_src, edge_dst, _)| edge_src == src && edge_dst == target),
         "the edge committed after repair was lost"
     );
 }

@@ -2,10 +2,12 @@
 
 use std::sync::Arc;
 
+use citadel::CancelToken;
 use citadel_mem::types::{
-    AtomAttestation, AtomHit, AtomInput, EdgeKind, ErasureReceipt, EvictionPolicy, FetchQuery,
-    FusionWeights, GraphExpand, MemoryRegionInfo, MemoryRegionInventory, RecallQuery,
-    ReembedReport, RerankStrategy, SlotErasure, StoredRegionIdentity,
+    AtomAttestation, AtomHit, AtomInput, Edge, EdgeKind, ErasureReceipt, EvictionPolicy,
+    FetchQuery, FusionWeights, GraphExpand, MemoryRegionInfo, MemoryRegionInventory, RecallQuery,
+    ReembedReport, RememberOutcome, RerankStrategy, SlotErasure, StoredRegionIdentity,
+    SummaryQuery,
 };
 #[cfg(feature = "candle-embed")]
 use citadel_mem::{CandleConfig, CandleEmbedder, CrossEncoder};
@@ -13,16 +15,25 @@ use citadel_mem::{
     EmbedError, Embedder, EmbeddingMetric, MemoryEngine, MemoryMaintenance, MockEmbedder,
     MockReranker, Reranker,
 };
-use pyo3::exceptions::{PyTypeError, PyValueError};
+use pyo3::exceptions::{PyInterruptedError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict};
 use pyo3::IntoPyObjectExt;
 use serde_json::Value as Json;
 
+use crate::sql::PyCancelToken;
 use crate::vector::require_finite;
 use crate::{
     ann_index_source_dict, ann_segment_info_dict, dict_item, json_to_py, py_to_json, to_pyerr,
 };
+
+fn callback_error(py: Python<'_>, error: PyErr) -> EmbedError {
+    if error.is_instance_of::<PyInterruptedError>(py) {
+        EmbedError::Interrupted
+    } else {
+        EmbedError::Backend(error.to_string())
+    }
+}
 
 // ---- conversions / parsing -------------------------------------------------
 
@@ -46,19 +57,26 @@ fn embedding_metric_name(m: EmbeddingMetric) -> &'static str {
 }
 
 fn parse_edge_kind(s: &str) -> PyResult<EdgeKind> {
-    match s.to_ascii_lowercase().as_str() {
-        "causes" => Ok(EdgeKind::Causes),
-        "contradicts" => Ok(EdgeKind::Contradicts),
-        "refines" => Ok(EdgeKind::Refines),
-        "precedes" => Ok(EdgeKind::Precedes),
-        "supersedes" => Ok(EdgeKind::Supersedes),
-        "derived_from" => Ok(EdgeKind::DerivedFrom),
-        "depends_on" => Ok(EdgeKind::DependsOn),
-        "similar_to" => Ok(EdgeKind::SimilarTo),
-        other => Err(PyValueError::new_err(format!(
-            "unknown edge kind '{other}' (causes|contradicts|refines|precedes|supersedes|derived_from|depends_on|similar_to)"
-        ))),
-    }
+    let normalized = s.to_ascii_lowercase();
+    normalized.parse().map_err(|_| {
+        PyValueError::new_err(format!(
+            "unknown edge kind '{normalized}' (causes|contradicts|refines|precedes|supersedes|derived_from|depends_on|similar_to)"
+        ))
+    })
+}
+
+fn edge_to_py(py: Python<'_>, edge: &Edge) -> PyResult<Py<PyAny>> {
+    let row = PyDict::new(py);
+    row.set_item("src", edge.src_id)?;
+    row.set_item("dst", edge.dst_id)?;
+    row.set_item("kind", edge.kind.as_str())?;
+    row.set_item("weight", edge.weight)?;
+    let evidence = match &edge.evidence_ref {
+        Some(value) => json_to_py(py, value)?,
+        None => py.None(),
+    };
+    row.set_item("evidence", evidence)?;
+    row.into_py_any(py)
 }
 
 /// Build an `AtomInput` from a Python dict (`kind` + `text` required).
@@ -79,7 +97,7 @@ fn dict_to_atom_input(py: Python<'_>, d: &Bound<'_, PyDict>) -> PyResult<AtomInp
         kind,
         text,
         payload,
-        score: dict_item(d, "score")?
+        importance: dict_item(d, "importance")?
             .map(|v| v.extract())
             .transpose()?
             .unwrap_or(0.0),
@@ -106,14 +124,15 @@ fn dict_to_atom_input(py: Python<'_>, d: &Bound<'_, PyDict>) -> PyResult<AtomInp
 
 // ---- embedder bridge -------------------------------------------------------
 
-/// Adapts a Python embedder object to citadel-mem's `Embedder`. An
-/// `embed_queries` method, if present, enables E5-style asymmetric encoding.
+/// Adapts a token-aware Python embedder object to citadel-mem's `Embedder`.
+/// An `embed_queries_with_cancel` method, if present, enables E5-style
+/// asymmetric encoding.
 struct PyEmbedder {
     callable: Py<PyAny>,
     dim: usize,
     metric: EmbeddingMetric,
     model_id: String,
-    has_query_method: bool,
+    has_query_cancel_method: bool,
 }
 
 fn extract_embedder_dim(value: &Bound<'_, PyAny>) -> PyResult<usize> {
@@ -144,15 +163,15 @@ impl PyEmbedder {
                 "embedder model_id must be a nonblank string other than 'unknown' or 'default'",
             ));
         }
-        let has_query_method = obj.hasattr("embed_queries")?;
-        if !obj.hasattr("embed")? || !obj.getattr("embed")?.is_callable() {
+        let has_query_cancel_method = obj.hasattr("embed_queries_with_cancel")?;
+        if !obj.hasattr("embed_with_cancel")? || !obj.getattr("embed_with_cancel")?.is_callable() {
             return Err(PyTypeError::new_err(
-                "embedder must provide a callable embed(texts) method",
+                "embedder must provide a callable embed_with_cancel(texts, cancel_token) method",
             ));
         }
-        if has_query_method && !obj.getattr("embed_queries")?.is_callable() {
+        if has_query_cancel_method && !obj.getattr("embed_queries_with_cancel")?.is_callable() {
             return Err(PyTypeError::new_err(
-                "embedder embed_queries attribute must be callable",
+                "embedder embed_queries_with_cancel attribute must be callable",
             ));
         }
         Ok(Self {
@@ -160,19 +179,28 @@ impl PyEmbedder {
             dim,
             metric,
             model_id,
-            has_query_method,
+            has_query_cancel_method,
         })
     }
 
     /// Call `method` on the Python object and validate count + dim of the result.
-    fn call(&self, method: &str, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
+    fn call(
+        &self,
+        method: &str,
+        texts: &[&str],
+        cancel: Option<&CancelToken>,
+    ) -> Result<Vec<Vec<f32>>, EmbedError> {
         Python::attach(|py| {
             let arg: Vec<&str> = texts.to_vec();
+            let cancel = cancel
+                .map(|token| Py::new(py, PyCancelToken::from_inner(token.clone())))
+                .transpose()
+                .map_err(|error| EmbedError::Backend(error.to_string()))?;
             let out = self
                 .callable
                 .bind(py)
-                .call_method1(method, (arg,))
-                .map_err(|e| EmbedError::Backend(e.to_string()))?;
+                .call_method1(method, (arg, cancel))
+                .map_err(|error| callback_error(py, error))?;
             let vecs = out
                 .extract::<Vec<Vec<f32>>>()
                 .map_err(|e| EmbedError::Backend(e.to_string()))?;
@@ -208,15 +236,23 @@ impl Embedder for PyEmbedder {
         &self.model_id
     }
 
-    fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
-        self.call("embed", texts)
+    fn embed_with_cancel(
+        &self,
+        texts: &[&str],
+        cancel: Option<&CancelToken>,
+    ) -> Result<Vec<Vec<f32>>, EmbedError> {
+        self.call("embed_with_cancel", texts, cancel)
     }
 
-    fn embed_queries(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
-        if self.has_query_method {
-            self.call("embed_queries", texts)
+    fn embed_queries_with_cancel(
+        &self,
+        texts: &[&str],
+        cancel: Option<&CancelToken>,
+    ) -> Result<Vec<Vec<f32>>, EmbedError> {
+        if self.has_query_cancel_method {
+            self.call("embed_queries_with_cancel", texts, cancel)
         } else {
-            self.call("embed", texts)
+            self.call("embed_with_cancel", texts, cancel)
         }
     }
 }
@@ -238,8 +274,7 @@ fn build_embedder(obj: &Bound<'_, PyAny>) -> PyResult<Arc<dyn Embedder>> {
 
 // ---- reranker bridge -------------------------------------------------------
 
-/// Adapts a Python reranker object (`model_id` + `rerank(query, passages) ->
-/// list[float]`) to citadel-mem's `Reranker`.
+/// Adapts a token-aware Python reranker object to citadel-mem's `Reranker`.
 struct PyReranker {
     callable: Py<PyAny>,
     model_id: String,
@@ -254,9 +289,10 @@ impl PyReranker {
                 "reranker model_id must be a nonblank string",
             ));
         }
-        if !obj.hasattr("rerank")? || !obj.getattr("rerank")?.is_callable() {
+        if !obj.hasattr("rerank_with_cancel")? || !obj.getattr("rerank_with_cancel")?.is_callable()
+        {
             return Err(PyTypeError::new_err(
-                "reranker must provide a callable rerank(query, passages) method",
+                "reranker must provide a callable rerank_with_cancel(query, passages, cancel_token) method",
             ));
         }
         Ok(Self {
@@ -271,14 +307,23 @@ impl Reranker for PyReranker {
         &self.model_id
     }
 
-    fn rerank(&self, query: &str, passages: &[&str]) -> Result<Vec<f32>, EmbedError> {
+    fn rerank_with_cancel(
+        &self,
+        query: &str,
+        passages: &[&str],
+        cancel: Option<&CancelToken>,
+    ) -> Result<Vec<f32>, EmbedError> {
         Python::attach(|py| {
             let arg: Vec<&str> = passages.to_vec();
+            let cancel = cancel
+                .map(|token| Py::new(py, PyCancelToken::from_inner(token.clone())))
+                .transpose()
+                .map_err(|error| EmbedError::Backend(error.to_string()))?;
             let out = self
                 .callable
                 .bind(py)
-                .call_method1("rerank", (query, arg))
-                .map_err(|e| EmbedError::Backend(e.to_string()))?;
+                .call_method1("rerank_with_cancel", (query, arg, cancel))
+                .map_err(|error| callback_error(py, error))?;
             let scores = out
                 .extract::<Vec<f32>>()
                 .map_err(|e| EmbedError::Backend(e.to_string()))?;
@@ -340,6 +385,33 @@ impl PyMockReranker {
     #[new]
     fn new() -> Self {
         Self
+    }
+
+    #[getter]
+    fn model_id(&self) -> &str {
+        MockReranker.model_id()
+    }
+
+    fn rerank(&self, query: &str, passages: Vec<String>) -> PyResult<Vec<f32>> {
+        let refs: Vec<&str> = passages.iter().map(String::as_str).collect();
+        MockReranker.rerank(query, &refs).map_err(to_pyerr)
+    }
+
+    #[pyo3(signature = (query, passages, cancel_token=None))]
+    fn rerank_with_cancel(
+        &self,
+        query: &str,
+        passages: Vec<String>,
+        cancel_token: Option<PyRef<'_, PyCancelToken>>,
+    ) -> PyResult<Vec<f32>> {
+        let refs: Vec<&str> = passages.iter().map(String::as_str).collect();
+        MockReranker
+            .rerank_with_cancel(
+                query,
+                &refs,
+                cancel_token.as_deref().map(PyCancelToken::as_inner),
+            )
+            .map_err(to_pyerr)
     }
 }
 
@@ -440,6 +512,22 @@ impl PyCandleEmbedder {
         .map_err(to_pyerr)
     }
 
+    #[pyo3(signature = (texts, cancel_token=None))]
+    fn embed_with_cancel(
+        &self,
+        py: Python<'_>,
+        texts: Vec<String>,
+        cancel_token: Option<PyRef<'_, PyCancelToken>>,
+    ) -> PyResult<Vec<Vec<f32>>> {
+        let inner = self.inner.clone();
+        let cancel = cancel_token.map(|token| token.as_inner().clone());
+        py.detach(move || {
+            let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+            inner.embed_with_cancel(&refs, cancel.as_ref())
+        })
+        .map_err(to_pyerr)
+    }
+
     /// Embed queries with the model's query prefix for asymmetric retrieval;
     /// equals `embed` for symmetric presets.
     fn embed_queries(&self, py: Python<'_>, texts: Vec<String>) -> PyResult<Vec<Vec<f32>>> {
@@ -447,6 +535,22 @@ impl PyCandleEmbedder {
         py.detach(move || {
             let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
             inner.embed_queries(&refs)
+        })
+        .map_err(to_pyerr)
+    }
+
+    #[pyo3(signature = (texts, cancel_token=None))]
+    fn embed_queries_with_cancel(
+        &self,
+        py: Python<'_>,
+        texts: Vec<String>,
+        cancel_token: Option<PyRef<'_, PyCancelToken>>,
+    ) -> PyResult<Vec<Vec<f32>>> {
+        let inner = self.inner.clone();
+        let cancel = cancel_token.map(|token| token.as_inner().clone());
+        py.detach(move || {
+            let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+            inner.embed_queries_with_cancel(&refs, cancel.as_ref())
         })
         .map_err(to_pyerr)
     }
@@ -479,6 +583,32 @@ impl PyCrossEncoder {
     #[getter]
     fn model_id(&self) -> String {
         self.inner.model_id().to_string()
+    }
+
+    fn rerank(&self, py: Python<'_>, query: String, passages: Vec<String>) -> PyResult<Vec<f32>> {
+        let inner = self.inner.clone();
+        py.detach(move || {
+            let refs: Vec<&str> = passages.iter().map(String::as_str).collect();
+            inner.rerank(&query, &refs)
+        })
+        .map_err(to_pyerr)
+    }
+
+    #[pyo3(signature = (query, passages, cancel_token=None))]
+    fn rerank_with_cancel(
+        &self,
+        py: Python<'_>,
+        query: String,
+        passages: Vec<String>,
+        cancel_token: Option<PyRef<'_, PyCancelToken>>,
+    ) -> PyResult<Vec<f32>> {
+        let inner = self.inner.clone();
+        let cancel = cancel_token.map(|token| token.as_inner().clone());
+        py.detach(move || {
+            let refs: Vec<&str> = passages.iter().map(String::as_str).collect();
+            inner.rerank_with_cancel(&query, &refs, cancel.as_ref())
+        })
+        .map_err(to_pyerr)
     }
 }
 
@@ -523,16 +653,40 @@ impl PyMockEmbedder {
         self.inner.embed(&refs).map_err(to_pyerr)
     }
 
+    #[pyo3(signature = (texts, cancel_token=None))]
+    fn embed_with_cancel(
+        &self,
+        texts: Vec<String>,
+        cancel_token: Option<PyRef<'_, PyCancelToken>>,
+    ) -> PyResult<Vec<Vec<f32>>> {
+        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        self.inner
+            .embed_with_cancel(&refs, cancel_token.as_deref().map(PyCancelToken::as_inner))
+            .map_err(to_pyerr)
+    }
+
     /// Query-side embedding (symmetric for the mock: equals `embed`).
     fn embed_queries(&self, texts: Vec<String>) -> PyResult<Vec<Vec<f32>>> {
         let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
         self.inner.embed_queries(&refs).map_err(to_pyerr)
     }
+
+    #[pyo3(signature = (texts, cancel_token=None))]
+    fn embed_queries_with_cancel(
+        &self,
+        texts: Vec<String>,
+        cancel_token: Option<PyRef<'_, PyCancelToken>>,
+    ) -> PyResult<Vec<Vec<f32>>> {
+        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        self.inner
+            .embed_queries_with_cancel(&refs, cancel_token.as_deref().map(PyCancelToken::as_inner))
+            .map_err(to_pyerr)
+    }
 }
 
 // ---- result DTOs -----------------------------------------------------------
 
-/// A recalled atom with its raw distance and fused score.
+/// A fetched or recalled atom with explicit stored and query-time metadata.
 #[pyclass(name = "AtomHit")]
 pub(crate) struct PyAtomHit {
     #[pyo3(get)]
@@ -543,11 +697,19 @@ pub(crate) struct PyAtomHit {
     text: String,
     payload: Json,
     #[pyo3(get)]
-    distance: f32,
+    importance: f32,
     #[pyo3(get)]
-    score: f32,
+    confidence: f32,
+    #[pyo3(get)]
+    relevance: Option<f32>,
+    #[pyo3(get)]
+    distance: Option<f32>,
+    #[pyo3(get)]
+    graph_depth: Option<usize>,
     #[pyo3(get)]
     created_at: i64,
+    #[pyo3(get)]
+    expires_at: Option<i64>,
     #[pyo3(get)]
     immutable: bool,
 }
@@ -559,11 +721,43 @@ impl PyAtomHit {
             kind: h.kind,
             text: h.text,
             payload: h.payload,
+            importance: h.importance,
+            confidence: h.confidence,
+            relevance: h.relevance,
             distance: h.distance,
-            score: h.score,
+            graph_depth: h.graph_depth,
             created_at: h.created_at,
+            expires_at: h.expires_at,
             immutable: h.immutable,
         }
+    }
+}
+
+/// The stable result of an idempotent remember operation.
+#[pyclass(name = "RememberOutcome")]
+pub(crate) struct PyRememberOutcome {
+    #[pyo3(get)]
+    id: i64,
+    #[pyo3(get)]
+    inserted: bool,
+}
+
+impl PyRememberOutcome {
+    fn from_outcome(outcome: RememberOutcome) -> Self {
+        Self {
+            id: outcome.id,
+            inserted: outcome.inserted,
+        }
+    }
+}
+
+#[pymethods]
+impl PyRememberOutcome {
+    fn __repr__(&self) -> String {
+        format!(
+            "RememberOutcome(id={}, inserted={})",
+            self.id, self.inserted
+        )
     }
 }
 
@@ -576,8 +770,8 @@ impl PyAtomHit {
 
     fn __repr__(&self) -> String {
         format!(
-            "AtomHit(id={}, kind={:?}, score={:.4})",
-            self.id, self.kind, self.score
+            "AtomHit(id={}, kind={:?}, importance={:.4}, relevance={:?})",
+            self.id, self.kind, self.importance, self.relevance
         )
     }
 }
@@ -623,10 +817,10 @@ impl PyEvictionPolicy {
 
     /// Atoms below both thresholds.
     #[staticmethod]
-    fn low_score(score_threshold: f32, confidence_threshold: f32) -> Self {
+    fn low_importance(importance_threshold: f32, confidence_threshold: f32) -> Self {
         Self {
-            inner: EvictionPolicy::LowScore {
-                score_threshold,
+            inner: EvictionPolicy::LowImportance {
+                importance_threshold,
                 confidence_threshold,
             },
         }
@@ -1028,6 +1222,45 @@ impl PyRecallOptions {
     }
 }
 
+fn build_recall_query(
+    text: Option<String>,
+    embedding: Option<Vec<f32>>,
+    k: usize,
+    kinds: Option<Vec<String>>,
+    options: Option<&PyRecallOptions>,
+) -> PyResult<RecallQuery> {
+    if let Some(embedding) = embedding.as_deref() {
+        require_finite("embedding", embedding)?;
+    }
+    let mut query = match (text, embedding) {
+        (Some(text), None) => RecallQuery::by_text(text, k),
+        (None, Some(embedding)) => RecallQuery::by_embedding(embedding, k),
+        (Some(text), Some(embedding)) => RecallQuery::by_embedding(embedding, k).with_text(text),
+        (None, None) => return Err(PyValueError::new_err("text= or embedding= is required")),
+    };
+    if let Some(kinds) = kinds {
+        query = query.with_kinds(kinds);
+    }
+    if let Some(options) = options {
+        if let Some(filter) = &options.payload_filter {
+            query = query.with_payload_filter(filter.clone());
+        }
+        if let Some(weights) = options.weights {
+            query = query.with_weights(weights);
+        }
+        if let Some(as_of_micros) = options.as_of_micros {
+            query = query.with_as_of(as_of_micros);
+        }
+        if let Some(expand) = &options.graph_expand {
+            query = query.with_graph_expand(expand.clone());
+        }
+        if options.include_superseded {
+            query = query.with_superseded(true);
+        }
+    }
+    Ok(query)
+}
+
 // ---- maintenance -----------------------------------------------------------
 
 /// Model-free inventory, verification, and erasure over existing memory data.
@@ -1110,6 +1343,23 @@ impl PyMemoryMaintenance {
             .map_err(to_pyerr)?
             .into_iter()
             .map(PyAtomHit::from_hit)
+            .collect())
+    }
+
+    /// Fetch requested atoms in input order without loading an embedder.
+    fn fetch_by_ids(
+        &self,
+        py: Python<'_>,
+        region: &str,
+        ids: Vec<i64>,
+    ) -> PyResult<Vec<Option<PyAtomHit>>> {
+        let maintenance = Arc::clone(&self.inner);
+        let region = region.to_owned();
+        Ok(py
+            .detach(move || maintenance.fetch_by_ids(&region, &ids))
+            .map_err(to_pyerr)?
+            .into_iter()
+            .map(|hit| hit.map(PyAtomHit::from_hit))
             .collect())
     }
 
@@ -1291,6 +1541,49 @@ impl PyMemory {
             .map_err(to_pyerr)
     }
 
+    /// Remember one atom under a non-replacing idempotency key. An identical
+    /// retry returns the original id with `inserted = false`; changed reuse of
+    /// a live key fails without modifying the stored atom.
+    fn remember_if_absent_keyed(
+        &self,
+        py: Python<'_>,
+        region: &str,
+        atom: &Bound<'_, PyDict>,
+        key: &str,
+    ) -> PyResult<PyRememberOutcome> {
+        let input = dict_to_atom_input(py, atom)?;
+        let engine = Arc::clone(&self.inner);
+        let region = region.to_owned();
+        let key = key.to_owned();
+        py.detach(move || engine.remember_if_absent_keyed(&region, input, &[], None, &key))
+            .map(PyRememberOutcome::from_outcome)
+            .map_err(to_pyerr)
+    }
+
+    /// Store `(atom, key)` pairs atomically without replacing any live key.
+    /// Outcomes preserve input order and distinguish inserts from exact replays.
+    fn remember_if_absent_keyed_batch(
+        &self,
+        py: Python<'_>,
+        region: &str,
+        entries: Vec<(Py<PyDict>, String)>,
+    ) -> PyResult<Vec<PyRememberOutcome>> {
+        let inputs = entries
+            .iter()
+            .map(|(atom, key)| Ok((dict_to_atom_input(py, atom.bind(py))?, key.clone())))
+            .collect::<PyResult<Vec<_>>>()?;
+        let engine = Arc::clone(&self.inner);
+        let region = region.to_owned();
+        py.detach(move || engine.remember_if_absent_keyed_batch(&region, inputs))
+            .map(|outcomes| {
+                outcomes
+                    .into_iter()
+                    .map(PyRememberOutcome::from_outcome)
+                    .collect()
+            })
+            .map_err(to_pyerr)
+    }
+
     /// Remember one atom as the sole occupant of `key`, superseding whatever atom
     /// that key named before. Insert, rebind and the old row's delete commit
     /// together, so concurrent writers to one key serialize instead of each
@@ -1350,7 +1643,7 @@ impl PyMemory {
     }
 
     /// Hybrid recall by `text` (embedded + keyword-ranked) and/or a precomputed
-    /// `embedding`; returns the top `k` atoms by fused score. `options` carries the
+    /// `embedding`; returns the top `k` atoms by fused relevance. `options` carries the
     /// advanced `RecallQuery` modifiers (payload filter, weights, recency, graph).
     #[pyo3(signature = (region, *, text=None, embedding=None, k=10, kinds=None, options=None))]
     // The parameter list is the Python keyword signature; a struct would break it.
@@ -1365,45 +1658,52 @@ impl PyMemory {
         kinds: Option<Vec<String>>,
         options: Option<&PyRecallOptions>,
     ) -> PyResult<Vec<PyAtomHit>> {
-        if let Some(e) = embedding.as_deref() {
-            require_finite("embedding", e)?;
-        }
-        let mut q = match (text, embedding) {
-            (Some(t), None) => RecallQuery::by_text(t, k),
-            (None, Some(e)) => RecallQuery::by_embedding(e, k),
-            (Some(t), Some(e)) => RecallQuery::by_embedding(e, k).with_text(t),
-            (None, None) => {
-                return Err(PyValueError::new_err("recall requires text= or embedding="))
-            }
-        };
-        if let Some(ks) = kinds {
-            q = q.with_kinds(ks);
-        }
-        if let Some(opts) = options {
-            if let Some(pf) = &opts.payload_filter {
-                q = q.with_payload_filter(pf.clone());
-            }
-            if let Some(w) = opts.weights {
-                q = q.with_weights(w);
-            }
-            if let Some(m) = opts.as_of_micros {
-                q = q.with_as_of(m);
-            }
-            if let Some(ge) = &opts.graph_expand {
-                q = q.with_graph_expand(ge.clone());
-            }
-            if opts.include_superseded {
-                q = q.with_superseded(true);
-            }
-        }
+        let query = build_recall_query(text, embedding, k, kinds, options)?;
         let engine = Arc::clone(&self.inner);
         let region = region.to_owned();
         Ok(py
-            .detach(move || engine.recall(&region, q))
+            .detach(move || engine.recall(&region, query))
             .map_err(to_pyerr)?
             .into_iter()
             .map(PyAtomHit::from_hit)
             .collect())
+    }
+
+    /// Recall atoms and return their induced region-local edge subgraph.
+    #[pyo3(signature = (region, *, text=None, embedding=None, k=10, kinds=None, options=None, edge_limit=500))]
+    #[allow(clippy::too_many_arguments)]
+    fn profile(
+        &self,
+        py: Python<'_>,
+        region: &str,
+        text: Option<String>,
+        embedding: Option<Vec<f32>>,
+        k: usize,
+        kinds: Option<Vec<String>>,
+        options: Option<&PyRecallOptions>,
+        edge_limit: usize,
+    ) -> PyResult<Py<PyAny>> {
+        let query = build_recall_query(text, embedding, k, kinds, options)?;
+        let engine = Arc::clone(&self.inner);
+        let region = region.to_owned();
+        let profile = py
+            .detach(move || engine.profile(&region, query, edge_limit))
+            .map_err(to_pyerr)?;
+        let atoms = profile
+            .atoms
+            .into_iter()
+            .map(PyAtomHit::from_hit)
+            .collect::<Vec<_>>();
+        let edges = profile
+            .edges
+            .iter()
+            .map(|edge| edge_to_py(py, edge))
+            .collect::<PyResult<Vec<_>>>()?;
+        let result = PyDict::new(py);
+        result.set_item("atoms", atoms)?;
+        result.set_item("edges", edges)?;
+        result.set_item("edges_truncated", profile.edges_truncated)?;
+        result.into_py_any(py)
     }
 
     /// Non-semantic fetch of a `kind`, optionally narrowed by a JSONB `payload_filter`.
@@ -1448,6 +1748,23 @@ impl PyMemory {
             .map(PyAtomHit::from_hit))
     }
 
+    /// Fetch requested atoms in input order; missing atoms are returned as `None`.
+    fn fetch_by_ids(
+        &self,
+        py: Python<'_>,
+        region: &str,
+        ids: Vec<i64>,
+    ) -> PyResult<Vec<Option<PyAtomHit>>> {
+        let engine = Arc::clone(&self.inner);
+        let region = region.to_owned();
+        Ok(py
+            .detach(move || engine.fetch_by_ids(&region, &ids))
+            .map_err(to_pyerr)?
+            .into_iter()
+            .map(|hit| hit.map(PyAtomHit::from_hit))
+            .collect())
+    }
+
     fn count(&self, py: Python<'_>, region: &str, kind: &str) -> PyResult<u64> {
         let engine = Arc::clone(&self.inner);
         let region = region.to_owned();
@@ -1458,11 +1775,36 @@ impl PyMemory {
 
     /// Link two atoms with a typed edge (causes/contradicts/refines/precedes/
     /// supersedes/derived_from/depends_on/similar_to).
-    #[pyo3(signature = (src, dst, kind, weight=1.0))]
-    fn link(&self, py: Python<'_>, src: i64, dst: i64, kind: &str, weight: f32) -> PyResult<()> {
+    #[pyo3(signature = (region, src, dst, kind, weight=1.0))]
+    fn link(
+        &self,
+        py: Python<'_>,
+        region: &str,
+        src: i64,
+        dst: i64,
+        kind: &str,
+        weight: f32,
+    ) -> PyResult<()> {
         let engine = Arc::clone(&self.inner);
+        let region = region.to_owned();
         let kind = parse_edge_kind(kind)?;
-        py.detach(move || engine.link(src, dst, kind, weight))
+        py.detach(move || engine.link_in_region(&region, src, dst, kind, weight))
+            .map_err(to_pyerr)
+    }
+
+    /// Remove one exact typed edge. Returns false when it does not exist.
+    fn unlink(
+        &self,
+        py: Python<'_>,
+        region: &str,
+        src: i64,
+        dst: i64,
+        kind: &str,
+    ) -> PyResult<bool> {
+        let engine = Arc::clone(&self.inner);
+        let region = region.to_owned();
+        let kind = parse_edge_kind(kind)?;
+        py.detach(move || engine.unlink_in_region(&region, src, dst, kind))
             .map_err(to_pyerr)
     }
 
@@ -1477,20 +1819,29 @@ impl PyMemory {
             .removed)
     }
 
-    /// Forget atoms (cryptographic erasure on encrypted regions); returns a receipt.
-    #[pyo3(signature = (region, ids, force=false))]
+    /// Forget atoms, optionally including their transitive provenance dependents.
+    ///
+    /// Encrypted regions use cryptographic erasure and return its receipt.
+    #[pyo3(signature = (region, ids, force=false, cascade_dependents=false))]
     fn forget(
         &self,
         py: Python<'_>,
         region: &str,
         ids: Vec<i64>,
         force: bool,
+        cascade_dependents: bool,
     ) -> PyResult<PyErasureReceipt> {
         let engine = Arc::clone(&self.inner);
         let region = region.to_owned();
         Ok(PyErasureReceipt {
             inner: py
-                .detach(move || engine.forget_atoms(&region, &ids, force))
+                .detach(move || {
+                    if cascade_dependents {
+                        engine.forget_atoms_with_dependents(&region, &ids, force)
+                    } else {
+                        engine.forget_atoms(&region, &ids, force)
+                    }
+                })
                 .map_err(to_pyerr)?,
         })
     }
@@ -1512,19 +1863,21 @@ impl PyMemory {
             .collect())
     }
 
-    /// Replace an atom's JSON payload.
+    /// Replace an atom's JSON payload; returns false for an exact no-op.
     fn update_atom_payload(
         &self,
         py: Python<'_>,
         region: &str,
         atom_id: i64,
         payload: &Bound<'_, PyAny>,
-    ) -> PyResult<()> {
+    ) -> PyResult<bool> {
         let json = py_to_json(py, payload)?;
         let engine = Arc::clone(&self.inner);
         let region = region.to_owned();
-        py.detach(move || engine.update_atom_payload(&region, atom_id, &json))
-            .map_err(to_pyerr)
+        Ok(py
+            .detach(move || engine.update_atom_payload(&region, atom_id, &json))
+            .map_err(to_pyerr)?
+            .changed)
     }
 
     /// The most recently created atom of `kind`, if any.
@@ -1538,38 +1891,30 @@ impl PyMemory {
             .map(PyAtomHit::from_hit))
     }
 
-    /// Read edges, optionally filtered by `src`/`dst`/`kind`; each is
-    /// `{src, dst, kind, weight, evidence}`.
-    #[pyo3(signature = (*, src=None, dst=None, kind=None))]
+    /// Read at most `limit` live region-local edges, optionally filtered by
+    /// `src`/`dst`/`kind`; each is `{src, dst, kind, weight, evidence}`.
+    #[pyo3(signature = (region, *, src=None, dst=None, kind=None, limit=1000))]
     fn fetch_edges(
         &self,
         py: Python<'_>,
+        region: &str,
         src: Option<i64>,
         dst: Option<i64>,
         kind: Option<String>,
+        limit: usize,
     ) -> PyResult<Vec<Py<PyAny>>> {
         let kind = kind.map(|s| parse_edge_kind(&s)).transpose()?;
         let engine = Arc::clone(&self.inner);
-        py.detach(move || engine.fetch_edges(src, dst, kind))
+        let region = region.to_owned();
+        py.detach(move || engine.fetch_edges_in_region(&region, src, dst, kind, limit))
             .map_err(to_pyerr)?
             .iter()
-            .map(|e| {
-                let d = PyDict::new(py);
-                d.set_item("src", e.src_id)?;
-                d.set_item("dst", e.dst_id)?;
-                d.set_item("kind", e.kind.as_str())?;
-                d.set_item("weight", e.weight)?;
-                let evidence = match &e.evidence_ref {
-                    Some(j) => json_to_py(py, j)?,
-                    None => py.None(),
-                };
-                d.set_item("evidence", evidence)?;
-                d.into_py_any(py)
-            })
+            .map(|edge| edge_to_py(py, edge))
             .collect()
     }
 
-    /// Recompute an atom's `similar_to` links by ANN search; returns `{links_added, score}`.
+    /// Recompute an atom's `similar_to` links by ANN search; returns
+    /// `{links_added, importance}`.
     fn evolve(
         &self,
         py: Python<'_>,
@@ -1585,16 +1930,28 @@ impl PyMemory {
             .map_err(to_pyerr)?;
         let d = PyDict::new(py);
         d.set_item("links_added", r.links_added)?;
-        d.set_item("score", r.score)?;
+        d.set_item("importance", r.importance)?;
         d.into_py_any(py)
     }
 
-    /// Structural digest of a region since `since_micros`: `{total, kinds: [...]}`.
-    fn summarize(&self, py: Python<'_>, region: &str, since_micros: i64) -> PyResult<Py<PyAny>> {
+    /// One bounded kind-summary page since `since_micros`.
+    #[pyo3(signature = (region, since_micros, *, after_kind=None, limit=256))]
+    fn summarize(
+        &self,
+        py: Python<'_>,
+        region: &str,
+        since_micros: i64,
+        after_kind: Option<String>,
+        limit: usize,
+    ) -> PyResult<Py<PyAny>> {
         let engine = Arc::clone(&self.inner);
         let region = region.to_owned();
+        let mut query = SummaryQuery::new(since_micros, limit);
+        if let Some(after_kind) = after_kind {
+            query = query.with_after_kind(after_kind);
+        }
         let r = py
-            .detach(move || engine.summarize(&region, since_micros))
+            .detach(move || engine.summarize_page(&region, &query))
             .map_err(to_pyerr)?;
         let kinds = r
             .kinds
@@ -1605,7 +1962,7 @@ impl PyMemory {
                 k.set_item("count", kd.count)?;
                 k.set_item("earliest", kd.earliest)?;
                 k.set_item("latest", kd.latest)?;
-                k.set_item("avg_score", kd.avg_score)?;
+                k.set_item("avg_importance", kd.avg_importance)?;
                 k.set_item("avg_confidence", kd.avg_confidence)?;
                 k.into_py_any(py)
             })
@@ -1613,13 +1970,14 @@ impl PyMemory {
         let d = PyDict::new(py);
         d.set_item("total", r.total)?;
         d.set_item("kinds", kinds)?;
+        d.set_item("next_after_kind", r.next_after_kind)?;
         d.into_py_any(py)
     }
 
     /// Attach a cross-encoder reranker applied in `recall` before truncation.
     /// `reranker` is a built-in `MockReranker`/`CrossEncoder` or any object with
-    /// `model_id` + `rerank(query, passages) -> list[float]`. `strategy` is "rrf"
-    /// (reciprocal-rank fusion, damping `rrf_k`) or "replace".
+    /// `model_id` + `rerank_with_cancel(query, passages, cancel_token)`. `strategy`
+    /// is "rrf" (reciprocal-rank fusion, damping `rrf_k`) or "replace".
     #[pyo3(signature = (reranker, *, strategy="rrf", rrf_k=20.0))]
     fn set_reranker(
         &self,

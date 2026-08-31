@@ -9,6 +9,7 @@ use citadel_mem::{
     AtomInput, EdgeKind, Embedder, EvictionPolicy, GraphExpand, MemoryEngine, MockEmbedder,
     MockReranker, RecallQuery, RerankStrategy,
 };
+use citadel_sql::{Connection, Value};
 use serde_json::json;
 use std::sync::Arc;
 
@@ -28,6 +29,21 @@ fn open_enc_db(path: &std::path::Path, pass: &[u8], create: bool) -> citadel::Re
 
 fn embedder() -> Arc<MockEmbedder> {
     Arc::new(MockEmbedder::new(DIM))
+}
+
+fn insert_legacy_edge(db: &Database, src: i64, dst: i64, kind: EdgeKind) {
+    Connection::open(db)
+        .unwrap()
+        .execute_params(
+            "INSERT INTO memory_edges (src_id, dst_id, kind, weight) VALUES ($1, $2, $3, $4)",
+            &[
+                Value::Integer(src),
+                Value::Integer(dst),
+                Value::Text(kind.as_str().into()),
+                Value::Real(1.0),
+            ],
+        )
+        .unwrap();
 }
 
 #[test]
@@ -203,7 +219,8 @@ fn sealed_read_paths_are_functional() {
     let c = eng
         .remember("r", AtomInput::new("fact", "the sky is blue"))
         .unwrap();
-    eng.link(a, b, EdgeKind::DerivedFrom, 1.0).unwrap();
+    eng.link_in_region("r", a, b, EdgeKind::DerivedFrom, 1.0)
+        .unwrap();
 
     // fetch by kind, fetch_one, fetch_last all decrypt correctly.
     let facts = eng.fetch("r", "fact", None, 10).unwrap();
@@ -271,8 +288,10 @@ fn sealed_graph_expand_respects_atom_kind_filter() {
     let blocked = eng
         .remember("r", AtomInput::new("audit", "blocked audit neighbor"))
         .unwrap();
-    eng.link(seed, allowed, EdgeKind::DerivedFrom, 1.0).unwrap();
-    eng.link(seed, blocked, EdgeKind::DerivedFrom, 1.0).unwrap();
+    eng.link_in_region("r", seed, allowed, EdgeKind::DerivedFrom, 1.0)
+        .unwrap();
+    eng.link_in_region("r", seed, blocked, EdgeKind::DerivedFrom, 1.0)
+        .unwrap();
 
     let hits = eng
         .recall(
@@ -376,7 +395,8 @@ fn encrypted_region_survives_close_and_reopen() {
         let b = eng
             .remember("r", AtomInput::new("fact", "beta lazy dog"))
             .unwrap();
-        eng.link(a, b, EdgeKind::DerivedFrom, 1.0).unwrap();
+        eng.link_in_region("r", a, b, EdgeKind::DerivedFrom, 1.0)
+            .unwrap();
         (a, b)
     };
 
@@ -535,25 +555,28 @@ fn backup_then_forget_live_vs_backup_with_sibling_survival() {
 fn forget_encrypted_region_with_cross_region_edges() {
     let dir = tempfile::tempdir().unwrap();
     let db = Arc::new(open_enc_db(&dir.path().join("m.db"), b"pw", true).unwrap());
-    let eng = MemoryEngine::open(db).unwrap();
+    let eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
     eng.create_encrypted_region("a", embedder()).unwrap();
     eng.create_encrypted_region("b", embedder()).unwrap();
     let a1 = eng.remember("a", AtomInput::new("fact", "a-one")).unwrap();
     let a2 = eng.remember("a", AtomInput::new("fact", "a-two")).unwrap();
     let b1 = eng.remember("b", AtomInput::new("fact", "b-one")).unwrap();
-    eng.link(a1, b1, EdgeKind::DerivedFrom, 1.0).unwrap(); // A -> B
-    eng.link(b1, a2, EdgeKind::DerivedFrom, 1.0).unwrap(); // B -> A
-    eng.link(a1, a2, EdgeKind::DerivedFrom, 1.0).unwrap(); // intra-A
+    insert_legacy_edge(&db, a1, b1, EdgeKind::DerivedFrom); // A -> B
+    insert_legacy_edge(&db, b1, a2, EdgeKind::DerivedFrom); // B -> A
+    eng.link_in_region("a", a1, a2, EdgeKind::DerivedFrom, 1.0)
+        .unwrap();
 
     eng.drop_region("a").unwrap();
 
     // Every edge incident to a1/a2 (both directions, intra and cross) is gone.
-    assert!(eng.fetch_edges(Some(a1), None, None).unwrap().is_empty());
-    assert!(eng.fetch_edges(None, Some(a2), None).unwrap().is_empty());
-    assert!(eng
-        .fetch_edges(Some(a1), Some(a2), None)
+    let remaining = Connection::open(&db)
         .unwrap()
-        .is_empty());
+        .query_params(
+            "SELECT src_id FROM memory_edges WHERE src_id IN ($1, $2) OR dst_id IN ($1, $2)",
+            &[Value::Integer(a1), Value::Integer(a2)],
+        )
+        .unwrap();
+    assert!(remaining.rows.is_empty());
     // B's atoms survive and recall; re-creating A by name is empty.
     assert!(eng
         .recall("b", RecallQuery::by_text("b-one", 5))
@@ -709,7 +732,7 @@ fn encrypted_immutable_expires_and_nonpredicate_eviction() {
         .evict(
             "r",
             EvictionPolicy::Stale {
-                older_than_micros: 0,
+                older_than_micros: 1,
             },
         )
         .unwrap();
@@ -766,7 +789,9 @@ fn evolve_and_update_payload_on_encrypted_region_across_reopen() {
         "re-sealed payload survives reopen"
     );
     assert!(
-        !eng.fetch_edges(Some(a), Some(b), None).unwrap().is_empty(),
+        !eng.fetch_edges_in_region("r", Some(a), Some(b), None, 10)
+            .unwrap()
+            .is_empty(),
         "evolve edge a->b survived reopen"
     );
 }

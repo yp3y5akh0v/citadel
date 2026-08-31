@@ -1,5 +1,7 @@
 //! Pluggable text-to-vector embedding backends.
 
+use citadel_core::CancelToken;
+
 /// Distance metric for comparing an embedder's vectors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EmbeddingMetric {
@@ -10,8 +12,19 @@ pub enum EmbeddingMetric {
 
 #[derive(Debug, thiserror::Error)]
 pub enum EmbedError {
+    #[error("embedding operation interrupted")]
+    Interrupted,
     #[error("embedding backend error: {0}")]
     Backend(String),
+}
+
+#[inline]
+pub(crate) fn check_cancel(cancel: Option<&CancelToken>) -> Result<(), EmbedError> {
+    if cancel.is_some_and(CancelToken::is_cancelled) {
+        Err(EmbedError::Interrupted)
+    } else {
+        Ok(())
+    }
 }
 
 pub(crate) fn normalize_model_id_label(model_id: &str) -> Result<String, String> {
@@ -28,6 +41,25 @@ pub(crate) fn normalize_model_id_label(model_id: &str) -> Result<String, String>
 }
 
 /// Sync, bring-your-own embedding backend: text -> fixed-dim vectors.
+///
+/// Implementations must expose the cancellation-aware passage path. The
+/// non-cancellable convenience method is derived from it, so a backend cannot
+/// satisfy this trait by implementing only a blocking legacy callback.
+///
+/// ```compile_fail
+/// use citadel_mem::{EmbedError, Embedder, EmbeddingMetric};
+///
+/// struct BlockingLegacyBackend;
+///
+/// impl Embedder for BlockingLegacyBackend {
+///     fn dim(&self) -> usize { 1 }
+///     fn metric(&self) -> EmbeddingMetric { EmbeddingMetric::Cosine }
+///     fn model_id(&self) -> &str { "legacy" }
+///     fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
+///         Ok(vec![vec![0.0]; texts.len()])
+///     }
+/// }
+/// ```
 pub trait Embedder: Send + Sync {
     fn dim(&self) -> usize;
     fn metric(&self) -> EmbeddingMetric;
@@ -35,22 +67,63 @@ pub trait Embedder: Send + Sync {
     /// [`dim`](Self::dim) and [`metric`](Self::metric), the same value promises
     /// that stored texts produce compatible vectors.
     fn model_id(&self) -> &str;
-    /// Embed a batch of stored texts (the passage side), one vector per input,
-    /// each of length `dim()`.
-    fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError>;
+    /// Cooperatively embed stored texts (the passage side), polling `cancel`
+    /// during tokenization and inference. Returns one `dim()`-wide vector per
+    /// input.
+    fn embed_with_cancel(
+        &self,
+        texts: &[&str],
+        cancel: Option<&CancelToken>,
+    ) -> Result<Vec<Vec<f32>>, EmbedError>;
+    /// Embed stored texts without a cancellation token.
+    fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        self.embed_with_cancel(texts, None)
+    }
     /// Embed a batch of search queries. Asymmetric retrieval models (E5's
     /// `query: `/`passage: ` format) encode the two sides differently; symmetric
-    /// models keep the default, which is identical to [`embed`](Self::embed).
+    /// models keep the default, which uses their cancellable passage path.
     fn embed_queries(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
-        self.embed(texts)
+        self.embed_queries_with_cancel(texts, None)
+    }
+    /// Cooperatively cancellable query embedding. Symmetric models delegate to
+    /// their required passage implementation; asymmetric models override this.
+    fn embed_queries_with_cancel(
+        &self,
+        texts: &[&str],
+        cancel: Option<&CancelToken>,
+    ) -> Result<Vec<Vec<f32>>, EmbedError> {
+        self.embed_with_cancel(texts, cancel)
     }
 }
 
 /// Sync, bring-your-own reranker: scores `(query, passage)` pairs jointly (higher = better).
+///
+/// ```compile_fail
+/// use citadel_mem::{EmbedError, Reranker};
+///
+/// struct BlockingLegacyReranker;
+///
+/// impl Reranker for BlockingLegacyReranker {
+///     fn model_id(&self) -> &str { "legacy" }
+///     fn rerank(&self, _: &str, passages: &[&str]) -> Result<Vec<f32>, EmbedError> {
+///         Ok(vec![0.0; passages.len()])
+///     }
+/// }
+/// ```
 pub trait Reranker: Send + Sync {
     fn model_id(&self) -> &str;
-    /// One relevance score per passage, in input order (`passages.len()` scores).
-    fn rerank(&self, query: &str, passages: &[&str]) -> Result<Vec<f32>, EmbedError>;
+    /// Cooperatively rerank passages, polling `cancel` during tokenization and
+    /// inference. Returns one relevance score per passage, in input order.
+    fn rerank_with_cancel(
+        &self,
+        query: &str,
+        passages: &[&str],
+        cancel: Option<&CancelToken>,
+    ) -> Result<Vec<f32>, EmbedError>;
+    /// Rerank without a cancellation token.
+    fn rerank(&self, query: &str, passages: &[&str]) -> Result<Vec<f32>, EmbedError> {
+        self.rerank_with_cancel(query, passages, None)
+    }
 }
 
 /// Deterministic test reranker: scores a passage by how many query words it repeats.
@@ -61,12 +134,25 @@ impl Reranker for MockReranker {
         "mock-reranker"
     }
 
-    fn rerank(&self, query: &str, passages: &[&str]) -> Result<Vec<f32>, EmbedError> {
+    fn rerank_with_cancel(
+        &self,
+        query: &str,
+        passages: &[&str],
+        cancel: Option<&CancelToken>,
+    ) -> Result<Vec<f32>, EmbedError> {
         let q: Vec<&str> = query.split_whitespace().collect();
-        Ok(passages
-            .iter()
-            .map(|p| p.split_whitespace().filter(|w| q.contains(w)).count() as f32)
-            .collect())
+        let mut scores = Vec::with_capacity(passages.len());
+        for passage in passages {
+            check_cancel(cancel)?;
+            scores.push(
+                passage
+                    .split_whitespace()
+                    .filter(|word| q.contains(word))
+                    .count() as f32,
+            );
+        }
+        check_cancel(cancel)?;
+        Ok(scores)
     }
 }
 
@@ -102,8 +188,18 @@ impl Embedder for MockEmbedder {
         "mock-fnv1a-bow-v1"
     }
 
-    fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
-        Ok(texts.iter().map(|t| hashed_bow(t, self.dim)).collect())
+    fn embed_with_cancel(
+        &self,
+        texts: &[&str],
+        cancel: Option<&CancelToken>,
+    ) -> Result<Vec<Vec<f32>>, EmbedError> {
+        let mut vectors = Vec::with_capacity(texts.len());
+        for text in texts {
+            check_cancel(cancel)?;
+            vectors.push(hashed_bow(text, self.dim));
+        }
+        check_cancel(cancel)?;
+        Ok(vectors)
     }
 }
 
@@ -127,6 +223,56 @@ fn hashed_bow(text: &str, dim: usize) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct TokenAwareEmbedder {
+        calls: AtomicUsize,
+    }
+
+    impl Embedder for TokenAwareEmbedder {
+        fn dim(&self) -> usize {
+            1
+        }
+
+        fn metric(&self) -> EmbeddingMetric {
+            EmbeddingMetric::Cosine
+        }
+
+        fn model_id(&self) -> &str {
+            "token-aware"
+        }
+
+        fn embed_with_cancel(
+            &self,
+            texts: &[&str],
+            cancel: Option<&CancelToken>,
+        ) -> Result<Vec<Vec<f32>>, EmbedError> {
+            check_cancel(cancel)?;
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(vec![vec![1.0]; texts.len()])
+        }
+    }
+
+    struct TokenAwareReranker {
+        calls: AtomicUsize,
+    }
+
+    impl Reranker for TokenAwareReranker {
+        fn model_id(&self) -> &str {
+            "token-aware"
+        }
+
+        fn rerank_with_cancel(
+            &self,
+            _query: &str,
+            passages: &[&str],
+            cancel: Option<&CancelToken>,
+        ) -> Result<Vec<f32>, EmbedError> {
+            check_cancel(cancel)?;
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(vec![1.0; passages.len()])
+        }
+    }
 
     fn cosine(a: &[f32], b: &[f32]) -> f32 {
         let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
@@ -137,6 +283,35 @@ mod tests {
         } else {
             dot / (na * nb)
         }
+    }
+
+    #[test]
+    fn required_cancellable_paths_power_the_convenience_methods() {
+        let embedder = TokenAwareEmbedder {
+            calls: AtomicUsize::new(0),
+        };
+        let reranker = TokenAwareReranker {
+            calls: AtomicUsize::new(0),
+        };
+        let live = CancelToken::new();
+
+        assert_eq!(embedder.embed(&["text"]).unwrap(), vec![vec![1.0]]);
+        assert_eq!(embedder.embed_queries(&["query"]).unwrap(), vec![vec![1.0]]);
+        assert_eq!(reranker.rerank("query", &["passage"]).unwrap(), vec![1.0]);
+        assert_eq!(embedder.calls.load(Ordering::Relaxed), 2);
+        assert_eq!(reranker.calls.load(Ordering::Relaxed), 1);
+
+        live.cancel();
+        assert!(matches!(
+            embedder.embed_with_cancel(&["not called"], Some(&live)),
+            Err(EmbedError::Interrupted)
+        ));
+        assert!(matches!(
+            reranker.rerank_with_cancel("query", &["not called"], Some(&live)),
+            Err(EmbedError::Interrupted)
+        ));
+        assert_eq!(embedder.calls.load(Ordering::Relaxed), 2);
+        assert_eq!(reranker.calls.load(Ordering::Relaxed), 1);
     }
 
     #[test]

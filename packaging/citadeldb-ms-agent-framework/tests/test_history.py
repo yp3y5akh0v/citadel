@@ -369,7 +369,11 @@ def test_an_embedder_is_required(tmp_path):
     partial = type(
         "PartialEmbedder",
         (),
-        {"dim": 8, "metric": "cosine", "embed": lambda self, texts: []},
+        {
+            "dim": 8,
+            "metric": "cosine",
+            "embed_with_cancel": lambda self, texts, cancel_token: [],
+        },
     )()
     with pytest.raises(TypeError, match="model_id"):
         CitadelHistoryProvider(
@@ -387,7 +391,9 @@ def test_history_normalizes_model_id_without_mutating_the_caller(tmp_path):
             "dim": 8,
             "metric": "cosine",
             "model_id": "  stable-model  ",
-            "embed": lambda self, texts: [[0.0] * 8 for _ in texts],
+            "embed_with_cancel": lambda self, texts, cancel_token: [
+                [0.0] * 8 for _ in texts
+            ],
         },
     )()
     path = str(tmp_path / "normalized-history.cdl")

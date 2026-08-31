@@ -8,6 +8,10 @@ that destroy the key, not just the row.
 pip install citadeldb-openai-agents
 ```
 
+The session protocol below reads complete transcripts by id and never performs semantic
+search, so its explicit mock avoids unused model work. The e5-large search setup is shown
+separately.
+
 ```python
 import citadeldb
 from agents import Agent, Runner
@@ -17,7 +21,7 @@ session = CitadelSession(
     "user-123",
     "agent.cdl",
     key="your-passphrase",
-    embedder=citadeldb.MockEmbedder(dim=64),  # see Notes for a real model
+    embedder=citadeldb.MockEmbedder(dim=64),  # intentional transcript-only store
 )
 
 agent = Agent(name="assistant", instructions="Be brief.")
@@ -40,7 +44,7 @@ from citadeldb_openai_agents import CitadelSessionStore
 store = CitadelSessionStore(
     "agent.cdl",
     key="your-passphrase",
-    embedder=citadeldb.MockEmbedder(dim=64),
+    embedder=citadeldb.MockEmbedder(dim=64),  # sessions are read by id
 )
 alice = store.session("user-alice")
 bob = store.session("user-bob")
@@ -70,15 +74,25 @@ but the ciphertext and its key both remain.
 Beyond the protocol, a session can be searched with Citadel's hybrid recall, which ranks
 on vector distance, keyword rank and recency rather than on an exact match:
 
+This semantic example uses local e5-large. `CandleEmbedder` requires a `citadeldb`
+source wheel built with `--features candle-embed`; the default wheel accepts an
+equivalent real bring-your-own embedder.
+
 ```python
-await session.add_items(
+semantic_store = CitadelSessionStore(
+    "semantic-sessions.cdl",
+    key="your-passphrase",
+    embedder=citadeldb.CandleEmbedder("/path/to/e5-large", preset="e5-large"),
+)
+semantic_session = semantic_store.session("user-123")
+await semantic_session.add_items(
     [
         {"role": "user", "content": "the deployment failed because the disk was full"},
         {"role": "user", "content": "lunch plans for friday"},
     ]
 )
 
-await session.search("why did the release break?", limit=1)
+await semantic_session.search("why did the release break?", limit=1)
 # [{'content': 'the deployment failed because the disk was full', 'role': 'user'}]
 ```
 
@@ -92,7 +106,7 @@ import citadeldb
 store = CitadelSessionStore(
     "agent.cdl",
     key="your-passphrase",
-    embedder=citadeldb.MockEmbedder(dim=64),
+    embedder=citadeldb.MockEmbedder(dim=64),  # TTL reads are session-id based
     ttl=86400,  # seconds
 )
 ```
@@ -107,26 +121,14 @@ the `openai` package, so the stored payload is never normalised: function calls,
 items and multi-part content all round-trip unchanged. Only a plain-text projection of
 `content` is derived, for search ranking.
 
-`embedder=` is required. There is no default: quietly substituting `MockEmbedder` would change
-ranking semantics and persist different provenance. `MockEmbedder` needs no download and is
-enough to run an agent and to test, so pass it explicitly if that is what you want. `search`
-only becomes semantically useful with a real embedder. `CandleEmbedder`
-is not in the default `citadeldb` wheel and needs a source build (`maturin build --features
-candle-embed`); any object exposing `dim`, `metric`, `model_id`, `embed` and `embed_queries`
-works too:
+`embedder=` is required. There is no default: changing the model changes ranking semantics
+and persisted provenance. A bring-your-own object exposes `dim`, `metric`, `model_id`, and
+`embed_with_cancel(texts, cancel_token)`; asymmetric models may also provide
+`embed_queries_with_cancel`. Use `MockEmbedder` only for transcript-by-id flows or
+deliberate lexical-only tests.
 
 A session created with `store=` inherits that store's database, region, embedder, and TTL;
 passing any of those options alongside `store=` is rejected instead of silently ignoring it.
-
-```python
-import citadeldb
-
-store = CitadelSessionStore(
-    "agent.cdl",
-    key="your-passphrase",
-    embedder=citadeldb.CandleEmbedder("/path/to/e5-large", preset="e5-large"),
-)
-```
 
 ## License
 

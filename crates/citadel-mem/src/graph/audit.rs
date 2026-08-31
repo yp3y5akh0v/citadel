@@ -75,7 +75,8 @@ fn verify_closure(
             if !visited.insert(id) {
                 continue;
             }
-            let edges = eng.fetch_edges(Some(id), None, Some(EdgeKind::DerivedFrom))?;
+            let edges =
+                eng.fetch_all_edges_in_region(region, Some(id), None, Some(EdgeKind::DerivedFrom))?;
             if edges.is_empty() {
                 return Ok(Some(format!("derived atom {id} has no DerivedFrom edge")));
             }

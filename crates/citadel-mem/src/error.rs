@@ -5,9 +5,9 @@ pub type Result<T> = std::result::Result<T, MemError>;
 #[derive(Debug, thiserror::Error)]
 pub enum MemError {
     #[error(transparent)]
-    Sql(#[from] citadel_sql::SqlError),
+    Sql(citadel_sql::SqlError),
     #[error(transparent)]
-    Embed(#[from] EmbedError),
+    Embed(EmbedError),
     #[error(transparent)]
     Core(#[from] citadel_core::Error),
     #[error(transparent)]
@@ -23,6 +23,12 @@ pub enum MemError {
     RegionNotAttached(String),
     #[error("link {src}->{dst} would create a cycle")]
     Cycle { src: i64, dst: i64 },
+    #[error("atom {atom_id} is not live in region '{region}'")]
+    AtomNotLive { atom_id: i64, region: String },
+    #[error("atom {atom_id} is not live and mutable in region '{region}'")]
+    AtomNotMutable { atom_id: i64, region: String },
+    #[error("idempotency key is already bound to atom {atom_id} with a different request")]
+    IdempotencyConflict { atom_id: i64 },
     #[error("region '{region}' exists with dim {expected}, embedder has dim {got}")]
     DimMismatch {
         region: String,
@@ -48,6 +54,45 @@ pub enum MemError {
         expected: String,
         got: String,
     },
+    #[error(
+        "memory read limit exceeded: item is {size} bytes, per-item limit is {max_value} bytes, {remaining} bytes remain"
+    )]
+    ReadLimitExceeded {
+        size: usize,
+        max_value: usize,
+        remaining: usize,
+    },
+    #[error("{operation} exceeds the work limit of {limit}")]
+    WorkLimitExceeded {
+        operation: &'static str,
+        limit: usize,
+    },
     #[error("{0}")]
     Invalid(String),
+}
+
+impl From<citadel_sql::SqlError> for MemError {
+    fn from(error: citadel_sql::SqlError) -> Self {
+        match error {
+            citadel_sql::SqlError::Storage(citadel_core::Error::ReadBudgetExceeded {
+                size,
+                max_value,
+                remaining,
+            }) => Self::ReadLimitExceeded {
+                size,
+                max_value,
+                remaining,
+            },
+            error => Self::Sql(error),
+        }
+    }
+}
+
+impl From<EmbedError> for MemError {
+    fn from(error: EmbedError) -> Self {
+        match error {
+            EmbedError::Interrupted => Self::Core(citadel_core::Error::Interrupted),
+            error => Self::Embed(error),
+        }
+    }
 }

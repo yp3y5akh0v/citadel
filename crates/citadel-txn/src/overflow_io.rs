@@ -8,27 +8,44 @@ use citadel_page::leaf_node::OverflowRef;
 use citadel_page::overflow;
 use rustc_hash::FxHashSet;
 
+use crate::ReadBudget;
+
+#[cfg(test)]
 pub(crate) fn read_chain_value(loader: &mut dyn PageLoader, oref: &OverflowRef) -> Result<Vec<u8>> {
-    read_chain_value_checked(loader, oref, || Ok(()))
+    read_chain_value_checked(loader, oref, None, || Ok(()))
 }
 
 /// Read an overflow value, observing `cancel` once per page and once after the
 /// final page. The `None` lane calls the original no-check walk, so transactions
 /// without cancellation enabled do not pay an atomic load per overflow page.
+#[cfg(test)]
 pub(crate) fn read_chain_value_with_cancel(
     loader: &mut dyn PageLoader,
     oref: &OverflowRef,
     cancel: Option<&CancelToken>,
 ) -> Result<Vec<u8>> {
     match cancel {
-        Some(token) => read_chain_value_checked(loader, oref, || token.check()),
+        Some(token) => read_chain_value_checked(loader, oref, None, || token.check()),
         None => read_chain_value(loader, oref),
     }
+}
+
+pub(crate) fn read_chain_value_with_budget(
+    loader: &mut dyn PageLoader,
+    oref: &OverflowRef,
+    cancel: Option<&CancelToken>,
+    budget: Option<&ReadBudget>,
+) -> Result<Vec<u8>> {
+    read_chain_value_checked(loader, oref, budget, || match cancel {
+        Some(token) => token.check(),
+        None => Ok(()),
+    })
 }
 
 fn read_chain_value_checked<F>(
     loader: &mut dyn PageLoader,
     oref: &OverflowRef,
+    budget: Option<&ReadBudget>,
     mut check: F,
 ) -> Result<Vec<u8>>
 where
@@ -41,6 +58,9 @@ where
         )));
     }
     check()?;
+    if let Some(budget) = budget {
+        budget.try_charge(total)?;
+    }
     let mut buf = Vec::with_capacity(total);
     let mut cur = oref.first_page;
     let mut pages_seen = 0usize;

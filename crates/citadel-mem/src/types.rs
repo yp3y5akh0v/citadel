@@ -3,6 +3,7 @@
 use serde_json::Value as Json;
 
 use crate::embed::EmbeddingMetric;
+use crate::error::MemError;
 
 /// Stable identifier for a memory atom (globally unique across per-dim tables).
 pub type AtomId = i64;
@@ -146,12 +147,12 @@ impl StoredRegionIdentity {
     }
 }
 
-/// Content-free retrieval metadata; score keeps exact f32 bits (+0.0 vs -0.0).
+/// Content-free retrieval metadata; importance keeps exact f32 bits (+0.0 vs -0.0).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredAtomRetrievalState {
     atom_id: AtomId,
     kind: String,
-    score_bits: u32,
+    importance_bits: u32,
     expires_at: Option<i64>,
 }
 
@@ -159,13 +160,13 @@ impl StoredAtomRetrievalState {
     pub(crate) fn new(
         atom_id: AtomId,
         kind: String,
-        score_bits: u32,
+        importance_bits: u32,
         expires_at: Option<i64>,
     ) -> Self {
         Self {
             atom_id,
             kind,
-            score_bits,
+            importance_bits,
             expires_at,
         }
     }
@@ -178,8 +179,8 @@ impl StoredAtomRetrievalState {
         &self.kind
     }
 
-    pub fn score_bits(&self) -> u32 {
-        self.score_bits
+    pub fn importance_bits(&self) -> u32 {
+        self.importance_bits
     }
 
     pub fn expires_at(&self) -> Option<i64> {
@@ -245,7 +246,7 @@ pub struct AtomInput {
     pub kind: String,
     pub text: String,
     pub payload: Json,
-    pub score: f32,
+    pub importance: f32,
     pub confidence: f32,
     /// Event time (micros): when the remembered fact happened, vs the ingest
     /// wall clock used when `None`. Drives the recency fusion signal and
@@ -264,7 +265,7 @@ impl AtomInput {
             kind: kind.into(),
             text: text.into(),
             payload: Json::Null,
-            score: 0.0,
+            importance: 0.0,
             confidence: 1.0,
             created_at: None,
             expires_at: None,
@@ -278,8 +279,8 @@ impl AtomInput {
         self
     }
 
-    pub fn with_score(mut self, score: f32) -> Self {
-        self.score = score;
+    pub fn with_importance(mut self, importance: f32) -> Self {
+        self.importance = importance;
         self
     }
 
@@ -379,6 +380,17 @@ pub enum EdgeKind {
 }
 
 impl EdgeKind {
+    pub const ALL: [Self; 8] = [
+        Self::Causes,
+        Self::Contradicts,
+        Self::Refines,
+        Self::Precedes,
+        Self::Supersedes,
+        Self::DerivedFrom,
+        Self::DependsOn,
+        Self::SimilarTo,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             EdgeKind::Causes => "causes",
@@ -408,16 +420,65 @@ pub struct Edge {
     pub evidence_ref: Option<Json>,
 }
 
+/// Stable keyset cursor for region-scoped edge pagination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EdgeCursor {
+    pub src_id: AtomId,
+    pub dst_id: AtomId,
+    pub kind: EdgeKind,
+}
+
+/// One stable page of live, region-local edges.
+#[derive(Debug, Clone)]
+pub struct EdgePage {
+    pub edges: Vec<Edge>,
+    pub next_after: Option<EdgeCursor>,
+}
+
+/// A ranked memory view plus the live region-local edges induced by its atoms.
+#[derive(Debug, Clone)]
+pub struct MemoryProfileReport {
+    pub atoms: Vec<AtomHit>,
+    pub edges: Vec<Edge>,
+    pub edges_truncated: bool,
+}
+
 /// Recall graph expansion: walk `memory_edges` up to `depth` hops over `kinds`.
 #[derive(Debug, Clone)]
 pub struct GraphExpand {
     pub depth: usize,
     pub kinds: Vec<EdgeKind>,
+    /// Maximum distinct non-seed nodes the traversal may inspect.
+    pub max_nodes: usize,
 }
 
 impl GraphExpand {
+    /// Default graph work budget used by [`Self::new`].
+    pub const DEFAULT_MAX_NODES: usize = 10_000;
+
     pub fn new(depth: usize, kinds: Vec<EdgeKind>) -> Self {
-        Self { depth, kinds }
+        Self {
+            depth,
+            kinds,
+            max_nodes: Self::DEFAULT_MAX_NODES,
+        }
+    }
+
+    /// Bound graph work independently of hop depth.
+    pub fn with_max_nodes(mut self, max_nodes: usize) -> Self {
+        self.max_nodes = max_nodes;
+        self
+    }
+}
+
+impl std::str::FromStr for EdgeKind {
+    type Err = MemError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|kind| kind.as_str() == value)
+            .ok_or_else(|| MemError::Invalid(format!("unknown edge kind: {value}")))
     }
 }
 
@@ -599,18 +660,38 @@ impl FetchQuery {
     }
 }
 
-/// A recalled atom with its raw distance and fused ranking score.
+/// One deterministic page of live atoms.
+#[derive(Debug, Clone)]
+pub struct FetchPage {
+    pub atoms: Vec<AtomHit>,
+    pub next_after_id: Option<AtomId>,
+}
+
+/// A live atom returned by fetch or recall.
 #[derive(Debug, Clone)]
 pub struct AtomHit {
     pub id: AtomId,
     pub kind: String,
     pub text: String,
     pub payload: Json,
-    pub distance: f32,
-    pub score: f32,
+    /// Persisted atom importance used as one recall and eviction signal.
+    pub importance: f32,
+    /// Persisted confidence used by summaries and confidence-aware eviction.
+    pub confidence: f32,
+    /// Query-specific fused or reranker relevance for a ranked recall hit.
+    ///
+    /// Unranked fetches and graph-expanded rows carry `None`.
+    pub relevance: Option<f32>,
+    /// Raw vector distance for a directly ranked semantic recall hit.
+    pub distance: Option<f32>,
+    /// Hop count for an atom reached through graph expansion.
+    pub graph_depth: Option<usize>,
     /// Stored creation clock (micros): the event time when remembered with
     /// [`AtomInput::with_created_at`], else the ingest wall clock.
     pub created_at: i64,
+    /// Stored expiry clock (micros), or `None` when the atom has no TTL.
+    /// Expired atoms are filtered before an [`AtomHit`] is returned.
+    pub expires_at: Option<i64>,
     /// Protected from eviction and in-place payload edits.
     pub immutable: bool,
 }
@@ -630,9 +711,9 @@ pub enum EvictionPolicy {
     /// Atoms whose `expires_at` TTL has lapsed (physical delete; encrypted
     /// regions get per-atom cryptographic erasure like every eviction).
     Expired,
-    /// Atoms below both score and confidence thresholds.
-    LowScore {
-        score_threshold: f32,
+    /// Atoms below both importance and confidence thresholds.
+    LowImportance {
+        importance_threshold: f32,
         confidence_threshold: f32,
     },
     /// Wipe the whole region (including immutable atoms; key-rotation prep).
@@ -677,8 +758,8 @@ pub struct ReembedReport {
     /// encrypted recall lazily rebuilds its in-memory sealed ANN.
     pub ann_rebuilt: bool,
     /// Managed `SimilarTo` edges rebuilt from their persisted neighbor policy.
-    /// Authored edges are untouched. Score thresholds and fusion weights may
-    /// need recalibration for the new model's score distribution.
+    /// Authored edges are untouched. Distance thresholds and fusion weights may
+    /// need recalibration for the new model's output distribution.
     pub similarity_edges_rewoven: u64,
     /// Managed or explicitly adopted edges no longer selected by their policy.
     pub similarity_edges_cleared: u64,
@@ -753,7 +834,7 @@ impl AttestVerdict {
 #[derive(Debug, Clone)]
 pub struct EvolutionReport {
     pub links_added: usize,
-    pub score: f32,
+    pub importance: f32,
 }
 
 /// Result of [`crate::MemoryEngine::remember_if_absent`]: id + whether it inserted.
@@ -761,6 +842,12 @@ pub struct EvolutionReport {
 pub struct RememberOutcome {
     pub id: AtomId,
     pub inserted: bool,
+}
+
+/// Result of replacing an atom payload; `changed` is false for an exact no-op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PayloadUpdateOutcome {
+    pub changed: bool,
 }
 
 /// One member of the caller-declared source snapshot for
@@ -779,12 +866,39 @@ pub struct KindDigest {
     pub count: u64,
     pub earliest: i64,
     pub latest: i64,
-    pub avg_score: f32,
+    pub avg_importance: f32,
     pub avg_confidence: f32,
+}
+
+/// Bounded kind-summary page. Kinds are ordered lexicographically; pass the
+/// returned cursor to [`Self::with_after_kind`] to continue.
+#[derive(Debug, Clone)]
+pub struct SummaryQuery {
+    pub since_micros: i64,
+    pub after_kind: Option<String>,
+    pub limit: usize,
+}
+
+impl SummaryQuery {
+    pub fn new(since_micros: i64, limit: usize) -> Self {
+        Self {
+            since_micros,
+            after_kind: None,
+            limit,
+        }
+    }
+
+    pub fn with_after_kind(mut self, kind: impl Into<String>) -> Self {
+        self.after_kind = Some(kind.into());
+        self
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct SummaryReport {
+    /// Total live atoms in the requested time window, across every page.
     pub total: u64,
     pub kinds: Vec<KindDigest>,
+    /// Last returned kind when another page exists.
+    pub next_after_kind: Option<String>,
 }

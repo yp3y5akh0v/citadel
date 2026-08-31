@@ -10,22 +10,29 @@ use super::tool::ToolCtx;
 pub(super) enum ResourceError {
     NotFound(String),
     InvalidUri(String),
+    ReadLimit(String),
     Failed(String),
 }
 
 impl ResourceError {
-    pub(super) fn code(&self) -> i64 {
+    pub(super) fn code(&self, modern: bool) -> i64 {
         match self {
+            ResourceError::NotFound(_) if modern => INVALID_PARAMS,
             ResourceError::NotFound(_) => RESOURCE_NOT_FOUND,
             ResourceError::InvalidUri(_) => INVALID_PARAMS,
-            ResourceError::Failed(_) => INTERNAL_ERROR,
+            ResourceError::ReadLimit(_) | ResourceError::Failed(_) => INTERNAL_ERROR,
         }
+    }
+
+    pub(super) fn identifies_uri(&self) -> bool {
+        matches!(self, Self::NotFound(_) | Self::InvalidUri(_))
     }
 
     pub(super) fn message(self) -> String {
         match self {
             ResourceError::NotFound(m)
             | ResourceError::InvalidUri(m)
+            | ResourceError::ReadLimit(m)
             | ResourceError::Failed(m) => m,
         }
     }

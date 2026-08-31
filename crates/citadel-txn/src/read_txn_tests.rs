@@ -27,6 +27,59 @@ fn read_after_write_commit() {
 }
 
 #[test]
+fn point_get_rejects_an_overflow_value_at_the_read_budget_boundary() {
+    let mgr = create_test_manager();
+    let value = vec![0x5A; citadel_core::MAX_INLINE_VALUE_SIZE + 1];
+    let mut writer = mgr.begin_write().unwrap();
+    writer.insert(b"large", &value).unwrap();
+    writer.commit().unwrap();
+
+    let mut reader = mgr.begin_read();
+    reader.set_read_budget(Some(crate::ReadBudget::new(
+        value.len() - 1,
+        value.len() * 2,
+    )));
+    let err = reader.get(b"large").unwrap_err();
+
+    assert!(matches!(
+        err,
+        citadel_core::Error::ReadBudgetExceeded { size, .. } if size == value.len()
+    ));
+}
+
+#[test]
+fn scan_charges_one_shared_total_before_each_inline_row() {
+    let mgr = create_test_manager();
+    let mut writer = mgr.begin_write().unwrap();
+    writer.create_table(b"budgeted").unwrap();
+    writer.table_insert(b"budgeted", b"a", b"123").unwrap();
+    writer.table_insert(b"budgeted", b"b", b"456").unwrap();
+    writer.commit().unwrap();
+
+    let budget = crate::ReadBudget::new(3, 5);
+    let mut reader = mgr.begin_read();
+    reader.set_read_budget(Some(budget.clone()));
+    let mut emitted = 0;
+    let err = reader
+        .table_scan_from(b"budgeted", b"", |_, _| {
+            emitted += 1;
+            Ok(true)
+        })
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        citadel_core::Error::ReadBudgetExceeded {
+            size: 3,
+            remaining: 2,
+            ..
+        }
+    ));
+    assert_eq!(emitted, 1, "the rejected row reached the callback");
+    assert_eq!(budget.remaining(), 2);
+}
+
+#[test]
 fn snapshot_isolation() {
     let mgr = create_test_manager();
 

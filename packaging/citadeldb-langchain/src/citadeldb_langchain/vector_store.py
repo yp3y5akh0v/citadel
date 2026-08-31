@@ -20,6 +20,7 @@ DEFAULT_REGION = "vectors"
 # A region is read whole where containment cannot express a predicate.
 PAGE = 10_000
 _DIM_PROBE = "dimension probe"
+_EMBED_BATCH = 32
 
 
 # A Database is pinned to its opening thread, so workers take Memory, not self.
@@ -62,10 +63,36 @@ class _LangChainEmbedder:
         self.model_id = model_id
 
     def embed(self, texts: list[str]) -> list[list[float]]:
-        return self._embedding.embed_documents(texts)
+        return self.embed_with_cancel(texts, None)
 
     def embed_queries(self, texts: list[str]) -> list[list[float]]:
-        return [self._embedding.embed_query(text) for text in texts]
+        return self.embed_queries_with_cancel(texts, None)
+
+    def embed_with_cancel(
+        self, texts: list[str], cancel_token: Any | None
+    ) -> list[list[float]]:
+        vectors: list[list[float]] = []
+        for start in range(0, len(texts), _EMBED_BATCH):
+            if cancel_token is not None:
+                cancel_token.check()
+            vectors.extend(
+                self._embedding.embed_documents(texts[start : start + _EMBED_BATCH])
+            )
+            if cancel_token is not None:
+                cancel_token.check()
+        return vectors
+
+    def embed_queries_with_cancel(
+        self, texts: list[str], cancel_token: Any | None
+    ) -> list[list[float]]:
+        vectors: list[list[float]] = []
+        for text in texts:
+            if cancel_token is not None:
+                cancel_token.check()
+            vectors.append(self._embedding.embed_query(text))
+            if cancel_token is not None:
+                cancel_token.check()
+        return vectors
 
 
 def _embedding_dim(value: Any) -> int:
@@ -204,7 +231,7 @@ def _search(
 def _similarity(hit: Any) -> float:
     """Distance to similarity, capped at 1 for near-zero distances."""
     if hit.distance is None:
-        return hit.score
+        return hit.relevance if hit.relevance is not None else 0.0
     return min(1.0, 1.0 - hit.distance)
 
 

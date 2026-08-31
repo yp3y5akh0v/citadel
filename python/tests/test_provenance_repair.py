@@ -20,12 +20,17 @@ class CallerSideEmbedder:
     metric = "cosine"
     model_id = REAL_MODEL
 
-    def embed(self, texts):
+    def embed_with_cancel(self, texts, cancel_token):
+        if cancel_token is not None:
+            cancel_token.check()
         out = []
         for t in texts:
             h = hashlib.sha256(t.encode()).digest()
             out.append([h[i % len(h)] / 255.0 for i in range(DIM)])
         return out
+
+    def embed(self, texts):
+        return self.embed_with_cancel(texts, None)
 
 
 class LegacyMockEmbedder:
@@ -38,8 +43,8 @@ class LegacyMockEmbedder:
     def __init__(self):
         self._inner = citadeldb.MockEmbedder(DIM)
 
-    def embed(self, texts):
-        return self._inner.embed(texts)
+    def embed_with_cancel(self, texts, cancel_token):
+        return self._inner.embed_with_cancel(texts, cancel_token)
 
 
 def shim_store():

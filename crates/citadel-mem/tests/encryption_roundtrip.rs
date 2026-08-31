@@ -38,7 +38,8 @@ fn atoms_edges_payloads_survive_close_and_reopen() {
         let derived = eng
             .remember("r", AtomInput::new("fact", "red green derived"))
             .unwrap();
-        eng.link(seed, derived, EdgeKind::DerivedFrom, 1.0).unwrap();
+        eng.link_in_region("r", seed, derived, EdgeKind::DerivedFrom, 1.0)
+            .unwrap();
         (seed, derived)
     };
 

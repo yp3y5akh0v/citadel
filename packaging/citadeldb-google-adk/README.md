@@ -8,6 +8,10 @@ that destroy the key, not just the row.
 pip install citadeldb-google-adk
 ```
 
+The semantic example uses a local e5-large model. `CandleEmbedder` requires a
+`citadeldb` source wheel built with `--features candle-embed`; the default wheel accepts
+an equivalent real bring-your-own embedder.
+
 ```python
 import citadeldb
 from google.adk.runners import Runner
@@ -16,7 +20,7 @@ from citadeldb_google_adk import CitadelMemoryService
 memory = CitadelMemoryService(
     "adk_memory.cdl",
     key="your-passphrase",
-    embedder=citadeldb.MockEmbedder(dim=64),  # see Notes for a real model
+    embedder=citadeldb.CandleEmbedder("/path/to/e5-large", preset="e5-large"),
 )
 
 runner = Runner(
@@ -32,7 +36,8 @@ runner = Runner(
 ADK hands the service a query string, so Citadel embeds it and runs hybrid recall: vector
 distance, keyword rank and recency, fused into one score. The reference
 `InMemoryMemoryService` returns only turns sharing a word with the query; nothing here is
-dropped for lacking one. With `MockEmbedder` that ranking is still lexical:
+dropped for lacking one. With e5-large, differently worded questions and memories can
+still match:
 
 ```python
 await memory.add_session_to_memory(session)  # a Session your Runner already ran
@@ -83,22 +88,11 @@ Citadel is embedded and one process owns the file. A path already open on this t
 under the same passphrase, is shared, so this can sit on the same database as another
 Citadel adapter; construct them on the same thread.
 
-`embedder=` is required. There is no default: quietly substituting `MockEmbedder` would change
-ranking semantics and persist different provenance. `MockEmbedder` needs no download and is
-enough to run an agent and to test, so pass it explicitly if that is what you want. For semantic
-recall pass a real embedder. `CandleEmbedder` is not in the default
-`citadeldb` wheel and needs a source build (`maturin build --features candle-embed`); any
-object exposing `dim`, `metric`, `model_id`, `embed` and `embed_queries` works too:
-
-```python
-import citadeldb
-
-memory = CitadelMemoryService(
-    "adk_memory.cdl",
-    key="your-passphrase",
-    embedder=citadeldb.CandleEmbedder("/path/to/e5-large", preset="e5-large"),
-)
-```
+`embedder=` is required. There is no default: substituting a different model changes
+ranking semantics and persisted provenance. A bring-your-own object exposes `dim`,
+`metric`, `model_id`, and `embed_with_cancel(texts, cancel_token)`; asymmetric models
+may also provide `embed_queries_with_cancel`. Use `MockEmbedder` only for a deliberate
+lexical-only test.
 
 ## License
 

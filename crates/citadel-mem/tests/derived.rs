@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use citadel::{Argon2Profile, DatabaseBuilder};
-use citadel_mem::{AtomInput, EdgeKind, MemoryEngine, MockEmbedder};
+use citadel_mem::{AtomInput, EdgeKind, MemError, MemoryEngine, MockEmbedder};
 use serde_json::json;
 
 const DIM: usize = 64;
@@ -55,7 +55,7 @@ fn links_all_sources_with_evidence() {
         .unwrap();
 
     let edges = eng
-        .fetch_edges(Some(d), None, Some(EdgeKind::DerivedFrom))
+        .fetch_edges_in_region("notes", Some(d), None, Some(EdgeKind::DerivedFrom), 10)
         .unwrap();
     let mut dsts: Vec<_> = edges.iter().map(|e| e.dst_id).collect();
     dsts.sort_unstable();
@@ -84,7 +84,13 @@ fn missing_source_stores_nothing() {
             None,
         )
         .unwrap_err();
-    assert!(err.to_string().contains("source"), "got: {err}");
+    assert!(matches!(
+        err,
+        MemError::AtomNotLive {
+            atom_id: 99_999,
+            ref region,
+        } if region == "notes"
+    ));
 
     assert_eq!(
         eng.count("notes", "derived").unwrap(),
@@ -92,7 +98,7 @@ fn missing_source_stores_nothing() {
         "atom rolled back"
     );
     assert!(
-        eng.fetch_edges(None, Some(a), Some(EdgeKind::DerivedFrom))
+        eng.fetch_edges_in_region("notes", None, Some(a), Some(EdgeKind::DerivedFrom), 10)
             .unwrap()
             .is_empty(),
         "no provenance edge survives the rollback"
@@ -128,7 +134,10 @@ fn empty_sources_equals_remember() {
     let id = eng
         .remember_derived("notes", AtomInput::new("fact", "plain"), &[], None)
         .unwrap();
-    assert!(eng.fetch_edges(Some(id), None, None).unwrap().is_empty());
+    assert!(eng
+        .fetch_edges_in_region("notes", Some(id), None, None, 10)
+        .unwrap()
+        .is_empty());
     assert_eq!(eng.count("notes", "fact").unwrap(), 1);
 }
 
@@ -150,7 +159,7 @@ fn duplicate_source_ids_write_one_edge() {
         )
         .unwrap();
     assert_eq!(
-        eng.fetch_edges(Some(d), None, Some(EdgeKind::DerivedFrom))
+        eng.fetch_edges_in_region("notes", Some(d), None, Some(EdgeKind::DerivedFrom), 10)
             .unwrap()
             .len(),
         1
@@ -178,7 +187,7 @@ fn sealed_region_provenance_roundtrip() {
         .unwrap();
 
     let edges = eng
-        .fetch_edges(Some(d), None, Some(EdgeKind::DerivedFrom))
+        .fetch_edges_in_region("vault", Some(d), None, Some(EdgeKind::DerivedFrom), 10)
         .unwrap();
     assert_eq!(edges.len(), 1);
     assert_eq!(edges[0].dst_id, a);
@@ -198,15 +207,20 @@ fn link_with_evidence_upsert_replaces_weight_and_evidence() {
         .remember("notes", AtomInput::new("fact", "two"))
         .unwrap();
 
-    eng.link_with_evidence(a, b, EdgeKind::Refines, 0.5, Some(json!({"v": 1})))
+    eng.link_with_evidence_in_region("notes", a, b, EdgeKind::Refines, 0.5, Some(json!({"v": 1})))
         .unwrap();
-    let e = &eng.fetch_edges(Some(a), Some(b), None).unwrap()[0];
+    let e = &eng
+        .fetch_edges_in_region("notes", Some(a), Some(b), None, 1)
+        .unwrap()[0];
     assert_eq!(e.weight, 0.5);
     assert_eq!(e.evidence_ref, Some(json!({"v": 1})));
 
     // Re-linking replaces both fields; plain link clears evidence back to NULL.
-    eng.link(a, b, EdgeKind::Refines, 0.9).unwrap();
-    let e = &eng.fetch_edges(Some(a), Some(b), None).unwrap()[0];
+    eng.link_in_region("notes", a, b, EdgeKind::Refines, 0.9)
+        .unwrap();
+    let e = &eng
+        .fetch_edges_in_region("notes", Some(a), Some(b), None, 1)
+        .unwrap()[0];
     assert_eq!(e.weight, 0.9);
     assert_eq!(e.evidence_ref, None);
 }
@@ -227,13 +241,13 @@ fn evolve_writes_similar_to_not_derived_from() {
     assert!(report.links_added >= 1);
 
     assert!(
-        !eng.fetch_edges(Some(a), None, Some(EdgeKind::SimilarTo))
+        !eng.fetch_edges_in_region("notes", Some(a), None, Some(EdgeKind::SimilarTo), 10)
             .unwrap()
             .is_empty(),
         "evolve neighbors are similar_to"
     );
     assert!(
-        eng.fetch_edges(Some(a), None, Some(EdgeKind::DerivedFrom))
+        eng.fetch_edges_in_region("notes", Some(a), None, Some(EdgeKind::DerivedFrom), 10)
             .unwrap()
             .is_empty(),
         "evolve must not fabricate provenance"

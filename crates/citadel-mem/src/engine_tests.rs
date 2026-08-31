@@ -1,6 +1,7 @@
 use super::*;
 use crate::embed::MockEmbedder;
 use crate::error::MemError;
+use crate::read_limits::MemoryReadLimits;
 use crate::types::FusionWeights;
 use citadel::{Argon2Profile, Database, DatabaseBuilder};
 use std::sync::Arc;
@@ -335,7 +336,7 @@ fn public_ranking_writes_reject_non_finite_values_before_sql() {
         .stored_atom_retrieval_state("finite")
         .unwrap()
         .iter()
-        .all(|state| state.score_bits() == 0.0f32.to_bits()));
+        .all(|state| state.importance_bits() == 0.0f32.to_bits()));
 
     for weight in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
         let err = eng
@@ -355,6 +356,536 @@ fn public_ranking_writes_reject_non_finite_values_before_sql() {
     assert!(matches!(err, MemError::Invalid(_)));
     assert!(eng
         .fetch_edges(Some(first), Some(second), None)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn atom_confidence_is_normalized_at_the_core_boundary() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = MemoryEngine::open(create_db(dir.path())).unwrap();
+    eng.create_region("confidence", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+
+    for confidence in [-0.01, 1.01] {
+        let error = eng
+            .remember(
+                "confidence",
+                AtomInput::new("fact", "must not persist").with_confidence(confidence),
+            )
+            .unwrap_err();
+        assert!(matches!(error, MemError::Invalid(_)), "{error:?}");
+    }
+    assert_eq!(eng.count_region("confidence").unwrap(), 0);
+}
+
+#[test]
+fn core_rejects_invalid_evolution_and_eviction_policies() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = MemoryEngine::open(create_db(dir.path())).unwrap();
+    eng.create_region("validations", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let atom = eng
+        .remember("validations", AtomInput::new("fact", "must survive"))
+        .unwrap();
+
+    for max_distance in [-1.0, f32::NAN, f32::INFINITY] {
+        let error = eng
+            .evolve("validations", atom, 5, max_distance)
+            .unwrap_err();
+        assert!(matches!(error, MemError::Invalid(_)), "{error:?}");
+    }
+    let invalid_policies = [
+        EvictionPolicy::Stale {
+            older_than_micros: 0,
+        },
+        EvictionPolicy::Lru { keep_fraction: 0.0 },
+        EvictionPolicy::Lru {
+            keep_fraction: 1.01,
+        },
+        EvictionPolicy::Lru {
+            keep_fraction: f32::NAN,
+        },
+        EvictionPolicy::LowImportance {
+            importance_threshold: f32::INFINITY,
+            confidence_threshold: 0.5,
+        },
+        EvictionPolicy::LowImportance {
+            importance_threshold: 0.5,
+            confidence_threshold: f32::NAN,
+        },
+        EvictionPolicy::LowImportance {
+            importance_threshold: 0.5,
+            confidence_threshold: -0.01,
+        },
+        EvictionPolicy::LowImportance {
+            importance_threshold: 0.5,
+            confidence_threshold: 1.01,
+        },
+    ];
+    for policy in invalid_policies {
+        let error = eng.evict("validations", policy).unwrap_err();
+        assert!(matches!(error, MemError::Invalid(_)), "{error:?}");
+    }
+    assert!(eng.fetch_one("validations", atom).unwrap().is_some());
+    assert!(eng.fetch_edges(Some(atom), None, None).unwrap().is_empty());
+}
+
+#[test]
+fn region_edge_reads_require_two_live_local_endpoints_and_preserve_filters() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = MemoryEngine::open(create_db(dir.path())).unwrap();
+    eng.create_region("alpha", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    eng.create_region("beta", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let a1 = eng.remember("alpha", AtomInput::new("note", "a1")).unwrap();
+    let a2 = eng.remember("alpha", AtomInput::new("note", "a2")).unwrap();
+    let a3 = eng.remember("alpha", AtomInput::new("note", "a3")).unwrap();
+    let expired = eng
+        .remember(
+            "alpha",
+            AtomInput::new("note", "expired").with_expires_at(micros_now() - 1),
+        )
+        .unwrap();
+    let b1 = eng.remember("beta", AtomInput::new("note", "b1")).unwrap();
+    let b2 = eng.remember("beta", AtomInput::new("note", "b2")).unwrap();
+
+    let evidence = serde_json::json!({"quote": "alpha evidence"});
+    eng.link_with_evidence(a1, a2, EdgeKind::Refines, 0.75, Some(evidence.clone()))
+        .unwrap();
+    eng.link(a2, a3, EdgeKind::Causes, 0.5).unwrap();
+    eng.link(a1, b1, EdgeKind::Refines, 1.0).unwrap();
+    eng.link(b1, a2, EdgeKind::Refines, 1.0).unwrap();
+    eng.link(b1, b2, EdgeKind::Refines, 1.0).unwrap();
+    eng.link(a1, expired, EdgeKind::Precedes, 1.0).unwrap();
+
+    assert_eq!(
+        eng.fetch_edges(Some(a1), Some(b1), None).unwrap().len(),
+        1,
+        "the global library reader keeps exposing cross-region edges"
+    );
+    let all = eng
+        .fetch_edges_in_region("alpha", None, None, None, 10)
+        .unwrap();
+    assert_eq!(all.len(), 2);
+    assert!(all.iter().any(|edge| {
+        edge.src_id == a1
+            && edge.dst_id == a2
+            && edge.kind == EdgeKind::Refines
+            && edge.evidence_ref.as_ref() == Some(&evidence)
+    }));
+    assert!(all
+        .iter()
+        .any(|edge| edge.src_id == a2 && edge.dst_id == a3));
+    assert!(all.iter().all(|edge| {
+        ![b1, b2, expired].contains(&edge.src_id) && ![b1, b2, expired].contains(&edge.dst_id)
+    }));
+
+    let by_src = eng
+        .fetch_edges_in_region("alpha", Some(a1), None, None, 10)
+        .unwrap();
+    assert_eq!(by_src.len(), 1);
+    assert_eq!(by_src[0].dst_id, a2);
+    let by_dst = eng
+        .fetch_edges_in_region("alpha", None, Some(a2), None, 10)
+        .unwrap();
+    assert_eq!(by_dst.len(), 1);
+    assert_eq!(by_dst[0].src_id, a1);
+    let by_kind = eng
+        .fetch_edges_in_region("alpha", None, None, Some(EdgeKind::Causes), 10)
+        .unwrap();
+    assert_eq!(by_kind.len(), 1);
+    assert_eq!((by_kind[0].src_id, by_kind[0].dst_id), (a2, a3));
+    assert!(eng
+        .fetch_edges_in_region("alpha", Some(a1), Some(b1), None, 10)
+        .unwrap()
+        .is_empty());
+    let first = eng
+        .fetch_edges_in_region("alpha", None, None, None, 1)
+        .unwrap();
+    assert_eq!(first.len(), 1);
+    assert_eq!(
+        (first[0].src_id, first[0].dst_id, first[0].kind),
+        (a1, a2, EdgeKind::Refines),
+        "the SQL limit is applied after the stable edge order"
+    );
+    assert!(eng
+        .fetch_edges_in_region("alpha", None, None, None, 0)
+        .unwrap()
+        .is_empty());
+    let from_many = eng
+        .fetch_edges_from_atoms_in_region("alpha", &[a1, a2], None, 10)
+        .unwrap();
+    assert_eq!(from_many.len(), 2);
+    let between = eng
+        .fetch_edges_between_atoms_in_region("alpha", &[a1, a2], None, 10)
+        .unwrap();
+    assert_eq!(between.len(), 1);
+    assert_eq!((between[0].src_id, between[0].dst_id), (a1, a2));
+    assert!(eng
+        .fetch_edges_from_atoms_in_region("alpha", &[], None, 10)
+        .unwrap()
+        .is_empty());
+
+    let page1 = eng
+        .fetch_edges_page_in_region("alpha", None, None, None, None, 1)
+        .unwrap();
+    assert_eq!(page1.edges.len(), 1);
+    let cursor = page1.next_after.expect("another live edge remains");
+    assert_eq!(
+        cursor,
+        EdgeCursor {
+            src_id: a1,
+            dst_id: a2,
+            kind: EdgeKind::Refines,
+        }
+    );
+    let page2 = eng
+        .fetch_edges_page_in_region("alpha", None, None, None, Some(cursor), 1)
+        .unwrap();
+    assert_eq!(page2.edges.len(), 1);
+    assert_eq!((page2.edges[0].src_id, page2.edges[0].dst_id), (a2, a3));
+    assert!(page2.next_after.is_none());
+}
+
+#[test]
+fn region_edge_writes_require_two_live_local_endpoints() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = MemoryEngine::open(create_db(dir.path())).unwrap();
+    eng.create_region("alpha", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    eng.create_region("beta", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let src = eng
+        .remember("alpha", AtomInput::new("note", "source"))
+        .unwrap();
+    let dst = eng
+        .remember("alpha", AtomInput::new("note", "destination"))
+        .unwrap();
+    let foreign = eng
+        .remember("beta", AtomInput::new("note", "foreign"))
+        .unwrap();
+    let expired = eng
+        .remember(
+            "alpha",
+            AtomInput::new("note", "expired").with_expires_at(micros_now() - 1),
+        )
+        .unwrap();
+
+    eng.link_with_evidence_in_region(
+        "alpha",
+        src,
+        dst,
+        EdgeKind::Refines,
+        0.75,
+        Some(serde_json::json!({"quote": "local evidence"})),
+    )
+    .unwrap();
+    for invalid in [foreign, expired, i64::MAX] {
+        let error = eng
+            .link_in_region("alpha", src, invalid, EdgeKind::Causes, 1.0)
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MemError::AtomNotLive { atom_id, ref region }
+                    if atom_id == invalid && region == "alpha"
+            ),
+            "{error:?}"
+        );
+    }
+
+    let edges = eng.fetch_edges(Some(src), None, None).unwrap();
+    assert_eq!(edges.len(), 1);
+    assert_eq!((edges[0].src_id, edges[0].dst_id), (src, dst));
+    assert_eq!(
+        edges[0].evidence_ref,
+        Some(serde_json::json!({"quote": "local evidence"}))
+    );
+}
+
+#[test]
+fn region_edge_unlink_is_exact_idempotent_and_region_scoped() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = MemoryEngine::open(create_db(dir.path())).unwrap();
+    eng.create_region("alpha", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    eng.create_region("beta", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let src = eng
+        .remember("alpha", AtomInput::new("note", "source"))
+        .unwrap();
+    let dst = eng
+        .remember("alpha", AtomInput::new("note", "destination"))
+        .unwrap();
+    let foreign = eng
+        .remember("beta", AtomInput::new("note", "foreign"))
+        .unwrap();
+
+    eng.link_in_region("alpha", src, dst, EdgeKind::Causes, 1.0)
+        .unwrap();
+    eng.link_in_region("alpha", src, dst, EdgeKind::Refines, 0.5)
+        .unwrap();
+    eng.link(src, foreign, EdgeKind::Causes, 1.0).unwrap();
+
+    assert!(eng
+        .unlink_in_region("alpha", src, dst, EdgeKind::Causes)
+        .unwrap());
+    assert!(!eng
+        .unlink_in_region("alpha", src, dst, EdgeKind::Causes)
+        .unwrap());
+    let remaining = eng.fetch_edges(Some(src), None, None).unwrap();
+    assert!(remaining
+        .iter()
+        .any(|edge| { edge.dst_id == dst && edge.kind == EdgeKind::Refines }));
+    assert!(!remaining
+        .iter()
+        .any(|edge| { edge.dst_id == dst && edge.kind == EdgeKind::Causes }));
+
+    let error = eng
+        .unlink_in_region("alpha", src, foreign, EdgeKind::Causes)
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            MemError::AtomNotLive { atom_id, ref region }
+                if atom_id == foreign && region == "alpha"
+        ),
+        "{error:?}"
+    );
+    assert_eq!(
+        eng.fetch_edges(Some(src), Some(foreign), Some(EdgeKind::Causes))
+            .unwrap()
+            .len(),
+        1,
+        "a region-scoped unlink must not remove a foreign edge"
+    );
+}
+
+#[test]
+fn region_edge_cycle_check_ignores_a_foreign_legacy_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = MemoryEngine::open(create_db(dir.path())).unwrap();
+    eng.create_region("local", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    eng.create_region("foreign", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let src = eng
+        .remember("local", AtomInput::new("note", "src"))
+        .unwrap();
+    let dst = eng
+        .remember("local", AtomInput::new("note", "dst"))
+        .unwrap();
+    let bridge = eng
+        .remember("foreign", AtomInput::new("note", "bridge"))
+        .unwrap();
+    eng.link(dst, bridge, EdgeKind::DependsOn, 1.0).unwrap();
+    eng.link(bridge, src, EdgeKind::DependsOn, 1.0).unwrap();
+
+    assert!(matches!(
+        eng.link(src, dst, EdgeKind::DependsOn, 1.0),
+        Err(MemError::Cycle { .. })
+    ));
+    eng.link_in_region("local", src, dst, EdgeKind::DependsOn, 1.0)
+        .unwrap();
+    assert_eq!(
+        eng.fetch_edges(Some(src), Some(dst), Some(EdgeKind::DependsOn))
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn region_edge_cycle_check_ignores_a_stale_sealed_intermediary() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_enc_db(dir.path());
+    let eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
+    eng.create_encrypted_region("sealed", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let src = eng
+        .remember("sealed", AtomInput::new("note", "src"))
+        .unwrap();
+    let dst = eng
+        .remember("sealed", AtomInput::new("note", "dst"))
+        .unwrap();
+    let bridge = eng
+        .remember("sealed", AtomInput::new("note", "bridge"))
+        .unwrap();
+    eng.link(dst, bridge, EdgeKind::DependsOn, 1.0).unwrap();
+    eng.link(bridge, src, EdgeKind::DependsOn, 1.0).unwrap();
+
+    let table = atoms_table(8, EmbeddingMetric::Cosine, true);
+    Connection::open(&db)
+        .unwrap()
+        .execute_params(
+            &format!("UPDATE {table} SET key_gen = key_gen + 1 WHERE id = $1"),
+            &[Value::Integer(bridge)],
+        )
+        .unwrap();
+
+    assert!(matches!(
+        eng.link(src, dst, EdgeKind::DependsOn, 1.0),
+        Err(MemError::Cycle { .. })
+    ));
+    eng.link_in_region("sealed", src, dst, EdgeKind::DependsOn, 1.0)
+        .unwrap();
+}
+
+#[test]
+fn region_edge_reads_reject_stale_sealed_endpoint_bindings() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_enc_db(dir.path());
+    let eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
+    eng.create_encrypted_region("sealed", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let src = eng
+        .remember("sealed", AtomInput::new("note", "source"))
+        .unwrap();
+    let stale = eng
+        .remember("sealed", AtomInput::new("note", "stale"))
+        .unwrap();
+    let live = eng
+        .remember("sealed", AtomInput::new("note", "live"))
+        .unwrap();
+    eng.link(src, stale, EdgeKind::Refines, 1.0).unwrap();
+    eng.link(src, live, EdgeKind::Causes, 1.0).unwrap();
+
+    let table = atoms_table(8, EmbeddingMetric::Cosine, true);
+    Connection::open(&db)
+        .unwrap()
+        .execute_params(
+            &format!("UPDATE {table} SET key_gen = key_gen + 1 WHERE id = $1"),
+            &[Value::Integer(stale)],
+        )
+        .unwrap();
+
+    assert_eq!(
+        eng.fetch_edges(Some(src), None, None).unwrap().len(),
+        2,
+        "global edge storage is unchanged by a stale atom-key binding"
+    );
+    let scoped = eng
+        .fetch_edges_in_region("sealed", Some(src), None, None, 10)
+        .unwrap();
+    assert_eq!(scoped.len(), 1);
+    assert_eq!((scoped[0].src_id, scoped[0].dst_id), (src, live));
+    let first_live = eng
+        .fetch_edges_in_region("sealed", Some(src), None, None, 1)
+        .unwrap();
+    assert_eq!(first_live.len(), 1);
+    assert_eq!(
+        (first_live[0].src_id, first_live[0].dst_id),
+        (src, live),
+        "the SQL limit must be filled after stale sealed bindings are filtered"
+    );
+}
+
+#[test]
+fn region_edge_writes_reject_stale_sealed_endpoint_bindings() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_enc_db(dir.path());
+    let eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
+    eng.create_encrypted_region("sealed", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let src = eng
+        .remember("sealed", AtomInput::new("note", "source"))
+        .unwrap();
+    let stale = eng
+        .remember("sealed", AtomInput::new("note", "stale"))
+        .unwrap();
+
+    let table = atoms_table(8, EmbeddingMetric::Cosine, true);
+    Connection::open(&db)
+        .unwrap()
+        .execute_params(
+            &format!("UPDATE {table} SET key_gen = key_gen + 1 WHERE id = $1"),
+            &[Value::Integer(stale)],
+        )
+        .unwrap();
+
+    let error = eng
+        .link_in_region("sealed", src, stale, EdgeKind::Refines, 1.0)
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            MemError::AtomNotLive { atom_id, ref region }
+                if atom_id == stale && region == "sealed"
+        ),
+        "{error:?}"
+    );
+    assert!(eng
+        .fetch_edges(Some(src), Some(stale), None)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn provenance_writes_require_live_source_atoms() {
+    let plain_dir = tempfile::tempdir().unwrap();
+    let plain = MemoryEngine::open(create_db(plain_dir.path())).unwrap();
+    plain
+        .create_region("plain", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let expired = plain
+        .remember(
+            "plain",
+            AtomInput::new("fact", "expired source").with_expires_at(micros_now() - 1),
+        )
+        .unwrap();
+    assert!(matches!(
+        plain.remember_derived(
+            "plain",
+            AtomInput::new("fact", "plain derived"),
+            &[expired],
+            None,
+        ),
+        Err(MemError::AtomNotLive { atom_id, ref region })
+            if atom_id == expired && region == "plain"
+    ));
+    assert!(matches!(
+        plain.remember_if_absent(
+            "plain",
+            AtomInput::new("fact", "plain absent"),
+            &[expired],
+            None,
+        ),
+        Err(MemError::AtomNotLive { atom_id, ref region })
+            if atom_id == expired && region == "plain"
+    ));
+
+    let sealed_dir = tempfile::tempdir().unwrap();
+    let db = create_enc_db(sealed_dir.path());
+    let sealed = MemoryEngine::open(Arc::clone(&db)).unwrap();
+    sealed
+        .create_encrypted_region("sealed", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let stale = sealed
+        .remember("sealed", AtomInput::new("fact", "stale source"))
+        .unwrap();
+    let table = atoms_table(8, EmbeddingMetric::Cosine, true);
+    Connection::open(&db)
+        .unwrap()
+        .execute_params(
+            &format!("UPDATE {table} SET key_gen = key_gen + 1 WHERE id = $1"),
+            &[Value::Integer(stale)],
+        )
+        .unwrap();
+    assert!(matches!(
+        sealed.remember_if_absent_keyed(
+            "sealed",
+            AtomInput::new("fact", "sealed keyed"),
+            &[stale],
+            None,
+            "request-1",
+        ),
+        Err(MemError::AtomNotLive { atom_id, ref region })
+            if atom_id == stale && region == "sealed"
+    ));
+    assert!(sealed
+        .fetch_edges(None, Some(stale), Some(EdgeKind::DerivedFrom))
         .unwrap()
         .is_empty());
 }
@@ -383,36 +914,42 @@ impl Embedder for SelectivelyNonFiniteEmbedder {
         }
     }
 
-    fn embed(
+    fn embed_with_cancel(
         &self,
         texts: &[&str],
+        cancel: Option<&citadel_core::CancelToken>,
     ) -> std::result::Result<Vec<Vec<f32>>, crate::embed::EmbedError> {
-        Ok(texts
-            .iter()
-            .map(|_| {
-                let mut vector = vec![0.0; self.dim()];
-                if self.passage {
-                    vector[3] = f32::NAN;
-                }
-                vector
-            })
-            .collect())
+        let mut vectors = Vec::with_capacity(texts.len());
+        for _ in texts {
+            if cancel.is_some_and(citadel_core::CancelToken::is_cancelled) {
+                return Err(crate::embed::EmbedError::Interrupted);
+            }
+            let mut vector = vec![0.0; self.dim()];
+            if self.passage {
+                vector[3] = f32::NAN;
+            }
+            vectors.push(vector);
+        }
+        Ok(vectors)
     }
 
-    fn embed_queries(
+    fn embed_queries_with_cancel(
         &self,
         texts: &[&str],
+        cancel: Option<&citadel_core::CancelToken>,
     ) -> std::result::Result<Vec<Vec<f32>>, crate::embed::EmbedError> {
-        Ok(texts
-            .iter()
-            .map(|_| {
-                let mut vector = vec![0.0; self.dim()];
-                if self.query {
-                    vector[5] = f32::INFINITY;
-                }
-                vector
-            })
-            .collect())
+        let mut vectors = Vec::with_capacity(texts.len());
+        for _ in texts {
+            if cancel.is_some_and(citadel_core::CancelToken::is_cancelled) {
+                return Err(crate::embed::EmbedError::Interrupted);
+            }
+            let mut vector = vec![0.0; self.dim()];
+            if self.query {
+                vector[5] = f32::INFINITY;
+            }
+            vectors.push(vector);
+        }
+        Ok(vectors)
     }
 }
 
@@ -438,7 +975,7 @@ fn atom_inputs_and_passage_vectors_are_finite_before_plain_or_sealed_writes() {
         }
 
         for atom in [
-            AtomInput::new("fact", "bad score").with_score(f32::NAN),
+            AtomInput::new("fact", "bad importance").with_importance(f32::NAN),
             AtomInput::new("fact", "bad confidence").with_confidence(f32::NEG_INFINITY),
         ] {
             assert!(matches!(
@@ -465,7 +1002,7 @@ fn atom_inputs_and_passage_vectors_are_finite_before_plain_or_sealed_writes() {
                 "finite-input",
                 vec![
                     AtomInput::new("fact", "finite first"),
-                    AtomInput::new("fact", "bad second").with_score(f32::INFINITY),
+                    AtomInput::new("fact", "bad second").with_importance(f32::INFINITY),
                 ],
             ),
             Err(MemError::Invalid(_))
@@ -579,7 +1116,7 @@ fn query_vectors_are_finite_before_single_or_multi_recall_observation() {
         } else {
             create_db(dir.path())
         };
-        let eng = MemoryEngine::open(db).unwrap();
+        let eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
         let embedder = Arc::new(SelectivelyNonFiniteEmbedder {
             passage: false,
             query: true,
@@ -813,14 +1350,14 @@ fn stored_atom_retrieval_state_is_exact_physical_metadata_without_content() {
     let turn = writer
         .remember(
             "retrievalstate",
-            AtomInput::new("turn", "turn content").with_score(0.0),
+            AtomInput::new("turn", "turn content").with_importance(0.0),
         )
         .unwrap();
     let residue = writer
         .remember(
             "retrievalstate",
             AtomInput::new("marker", "residue content")
-                .with_score(-0.0)
+                .with_importance(-0.0)
                 .with_expires_at(expired),
         )
         .unwrap();
@@ -828,14 +1365,14 @@ fn stored_atom_retrieval_state_is_exact_physical_metadata_without_content() {
         .remember(
             "retrievalstate",
             AtomInput::new("derived", "derived content")
-                .with_score(exact_score)
+                .with_importance(exact_score)
                 .with_expires_at(future),
         )
         .unwrap();
     let plain = writer
         .remember(
             "plainstate",
-            AtomInput::new("plain", "plain content").with_score(0.0),
+            AtomInput::new("plain", "plain content").with_importance(0.0),
         )
         .unwrap();
 
@@ -875,20 +1412,20 @@ fn stored_atom_retrieval_state_is_exact_physical_metadata_without_content() {
         vec![turn, residue, derived]
     );
     assert_eq!(states[0].kind(), "turn");
-    assert_eq!(states[0].score_bits(), 0.0f32.to_bits());
+    assert_eq!(states[0].importance_bits(), 0.0f32.to_bits());
     assert_eq!(states[0].expires_at(), None);
     assert_eq!(states[1].kind(), "marker");
-    assert_eq!(states[1].score_bits(), (-0.0f32).to_bits());
+    assert_eq!(states[1].importance_bits(), (-0.0f32).to_bits());
     assert_eq!(states[1].expires_at(), Some(expired));
     assert_eq!(states[2].kind(), "derived");
-    assert_eq!(states[2].score_bits(), exact_score.to_bits());
+    assert_eq!(states[2].importance_bits(), exact_score.to_bits());
     assert_eq!(states[2].expires_at(), Some(future));
 
     let plain_states = inventory.stored_atom_retrieval_state("plainstate").unwrap();
     assert_eq!(plain_states.len(), 1);
     assert_eq!(plain_states[0].atom_id(), plain);
     assert_eq!(plain_states[0].kind(), "plain");
-    assert_eq!(plain_states[0].score_bits(), 0.0f32.to_bits());
+    assert_eq!(plain_states[0].importance_bits(), 0.0f32.to_bits());
     assert_eq!(plain_states[0].expires_at(), None);
     assert!(matches!(
         inventory.stored_atom_retrieval_state("missing"),
@@ -959,7 +1496,10 @@ fn reranker_reorders_recall_results() {
         .recall("rr", RecallQuery::by_text("alpha beta gamma delta", 3))
         .unwrap();
     assert_eq!(hits[0].text, "alpha beta gamma delta", "best overlap first");
-    assert!(hits[0].score >= hits[1].score, "scores descending");
+    assert!(
+        hits[0].relevance >= hits[1].relevance,
+        "relevance descending"
+    );
 }
 
 #[test]
@@ -975,7 +1515,7 @@ fn fetch_last_returns_highest_id_of_kind() {
 
     eng.remember("r", AtomInput::new("audit", "first")).unwrap();
     let second = eng
-        .remember("r", AtomInput::new("audit", "second"))
+        .remember("r", AtomInput::new("audit", "second").with_importance(0.75))
         .unwrap();
     eng.remember("r", AtomInput::new("note", "unrelated"))
         .unwrap();
@@ -983,6 +1523,10 @@ fn fetch_last_returns_highest_id_of_kind() {
     let last = eng.fetch_last("r", "audit").unwrap().unwrap();
     assert_eq!(last.id, second);
     assert_eq!(last.text, "second");
+    assert_eq!(last.importance, 0.75);
+    assert_eq!(last.relevance, None);
+    assert_eq!(last.distance, None);
+    assert_eq!(last.graph_depth, None);
 }
 
 #[test]
@@ -1556,6 +2100,52 @@ fn dependent_forget_finishes_cleanup_when_cancelled_after_key_erasure() {
 }
 
 #[test]
+fn dependent_forget_closure_stops_at_its_core_work_limit_before_deletion() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
+    eng.create_region("bounded", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let root = eng
+        .remember("bounded", AtomInput::new("fact", "root"))
+        .unwrap();
+    let first = eng
+        .remember_derived(
+            "bounded",
+            AtomInput::new("fact", "first dependent"),
+            &[root],
+            None,
+        )
+        .unwrap();
+    let second = eng
+        .remember_derived(
+            "bounded",
+            AtomInput::new("fact", "second dependent"),
+            &[first],
+            None,
+        )
+        .unwrap();
+    let handle = eng.region_handle("bounded").unwrap();
+    let conn = Connection::open(&db).unwrap();
+
+    let error = dependent_closure(&conn, &handle, &[root], 2, None)
+        .expect_err("the reverse-provenance closure exceeded its work limit");
+    assert!(matches!(
+        error,
+        MemError::WorkLimitExceeded {
+            operation: "dependent forget",
+            limit: 2
+        }
+    ));
+    for id in [root, first, second] {
+        assert!(
+            eng.fetch_one("bounded", id).unwrap().is_some(),
+            "work-limit refusal partially deleted atom {id}"
+        );
+    }
+}
+
+#[test]
 fn dependent_forget_finishes_after_segment_key_erasure_cancels() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_enc_db(dir.path());
@@ -1911,6 +2501,406 @@ fn a_warm_sealed_ann_cache_revalidates_the_row_key_binding() {
 }
 
 #[test]
+fn a_warm_sealed_ann_cache_spends_the_materialized_budget_before_cloning() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_enc_db(dir.path());
+    let eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
+    eng.create_encrypted_region("s", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let cached_text = "cached secret ".repeat(1_280);
+    let cached_content_bytes =
+        atom_content_bytes("fact", &cached_text, &serde_json::Value::Null, usize::MAX);
+    let atom = eng
+        .remember(
+            "s",
+            AtomInput::new("fact", cached_text).with_embedding(unit(8, 0)),
+        )
+        .unwrap();
+    let query = RecallQuery::by_embedding(unit(8, 0), 1).with_superseded(true);
+    assert_eq!(eng.recall("s", query.clone()).unwrap()[0].id, atom);
+    assert!(eng
+        .region_handle("s")
+        .unwrap()
+        .ann
+        .read()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|ann| ann.cached.contains_key(&atom)));
+
+    let error = eng
+        .with_read_limits(
+            MemoryReadLimits::new(1024 * 1024, 24 * 1024, 1024 * 1024),
+            |eng| eng.recall("s", query),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        MemError::ReadLimitExceeded { size, .. } if size == cached_content_bytes
+    ));
+}
+
+#[test]
+fn warm_sealed_ann_only_spends_returned_budget_on_the_final_hit() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = MemoryEngine::open(create_enc_db(dir.path())).unwrap();
+    eng.create_encrypted_region("s", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let atoms = (0..64)
+        .map(|index| {
+            AtomInput::new("fact", format!("candidate {index:02} with bounded content"))
+                .with_embedding(unit(8, index % 8))
+        })
+        .collect();
+    eng.remember_batch("s", atoms).unwrap();
+    let query = RecallQuery::by_embedding(unit(8, 0), 1).with_superseded(true);
+    eng.recall("s", query.clone()).unwrap();
+
+    let hits = eng
+        .with_read_limits(MemoryReadLimits::new(1024 * 1024, 1024 * 1024, 64), |eng| {
+            eng.recall("s", query)
+        })
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+}
+
+#[test]
+fn fetch_page_does_not_charge_the_returned_budget_for_its_lookahead_atom() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = MemoryEngine::open(create_db(dir.path())).unwrap();
+    eng.create_region("plain", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let first = eng
+        .remember("plain", AtomInput::new("fact", "first"))
+        .unwrap();
+    eng.remember("plain", AtomInput::new("fact", "x".repeat(512)))
+        .unwrap();
+
+    let page = eng
+        .with_read_limits(MemoryReadLimits::new(1024 * 1024, 1024 * 1024, 64), |eng| {
+            eng.fetch_page("plain", &FetchQuery::new(1))
+        })
+        .unwrap();
+    assert_eq!(page.atoms.len(), 1);
+    assert_eq!(page.atoms[0].id, first);
+    assert_eq!(page.next_after_id, Some(first));
+}
+
+#[test]
+fn edge_page_does_not_charge_returned_budget_for_lookahead_evidence() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = MemoryEngine::open(create_db(dir.path())).unwrap();
+    eng.create_region("plain", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let source = eng
+        .remember("plain", AtomInput::new("fact", "source"))
+        .unwrap();
+    let first = eng
+        .remember("plain", AtomInput::new("fact", "first"))
+        .unwrap();
+    let second = eng
+        .remember("plain", AtomInput::new("fact", "second"))
+        .unwrap();
+    eng.link_in_region("plain", source, first, EdgeKind::Causes, 1.0)
+        .unwrap();
+    eng.link_with_evidence_in_region(
+        "plain",
+        source,
+        second,
+        EdgeKind::Causes,
+        1.0,
+        Some(serde_json::json!({"detail": "x".repeat(512)})),
+    )
+    .unwrap();
+
+    let page = eng
+        .with_read_limits(MemoryReadLimits::new(1024 * 1024, 1024 * 1024, 1), |eng| {
+            eng.fetch_edges_page_in_region("plain", None, None, None, None, 1)
+        })
+        .unwrap();
+    assert_eq!(page.edges.len(), 1);
+    assert_eq!(
+        (page.edges[0].src_id, page.edges[0].dst_id),
+        (source, first)
+    );
+    assert!(page.next_after.is_some());
+}
+
+#[test]
+fn profile_is_region_scoped_deterministic_and_does_not_charge_lookahead_evidence() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = MemoryEngine::open(create_db(dir.path())).unwrap();
+    eng.create_region("profile", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    eng.create_region("foreign", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let first = eng
+        .remember(
+            "profile",
+            AtomInput::new("fact", "a").with_embedding(unit(8, 0)),
+        )
+        .unwrap();
+    let second = eng
+        .remember(
+            "profile",
+            AtomInput::new("fact", "b").with_embedding(unit(8, 1)),
+        )
+        .unwrap();
+    let third = eng
+        .remember(
+            "profile",
+            AtomInput::new("fact", "c").with_embedding(unit(8, 2)),
+        )
+        .unwrap();
+    let foreign = eng
+        .remember(
+            "foreign",
+            AtomInput::new("fact", "foreign").with_embedding(unit(8, 0)),
+        )
+        .unwrap();
+    let foreign_peer = eng
+        .remember(
+            "foreign",
+            AtomInput::new("fact", "foreign peer").with_embedding(unit(8, 1)),
+        )
+        .unwrap();
+    eng.link_in_region("profile", first, second, EdgeKind::Causes, 1.0)
+        .unwrap();
+    eng.link_with_evidence_in_region(
+        "profile",
+        first,
+        third,
+        EdgeKind::Causes,
+        1.0,
+        Some(serde_json::json!({"detail": "x".repeat(512)})),
+    )
+    .unwrap();
+    eng.link_in_region("foreign", foreign, foreign_peer, EdgeKind::Refines, 1.0)
+        .unwrap();
+
+    let query = RecallQuery::by_embedding(unit(8, 0), 3).with_superseded(true);
+    let profile = eng
+        .with_read_limits(
+            MemoryReadLimits::new(1024 * 1024, 1024 * 1024, 128),
+            |eng| eng.profile("profile", query.clone(), 1),
+        )
+        .unwrap();
+    assert_eq!(profile.atoms.len(), 3);
+    assert!(profile.atoms.iter().all(|atom| atom.id != foreign));
+    assert!(profile.edges_truncated);
+    assert_eq!(profile.edges.len(), 1);
+    assert_eq!(
+        (profile.edges[0].src_id, profile.edges[0].dst_id),
+        (first, second)
+    );
+
+    let repeated = eng.profile("profile", query, 1).unwrap();
+    assert_eq!(repeated.edges.len(), 1);
+    assert_eq!(
+        (repeated.edges[0].src_id, repeated.edges[0].dst_id),
+        (first, second)
+    );
+}
+
+#[test]
+fn summary_page_charges_returned_kind_and_cursor_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = MemoryEngine::open(create_db(dir.path())).unwrap();
+    eng.create_region("plain", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let first_kind = format!("a{}", "x".repeat(127));
+    let second_kind = format!("z{}", "x".repeat(127));
+    eng.remember("plain", AtomInput::new(&first_kind, "first"))
+        .unwrap();
+    eng.remember("plain", AtomInput::new(second_kind, "second"))
+        .unwrap();
+
+    let error = eng
+        .with_read_limits(
+            MemoryReadLimits::new(1024 * 1024, 1024 * 1024, first_kind.len()),
+            |eng| eng.summarize_page("plain", &SummaryQuery::new(0, 1)),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        MemError::ReadLimitExceeded {
+            size,
+            remaining: 0,
+            ..
+        } if size == first_kind.len()
+    ));
+}
+
+#[test]
+fn persisted_name_and_kind_inventories_charge_returned_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = MemoryEngine::open(create_db(dir.path())).unwrap();
+    let region = format!("region-{}", "r".repeat(96));
+    let kind = format!("kind-{}", "k".repeat(96));
+    eng.create_region(&region, Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    eng.remember(&region, AtomInput::new(&kind, "content"))
+        .unwrap();
+    let limits = MemoryReadLimits::new(1024 * 1024, 1024 * 1024, 32);
+
+    assert!(matches!(
+        eng.with_read_limits(limits, |eng| eng.stored_region_names()),
+        Err(MemError::ReadLimitExceeded { .. })
+    ));
+    assert!(matches!(
+        eng.with_read_limits(limits, |eng| eng.stored_atom_kinds(&region)),
+        Err(MemError::ReadLimitExceeded { .. })
+    ));
+}
+
+#[test]
+fn endpoint_projection_does_not_materialize_unused_edge_evidence() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = MemoryEngine::open(create_db(dir.path())).unwrap();
+    eng.create_region("plain", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let source = eng
+        .remember("plain", AtomInput::new("fact", "source"))
+        .unwrap();
+    let destination = eng
+        .remember("plain", AtomInput::new("fact", "destination"))
+        .unwrap();
+    eng.link_with_evidence_in_region(
+        "plain",
+        source,
+        destination,
+        EdgeKind::DerivedFrom,
+        1.0,
+        Some(serde_json::json!({"detail": "x".repeat(4 * 1024)})),
+    )
+    .unwrap();
+    let limits = MemoryReadLimits::new(16 * 1024, 6_500, 16 * 1024);
+
+    let endpoints = eng
+        .with_read_limits(limits, |eng| {
+            eng.fetch_edge_endpoints_from_atoms_in_region(
+                "plain",
+                &[source],
+                Some(EdgeKind::DerivedFrom),
+                1,
+            )
+        })
+        .unwrap();
+    assert_eq!(endpoints, vec![(source, destination)]);
+
+    let error = eng
+        .with_read_limits(limits, |eng| {
+            eng.fetch_edges_from_atoms_in_region("plain", &[source], Some(EdgeKind::DerivedFrom), 1)
+        })
+        .unwrap_err();
+    assert!(matches!(error, MemError::ReadLimitExceeded { .. }));
+}
+
+#[test]
+fn exact_id_batch_reads_are_region_local_ordered_and_expiry_aware() {
+    for encrypted in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = if encrypted {
+            create_enc_db(dir.path())
+        } else {
+            create_db(dir.path())
+        };
+        let eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
+        if encrypted {
+            eng.create_encrypted_region("r", Arc::new(MockEmbedder::new(8)))
+                .unwrap();
+        } else {
+            eng.create_region("r", Arc::new(MockEmbedder::new(8)))
+                .unwrap();
+        }
+        let future = micros_now() + 60_000_000;
+        let first = eng
+            .remember(
+                "r",
+                AtomInput::new("fact", "first")
+                    .with_confidence(0.25)
+                    .with_expires_at(future)
+                    .with_embedding(unit(8, 0)),
+            )
+            .unwrap();
+        let expired = eng
+            .remember(
+                "r",
+                AtomInput::new("fact", "expired").with_expires_at(micros_now() - 1),
+            )
+            .unwrap();
+        let second = eng.remember("r", AtomInput::new("fact", "second")).unwrap();
+
+        let hits = eng
+            .fetch_by_ids("r", &[second, i64::MAX, expired, first])
+            .unwrap();
+        assert_eq!(hits.len(), 4);
+        assert_eq!(hits[0].as_ref().map(|hit| hit.id), Some(second));
+        assert!(hits[1].is_none());
+        assert!(hits[2].is_none());
+        assert_eq!(hits[3].as_ref().map(|hit| hit.id), Some(first));
+        assert_eq!(hits[3].as_ref().map(|hit| hit.confidence), Some(0.25));
+        assert_eq!(
+            hits[3].as_ref().and_then(|hit| hit.expires_at),
+            Some(future)
+        );
+
+        let recalled = eng
+            .recall(
+                "r",
+                RecallQuery::by_embedding(unit(8, 0), 10).with_superseded(true),
+            )
+            .unwrap();
+        let recalled_first = recalled.iter().find(|hit| hit.id == first).unwrap();
+        assert_eq!(recalled_first.confidence, 0.25);
+        assert_eq!(recalled_first.expires_at, Some(future));
+
+        let maintenance = MemoryMaintenance::open(db).unwrap();
+        let maintained = maintenance.fetch_by_ids("r", &[first]).unwrap();
+        assert_eq!(maintained[0].as_ref().map(|hit| hit.confidence), Some(0.25));
+        assert_eq!(
+            maintained[0].as_ref().and_then(|hit| hit.expires_at),
+            Some(future)
+        );
+
+        assert!(matches!(
+            eng.with_read_limits(MemoryReadLimits::new(1024 * 1024, 1024 * 1024, 1), |eng| {
+                eng.fetch_by_ids("r", &[first])
+            },),
+            Err(MemError::ReadLimitExceeded { .. })
+        ));
+        assert!(matches!(
+            maintenance.with_read_limits(
+                MemoryReadLimits::new(1024 * 1024, 1024 * 1024, 1),
+                |maintenance| maintenance.fetch_by_ids("r", &[first]),
+            ),
+            Err(MemError::ReadLimitExceeded { .. })
+        ));
+
+        assert!(matches!(
+            eng.fetch_by_ids("r", &[first, first]),
+            Err(MemError::Invalid(message)) if message.contains("duplicate id")
+        ));
+    }
+}
+
+#[test]
+fn a_plain_overflow_value_is_refused_by_the_storage_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = MemoryEngine::open(create_db(dir.path())).unwrap();
+    eng.create_region("plain", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    eng.remember("plain", AtomInput::new("fact", "x".repeat(16 * 1024)))
+        .unwrap();
+
+    let error = eng
+        .with_read_limits(MemoryReadLimits::new(128, 1024, 1024), |eng| {
+            eng.fetch_range("plain", &FetchQuery::new(1))
+        })
+        .unwrap_err();
+    assert!(matches!(error, MemError::ReadLimitExceeded { .. }));
+}
+
+#[test]
 fn a_warm_sealed_ann_cache_rebuilds_after_raw_row_metadata_changes() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_enc_db(dir.path());
@@ -2065,8 +3055,10 @@ fn update_atom_payload_encrypted_preserves_embedding_edges_and_integrity() {
         .unwrap();
     eng.link(a, b, EdgeKind::DerivedFrom, 1.0).unwrap();
 
-    eng.update_atom_payload("s", a, &serde_json::json!({"v": 2, "note": "updated"}))
+    let outcome = eng
+        .update_atom_payload("s", a, &serde_json::json!({"v": 2, "note": "updated"}))
         .unwrap();
+    assert!(outcome.changed);
 
     assert_eq!(
         eng.fetch_one("s", a).unwrap().unwrap().payload,
@@ -2094,6 +3086,172 @@ fn update_atom_payload_encrypted_preserves_embedding_edges_and_integrity() {
         .is_err());
 }
 
+#[test]
+fn invalid_and_same_payload_updates_preserve_a_persisted_sealed_segment() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_enc_db(dir.path());
+    let eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
+    let region_id = eng
+        .create_encrypted_region("s", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let payload = serde_json::json!({"state": "unchanged", "n": 1});
+    let atom = eng
+        .remember(
+            "s",
+            AtomInput::new("fact", "persisted").with_payload(payload.clone()),
+        )
+        .unwrap();
+    eng.persist_ann_index("s").unwrap();
+    let meta = read_annseg_meta(&Connection::open(&db).unwrap(), region_id)
+        .unwrap()
+        .expect("persisted sealed segment");
+    let epoch = db.cache_epoch();
+
+    assert!(eng
+        .update_atom_payload("s", i64::MAX, &serde_json::json!({"state": "new"}))
+        .is_err());
+    assert_eq!(db.cache_epoch(), epoch);
+    assert!(seg_tree_exists(&db, region_id, 8));
+    assert_eq!(
+        read_annseg_meta(&Connection::open(&db).unwrap(), region_id)
+            .unwrap()
+            .unwrap(),
+        meta
+    );
+
+    assert!(
+        !eng.update_atom_payload("s", atom, &payload)
+            .unwrap()
+            .changed
+    );
+    assert_eq!(
+        db.cache_epoch(),
+        epoch,
+        "same payload must not arm the epoch"
+    );
+    assert!(seg_tree_exists(&db, region_id, 8));
+    assert_eq!(
+        read_annseg_meta(&Connection::open(&db).unwrap(), region_id)
+            .unwrap()
+            .unwrap(),
+        meta
+    );
+
+    assert!(
+        eng.update_atom_payload("s", atom, &serde_json::json!({"state": "changed"}))
+            .unwrap()
+            .changed
+    );
+    assert!(db.cache_epoch() > epoch);
+    assert_segment_retired(&db, region_id, 8);
+}
+
+#[test]
+fn expired_atoms_reject_payload_updates_and_evolution_before_side_effects() {
+    let expired_at = micros_now() - 1;
+
+    let plain_dir = tempfile::tempdir().unwrap();
+    let plain = MemoryEngine::open(create_db(plain_dir.path())).unwrap();
+    plain
+        .create_region("p", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let plain_expired = plain
+        .remember(
+            "p",
+            AtomInput::new("fact", "expired plain")
+                .with_payload(serde_json::json!({"v": 1}))
+                .with_expires_at(expired_at),
+        )
+        .unwrap();
+    assert!(plain
+        .update_atom_payload("p", plain_expired, &serde_json::json!({"v": 2}))
+        .is_err());
+    assert!(plain.evolve("p", plain_expired, 1, f32::MAX).is_err());
+    assert!(plain
+        .fetch_edges(Some(plain_expired), None, None)
+        .unwrap()
+        .is_empty());
+
+    let sealed_dir = tempfile::tempdir().unwrap();
+    let db = create_enc_db(sealed_dir.path());
+    let sealed = MemoryEngine::open(Arc::clone(&db)).unwrap();
+    let region_id = sealed
+        .create_encrypted_region("s", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let sealed_expired = sealed
+        .remember(
+            "s",
+            AtomInput::new("fact", "expired sealed")
+                .with_payload(serde_json::json!({"v": 1}))
+                .with_expires_at(expired_at),
+        )
+        .unwrap();
+    sealed
+        .remember("s", AtomInput::new("fact", "live sibling"))
+        .unwrap();
+    sealed.persist_ann_index("s").unwrap();
+    let epoch = db.cache_epoch();
+    let meta = read_annseg_meta(&Connection::open(&db).unwrap(), region_id)
+        .unwrap()
+        .expect("persisted sealed segment");
+
+    assert!(sealed
+        .update_atom_payload("s", sealed_expired, &serde_json::json!({"v": 2}))
+        .is_err());
+    assert!(sealed.evolve("s", sealed_expired, 1, f32::MAX).is_err());
+    assert_eq!(db.cache_epoch(), epoch);
+    assert!(seg_tree_exists(&db, region_id, 8));
+    assert_eq!(
+        read_annseg_meta(&Connection::open(&db).unwrap(), region_id)
+            .unwrap()
+            .unwrap(),
+        meta
+    );
+}
+
+#[test]
+fn sealed_summary_pages_exact_live_kinds_and_rejects_stale_evolution_targets() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_enc_db(dir.path());
+    let eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
+    eng.create_encrypted_region("s", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let stale = eng
+        .remember("s", AtomInput::new("aardvark", "key-erased residue"))
+        .unwrap();
+    eng.remember("s", AtomInput::new("alpha", "first live alpha"))
+        .unwrap();
+    eng.remember("s", AtomInput::new("zeta", "live zeta"))
+        .unwrap();
+    eng.remember("s", AtomInput::new("alpha", "second live alpha"))
+        .unwrap();
+
+    let table = atoms_table(8, EmbeddingMetric::Cosine, true);
+    let (slot, generation) = atom_binding(&db, &table, stale);
+    db.atom_store_tombstone(slot, stale as u64, generation)
+        .unwrap();
+
+    let first = eng.summarize_page("s", &SummaryQuery::new(0, 1)).unwrap();
+    assert_eq!(first.total, 3, "key-erased residue must not be counted");
+    assert_eq!(first.kinds.len(), 1);
+    assert_eq!(first.kinds[0].kind, "alpha");
+    assert_eq!(first.kinds[0].count, 2);
+    assert_eq!(first.next_after_kind.as_deref(), Some("alpha"));
+
+    let second = eng
+        .summarize_page("s", &SummaryQuery::new(0, 1).with_after_kind("alpha"))
+        .unwrap();
+    assert_eq!(second.total, 3);
+    assert_eq!(second.kinds.len(), 1);
+    assert_eq!(second.kinds[0].kind, "zeta");
+    assert_eq!(second.next_after_kind, None);
+    assert!(eng.summarize_page("s", &SummaryQuery::new(0, 0)).is_err());
+    assert!(eng
+        .summarize_page("s", &SummaryQuery::new(0, MAX_SUMMARY_KIND_LIMIT + 1),)
+        .is_err());
+    assert!(eng.evolve("s", stale, 1, f32::MAX).is_err());
+}
+
 /// `update_atom_payload` (plaintext): payload replaced; recall + edge
 /// preserved; immutable/absent rejected.
 #[test]
@@ -2114,8 +3272,15 @@ fn update_atom_payload_plaintext_preserves_recall_and_edges() {
         .unwrap();
     eng.link(a, b, EdgeKind::DerivedFrom, 1.0).unwrap();
 
-    eng.update_atom_payload("p", a, &serde_json::json!({"v": 9}))
+    let outcome = eng
+        .update_atom_payload("p", a, &serde_json::json!({"v": 9}))
         .unwrap();
+    assert!(outcome.changed);
+    assert!(
+        !eng.update_atom_payload("p", a, &serde_json::json!({"v": 9}))
+            .unwrap()
+            .changed
+    );
 
     assert_eq!(
         eng.fetch_one("p", a).unwrap().unwrap().payload,
@@ -3211,19 +4376,31 @@ fn text_only_atom_decoder_never_materializes_payload() {
 #[test]
 fn vec_distance_matches_sql_metrics() {
     // L2 = sqrt(sum sq): [3,4] vs [0,0] -> 5
-    assert!((vec_distance(EmbeddingMetric::L2, &[3.0, 4.0], &[0.0, 0.0]) - 5.0).abs() < 1e-5);
+    assert!(
+        (vec_distance(EmbeddingMetric::L2, &[3.0, 4.0], &[0.0, 0.0]).unwrap() - 5.0).abs() < 1e-5
+    );
     // Inner = -dot: -([1,2].[3,4]) = -11
     assert!(
-        (vec_distance(EmbeddingMetric::InnerProduct, &[1.0, 2.0], &[3.0, 4.0]) - (-11.0)).abs()
+        (vec_distance(EmbeddingMetric::InnerProduct, &[1.0, 2.0], &[3.0, 4.0]).unwrap() - (-11.0))
+            .abs()
             < 1e-5
     );
     // Cosine: identical -> 0, orthogonal -> 1
-    assert!(vec_distance(EmbeddingMetric::Cosine, &[1.0, 0.0], &[1.0, 0.0]).abs() < 1e-6);
-    assert!((vec_distance(EmbeddingMetric::Cosine, &[1.0, 0.0], &[0.0, 1.0]) - 1.0).abs() < 1e-6);
-    // Cosine zero-norm -> f32::MAX (the worst rank), NOT NaN
-    let d = vec_distance(EmbeddingMetric::Cosine, &[3.0, 4.0], &[0.0, 0.0]);
-    assert_eq!(d, f32::MAX);
-    assert!(!d.is_nan());
+    assert!(
+        vec_distance(EmbeddingMetric::Cosine, &[1.0, 0.0], &[1.0, 0.0])
+            .unwrap()
+            .abs()
+            < 1e-6
+    );
+    assert!(
+        (vec_distance(EmbeddingMetric::Cosine, &[1.0, 0.0], &[0.0, 1.0]).unwrap() - 1.0).abs()
+            < 1e-6
+    );
+    assert_eq!(
+        vec_distance(EmbeddingMetric::Cosine, &[3.0, 4.0], &[0.0, 0.0]),
+        None,
+        "cosine distance is undefined for a zero-norm vector"
+    );
 }
 
 /// `search_sealed_index` sorts AnnIndex distances together with `vec_distance`
@@ -3246,7 +4423,7 @@ fn ann_index_distances_match_vec_distance_for_all_metrics() {
         assert_eq!(hits.len(), rows.len());
         for (rid, d) in hits {
             let v = &rows.iter().find(|(id, _)| *id == rid).unwrap().1;
-            let exact = vec_distance(m, &q, v);
+            let exact = vec_distance(m, &q, v).expect("fixture vectors have nonzero norms");
             assert!(
                 (d - exact).abs() < 1e-4,
                 "{m:?} row {rid}: index dist {d} vs exact {exact}"
@@ -3293,7 +4470,7 @@ fn micros_now() -> i64 {
 }
 
 #[test]
-fn evolve_score_pins_recency_decay_and_access_boost() {
+fn evolve_importance_pins_recency_decay_and_access_boost() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let eng = MemoryEngine::open(db.clone()).unwrap();
@@ -3311,9 +4488,9 @@ fn evolve_score_pins_recency_decay_and_access_boost() {
     let recency = 0.5f32;
     let expected = recency * (1.0 + (19f32).ln_1p());
     assert!(
-        (report.score - expected).abs() < 1e-3,
-        "score {} should equal recency*ln1p boost {}",
-        report.score,
+        (report.importance - expected).abs() < 1e-3,
+        "importance {} should equal recency*ln1p boost {}",
+        report.importance,
         expected
     );
     assert!(
@@ -3323,7 +4500,7 @@ fn evolve_score_pins_recency_decay_and_access_boost() {
 }
 
 #[test]
-fn evolve_score_zero_age_no_access_is_unity() {
+fn evolve_importance_zero_age_no_access_is_unity() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let eng = MemoryEngine::open(db.clone()).unwrap();
@@ -3337,9 +4514,9 @@ fn evolve_score_zero_age_no_access_is_unity() {
     set_atom_age_and_access(&db, 8, region_id, a, micros_now(), 0);
     let report = eng.evolve("ev0", a, 0, 10.0).unwrap();
     assert!(
-        (report.score - 1.0).abs() < 1e-4,
-        "fresh, never-accessed atom scores 1.0, got {}",
-        report.score
+        (report.importance - 1.0).abs() < 1e-4,
+        "fresh, never-accessed atom has importance 1.0, got {}",
+        report.importance
     );
 }
 
@@ -3461,8 +4638,12 @@ impl Embedder for ModelEmbedder {
         self.model
     }
 
-    fn embed(&self, texts: &[&str]) -> std::result::Result<Vec<Vec<f32>>, crate::EmbedError> {
-        self.inner.embed(texts)
+    fn embed_with_cancel(
+        &self,
+        texts: &[&str],
+        cancel: Option<&citadel_core::CancelToken>,
+    ) -> std::result::Result<Vec<Vec<f32>>, crate::EmbedError> {
+        self.inner.embed_with_cancel(texts, cancel)
     }
 }
 
@@ -3479,23 +4660,31 @@ impl Embedder for BlockingQueryEmbedder {
         "blocking-query"
     }
 
-    fn embed(&self, texts: &[&str]) -> std::result::Result<Vec<Vec<f32>>, crate::EmbedError> {
-        self.inner.embed(texts)
-    }
-
-    fn embed_queries(
+    fn embed_with_cancel(
         &self,
         texts: &[&str],
+        cancel: Option<&citadel_core::CancelToken>,
+    ) -> std::result::Result<Vec<Vec<f32>>, crate::EmbedError> {
+        self.inner.embed_with_cancel(texts, cancel)
+    }
+
+    fn embed_queries_with_cancel(
+        &self,
+        texts: &[&str],
+        cancel: Option<&citadel_core::CancelToken>,
     ) -> std::result::Result<Vec<Vec<f32>>, crate::EmbedError> {
         use std::sync::atomic::Ordering;
 
         if self.armed.load(Ordering::SeqCst) {
             self.entered.store(true, Ordering::SeqCst);
             while !self.release.load(Ordering::SeqCst) {
+                if cancel.is_some_and(citadel_core::CancelToken::is_cancelled) {
+                    return Err(crate::EmbedError::Interrupted);
+                }
                 std::thread::yield_now();
             }
         }
-        self.inner.embed(texts)
+        self.inner.embed_with_cancel(texts, cancel)
     }
 }
 
@@ -3512,17 +4701,22 @@ impl Embedder for SideCountingEmbedder {
         "side-counting"
     }
 
-    fn embed(&self, texts: &[&str]) -> std::result::Result<Vec<Vec<f32>>, crate::EmbedError> {
-        self.passages.fetch_add(texts.len(), Ordering::Relaxed);
-        self.inner.embed(texts)
-    }
-
-    fn embed_queries(
+    fn embed_with_cancel(
         &self,
         texts: &[&str],
+        cancel: Option<&citadel_core::CancelToken>,
+    ) -> std::result::Result<Vec<Vec<f32>>, crate::EmbedError> {
+        self.passages.fetch_add(texts.len(), Ordering::Relaxed);
+        self.inner.embed_with_cancel(texts, cancel)
+    }
+
+    fn embed_queries_with_cancel(
+        &self,
+        texts: &[&str],
+        cancel: Option<&citadel_core::CancelToken>,
     ) -> std::result::Result<Vec<Vec<f32>>, crate::EmbedError> {
         self.queries.fetch_add(texts.len(), Ordering::Relaxed);
-        self.inner.embed(texts)
+        self.inner.embed_with_cancel(texts, cancel)
     }
 }
 
@@ -3547,20 +4741,25 @@ impl Embedder for CancelAndClearEmbedder {
         "cancel-and-clear"
     }
 
-    fn embed(&self, texts: &[&str]) -> std::result::Result<Vec<Vec<f32>>, crate::EmbedError> {
+    fn embed_with_cancel(
+        &self,
+        texts: &[&str],
+        cancel: Option<&citadel_core::CancelToken>,
+    ) -> std::result::Result<Vec<Vec<f32>>, crate::EmbedError> {
         self.passages.fetch_add(texts.len(), Ordering::Relaxed);
-        let result = self.inner.embed(texts);
+        let result = self.inner.embed_with_cancel(texts, cancel);
         self.token.cancel();
         self.db.set_cancel(None);
         result
     }
 
-    fn embed_queries(
+    fn embed_queries_with_cancel(
         &self,
         texts: &[&str],
+        cancel: Option<&citadel_core::CancelToken>,
     ) -> std::result::Result<Vec<Vec<f32>>, crate::EmbedError> {
         self.queries.fetch_add(texts.len(), Ordering::Relaxed);
-        let result = self.inner.embed(texts);
+        let result = self.inner.embed_with_cancel(texts, cancel);
         self.token.cancel();
         self.db.set_cancel(None);
         result
@@ -3579,20 +4778,126 @@ struct BlockingReranker {
     panic_after_release: bool,
 }
 
+struct CooperativeCancelEmbedder {
+    inner: MockEmbedder,
+    passage_calls: std::sync::atomic::AtomicUsize,
+    query_calls: std::sync::atomic::AtomicUsize,
+}
+
+impl CooperativeCancelEmbedder {
+    fn wait_for_cancel(
+        calls: &std::sync::atomic::AtomicUsize,
+        cancel: Option<&citadel_core::CancelToken>,
+    ) -> std::result::Result<Vec<Vec<f32>>, crate::EmbedError> {
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+
+        calls.fetch_add(1, Ordering::SeqCst);
+        let Some(cancel) = cancel else {
+            return Err(crate::EmbedError::Backend(
+                "engine omitted the model cancellation token".into(),
+            ));
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !cancel.is_cancelled() && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        if cancel.is_cancelled() {
+            Err(crate::EmbedError::Interrupted)
+        } else {
+            Err(crate::EmbedError::Backend(
+                "timed out waiting for cooperative cancellation".into(),
+            ))
+        }
+    }
+}
+
+impl Embedder for CooperativeCancelEmbedder {
+    fn dim(&self) -> usize {
+        self.inner.dim()
+    }
+
+    fn metric(&self) -> EmbeddingMetric {
+        self.inner.metric()
+    }
+
+    fn model_id(&self) -> &str {
+        "cooperative-cancel"
+    }
+
+    fn embed_with_cancel(
+        &self,
+        _texts: &[&str],
+        cancel: Option<&citadel_core::CancelToken>,
+    ) -> std::result::Result<Vec<Vec<f32>>, crate::EmbedError> {
+        Self::wait_for_cancel(&self.passage_calls, cancel)
+    }
+
+    fn embed_queries_with_cancel(
+        &self,
+        _texts: &[&str],
+        cancel: Option<&citadel_core::CancelToken>,
+    ) -> std::result::Result<Vec<Vec<f32>>, crate::EmbedError> {
+        Self::wait_for_cancel(&self.query_calls, cancel)
+    }
+}
+
+struct CooperativeCancelReranker {
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl Reranker for CooperativeCancelReranker {
+    fn model_id(&self) -> &str {
+        "cooperative-cancel"
+    }
+
+    fn rerank_with_cancel(
+        &self,
+        _query: &str,
+        _passages: &[&str],
+        cancel: Option<&citadel_core::CancelToken>,
+    ) -> std::result::Result<Vec<f32>, crate::EmbedError> {
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let Some(cancel) = cancel else {
+            return Err(crate::EmbedError::Backend(
+                "engine omitted the reranker cancellation token".into(),
+            ));
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !cancel.is_cancelled() && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        if cancel.is_cancelled() {
+            Err(crate::EmbedError::Interrupted)
+        } else {
+            Err(crate::EmbedError::Backend(
+                "timed out waiting for cooperative reranker cancellation".into(),
+            ))
+        }
+    }
+}
+
 impl Reranker for BlockingReranker {
     fn model_id(&self) -> &str {
         "blocking-reranker"
     }
 
-    fn rerank(
+    fn rerank_with_cancel(
         &self,
         _query: &str,
         passages: &[&str],
+        cancel: Option<&citadel_core::CancelToken>,
     ) -> std::result::Result<Vec<f32>, crate::EmbedError> {
         use std::sync::atomic::Ordering;
 
         self.entered.store(true, Ordering::SeqCst);
         while !self.release.load(Ordering::SeqCst) {
+            if cancel.is_some_and(citadel_core::CancelToken::is_cancelled) {
+                return Err(crate::EmbedError::Interrupted);
+            }
             std::thread::yield_now();
         }
         assert!(!self.panic_after_release, "injected reranker panic");
@@ -3605,11 +4910,15 @@ impl Reranker for CancelAndClearReranker {
         "cancel-and-clear-reranker"
     }
 
-    fn rerank(
+    fn rerank_with_cancel(
         &self,
         _query: &str,
         passages: &[&str],
+        cancel: Option<&citadel_core::CancelToken>,
     ) -> std::result::Result<Vec<f32>, crate::EmbedError> {
+        if cancel.is_some_and(citadel_core::CancelToken::is_cancelled) {
+            return Err(crate::EmbedError::Interrupted);
+        }
         self.calls.fetch_add(1, Ordering::Relaxed);
         let scores = vec![1.0; passages.len()];
         self.token.cancel();
@@ -3624,6 +4933,21 @@ fn assert_mem_interrupted<T>(result: crate::Result<T>) {
         Err(err) => panic!("expected Interrupted, got {err:?}"),
         Ok(_) => panic!("expected Interrupted, got success"),
     }
+}
+
+fn wait_for_model_call(calls: &std::sync::atomic::AtomicUsize, operation: &str) {
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while calls.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "{operation} did not enter the cancellable model callback"
+    );
 }
 
 fn arm_cancel_after_local_work(db: &Arc<Database>) {
@@ -3710,6 +5034,163 @@ fn finish_segment_key_erasure_probe(db: &Arc<Database>, fired: &std::sync::atomi
 }
 
 #[test]
+fn request_cancel_scope_restores_the_database_token_after_success_and_panic() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
+    let other_dir = tempfile::tempdir().unwrap();
+    let other_db = create_db(other_dir.path());
+    let other = MemoryEngine::open(Arc::clone(&other_db)).unwrap();
+
+    let global = citadel_core::CancelToken::new();
+    global.cancel();
+    db.set_cancel(Some(global));
+
+    let outer = citadel_core::CancelToken::new();
+    eng.with_cancel_token(outer, |eng| {
+        assert!(db
+            .cancel_token()
+            .is_some_and(|installed| !installed.is_cancelled()));
+
+        let inner = citadel_core::CancelToken::new();
+        inner.cancel();
+        eng.with_cancel_token(inner, |_| {
+            assert!(db
+                .cancel_token()
+                .is_some_and(|installed| installed.is_cancelled()));
+        });
+        assert!(db
+            .cancel_token()
+            .is_some_and(|installed| !installed.is_cancelled()));
+
+        let other_token = citadel_core::CancelToken::new();
+        other_token.cancel();
+        other.with_cancel_token(other_token, |_| {
+            assert!(db
+                .cancel_token()
+                .is_some_and(|installed| !installed.is_cancelled()));
+            assert!(other_db
+                .cancel_token()
+                .is_some_and(|installed| installed.is_cancelled()));
+        });
+        assert!(other_db.cancel_token().is_none());
+        assert!(db
+            .cancel_token()
+            .is_some_and(|installed| !installed.is_cancelled()));
+
+        let replacement = citadel_core::CancelToken::new();
+        replacement.cancel();
+        db.set_cancel(Some(replacement));
+        assert!(
+            db.cancel_token()
+                .is_some_and(|installed| !installed.is_cancelled()),
+            "the explicit database token replaced the current local scope"
+        );
+    });
+    assert!(db
+        .cancel_token()
+        .is_some_and(|installed| installed.is_cancelled()));
+
+    db.set_cancel(None);
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        eng.with_cancel_token(citadel_core::CancelToken::new(), |_| {
+            panic!("request handler panic must unwind through the cancellation lease")
+        });
+    }));
+    assert!(panic.is_err());
+    assert!(
+        db.cancel_token().is_none(),
+        "panic leaked a request token into later engine work"
+    );
+
+    eng.with_cancel_token(citadel_core::CancelToken::new(), |_| ());
+    assert!(
+        db.cancel_token().is_none(),
+        "a poisoned execution lease did not recover"
+    );
+}
+
+#[test]
+fn request_cancel_scopes_are_thread_local_and_do_not_cancel_unscoped_work() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let first = Arc::new(MemoryEngine::open(Arc::clone(&db)).unwrap());
+    let second = Arc::new(MemoryEngine::open(Arc::clone(&db)).unwrap());
+    first
+        .create_region("scope", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    second
+        .attach_existing_region("scope", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    first
+        .remember("scope", AtomInput::new("fact", "one"))
+        .unwrap();
+
+    let first_token = citadel_core::CancelToken::new();
+    let release = Arc::new(AtomicBool::new(false));
+    let (first_entered_tx, first_entered_rx) = mpsc::sync_channel(0);
+    let (second_done_tx, second_done_rx) = mpsc::sync_channel(0);
+
+    std::thread::scope(|scope| {
+        let first = Arc::clone(&first);
+        let token = first_token.clone();
+        let worker_release = Arc::clone(&release);
+        let first_thread = scope.spawn(move || {
+            first.with_cancel_token(token.clone(), |first| {
+                token.cancel();
+                first_entered_tx.send(first.count("scope", "fact")).unwrap();
+                while !worker_release.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+            });
+        });
+        let scoped_result = first_entered_rx.recv().unwrap();
+
+        let second_worker = Arc::clone(&second);
+        let second_thread = scope.spawn(move || {
+            let result = second_worker
+                .with_cancel_token(citadel_core::CancelToken::new(), |second| {
+                    second.count("scope", "fact")
+                });
+            second_done_tx.send(result).unwrap();
+        });
+
+        let unscoped_result = second.count("scope", "fact");
+        let concurrent_scope_result = second_done_rx.recv_timeout(Duration::from_secs(2));
+
+        release.store(true, Ordering::Release);
+        first_thread.join().unwrap();
+        second_thread.join().unwrap();
+
+        assert!(
+            matches!(
+                scoped_result,
+                Err(MemError::Core(citadel_core::Error::Interrupted))
+            ),
+            "the scoped operation did not observe its own cancelled token"
+        );
+        assert_eq!(unscoped_result.unwrap(), 1);
+        assert_eq!(
+            concurrent_scope_result
+                .expect("a second thread's cancellation scope was serialized")
+                .unwrap(),
+            1
+        );
+    });
+
+    assert!(db.cancel_token().is_none());
+    let global = citadel_core::CancelToken::new();
+    global.cancel();
+    db.set_cancel(Some(global));
+    assert_mem_interrupted(second.count("scope", "fact"));
+    db.set_cancel(None);
+}
+
+#[test]
 fn local_read_postprocessing_observes_its_cancel_snapshot() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
@@ -3737,7 +5218,17 @@ fn local_read_postprocessing_observes_its_cancel_snapshot() {
     assert_mem_interrupted(eng.recall("local-cancel", RecallQuery::by_embedding(unit(8, 0), 10)));
 
     arm_cancel_after_local_work(&db);
+    assert_mem_interrupted(eng.profile(
+        "local-cancel",
+        RecallQuery::by_embedding(unit(8, 0), 10),
+        10,
+    ));
+
+    arm_cancel_after_local_work(&db);
     assert_mem_interrupted(eng.fetch_edges(Some(a), None, None));
+
+    arm_cancel_after_local_work(&db);
+    assert_mem_interrupted(eng.fetch_edges_in_region("local-cancel", Some(a), None, None, 10));
 
     arm_cancel_after_local_work(&db);
     assert_mem_interrupted(eng.summarize("local-cancel", 0));
@@ -3756,6 +5247,16 @@ fn local_read_postprocessing_observes_its_cancel_snapshot() {
 
     arm_cancel_after_local_work(&db);
     assert_mem_interrupted(eng.ann_cache_status_current("local-cancel"));
+
+    arm_cancel_after_local_work(&db);
+    assert_mem_interrupted(eng.unlink_in_region("local-cancel", a, b, EdgeKind::Refines));
+    assert_eq!(
+        eng.fetch_edges(Some(a), Some(b), Some(EdgeKind::Refines))
+            .unwrap()
+            .len(),
+        1,
+        "a cancelled unlink must roll its deletion back"
+    );
 }
 
 #[test]
@@ -4053,8 +5554,12 @@ impl Embedder for ReentrantDropEmbedder {
         self.inner.model_id()
     }
 
-    fn embed(&self, texts: &[&str]) -> std::result::Result<Vec<Vec<f32>>, crate::EmbedError> {
-        self.inner.embed(texts)
+    fn embed_with_cancel(
+        &self,
+        texts: &[&str],
+        cancel: Option<&citadel_core::CancelToken>,
+    ) -> std::result::Result<Vec<Vec<f32>>, crate::EmbedError> {
+        self.inner.embed_with_cancel(texts, cancel)
     }
 }
 
@@ -4544,6 +6049,79 @@ fn cancellation_landing_inside_a_reranker_is_observed_from_its_snapshot() {
 }
 
 #[test]
+fn model_callbacks_receive_the_operation_token_while_they_are_running() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let eng = Arc::new(MemoryEngine::open(Arc::clone(&db)).unwrap());
+    let embedder = Arc::new(CooperativeCancelEmbedder {
+        inner: MockEmbedder::new(8),
+        passage_calls: std::sync::atomic::AtomicUsize::new(0),
+        query_calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    eng.create_region("cooperative-models", embedder.clone())
+        .unwrap();
+
+    let passage_token = citadel_core::CancelToken::new();
+    db.set_cancel(Some(passage_token.clone()));
+    let passage = {
+        let eng = Arc::clone(&eng);
+        std::thread::spawn(move || {
+            eng.remember(
+                "cooperative-models",
+                AtomInput::new("note", "cancel passage inference"),
+            )
+        })
+    };
+    wait_for_model_call(&embedder.passage_calls, "passage embedding");
+    passage_token.cancel();
+    assert_mem_interrupted(passage.join().unwrap());
+    db.set_cancel(None);
+    assert_eq!(eng.count_region("cooperative-models").unwrap(), 0);
+
+    let query_token = citadel_core::CancelToken::new();
+    db.set_cancel(Some(query_token.clone()));
+    let query = {
+        let eng = Arc::clone(&eng);
+        std::thread::spawn(move || {
+            eng.recall(
+                "cooperative-models",
+                RecallQuery::by_text("cancel query inference", 1),
+            )
+        })
+    };
+    wait_for_model_call(&embedder.query_calls, "query embedding");
+    query_token.cancel();
+    assert_mem_interrupted(query.join().unwrap());
+    db.set_cancel(None);
+
+    eng.remember(
+        "cooperative-models",
+        AtomInput::new("note", "rerank candidate").with_embedding(unit(8, 0)),
+    )
+    .unwrap();
+    let reranker = Arc::new(CooperativeCancelReranker {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    eng.set_reranker(reranker.clone(), RerankStrategy::Replace);
+
+    let rerank_token = citadel_core::CancelToken::new();
+    db.set_cancel(Some(rerank_token.clone()));
+    let rerank = {
+        let eng = Arc::clone(&eng);
+        std::thread::spawn(move || {
+            eng.recall(
+                "cooperative-models",
+                RecallQuery::by_embedding(unit(8, 0), 1).with_text("rerank candidate"),
+            )
+        })
+    };
+    wait_for_model_call(&reranker.calls, "reranking");
+    rerank_token.cancel();
+    assert_mem_interrupted(rerank.join().unwrap());
+    db.set_cancel(None);
+}
+
+#[test]
 fn recall_as_of_re_grades_recency_against_the_reference_clock() {
     let dir = tempfile::tempdir().unwrap();
     let eng = MemoryEngine::open(create_db(dir.path())).unwrap();
@@ -4614,6 +6192,7 @@ fn evolve_links_nearest_neighbor_with_inverse_distance_weight() {
     let emb = embed_one(
         &*eng.region_handle("evw").unwrap().embedder,
         "red green blue",
+        None,
     )
     .unwrap();
     let hits = eng
@@ -4623,7 +6202,8 @@ fn evolve_links_nearest_neighbor_with_inverse_distance_weight() {
         .iter()
         .find(|h| h.id == b)
         .expect("b is recalled")
-        .distance;
+        .distance
+        .expect("semantic recall has a raw distance");
     assert!(
         d > 0.0 && d < 1.0,
         "distance must be a proper fraction: {d}"
@@ -4665,7 +6245,7 @@ fn evolve_retain_requires_both_id_and_distance() {
         .remember("evr", AtomInput::new("note", "alpha beta gamma"))
         .unwrap();
 
-    let report = eng.evolve("evr", a, 5, -1.0).unwrap();
+    let report = eng.evolve("evr", a, 5, 0.0).unwrap();
     assert_eq!(
         report.links_added, 0,
         "AND filter drops everything when the distance bound excludes all"
@@ -4679,7 +6259,7 @@ fn evolve_retain_requires_both_id_and_distance() {
 
 #[test]
 fn vec_distance_l2_uses_difference_not_sum() {
-    let d = vec_distance(EmbeddingMetric::L2, &[1.0, 2.0], &[5.0, 10.0]);
+    let d = vec_distance(EmbeddingMetric::L2, &[1.0, 2.0], &[5.0, 10.0]).unwrap();
     assert!(
         (d - 80.0_f32.sqrt()).abs() < 1e-3,
         "L2 = sqrt(80) ~ 8.944, not sqrt(180)"
@@ -4688,7 +6268,7 @@ fn vec_distance_l2_uses_difference_not_sum() {
 
 #[test]
 fn vec_distance_cosine_divides_by_denominator() {
-    let d = vec_distance(EmbeddingMetric::Cosine, &[1.0, 1.0], &[1.0, 0.0]);
+    let d = vec_distance(EmbeddingMetric::Cosine, &[1.0, 1.0], &[1.0, 0.0]).unwrap();
     let expected = 1.0_f32 - 1.0 / 2.0_f32.sqrt();
     assert!(
         (d - expected).abs() < 1e-3,
@@ -4698,8 +6278,9 @@ fn vec_distance_cosine_divides_by_denominator() {
 
 #[test]
 fn dist_value_coerces_integer_to_f32() {
-    assert_eq!(dist_value(&Value::Integer(-7)), -7.0_f32);
-    assert_eq!(dist_value(&Value::Integer(42)), 42.0_f32);
+    assert_eq!(dist_value(&Value::Integer(-7)).unwrap(), Some(-7.0_f32));
+    assert_eq!(dist_value(&Value::Integer(42)).unwrap(), Some(42.0_f32));
+    assert_eq!(dist_value(&Value::Null).unwrap(), None);
 }
 
 #[test]
@@ -4723,10 +6304,12 @@ fn bm25_idf_rewards_rare_terms_and_handles_tokenization() {
         kind: "fact".into(),
         text: text.into(),
         payload: serde_json::Value::Null,
-        dist: 0.0,
+        dist: Some(0.0),
         text_rank: 0.0,
         importance: 0.0,
+        confidence: 1.0,
         created_micros: 0,
+        expires_micros: None,
         immutable: false,
     };
     // 'common' is in all three (low IDF); 'zebra' is in one (high IDF). The query has
@@ -4761,19 +6344,31 @@ fn bm25_idf_rewards_rare_terms_and_handles_tokenization() {
 }
 
 #[test]
-fn graph_expand_plaintext_depth1_score_is_exactly_half() {
+fn graph_expand_plaintext_exposes_depth_and_stored_metadata() {
     let dir = tempfile::tempdir().unwrap();
     let eng = MemoryEngine::open(create_db(dir.path())).unwrap();
     eng.create_region("g", Arc::new(MockEmbedder::new(8)))
         .unwrap();
+    let future = micros_now() + 60_000_000;
     let a = eng
         .remember("g", AtomInput::new("fact", "alpha unique one"))
         .unwrap();
     let b = eng
-        .remember("g", AtomInput::new("fact", "beta unique two"))
+        .remember(
+            "g",
+            AtomInput::new("fact", "beta unique two")
+                .with_importance(0.7)
+                .with_confidence(0.6)
+                .with_expires_at(future),
+        )
         .unwrap();
     let c = eng
-        .remember("g", AtomInput::new("fact", "gamma unique three"))
+        .remember(
+            "g",
+            AtomInput::new("fact", "gamma unique three")
+                .with_importance(0.2)
+                .with_confidence(0.3),
+        )
         .unwrap();
     eng.link(a, b, EdgeKind::DerivedFrom, 1.0).unwrap();
     eng.link(b, c, EdgeKind::DerivedFrom, 1.0).unwrap();
@@ -4785,23 +6380,184 @@ fn graph_expand_plaintext_depth1_score_is_exactly_half() {
                 .with_graph_expand(GraphExpand::new(2, vec![EdgeKind::DerivedFrom])),
         )
         .unwrap();
-    let score_b = hits
-        .iter()
-        .find(|h| h.id == b)
-        .map(|h| h.score)
-        .expect("1-hop atom reached");
-    let score_c = hits
-        .iter()
-        .find(|h| h.id == c)
-        .map(|h| h.score)
-        .expect("2-hop atom reached");
-    assert_eq!(score_b, 0.5_f32, "depth-1 graph score is 1/(1+1)");
+    let hit_b = hits.iter().find(|h| h.id == b).expect("1-hop atom reached");
+    let hit_c = hits.iter().find(|h| h.id == c).expect("2-hop atom reached");
+    assert_eq!(hit_b.graph_depth, Some(1));
+    assert_eq!(hit_c.graph_depth, Some(2));
+    assert_eq!(hit_b.importance, 0.7);
+    assert_eq!(hit_c.importance, 0.2);
+    assert_eq!((hit_b.confidence, hit_b.expires_at), (0.6, Some(future)));
+    assert_eq!((hit_c.confidence, hit_c.expires_at), (0.3, None));
+    for hit in [hit_b, hit_c] {
+        assert_eq!(hit.relevance, None, "graph rows are not query-ranked");
+        assert_eq!(hit.distance, None, "graph rows are not distance-ranked");
+    }
+}
+
+#[test]
+fn graph_expand_cannot_cross_a_foreign_region_as_an_intermediate_hop() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = MemoryEngine::open(create_db(dir.path())).unwrap();
+    eng.create_region("local", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    eng.create_region("foreign", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let seed = eng
+        .remember(
+            "local",
+            AtomInput::new("fact", "local seed").with_embedding(unit(8, 0)),
+        )
+        .unwrap();
+    let target = eng
+        .remember(
+            "local",
+            AtomInput::new("fact", "local target").with_embedding(unit(8, 1)),
+        )
+        .unwrap();
+    let bridge = eng
+        .remember(
+            "foreign",
+            AtomInput::new("fact", "foreign bridge").with_embedding(unit(8, 2)),
+        )
+        .unwrap();
+    eng.link(seed, bridge, EdgeKind::DerivedFrom, 1.0).unwrap();
+    eng.link(bridge, target, EdgeKind::DerivedFrom, 1.0)
+        .unwrap();
+
     assert_eq!(
-        score_c,
-        1.0_f32 / (2.0_f32 + 1.0),
-        "depth-2 graph score is 1/(2+1)"
+        eng.fetch_edges(None, None, Some(EdgeKind::DerivedFrom))
+            .unwrap()
+            .len(),
+        2,
+        "the cross-region path exists in global edge storage"
     );
-    assert!(score_c.is_finite() && score_c < score_b);
+    let hits = eng
+        .recall(
+            "local",
+            RecallQuery::by_embedding(unit(8, 0), 1)
+                .with_graph_expand(GraphExpand::new(2, vec![EdgeKind::DerivedFrom])),
+        )
+        .unwrap();
+    assert!(hits.iter().any(|hit| hit.id == seed));
+    assert!(
+        hits.iter().all(|hit| hit.id != target),
+        "a foreign atom must not bridge two local atoms during graph expansion"
+    );
+}
+
+#[test]
+fn foreign_or_expired_superseders_do_not_hide_a_live_local_atom() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = MemoryEngine::open(create_db(dir.path())).unwrap();
+    eng.create_region("local", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    eng.create_region("foreign", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let target = eng
+        .remember(
+            "local",
+            AtomInput::new("fact", "local target").with_embedding(unit(8, 0)),
+        )
+        .unwrap();
+    let foreign = eng
+        .remember(
+            "foreign",
+            AtomInput::new("fact", "foreign source").with_embedding(unit(8, 1)),
+        )
+        .unwrap();
+    let expired = eng
+        .remember(
+            "local",
+            AtomInput::new("fact", "expired source")
+                .with_embedding(unit(8, 2))
+                .with_expires_at(micros_now() - 1),
+        )
+        .unwrap();
+    eng.link(foreign, target, EdgeKind::Supersedes, 1.0)
+        .unwrap();
+    eng.link(expired, target, EdgeKind::Supersedes, 1.0)
+        .unwrap();
+
+    let hits = eng
+        .recall("local", RecallQuery::by_embedding(unit(8, 0), 1))
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].id, target);
+}
+
+#[test]
+fn graph_expand_rejects_a_high_fanout_before_exceeding_its_node_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = MemoryEngine::open(create_db(dir.path())).unwrap();
+    eng.create_region("bounded", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let seed = eng
+        .remember(
+            "bounded",
+            AtomInput::new("fact", "seed").with_embedding(unit(8, 0)),
+        )
+        .unwrap();
+    let mut neighbours = Vec::new();
+    for index in 1..=4 {
+        let id = eng
+            .remember(
+                "bounded",
+                AtomInput::new("fact", format!("neighbour {index}")).with_embedding(unit(8, index)),
+            )
+            .unwrap();
+        eng.link(seed, id, EdgeKind::DerivedFrom, 1.0).unwrap();
+        neighbours.push(id);
+    }
+
+    let allowed = eng
+        .recall(
+            "bounded",
+            RecallQuery::by_embedding(unit(8, 0), 1).with_graph_expand(
+                GraphExpand::new(1, vec![EdgeKind::DerivedFrom]).with_max_nodes(4),
+            ),
+        )
+        .unwrap();
+    assert!(neighbours
+        .iter()
+        .all(|id| allowed.iter().any(|hit| hit.id == *id)));
+
+    let error = eng
+        .recall(
+            "bounded",
+            RecallQuery::by_embedding(unit(8, 0), 1).with_graph_expand(
+                GraphExpand::new(1, vec![EdgeKind::DerivedFrom]).with_max_nodes(3),
+            ),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            MemError::WorkLimitExceeded {
+                operation: "graph expansion",
+                limit: 3,
+            }
+        ),
+        "{error:?}"
+    );
+
+    let error = eng
+        .recall(
+            "bounded",
+            RecallQuery::by_embedding(unit(8, 0), 1).with_graph_expand(
+                GraphExpand::new(1, vec![EdgeKind::DerivedFrom]).with_max_nodes(100_001),
+            ),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            MemError::WorkLimitExceeded {
+                operation: "graph expansion",
+                limit: 100_000,
+            }
+        ),
+        "{error:?}"
+    );
 }
 
 #[test]
@@ -4834,19 +6590,31 @@ fn graph_expand_plaintext_depth_zero_returns_no_reached_atoms() {
 }
 
 #[test]
-fn graph_expand_sealed_depth1_score_is_exactly_half() {
+fn graph_expand_sealed_exposes_depth_and_stored_metadata() {
     let dir = tempfile::tempdir().unwrap();
     let eng = MemoryEngine::open(create_enc_db(dir.path())).unwrap();
     eng.create_encrypted_region("sg", Arc::new(MockEmbedder::new(8)))
         .unwrap();
+    let future = micros_now() + 60_000_000;
     let a = eng
         .remember("sg", AtomInput::new("fact", "alpha unique one"))
         .unwrap();
     let b = eng
-        .remember("sg", AtomInput::new("fact", "beta unique two"))
+        .remember(
+            "sg",
+            AtomInput::new("fact", "beta unique two")
+                .with_importance(0.7)
+                .with_confidence(0.6)
+                .with_expires_at(future),
+        )
         .unwrap();
     let c = eng
-        .remember("sg", AtomInput::new("fact", "gamma unique three"))
+        .remember(
+            "sg",
+            AtomInput::new("fact", "gamma unique three")
+                .with_importance(0.2)
+                .with_confidence(0.3),
+        )
         .unwrap();
     eng.link(a, b, EdgeKind::DerivedFrom, 1.0).unwrap();
     eng.link(b, c, EdgeKind::DerivedFrom, 1.0).unwrap();
@@ -4858,22 +6626,24 @@ fn graph_expand_sealed_depth1_score_is_exactly_half() {
                 .with_graph_expand(GraphExpand::new(2, vec![EdgeKind::DerivedFrom])),
         )
         .unwrap();
-    let score_b = hits
+    let hit_b = hits
         .iter()
         .find(|h| h.id == b)
-        .map(|h| h.score)
         .expect("1-hop sealed atom reached");
-    let score_c = hits
+    let hit_c = hits
         .iter()
         .find(|h| h.id == c)
-        .map(|h| h.score)
         .expect("2-hop sealed atom reached");
-    assert_eq!(score_b, 0.5_f32, "sealed depth-1 graph score is 1/(1+1)");
-    assert_eq!(
-        score_c,
-        1.0_f32 / (2.0_f32 + 1.0),
-        "sealed depth-2 graph score is 1/(2+1)"
-    );
+    assert_eq!(hit_b.graph_depth, Some(1));
+    assert_eq!(hit_c.graph_depth, Some(2));
+    assert_eq!(hit_b.importance, 0.7);
+    assert_eq!(hit_c.importance, 0.2);
+    assert_eq!((hit_b.confidence, hit_b.expires_at), (0.6, Some(future)));
+    assert_eq!((hit_c.confidence, hit_c.expires_at), (0.3, None));
+    for hit in [hit_b, hit_c] {
+        assert_eq!(hit.relevance, None, "graph rows are not query-ranked");
+        assert_eq!(hit.distance, None, "graph rows are not distance-ranked");
+    }
     assert_eq!(
         hits.iter().find(|h| h.id == b).unwrap().text,
         "beta unique two"
@@ -4926,6 +6696,96 @@ fn graph_expand_sealed_rejects_a_stale_row_key_binding() {
 }
 
 #[test]
+fn stale_sealed_superseder_does_not_hide_a_live_atom() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_enc_db(dir.path());
+    let eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
+    eng.create_encrypted_region("sealed", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let target = eng
+        .remember(
+            "sealed",
+            AtomInput::new("fact", "live target").with_embedding(unit(8, 0)),
+        )
+        .unwrap();
+    let stale = eng
+        .remember(
+            "sealed",
+            AtomInput::new("fact", "stale superseder").with_embedding(unit(8, 1)),
+        )
+        .unwrap();
+    eng.link(stale, target, EdgeKind::Supersedes, 1.0).unwrap();
+
+    let table = atoms_table(8, EmbeddingMetric::Cosine, true);
+    Connection::open(&db)
+        .unwrap()
+        .execute_params(
+            &format!("UPDATE {table} SET key_gen = key_gen + 1 WHERE id = $1"),
+            &[Value::Integer(stale)],
+        )
+        .unwrap();
+
+    let hits = eng
+        .recall("sealed", RecallQuery::by_embedding(unit(8, 0), 1))
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].id, target);
+}
+
+#[test]
+fn graph_expand_sealed_does_not_traverse_a_stale_intermediary() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_enc_db(dir.path());
+    let eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
+    eng.create_encrypted_region("sealed", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let seed = eng
+        .remember(
+            "sealed",
+            AtomInput::new("fact", "seed").with_embedding(unit(8, 0)),
+        )
+        .unwrap();
+    let bridge = eng
+        .remember(
+            "sealed",
+            AtomInput::new("fact", "stale bridge").with_embedding(unit(8, 1)),
+        )
+        .unwrap();
+    let target = eng
+        .remember(
+            "sealed",
+            AtomInput::new("fact", "live target").with_embedding(unit(8, 2)),
+        )
+        .unwrap();
+    eng.link(seed, bridge, EdgeKind::DerivedFrom, 1.0).unwrap();
+    eng.link(bridge, target, EdgeKind::DerivedFrom, 1.0)
+        .unwrap();
+
+    let table = atoms_table(8, EmbeddingMetric::Cosine, true);
+    Connection::open(&db)
+        .unwrap()
+        .execute_params(
+            &format!("UPDATE {table} SET key_gen = key_gen + 1 WHERE id = $1"),
+            &[Value::Integer(bridge)],
+        )
+        .unwrap();
+
+    let hits = eng
+        .recall(
+            "sealed",
+            RecallQuery::by_embedding(unit(8, 0), 1)
+                .with_graph_expand(GraphExpand::new(2, vec![EdgeKind::DerivedFrom])),
+        )
+        .unwrap();
+    assert!(hits.iter().any(|hit| hit.id == seed));
+    assert!(hits.iter().all(|hit| hit.id != bridge));
+    assert!(
+        hits.iter().all(|hit| hit.id != target),
+        "a stale sealed atom must not be usable as a traversal bridge"
+    );
+}
+
+#[test]
 fn graph_expand_sealed_depth_zero_returns_no_reached_atoms() {
     let dir = tempfile::tempdir().unwrap();
     let eng = MemoryEngine::open(create_enc_db(dir.path())).unwrap();
@@ -4956,9 +6816,32 @@ fn graph_expand_sealed_depth_zero_returns_no_reached_atoms() {
 
 #[test]
 fn parse_candidate_rejects_short_row() {
-    let row = vec![Value::Integer(1); 8];
+    let row = vec![Value::Integer(1); 10];
     assert!(
         matches!(parse_candidate(&row), Err(MemError::Invalid(ref m)) if m.contains("recall row shape")),
+        "row of len 10 (< 11) must be rejected by the length guard, not a later type error"
+    );
+    let ok = vec![
+        Value::Integer(1),
+        Value::Text("fact".into()),
+        Value::Null,
+        Value::Null,
+        Value::Real(0.5),
+        Value::Real(0.75),
+        Value::Timestamp(0),
+        Value::Null,
+        Value::Real(0.1),
+        Value::Real(0.0),
+        Value::Integer(0),
+    ];
+    assert!(parse_candidate(&ok).is_ok(), "row of len 11 must parse");
+}
+
+#[test]
+fn parse_fetched_rejects_short_row() {
+    let row = vec![Value::Integer(1); 8];
+    assert!(
+        matches!(parse_fetched(&row), Err(MemError::Invalid(ref m)) if m.contains("fetch row shape")),
         "row of len 8 (< 9) must be rejected by the length guard, not a later type error"
     );
     let ok = vec![
@@ -4967,31 +6850,12 @@ fn parse_candidate_rejects_short_row() {
         Value::Null,
         Value::Null,
         Value::Real(0.5),
-        Value::Timestamp(0),
-        Value::Real(0.1),
-        Value::Real(0.0),
-        Value::Integer(0),
-    ];
-    assert!(parse_candidate(&ok).is_ok(), "row of len 9 must parse");
-}
-
-#[test]
-fn parse_fetched_rejects_short_row() {
-    let row = vec![Value::Integer(1); 6];
-    assert!(
-        matches!(parse_fetched(&row), Err(MemError::Invalid(ref m)) if m.contains("fetch row shape")),
-        "row of len 6 (< 7) must be rejected by the length guard, not a later type error"
-    );
-    let ok = vec![
-        Value::Integer(1),
-        Value::Text("fact".into()),
-        Value::Null,
-        Value::Null,
-        Value::Real(0.5),
+        Value::Real(0.75),
         Value::Integer(1),
         Value::Timestamp(0),
+        Value::Null,
     ];
-    assert!(parse_fetched(&ok).is_ok(), "row of len 7 must parse");
+    assert!(parse_fetched(&ok).is_ok(), "row of len 9 must parse");
 }
 
 #[test]
@@ -5013,16 +6877,41 @@ fn parse_edge_rejects_short_row() {
 
 #[test]
 fn as_f32_coerces_integer() {
-    assert_eq!(as_f32(&Value::Integer(7)), 7.0f32);
-    assert_eq!(as_f32(&Value::Real(2.5)), 2.5f32);
-    assert_eq!(as_f32(&Value::Null), 0.0f32);
+    assert_eq!(as_f32(&Value::Integer(7)).unwrap(), 7.0f32);
+    assert_eq!(as_f32(&Value::Real(2.5)).unwrap(), 2.5f32);
+    assert_eq!(as_f32(&Value::Null).unwrap(), 0.0f32);
+    assert!(as_f32(&Value::Text("7".into())).is_err());
+    for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, f64::MAX] {
+        assert!(as_f32(&Value::Real(value)).is_err(), "{value}");
+        assert!(exact_f32_bits(&Value::Real(value)).is_err(), "{value}");
+    }
 }
 
 #[test]
 fn as_ts_coerces_integer() {
-    assert_eq!(as_ts(&Value::Integer(123)), 123i64);
-    assert_eq!(as_ts(&Value::Timestamp(456)), 456i64);
-    assert_eq!(as_ts(&Value::Null), 0i64);
+    assert_eq!(as_ts(&Value::Integer(123)).unwrap(), 123i64);
+    assert_eq!(as_ts(&Value::Timestamp(456)).unwrap(), 456i64);
+    assert_eq!(as_ts(&Value::Null).unwrap(), 0i64);
+    assert!(as_ts(&Value::Text("123".into())).is_err());
+}
+
+#[test]
+fn stored_payload_and_text_decoders_reject_malformed_non_null_values() {
+    assert_eq!(
+        parse_payload(&Value::Null).unwrap(),
+        serde_json::Value::Null
+    );
+    assert!(parse_payload(&Value::Text("{".into())).is_err());
+    assert!(parse_payload(&Value::Integer(7)).is_err());
+    assert_eq!(opt_text(&Value::Null).unwrap(), "");
+    assert!(opt_text(&Value::Integer(7)).is_err());
+    assert!(!as_bool(&Value::Integer(0)).unwrap());
+    assert!(as_bool(&Value::Integer(1)).unwrap());
+    assert!(as_bool(&Value::Integer(2)).is_err());
+    assert!(as_bool(&Value::Text("false".into())).is_err());
+    assert_eq!(opt_ts(&Value::Null).unwrap(), None);
+    assert_eq!(opt_ts(&Value::Timestamp(9)).unwrap(), Some(9));
+    assert!(opt_ts(&Value::Text("never".into())).is_err());
 }
 
 #[test]
@@ -5045,11 +6934,12 @@ fn recall_fusion_arm_uses_reranker_replace_scores() {
         .unwrap();
     assert_eq!(hits[0].text, "alpha beta gamma");
     assert_eq!(
-        hits[0].score, 3.0_f32,
+        hits[0].relevance,
+        Some(3.0_f32),
         "Replace score is the raw overlap count"
     );
     assert_eq!(hits[1].text, "delta epsilon");
-    assert_eq!(hits[1].score, 0.0_f32);
+    assert_eq!(hits[1].relevance, Some(0.0_f32));
 }
 
 #[test]
@@ -5072,11 +6962,12 @@ fn recall_sealed_fusion_arm_uses_reranker_replace_scores() {
         .unwrap();
     assert_eq!(hits[0].text, "alpha beta gamma");
     assert_eq!(
-        hits[0].score, 3.0_f32,
+        hits[0].relevance,
+        Some(3.0_f32),
         "sealed Replace score is the raw overlap count"
     );
     assert_eq!(hits[1].text, "delta epsilon");
-    assert_eq!(hits[1].score, 0.0_f32);
+    assert_eq!(hits[1].relevance, Some(0.0_f32));
 }
 
 #[test]
@@ -5092,7 +6983,7 @@ fn set_reranker_changes_recall_score_from_fusion() {
         .recall("sr", RecallQuery::by_text("alpha beta gamma", 1))
         .unwrap();
     assert!(
-        before[0].score <= 1.0_f32,
+        before[0].relevance.is_some_and(|score| score <= 1.0_f32),
         "fusion score is a normalized blend"
     );
 
@@ -5104,7 +6995,8 @@ fn set_reranker_changes_recall_score_from_fusion() {
         .recall("sr", RecallQuery::by_text("alpha beta gamma", 1))
         .unwrap();
     assert_eq!(
-        after[0].score, 3.0_f32,
+        after[0].relevance,
+        Some(3.0_f32),
         "reranker took effect: Replace overlap score"
     );
 }
@@ -6636,16 +8528,50 @@ fn table_name_parsers_are_canonical() {
 }
 
 #[test]
+fn read_transaction_helper_enforces_read_only_mode_and_rolls_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE read_only_probe (id INTEGER PRIMARY KEY, value INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO read_only_probe VALUES (1, 7)")
+        .unwrap();
+
+    let error = with_read_txn(&conn, |c| {
+        c.execute("UPDATE read_only_probe SET value = 8 WHERE id = 1")?;
+        Ok(())
+    })
+    .expect_err("the read-only helper allowed a mutation");
+    let message = error.to_string();
+    assert!(
+        message.contains("read-only") || message.contains("read only"),
+        "expected a read-only error, got: {message}"
+    );
+    assert!(
+        !conn.in_transaction(),
+        "the failed read transaction was not rolled back"
+    );
+
+    let row = conn
+        .prepare("SELECT value FROM read_only_probe WHERE id = 1")
+        .unwrap()
+        .query_collect(&[])
+        .unwrap();
+    assert_eq!(row.rows, vec![vec![Value::Integer(7)]]);
+}
+
+#[test]
 fn identity_tag_persisted_format_is_frozen() {
     // Pins the persisted identity encoding: if it moves, bump the
     // IK_*_DOMAIN version tags instead of re-pinning.
     let atom = AtomInput::new("kind-a", "text-b")
         .with_payload(serde_json::json!({"p": 1}))
-        .with_score(0.5)
+        .with_importance(0.5)
         .with_confidence(0.25)
         .with_created_at(123)
         .with_expires_at(456)
-        .immutable();
+        .immutable()
+        .with_embedding(vec![0.0, -0.0, 1.5]);
     let payload_json = serde_json::to_string(&atom.payload).unwrap();
     let evidence = serde_json::json!({"e": 2});
 
@@ -6676,7 +8602,7 @@ fn identity_tag_persisted_format_is_frozen() {
     );
     assert_eq!(
         plain_req,
-        "e2e7ca3a0d890eac10995c768b4c4b9e49181f5be9bd4feda4c6d6bf77e46484"
+        "cc57721b05d378dc6c30856bcfe3a70632a1fa3cab1c69b945ff6a4373386572"
     );
     assert_eq!(
         keyed_key,
@@ -6684,7 +8610,7 @@ fn identity_tag_persisted_format_is_frozen() {
     );
     assert_eq!(
         keyed_req,
-        "de4ef94e9931c9bb99ce912f47bbb9a0680ae87c55346648be27660ad68d2157"
+        "61b07cf8d832b5dc0075a1f4023f4c0cd5ded74f66d865c4d4e26acc3e5b0c68"
     );
 }
 
@@ -6718,9 +8644,9 @@ fn supplied_embedding_is_stored_instead_of_embedding_the_text() {
         .unwrap();
     assert_eq!(hits.len(), 1);
     assert!(
-        hits[0].distance < 1e-3,
+        hits[0].distance.is_some_and(|distance| distance < 1e-3),
         "the text was embedded instead of the supplied vector (distance {})",
-        hits[0].distance
+        hits[0].distance.unwrap()
     );
 }
 
@@ -6764,7 +8690,53 @@ fn batch_mixes_supplied_and_embedded_vectors() {
         .recall("s", RecallQuery::by_embedding(unit(8, 7), 1))
         .unwrap();
     assert_eq!(hits[0].text, "supplied two", "wrong slot got the vector");
-    assert!(hits[0].distance < 1e-3, "distance {}", hits[0].distance);
+    assert!(
+        hits[0].distance.is_some_and(|distance| distance < 1e-3),
+        "distance {:?}",
+        hits[0].distance
+    );
+}
+
+#[test]
+fn undefined_cosine_distance_is_none_in_plain_and_sealed_recall() {
+    for encrypted in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let eng = MemoryEngine::open(create_enc_db(dir.path())).unwrap();
+        let embedder = Arc::new(MockEmbedder::new(8));
+        if encrypted {
+            eng.create_encrypted_region("r", embedder).unwrap();
+        } else {
+            eng.create_region("r", embedder).unwrap();
+        }
+
+        eng.remember(
+            "r",
+            AtomInput::new("note", "indexed seed").with_embedding(unit(8, 0)),
+        )
+        .unwrap();
+        eng.recall("r", RecallQuery::by_embedding(unit(8, 0), 1))
+            .unwrap();
+        let zero = eng
+            .remember(
+                "r",
+                AtomInput::new("note", "zero norm")
+                    .with_importance(0.4)
+                    .with_embedding(vec![0.0; 8]),
+            )
+            .unwrap();
+
+        let hits = eng
+            .recall("r", RecallQuery::by_embedding(unit(8, 0), 2))
+            .unwrap();
+        let hit = hits
+            .iter()
+            .find(|hit| hit.id == zero)
+            .expect("zero-norm candidate remains visible");
+        assert_eq!(hit.distance, None, "encrypted={encrypted}");
+        assert!(hit.relevance.is_some(), "encrypted={encrypted}");
+        assert_eq!(hit.importance, 0.4, "encrypted={encrypted}");
+        assert_eq!(hit.graph_depth, None, "encrypted={encrypted}");
+    }
 }
 
 #[test]
@@ -6786,6 +8758,44 @@ fn fetch_newest_takes_the_last_rows_still_ascending() {
         .map(|h| h.text)
         .collect();
     assert_eq!(texts, vec!["3".to_string(), "4".to_string()]);
+}
+
+#[test]
+fn fetch_page_only_returns_a_cursor_when_more_live_rows_exist() {
+    for encrypted in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let eng = MemoryEngine::open(create_enc_db(dir.path())).unwrap();
+        if encrypted {
+            eng.create_encrypted_region("r", Arc::new(MockEmbedder::new(8)))
+                .unwrap();
+        } else {
+            eng.create_region("r", Arc::new(MockEmbedder::new(8)))
+                .unwrap();
+        }
+        let mut ids = Vec::new();
+        for n in 0..4 {
+            ids.push(
+                eng.remember("r", AtomInput::new("note", n.to_string()))
+                    .unwrap(),
+            );
+        }
+
+        let first = eng.fetch_page("r", &FetchQuery::new(2)).unwrap();
+        assert_eq!(first.atoms.len(), 2, "encrypted={encrypted}");
+        assert_eq!(first.next_after_id, Some(ids[1]), "encrypted={encrypted}");
+        let second = eng
+            .fetch_page("r", &FetchQuery::new(2).with_after_id(ids[1]))
+            .unwrap();
+        assert_eq!(
+            second.atoms.iter().map(|atom| atom.id).collect::<Vec<_>>(),
+            ids[2..],
+            "encrypted={encrypted}"
+        );
+        assert_eq!(second.next_after_id, None, "encrypted={encrypted}");
+
+        let newest = eng.fetch_page("r", &FetchQuery::new(2).newest()).unwrap();
+        assert_eq!(newest.next_after_id, None, "newest is a one-shot window");
+    }
 }
 
 #[test]

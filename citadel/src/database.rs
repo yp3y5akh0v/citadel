@@ -478,6 +478,13 @@ pub type MemoryRegionInvalidator =
 #[doc(hidden)]
 pub type MemoryAtomInvalidator = dyn Fn(&[u64]) -> Vec<Box<dyn Any + Send>> + Send + Sync + 'static;
 
+thread_local! {
+    /// Request-scoped tokens for database operations executing on this thread.
+    /// The database pointer distinguishes nested scopes over independent vaults.
+    static SCOPED_CANCEL_TOKENS: RefCell<Vec<(*const Database, CancelToken)>> =
+        const { RefCell::new(Vec::new()) };
+}
+
 /// An open Citadel database (`Send + Sync`).
 ///
 /// Exclusively locks the database file for its lifetime.
@@ -527,7 +534,8 @@ pub struct Database {
     memory_edges: Mutex<()>,
     /// Bumped before key destruction and rewrites; caches refuse older-epoch plaintext.
     cache_epoch: AtomicU64,
-    /// Token cloned into transactions and consulted by non-transactional fast paths.
+    /// Explicit database-wide token cloned into transactions and consulted by
+    /// non-transactional fast paths when no operation-local token is active.
     cancel: Mutex<Option<CancelToken>>,
     /// Test-only hook fired as a destruction wrapper reaches the acquisition boundary.
     #[cfg(any(test, feature = "test-util"))]
@@ -539,6 +547,26 @@ pub struct Database {
     /// Test-only observation point immediately before an edge-guard acquisition.
     #[cfg(any(test, feature = "test-util"))]
     memory_edges_acquire_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+}
+
+/// Removes one operation-local token on normal return or panic unwind.
+struct ScopedCancelTokenReset {
+    database: *const Database,
+}
+
+impl Drop for ScopedCancelTokenReset {
+    fn drop(&mut self) {
+        SCOPED_CANCEL_TOKENS.with(|tokens| {
+            let (database, _) = tokens
+                .borrow_mut()
+                .pop()
+                .expect("scoped cancellation stack remains balanced");
+            assert!(
+                std::ptr::eq(database, self.database),
+                "scoped cancellation stack remains properly nested"
+            );
+        });
+    }
 }
 
 impl std::fmt::Debug for Database {
@@ -784,36 +812,63 @@ impl Database {
 
     /// Begin a read-only transaction with snapshot isolation.
     ///
-    /// The transaction clones the currently installed cancellation token.
-    /// Replacing the handle token later does not retarget an open transaction;
-    /// install the desired token before this call or use [`ReadTxn::set_cancel`].
+    /// The transaction clones the current operation-local token, or the explicit
+    /// database-wide token when no local scope is active. Later changes do not
+    /// retarget an open transaction; use [`ReadTxn::set_cancel`] when needed.
     pub fn begin_read(&self) -> ReadTxn<'_> {
         let mut txn = self.manager.begin_read();
-        txn.set_cancel(self.cancel.lock().clone());
+        txn.set_cancel(self.cancel_token());
         txn
     }
 
     /// Begin a read-write transaction. Only one can be active at a time.
     ///
-    /// The transaction clones the currently installed cancellation token.
-    /// Replacing the handle token later does not retarget an open transaction;
-    /// install the desired token before this call or use [`WriteTxn::set_cancel`].
+    /// The transaction clones the current operation-local token, or the explicit
+    /// database-wide token when no local scope is active. Later changes do not
+    /// retarget an open transaction; use [`WriteTxn::set_cancel`] when needed.
     pub fn begin_write(&self) -> Result<WriteTxn<'_>> {
         let mut txn = self.manager.begin_write()?;
-        txn.set_cancel(self.cancel.lock().clone());
+        txn.set_cancel(self.cancel_token());
         Ok(txn)
     }
 
-    /// Install the token cloned by future transactions and checked by work
-    /// that can complete without opening a transaction. `None` clears it.
-    /// Existing raw transactions retain the token they already cloned.
+    /// Install the explicit database-wide token cloned by future transactions
+    /// and checked by work that can complete without opening a transaction.
+    /// `None` clears it. Existing transactions and operation-local scopes retain
+    /// the token they already selected.
     pub fn set_cancel(&self, token: Option<CancelToken>) {
         *self.cancel.lock() = token;
     }
 
-    /// Clone the currently installed cancellation token.
+    /// Run one synchronous operation with a current-thread cancellation token.
+    ///
+    /// Nested scopes restore the outer token on normal return or panic unwind.
+    /// Concurrent operations on other threads never inherit this token. Cancel
+    /// the supplied token itself from another thread to stop the scoped work.
+    #[doc(hidden)]
+    pub fn with_cancel_token<T>(&self, token: CancelToken, operation: impl FnOnce() -> T) -> T {
+        // Identity only: the pointer is never dereferenced, and this synchronous
+        // scope plus its guard cannot outlive the `&self` borrow.
+        let database = std::ptr::from_ref(self);
+        SCOPED_CANCEL_TOKENS.with(|tokens| tokens.borrow_mut().push((database, token)));
+        let _reset = ScopedCancelTokenReset { database };
+        operation()
+    }
+
+    /// Clone the current operation-local token, falling back to the explicit
+    /// database-wide token when this thread has no scope for this database.
     pub fn cancel_token(&self) -> Option<CancelToken> {
-        self.cancel.lock().clone()
+        let database = std::ptr::from_ref(self);
+        SCOPED_CANCEL_TOKENS
+            .with(|tokens| {
+                tokens
+                    .borrow()
+                    .iter()
+                    .rev()
+                    .find(|(candidate, _)| std::ptr::eq(*candidate, database))
+                    .map(|(_, token)| token.clone())
+            })
+            .or_else(|| self.cancel.lock().clone())
     }
 
     /// Database-wide storage entries examined since this database opened.

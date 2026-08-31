@@ -2,22 +2,24 @@
 //! [`Registry`] resolves tools by name.
 
 use rustc_hash::FxHashMap;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use citadel_mem::MemoryEngine;
 
 use crate::types::{Content, Tool as ToolDef};
 
-/// A tool-level failure, surfaced as `isError: true` (not a JSON-RPC protocol error).
+/// A tool input or execution failure, surfaced as `isError: true`.
 pub(super) enum ToolError {
     InvalidParams(String),
-    Failed(String),
+    Execution(String),
+    Internal(String),
 }
 
 impl ToolError {
-    pub(super) fn message(self) -> String {
+    pub(super) fn execution_message(self) -> Result<String, String> {
         match self {
-            ToolError::InvalidParams(m) | ToolError::Failed(m) => m,
+            ToolError::InvalidParams(message) | ToolError::Execution(message) => Ok(message),
+            ToolError::Internal(diagnostic) => Err(diagnostic),
         }
     }
 }
@@ -26,6 +28,7 @@ impl ToolError {
 pub(super) struct ToolCtx<'a> {
     pub(super) mem: &'a MemoryEngine,
     pub(super) region: &'a str,
+    pub(super) allow_protected_memory_erasure: bool,
 }
 
 pub(super) trait Tool: Send + Sync {
@@ -55,11 +58,28 @@ impl Registry {
     pub(super) fn list(&self) -> Vec<ToolDef> {
         self.order
             .iter()
-            .map(|n| self.by_name[n].definition())
+            .map(|n| {
+                let mut definition = self.by_name[n].definition();
+                declare_schema_dialect(&mut definition.input_schema);
+                if let Some(schema) = &mut definition.output_schema {
+                    declare_schema_dialect(schema);
+                }
+                definition
+            })
             .collect()
     }
 
     pub(super) fn get(&self, name: &str) -> Option<&dyn Tool> {
         self.by_name.get(name).map(|tool| &**tool)
     }
+}
+
+fn declare_schema_dialect(schema: &mut Value) {
+    schema
+        .as_object_mut()
+        .expect("tool schemas are JSON objects")
+        .insert(
+            "$schema".to_string(),
+            json!("https://json-schema.org/draft/2020-12/schema"),
+        );
 }

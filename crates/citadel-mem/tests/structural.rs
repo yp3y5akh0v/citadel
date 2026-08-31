@@ -106,26 +106,33 @@ fn fetch_edges_filters_by_src_dst_and_kind() {
     let a = eng.remember("r", AtomInput::new("task", "alpha")).unwrap();
     let b = eng.remember("r", AtomInput::new("task", "beta")).unwrap();
     let c = eng.remember("r", AtomInput::new("task", "gamma")).unwrap();
-    eng.link(a, b, EdgeKind::DependsOn, 1.0).unwrap();
-    eng.link(a, c, EdgeKind::Causes, 0.5).unwrap();
-    eng.link(b, c, EdgeKind::DependsOn, 1.0).unwrap();
+    eng.link_in_region("r", a, b, EdgeKind::DependsOn, 1.0)
+        .unwrap();
+    eng.link_in_region("r", a, c, EdgeKind::Causes, 0.5)
+        .unwrap();
+    eng.link_in_region("r", b, c, EdgeKind::DependsOn, 1.0)
+        .unwrap();
 
-    let from_a = eng.fetch_edges(Some(a), None, None).unwrap();
+    let from_a = eng
+        .fetch_edges_in_region("r", Some(a), None, None, 10)
+        .unwrap();
     assert_eq!(from_a.len(), 2, "a -> b, a -> c");
 
     let a_depends = eng
-        .fetch_edges(Some(a), None, Some(EdgeKind::DependsOn))
+        .fetch_edges_in_region("r", Some(a), None, Some(EdgeKind::DependsOn), 10)
         .unwrap();
     assert_eq!(a_depends.len(), 1);
     assert_eq!(a_depends[0].dst_id, b);
     assert_eq!(a_depends[0].kind, EdgeKind::DependsOn);
     assert!((a_depends[0].weight - 1.0).abs() < 1e-6);
 
-    let into_c = eng.fetch_edges(None, Some(c), None).unwrap();
+    let into_c = eng
+        .fetch_edges_in_region("r", None, Some(c), None, 10)
+        .unwrap();
     assert_eq!(into_c.len(), 2, "a -> c, b -> c");
 
     let all_depends = eng
-        .fetch_edges(None, None, Some(EdgeKind::DependsOn))
+        .fetch_edges_in_region("r", None, None, Some(EdgeKind::DependsOn), 10)
         .unwrap();
     assert_eq!(all_depends.len(), 2, "a -> b, b -> c");
 }

@@ -87,9 +87,9 @@ pub fn reweight_turns_from_provenance(
     }
     let turn_set: FxHashSet<AtomId> = turn_ids.iter().copied().collect();
 
-    // Global listing; region filters below. Outgoing DerivedFrom = derived atom.
+    // Outgoing DerivedFrom = derived atom.
     let mut adjacency: FxHashMap<AtomId, Vec<AtomId>> = FxHashMap::default();
-    for edge in eng.fetch_edges(None, None, Some(EdgeKind::DerivedFrom))? {
+    for edge in eng.fetch_all_edges_in_region(region, None, None, Some(EdgeKind::DerivedFrom))? {
         adjacency.entry(edge.src_id).or_default().push(edge.dst_id);
     }
 
@@ -196,7 +196,7 @@ mod tests {
         assert_eq!(stats, ReweightStats { turns: 1, cited: 1 });
         // fact (direct) + timeline (through the fact) = closure count 2.
         let hit = eng.fetch_one("r", cited).unwrap().unwrap();
-        assert_eq!(hit.score, 2.0, "transitive citation counted");
+        assert_eq!(hit.importance, 2.0, "transitive citation counted");
 
         let hits = eng
             .recall(
@@ -233,14 +233,14 @@ mod tests {
             .unwrap();
 
         reweight_turns_from_provenance(&eng, "r", "turn", WeightShape::Linear).unwrap();
-        assert_eq!(eng.fetch_one("r", t).unwrap().unwrap().score, 3.0);
+        assert_eq!(eng.fetch_one("r", t).unwrap().unwrap().importance, 3.0);
 
         reweight_turns_from_provenance(&eng, "r", "turn", WeightShape::Sqrt).unwrap();
-        let sqrt = eng.fetch_one("r", t).unwrap().unwrap().score;
+        let sqrt = eng.fetch_one("r", t).unwrap().unwrap().importance;
         assert!((sqrt - 3f32.sqrt()).abs() < 1e-6);
 
         reweight_turns_from_provenance(&eng, "r", "turn", WeightShape::Log).unwrap();
-        let log = eng.fetch_one("r", t).unwrap().unwrap().score;
+        let log = eng.fetch_one("r", t).unwrap().unwrap().importance;
         assert!((log - 4f32.ln()).abs() < 1e-6);
     }
 
@@ -261,7 +261,7 @@ mod tests {
         eng.delete_atoms("r", &[fact]).unwrap();
         let stats = reweight_turns_from_provenance(&eng, "r", "turn", WeightShape::Linear).unwrap();
         assert_eq!(stats, ReweightStats { turns: 1, cited: 0 });
-        assert_eq!(eng.fetch_one("r", t).unwrap().unwrap().score, 0.0);
+        assert_eq!(eng.fetch_one("r", t).unwrap().unwrap().importance, 0.0);
     }
 
     #[test]

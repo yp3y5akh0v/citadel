@@ -10,7 +10,11 @@ use candle_transformers::models::bert::{BertModel, Config, DTYPE};
 use candle_transformers::models::modernbert::{Config as ModernBertConfig, ModernBert};
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 
-use crate::embed::{normalize_model_id_label, EmbedError, Embedder, EmbeddingMetric, Reranker};
+use citadel_core::CancelToken;
+
+use crate::embed::{
+    check_cancel, normalize_model_id_label, EmbedError, Embedder, EmbeddingMetric, Reranker,
+};
 
 fn backend(e: impl std::fmt::Display) -> EmbedError {
     EmbedError::Backend(e.to_string())
@@ -31,6 +35,34 @@ fn ensure_finite(values: &[f32], model_id: &str) -> Result<(), EmbedError> {
 /// Micro-batch size for length-bucketed encoding; inputs are length-sorted so
 /// padding tracks each chunk (attention cost is ~length squared).
 const MICRO_BATCH: usize = 16;
+
+#[cfg(test)]
+std::thread_local! {
+    static CANCEL_AFTER_TOKENIZATION: std::cell::RefCell<Option<CancelToken>> = const {
+        std::cell::RefCell::new(None)
+    };
+    static CANCEL_AFTER_MODEL_FORWARD: std::cell::RefCell<Option<CancelToken>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+fn cancel_after_tokenization() {
+    CANCEL_AFTER_TOKENIZATION.with(|slot| {
+        if let Some(token) = slot.borrow_mut().take() {
+            token.cancel();
+        }
+    });
+}
+
+#[cfg(test)]
+fn cancel_after_model_forward() {
+    CANCEL_AFTER_MODEL_FORWARD.with(|slot| {
+        if let Some(token) = slot.borrow_mut().take() {
+            token.cancel();
+        }
+    });
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pooling {
@@ -497,18 +529,24 @@ impl CandleEmbedder {
     /// each chunk; masked padding keeps outputs identical to a single batch.
     /// Encoding stays sequential to avoid rayon contention with concurrent
     /// recalls.
-    fn run(&self, texts: &[&str], prefix: Option<&str>) -> candle_core::Result<Vec<Vec<f32>>> {
+    fn run(
+        &self,
+        texts: &[&str],
+        prefix: Option<&str>,
+        cancel: Option<&CancelToken>,
+    ) -> Result<Vec<Vec<f32>>, EmbedError> {
+        check_cancel(cancel)?;
         let mut encodings = Vec::with_capacity(texts.len());
         for t in texts {
+            check_cancel(cancel)?;
             let input = match prefix {
                 Some(p) => format!("{p}{t}"),
                 None => (*t).to_string(),
             };
-            encodings.push(
-                self.tokenizer
-                    .encode(input, true)
-                    .map_err(candle_core::Error::wrap)?,
-            );
+            encodings.push(self.tokenizer.encode(input, true).map_err(backend)?);
+            #[cfg(test)]
+            cancel_after_tokenization();
+            check_cancel(cancel)?;
         }
 
         let mut order: Vec<usize> = (0..encodings.len()).collect();
@@ -516,6 +554,7 @@ impl CandleEmbedder {
 
         let mut rows: Vec<Vec<f32>> = vec![Vec::new(); encodings.len()];
         for chunk in order.chunks(MICRO_BATCH) {
+            check_cancel(cancel)?;
             let seq = chunk
                 .iter()
                 .map(|&i| encodings[i].get_ids().len())
@@ -539,25 +578,37 @@ impl CandleEmbedder {
                 mask.extend_from_slice(&row_mask);
             }
 
-            let input_ids = Tensor::from_vec(ids, (bsz, seq), &self.device)?;
-            let type_ids = Tensor::from_vec(type_ids, (bsz, seq), &self.device)?;
-            let attn = Tensor::from_vec(mask, (bsz, seq), &self.device)?;
+            let input_ids = Tensor::from_vec(ids, (bsz, seq), &self.device).map_err(backend)?;
+            let type_ids = Tensor::from_vec(type_ids, (bsz, seq), &self.device).map_err(backend)?;
+            let attn = Tensor::from_vec(mask, (bsz, seq), &self.device).map_err(backend)?;
 
-            let hidden = self.model.forward(&input_ids, &type_ids, &attn)?;
+            check_cancel(cancel)?;
+            let hidden = self
+                .model
+                .forward(&input_ids, &type_ids, &attn)
+                .map_err(backend)?;
+            #[cfg(test)]
+            cancel_after_model_forward();
+            check_cancel(cancel)?;
             let pooled = match self.pooling {
-                Pooling::Cls => cls_pool(&hidden)?,
-                Pooling::Mean => masked_mean_pool(&hidden, &attn)?,
+                Pooling::Cls => cls_pool(&hidden).map_err(backend)?,
+                Pooling::Mean => masked_mean_pool(&hidden, &attn).map_err(backend)?,
             };
             let out = if self.normalize {
-                l2_normalize(&pooled)?
+                l2_normalize(&pooled).map_err(backend)?
             } else {
                 pooled
             };
-            let chunk_rows = out.contiguous()?.to_vec2::<f32>()?;
+            let chunk_rows = out
+                .contiguous()
+                .and_then(|out| out.to_vec2::<f32>())
+                .map_err(backend)?;
             for (pos, &i) in chunk.iter().enumerate() {
                 rows[i].clone_from(&chunk_rows[pos]);
             }
+            check_cancel(cancel)?;
         }
+        check_cancel(cancel)?;
         Ok(rows)
     }
 }
@@ -575,29 +626,39 @@ impl Embedder for CandleEmbedder {
         &self.model_id
     }
 
-    fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
+    fn embed_with_cancel(
+        &self,
+        texts: &[&str],
+        cancel: Option<&CancelToken>,
+    ) -> Result<Vec<Vec<f32>>, EmbedError> {
+        check_cancel(cancel)?;
         if texts.is_empty() {
             return Ok(Vec::new());
         }
-        let rows = self
-            .run(texts, self.passage_prefix.as_deref())
-            .map_err(backend)?;
+        let rows = self.run(texts, self.passage_prefix.as_deref(), cancel)?;
         for row in &rows {
+            check_cancel(cancel)?;
             ensure_finite(row, &self.model_id)?;
         }
+        check_cancel(cancel)?;
         Ok(rows)
     }
 
-    fn embed_queries(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
+    fn embed_queries_with_cancel(
+        &self,
+        texts: &[&str],
+        cancel: Option<&CancelToken>,
+    ) -> Result<Vec<Vec<f32>>, EmbedError> {
+        check_cancel(cancel)?;
         if texts.is_empty() {
             return Ok(Vec::new());
         }
-        let rows = self
-            .run(texts, self.query_prefix.as_deref())
-            .map_err(backend)?;
+        let rows = self.run(texts, self.query_prefix.as_deref(), cancel)?;
         for row in &rows {
+            check_cancel(cancel)?;
             ensure_finite(row, &self.model_id)?;
         }
+        check_cancel(cancel)?;
         Ok(rows)
     }
 }
@@ -676,14 +737,20 @@ impl CrossEncoder {
     /// Length-bucketed micro-batches keep padding near each chunk's real
     /// length. Tokenization stays sequential: `encode_batch`'s rayon fan-out
     /// contends with concurrent recalls.
-    fn run(&self, query: &str, passages: &[&str]) -> candle_core::Result<Vec<f32>> {
+    fn run(
+        &self,
+        query: &str,
+        passages: &[&str],
+        cancel: Option<&CancelToken>,
+    ) -> Result<Vec<f32>, EmbedError> {
+        check_cancel(cancel)?;
         let mut encodings = Vec::with_capacity(passages.len());
         for p in passages {
-            encodings.push(
-                self.tokenizer
-                    .encode((query, *p), true)
-                    .map_err(candle_core::Error::wrap)?,
-            );
+            check_cancel(cancel)?;
+            encodings.push(self.tokenizer.encode((query, *p), true).map_err(backend)?);
+            #[cfg(test)]
+            cancel_after_tokenization();
+            check_cancel(cancel)?;
         }
 
         // Process short pairs together and long pairs together: sorting by
@@ -694,6 +761,7 @@ impl CrossEncoder {
 
         let mut scores = vec![0f32; encodings.len()];
         for chunk in order.chunks(MICRO_BATCH) {
+            check_cancel(cancel)?;
             let seq = chunk
                 .iter()
                 .map(|&i| encodings[i].get_ids().len())
@@ -717,21 +785,41 @@ impl CrossEncoder {
                 mask.extend_from_slice(&row_mask);
             }
 
-            let input_ids = Tensor::from_vec(ids, (bsz, seq), &self.device)?;
-            let type_ids = Tensor::from_vec(type_ids, (bsz, seq), &self.device)?;
-            let attn = Tensor::from_vec(mask, (bsz, seq), &self.device)?;
+            let input_ids = Tensor::from_vec(ids, (bsz, seq), &self.device).map_err(backend)?;
+            let type_ids = Tensor::from_vec(type_ids, (bsz, seq), &self.device).map_err(backend)?;
+            let attn = Tensor::from_vec(mask, (bsz, seq), &self.device).map_err(backend)?;
 
-            let hidden = self.model.forward(&input_ids, &type_ids, Some(&attn))?;
+            check_cancel(cancel)?;
+            let hidden = self
+                .model
+                .forward(&input_ids, &type_ids, Some(&attn))
+                .map_err(backend)?;
+            #[cfg(test)]
+            cancel_after_model_forward();
+            check_cancel(cancel)?;
             // narrow+squeeze is non-contiguous; candle's CUDA matmul needs
             // contiguous.
-            let cls = hidden.narrow(1, 0, 1)?.squeeze(1)?.contiguous()?;
-            let pooled = self.pooler.forward(&cls)?.tanh()?;
-            let logits = self.classifier.forward(&pooled)?;
-            let batch_scores = logits.squeeze(1)?.to_vec1::<f32>()?;
+            let cls = hidden
+                .narrow(1, 0, 1)
+                .and_then(|hidden| hidden.squeeze(1))
+                .and_then(|hidden| hidden.contiguous())
+                .map_err(backend)?;
+            let pooled = self
+                .pooler
+                .forward(&cls)
+                .and_then(|pooled| pooled.tanh())
+                .map_err(backend)?;
+            let logits = self.classifier.forward(&pooled).map_err(backend)?;
+            let batch_scores = logits
+                .squeeze(1)
+                .and_then(|logits| logits.to_vec1::<f32>())
+                .map_err(backend)?;
             for (pos, &i) in chunk.iter().enumerate() {
                 scores[i] = batch_scores[pos];
             }
+            check_cancel(cancel)?;
         }
+        check_cancel(cancel)?;
         Ok(scores)
     }
 }
@@ -741,12 +829,20 @@ impl Reranker for CrossEncoder {
         &self.model_id
     }
 
-    fn rerank(&self, query: &str, passages: &[&str]) -> Result<Vec<f32>, EmbedError> {
+    fn rerank_with_cancel(
+        &self,
+        query: &str,
+        passages: &[&str],
+        cancel: Option<&CancelToken>,
+    ) -> Result<Vec<f32>, EmbedError> {
+        check_cancel(cancel)?;
         if passages.is_empty() {
             return Ok(Vec::new());
         }
-        let scores = self.run(query, passages).map_err(backend)?;
+        let scores = self.run(query, passages, cancel)?;
+        check_cancel(cancel)?;
         ensure_finite(&scores, &self.model_id)?;
+        check_cancel(cancel)?;
         Ok(scores)
     }
 }
@@ -1411,6 +1507,39 @@ mod tests {
             device,
             model_id: "synthetic-ce".into(),
         }
+    }
+
+    #[test]
+    fn built_in_models_poll_after_tokenization_and_forward_work() {
+        let embedder = synthetic_embedder();
+        let token = CancelToken::new();
+        CANCEL_AFTER_TOKENIZATION.with(|slot| *slot.borrow_mut() = Some(token.clone()));
+        assert!(matches!(
+            embedder.embed_with_cancel(&["hello world"], Some(&token)),
+            Err(EmbedError::Interrupted)
+        ));
+
+        let token = CancelToken::new();
+        CANCEL_AFTER_MODEL_FORWARD.with(|slot| *slot.borrow_mut() = Some(token.clone()));
+        assert!(matches!(
+            embedder.embed_with_cancel(&["hello world"], Some(&token)),
+            Err(EmbedError::Interrupted)
+        ));
+
+        let reranker = synthetic_cross_encoder();
+        let token = CancelToken::new();
+        CANCEL_AFTER_TOKENIZATION.with(|slot| *slot.borrow_mut() = Some(token.clone()));
+        assert!(matches!(
+            reranker.rerank_with_cancel("hello", &["world"], Some(&token)),
+            Err(EmbedError::Interrupted)
+        ));
+
+        let token = CancelToken::new();
+        CANCEL_AFTER_MODEL_FORWARD.with(|slot| *slot.borrow_mut() = Some(token.clone()));
+        assert!(matches!(
+            reranker.rerank_with_cancel("hello", &["world"], Some(&token)),
+            Err(EmbedError::Interrupted)
+        ));
     }
 
     #[test]

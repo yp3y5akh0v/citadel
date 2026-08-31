@@ -119,10 +119,27 @@ class _HaystackEmbedder:
         return vector
 
     def embed(self, texts: list[str]) -> list[list[float]]:
-        return [self._one(text) for text in texts]
+        return self.embed_with_cancel(texts, None)
 
     def embed_queries(self, texts: list[str]) -> list[list[float]]:
-        return self.embed(texts)
+        return self.embed_queries_with_cancel(texts, None)
+
+    def embed_with_cancel(
+        self, texts: list[str], cancel_token: Any | None
+    ) -> list[list[float]]:
+        vectors: list[list[float]] = []
+        for text in texts:
+            if cancel_token is not None:
+                cancel_token.check()
+            vectors.append(self._one(text))
+            if cancel_token is not None:
+                cancel_token.check()
+        return vectors
+
+    def embed_queries_with_cancel(
+        self, texts: list[str], cancel_token: Any | None
+    ) -> list[list[float]]:
+        return self.embed_with_cancel(texts, cancel_token)
 
 
 def _fetch(mem: Any, region: str, criterion: dict[str, Any] | None) -> list[Any]:
@@ -449,7 +466,7 @@ class CitadelDocumentStore:
                 if filters and not document_matches_filter(filters, doc):
                     continue
                 if h.distance is None:
-                    score = h.score
+                    score = h.relevance if h.relevance is not None else 0.0
                 elif self.embedding_similarity_function == "dot_product":
                     score = -h.distance
                 else:
