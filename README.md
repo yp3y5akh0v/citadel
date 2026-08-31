@@ -193,24 +193,47 @@ package's own README.
 
 Serve an encrypted memory region to Claude Desktop or any MCP client. `citadeldb-mcp` is
 published to PyPI and listed in the official [MCP registry](https://registry.modelcontextprotocol.io/v0/servers?search=dev.citadeldb/mcp)
-as `dev.citadeldb/mcp`. Run it with no install via `uvx citadeldb-mcp`, or
-`pip install citadeldb-mcp` / `cargo install citadeldb-mcp`, then add it to `claude_desktop_config.json`:
+as `dev.citadeldb/mcp`. Run it without installing through `uvx`.
+
+For the recommended semantic-recall setup, pull the embedder and cross-encoder reranker once:
+
+```console
+uvx citadeldb-mcp pull e5-large
+uvx citadeldb-mcp pull ms-marco-minilm
+```
+
+The pull commands do not need a vault key. Before starting the server, set `CITADEL_KEY`
+to the vault passphrase: use `export CITADEL_KEY="your-passphrase"` on macOS/Linux or
+`$env:CITADEL_KEY = "your-passphrase"` in PowerShell. Then run:
+
+```console
+uvx citadeldb-mcp --db memory.cdl --embedder e5-large --reranker ms-marco-minilm
+```
+
+`--db`, `--embedder`, and `CITADEL_KEY` are required when serving. The reranker is optional,
+but `e5-large` with `ms-marco-minilm` is the recommended highest-recall configuration used
+for the memory benchmarks. `--embedder mock` is a keyword-only option, not a semantic
+embedder.
+
+To install the executable instead, run `pip install citadeldb-mcp` or
+`cargo install citadeldb-mcp`. Pull the same models with `citadeldb-mcp pull e5-large` and
+`citadeldb-mcp pull ms-marco-minilm`, then add it to `claude_desktop_config.json`:
 
 ```json
 {
   "mcpServers": {
     "citadel": {
       "command": "citadeldb-mcp",
-      "args": ["--db", "memory.cdl", "--embedder", "e5-large", "--reranker", "ms-marco-minilm"],
+      "args": [
+        "--db", "/absolute/path/to/memory.cdl",
+        "--embedder", "e5-large",
+        "--reranker", "ms-marco-minilm"
+      ],
       "env": { "CITADEL_KEY": "your-passphrase" }
     }
   }
 }
 ```
-
-For the best recall (the benchmark config), `pull e5-large` + `pull ms-marco-minilm` first,
-then use `--embedder e5-large --reranker ms-marco-minilm`. Every server invocation must select an
-embedder; use `--embedder mock` explicitly when keyword-only recall is intentional.
 
 ## Memory benchmarks
 
@@ -588,8 +611,8 @@ Shadow paging with a god byte - one byte selects the active commit slot. Atomic 
 What the at-rest integrity machinery does and does not guarantee against an attacker with file access:
 
 - **Per-page HMAC** binds `(epoch, page_id, IV, ciphertext)`. Any modification of a page's bytes is detected before decryption. It does **not** bind the commit generation: a page image validly written in the past for the same `(page_id, epoch)` verifies forever.
-- **Commit slots** are keyed-MAC'd (truncated HMAC-SHA256 over the whole slot) when the named-table entries fit the authenticated layout; files written by pre-1.13 versions carry only a keyless checksum over part of the slot and are still accepted, so slot authentication is corruption detection and a tampering bar, not a hard guarantee - an attacker can re-encode a slot in the legacy format.
-- **Rollback to an older genuine state** (an earlier file snapshot, or an old slot plus its old pages) passes every check by construction and cannot be detected from the file alone. Deployments that need freshness must keep an external anchor - e.g. record the latest commit's `txn_id` and Merkle root outside the attacker's reach and compare after opening.
+- **Commit slots** have two accepted formats. V1 slots carry a truncated HMAC-SHA256 over every field except the MAC itself; legacy slots carry only a keyless checksum over a prefix. Checksum-valid legacy slots remain readable only while no V1 requirement is recorded. Once both physical slots are valid V1 and the vault records that one-way requirement, any checksum-valid legacy slot is rejected as downgrade evidence, and writers refuse to create one.
+- **Rollback to an older genuine state** is outside this boundary. An earlier authenticated slot plus its matching pages can pass the data-file checks; an older internally consistent snapshot of all local vault state, including the data, key, and retained audit files, also passes local authentication. Detecting freshness requires an external anchor - for example, store the latest commit's `txn_id` and Merkle root outside the attacker's reach and compare them after opening.
 
 ## Language Bindings
 
