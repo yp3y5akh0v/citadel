@@ -15,12 +15,17 @@ Two providers for two jobs, matching how the framework's own Redis integration i
 | `CitadelHistoryProvider` | `HistoryProvider` | a session must recover its complete transcript |
 | `CitadelContextProvider` | `ContextProvider` | an agent should recall relevant facts across sessions |
 
+The context provider performs semantic recall. This example uses local e5-large;
+`CandleEmbedder` requires a `citadeldb` source wheel built with
+`--features candle-embed`, while the default wheel accepts an equivalent real
+bring-your-own embedder.
+
 ```python
 from agent_framework import Agent
 import citadeldb
 from citadeldb_ms_agent_framework import CitadelContextProvider, CitadelHistoryProvider
 
-embedder = citadeldb.MockEmbedder(dim=64)
+embedder = citadeldb.CandleEmbedder("/path/to/e5-large", preset="e5-large")
 
 agent = Agent(
     client=chat_client,  # any agent_framework chat client
@@ -76,8 +81,8 @@ multi-part contents and `additional_properties` all survive.
 
 Recalls with Citadel's hybrid search: vector distance, keyword rank and recency, fused
 into one score. `embedder=` is required and has no default: silent substitution would change
-ranking semantics and persist different provenance. `MockEmbedder` is lexical and needs no
-download; pass a real model to match across wording.
+ranking semantics and persist different provenance. Use `MockEmbedder` only for a deliberate
+lexical-only test or a history-only provider that never performs recall.
 
 ```python
 memory = CitadelContextProvider(

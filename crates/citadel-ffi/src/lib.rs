@@ -196,6 +196,7 @@ fn map_error(err: &citadel_core::Error) -> CitadelError {
         citadel_core::Error::TransactionTooLarge { .. } => CitadelError::TransactionTooLarge,
         citadel_core::Error::KeyTooLarge { .. } => CitadelError::KeyTooLarge,
         citadel_core::Error::ValueTooLarge { .. } => CitadelError::ValueTooLarge,
+        citadel_core::Error::ReadBudgetExceeded { .. } => CitadelError::InvalidArgument,
         citadel_core::Error::TableNotFound(_) => CitadelError::TableNotFound,
         citadel_core::Error::TableAlreadyExists(_) => CitadelError::TableAlreadyExists,
         citadel_core::Error::NamedTableHashCollision { .. } => {

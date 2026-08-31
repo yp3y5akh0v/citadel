@@ -21,6 +21,11 @@
 pip install citadeldb
 ```
 
+The default wheel uses bring-your-own embeddings. This zero-download example uses
+`MockEmbedder` only as a deterministic lexical API demo; it does not provide semantic
+recall. For production semantic recall, use the e5-large MCP setup below or a source
+build with the `candle-embed` feature.
+
 ```python
 import citadeldb
 
@@ -31,10 +36,9 @@ mem.create_encrypted_region("chat", citadeldb.MockEmbedder(dim=64))
 mem.remember("chat", {"kind": "fact", "text": "Alice's cat is named Mochi"})
 berlin = mem.remember("chat", {"kind": "fact", "text": "Alice lives in Berlin"})
 
-for hit in mem.recall("chat", text="where does Alice live?", k=2):
-    print(f"{hit.score:.3f}  {hit.text}")
-# 0.850  Alice lives in Berlin
-# 0.200  Alice's cat is named Mochi
+for hit in mem.recall("chat", text="Alice lives", k=2):
+    assert hit.relevance is not None
+    print(f"{hit.relevance:.3f}  {hit.text}")
 
 # Forgetting destroys the atom's key, so the ciphertext is unrecoverable.
 receipt = mem.forget("chat", [berlin])
@@ -42,8 +46,18 @@ print(receipt.cryptographic_erasure, receipt.algorithm)
 # True AES-256-KW(RFC3394)
 ```
 
-`MockEmbedder` needs no download and is enough to try the API. For real recall
-quality use `CandleEmbedder` with a local e5-large, which is the benchmark setup.
+With a `candle-embed` build, replace the region setup above with the real embedder and
+add the benchmark reranker:
+
+```python
+embedder = citadeldb.CandleEmbedder("/path/to/e5-large", preset="e5-large")
+mem.create_encrypted_region("chat", embedder)  # replaces the MockEmbedder call above
+mem.set_reranker(citadeldb.CrossEncoder("/path/to/ms-marco-minilm"))
+```
+
+A Python bring-your-own backend implements `embed_with_cancel(texts, cancel_token)` and
+polls `cancel_token.check()` between bounded batches; asymmetric models may also implement
+`embed_queries_with_cancel`.
 
 ### Memory (Rust)
 
@@ -75,7 +89,7 @@ let berlin = mem.remember("chat", AtomInput::new("fact", "Alice lives in Berlin"
 
 // Recall by relevance
 for hit in mem.recall("chat", RecallQuery::by_text("where does Alice live?", 5))? {
-    println!("{:.3}  {}", hit.score, hit.text);
+    println!("{:.3}  {}", hit.relevance.expect("ranked recall"), hit.text);
 }
 
 // Cryptographic forgetting: destroy the atom's key
@@ -178,7 +192,8 @@ from citadeldb_langgraph import CitadelStore
 store = CitadelStore(
     "agent.cdl",
     key="your-passphrase",
-    embedder=citadeldb.MockEmbedder(dim=64),  # replace with your production model
+    # This example lists namespaces without a semantic query, so no model work is needed.
+    embedder=citadeldb.MockEmbedder(dim=64),
 )
 store.put(("users", "alice"), "prefs", {"theme": "dark"})
 store.search(("users",))                     # every namespace under users/

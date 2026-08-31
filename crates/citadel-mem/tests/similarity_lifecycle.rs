@@ -123,10 +123,10 @@ fn reconciliation_deletes_only_exact_tracked_pairs() {
         .create_region("other", Arc::new(MockEmbedder::new(DIM)))
         .unwrap();
     engine
-        .link(authored_src, shared_dst, EdgeKind::SimilarTo, 0.25)
+        .link_in_region("notes", authored_src, shared_dst, EdgeKind::SimilarTo, 0.25)
         .unwrap();
     engine
-        .link(tracked_src, shared_dst, EdgeKind::SimilarTo, 0.5)
+        .link_in_region("notes", tracked_src, shared_dst, EdgeKind::SimilarTo, 0.5)
         .unwrap();
 
     let conn = Connection::open(&db).unwrap();
@@ -203,7 +203,9 @@ fn explicitly_relinking_a_managed_pair_makes_it_authored() {
     };
     drop(conn);
 
-    engine.link(src, dst, EdgeKind::SimilarTo, 0.25).unwrap();
+    engine
+        .link_in_region("notes", src, dst, EdgeKind::SimilarTo, 0.25)
+        .unwrap();
     assert_eq!(count(&db, "memory_similarity_policies"), 1);
     assert_eq!(count(&db, "memory_similarity_edges"), 0);
     let edge = Connection::open(&db)
@@ -223,7 +225,7 @@ fn legacy_similarity_is_replaced_only_through_the_explicit_migration_path() {
     let (db, engine) = setup(&dir.path().join("legacy-similarity.citadel"));
     let ids = seed(&engine);
     engine
-        .link(ids[0], ids[1], EdgeKind::SimilarTo, 0.25)
+        .link_in_region("notes", ids[0], ids[1], EdgeKind::SimilarTo, 0.25)
         .unwrap();
 
     engine.evolve("notes", ids[0], 0, f32::MAX).unwrap();

@@ -1457,6 +1457,7 @@ impl TxnManager {
         high_water_mark: u32,
         merkle_scheme: MerkleScheme,
         cancel: Option<&CancelToken>,
+        budget: Option<&crate::ReadBudget>,
     ) -> Result<Vec<u8>> {
         if let Some(token) = cancel {
             token.check()?;
@@ -1467,6 +1468,9 @@ impl TxnManager {
                 "declared length {total_len} exceeds maximum {}",
                 citadel_core::MAX_VALUE_SIZE
             )));
+        }
+        if let Some(budget) = budget {
+            budget.try_charge(total_len)?;
         }
         let mut value = Vec::with_capacity(total_len);
         let require_digest = match merkle_scheme {

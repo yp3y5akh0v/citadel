@@ -49,12 +49,15 @@ def _require_embedder(embedder: Any) -> tuple[Any, int]:
         raise TypeError(
             "embedder model_id must be a nonblank string other than 'unknown' or 'default'"
         )
-    if not callable(getattr(embedder, "embed", None)):
-        raise TypeError("embedder must provide a callable embed(texts) method")
+    if not callable(getattr(embedder, "embed_with_cancel", None)):
+        raise TypeError(
+            "embedder must provide a callable "
+            "embed_with_cancel(texts, cancel_token) method"
+        )
     missing = object()
-    embed_queries = getattr(embedder, "embed_queries", missing)
+    embed_queries = getattr(embedder, "embed_queries_with_cancel", missing)
     if embed_queries is not missing and not callable(embed_queries):
-        raise TypeError("embedder embed_queries attribute must be callable")
+        raise TypeError("embedder embed_queries_with_cancel attribute must be callable")
     normalized = model_id.strip()
     return (
         embedder
@@ -146,10 +149,7 @@ def _to_record(hit) -> MemoryRecord:
         scope=p["scope"],
         categories=p.get("categories", []),
         metadata=p.get("metadata", {}),
-        # The stored value. A recall hit's score is the fused rank over whichever
-        # rows shared its candidate pool, which is neither this quantity nor
-        # stable between calls.
-        importance=p.get("importance", hit.score),
+        importance=p.get("importance", hit.importance),
         created_at=_dt(p.get("created_at")),
         last_accessed=_dt(p.get("last_accessed")),
         source=p.get("source"),
@@ -191,8 +191,7 @@ def _save(mem: Any, region: str, dim: int, records: list[MemoryRecord]) -> None:
             "anc": _ancestors(scope),
             "categories": list(r.categories),
             "metadata": dict(r.metadata),
-            # Stored, not read back off the hit: a recall hit's score is the
-            # fused rank, which is a different quantity from what was saved.
+            # Persisted separately from query-time relevance.
             "importance": r.importance,
             "created_at": _micros(r.created_at),
             "last_accessed": _micros(r.last_accessed) if r.last_accessed else None,
@@ -208,8 +207,8 @@ def _save(mem: Any, region: str, dim: int, records: list[MemoryRecord]) -> None:
         atom: dict[str, Any] = {
             "kind": KIND,
             "text": r.content,
-            # Importance is a ranking signal, so it becomes the atom's score too.
-            "score": r.importance,
+            # Importance is persisted as a native ranking signal.
+            "importance": r.importance,
             "payload": payload,
         }
         # The vector rides its own atom so duplicate content cannot swap them.
@@ -254,7 +253,9 @@ def _search(
             score = (
                 max(0.0, min(1.0, 1.0 - h.distance))
                 if h.distance is not None
-                else h.score
+                else h.relevance
+                if h.relevance is not None
+                else 0.0
             )
             if score >= min_score:
                 out.append((_to_record(h), score))
@@ -343,7 +344,7 @@ class CitadelBackend:
             scope=p["scope"],
             categories=p.get("categories", []),
             metadata=p.get("metadata", {}),
-            importance=p.get("importance", hit.score),
+            importance=p.get("importance", hit.importance),
             created_at=_dt(p.get("created_at")),
             last_accessed=_dt(p.get("last_accessed")),
             source=p.get("source"),

@@ -91,9 +91,13 @@ mod tests {
             kind: "turn".into(),
             text: text.into(),
             payload: json!({ "session_id": sid, "role": "user" }),
-            distance: 0.0,
-            score: 0.0,
+            importance: 0.0,
+            confidence: 1.0,
+            relevance: Some(0.0),
+            distance: Some(0.0),
+            graph_depth: None,
             created_at,
+            expires_at: None,
             immutable: false,
         }
     }

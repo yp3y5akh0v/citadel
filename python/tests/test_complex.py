@@ -26,13 +26,15 @@ def test_byo_embedder_error_propagates():
         metric = "cosine"
         model_id = "bad"
 
-        def embed(self, texts):
+        def embed_with_cancel(self, texts, cancel_token):
+            if cancel_token is not None:
+                cancel_token.check()
             raise ValueError("boom from python embedder")
 
     mem = citadeldb.connect(key="k").memory()
     mem.create_region("r", Bad())  # only reads dim/metric/model_id
     with pytest.raises(citadeldb.OperationalError) as exc:
-        mem.remember("r", {"kind": "fact", "text": "x"})  # triggers embed()
+        mem.remember("r", {"kind": "fact", "text": "x"})
     assert "boom" in str(exc.value)
 
 

@@ -210,6 +210,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<mem::PyRecallOptions>()?;
     m.add_class::<mem::PyMockEmbedder>()?;
     m.add_class::<mem::PyAtomHit>()?;
+    m.add_class::<mem::PyRememberOutcome>()?;
     m.add_class::<mem::PyMemoryMaintenance>()?;
     m.add_class::<mem::PyMemoryRegionInfo>()?;
     m.add_class::<mem::PyMemoryRegionInventory>()?;

@@ -13,23 +13,32 @@ connected by a typed edge graph, and forgotten by **destroying keys** (cryptogra
 
 ## Install
 
-Run it with no install and explicitly select the keyword-only test embedder (no downloads):
-
-```sh
-uvx citadeldb-mcp --db memory.cdl --embedder mock
-```
-
-**For the best recall (recommended - this is the benchmark config):** pull the semantic
-embedder and the cross-encoder reranker once, then enable both:
+Run it with no install. For semantic recall, pull the recommended embedder and
+cross-encoder reranker once, then enable both:
 
 ```sh
 uvx citadeldb-mcp pull e5-large
 uvx citadeldb-mcp pull ms-marco-minilm
+```
+
+The pull commands do not open a vault. Before serving, set `CITADEL_KEY` to the vault
+passphrase (`export CITADEL_KEY="your-passphrase"` on macOS/Linux or
+`$env:CITADEL_KEY = "your-passphrase"` in PowerShell), then run:
+
+```sh
 uvx citadeldb-mcp --db memory.cdl --embedder e5-large --reranker ms-marco-minilm
 ```
 
 `e5-large` + `ms-marco-minilm` is the highest-recall setup and the exact config behind the
 memory benchmark numbers. Models are never downloaded automatically.
+
+For an intentional lexical-only smoke test, select the deterministic mock explicitly:
+
+```sh
+uvx citadeldb-mcp --db memory.cdl --embedder mock
+```
+
+The mock performs no semantic matching and is not a substitute for the configuration above.
 
 Built-in pulls use release-pinned Hugging Face revisions. Each complete snapshot is verified
 against compiled sizes and SHA-256 digests, then stored with a BLAKE3 manifest under
@@ -53,20 +62,25 @@ then wire it into Claude Desktop (`claude_desktop_config.json`):
 }
 ```
 
-Tools (over a synchronous, hand-rolled JSON-RPC 2.0 stdio transport):
+The server supports stateless MCP `2026-07-28` discovery and per-request metadata, plus the
+initialize-based `2025-11-25` and `2025-06-18` revisions for existing clients.
+
+Tools (over a bounded, cancellable JSON-RPC 2.0 stdio transport):
 
 - `mem_recall` - hybrid retrieval (vector + keyword + recency + importance); filter by kind/payload, expand along the memory graph, override fusion weights, and optionally attach provenance (`derived_from`), per-hit integrity verdicts (`attest`), and `resource_link`s to each hit
-- `mem_fetch` - deterministic listing of a kind (no embedding)
-- `mem_edges` - typed graph introspection
+- `mem_fetch` - deterministic cursor-based listing of a kind (no embedding)
+- `mem_get` - bounded exact-id batch retrieval in request order, with missing atoms marked explicitly
+- `mem_edges` - cursor-based typed graph introspection
 - `mem_profile` - what the memory knows about a query: recall plus its graph neighborhood
 - `mem_summarize` - per-kind digest of a region
 - `mem_verify` - re-authenticate atoms off disk: per-atom integrity verdict (authentic / tampered / key_erased / missing / plaintext_unattested)
-- `mem_remember` / `mem_remember_batch` - store atoms with payload, importance, TTL, immutability
+- `mem_remember` - store one atom with optional provenance and retry-safe idempotency
+- `mem_remember_batch` - atomically store an ordered batch; every entry carries a distinct idempotency key, and a changed reuse rejects the whole batch
 - `mem_update` - replace a stored atom's payload in place (preserves id, edges, and embedding)
-- `mem_link` - connect atoms with a typed edge
-- `mem_evolve` - recompute an atom's neighbor links and score
+- `mem_link` / `mem_unlink` - add or remove one exact typed edge
+- `mem_evolve` - recompute an atom's neighbor links and stored importance
 - `mem_evict` - selective forgetting by policy (cryptographic erasure on encrypted regions)
-- `mem_forget` - forget atoms by id and return a verifiable **erasure receipt** (cryptographic erasure on encrypted regions; skips immutable atoms unless forced)
+- `mem_forget` - forget atoms by id and return a verifiable **erasure receipt**; optionally erase their region-local `derived_from` closure atomically (cryptographic erasure on encrypted regions; immutable atoms require the protected-erasure opt-in)
 
 The `citadeldb-mcp` binary reads the passphrase from `CITADEL_KEY` and serves one region
 (encrypted by default); only protocol messages go to stdout, diagnostics to stderr.
@@ -80,6 +94,10 @@ Embedder pull names: `e5-large` (recommended), `e5-large-v2`, `bge-small`, `bge-
 `bge-large`, `minilm`. Reranker: `ms-marco-minilm`. Or point `--model-dir` at a
 compatible local checkpoint for the selected catalog pipeline, and build with
 `--features cuda-embed` to run on an NVIDIA GPU.
+
+Managed snapshots fetched by `pull` are manifest- and checksum-verified. A directory
+supplied through `--model-dir` or `--reranker-dir` is an operator-trusted input and is
+not validated against the managed snapshot manifest.
 
 This crate is part of the Citadel workspace.
 

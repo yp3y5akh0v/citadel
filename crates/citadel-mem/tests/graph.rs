@@ -24,9 +24,11 @@ fn link_creates_edge_and_is_idempotent() {
     let eng = engine(dir.path());
     let a = eng.remember("r", AtomInput::new("fact", "alpha")).unwrap();
     let b = eng.remember("r", AtomInput::new("fact", "beta")).unwrap();
-    eng.link(a, b, EdgeKind::DerivedFrom, 1.0).unwrap();
+    eng.link_in_region("r", a, b, EdgeKind::DerivedFrom, 1.0)
+        .unwrap();
     // Re-linking updates weight rather than erroring on the PK.
-    eng.link(a, b, EdgeKind::DerivedFrom, 0.5).unwrap();
+    eng.link_in_region("r", a, b, EdgeKind::DerivedFrom, 0.5)
+        .unwrap();
 }
 
 #[test]
@@ -36,9 +38,13 @@ fn depends_on_cycle_is_rejected() {
     let a = eng.remember("r", AtomInput::new("task", "a")).unwrap();
     let b = eng.remember("r", AtomInput::new("task", "b")).unwrap();
     let c = eng.remember("r", AtomInput::new("task", "c")).unwrap();
-    eng.link(a, b, EdgeKind::DependsOn, 1.0).unwrap();
-    eng.link(b, c, EdgeKind::DependsOn, 1.0).unwrap();
-    let err = eng.link(c, a, EdgeKind::DependsOn, 1.0).unwrap_err();
+    eng.link_in_region("r", a, b, EdgeKind::DependsOn, 1.0)
+        .unwrap();
+    eng.link_in_region("r", b, c, EdgeKind::DependsOn, 1.0)
+        .unwrap();
+    let err = eng
+        .link_in_region("r", c, a, EdgeKind::DependsOn, 1.0)
+        .unwrap_err();
     assert!(matches!(err, MemError::Cycle { .. }), "got {err:?}");
 }
 
@@ -47,7 +53,9 @@ fn depends_on_self_loop_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let eng = engine(dir.path());
     let a = eng.remember("r", AtomInput::new("task", "a")).unwrap();
-    let err = eng.link(a, a, EdgeKind::DependsOn, 1.0).unwrap_err();
+    let err = eng
+        .link_in_region("r", a, a, EdgeKind::DependsOn, 1.0)
+        .unwrap_err();
     assert!(matches!(err, MemError::Cycle { .. }), "got {err:?}");
 }
 
@@ -57,8 +65,10 @@ fn non_dag_kinds_allow_cycles() {
     let eng = engine(dir.path());
     let a = eng.remember("r", AtomInput::new("fact", "a")).unwrap();
     let b = eng.remember("r", AtomInput::new("fact", "b")).unwrap();
-    eng.link(a, b, EdgeKind::Causes, 1.0).unwrap();
-    eng.link(b, a, EdgeKind::Causes, 1.0).unwrap();
+    eng.link_in_region("r", a, b, EdgeKind::Causes, 1.0)
+        .unwrap();
+    eng.link_in_region("r", b, a, EdgeKind::Causes, 1.0)
+        .unwrap();
 }
 
 #[test]
@@ -80,10 +90,14 @@ fn recall_graph_expand_returns_bounded_chain() {
     let e = eng
         .remember("r", AtomInput::new("fact", "epsilon unique five"))
         .unwrap();
-    eng.link(a, b, EdgeKind::DerivedFrom, 1.0).unwrap();
-    eng.link(b, c, EdgeKind::DerivedFrom, 1.0).unwrap();
-    eng.link(c, d, EdgeKind::DerivedFrom, 1.0).unwrap();
-    eng.link(d, e, EdgeKind::DerivedFrom, 1.0).unwrap();
+    eng.link_in_region("r", a, b, EdgeKind::DerivedFrom, 1.0)
+        .unwrap();
+    eng.link_in_region("r", b, c, EdgeKind::DerivedFrom, 1.0)
+        .unwrap();
+    eng.link_in_region("r", c, d, EdgeKind::DerivedFrom, 1.0)
+        .unwrap();
+    eng.link_in_region("r", d, e, EdgeKind::DerivedFrom, 1.0)
+        .unwrap();
 
     let hits = eng
         .recall(
@@ -111,7 +125,8 @@ fn graph_expand_respects_edge_kind_filter() {
     let b = eng
         .remember("r", AtomInput::new("fact", "beta unique two"))
         .unwrap();
-    eng.link(a, b, EdgeKind::Causes, 1.0).unwrap();
+    eng.link_in_region("r", a, b, EdgeKind::Causes, 1.0)
+        .unwrap();
 
     let hits = eng
         .recall(
@@ -138,8 +153,10 @@ fn graph_expand_respects_atom_kind_filter() {
     let blocked = eng
         .remember("r", AtomInput::new("audit", "blocked audit neighbor"))
         .unwrap();
-    eng.link(seed, allowed, EdgeKind::DerivedFrom, 1.0).unwrap();
-    eng.link(seed, blocked, EdgeKind::DerivedFrom, 1.0).unwrap();
+    eng.link_in_region("r", seed, allowed, EdgeKind::DerivedFrom, 1.0)
+        .unwrap();
+    eng.link_in_region("r", seed, blocked, EdgeKind::DerivedFrom, 1.0)
+        .unwrap();
 
     let hits = eng
         .recall(
@@ -187,9 +204,9 @@ fn graph_expansion_honours_payload_filter() {
                 .with_payload(serde_json::json!({"visibility": "private"})),
         )
         .unwrap();
-    eng.link(seed, public_nb, EdgeKind::DerivedFrom, 1.0)
+    eng.link_in_region("r", seed, public_nb, EdgeKind::DerivedFrom, 1.0)
         .unwrap();
-    eng.link(seed, private_nb, EdgeKind::DerivedFrom, 1.0)
+    eng.link_in_region("r", seed, private_nb, EdgeKind::DerivedFrom, 1.0)
         .unwrap();
 
     let hits = eng
@@ -245,8 +262,10 @@ fn sealed_graph_expansion_honours_payload_filter() {
                 .with_payload(serde_json::json!({"vis": "private"})),
         )
         .unwrap();
-    eng.link(seed, pub_nb, EdgeKind::DerivedFrom, 1.0).unwrap();
-    eng.link(seed, priv_nb, EdgeKind::DerivedFrom, 1.0).unwrap();
+    eng.link_in_region("v", seed, pub_nb, EdgeKind::DerivedFrom, 1.0)
+        .unwrap();
+    eng.link_in_region("v", seed, priv_nb, EdgeKind::DerivedFrom, 1.0)
+        .unwrap();
 
     let ids: Vec<i64> = eng
         .recall(

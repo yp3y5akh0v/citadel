@@ -53,6 +53,8 @@ from citadeldb_openai_agents import CitadelSession
 PATH, KEY = "agent.cdl", "your-passphrase"
 # No adapter defaults an embedder: silent substitution would change ranking
 # semantics and persist different provenance.
+# This example performs keyed state and transcript reads only, so the mock avoids
+# model work that neither adapter invokes here. Use a real embedder before semantic search.
 EMB = citadeldb.MockEmbedder(dim=64)
 
 store = CitadelStore(PATH, key=KEY, embedder=EMB)            # LangGraph state

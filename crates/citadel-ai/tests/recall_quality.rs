@@ -21,7 +21,7 @@ const FILLER: &str = "lunch is served at noon in the building cafeteria";
 const QUERY: &str = "how do I fix an off-by-one boundary bug";
 
 /// Seed a fresh region with the three atoms (as `evidence`, which `recall_relevant`
-/// admits) and return the ranked recall for QUERY: (text, fused score), best first.
+/// admits) and return the ranked recall for QUERY: (text, relevance), best first.
 fn ranked_recall(embedder: Arc<dyn Embedder>) -> Vec<(String, f32)> {
     let dir = tempfile::tempdir().unwrap();
     let db = Arc::new(
@@ -42,7 +42,7 @@ fn ranked_recall(embedder: Arc<dyn Embedder>) -> Vec<(String, f32)> {
         .recall_relevant(QUERY, 3)
         .unwrap()
         .into_iter()
-        .map(|h| (h.text, h.score))
+        .map(|h| (h.text, h.relevance.expect("recall results carry relevance")))
         .collect()
 }
 

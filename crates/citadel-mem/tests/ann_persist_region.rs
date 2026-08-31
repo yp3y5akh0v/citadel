@@ -568,6 +568,7 @@ fn plaintext_evolve_and_payload_update_and_evict_purge() {
             "payload update",
             Box::new(|e: &MemoryEngine| {
                 e.update_atom_payload("corpus", last, &serde_json::json!({"r": 1}))
+                    .map(drop)
             }),
         ),
         (
@@ -575,9 +576,9 @@ fn plaintext_evolve_and_payload_update_and_evict_purge() {
             Box::new(|e: &MemoryEngine| {
                 e.evict(
                     "corpus",
-                    citadel_mem::EvictionPolicy::LowScore {
-                        score_threshold: -1.0,
-                        confidence_threshold: -1.0,
+                    citadel_mem::EvictionPolicy::LowImportance {
+                        importance_threshold: -1.0,
+                        confidence_threshold: 0.0,
                     },
                 )
                 .map(|_| ())
@@ -702,15 +703,18 @@ fn sealed_evict_retires_the_segment() {
     let eng = open_engine(dir.path(), true);
     eng.create_encrypted_region("vault", embedder()).unwrap();
     for i in 0..20 {
-        eng.remember("vault", AtomInput::new("fact", format!("note {i}")))
-            .unwrap();
+        eng.remember(
+            "vault",
+            AtomInput::new("fact", format!("note {i}")).with_confidence(0.5),
+        )
+        .unwrap();
     }
     eng.persist_ann_index("vault").unwrap();
     eng.evict(
         "vault",
-        citadel_mem::EvictionPolicy::LowScore {
-            score_threshold: 10.0,
-            confidence_threshold: 10.0,
+        citadel_mem::EvictionPolicy::LowImportance {
+            importance_threshold: 10.0,
+            confidence_threshold: 1.0,
         },
     )
     .unwrap();

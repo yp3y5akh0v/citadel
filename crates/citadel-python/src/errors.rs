@@ -138,7 +138,9 @@ fn core_category(e: &CoreError) -> Category {
         | CoreError::NamedTableHashCollision { .. }
         | CoreError::RegionKeysDisabled
         | CoreError::RegionKeysRequireFile => Programming,
-        CoreError::KeyTooLarge { .. } | CoreError::ValueTooLarge { .. } => Data,
+        CoreError::KeyTooLarge { .. }
+        | CoreError::ValueTooLarge { .. }
+        | CoreError::ReadBudgetExceeded { .. } => Data,
         CoreError::UnsupportedVersion(_)
         | CoreError::UnsupportedCipher(_)
         | CoreError::UnsupportedKdf(_) => NotSupported,
@@ -213,9 +215,14 @@ fn mem_category(e: &MemError) -> Category {
         MemError::RegionForgotten(_) => Encryption,
         MemError::RegionNotFound(_) | MemError::RegionNotAttached(_) => Programming,
         MemError::Cycle { .. } => Integrity,
-        MemError::DimMismatch { .. }
+        MemError::AtomNotLive { .. }
+        | MemError::AtomNotMutable { .. }
+        | MemError::IdempotencyConflict { .. }
+        | MemError::DimMismatch { .. }
         | MemError::MetricMismatch { .. }
         | MemError::ModelMismatch { .. }
+        | MemError::ReadLimitExceeded { .. }
+        | MemError::WorkLimitExceeded { .. }
         | MemError::Invalid(_) => Data,
     }
 }

@@ -39,19 +39,29 @@ fn evict_purge_region_removes_all() {
 }
 
 #[test]
-fn evict_low_score_keeps_high() {
+fn evict_low_importance_keeps_high() {
     let dir = tempfile::tempdir().unwrap();
     let eng = engine(dir.path());
-    eng.remember("r", AtomInput::new("fact", "low one").with_score(0.1))
-        .unwrap();
-    eng.remember("r", AtomInput::new("fact", "high one").with_score(0.9))
-        .unwrap();
+    eng.remember(
+        "r",
+        AtomInput::new("fact", "low one")
+            .with_importance(0.1)
+            .with_confidence(0.5),
+    )
+    .unwrap();
+    eng.remember(
+        "r",
+        AtomInput::new("fact", "high one")
+            .with_importance(0.9)
+            .with_confidence(0.5),
+    )
+    .unwrap();
     let report = eng
         .evict(
             "r",
-            EvictionPolicy::LowScore {
-                score_threshold: 0.5,
-                confidence_threshold: 2.0, // confidence default 1.0 always passes
+            EvictionPolicy::LowImportance {
+                importance_threshold: 0.5,
+                confidence_threshold: 1.0,
             },
         )
         .unwrap();
@@ -123,18 +133,23 @@ fn evict_stale_spares_fresh() {
 fn evict_purge_removes_immutable_too() {
     let dir = tempfile::tempdir().unwrap();
     let eng = engine(dir.path());
-    eng.remember("r", AtomInput::new("fact", "protected").immutable())
-        .unwrap();
+    eng.remember(
+        "r",
+        AtomInput::new("fact", "protected")
+            .with_confidence(0.5)
+            .immutable(),
+    )
+    .unwrap();
     let r1 = eng
         .evict(
             "r",
-            EvictionPolicy::LowScore {
-                score_threshold: 100.0,
-                confidence_threshold: 100.0,
+            EvictionPolicy::LowImportance {
+                importance_threshold: 100.0,
+                confidence_threshold: 1.0,
             },
         )
         .unwrap();
-    assert_eq!(r1.removed, 0, "immutable spared by LowScore");
+    assert_eq!(r1.removed, 0, "immutable spared by LowImportance");
     let r2 = eng.evict("r", EvictionPolicy::PurgeRegion).unwrap();
     assert_eq!(r2.removed, 1, "PurgeRegion removes immutable");
 }
@@ -155,7 +170,7 @@ fn evolve_links_close_neighbors_and_sets_score() {
 
     let report = eng.evolve("r", a, 5, 0.5).unwrap();
     assert!(report.links_added >= 1, "should link the close neighbor");
-    assert!(report.score > 0.0);
+    assert!(report.importance > 0.0);
 
     let hits = eng
         .recall(
@@ -171,11 +186,11 @@ fn evolve_links_close_neighbors_and_sets_score() {
 fn summarize_rolls_up_per_kind() {
     let dir = tempfile::tempdir().unwrap();
     let eng = engine(dir.path());
-    eng.remember("r", AtomInput::new("fact", "f1").with_score(0.4))
+    eng.remember("r", AtomInput::new("fact", "f1").with_importance(0.4))
         .unwrap();
-    eng.remember("r", AtomInput::new("fact", "f2").with_score(0.6))
+    eng.remember("r", AtomInput::new("fact", "f2").with_importance(0.6))
         .unwrap();
-    eng.remember("r", AtomInput::new("event", "e1").with_score(1.0))
+    eng.remember("r", AtomInput::new("event", "e1").with_importance(1.0))
         .unwrap();
 
     let summary = eng.summarize("r", 0).unwrap();
@@ -183,9 +198,9 @@ fn summarize_rolls_up_per_kind() {
     let fact = summary.kinds.iter().find(|k| k.kind == "fact").unwrap();
     assert_eq!(fact.count, 2);
     assert!(
-        (fact.avg_score - 0.5).abs() < 0.01,
+        (fact.avg_importance - 0.5).abs() < 0.01,
         "avg score {}",
-        fact.avg_score
+        fact.avg_importance
     );
     let event = summary.kinds.iter().find(|k| k.kind == "event").unwrap();
     assert_eq!(event.count, 1);
@@ -237,10 +252,16 @@ fn lru_and_stale_honour_in_process_access() {
     let dir = tempfile::tempdir().unwrap();
     let eng = engine(dir.path());
     let hot = eng
-        .remember("r", AtomInput::new("fact", "the hot topic everyone asks"))
+        .remember(
+            "r",
+            AtomInput::new("fact", "the hot topic everyone asks").with_created_at(1),
+        )
         .unwrap();
     let _cold = eng
-        .remember("r", AtomInput::new("fact", "a cold forgotten trivia"))
+        .remember(
+            "r",
+            AtomInput::new("fact", "a cold forgotten trivia").with_created_at(1),
+        )
         .unwrap();
 
     // Recall the hot atom so in-process stats mark it accessed.
@@ -249,12 +270,12 @@ fn lru_and_stale_honour_in_process_access() {
         .unwrap();
     assert_eq!(hits[0].id, hot);
 
-    // Stale (cutoff = far future) targets only the never-accessed cold atom.
+    // Both atoms are old; the in-process recall protects only the hot one.
     let report = eng
         .evict(
             "r",
             EvictionPolicy::Stale {
-                older_than_micros: -3_600_000_000,
+                older_than_micros: 1,
             },
         )
         .unwrap();

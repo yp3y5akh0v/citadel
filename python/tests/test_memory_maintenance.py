@@ -32,6 +32,9 @@ def test_an_existing_encrypted_region_can_be_maintained_without_its_embedder(tmp
     assert maintenance.count("notes") == 1
     hits = maintenance.fetch("notes", "fact", payload_filter={"owner": "alice"})
     assert [hit.id for hit in hits] == [atom_id]
+    exact = maintenance.fetch_by_ids("notes", [atom_id, atom_id + 10_000])
+    assert exact[0].id == atom_id
+    assert exact[1] is None
     assert maintenance.verify("notes", [atom_id])[0].verdict == "authentic"
 
     receipt = maintenance.forget("notes", [atom_id])

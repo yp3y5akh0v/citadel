@@ -35,7 +35,7 @@ fn large_dim_atoms_overflow_and_roundtrip() {
     assert!(hits.iter().any(|h| h.text.contains("number 3")));
 
     let report = eng.evolve("r", ids[0], 5, 10.0).unwrap();
-    assert!(report.score > 0.0, "evolve updates an overflow row");
+    assert!(report.importance > 0.0, "evolve updates an overflow row");
 
     let removed = eng
         .evict("r", EvictionPolicy::Lru { keep_fraction: 0.5 })

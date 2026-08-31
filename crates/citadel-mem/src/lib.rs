@@ -8,13 +8,17 @@ pub mod error;
 mod fusion;
 pub mod graph;
 pub mod profile;
+mod read_limits;
 pub mod types;
 
 #[cfg(feature = "candle-embed")]
 pub use candle::{CandleConfig, CandleEmbedder, CrossEncoder, Pooling};
 pub use citadel_sql::executor::{AnnIndexSource, AnnSegmentInfo};
 pub use embed::{EmbedError, Embedder, EmbeddingMetric, MockEmbedder, MockReranker, Reranker};
-pub use engine::{owns_table, MemoryEngine, MemoryMaintenance, RegionId};
+pub use engine::{
+    owns_table, MemoryEngine, MemoryMaintenance, RegionId, DEFAULT_SUMMARY_KIND_LIMIT,
+    MAX_DEPENDENT_FORGET_ATOMS, MAX_SUMMARY_KIND_LIMIT,
+};
 pub use error::{MemError, Result};
 pub use graph::{
     activation_rerank_cached, activation_scores_cached, audit_provenance, pin_into_view,
@@ -23,11 +27,13 @@ pub use graph::{
     AUDIT_DEPTH_CAP, REWEIGHT_REVISION, WEAVE_MAX_DISTANCE, WEAVE_NEIGHBORS, WEAVE_REVISION,
 };
 pub use profile::{RecallProfile, NARRATIVE_KINDS};
+pub use read_limits::MemoryReadLimits;
 pub use types::{
-    AtomAttestation, AtomHit, AtomId, AtomInput, AttestVerdict, Edge, EdgeKind, ErasureReceipt,
-    EvictionPolicy, EvictionReport, EvolutionReport, FetchQuery, FusionWeights, GraphExpand,
-    KindDigest, MemoryRegionInfo, MemoryRegionInventory, MultiRecallQuery, RecallQuery,
-    ReembedReport, RememberOutcome, RerankStrategy, SlotErasure, SourceSnapshot,
-    StoredAtomRetrievalState, StoredEmbeddingsIdentity, StoredRegionIdentity, SummaryReport,
+    AtomAttestation, AtomHit, AtomId, AtomInput, AttestVerdict, Edge, EdgeCursor, EdgeKind,
+    EdgePage, ErasureReceipt, EvictionPolicy, EvictionReport, EvolutionReport, FetchPage,
+    FetchQuery, FusionWeights, GraphExpand, KindDigest, MemoryProfileReport, MemoryRegionInfo,
+    MemoryRegionInventory, MultiRecallQuery, PayloadUpdateOutcome, RecallQuery, ReembedReport,
+    RememberOutcome, RerankStrategy, SlotErasure, SourceSnapshot, StoredAtomRetrievalState,
+    StoredEmbeddingsIdentity, StoredRegionIdentity, SummaryQuery, SummaryReport,
     STORED_EMBEDDINGS_SCHEMA,
 };

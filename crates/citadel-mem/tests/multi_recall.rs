@@ -82,7 +82,10 @@ fn truncates_to_k_and_orders_by_merged_score() {
     let mq_all = MultiRecallQuery::new(vec![RecallQuery::by_text("cat", 10)], 10);
     let hits = eng.recall_many("notes", mq_all).unwrap();
     for w in hits.windows(2) {
-        assert!(w[0].score >= w[1].score, "merged scores descending");
+        assert!(
+            w[0].relevance >= w[1].relevance,
+            "merged relevance descending"
+        );
     }
 }
 

@@ -93,7 +93,7 @@ backend.reset("/users/alice")  # a whole subtree
 
 ## Importance is a real ranking signal
 
-`MemoryRecord.importance` maps onto Citadel's native atom score, so it survives as something
+`MemoryRecord.importance` maps onto Citadel's native atom importance, so it survives as something
 recall ranks by rather than as metadata the store carries and ignores.
 
 ## Notes
@@ -112,8 +112,10 @@ of receiving a placeholder. A record read back carries no embedding, which is wh
 the stored vector rather than replacing it.
 
 The embedder must expose `dim`, `metric`, and `model_id`, plus
-`embed(list[str]) -> list[list[float]]`; `embed_queries` is optional. Pass the same model (or a
-thin adapter over it) to CrewAI and Citadel so supplied and generated vectors share one space.
+`embed_with_cancel(list[str], cancel_token) -> list[list[float]]`; asymmetric models may
+also provide `embed_queries_with_cancel`. Poll `cancel_token.check()` between bounded
+batches. Pass the same model (or a thin adapter over it) to CrewAI and Citadel so supplied
+and generated vectors share one space.
 A cosine metric is required because CrewAI's storage contract exposes normalized similarity
 scores; L2 and inner-product distances have no equivalent bounded score without inventing a
 model-specific calibration.

@@ -41,13 +41,17 @@ impl Embedder for NamedEmbedder {
         self.model_id
     }
 
-    fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, citadel_mem::EmbedError> {
+    fn embed_with_cancel(
+        &self,
+        texts: &[&str],
+        cancel: Option<&citadel_core::CancelToken>,
+    ) -> Result<Vec<Vec<f32>>, citadel_mem::EmbedError> {
         let seed = self.model_id.bytes().fold(0u64, |acc, b| {
             acc.wrapping_mul(1_099_511_628_211).wrapping_add(b as u64)
         });
         Ok(self
             .inner
-            .embed(texts)?
+            .embed_with_cancel(texts, cancel)?
             .into_iter()
             .map(|mut vector| {
                 for (index, value) in vector.iter_mut().enumerate() {

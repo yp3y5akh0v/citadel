@@ -17,6 +17,12 @@ pub struct ServeConfig {
     pub db: String,
     pub region: String,
     pub encrypted: bool,
+    /// Permit MCP calls that erase immutable atoms or the entire configured region.
+    /// Safe by default: ordinary selective forgetting remains available when this is false.
+    pub allow_protected_memory_erasure: bool,
+    /// Tool-call token-bucket refill rate. Capacity is `min(rate, 20)`, so the
+    /// default 120/minute permits a bounded burst of 20 and then refills at 2/s.
+    pub tool_rate_limit_per_minute: u32,
     pub embedder: String,
     pub model_dir: Option<String>,
     pub models_dir: Option<String>,
@@ -37,6 +43,9 @@ fn validate_serve_config(config: &ServeConfig) -> Result<ModelSelection<'_>, Str
     }
     if config.region.trim().is_empty() {
         return Err("--region needs a non-empty name".to_string());
+    }
+    if config.tool_rate_limit_per_minute == 0 {
+        return Err("--tool-rate-limit must be a positive integer".to_string());
     }
     let embedder = config.embedder.trim();
     if embedder.is_empty() {
@@ -186,7 +195,13 @@ pub fn serve_with_config(config: &ServeConfig) -> Result<(), String> {
         mem.set_reranker(reranker, RerankStrategy::default());
         eprintln!("citadeldb-mcp: reranker={name} (rrf)");
     }
-    crate::serve_stdio(Arc::new(mem), &config.region).map_err(|e| format!("serve: {e}"))
+    crate::server::serve_stdio_with_policy(
+        Arc::new(mem),
+        &config.region,
+        config.allow_protected_memory_erasure,
+        config.tool_rate_limit_per_minute,
+    )
+    .map_err(|e| format!("serve: {e}"))
 }
 
 fn database_builder(config: &ServeConfig, key: &[u8]) -> DatabaseBuilder {
@@ -212,6 +227,8 @@ fn parse_serve_config(argv: &[String]) -> Result<ServeConfig, String> {
     let mut db = None;
     let mut region = String::from("default");
     let mut encrypted = true;
+    let mut allow_protected_memory_erasure = false;
+    let mut tool_rate_limit_per_minute = crate::server::DEFAULT_TOOL_RATE_LIMIT_PER_MINUTE;
     let mut embedder = None;
     #[cfg(feature = "candle-embed")]
     let mut model_dir = None;
@@ -245,6 +262,17 @@ fn parse_serve_config(argv: &[String]) -> Result<ServeConfig, String> {
                         ))
                     }
                 };
+            }
+            "--allow-protected-memory-erasure" => allow_protected_memory_erasure = true,
+            "--tool-rate-limit" => {
+                let value = it
+                    .next()
+                    .ok_or("--tool-rate-limit needs calls per minute")?;
+                tool_rate_limit_per_minute = value
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|value| *value > 0)
+                    .ok_or("--tool-rate-limit must be a positive integer")?;
             }
             "--embedder" => embedder = Some(it.next().ok_or("--embedder needs a name")?.clone()),
             #[cfg(feature = "candle-embed")]
@@ -291,6 +319,8 @@ fn parse_serve_config(argv: &[String]) -> Result<ServeConfig, String> {
         db,
         region,
         encrypted,
+        allow_protected_memory_erasure,
+        tool_rate_limit_per_minute,
         embedder: embedder.to_string(),
         model_dir,
         models_dir,
@@ -561,6 +591,8 @@ mod tests {
             db: "m.cdl".into(),
             region: "default".into(),
             encrypted: true,
+            allow_protected_memory_erasure: false,
+            tool_rate_limit_per_minute: crate::server::DEFAULT_TOOL_RATE_LIMIT_PER_MINUTE,
             embedder: "mock".into(),
             model_dir: None,
             models_dir: None,
@@ -690,6 +722,14 @@ mod tests {
         assert_eq!(a.db, "m.cdl");
         assert_eq!(a.region, "default");
         assert!(a.encrypted, "encrypted is the default");
+        assert!(
+            !a.allow_protected_memory_erasure,
+            "protected-memory erasure is denied by default"
+        );
+        assert_eq!(
+            a.tool_rate_limit_per_minute,
+            crate::server::DEFAULT_TOOL_RATE_LIMIT_PER_MINUTE
+        );
         assert_eq!(a.embedder, "mock");
 
         let err = parse_serve_config(&[
@@ -715,6 +755,39 @@ mod tests {
         assert_eq!(a.region, "notes");
         assert!(!a.encrypted);
         assert_eq!(a.embedder, "bge-small");
+
+        let a = parse_serve_config(&[
+            "--db".into(),
+            "m.cdl".into(),
+            "--embedder".into(),
+            "mock".into(),
+            "--allow-protected-memory-erasure".into(),
+        ])
+        .unwrap();
+        assert!(a.allow_protected_memory_erasure);
+
+        let a = parse_serve_config(&[
+            "--db".into(),
+            "m.cdl".into(),
+            "--embedder".into(),
+            "mock".into(),
+            "--tool-rate-limit".into(),
+            "60".into(),
+        ])
+        .unwrap();
+        assert_eq!(a.tool_rate_limit_per_minute, 60);
+        for invalid in ["0", "-1", "fast"] {
+            let error = parse_serve_config(&[
+                "--db".into(),
+                "m.cdl".into(),
+                "--embedder".into(),
+                "mock".into(),
+                "--tool-rate-limit".into(),
+                invalid.into(),
+            ])
+            .unwrap_err();
+            assert!(error.contains("positive integer"), "{error}");
+        }
 
         assert!(parse_serve_config(&[]).is_err(), "--db is required");
         assert!(

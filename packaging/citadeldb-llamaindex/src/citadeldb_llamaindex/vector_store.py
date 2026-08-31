@@ -25,6 +25,7 @@ from llama_index.core.vector_stores.utils import (
 from pydantic import PrivateAttr
 
 KIND = "node"
+_EMBED_BATCH = 32
 DEFAULT_PATH = "llamaindex.cdl"
 DEFAULT_REGION = "nodes"
 # OpenAI text-embedding-ada-002 / 3-small, LlamaIndex's default width.
@@ -87,10 +88,38 @@ class _LlamaIndexEmbedder:
         self.model_id = model_id
 
     def embed(self, texts: list[str]) -> list[list[float]]:
-        return self._embed_model.get_text_embedding_batch(texts)
+        return self.embed_with_cancel(texts, None)
 
     def embed_queries(self, texts: list[str]) -> list[list[float]]:
-        return [self._embed_model.get_query_embedding(text) for text in texts]
+        return self.embed_queries_with_cancel(texts, None)
+
+    def embed_with_cancel(
+        self, texts: list[str], cancel_token: Any | None
+    ) -> list[list[float]]:
+        vectors: list[list[float]] = []
+        for start in range(0, len(texts), _EMBED_BATCH):
+            if cancel_token is not None:
+                cancel_token.check()
+            vectors.extend(
+                self._embed_model.get_text_embedding_batch(
+                    texts[start : start + _EMBED_BATCH]
+                )
+            )
+            if cancel_token is not None:
+                cancel_token.check()
+        return vectors
+
+    def embed_queries_with_cancel(
+        self, texts: list[str], cancel_token: Any | None
+    ) -> list[list[float]]:
+        vectors: list[list[float]] = []
+        for text in texts:
+            if cancel_token is not None:
+                cancel_token.check()
+            vectors.append(self._embed_model.get_query_embedding(text))
+            if cancel_token is not None:
+                cancel_token.check()
+        return vectors
 
 
 def _pushdown(filters: MetadataFilters | None) -> dict[str, Any] | None:
@@ -295,6 +324,13 @@ def _query(mem: Any, region: str, query: VectorStoreQuery) -> VectorStoreQueryRe
             hits = [h for h in hits if h.payload.get("ref") in allowed]
         return hits
 
+    def similarity(hit: Any) -> float:
+        if query.mode == VectorStoreQueryMode.HYBRID:
+            return hit.relevance if hit.relevance is not None else 0.0
+        if hit.distance is not None:
+            return min(1.0, 1.0 - hit.distance)
+        return hit.relevance if hit.relevance is not None else 0.0
+
     recall: dict[str, Any] = {
         "embedding": query.query_embedding,
         "kinds": [KIND],
@@ -305,14 +341,7 @@ def _query(mem: Any, region: str, query: VectorStoreQuery) -> VectorStoreQueryRe
     hits = _ranked(mem, region, want=top_k, surviving=surviving, **recall)
     return VectorStoreQueryResult(
         nodes=[_node_of(h) for h in hits],
-        similarities=[
-            h.score
-            if query.mode == VectorStoreQueryMode.HYBRID
-            else min(1.0, 1.0 - h.distance)
-            if h.distance is not None
-            else h.score
-            for h in hits
-        ],
+        similarities=[similarity(h) for h in hits],
         ids=[h.payload["nid"] for h in hits],
     )
 

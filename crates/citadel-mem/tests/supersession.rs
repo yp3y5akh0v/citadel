@@ -35,7 +35,8 @@ fn seed_versions(eng: &MemoryEngine, region: &str) -> (i64, i64) {
     let new = eng
         .remember(region, AtomInput::new("fact", "Bob lives in Munich now"))
         .unwrap();
-    eng.link(new, old, EdgeKind::Supersedes, 1.0).unwrap();
+    eng.link_in_region(region, new, old, EdgeKind::Supersedes, 1.0)
+        .unwrap();
     (old, new)
 }
 
@@ -74,7 +75,8 @@ fn chain_leaves_only_the_head() {
     let c = eng
         .remember("notes", AtomInput::new("fact", "Bob lives in Hamburg now"))
         .unwrap();
-    eng.link(c, b, EdgeKind::Supersedes, 1.0).unwrap();
+    eng.link_in_region("notes", c, b, EdgeKind::Supersedes, 1.0)
+        .unwrap();
 
     let hits = eng
         .recall("notes", RecallQuery::by_text("where does Bob live", 10))

@@ -1,6 +1,7 @@
 import hashlib
 import random
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 import pytest
 from citadeldb_crewai import CitadelBackend
@@ -22,6 +23,13 @@ class DeterministicEmbedder:
         self.model_id = f"test-{dim}"
 
     def embed(self, texts: list[str]) -> list[list[float]]:
+        return self.embed_with_cancel(texts, None)
+
+    def embed_with_cancel(
+        self, texts: list[str], cancel_token: Any | None
+    ) -> list[list[float]]:
+        if cancel_token is not None:
+            cancel_token.check()
         return [
             [
                 hashlib.sha256(text.lower().encode()).digest()[i % 32] / 255.0
@@ -31,7 +39,12 @@ class DeterministicEmbedder:
         ]
 
     def embed_queries(self, texts: list[str]) -> list[list[float]]:
-        return self.embed(texts)
+        return self.embed_queries_with_cancel(texts, None)
+
+    def embed_queries_with_cancel(
+        self, texts: list[str], cancel_token: Any | None
+    ) -> list[list[float]]:
+        return self.embed_with_cancel(texts, cancel_token)
 
     def __call__(self, texts: list[str]) -> list[list[float]]:
         return self.embed(texts)
@@ -144,8 +157,7 @@ def test_embedder_model_id_is_normalized_without_mutating_the_caller():
 
 
 def test_importance_survives_a_ranked_read(backend):
-    """A recall hit's score is the fused rank over its candidate pool, which is
-    a different quantity from the importance that was saved."""
+    """Recall relevance remains separate from persisted importance."""
     backend.save([rec("rank", "ranked read", importance=0.25, embedding=vec(12))])
     found = backend.search(vec(12), scope_prefix="/", limit=10)
     got = next(r for r, _ in found if r.id == "rank")
@@ -567,7 +579,11 @@ def test_an_embedder_is_required_before_a_vault_is_created(tmp_path):
     partial = type(
         "PartialEmbedder",
         (),
-        {"dim": 8, "metric": "cosine", "embed": lambda self, texts: []},
+        {
+            "dim": 8,
+            "metric": "cosine",
+            "embed_with_cancel": lambda self, texts, cancel_token: [],
+        },
     )()
     with pytest.raises(TypeError, match="model_id"):
         CitadelBackend(str(tmp_path / "invalid-model.cdl"), key="pw", embedder=partial)

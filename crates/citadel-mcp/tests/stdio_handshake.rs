@@ -2,14 +2,13 @@
 //! JSON-RPC session over stdio. Exercises the live `serve_stdio` IO loop, the CLI,
 //! and the encrypted-by-default region with the mock embedder (so it runs in CI).
 
-use std::io::Write;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};
 
 use serde_json::Value;
 
-/// Spawn `citadeldb-mcp` on a throwaway encrypted DB, feed `requests` (newline-delimited
-/// JSON-RPC), and return the parsed response lines. Dropping stdin sends EOF, which
-/// ends the server's loop cleanly.
+/// Spawn `citadeldb-mcp` on a throwaway encrypted DB and exchange each request
+/// interactively. EOF is a cancellation signal, not a response-flush mechanism.
 fn run_session(requests: &str) -> Vec<Value> {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("mcp.cdl");
@@ -22,6 +21,7 @@ fn run_session(requests: &str) -> Vec<Value> {
             "demo",
             "--embedder",
             "mock",
+            "--allow-protected-memory-erasure",
         ])
         .env("CITADEL_KEY", "integration-test")
         .stdin(Stdio::piped())
@@ -29,24 +29,43 @@ fn run_session(requests: &str) -> Vec<Value> {
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn citadeldb-mcp");
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(requests.as_bytes())
-        .unwrap();
-    let out = child.wait_with_output().expect("wait for citadeldb-mcp");
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut responses = Vec::new();
+    for line in requests.lines().filter(|line| !line.trim().is_empty()) {
+        writeln!(stdin, "{line}").unwrap();
+        stdin.flush().unwrap();
+
+        let request: Value = serde_json::from_str(line).expect("request is valid JSON");
+        let Some(expected_id) = request.get("id") else {
+            continue;
+        };
+        let mut response_line = String::new();
+        assert_ne!(
+            stdout.read_line(&mut response_line).unwrap(),
+            0,
+            "server closed before answering request {expected_id}"
+        );
+        let response: Value =
+            serde_json::from_str(response_line.trim()).expect("stdout line is valid JSON-RPC");
+        assert_eq!(
+            response.get("id"),
+            Some(expected_id),
+            "a notification produced a response or responses were mis-correlated: {response}"
+        );
+        responses.push(response);
+    }
+    drop(stdin);
+
+    let mut trailing = String::new();
+    stdout.read_to_string(&mut trailing).unwrap();
     assert!(
-        out.status.success(),
-        "citadeldb-mcp exited with {:?}",
-        out.status
+        trailing.trim().is_empty(),
+        "notification unexpectedly produced a response: {trailing}"
     );
-    String::from_utf8(out.stdout)
-        .unwrap()
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(|l| serde_json::from_str(l).expect("each stdout line is valid JSON-RPC"))
-        .collect()
+    let status = child.wait().expect("wait for citadeldb-mcp");
+    assert!(status.success(), "citadeldb-mcp exited with {:?}", status);
+    responses
 }
 
 #[test]
@@ -304,9 +323,11 @@ fn an_unknown_model_is_rejected_before_an_existing_vault_is_opened() {
 #[test]
 fn stdio_round_trip_remember_recall_forget() {
     let requests = concat!(
-        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"stdio-test","version":"1.0.0"}}}"#,
         "\n",
         r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":999,"reason":"no such request"}}"#,
         "\n",
         r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
         "\n",
@@ -314,7 +335,7 @@ fn stdio_round_trip_remember_recall_forget() {
         "\n",
         r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"mem_recall","arguments":{"query":"sky","k":5}}}"#,
         "\n",
-        r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"mem_evict","arguments":{"policy":"purge_region"}}}"#,
+        r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"mem_evict","arguments":{"policy":"purge_region","confirm_region":"demo"}}}"#,
         "\n",
         r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"mem_recall","arguments":{"query":"sky","k":5}}}"#,
         "\n",
@@ -324,7 +345,7 @@ fn stdio_round_trip_remember_recall_forget() {
     // 6 requests carry an id; the notification gets no reply.
     assert_eq!(resps.len(), 6);
     assert_eq!(resps[0]["result"]["serverInfo"]["name"], "citadel-mem");
-    assert_eq!(resps[1]["result"]["tools"].as_array().unwrap().len(), 13);
+    assert_eq!(resps[1]["result"]["tools"].as_array().unwrap().len(), 15);
     assert_eq!(resps[2]["result"]["isError"], false);
     assert!(resps[3]["result"]["content"][0]["text"]
         .as_str()
@@ -336,4 +357,57 @@ fn stdio_round_trip_remember_recall_forget() {
         .as_array()
         .unwrap()
         .is_empty());
+}
+
+#[test]
+fn stdio_supports_stateless_discovery_and_deterministic_tools() {
+    let requests = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"stdio-test","version":"1.0.0"},"io.modelcontextprotocol/clientCapabilities":{}}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"stdio-test","version":"1.0.0"},"io.modelcontextprotocol/clientCapabilities":{}}}}"#,
+        "\n",
+    );
+    let responses = run_session(requests);
+    assert_eq!(responses.len(), 2);
+
+    let discover = &responses
+        .iter()
+        .find(|response| response["id"] == 1)
+        .unwrap()["result"];
+    assert_eq!(
+        discover["supportedVersions"],
+        serde_json::json!(["2026-07-28", "2025-11-25", "2025-06-18"])
+    );
+    assert_eq!(discover["resultType"], "complete");
+    assert_eq!(discover["ttlMs"], 3_600_000);
+    assert_eq!(discover["cacheScope"], "public");
+
+    let tools_response = responses
+        .iter()
+        .find(|response| response["id"] == 2)
+        .unwrap();
+    let tools = tools_response["result"]["tools"].as_array().unwrap();
+    let names: Vec<_> = tools.iter().map(|tool| &tool["name"]).collect();
+    assert_eq!(
+        names,
+        [
+            "mem_recall",
+            "mem_fetch",
+            "mem_get",
+            "mem_edges",
+            "mem_profile",
+            "mem_summarize",
+            "mem_verify",
+            "mem_remember",
+            "mem_remember_batch",
+            "mem_update",
+            "mem_link",
+            "mem_unlink",
+            "mem_evolve",
+            "mem_evict",
+            "mem_forget",
+        ]
+    );
+    assert_eq!(tools_response["result"]["resultType"], "complete");
+    assert_eq!(tools_response["result"]["cacheScope"], "public");
 }

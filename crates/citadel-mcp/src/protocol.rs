@@ -12,19 +12,25 @@ pub const INVALID_PARAMS: i64 = -32602;
 pub const INTERNAL_ERROR: i64 = -32603;
 /// MCP "resource not found" (server-defined error range).
 pub const RESOURCE_NOT_FOUND: i64 = -32002;
+/// MCP 2026-07-28 unsupported protocol version.
+pub const UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
 
-/// MCP protocol revisions this server can speak, newest first.
-pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18"];
+/// Stateless MCP revisions accepted in per-request metadata.
+pub const MODERN_PROTOCOL_VERSIONS: &[&str] = &["2026-07-28"];
+/// Handshake-based revisions negotiated through `initialize`, newest first.
+pub const LEGACY_PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18"];
+/// Every protocol revision this server implements, newest first.
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2026-07-28", "2025-11-25", "2025-06-18"];
 
 /// Echo the requested version if supported, else our latest. Per MCP, a client that
 /// can't accept the offer disconnects - it is not an error response.
 pub fn negotiate_protocol_version(requested: Option<&str>) -> &'static str {
     if let Some(v) = requested {
-        if let Some(&supported) = SUPPORTED_PROTOCOL_VERSIONS.iter().find(|&&s| s == v) {
+        if let Some(&supported) = LEGACY_PROTOCOL_VERSIONS.iter().find(|&&s| s == v) {
             return supported;
         }
     }
-    SUPPORTED_PROTOCOL_VERSIONS[0]
+    LEGACY_PROTOCOL_VERSIONS[0]
 }
 
 #[derive(Serialize)]
@@ -56,6 +62,10 @@ pub fn result_response(id: Value, result: Value) -> Value {
 }
 
 pub fn error_response(id: Value, code: i64, message: &str) -> Value {
+    error_response_with_data(id, code, message, None)
+}
+
+pub fn error_response_with_data(id: Value, code: i64, message: &str, data: Option<Value>) -> Value {
     to_value(Response {
         jsonrpc: "2.0",
         id,
@@ -63,7 +73,7 @@ pub fn error_response(id: Value, code: i64, message: &str) -> Value {
         error: Some(RpcError {
             code,
             message: message.to_string(),
-            data: None,
+            data,
         }),
     })
 }

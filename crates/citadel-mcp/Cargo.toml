@@ -34,6 +34,7 @@ sha2 = { workspace = true, optional = true }
 ureq = { version = "2", optional = true }
 
 [dev-dependencies]
+jsonschema = { version = "0.52.1", default-features = false }
 tempfile = "3"
 
 [features]

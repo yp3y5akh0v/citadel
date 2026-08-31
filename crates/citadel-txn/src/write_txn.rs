@@ -23,6 +23,7 @@ use crate::manager::TxnManager;
 use crate::merkle;
 use crate::overflow_io;
 use crate::read_txn::ScanCount;
+use crate::ReadBudget;
 
 thread_local! {
     static PATH_BUF: std::cell::RefCell<Vec<(PageId, usize)>> =
@@ -164,6 +165,7 @@ pub struct WriteTxn<'a> {
     /// UPDATE and DELETE scan through here, so a cancellation covering only the
     /// read path would stop the quickest queries and leave the long ones running.
     cancel: Option<CancelToken>,
+    read_budget: Option<ReadBudget>,
     /// A failed mutation can leave a prefix in the CoW page set or allocator.
     /// Keep cancellation distinct from other failures so commit reports the
     /// cause accurately while refusing both states.
@@ -222,6 +224,7 @@ impl<'db> WriteTxn<'db> {
             fk_check_cache: FxHashMap::default(),
             force_commit: false,
             cancel: None,
+            read_budget: None,
             failure: None,
             mutation_sequence: 0,
         }
@@ -273,6 +276,14 @@ impl<'db> WriteTxn<'db> {
 
     pub fn cancel_token(&self) -> Option<&CancelToken> {
         self.cancel.as_ref()
+    }
+
+    pub fn set_read_budget(&mut self, budget: Option<ReadBudget>) {
+        self.read_budget = budget;
+    }
+
+    pub fn read_budget(&self) -> Option<&ReadBudget> {
+        self.read_budget.as_ref()
     }
 
     /// Refuse a mutation once the token is tripped.
@@ -504,7 +515,12 @@ impl<'db> WriteTxn<'db> {
                 let oref = OverflowRef::from_bytes(&payload);
                 self.materialize_overflow(&oref).map(Some)
             }
-            Some((_, value)) => Ok(Some(value)),
+            Some((_, value)) => {
+                if let Some(budget) = &self.read_budget {
+                    budget.try_charge(value.len())?;
+                }
+                Ok(Some(value))
+            }
             None => Ok(None),
         }?;
         self.check_cancel()?;
@@ -621,6 +637,9 @@ impl<'db> WriteTxn<'db> {
                 f(&key, &materialized)?;
             } else if let Some(entry) = cursor.current_ref(&self.pages) {
                 if entry.val_type != ValueType::Tombstone {
+                    if let Some(budget) = &self.read_budget {
+                        budget.try_charge(entry.value.len())?;
+                    }
                     f(entry.key, entry.value)?;
                 }
             }
@@ -634,10 +653,16 @@ impl<'db> WriteTxn<'db> {
             pages,
             manager,
             cancel,
+            read_budget,
             ..
         } = self;
         let mut view = WritePages { pages, manager };
-        overflow_io::read_chain_value_with_cancel(&mut view, oref, cancel.as_ref())
+        overflow_io::read_chain_value_with_budget(
+            &mut view,
+            oref,
+            cancel.as_ref(),
+            read_budget.as_ref(),
+        )
     }
 
     pub fn table_entry_count(&mut self, table: &[u8]) -> Result<u64> {
@@ -674,6 +699,9 @@ impl<'db> WriteTxn<'db> {
                 f(&key, &materialized)?;
             } else if let Some(entry) = cursor.current_ref(&self.pages) {
                 if entry.val_type != ValueType::Tombstone {
+                    if let Some(budget) = &self.read_budget {
+                        budget.try_charge(entry.value.len())?;
+                    }
                     f(entry.key, entry.value)?;
                 }
             }
@@ -690,6 +718,7 @@ impl<'db> WriteTxn<'db> {
         self.ensure_table(table)?;
         let root = self.named_trees[table].root;
         let cancel = self.cancel.clone();
+        let budget = self.read_budget.clone();
         let mut count = ScanCount::new(self.manager);
         let mut view = WritePages {
             pages: &mut self.pages,
@@ -705,6 +734,9 @@ impl<'db> WriteTxn<'db> {
                 ValueType::Tombstone => {}
                 ValueType::Inline => {
                     let entry = cursor.current_ref_lazy(&mut view).unwrap();
+                    if let Some(budget) = &budget {
+                        budget.try_charge(entry.value.len())?;
+                    }
                     if !f(entry.key, entry.value)? {
                         break;
                     }
@@ -714,10 +746,11 @@ impl<'db> WriteTxn<'db> {
                         let c = cursor.current_ref_lazy(&mut view).unwrap();
                         (c.key.to_vec(), OverflowRef::from_bytes(c.value))
                     };
-                    let materialized = overflow_io::read_chain_value_with_cancel(
+                    let materialized = overflow_io::read_chain_value_with_budget(
                         &mut view,
                         &oref,
                         cancel.as_ref(),
+                        budget.as_ref(),
                     )?;
                     if !f(&key, &materialized)? {
                         break;
@@ -1053,7 +1086,12 @@ impl<'db> WriteTxn<'db> {
                 let oref = OverflowRef::from_bytes(&payload);
                 Some(self.materialize_overflow(&oref)?)
             }
-            Some((_, value)) => Some(value),
+            Some((_, value)) => {
+                if let Some(budget) = &self.read_budget {
+                    budget.try_charge(value.len())?;
+                }
+                Some(value)
+            }
             None => None,
         };
 
@@ -1105,6 +1143,7 @@ impl<'db> WriteTxn<'db> {
             manager,
             txn_id,
             cancel,
+            read_budget,
             failure,
             mutation_sequence,
             ..
@@ -1135,10 +1174,20 @@ impl<'db> WriteTxn<'db> {
             Some((ValueType::Overflow, payload)) => {
                 let oref = OverflowRef::from_bytes(&payload);
                 let mut view = WritePages { pages, manager };
-                overflow_io::read_chain_value_with_cancel(&mut view, &oref, cancel.as_ref())
-                    .map(InsertOutcome::Existed)
+                overflow_io::read_chain_value_with_budget(
+                    &mut view,
+                    &oref,
+                    cancel.as_ref(),
+                    read_budget.as_ref(),
+                )
+                .map(InsertOutcome::Existed)
             }
-            Some((_, value)) => Ok(InsertOutcome::Existed(value)),
+            Some((_, value)) => {
+                if let Some(budget) = read_budget {
+                    budget.try_charge(value.len())?;
+                }
+                Ok(InsertOutcome::Existed(value))
+            }
         };
         match result {
             Ok(result) => {
@@ -1321,6 +1370,7 @@ impl<'db> WriteTxn<'db> {
             manager,
             txn_id,
             cancel,
+            read_budget,
             failure,
             mutation_sequence,
             ..
@@ -1387,10 +1437,11 @@ impl<'db> WriteTxn<'db> {
                         let cell = citadel_page::leaf_node::read_cell(page, cursor.cell_index());
                         (cell.key.to_vec(), OverflowRef::from_bytes(cell.value))
                     };
-                    let mut scratch = overflow_io::read_chain_value_with_cancel(
+                    let mut scratch = overflow_io::read_chain_value_with_budget(
                         &mut view,
                         &oref,
                         cancel.as_ref(),
+                        read_budget.as_ref(),
                     )?;
                     match f(&key, &mut scratch)? {
                         Some(true) => {
@@ -1465,6 +1516,10 @@ impl<'db> WriteTxn<'db> {
                 let (before_val, from_val) = page.data.split_at_mut(val_start);
                 let key = &before_val[key_start..key_start + key_len];
                 let value = &mut from_val[..val_len];
+
+                if let Some(budget) = read_budget.as_ref() {
+                    budget.try_charge(value.len())?;
+                }
 
                 match f(key, value)? {
                     Some(true) => count += 1,
@@ -1602,7 +1657,12 @@ impl<'db> WriteTxn<'db> {
                 let oref = OverflowRef::from_bytes(&payload);
                 self.materialize_overflow(&oref).map(Some)
             }
-            Some((_, value)) => Ok(Some(value)),
+            Some((_, value)) => {
+                if let Some(budget) = &self.read_budget {
+                    budget.try_charge(value.len())?;
+                }
+                Ok(Some(value))
+            }
             None => Ok(None),
         }?;
         self.check_cancel()?;
@@ -2277,6 +2337,10 @@ impl<'a, 'db: 'a> crate::scan_iter::TxnScanAdapter for WriteTxnScanAdapter<'a, '
 
     fn cancel(&self) -> Option<&CancelToken> {
         self.txn.cancel.as_ref()
+    }
+
+    fn read_budget(&self) -> Option<&ReadBudget> {
+        self.txn.read_budget.as_ref()
     }
 
     fn record_rows_scanned(&self, rows: u64) {

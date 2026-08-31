@@ -101,9 +101,13 @@ mod tests {
             kind: "turn".into(),
             text: String::new(),
             payload,
-            distance: 0.0,
-            score: 0.0,
+            importance: 0.0,
+            confidence: 1.0,
+            relevance: Some(0.0),
+            distance: Some(0.0),
+            graph_depth: None,
             created_at: 0,
+            expires_at: None,
             immutable: false,
         }
     }

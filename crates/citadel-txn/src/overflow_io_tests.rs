@@ -131,6 +131,34 @@ fn cancellable_read_stops_between_overflow_pages() {
 }
 
 #[test]
+fn read_budget_rejects_declared_length_before_loading_or_allocating() {
+    let data = vec![0xA6; pg_overflow::OVERFLOW_DATA_CAPACITY * 2 + 17];
+    let (mut pages, first, _) = build_chain(&data);
+    let oref = OverflowRef {
+        first_page: first,
+        total_len: data.len() as u32,
+    };
+    let token = CancelToken::new();
+    let mut loader = CancellingLoader {
+        pages: &mut pages,
+        token,
+        loads: 0,
+        cancel_after: usize::MAX,
+    };
+    let budget = crate::ReadBudget::new(data.len() - 1, data.len() * 2);
+
+    let err = read_chain_value_with_budget(&mut loader, &oref, None, Some(&budget)).unwrap_err();
+
+    assert!(matches!(
+        err,
+        Error::ReadBudgetExceeded { size, max_value, remaining }
+            if size == data.len() && max_value == data.len() - 1 && remaining == data.len() * 2
+    ));
+    assert_eq!(loader.loads, 0, "budget check ran after overflow I/O");
+    assert_eq!(budget.remaining(), data.len() * 2);
+}
+
+#[test]
 fn cancellable_free_preflights_before_changing_the_allocator() {
     let data = vec![0x5A; pg_overflow::OVERFLOW_DATA_CAPACITY * 5 + 17];
     let (mut pages, first, mut alloc) = build_chain(&data);

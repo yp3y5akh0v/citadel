@@ -9,7 +9,7 @@ use citadel_mem::MemoryEngine;
 use citadel_sql::{datetime, Connection, ExecutionResult, QueryResult, Value};
 use numpy::PyReadonlyArray1;
 use parking_lot::Mutex;
-use pyo3::exceptions::{PyOverflowError, PyValueError};
+use pyo3::exceptions::{PyInterruptedError, PyOverflowError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{
     PyBool, PyBytes, PyDate, PyDateAccess, PyDateTime, PyDelta, PyDeltaAccess, PyDict, PyList,
@@ -386,6 +386,16 @@ pub(crate) struct PyCancelToken {
     inner: CancelToken,
 }
 
+impl PyCancelToken {
+    pub(crate) fn from_inner(inner: CancelToken) -> Self {
+        Self { inner }
+    }
+
+    pub(crate) fn as_inner(&self) -> &CancelToken {
+        &self.inner
+    }
+}
+
 #[pymethods]
 impl PyCancelToken {
     #[new]
@@ -397,6 +407,14 @@ impl PyCancelToken {
 
     fn cancel(&self) {
         self.inner.cancel();
+    }
+
+    fn check(&self) -> PyResult<()> {
+        if self.inner.is_cancelled() {
+            Err(PyInterruptedError::new_err("operation interrupted"))
+        } else {
+            Ok(())
+        }
     }
 
     #[getter]

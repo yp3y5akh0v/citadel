@@ -28,10 +28,47 @@ use crate::parser::{BeginAccessMode, Statement, TimezoneValue};
 use crate::prepared::PreparedStatement;
 use crate::schema::{SchemaManager, SchemaSnapshot};
 use crate::types::{ExecutionResult, QueryResult, TableSchema, Value};
+use crate::ReadBudget;
 
 const DEFAULT_CACHE_CAPACITY: usize = 64;
 const DEFERRED_TEMP_DROPS_CACHE_KEY: &str = "citadel-sql:internal:deferred-temp-drops:v1";
 static PENDING_TEMP_DROP_QUEUES: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    static READ_BUDGET_STACK: RefCell<Vec<ReadBudget>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Run `f` with a shared read-materialization budget for SQL queries on this
+/// thread.
+///
+/// While the scope is active, [`Connection::query`] and
+/// [`Connection::query_params`] accept SELECT statements only and execute them
+/// through a budgeted storage transaction. Scopes nest, restore the previous
+/// budget on unwind, and share the supplied budget with its clones. Worker
+/// threads must enter their own scope explicitly. `f` must perform its work
+/// synchronously; returning a future ends the scope before that future runs.
+pub fn with_read_budget<R>(budget: &ReadBudget, f: impl FnOnce() -> R) -> R {
+    struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            READ_BUDGET_STACK.with(|stack| {
+                stack
+                    .borrow_mut()
+                    .pop()
+                    .expect("read-budget scope stack remains balanced");
+            });
+        }
+    }
+
+    READ_BUDGET_STACK.with(|stack| stack.borrow_mut().push(budget.clone()));
+    let _guard = Guard;
+    f()
+}
+
+fn scoped_read_budget() -> Option<ReadBudget> {
+    READ_BUDGET_STACK.with(|stack| stack.borrow().last().cloned())
+}
 
 #[cfg(test)]
 thread_local! {
@@ -508,6 +545,21 @@ impl<'a> ActiveTxn<'a> {
             _ => None,
         }
     }
+    fn replace_read_budget(&mut self, budget: Option<ReadBudget>) -> Option<ReadBudget> {
+        match self {
+            ActiveTxn::Write(txn) => {
+                let previous = txn.read_budget().cloned();
+                txn.set_read_budget(budget);
+                previous
+            }
+            ActiveTxn::Read(txn) => {
+                let previous = txn.read_budget().cloned();
+                txn.set_read_budget(budget);
+                previous
+            }
+            ActiveTxn::None => None,
+        }
+    }
     fn take(&mut self) -> ActiveTxn<'a> {
         std::mem::replace(self, ActiveTxn::None)
     }
@@ -688,6 +740,9 @@ impl<'a> Connection<'a> {
     }
 
     pub fn query_params(&self, sql: &str, params: &[Value]) -> Result<QueryResult> {
+        if let Some(budget) = scoped_read_budget() {
+            return self.query_params_bounded(sql, params, &budget);
+        }
         match self.execute_params(sql, params)? {
             ExecutionResult::Query(qr) => Ok(qr),
             ExecutionResult::RowsAffected(n) => Ok(QueryResult {
@@ -699,6 +754,23 @@ impl<'a> Connection<'a> {
                 rows: vec![],
             }),
         }
+    }
+
+    /// Execute a SELECT with a storage-materialization budget.
+    ///
+    /// `budget` is shared, so callers may reuse it across several queries that
+    /// make up one logical read. An existing explicit read or write transaction
+    /// is used when present; otherwise the SELECT owns one read transaction.
+    /// Storage rejects an oversized row before its overflow buffer is allocated.
+    pub fn query_params_bounded(
+        &self,
+        sql: &str,
+        params: &[Value],
+        budget: &ReadBudget,
+    ) -> Result<QueryResult> {
+        self.with_schema_retry(|inner| {
+            inner.query_params_bounded_impl(self.db, sql, params, budget.clone())
+        })
     }
 
     pub fn prepare(&self, sql: &str) -> Result<PreparedStatement<'_, 'a>> {
@@ -1024,6 +1096,71 @@ impl<'a> ConnectionInner<'a> {
         }
 
         self.dispatch(db, &stmt, params)
+    }
+
+    fn query_params_bounded_impl(
+        &mut self,
+        db: &'a Database,
+        sql: &str,
+        params: &[Value],
+        budget: ReadBudget,
+    ) -> Result<QueryResult> {
+        let (stmt, param_count) = self.get_or_parse(sql)?;
+        if param_count != params.len() {
+            return Err(SqlError::ParameterCountMismatch {
+                expected: param_count,
+                got: params.len(),
+            });
+        }
+        if !matches!(&*stmt, Statement::Select(_)) || executor::stmt_mutates(&stmt) {
+            return Err(SqlError::Unsupported(
+                "bounded queries accept read-only SELECT statements only".into(),
+            ));
+        }
+
+        if self.active_txn.is_active() {
+            let previous = self.active_txn.replace_read_budget(Some(budget));
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.dispatch(db, &stmt, params)
+            }));
+            self.active_txn.replace_read_budget(previous);
+            return match outcome {
+                Ok(result) => Self::bounded_query_result(result?),
+                Err(payload) => std::panic::resume_unwind(payload),
+            };
+        }
+
+        let statement_timestamp = crate::datetime::now_micros();
+        let timezone = self.session_timezone.zone.clone();
+        let jsonpath_context = self.jsonpath_session_context(statement_timestamp);
+        let mut rtx = db.begin_read();
+        rtx.set_read_budget(Some(budget));
+        let execute = || {
+            if params.is_empty() {
+                executor::execute_with_read(&mut rtx, &self.schema, &stmt, params)
+            } else {
+                crate::eval::with_scoped_params(params, || {
+                    executor::execute_with_read(&mut rtx, &self.schema, &stmt, params)
+                })
+            }
+        };
+        let result = crate::datetime::with_session_timezone(timezone, || {
+            crate::datetime::with_statement_clock(Some(statement_timestamp), || {
+                crate::datetime::with_txn_clock(Some(statement_timestamp), || {
+                    crate::json::with_jsonpath_session_context(jsonpath_context, execute)
+                })
+            })
+        })?;
+        Self::bounded_query_result(result)
+    }
+
+    fn bounded_query_result(result: ExecutionResult) -> Result<QueryResult> {
+        match result {
+            ExecutionResult::Query(query) => Ok(query),
+            ExecutionResult::RowsAffected(_) | ExecutionResult::Ok => Err(SqlError::Unsupported(
+                "bounded SELECT did not return a query result".into(),
+            )),
+        }
     }
 
     fn execute_params_uncancelled_recovery(
@@ -1734,6 +1871,215 @@ mod tests {
              BEGIN SELECT label FROM sort_input ORDER BY label; END",
         )
         .unwrap();
+    }
+
+    #[test]
+    fn bounded_select_rejects_overflow_before_length_or_projection_can_materialize_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT NOT NULL)")
+            .unwrap();
+        let body = "x".repeat(citadel_core::MAX_INLINE_VALUE_SIZE + 1);
+        conn.execute_params(
+            "INSERT INTO docs VALUES (1, $1)",
+            &[Value::Text(body.clone().into())],
+        )
+        .unwrap();
+        let budget = ReadBudget::new(body.len(), body.len() * 4);
+
+        for sql in [
+            "SELECT LENGTH(body) FROM docs WHERE id = 1",
+            "SELECT id FROM docs WHERE id = 1",
+        ] {
+            let err = conn.query_params_bounded(sql, &[], &budget).unwrap_err();
+            assert!(matches!(
+                err,
+                SqlError::Storage(citadel_core::Error::ReadBudgetExceeded { size, .. })
+                    if size > body.len()
+            ));
+        }
+        assert_eq!(
+            budget.remaining(),
+            body.len() * 4,
+            "a refused row consumed the shared total"
+        );
+    }
+
+    #[test]
+    fn bounded_select_is_read_only_and_shares_its_total_across_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT NOT NULL)")
+            .unwrap();
+        conn.execute("INSERT INTO docs VALUES (1, 'abc')").unwrap();
+        let probe = ReadBudget::new(128, 128);
+        let before = probe.remaining();
+        conn.query_params_bounded(
+            "SELECT body FROM docs WHERE id = $1",
+            &[Value::Integer(1)],
+            &probe,
+        )
+        .unwrap();
+        let charged = before - probe.remaining();
+        assert!(charged > 0);
+
+        let budget = ReadBudget::new(charged, charged * 2 - 1);
+        conn.query_params_bounded("SELECT body FROM docs WHERE id = 1", &[], &budget)
+            .unwrap();
+        let err = conn
+            .query_params_bounded("SELECT body FROM docs WHERE id = 1", &[], &budget)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            SqlError::Storage(citadel_core::Error::ReadBudgetExceeded { .. })
+        ));
+
+        let err = conn
+            .query_params_bounded(
+                "DELETE FROM docs WHERE id = 1",
+                &[],
+                &ReadBudget::new(128, 128),
+            )
+            .unwrap_err();
+        assert!(matches!(err, SqlError::Unsupported(_)));
+        assert_eq!(
+            conn.query("SELECT COUNT(*) FROM docs").unwrap().rows[0][0],
+            Value::Integer(1)
+        );
+    }
+
+    #[test]
+    fn scoped_read_budgets_nest_and_restore_the_outer_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT NOT NULL)")
+            .unwrap();
+        conn.execute("INSERT INTO docs VALUES (1, 'abc')").unwrap();
+
+        let probe = ReadBudget::new(128, 128);
+        let before = probe.remaining();
+        conn.query_params_bounded("SELECT body FROM docs", &[], &probe)
+            .unwrap();
+        let charged = before - probe.remaining();
+        assert!(charged > 0);
+        let outer = ReadBudget::new(charged, charged * 2);
+        let inner = ReadBudget::new(charged, 0);
+
+        with_read_budget(&outer, || {
+            conn.query("SELECT body FROM docs").unwrap();
+            assert_eq!(outer.remaining(), charged);
+
+            with_read_budget(&inner, || {
+                let err = conn.query("SELECT body FROM docs").unwrap_err();
+                assert!(matches!(
+                    err,
+                    SqlError::Storage(citadel_core::Error::ReadBudgetExceeded { .. })
+                ));
+            });
+            assert_eq!(outer.remaining(), charged);
+
+            conn.query("SELECT body FROM docs").unwrap();
+        });
+        assert_eq!(outer.remaining(), 0);
+
+        conn.query("SELECT body FROM docs").unwrap();
+    }
+
+    #[test]
+    fn scoped_read_budget_rejects_mutation_and_restores_after_unwind() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT NOT NULL)")
+            .unwrap();
+        conn.execute("INSERT INTO docs VALUES (1, 'abc')").unwrap();
+        let budget = ReadBudget::new(128, 128);
+
+        with_read_budget(&budget, || {
+            let err = conn
+                .query_params("DELETE FROM docs WHERE id = 1", &[])
+                .unwrap_err();
+            assert!(matches!(err, SqlError::Unsupported(_)));
+        });
+        assert_eq!(
+            conn.query("SELECT COUNT(*) FROM docs").unwrap().rows[0][0],
+            Value::Integer(1)
+        );
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_read_budget(&budget, || panic!("scope probe"));
+        }));
+        assert!(panicked.is_err());
+
+        let result = conn
+            .query_params("DELETE FROM docs WHERE id = 1", &[])
+            .unwrap();
+        assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
+    }
+
+    #[test]
+    fn scoped_read_budget_uses_and_restores_active_transactions() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT NOT NULL)")
+            .unwrap();
+        conn.execute("INSERT INTO docs VALUES (1, 'abc')").unwrap();
+
+        let probe = ReadBudget::new(128, 128);
+        let before = probe.remaining();
+        conn.query_params_bounded("SELECT body FROM docs", &[], &probe)
+            .unwrap();
+        let charged = before - probe.remaining();
+        assert!(charged > 0);
+
+        conn.execute("BEGIN READ ONLY").unwrap();
+        let too_small = ReadBudget::new(charged - 1, charged * 2);
+        with_read_budget(&too_small, || {
+            let err = conn.query("SELECT body FROM docs").unwrap_err();
+            assert!(matches!(
+                err,
+                SqlError::Storage(citadel_core::Error::ReadBudgetExceeded { .. })
+            ));
+        });
+        conn.query("SELECT body FROM docs").unwrap();
+        conn.execute("COMMIT").unwrap();
+
+        conn.execute("BEGIN").unwrap();
+        let too_small = ReadBudget::new(charged - 1, charged * 2);
+        with_read_budget(&too_small, || {
+            let err = conn.query("SELECT body FROM docs").unwrap_err();
+            assert!(matches!(
+                err,
+                SqlError::Storage(citadel_core::Error::ReadBudgetExceeded { .. })
+            ));
+        });
+        let budget = ReadBudget::new(charged, charged);
+        with_read_budget(&budget, || {
+            conn.query("SELECT body FROM docs").unwrap();
+            assert_eq!(budget.remaining(), 0);
+            let err = conn
+                .query(
+                    "WITH removed AS (DELETE FROM docs WHERE id = 1 RETURNING *) \
+                     SELECT COUNT(*) FROM removed",
+                )
+                .unwrap_err();
+            assert!(matches!(err, SqlError::Unsupported(_)));
+        });
+        assert_eq!(
+            conn.query("SELECT COUNT(*) FROM docs").unwrap().rows[0][0],
+            Value::Integer(1)
+        );
+        conn.execute("INSERT INTO docs VALUES (2, 'after-read')")
+            .unwrap();
+        conn.execute("COMMIT").unwrap();
+        assert_eq!(
+            conn.query("SELECT COUNT(*) FROM docs").unwrap().rows[0][0],
+            Value::Integer(2)
+        );
     }
 
     #[test]

@@ -16,6 +16,7 @@ use citadel_buffer::cursor::{Cursor, PageLoader, PageMap};
 use crate::catalog::TableDescriptor;
 use crate::manager::TxnManager;
 use crate::overflow_io;
+use crate::ReadBudget;
 
 struct ReadPages<'a> {
     cache: &'a mut FxHashMap<PageId, Arc<Page>>,
@@ -86,6 +87,7 @@ fn scan_leaf_cells<F>(
     view: &mut ReadPages<'_>,
     leaves: &[Arc<Page>],
     cancel: Option<&CancelToken>,
+    budget: Option<&ReadBudget>,
     count: &mut ScanCount<'_>,
     mut f: F,
 ) -> Result<()>
@@ -103,6 +105,9 @@ where
             match cell.val_type {
                 ValueType::Tombstone => continue,
                 ValueType::Inline => {
+                    if let Some(budget) = budget {
+                        budget.try_charge(cell.value.len())?;
+                    }
                     if !f(cell.key, cell.value) {
                         return Ok(());
                     }
@@ -111,7 +116,7 @@ where
                     let oref = OverflowRef::from_bytes(cell.value);
                     let key_owned = cell.key.to_vec();
                     let materialized =
-                        overflow_io::read_chain_value_with_cancel(view, &oref, cancel)?;
+                        overflow_io::read_chain_value_with_budget(view, &oref, cancel, budget)?;
                     if !f(&key_owned, &materialized) {
                         return Ok(());
                     }
@@ -134,6 +139,7 @@ pub struct LeafShardScanner<'t> {
     /// Inherited from the producing txn so a cancel reaches every shard; a
     /// per-shard flag would let the rest run on after one stopped.
     cancel: Option<CancelToken>,
+    budget: Option<ReadBudget>,
 }
 
 impl LeafShardScanner<'_> {
@@ -149,6 +155,7 @@ impl LeafShardScanner<'_> {
             measurements,
             high_water_mark,
             cancel,
+            budget,
         } = self;
         if let Some(token) = cancel.as_ref() {
             token.check()?;
@@ -159,7 +166,14 @@ impl LeafShardScanner<'_> {
             manager,
             high_water_mark: *high_water_mark,
         };
-        scan_leaf_cells(&mut view, leaves, cancel.as_ref(), &mut count, f)
+        scan_leaf_cells(
+            &mut view,
+            leaves,
+            cancel.as_ref(),
+            budget.as_ref(),
+            &mut count,
+            f,
+        )
     }
 }
 
@@ -200,6 +214,7 @@ pub struct ReadTxn<'a> {
     /// A field rather than a scan parameter: threading it through would change
     /// every scan signature, and a new scan cannot forget to accept it.
     cancel: Option<CancelToken>,
+    read_budget: Option<ReadBudget>,
 }
 
 impl<'db> ReadTxn<'db> {
@@ -222,6 +237,7 @@ impl<'db> ReadTxn<'db> {
                 .map(Arc::downgrade)
                 .collect(),
             cancel: None,
+            read_budget: None,
         }
     }
 
@@ -231,6 +247,14 @@ impl<'db> ReadTxn<'db> {
 
     pub fn cancel_token(&self) -> Option<&CancelToken> {
         self.cancel.as_ref()
+    }
+
+    pub fn set_read_budget(&mut self, budget: Option<ReadBudget>) {
+        self.read_budget = budget;
+    }
+
+    pub fn read_budget(&self) -> Option<&ReadBudget> {
+        self.read_budget.as_ref()
     }
 
     #[inline]
@@ -429,6 +453,7 @@ impl<'db> ReadTxn<'db> {
             self.snapshot.high_water_mark,
             self.snapshot.merkle_scheme,
             self.cancel.as_ref(),
+            self.read_budget.as_ref(),
         )
     }
 
@@ -469,6 +494,9 @@ impl<'db> ReadTxn<'db> {
                 f(&key, &materialized)?;
             } else if let Some(entry) = cursor.current_ref(&self.page_cache) {
                 if entry.val_type != ValueType::Tombstone {
+                    if let Some(budget) = &self.read_budget {
+                        budget.try_charge(entry.value.len())?;
+                    }
                     f(entry.key, entry.value)?;
                 }
             }
@@ -526,6 +554,9 @@ impl<'db> ReadTxn<'db> {
                 f(&key, &materialized)?;
             } else if let Some(entry) = cursor.current_ref(&self.page_cache) {
                 if entry.val_type != ValueType::Tombstone {
+                    if let Some(budget) = &self.read_budget {
+                        budget.try_charge(entry.value.len())?;
+                    }
                     f(entry.key, entry.value)?;
                 }
             }
@@ -543,6 +574,7 @@ impl<'db> ReadTxn<'db> {
         let desc = self.lookup_table(table)?;
         let root = desc.root_page;
         let cancel = self.cancel.clone();
+        let budget = self.read_budget.clone();
         let measurements = self.captured_scan_measurements();
         let mut count = ScanCount::with_measurements(self.manager, measurements);
         let mut view = ReadPages {
@@ -561,6 +593,9 @@ impl<'db> ReadTxn<'db> {
                 ValueType::Tombstone => {}
                 ValueType::Inline => {
                     let entry = cursor.current_ref_lazy(&mut view).unwrap();
+                    if let Some(budget) = &budget {
+                        budget.try_charge(entry.value.len())?;
+                    }
                     if !f(entry.key, entry.value)? {
                         break;
                     }
@@ -570,10 +605,11 @@ impl<'db> ReadTxn<'db> {
                         let c = cursor.current_ref_lazy(&mut view).unwrap();
                         (c.key.to_vec(), OverflowRef::from_bytes(c.value))
                     };
-                    let materialized = overflow_io::read_chain_value_with_cancel(
+                    let materialized = overflow_io::read_chain_value_with_budget(
                         &mut view,
                         &oref,
                         cancel.as_ref(),
+                        budget.as_ref(),
                     )?;
                     if !f(&key, &materialized)? {
                         break;
@@ -598,6 +634,7 @@ impl<'db> ReadTxn<'db> {
         let desc = self.lookup_table(table)?;
         let root = desc.root_page;
         let cancel = self.cancel.clone();
+        let budget = self.read_budget.clone();
         let measurements = self.captured_scan_measurements();
         let mut count = ScanCount::with_measurements(self.manager, measurements);
         let mut view = ReadPages {
@@ -626,14 +663,20 @@ impl<'db> ReadTxn<'db> {
                 let cell = leaf_node::read_cell(&leaf_page, idx);
                 let continue_scan = match cell.val_type {
                     ValueType::Tombstone => true,
-                    ValueType::Inline => f(cell.key, cell.value)?,
+                    ValueType::Inline => {
+                        if let Some(budget) = &budget {
+                            budget.try_charge(cell.value.len())?;
+                        }
+                        f(cell.key, cell.value)?
+                    }
                     ValueType::Overflow => {
                         let oref = OverflowRef::from_bytes(cell.value);
                         let key_owned = cell.key.to_vec();
-                        let materialized = overflow_io::read_chain_value_with_cancel(
+                        let materialized = overflow_io::read_chain_value_with_budget(
                             &mut view,
                             &oref,
                             cancel.as_ref(),
+                            budget.as_ref(),
                         )?;
                         f(&key_owned, &materialized)?
                     }
@@ -726,7 +769,14 @@ impl<'db> ReadTxn<'db> {
             manager: self.manager,
             high_water_mark: self.snapshot.high_water_mark,
         };
-        scan_leaf_cells(&mut view, leaves, cancel.as_ref(), &mut count, f)
+        scan_leaf_cells(
+            &mut view,
+            leaves,
+            cancel.as_ref(),
+            self.read_budget.as_ref(),
+            &mut count,
+            f,
+        )
     }
 
     /// A scanner for parallel leaf iteration, borrow-tied to this txn so the
@@ -742,6 +792,7 @@ impl<'db> ReadTxn<'db> {
             measurements,
             high_water_mark: self.snapshot.high_water_mark,
             cancel: self.cancel.clone(),
+            budget: self.read_budget.clone(),
         }
     }
 
@@ -895,6 +946,7 @@ impl<'db> ReadTxn<'db> {
 
     /// Search for a key in an arbitrary B+ tree starting at `root`.
     fn search_tree(&mut self, root: PageId, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let budget = self.read_budget.clone();
         let mut current = root;
         let snapshot: Option<(ValueType, Vec<u8>)> = loop {
             let page = self.load_page(current)?;
@@ -905,6 +957,12 @@ impl<'db> ReadTxn<'db> {
                             let cell = leaf_node::read_cell(page, idx);
                             match cell.val_type {
                                 ValueType::Tombstone => None,
+                                ValueType::Inline => {
+                                    if let Some(budget) = &budget {
+                                        budget.try_charge(cell.value.len())?;
+                                    }
+                                    Some((cell.val_type, cell.value.to_vec()))
+                                }
                                 _ => Some((cell.val_type, cell.value.to_vec())),
                             }
                         }
@@ -1001,6 +1059,10 @@ impl<'a, 'db: 'a> crate::scan_iter::TxnScanAdapter for ReadTxnScanAdapter<'a, 'd
         self.txn.cancel.as_ref()
     }
 
+    fn read_budget(&self) -> Option<&ReadBudget> {
+        self.txn.read_budget.as_ref()
+    }
+
     fn record_rows_scanned(&self, rows: u64) {
         self.txn
             .manager
@@ -1026,6 +1088,10 @@ impl<'db> crate::scan_iter::TxnScanAdapter for OwnedReadTxnAdapter<'db> {
 
     fn cancel(&self) -> Option<&CancelToken> {
         self.txn.cancel.as_ref()
+    }
+
+    fn read_budget(&self) -> Option<&ReadBudget> {
+        self.txn.read_budget.as_ref()
     }
 
     fn record_rows_scanned(&self, rows: u64) {
