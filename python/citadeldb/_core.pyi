@@ -425,6 +425,26 @@ class Memory:
         kinds: list[str] | None = ...,
         options: RecallOptions | None = ...,
     ) -> list[AtomHit]: ...
+    def preflight_mmr(
+        self,
+        region: str,
+        *,
+        k: int = ...,
+        fetch_k: int = ...,
+        lambda_mult: float = ...,
+    ) -> None: ...
+    def recall_mmr(
+        self,
+        region: str,
+        *,
+        text: str | None = ...,
+        embedding: list[float] | None = ...,
+        k: int = ...,
+        fetch_k: int = ...,
+        lambda_mult: float = ...,
+        kinds: list[str] | None = ...,
+        options: RecallOptions | None = ...,
+    ) -> list[AtomHit]: ...
     def profile(
         self,
         region: str,

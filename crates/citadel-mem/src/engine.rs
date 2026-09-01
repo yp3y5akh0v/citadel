@@ -30,6 +30,7 @@ use crate::fusion::{
 use crate::read_limits::{
     atom_content_bytes, charge_atom_content, charge_edge_evidence, charge_materialized_bytes,
     charge_returned_atom_content, charge_returned_bytes, charge_returned_edge_evidence,
+    with_storage_read_cap,
 };
 use crate::types::{
     AtomAttestation, AtomHit, AtomId, AtomInput, AttestVerdict, Edge, EdgeCursor, EdgeKind,
@@ -43,6 +44,11 @@ use crate::types::{
 
 /// Batch size for encrypted decrypt scans; no ANN/FTS index over ciphertext.
 const EXACT_SCAN_LIMIT: usize = 4096;
+const MAX_MMR_CANDIDATES: usize = EXACT_SCAN_LIMIT;
+const MAX_MMR_VECTOR_BYTES: usize = 16 * 1024 * 1024;
+const MAX_MMR_SIMILARITY_COMPONENTS: usize = 64 * 1024 * 1024;
+const MAX_MMR_SEALED_VALUE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_MMR_SEALED_TOTAL_BYTES: usize = 32 * 1024 * 1024;
 /// Default and hard caps for the number of kind digests returned by one summary page.
 pub const DEFAULT_SUMMARY_KIND_LIMIT: usize = 256;
 pub const MAX_SUMMARY_KIND_LIMIT: usize = 4096;
@@ -366,6 +372,30 @@ fn zeroize_atom_content(text: &mut String, payload: &mut serde_json::Value) {
     zeroize_json_strings(payload);
 }
 
+struct ScrubbedHitSlots(Vec<Option<AtomHit>>);
+
+impl ScrubbedHitSlots {
+    fn from_hits(hits: Vec<AtomHit>) -> Self {
+        Self(hits.into_iter().map(Some).collect())
+    }
+
+    fn with_capacity(capacity: usize) -> Self {
+        Self(Vec::with_capacity(capacity))
+    }
+
+    fn into_hits(mut self) -> Vec<AtomHit> {
+        std::mem::take(&mut self.0).into_iter().flatten().collect()
+    }
+}
+
+impl Drop for ScrubbedHitSlots {
+    fn drop(&mut self) {
+        for hit in self.0.iter_mut().filter_map(Option::as_mut) {
+            zeroize_atom_content(&mut hit.text, &mut hit.payload);
+        }
+    }
+}
+
 fn charge_owned_atom_content(
     kind: &str,
     text: &mut String,
@@ -451,6 +481,155 @@ fn charge_returned_embedding_identity(identity: &StoredEmbeddingsIdentity) -> Re
         identity.kind(),
         identity.sha256(),
     ])
+}
+
+fn embedding_bytes(dimension: usize) -> Result<usize> {
+    dimension
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| MemError::Invalid("stored embedding size overflow".into()))
+}
+
+fn validate_mmr_request(fetch_k: usize, lambda_mult: f32) -> Result<()> {
+    if !lambda_mult.is_finite() || !(0.0..=1.0).contains(&lambda_mult) {
+        return Err(MemError::Invalid(
+            "MMR lambda must be finite and between 0 and 1".into(),
+        ));
+    }
+    if fetch_k > MAX_MMR_CANDIDATES {
+        return Err(MemError::WorkLimitExceeded {
+            operation: "MMR candidate count",
+            limit: MAX_MMR_CANDIDATES,
+        });
+    }
+    Ok(())
+}
+
+fn validate_mmr_region_work(
+    fetch_k: usize,
+    k: usize,
+    dimension: usize,
+    metric: EmbeddingMetric,
+) -> Result<()> {
+    if metric != EmbeddingMetric::Cosine {
+        return Err(MemError::Invalid(
+            "MMR recall currently requires a cosine region".into(),
+        ));
+    }
+    let vector_bytes = embedding_bytes(dimension)?
+        .checked_mul(fetch_k)
+        .ok_or_else(|| MemError::Invalid("MMR candidate-vector size overflow".into()))?;
+    if vector_bytes > MAX_MMR_VECTOR_BYTES {
+        return Err(MemError::WorkLimitExceeded {
+            operation: "MMR candidate-vector bytes",
+            limit: MAX_MMR_VECTOR_BYTES,
+        });
+    }
+    let similarity_components = fetch_k
+        .checked_mul(k.min(fetch_k))
+        .and_then(|work| work.checked_mul(dimension))
+        .ok_or_else(|| MemError::Invalid("MMR similarity work overflow".into()))?;
+    if similarity_components > MAX_MMR_SIMILARITY_COMPONENTS {
+        return Err(MemError::WorkLimitExceeded {
+            operation: "MMR similarity components",
+            limit: MAX_MMR_SIMILARITY_COMPONENTS,
+        });
+    }
+    Ok(())
+}
+
+fn cosine_similarity(
+    left: &[f32],
+    right: &[f32],
+    cancel: Option<&citadel_core::CancelToken>,
+) -> Result<f64> {
+    debug_assert_eq!(left.len(), right.len());
+    let mut dot = 0.0f64;
+    let mut left_norm = 0.0f64;
+    let mut right_norm = 0.0f64;
+    for (index, (&left, &right)) in left.iter().zip(right).enumerate() {
+        if index % 1024 == 0 {
+            check_cancel(cancel)?;
+        }
+        let left = f64::from(left);
+        let right = f64::from(right);
+        dot += left * right;
+        left_norm += left * left;
+        right_norm += right * right;
+    }
+    let denominator = left_norm.sqrt() * right_norm.sqrt();
+    Ok(if denominator == 0.0 {
+        0.0
+    } else {
+        dot / denominator
+    })
+}
+
+fn maximal_marginal_relevance(
+    query: &[f32],
+    candidates: &[&[f32]],
+    k: usize,
+    lambda_mult: f32,
+    cancel: Option<&citadel_core::CancelToken>,
+) -> Result<Vec<usize>> {
+    let take = k.min(candidates.len());
+    if take == 0 {
+        return Ok(Vec::new());
+    }
+    let query_scores = candidates
+        .iter()
+        .map(|candidate| cosine_similarity(query, candidate, cancel))
+        .collect::<Result<Vec<_>>>()?;
+    let first = query_scores
+        .iter()
+        .enumerate()
+        .max_by(|(left_index, left), (right_index, right)| {
+            left.partial_cmp(right)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| right_index.cmp(left_index))
+        })
+        .map(|(index, _)| index)
+        .expect("non-empty candidate scores");
+    let mut selected = Vec::with_capacity(take);
+    selected.push(first);
+    if take == 1 {
+        return Ok(selected);
+    }
+    let mut is_selected = vec![false; candidates.len()];
+    is_selected[first] = true;
+    let mut max_redundancy = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        max_redundancy.push(cosine_similarity(candidate, candidates[first], cancel)?);
+    }
+    while selected.len() < take {
+        check_cancel(cancel)?;
+        let mut best: Option<(usize, f64)> = None;
+        for (index, &query_score) in query_scores.iter().enumerate() {
+            if is_selected[index] {
+                continue;
+            }
+            let lambda = f64::from(lambda_mult);
+            let score = lambda * query_score - (1.0 - lambda) * max_redundancy[index];
+            if best.is_none_or(|(_, best_score)| score > best_score) {
+                best = Some((index, score));
+            }
+        }
+        let next = best.expect("unselected MMR candidate remains").0;
+        selected.push(next);
+        is_selected[next] = true;
+        if selected.len() < take {
+            for index in 0..candidates.len() {
+                if is_selected[index] {
+                    continue;
+                }
+                max_redundancy[index] = max_redundancy[index].max(cosine_similarity(
+                    candidates[index],
+                    candidates[next],
+                    cancel,
+                )?);
+            }
+        }
+    }
+    Ok(selected)
 }
 
 /// Map the memory metric to PRISM's distance metric.
@@ -820,6 +999,13 @@ type ManagedSimilarityEdge = (AtomId, f32, Option<serde_json::Value>);
 struct RecallMode {
     rerank: bool,
     record_access: bool,
+}
+
+/// Optional final diversification over a bounded recall candidate pool.
+#[derive(Clone, Copy)]
+struct MmrSelection {
+    k: usize,
+    lambda_mult: f32,
 }
 
 impl RecallMode {
@@ -6380,8 +6566,160 @@ impl MemoryEngine {
     /// BM25, not SQL `ts_rank`.
     pub fn recall(&self, region: &str, q: RecallQuery) -> Result<Vec<AtomHit>> {
         let cancel = check_db_cancel(&self.db)?;
-        let mut hits = self.recall_impl(region, q, RecallMode::USER, cancel.as_ref())?;
+        let mut hits = self.recall_impl(region, q, RecallMode::USER, None, cancel.as_ref())?;
         charge_returned_hits(&mut hits)?;
+        Ok(hits)
+    }
+
+    /// Validate an MMR request against the currently attached region without
+    /// embedding a query or reading atoms. Recall revalidates after this call.
+    pub fn preflight_mmr(
+        &self,
+        region: &str,
+        k: usize,
+        fetch_k: usize,
+        lambda_mult: f32,
+    ) -> Result<()> {
+        let cancel = check_db_cancel(&self.db)?;
+        validate_mmr_request(fetch_k, lambda_mult)?;
+        if fetch_k == 0 || k == 0 {
+            return Ok(());
+        }
+        let key = region.to_ascii_lowercase();
+        let h = self.region_handle(&key)?;
+        validate_mmr_region_work(fetch_k, k, usize::from(h.dim), h.metric)?;
+        let _provenance = self.reserve_region_provenance(&key, &h, cancel.as_ref())?;
+        check_cancel(cancel.as_ref())
+    }
+
+    /// Recall a bounded candidate pool, then diversify it with maximal marginal relevance.
+    ///
+    /// `q.k` is the candidate-pool size and `k` is the final result size. The
+    /// operation uses exact stored vectors from a cosine region. Graph expansion
+    /// is deliberately unsupported because it would append undiversified hits.
+    pub fn recall_mmr(
+        &self,
+        region: &str,
+        q: RecallQuery,
+        k: usize,
+        lambda_mult: f32,
+    ) -> Result<Vec<AtomHit>> {
+        let cancel = check_db_cancel(&self.db)?;
+        validate_mmr_request(q.k, lambda_mult)?;
+        if q.graph_expand.is_some() {
+            return Err(MemError::Invalid(
+                "MMR recall does not support graph expansion".into(),
+            ));
+        }
+        if q.k == 0 || k == 0 {
+            return Ok(Vec::new());
+        }
+        let mut hits = self.recall_impl(
+            region,
+            q,
+            RecallMode::USER,
+            Some(MmrSelection { k, lambda_mult }),
+            cancel.as_ref(),
+        )?;
+        charge_returned_hits(&mut hits)?;
+        Ok(hits)
+    }
+
+    fn select_mmr_hits(
+        &self,
+        key: &str,
+        h: &RegionHandle,
+        hits: Vec<AtomHit>,
+        query_vector: &[f32],
+        selection: MmrSelection,
+        cancel: Option<&citadel_core::CancelToken>,
+    ) -> Result<Vec<AtomHit>> {
+        let mut hits = ScrubbedHitSlots::from_hits(hits);
+        if hits.0.is_empty() || selection.k == 0 {
+            return Ok(Vec::new());
+        }
+        let ids = hits
+            .0
+            .iter()
+            .filter_map(Option::as_ref)
+            .map(|hit| hit.id)
+            .collect::<Vec<_>>();
+        let _atom_reservation = self.reserve_plaintext_atoms(key, h, ids.iter().copied())?;
+        check_cancel(cancel)?;
+        let mut embeddings = if h.atom_wrap.is_some() {
+            self.with_live_sealed_read(key, h, |conn, atom_wrap, _kl| {
+                fetch_mmr_embeddings_sealed(
+                    &self.db, conn, key, h.id, &h.table, h.dim, atom_wrap, &ids, cancel,
+                )
+            })?
+        } else {
+            self.with_live_plain_access(key, h, |conn| {
+                fetch_mmr_embeddings_plain(conn, key, h.id, &h.table, h.dim, &ids, cancel)
+            })?
+        };
+        check_cancel(cancel)?;
+
+        let mut live_hits = ScrubbedHitSlots::with_capacity(hits.0.len());
+        let mut live_embeddings = Vec::with_capacity(hits.0.len());
+        for slot in &mut hits.0 {
+            let hit = slot.take().expect("MMR input hit is present");
+            match embeddings.remove(&hit.id) {
+                Some(embedding) => {
+                    live_hits.0.push(Some(hit));
+                    live_embeddings.push(embedding);
+                }
+                None => {
+                    let mut discarded = hit;
+                    zeroize_atom_content(&mut discarded.text, &mut discarded.payload);
+                }
+            }
+        }
+        let vectors = live_embeddings
+            .iter()
+            .map(|embedding| embedding.as_slice())
+            .collect::<Vec<_>>();
+        let selected = maximal_marginal_relevance(
+            query_vector,
+            &vectors,
+            selection.k,
+            selection.lambda_mult,
+            cancel,
+        )?;
+        let mut result = ScrubbedHitSlots::with_capacity(selected.len());
+        for index in selected {
+            result.0.push(Some(
+                live_hits.0[index]
+                    .take()
+                    .expect("MMR returns each candidate at most once"),
+            ));
+        }
+        check_cancel(cancel)?;
+        Ok(result.into_hits())
+    }
+
+    fn finish_recall_hits(
+        &self,
+        region_id: RegionId,
+        mut hits: Vec<AtomHit>,
+        mode: RecallMode,
+        scrub_on_error: bool,
+        cancel: Option<&citadel_core::CancelToken>,
+    ) -> Result<Vec<AtomHit>> {
+        let finish = (|| {
+            check_cancel(cancel)?;
+            if mode.record_access {
+                self.note_access(region_id, hits.iter().map(|hit| hit.id), cancel)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = finish {
+            if scrub_on_error {
+                for hit in &mut hits {
+                    zeroize_atom_content(&mut hit.text, &mut hit.payload);
+                }
+            }
+            return Err(error);
+        }
         Ok(hits)
     }
 
@@ -6484,7 +6822,13 @@ impl MemoryEngine {
         }
         let mut lists = Vec::with_capacity(queries.len());
         for sq in queries {
-            lists.push(self.recall_impl(region, sq, RecallMode::SUBQUERY, cancel.as_ref())?);
+            lists.push(self.recall_impl(
+                region,
+                sq,
+                RecallMode::SUBQUERY,
+                None,
+                cancel.as_ref(),
+            )?);
             check_cancel(cancel.as_ref())?;
         }
         let mut merged = rrf_merge(lists, q.rrf_k);
@@ -6493,7 +6837,7 @@ impl MemoryEngine {
         let mut hits = match (reranker.as_ref(), &q.rerank_query) {
             (Some((r, strategy)), Some(text)) => {
                 check_cancel(cancel.as_ref())?;
-                let _callback = self.reserve_reranker_atoms(
+                let _callback = self.reserve_plaintext_atoms(
                     &key,
                     &h,
                     merged.iter().take(RERANK_POOL).map(|hit| hit.id),
@@ -6527,6 +6871,7 @@ impl MemoryEngine {
         region: &str,
         q: RecallQuery,
         mode: RecallMode,
+        mmr: Option<MmrSelection>,
         cancel: Option<&citadel_core::CancelToken>,
     ) -> Result<Vec<AtomHit>> {
         let cancel = cancel.cloned();
@@ -6534,6 +6879,9 @@ impl MemoryEngine {
         let h = self.region_handle(&key)?;
         if q.k == 0 {
             return Ok(Vec::new());
+        }
+        if let Some(selection) = mmr {
+            validate_mmr_region_work(q.k, selection.k, usize::from(h.dim), h.metric)?;
         }
         let _provenance = self.reserve_region_provenance(&key, &h, cancel.as_ref())?;
         validate_fusion_weights(q.weights)?;
@@ -6548,7 +6896,7 @@ impl MemoryEngine {
             None
         };
 
-        let qvec: Vec<f32> = match &q.embedding {
+        let mut qvec: Vec<f32> = match &q.embedding {
             Some(v) => v.clone(),
             None => {
                 let text = q.text.as_deref().ok_or_else(|| {
@@ -6581,7 +6929,7 @@ impl MemoryEngine {
             let mut hits = match (reranker.as_ref(), &q.text) {
                 (Some((r, strategy)), Some(text)) => {
                     check_cancel(cancel.as_ref())?;
-                    let _callback = self.reserve_reranker_atoms(
+                    let _callback = self.reserve_plaintext_atoms(
                         &key,
                         &h,
                         cands.iter().map(|candidate| candidate.id),
@@ -6605,6 +6953,9 @@ impl MemoryEngine {
                 _ => fuse_rank(cands, q.weights, as_of, q.k),
             };
             check_cancel(cancel.as_ref())?;
+            if let Some(selection) = mmr {
+                hits = self.select_mmr_hits(&key, &h, hits, &qvec, selection, cancel.as_ref())?;
+            }
             if let Some(ge) = &q.graph_expand {
                 let seeds: Vec<AtomId> = hits.iter().map(|hit| hit.id).collect();
                 let present: FxHashSet<AtomId> = seeds.iter().copied().collect();
@@ -6631,11 +6982,7 @@ impl MemoryEngine {
                 expanded.retain(|hit| !present.contains(&hit.id));
                 hits.extend(expanded);
             }
-            check_cancel(cancel.as_ref())?;
-            if mode.record_access {
-                self.note_access(h.id, hits.iter().map(|a| a.id), cancel.as_ref())?;
-            }
-            return Ok(hits);
+            return self.finish_recall_hits(h.id, hits, mode, mmr.is_some(), cancel.as_ref());
         }
 
         let distop = match h.metric {
@@ -6646,7 +6993,13 @@ impl MemoryEngine {
         let table = h.table.clone();
 
         // $1 = query vector (reused in SELECT + ORDER BY), $2 = region_id.
-        let mut params: Vec<Value> = vec![Value::Vector(qvec.into()), Value::Integer(h.id)];
+        let sql_query_vector = if mmr.is_some() {
+            qvec.clone()
+        } else {
+            std::mem::take(&mut qvec)
+        };
+        let mut params: Vec<Value> =
+            vec![Value::Vector(sql_query_vector.into()), Value::Integer(h.id)];
 
         // Keyword rank uses the in-Rust BM25 primitive (assign_bm25_ranks)
         // shared with the sealed path; no SQL FTS, no language config.
@@ -6713,7 +7066,7 @@ impl MemoryEngine {
         let mut hits = match (reranker.as_ref(), &q.text) {
             (Some((r, strategy)), Some(text)) => {
                 check_cancel(cancel.as_ref())?;
-                let _callback = self.reserve_reranker_atoms(
+                let _callback = self.reserve_plaintext_atoms(
                     &key,
                     &h,
                     cands.iter().map(|candidate| candidate.id),
@@ -6738,6 +7091,10 @@ impl MemoryEngine {
         };
         check_cancel(cancel.as_ref())?;
 
+        if let Some(selection) = mmr {
+            hits = self.select_mmr_hits(&key, &h, hits, &qvec, selection, cancel.as_ref())?;
+        }
+
         if let Some(ge) = &q.graph_expand {
             let seeds: Vec<AtomId> = hits.iter().map(|h| h.id).collect();
             let present: FxHashSet<AtomId> = seeds.iter().copied().collect();
@@ -6755,11 +7112,7 @@ impl MemoryEngine {
             expanded.retain(|e| !present.contains(&e.id));
             hits.extend(expanded);
         }
-        check_cancel(cancel.as_ref())?;
-        if mode.record_access {
-            self.note_access(h.id, hits.iter().map(|a| a.id), cancel.as_ref())?;
-        }
-        Ok(hits)
+        self.finish_recall_hits(h.id, hits, mode, mmr.is_some(), cancel.as_ref())
     }
 
     /// Create a raw global edge for tests that exercise legacy/corrupt states.
@@ -7269,7 +7622,8 @@ impl MemoryEngine {
         let query = RecallQuery::by_embedding(state.embedding.clone(), neighbors.saturating_add(1))
             .with_kinds(kinds.clone())
             .with_weights(FusionWeights::semantic_only());
-        let mut found = self.recall_impl(&key, query, RecallMode::INTERNAL, cancel.as_ref())?;
+        let mut found =
+            self.recall_impl(&key, query, RecallMode::INTERNAL, None, cancel.as_ref())?;
         found.retain(|n| {
             n.id != atom_id && n.distance.is_some_and(|distance| distance <= max_distance)
         });
@@ -8255,8 +8609,8 @@ impl MemoryEngine {
         Ok(reservation)
     }
 
-    /// Keep sealed atom keys live while a user reranker holds their plaintext.
-    fn reserve_reranker_atoms<'a>(
+    /// Keep sealed atom keys live while local ranking or a callback holds their plaintext.
+    fn reserve_plaintext_atoms<'a>(
         &'a self,
         key: &str,
         h: &RegionHandle,
@@ -10480,6 +10834,32 @@ fn open_atom_embedding(
     decode_atom_embedding(&blob)
 }
 
+/// Open one MMR candidate vector under the operation's mandatory work cap.
+/// The authenticated framing dimension is checked before the second vector
+/// allocation, and both decrypted-blob and vector storage are accounted.
+fn open_mmr_embedding(
+    atom_wrap: &AtomWrapKey,
+    wrapped: &[u8; WRAPPED_KEY_SIZE],
+    id: AtomId,
+    sealed: &[u8],
+    expected_dim: usize,
+) -> Result<Zeroizing<Vec<f32>>> {
+    charge_materialized_bytes(sealed.len())?;
+    let mut ack = atom_wrap.unwrap_atom_key(wrapped)?;
+    let seal_keys = derive_seal_keys(&ack);
+    ack.zeroize();
+    let blob = Zeroizing::new(blob_seal::open(&seal_keys, id as u64, sealed)?);
+    let parts = parse_atom_blob(&blob)?;
+    if parts.dim != expected_dim {
+        return Err(MemError::Invalid(format!(
+            "stored embedding for atom {id} has dim {} != region dim {expected_dim}",
+            parts.dim
+        )));
+    }
+    charge_materialized_bytes(parts.embedding.len())?;
+    Ok(Zeroizing::new(decode_embedding(&parts)))
+}
+
 /// Open only the text for sealed dedup; other fields stay in the zeroized blob.
 fn open_atom_text(
     atom_wrap: &AtomWrapKey,
@@ -10862,6 +11242,102 @@ fn fetch_atoms_by_ids_sealed(
                     immutable: as_bool(&row[5])?,
                 },
             );
+        }
+    }
+    check_cancel(cancel)?;
+    Ok(found)
+}
+
+fn fetch_mmr_embeddings_plain(
+    conn: &Connection<'_>,
+    region: &str,
+    region_id: RegionId,
+    table: &str,
+    expected_dim: u16,
+    ids: &[AtomId],
+    cancel: Option<&citadel_core::CancelToken>,
+) -> Result<FxHashMap<AtomId, Zeroizing<Vec<f32>>>> {
+    let mut found = FxHashMap::default();
+    let now = now_micros();
+    for batch in ids.chunks(EXACT_SCAN_LIMIT) {
+        check_cancel(cancel)?;
+        let qr = with_storage_read_cap(MAX_MMR_VECTOR_BYTES, MAX_MMR_VECTOR_BYTES, || {
+            Ok(conn.query_params(
+                &format!(
+                    "SELECT id, embedding FROM {table} WHERE region_id = $1 AND id IN ({ids}) \
+                     AND (expires_at IS NULL OR expires_at > $2)",
+                    ids = id_list(batch),
+                ),
+                &[Value::Integer(region_id), Value::Timestamp(now)],
+            )?)
+        })?;
+        for row in &qr.rows {
+            check_cancel(cancel)?;
+            let id = as_int(&row[0])?;
+            let Value::Vector(vector) = &row[1] else {
+                return Err(MemError::Invalid(format!(
+                    "stored embedding for atom {id} is not a vector: {:?}",
+                    row[1]
+                )));
+            };
+            validate_embedding(region, expected_dim, vector, "stored")?;
+            charge_materialized_bytes(embedding_bytes(vector.len())?)?;
+            found.insert(id, Zeroizing::new(vector.to_vec()));
+            #[cfg(test)]
+            debug_fire_cancel_after_local_work();
+            check_cancel(cancel)?;
+        }
+    }
+    check_cancel(cancel)?;
+    Ok(found)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fetch_mmr_embeddings_sealed(
+    db: &Database,
+    conn: &Connection<'_>,
+    region: &str,
+    region_id: RegionId,
+    table: &str,
+    expected_dim: u16,
+    atom_wrap: &AtomWrapKey,
+    ids: &[AtomId],
+    cancel: Option<&citadel_core::CancelToken>,
+) -> Result<FxHashMap<AtomId, Zeroizing<Vec<f32>>>> {
+    let mut found = FxHashMap::default();
+    let now = now_micros();
+    for batch in ids.chunks(EXACT_SCAN_LIMIT) {
+        check_cancel(cancel)?;
+        let qr = with_storage_read_cap(
+            MAX_MMR_SEALED_VALUE_BYTES,
+            MAX_MMR_SEALED_TOTAL_BYTES,
+            || {
+                Ok(conn.query_params(
+                    &format!(
+                        "SELECT id, sealed, key_slot, key_gen FROM {table} \
+                         WHERE region_id = $1 AND id IN ({ids}) \
+                         AND (expires_at IS NULL OR expires_at > $2)",
+                        ids = id_list(batch),
+                    ),
+                    &[Value::Integer(region_id), Value::Timestamp(now)],
+                )?)
+            },
+        )?;
+        let wrapped = exact_live_atom_wrapped_rows(db, &qr.rows, 0, 2, 3)?;
+        for (row, wrapped) in qr.rows.iter().zip(wrapped) {
+            check_cancel(cancel)?;
+            let id = as_int(&row[0])?;
+            let Some(wrapped) = wrapped else {
+                continue;
+            };
+            let sealed = as_blob(&row[1])?;
+            let embedding =
+                open_mmr_embedding(atom_wrap, &wrapped, id, sealed, usize::from(expected_dim))?;
+            validate_embedding(region, expected_dim, &embedding, "stored")?;
+            found.insert(id, embedding);
+            #[cfg(test)]
+            debug_fire_cancel_after_local_work();
+            check_cancel(cancel)?;
         }
     }
     check_cancel(cancel)?;

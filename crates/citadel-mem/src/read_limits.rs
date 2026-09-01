@@ -147,6 +147,61 @@ pub(crate) fn charge_materialized_bytes(size: usize) -> Result<()> {
     charge_bytes_against(BudgetKind::Materialized, size)
 }
 
+/// Run a storage query under a mandatory cap while respecting a stricter
+/// surrounding memory-read scope. The caller still charges owned plaintext
+/// through [`charge_materialized_bytes`] after the query returns.
+pub(crate) fn with_storage_read_cap<T>(
+    max_value_bytes: usize,
+    max_total_bytes: usize,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    struct Settlement {
+        outer: Option<ReadBudget>,
+        child: ReadBudget,
+        initial_remaining: usize,
+    }
+
+    impl Settlement {
+        fn settle(&mut self) -> Result<()> {
+            let Some(outer) = self.outer.take() else {
+                return Ok(());
+            };
+            let spent = self
+                .initial_remaining
+                .saturating_sub(self.child.remaining());
+            outer
+                .record_aggregate_spend(spent)
+                .map_err(map_budget_error)
+        }
+    }
+
+    impl Drop for Settlement {
+        fn drop(&mut self) {
+            let _ = self.settle();
+        }
+    }
+
+    let outer = current_content_budget(BudgetKind::Materialized);
+    let (max_value_bytes, max_total_bytes) =
+        outer
+            .as_ref()
+            .map_or((max_value_bytes, max_total_bytes), |outer| {
+                let remaining = outer.remaining();
+                (
+                    max_value_bytes.min(outer.max_value()).min(remaining),
+                    max_total_bytes.min(remaining),
+                )
+            });
+    let mut settlement = Settlement {
+        outer,
+        child: ReadBudget::new(max_value_bytes, max_total_bytes),
+        initial_remaining: max_total_bytes,
+    };
+    let result = citadel_sql::with_read_budget(&settlement.child, operation);
+    settlement.settle()?;
+    result
+}
+
 /// Account for one atom that survived ranking and will leave the engine.
 pub(crate) fn charge_returned_atom_content(kind: &str, text: &str, payload: &Value) -> Result<()> {
     charge_atom_against(BudgetKind::Returned, kind, text, payload)
@@ -250,6 +305,11 @@ fn json_memory_bytes(root: &Value, stop_after: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use citadel::{Database, DatabaseBuilder};
+    use citadel_sql::Connection;
+
     use super::*;
 
     #[test]
@@ -289,6 +349,103 @@ mod tests {
                 charge_atom_content("fact", "text", &payload),
                 Err(MemError::ReadLimitExceeded { .. })
             ));
+        });
+    }
+
+    #[test]
+    fn mandatory_storage_cap_debits_the_surrounding_materialization_budget() {
+        let db: Arc<Database> = Arc::new(
+            DatabaseBuilder::new("ignored.db")
+                .passphrase(b"budget-probe")
+                .create_in_memory()
+                .unwrap(),
+        );
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("CREATE TABLE budget_probe (id INTEGER PRIMARY KEY, payload TEXT)")
+            .unwrap();
+        let payload = "x".repeat(16 * 1024);
+        conn.execute_params(
+            "INSERT INTO budget_probe VALUES (1, $1)",
+            &[citadel_sql::Value::Text(payload.into())],
+        )
+        .unwrap();
+
+        let outer = ReadBudget::new(64 * 1024, 64 * 1024);
+        with_content_budget(BudgetKind::Materialized, &outer, || {
+            let before = outer.remaining();
+            let result = with_storage_read_cap(64 * 1024, 64 * 1024, || {
+                Ok(conn.query("SELECT payload FROM budget_probe")?)
+            })
+            .unwrap();
+            assert_eq!(result.rows.len(), 1);
+            assert!(
+                outer.remaining() < before,
+                "child storage reads must debit the surrounding budget"
+            );
+        });
+    }
+
+    #[test]
+    fn failed_storage_reads_still_debit_the_surrounding_budget() {
+        let db: Arc<Database> = Arc::new(
+            DatabaseBuilder::new("ignored.db")
+                .passphrase(b"budget-probe")
+                .create_in_memory()
+                .unwrap(),
+        );
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("CREATE TABLE budget_probe (id INTEGER PRIMARY KEY, payload TEXT)")
+            .unwrap();
+        conn.execute_params(
+            "INSERT INTO budget_probe VALUES (1, $1)",
+            &[citadel_sql::Value::Text("x".repeat(16 * 1024).into())],
+        )
+        .unwrap();
+
+        let outer = ReadBudget::new(64 * 1024, 64 * 1024);
+        with_content_budget(BudgetKind::Materialized, &outer, || {
+            let before = outer.remaining();
+            let error = with_storage_read_cap(64 * 1024, 64 * 1024, || {
+                let result = conn.query("SELECT payload FROM budget_probe")?;
+                assert_eq!(result.rows.len(), 1);
+                Err::<(), _>(MemError::Invalid("probe".into()))
+            })
+            .unwrap_err();
+            assert!(matches!(error, MemError::Invalid(message) if message == "probe"));
+            assert!(outer.remaining() < before);
+        });
+    }
+
+    #[test]
+    fn unwinding_storage_reads_still_debit_the_surrounding_budget() {
+        let db: Arc<Database> = Arc::new(
+            DatabaseBuilder::new("ignored.db")
+                .passphrase(b"budget-probe")
+                .create_in_memory()
+                .unwrap(),
+        );
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("CREATE TABLE budget_probe (id INTEGER PRIMARY KEY, payload TEXT)")
+            .unwrap();
+        conn.execute_params(
+            "INSERT INTO budget_probe VALUES (1, $1)",
+            &[citadel_sql::Value::Text("x".repeat(16 * 1024).into())],
+        )
+        .unwrap();
+
+        let outer = ReadBudget::new(64 * 1024, 64 * 1024);
+        with_content_budget(BudgetKind::Materialized, &outer, || {
+            let before = outer.remaining();
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                with_storage_read_cap::<()>(64 * 1024, 64 * 1024, || {
+                    let result = conn.query("SELECT payload FROM budget_probe")?;
+                    assert_eq!(result.rows.len(), 1);
+                    panic!("probe");
+                })
+                .unwrap();
+            }));
+            assert!(panic.is_err());
+            assert!(outer.remaining() < before);
         });
     }
 }

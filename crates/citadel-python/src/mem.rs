@@ -1669,6 +1669,49 @@ impl PyMemory {
             .collect())
     }
 
+    /// Validate MMR limits and the attached region without embedding or reading atoms.
+    #[pyo3(signature = (region, *, k=4, fetch_k=20, lambda_mult=0.5))]
+    fn preflight_mmr(
+        &self,
+        py: Python<'_>,
+        region: &str,
+        k: usize,
+        fetch_k: usize,
+        lambda_mult: f32,
+    ) -> PyResult<()> {
+        let engine = Arc::clone(&self.inner);
+        let region = region.to_owned();
+        py.detach(move || engine.preflight_mmr(&region, k, fetch_k, lambda_mult))
+            .map_err(to_pyerr)
+    }
+
+    /// Recall `fetch_k` candidates from a cosine region, then return `k` selected
+    /// by maximal marginal relevance. Graph expansion is not supported.
+    #[pyo3(signature = (region, *, text=None, embedding=None, k=4, fetch_k=20, lambda_mult=0.5, kinds=None, options=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn recall_mmr(
+        &self,
+        py: Python<'_>,
+        region: &str,
+        text: Option<String>,
+        embedding: Option<Vec<f32>>,
+        k: usize,
+        fetch_k: usize,
+        lambda_mult: f32,
+        kinds: Option<Vec<String>>,
+        options: Option<&PyRecallOptions>,
+    ) -> PyResult<Vec<PyAtomHit>> {
+        let query = build_recall_query(text, embedding, fetch_k, kinds, options)?;
+        let engine = Arc::clone(&self.inner);
+        let region = region.to_owned();
+        Ok(py
+            .detach(move || engine.recall_mmr(&region, query, k, lambda_mult))
+            .map_err(to_pyerr)?
+            .into_iter()
+            .map(PyAtomHit::from_hit)
+            .collect())
+    }
+
     /// Recall atoms and return their induced region-local edge subgraph.
     #[pyo3(signature = (region, *, text=None, embedding=None, k=10, kinds=None, options=None, edge_limit=500))]
     #[allow(clippy::too_many_arguments)]

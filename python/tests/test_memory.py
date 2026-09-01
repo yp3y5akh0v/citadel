@@ -5,9 +5,8 @@ import tempfile
 import threading
 import time
 
-import pytest
-
 import citadeldb
+import pytest
 
 
 def mem_db(**kw):
@@ -47,10 +46,13 @@ def test_mock_embedder_rejects_dimensions_the_memory_format_cannot_store(dim):
 def test_remember_recall_payload():
     mem = mem_db()
     region(mem)
-    i = mem.remember("r", {"kind": "fact", "text": "the sky is blue", "payload": {"src": "x"}})
+    i = mem.remember(
+        "r", {"kind": "fact", "text": "the sky is blue", "payload": {"src": "x"}}
+    )
     assert isinstance(i, int)
     ids = mem.remember_batch(
-        "r", [{"kind": "fact", "text": "grass is green"}, {"kind": "note", "text": "todo"}]
+        "r",
+        [{"kind": "fact", "text": "grass is green"}, {"kind": "note", "text": "todo"}],
     )
     assert len(ids) == 2
     assert mem.count("r", "fact") == 2
@@ -203,6 +205,38 @@ def test_fetch_and_update_payload():
     assert mem.update_atom_payload("r", i, payload) is False
     assert mem.fetch_one("r", i).payload == {"v": 2, "nested": [1, 2, 3]}
     assert len(mem.fetch("r", "fact")) == 1
+
+
+def test_recall_mmr_uses_stored_vectors_without_exposing_them():
+    mem = mem_db()
+    region(mem, dim=2)
+    for text, embedding in [
+        ("nearest", [1.0, 0.0]),
+        ("redundant", [0.9, 0.1]),
+        ("diverse", [0.0, 1.0]),
+    ]:
+        mem.remember("r", {"kind": "fact", "text": text, "embedding": embedding})
+
+    hits = mem.recall_mmr(
+        "r",
+        embedding=[1.0, 0.0],
+        k=2,
+        fetch_k=3,
+        lambda_mult=0.0,
+        options=citadeldb.RecallOptions(weights=(1.0, 0.0, 0.0, 0.0)),
+    )
+    assert [hit.text for hit in hits] == ["nearest", "diverse"]
+
+
+def test_mmr_preflight_uses_the_core_region_and_work_policy():
+    mem = mem_db()
+    region(mem, dim=2)
+    mem.preflight_mmr("r", k=2, fetch_k=3, lambda_mult=0.25)
+
+    with pytest.raises(citadeldb.DataError, match="candidate count"):
+        mem.preflight_mmr("r", k=2, fetch_k=4097, lambda_mult=0.25)
+    with pytest.raises(citadeldb.ProgrammingError):
+        mem.preflight_mmr("missing", k=2, fetch_k=3, lambda_mult=0.25)
 
 
 def test_links_and_edges():
@@ -529,7 +563,9 @@ def test_set_reranker_python_object_reorders():
     long_ = mem.remember("r", {"kind": "fact", "text": "alpha alpha beta gamma"})
     assert mem.recall("r", text="alpha", k=2)[0].id == pure  # fusion: pure match first
     mem.set_reranker(ByLength(), strategy="replace")
-    assert mem.recall("r", text="alpha", k=2)[0].id == long_  # ByLength flips to the longer
+    assert (
+        mem.recall("r", text="alpha", k=2)[0].id == long_
+    )  # ByLength flips to the longer
 
 
 @pytest.mark.parametrize("rrf_k", [0.0, -1.0, float("nan"), float("inf")])
