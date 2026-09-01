@@ -54,6 +54,10 @@ The filter is evaluated inside the scan, so it narrows candidates before top-k r
 trimming results after it, and `k` is `k`: a filter matching only distant documents still
 returns them, however many others outrank them.
 
+MMR selection runs inside Citadel over the exact vectors stored for the recalled candidates.
+Stored vectors do not cross the Python boundary, and the document embedding model is not run
+again during search.
+
 ## Chat history
 
 ```python

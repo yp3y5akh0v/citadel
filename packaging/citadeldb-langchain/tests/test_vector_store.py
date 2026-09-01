@@ -1,3 +1,4 @@
+import citadeldb
 import pytest
 from citadeldb_langchain import CitadelVectorStore
 from citadeldb_langchain.vector_store import KIND, _model_id
@@ -455,6 +456,132 @@ def test_mmr_by_vector_works(store):
     )
 
 
+def test_mmr_uses_exact_stored_vectors_and_never_reembeds_documents(tmp_path):
+    class ArmableEmbedding:
+        model_id = "armable-mmr"
+
+        def __init__(self):
+            self.reject_documents = False
+
+        @staticmethod
+        def vector(text):
+            coordinates = {
+                "nearest": (1.0, 0.0),
+                "redundant": (0.9, 0.1),
+                "diverse": (0.0, 1.0),
+                "query": (1.0, 0.0),
+            }
+            x, y = coordinates[text]
+            return [x, y, *([0.0] * (DIM - 2))]
+
+        def embed_documents(self, texts):
+            if self.reject_documents:
+                raise AssertionError("MMR must not re-embed recalled documents")
+            return [self.vector(text) for text in texts]
+
+        def embed_query(self, text):
+            return self.vector(text)
+
+    embedding = ArmableEmbedding()
+    store = CitadelVectorStore(
+        embedding, str(tmp_path / "stored-mmr.cdl"), key="pw", dim=DIM
+    )
+    store.add_texts(["nearest", "redundant", "diverse"], ids=["a", "b", "c"])
+
+    embedding.reject_documents = True
+    got = store.max_marginal_relevance_search_by_vector(
+        embedding.embed_query("query"), k=2, fetch_k=3, lambda_mult=0.0
+    )
+    assert [document.id for document in got] == ["a", "c"]
+
+
+def test_similarity_and_mmr_candidates_use_only_vector_similarity(tmp_path):
+    class FixedEmbedding:
+        model_id = "semantic-only-ranking"
+
+        def embed_documents(self, texts):
+            raise AssertionError("the test supplies exact vectors")
+
+        def embed_query(self, text):
+            return [1.0, 0.0]
+
+    store = CitadelVectorStore(
+        FixedEmbedding(), str(tmp_path / "semantic-only.cdl"), key="pw", dim=2
+    )
+    store._mem.remember(
+        store._region,
+        {
+            "kind": KIND,
+            "text": "near",
+            "embedding": [0.6, 0.8],
+            "importance": 0.0,
+            "payload": {"did": "near", "meta": {}},
+        },
+    )
+    store._mem.remember(
+        store._region,
+        {
+            "kind": KIND,
+            "text": "important but slightly farther",
+            "embedding": [0.59, -0.807403],
+            "importance": 1.0,
+            "payload": {"did": "important", "meta": {}},
+        },
+    )
+    store._mem.remember(
+        store._region,
+        {
+            "kind": KIND,
+            "text": "farthest anchor",
+            "embedding": [-1.0, 0.0],
+            "importance": 0.0,
+            "payload": {"did": "anchor", "meta": {}},
+        },
+    )
+
+    query = [1.0, 0.0]
+    assert [doc.id for doc in store.similarity_search_by_vector(query, k=1)] == ["near"]
+    assert [
+        doc.id
+        for doc in store.max_marginal_relevance_search_by_vector(query, k=1, fetch_k=1)
+    ] == ["near"]
+
+
+def test_mmr_is_one_filtered_core_operation(store):
+    store.add_texts(
+        ["one", "two", "three"],
+        metadatas=[{"cat": "x"}, {"cat": "y"}, {"cat": "y"}],
+        ids=["a", "b", "c"],
+    )
+
+    class RecordingMemory:
+        def __init__(self, inner):
+            self.inner = inner
+            self.calls = []
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+        def recall(self, *args, **kwargs):
+            raise AssertionError("MMR must stay inside one core recall operation")
+
+        def recall_mmr(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            return self.inner.recall_mmr(*args, **kwargs)
+
+    proxy = RecordingMemory(store._mem)
+    store._mem = proxy
+    got = store.max_marginal_relevance_search(
+        "one", k=2, fetch_k=5, lambda_mult=0.25, filter={"cat": "y"}
+    )
+    assert {doc.id for doc in got} == {"b", "c"}
+    assert len(proxy.calls) == 1
+    _, kwargs = proxy.calls[0]
+    assert kwargs["k"] == 2
+    assert kwargs["fetch_k"] == 5
+    assert kwargs["lambda_mult"] == 0.25
+
+
 def test_mmr_respects_a_filter(store):
     store.add_texts(
         ["one", "two"], metadatas=[{"cat": "x"}, {"cat": "y"}], ids=["a", "b"]
@@ -467,6 +594,68 @@ def test_mmr_respects_a_filter(store):
 
 def test_mmr_on_an_empty_store_is_empty(store):
     assert store.max_marginal_relevance_search("anything", k=2) == []
+
+
+@pytest.mark.parametrize("lambda_mult", [-0.1, 1.1, float("nan"), float("inf")])
+def test_mmr_rejects_invalid_lambda(store, lambda_mult):
+    class NoQueryEmbedding:
+        def embed_query(self, text):
+            raise AssertionError("invalid MMR must fail before query embedding")
+
+    store._embedding = NoQueryEmbedding()
+    with pytest.raises(ValueError, match="lambda_mult"):
+        store.max_marginal_relevance_search("query", lambda_mult=lambda_mult)
+
+
+def test_empty_mmr_returns_before_query_embedding(store):
+    class NoQueryEmbedding:
+        def embed_query(self, text):
+            raise AssertionError("empty MMR must not run query embedding")
+
+    store._embedding = NoQueryEmbedding()
+    assert store.max_marginal_relevance_search("query", k=0) == []
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "error", "match"),
+    [
+        ({"k": True}, TypeError, "k must be an integer"),
+        ({"fetch_k": 1.5}, TypeError, "fetch_k must be an integer"),
+        ({"lambda_mult": True}, TypeError, "lambda_mult must be a number"),
+        ({"fetch_k": 4097}, citadeldb.DataError, "candidate count"),
+        ({"k": 0, "fetch_k": 4097}, citadeldb.DataError, "candidate count"),
+        (
+            {"k": 4096, "fetch_k": 4096},
+            citadeldb.DataError,
+            "similarity components",
+        ),
+    ],
+)
+def test_mmr_rejects_invalid_work_before_query_embedding(store, kwargs, error, match):
+    class NoQueryEmbedding:
+        def embed_query(self, text):
+            raise AssertionError("invalid MMR must fail before query embedding")
+
+    store._embedding = NoQueryEmbedding()
+    with pytest.raises(error, match=match):
+        store.max_marginal_relevance_search("query", **kwargs)
+
+
+def test_mmr_rejects_candidate_vector_bytes_before_query_embedding(tmp_path):
+    class NoQueryEmbedding:
+        model_id = "wide-mmr-policy"
+
+        def embed_documents(self, texts):
+            return [[0.0] * 4096 for _ in texts]
+
+        def embed_query(self, text):
+            raise AssertionError("invalid MMR must fail before query embedding")
+
+    store = CitadelVectorStore(
+        NoQueryEmbedding(), str(tmp_path / "wide-mmr.cdl"), key="pw", dim=4096
+    )
+    with pytest.raises(citadeldb.DataError, match="candidate-vector bytes"):
+        store.max_marginal_relevance_search("query", k=1, fetch_k=1025)
 
 
 def test_the_mmr_retriever_works(store):
@@ -501,8 +690,6 @@ def test_it_survives_a_reopen(tmp_path):
 
 def test_a_region_width_clash_raises_at_construction(tmp_path):
     """A dim clash must not be deferred to the first write."""
-    import citadeldb
-
     p = str(tmp_path / "clash.cdl")
     CitadelVectorStore(embedder(), p, key="pw", dim=DIM)
     with pytest.raises(citadeldb.DataError, match="dim"):
@@ -512,8 +699,6 @@ def test_a_region_width_clash_raises_at_construction(tmp_path):
 def test_a_wrong_passphrase_cannot_reopen(tmp_path):
     """The corpus is the payload, so the encryption claim is pinned."""
     import gc
-
-    import citadeldb
 
     p = str(tmp_path / "enc.cdl")
     first = CitadelVectorStore(embedder(), p, key="right", dim=DIM)
@@ -527,8 +712,6 @@ def test_a_wrong_passphrase_cannot_reopen(tmp_path):
 
 def test_existing_vault_authenticates_before_dimension_probe(tmp_path):
     import gc
-
-    import citadeldb
 
     path = str(tmp_path / "auth-before-probe.cdl")
     first = CitadelVectorStore(embedder(), path, key="right", dim=DIM)
@@ -586,6 +769,7 @@ async def test_async_surface_round_trips(store):
     assert ids == ["a1"]
     assert [d.id for d in await store.aget_by_ids(["a1"])] == ["a1"]
     assert [d.id for d in await store.asimilarity_search("async body", k=1)] == ["a1"]
+    assert len(await store.amax_marginal_relevance_search("async body", k=1)) == 1
     assert await store.adelete(["a1"]) is True
     assert store.count() == 0
 
@@ -593,6 +777,7 @@ async def test_async_surface_round_trips(store):
 async def test_the_event_loop_is_not_blocked(store):
     """The base class calls sync straight through, so each is overridden."""
     import asyncio
+    import time
 
     ticks = 0
 
@@ -606,5 +791,63 @@ async def test_the_event_loop_is_not_blocked(store):
     await asyncio.sleep(0)
     await store.aadd_texts([f"loop body {i}" for i in range(40)])
     await store.asimilarity_search("loop body 1", k=5)
+
+    class SlowMmrMemory:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+        def preflight_mmr(self, *args, **kwargs):
+            before = ticks
+            time.sleep(0.05)
+            assert ticks > before, "the event loop stalled during MMR preflight"
+            return self.inner.preflight_mmr(*args, **kwargs)
+
+        def recall_mmr(self, *args, **kwargs):
+            time.sleep(0.05)
+            return self.inner.recall_mmr(*args, **kwargs)
+
+    store._mem = SlowMmrMemory(store._mem)
+    before_mmr = ticks
+    await store.amax_marginal_relevance_search("loop body 1", k=5, fetch_k=20)
+    assert ticks > before_mmr, "the event loop stalled during async MMR"
     ticker.cancel()
     assert ticks > 1, "the loop made no progress during a store call"
+
+
+async def test_async_mmr_uses_async_query_embedding(tmp_path):
+    class AsyncQueryEmbedding:
+        model_id = "async-query-mmr"
+
+        def __init__(self):
+            self.reject_sync_query = False
+
+        @staticmethod
+        def vector(text):
+            seed = sum(text.encode("utf-8"))
+            return [float((seed + 11 * i) % 37 + 1) for i in range(DIM)]
+
+        def embed_documents(self, texts):
+            return [self.vector(text) for text in texts]
+
+        async def aembed_documents(self, texts):
+            return self.embed_documents(texts)
+
+        def embed_query(self, text):
+            if self.reject_sync_query:
+                raise AssertionError("async MMR called the synchronous query embedder")
+            return self.vector(text)
+
+        async def aembed_query(self, text):
+            return self.vector(text)
+
+    embedding = AsyncQueryEmbedding()
+    store = CitadelVectorStore(
+        embedding, str(tmp_path / "async-mmr.cdl"), key="pw", dim=DIM
+    )
+    store.add_texts(["alpha one", "alpha two"], ids=["a", "b"])
+    embedding.reject_sync_query = True
+    got = await store.amax_marginal_relevance_search("alpha", k=2, fetch_k=2)
+    assert {doc.id for doc in got} == {"a", "b"}

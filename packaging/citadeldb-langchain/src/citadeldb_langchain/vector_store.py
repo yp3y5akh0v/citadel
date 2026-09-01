@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import uuid
 from collections.abc import Iterable, Sequence
 from operator import index
@@ -210,6 +211,22 @@ def _get_by_ids(mem: Any, region: str, ids: Sequence[str]) -> list[Document]:
     return [_document(h) for did in wanted for h in found[did]]
 
 
+def _search_hits(
+    mem: Any,
+    region: str,
+    embedding: list[float],
+    k: int,
+    metadata_filter: dict[str, Any] | None,
+) -> list[Any]:
+    if k <= 0:
+        return []
+    options = citadeldb.RecallOptions(
+        payload_filter={"meta": metadata_filter} if metadata_filter else None,
+        weights=(1.0, 0.0, 0.0, 0.0),
+    )
+    return mem.recall(region, embedding=embedding, k=k, kinds=[KIND], options=options)
+
+
 def _search(
     mem: Any,
     region: str,
@@ -217,15 +234,10 @@ def _search(
     k: int,
     metadata_filter: dict[str, Any] | None,
 ) -> list[tuple[Document, float]]:
-    if k <= 0:
-        return []
-    options = (
-        citadeldb.RecallOptions(payload_filter={"meta": metadata_filter})
-        if metadata_filter
-        else None
-    )
-    hits = mem.recall(region, embedding=embedding, k=k, kinds=[KIND], options=options)
-    return [(_document(h), _similarity(h)) for h in hits]
+    return [
+        (_document(hit), _similarity(hit))
+        for hit in _search_hits(mem, region, embedding, k, metadata_filter)
+    ]
 
 
 def _similarity(hit: Any) -> float:
@@ -239,15 +251,48 @@ def _clear(mem: Any, region: str) -> int:
     return _erase(mem, region, _fetch(mem, region, None))
 
 
-def _mmr_indices(
-    query: list[float], candidates: list[list[float]], *, k: int, lambda_mult: float
-) -> list[int]:
-    """Rank candidates by maximal marginal relevance."""
-    import numpy as np
-    from langchain_core.vectorstores.utils import maximal_marginal_relevance
+def _validate_mmr(
+    mem: Any, region: str, k: int, fetch_k: int, lambda_mult: float
+) -> bool:
+    for name, value in (("k", k), ("fetch_k", fetch_k)):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"{name} must be an integer")
+    if isinstance(lambda_mult, bool) or not isinstance(lambda_mult, (int, float)):
+        raise TypeError("lambda_mult must be a number")
+    if not math.isfinite(lambda_mult) or not 0.0 <= lambda_mult <= 1.0:
+        raise ValueError("lambda_mult must be finite and between 0 and 1")
+    empty = k <= 0 or fetch_k <= 0
+    mem.preflight_mmr(
+        region,
+        k=max(k, 0),
+        fetch_k=max(fetch_k, 0),
+        lambda_mult=lambda_mult,
+    )
+    return not empty
 
-    return maximal_marginal_relevance(
-        np.array(query, dtype=np.float32), candidates, k=k, lambda_mult=lambda_mult
+
+def _mmr_hits(
+    mem: Any,
+    region: str,
+    embedding: list[float],
+    *,
+    k: int,
+    fetch_k: int,
+    lambda_mult: float,
+    metadata_filter: dict[str, Any] | None,
+) -> list[Any]:
+    options = citadeldb.RecallOptions(
+        payload_filter={"meta": metadata_filter} if metadata_filter else None,
+        weights=(1.0, 0.0, 0.0, 0.0),
+    )
+    return mem.recall_mmr(
+        region,
+        embedding=embedding,
+        k=k,
+        fetch_k=fetch_k,
+        lambda_mult=lambda_mult,
+        kinds=[KIND],
+        options=options,
     )
 
 
@@ -397,15 +442,18 @@ class CitadelVectorStore(VectorStore):
         filter: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> list[Document]:
-        candidates = _search(self._mem, self._region, embedding, fetch_k, filter)
-        if not candidates:
+        if not _validate_mmr(self._mem, self._region, k, fetch_k, lambda_mult):
             return []
-        docs = [doc for doc, _ in candidates]
-        # Recall does not expose stored ANN vectors. Re-embedding avoids duplicating
-        # every high-dimensional vector in the encrypted JSON payload.
-        vectors = self._embedding.embed_documents([d.page_content for d in docs])
-        chosen = _mmr_indices(embedding, vectors, k=k, lambda_mult=lambda_mult)
-        return [docs[i] for i in chosen]
+        hits = _mmr_hits(
+            self._mem,
+            self._region,
+            embedding,
+            k=k,
+            fetch_k=fetch_k,
+            lambda_mult=lambda_mult,
+            metadata_filter=filter,
+        )
+        return [_document(hit) for hit in hits]
 
     def max_marginal_relevance_search(
         self,
@@ -417,9 +465,18 @@ class CitadelVectorStore(VectorStore):
         filter: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> list[Document]:
-        return self.max_marginal_relevance_search_by_vector(
-            self._embedding.embed_query(query), k, fetch_k, lambda_mult, filter=filter
+        if not _validate_mmr(self._mem, self._region, k, fetch_k, lambda_mult):
+            return []
+        hits = _mmr_hits(
+            self._mem,
+            self._region,
+            self._embedding.embed_query(query),
+            k=k,
+            fetch_k=fetch_k,
+            lambda_mult=lambda_mult,
+            metadata_filter=filter,
         )
+        return [_document(hit) for hit in hits]
 
     def _select_relevance_score_fn(self):
         """Scores are cosine similarity; relevance only clamps to [0, 1]."""
@@ -463,6 +520,53 @@ class CitadelVectorStore(VectorStore):
             _search, self._mem, self._region, vector, k, filter
         )
         return [doc for doc, _ in pairs]
+
+    async def amax_marginal_relevance_search_by_vector(
+        self,
+        embedding: list[float],
+        k: int = 4,
+        fetch_k: int = 20,
+        lambda_mult: float = 0.5,
+        *,
+        filter: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> list[Document]:
+        return await asyncio.to_thread(
+            self.max_marginal_relevance_search_by_vector,
+            embedding,
+            k,
+            fetch_k,
+            lambda_mult,
+            filter=filter,
+        )
+
+    async def amax_marginal_relevance_search(
+        self,
+        query: str,
+        k: int = 4,
+        fetch_k: int = 20,
+        lambda_mult: float = 0.5,
+        *,
+        filter: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> list[Document]:
+        valid = await asyncio.to_thread(
+            _validate_mmr, self._mem, self._region, k, fetch_k, lambda_mult
+        )
+        if not valid:
+            return []
+        embedding = await self._embedding.aembed_query(query)
+        hits = await asyncio.to_thread(
+            _mmr_hits,
+            self._mem,
+            self._region,
+            embedding,
+            k=k,
+            fetch_k=fetch_k,
+            lambda_mult=lambda_mult,
+            metadata_filter=filter,
+        )
+        return [_document(hit) for hit in hits]
 
     @classmethod
     def from_texts(

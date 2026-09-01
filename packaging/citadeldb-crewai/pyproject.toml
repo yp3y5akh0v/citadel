@@ -19,8 +19,8 @@ classifiers = [
   "Topic :: Database",
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-# A record replaces under its own id, which needs the keyed write added in 2.0.
-dependencies = ["citadeldb>=2.0,<3", "crewai>=1.14.7,<2"]
+# Reads the expanded AtomHit scoring fields added in citadeldb 2.2.
+dependencies = ["citadeldb>=2.2,<3", "crewai>=1.14.7,<2"]
 
 [project.optional-dependencies]
 test = ["pytest>=8"]

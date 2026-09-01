@@ -18,8 +18,8 @@ classifiers = [
   "Topic :: Database",
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-# The precomputed vector needs the `embedding` field added in citadeldb 2.0.
-dependencies = ["citadeldb>=2.0,<3", "haystack-ai>=2.9,<4"]
+# Reads the expanded AtomHit scoring fields added in citadeldb 2.2.
+dependencies = ["citadeldb>=2.2,<3", "haystack-ai>=2.9,<4"]
 
 [project.optional-dependencies]
 test = ["pytest>=8", "pytest-asyncio>=0.23"]

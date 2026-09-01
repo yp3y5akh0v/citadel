@@ -18,8 +18,8 @@ classifiers = [
   "Topic :: Database",
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-# An event replaces under its own id, which needs the keyed write added in 2.0.
-dependencies = ["citadeldb>=2.0,<3", "google-adk>=2.0,<3"]
+# Requires the cancellation-aware embedder protocol added in citadeldb 2.2.
+dependencies = ["citadeldb>=2.2,<3", "google-adk>=2.0,<3"]
 
 [project.optional-dependencies]
 test = ["pytest>=8", "pytest-asyncio>=0.23"]
