@@ -54,6 +54,10 @@ impl ReadBudget {
                 remaining,
             });
         }
+        self.try_charge_aggregate(size)
+    }
+
+    fn try_charge_aggregate(&self, size: usize) -> Result<()> {
         match self
             .inner
             .remaining
@@ -66,6 +70,30 @@ impl ReadBudget {
                 max_value: self.inner.max_value,
                 remaining,
             }),
+        }
+    }
+
+    /// Record bytes already materialized by a child reader.
+    ///
+    /// Unlike admission, an over-budget record drains the remaining allowance:
+    /// the allocation has already happened and must not become spendable again.
+    #[doc(hidden)]
+    pub fn record_aggregate_spend(&self, size: usize) -> Result<()> {
+        let remaining = self
+            .inner
+            .remaining
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                Some(remaining.saturating_sub(size))
+            })
+            .expect("aggregate-spend update always supplies a value");
+        if size <= remaining {
+            Ok(())
+        } else {
+            Err(Error::ReadBudgetExceeded {
+                size,
+                max_value: self.inner.max_value,
+                remaining,
+            })
         }
     }
 }
@@ -110,5 +138,35 @@ mod tests {
             Err(Error::ReadBudgetExceeded { remaining: 4, .. })
         ));
         assert_eq!(budget.remaining(), 4);
+    }
+
+    #[test]
+    fn aggregate_charge_enforces_only_the_shared_total() {
+        let budget = ReadBudget::new(4, 10);
+        budget.try_charge_aggregate(7).unwrap();
+        assert_eq!(budget.remaining(), 3);
+        assert!(matches!(
+            budget.try_charge_aggregate(4),
+            Err(Error::ReadBudgetExceeded {
+                size: 4,
+                max_value: 4,
+                remaining: 3,
+            })
+        ));
+        assert_eq!(budget.remaining(), 3);
+    }
+
+    #[test]
+    fn recording_spend_drains_a_short_budget() {
+        let budget = ReadBudget::new(4, 3);
+        assert!(matches!(
+            budget.record_aggregate_spend(5),
+            Err(Error::ReadBudgetExceeded {
+                size: 5,
+                max_value: 4,
+                remaining: 3,
+            })
+        ));
+        assert_eq!(budget.remaining(), 0);
     }
 }

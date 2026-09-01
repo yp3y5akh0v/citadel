@@ -4,8 +4,9 @@ use std::sync::Arc;
 
 use citadel::{Argon2Profile, Database, DatabaseBuilder};
 use citadel_mem::{
-    AtomId, AtomInput, Embedder, MemError, MemoryEngine, MockEmbedder, MultiRecallQuery,
-    RecallQuery, StoredEmbeddingsIdentity, STORED_EMBEDDINGS_SCHEMA,
+    AtomId, AtomInput, EdgeKind, EmbedError, Embedder, EmbeddingMetric, GraphExpand, MemError,
+    MemoryEngine, MemoryReadLimits, MockEmbedder, MultiRecallQuery, RecallQuery,
+    StoredEmbeddingsIdentity, STORED_EMBEDDINGS_SCHEMA,
 };
 use citadel_sql::{Connection, Value};
 use serde_json::json;
@@ -13,6 +14,54 @@ use serde_json::json;
 const DIM: usize = 8;
 const PLAIN_TABLE: &str = "memory_atoms_d8_cosine";
 const SEALED_TABLE: &str = "memory_atoms_d8_cosine_enc";
+
+struct NoCallEmbedder;
+
+impl Embedder for NoCallEmbedder {
+    fn dim(&self) -> usize {
+        DIM
+    }
+
+    fn metric(&self) -> EmbeddingMetric {
+        EmbeddingMetric::Cosine
+    }
+
+    fn model_id(&self) -> &str {
+        "stored-vector-test"
+    }
+
+    fn embed_with_cancel(
+        &self,
+        _texts: &[&str],
+        _cancel: Option<&citadel_core::CancelToken>,
+    ) -> Result<Vec<Vec<f32>>, EmbedError> {
+        panic!("exact stored-vector reads must not invoke the embedder")
+    }
+}
+
+struct NoCallMetricEmbedder(EmbeddingMetric);
+
+impl Embedder for NoCallMetricEmbedder {
+    fn dim(&self) -> usize {
+        DIM
+    }
+
+    fn metric(&self) -> EmbeddingMetric {
+        self.0
+    }
+
+    fn model_id(&self) -> &str {
+        "stored-vector-metric-test"
+    }
+
+    fn embed_with_cancel(
+        &self,
+        _texts: &[&str],
+        _cancel: Option<&citadel_core::CancelToken>,
+    ) -> Result<Vec<Vec<f32>>, EmbedError> {
+        panic!("invalid MMR work must be rejected before model execution")
+    }
+}
 
 fn create_db(dir: &std::path::Path) -> Arc<Database> {
     Arc::new(
@@ -89,6 +138,233 @@ fn assert_identity_shape(identity: &StoredEmbeddingsIdentity, region: &str) {
         .sha256()
         .bytes()
         .all(|byte| byte.is_ascii_hexdigit()));
+}
+
+fn mmr_vector(x: f32, y: f32) -> Vec<f32> {
+    vec![x, y, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+}
+
+#[test]
+fn mmr_uses_stored_vectors_without_calling_the_embedder() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let eng = MemoryEngine::open(db).unwrap();
+
+    for encrypted in [false, true] {
+        let region = format!("mmr-{}", u8::from(encrypted));
+        if encrypted {
+            eng.create_encrypted_region(&region, Arc::new(NoCallEmbedder))
+                .unwrap();
+        } else {
+            eng.create_region(&region, Arc::new(NoCallEmbedder))
+                .unwrap();
+        }
+        for (text, vector) in [
+            ("nearest", mmr_vector(1.0, 0.0)),
+            ("redundant", mmr_vector(0.9, 0.1)),
+            ("diverse", mmr_vector(0.0, 1.0)),
+        ] {
+            eng.remember(&region, AtomInput::new("fact", text).with_embedding(vector))
+                .unwrap();
+        }
+
+        let query = RecallQuery::by_embedding(mmr_vector(1.0, 0.0), 3);
+        let hits = eng.recall_mmr(&region, query, 2, 0.0).unwrap();
+        assert_eq!(
+            hits.iter().map(|hit| hit.text.as_str()).collect::<Vec<_>>(),
+            ["nearest", "diverse"]
+        );
+    }
+}
+
+#[test]
+fn sealed_mmr_uses_exact_vectors_when_normalization_would_reverse_a_close_tie() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let eng = MemoryEngine::open(db).unwrap();
+    eng.create_encrypted_region("close-tie", Arc::new(NoCallEmbedder))
+        .unwrap();
+
+    let anchor = vec![
+        0.738_912_3,
+        -0.401_233_7,
+        0.274_551_1,
+        0.199_999_9,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+    ];
+    let b = vec![
+        0.002_584_744_2,
+        0.003_157_825_7,
+        0.000_159_807_12,
+        0.002_641_923_5,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+    ];
+    let c = vec![
+        0.001_037_197_2,
+        0.001_267_161_2,
+        0.000_064_126_936,
+        0.001_060_141_6,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+    ];
+    for (text, vector) in [("anchor", anchor.clone()), ("b", b), ("c", c)] {
+        eng.remember(
+            "close-tie",
+            AtomInput::new("fact", text).with_embedding(vector),
+        )
+        .unwrap();
+    }
+
+    let hits = eng
+        .recall_mmr("close-tie", RecallQuery::by_embedding(anchor, 3), 2, 0.0)
+        .unwrap();
+    assert_eq!(
+        hits.iter().map(|hit| hit.text.as_str()).collect::<Vec<_>>(),
+        ["anchor", "b"]
+    );
+}
+
+#[test]
+fn mmr_rejects_invalid_or_unbounded_work_before_model_execution() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let eng = MemoryEngine::open(db).unwrap();
+
+    let error = eng
+        .preflight_mmr("does-not-exist", 2, 3, f32::NAN)
+        .unwrap_err();
+    assert!(matches!(error, MemError::Invalid(_)), "got {error}");
+    let error = eng
+        .preflight_mmr("does-not-exist", 2, 4097, 0.5)
+        .unwrap_err();
+    assert!(
+        matches!(error, MemError::WorkLimitExceeded { limit: 4096, .. }),
+        "preflight must apply the core candidate cap before region access, got {error}"
+    );
+    eng.preflight_mmr("does-not-exist", 0, 3, 0.5).unwrap();
+
+    let error = eng
+        .recall_mmr(
+            "does-not-exist",
+            RecallQuery::by_embedding(mmr_vector(1.0, 0.0), 3),
+            2,
+            f32::NAN,
+        )
+        .unwrap_err();
+    assert!(matches!(error, MemError::Invalid(_)), "got {error}");
+
+    let error = eng
+        .recall_mmr(
+            "does-not-exist",
+            RecallQuery::by_embedding(mmr_vector(1.0, 0.0), 4097),
+            2,
+            0.5,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(error, MemError::WorkLimitExceeded { limit: 4096, .. }),
+        "candidate cap must precede region access, got {error}"
+    );
+
+    eng.create_region("wide", Arc::new(MockEmbedder::new(4096)))
+        .unwrap();
+    assert!(matches!(
+        eng.preflight_mmr("wide", 2, 1025, 0.5),
+        Err(MemError::WorkLimitExceeded { .. })
+    ));
+    let error = eng
+        .recall_mmr(
+            "wide",
+            RecallQuery::by_embedding(vec![0.0; 4096], 1025),
+            2,
+            0.5,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(error, MemError::WorkLimitExceeded { .. }),
+        "candidate vectors must stay within the raw-byte cap, got {error}"
+    );
+
+    eng.create_region(
+        "bounded-work",
+        Arc::new(NoCallMetricEmbedder(EmbeddingMetric::Cosine)),
+    )
+    .unwrap();
+    let error = eng
+        .recall_mmr(
+            "bounded-work",
+            RecallQuery::by_text("must not embed", 4096),
+            4096,
+            0.5,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(error, MemError::WorkLimitExceeded { .. }),
+        "similarity component work must be capped before embedding, got {error}"
+    );
+
+    eng.create_region("l2", Arc::new(NoCallMetricEmbedder(EmbeddingMetric::L2)))
+        .unwrap();
+    assert_invalid(eng.preflight_mmr("l2", 1, 2, 0.5), "cosine region");
+    assert_invalid(
+        eng.recall_mmr("l2", RecallQuery::by_text("must not embed", 2), 1, 0.5),
+        "cosine region",
+    );
+
+    let graph_query = RecallQuery::by_text("must not embed", 2)
+        .with_graph_expand(GraphExpand::new(1, vec![EdgeKind::SimilarTo]));
+    assert_invalid(
+        eng.recall_mmr("bounded-work", graph_query, 1, 0.5),
+        "graph expansion",
+    );
+}
+
+#[test]
+fn encrypted_mmr_composes_its_storage_cap_with_the_outer_materialization_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let eng = MemoryEngine::open(db.clone()).unwrap();
+    eng.create_encrypted_region("budget", Arc::new(NoCallEmbedder))
+        .unwrap();
+    let id = eng
+        .remember(
+            "budget",
+            AtomInput::new("fact", "budgeted secret").with_embedding(mmr_vector(1.0, 0.0)),
+        )
+        .unwrap();
+    let row = Connection::open(&db)
+        .unwrap()
+        .query_params(
+            &format!("SELECT sealed FROM {SEALED_TABLE} WHERE id = $1"),
+            &[Value::Integer(id)],
+        )
+        .unwrap();
+    let Value::Blob(sealed) = &row.rows[0][0] else {
+        panic!("sealed atom is not a blob")
+    };
+    let total = sealed.len() * 2 + DIM * std::mem::size_of::<f32>() - 1;
+    let error = eng
+        .with_read_limits(MemoryReadLimits::new(total, total, 1024), |eng| {
+            eng.recall_mmr(
+                "budget",
+                RecallQuery::by_embedding(mmr_vector(1.0, 0.0), 1),
+                1,
+                1.0,
+            )
+        })
+        .unwrap_err();
+    assert!(
+        matches!(error, MemError::ReadLimitExceeded { .. }),
+        "ciphertext, plaintext, and vector copies must share the outer budget, got {error}"
+    );
 }
 
 #[test]
@@ -351,7 +627,7 @@ fn every_sealed_surface_refuses_a_cross_engine_partial_region_drop() {
 
     // One handle per assertion: a failed guard evicts, so sharing tests only one.
     let mut clients = Vec::new();
-    for _ in 0..13 {
+    for _ in 0..14 {
         let client = MemoryEngine::open(db.clone()).unwrap();
         client
             .attach_existing_region("vault", Arc::new(MockEmbedder::new(DIM)))
@@ -414,12 +690,18 @@ fn every_sealed_surface_refuses_a_cross_engine_partial_region_drop() {
     assert_region_not_attached(clients[8].verify_atoms("vault", &[atom]));
     assert_region_not_attached(clients[9].summarize("vault", 0));
     assert_region_not_attached(clients[10].stored_embeddings_identity("vault", "fact"));
-    assert_region_not_attached(clients[11].update_atom_payload(
+    assert_region_not_attached(clients[11].recall_mmr(
+        "vault",
+        RecallQuery::by_embedding(mmr_vector(1.0, 0.0), 1),
+        1,
+        0.5,
+    ));
+    assert_region_not_attached(clients[12].update_atom_payload(
         "vault",
         atom,
         &json!({"must_not": "write"}),
     ));
-    assert_region_not_attached(clients[12].set_importance("vault", &[(atom, 99.0)]));
+    assert_region_not_attached(clients[13].set_importance("vault", &[(atom, 99.0)]));
     let err = owner
         .attach_existing_region("vault", Arc::new(MockEmbedder::new(DIM)))
         .expect_err("a tombstoned region key cannot be reattached");

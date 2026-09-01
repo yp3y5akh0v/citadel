@@ -4355,6 +4355,94 @@ fn vector_only_atom_decoder_never_parses_text_or_payload() {
 }
 
 #[test]
+fn mmr_vector_open_validates_dimension_before_allocating_and_charges_the_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = MemoryEngine::open(create_db(dir.path())).unwrap();
+    let atom_wrap = derive_atom_wrap_key(&[7u8; citadel_core::KEY_SIZE]);
+
+    let (wrong, wrapped) = seal_atom(&atom_wrap, 41, &[1.0; 16], "text", "{}");
+    let error = eng
+        .with_read_limits(
+            MemoryReadLimits::new(usize::MAX, wrong.len(), usize::MAX),
+            |_| open_mmr_embedding(&atom_wrap, &wrapped, 41, &wrong, 8),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(error, MemError::Invalid(_)) && error.to_string().contains("dim 16"),
+        "the authenticated dimension must be rejected before a vector allocation: {error}"
+    );
+
+    let (valid, wrapped) = seal_atom(&atom_wrap, 42, &[1.0; 8], "text", "{}");
+    let error = eng
+        .with_read_limits(
+            MemoryReadLimits::new(usize::MAX, valid.len() + 8 * 4 - 1, usize::MAX),
+            |_| open_mmr_embedding(&atom_wrap, &wrapped, 42, &valid, 8),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(error, MemError::ReadLimitExceeded { .. }),
+        "the decoded vector allocation must be charged: {error}"
+    );
+}
+
+#[test]
+fn cached_mmr_redundancy_matches_a_recomputing_reference() {
+    fn reference(query: &[f32], candidates: &[&[f32]], k: usize, lambda: f32) -> Vec<usize> {
+        let take = k.min(candidates.len());
+        if take == 0 {
+            return Vec::new();
+        }
+        let first = maximal_marginal_relevance(query, candidates, 1, lambda, None).unwrap()[0];
+        let query_scores = candidates
+            .iter()
+            .map(|candidate| cosine_similarity(query, candidate, None).unwrap())
+            .collect::<Vec<_>>();
+        let mut selected = vec![first];
+        while selected.len() < take {
+            let mut best = None;
+            for (index, &query_score) in query_scores.iter().enumerate() {
+                if selected.contains(&index) {
+                    continue;
+                }
+                let redundancy = selected
+                    .iter()
+                    .map(|&chosen| {
+                        cosine_similarity(candidates[index], candidates[chosen], None).unwrap()
+                    })
+                    .fold(f64::NEG_INFINITY, f64::max);
+                let score =
+                    f64::from(lambda) * query_score - (1.0 - f64::from(lambda)) * redundancy;
+                if best.is_none_or(|(_, best_score)| score > best_score) {
+                    best = Some((index, score));
+                }
+            }
+            selected.push(best.expect("an unselected reference candidate remains").0);
+        }
+        selected
+    }
+
+    let query = [1.0, 0.1, -0.2];
+    let owned = [
+        [0.95, 0.05, -0.1],
+        [0.8, 0.4, -0.2],
+        [0.1, 1.0, 0.3],
+        [-0.4, 0.2, 1.0],
+        [0.3, -0.8, 0.5],
+    ];
+    let candidates = owned
+        .iter()
+        .map(|candidate| candidate.as_slice())
+        .collect::<Vec<_>>();
+    for lambda in [0.0, 0.25, 0.5, 0.9, 1.0] {
+        assert_eq!(
+            maximal_marginal_relevance(&query, &candidates, 4, lambda, None).unwrap(),
+            reference(&query, &candidates, 4, lambda),
+            "cached redundancy diverged at lambda={lambda}"
+        );
+    }
+}
+
+#[test]
 fn text_only_atom_decoder_never_materializes_payload() {
     let embedding = [2.0f32, -4.0];
     let text = "dedup needle";
@@ -5243,6 +5331,14 @@ fn local_read_postprocessing_observes_its_cancel_snapshot() {
     assert_mem_interrupted(eng.stored_atom_retrieval_state("local-cancel"));
 
     arm_cancel_after_local_work(&db);
+    assert_mem_interrupted(eng.recall_mmr(
+        "local-cancel",
+        RecallQuery::by_embedding(unit(8, 0), 2),
+        2,
+        0.5,
+    ));
+
+    arm_cancel_after_local_work(&db);
     assert_mem_interrupted(eng.ann_cache_status("local-cancel"));
 
     arm_cancel_after_local_work(&db);
@@ -5906,6 +6002,13 @@ fn already_cancelled_database_token_skips_every_external_embedding_path() {
     assert_mem_interrupted(eng.delete_atoms("cancelled-boundary", &[]));
     assert_mem_interrupted(eng.verify_atoms("cancelled-boundary", &[]));
     assert_mem_interrupted(eng.recall("cancelled-boundary", RecallQuery::by_text("query", 0)));
+    assert_mem_interrupted(eng.preflight_mmr("cancelled-boundary", 0, 0, 0.5));
+    assert_mem_interrupted(eng.recall_mmr(
+        "cancelled-boundary",
+        RecallQuery::by_text("query", 0),
+        0,
+        0.5,
+    ));
     assert_mem_interrupted(
         eng.recall_many("cancelled-boundary", MultiRecallQuery::new(Vec::new(), 1)),
     );
