@@ -246,11 +246,13 @@ to a plaintext store. (An earlier revision reported A = 67.9% as the "embedder
 ceiling"; that diagnostic embedded the raw turn text while the index held
 speaker-and-caption-enriched text - an instrumentation artifact, not a ceiling.)
 Fusion and the reranker add recall on top of the exact vector layer because they
-merge non-vector signals. The all column bounds multi-hop: even exact retrieval
-surfaces every gold turn for only 57.1% of multi-hop questions at k=50, so the
-remaining multi-hop gap needs multi-query retrieval, not better ranking. Grading
-recency as of the conversation's end (the diag's C-asof/D-asof rows) was measured
-to hurt recall (-4.3 any@30) and is not used.
+merge non-vector signals. In the shipped fusion-plus-reranker stack at k=50,
+269/282 (95.4%) multi-hop questions surface at least one annotated gold turn and
+172/282 (61.0%) surface every annotated gold turn. Full-set coverage is a
+retrieval diagnostic; by itself, it does not identify which strategy would close
+the remaining evidence gaps. Grading recency as of the conversation's end
+(the diag's C-asof/D-asof rows) was measured to hurt recall (-4.3 any@30) and is
+not used.
 
 `judge-probe.ps1` feeds the judge a fixed 40-item set of answers that are factually wrong
 but on the gold topic and reports how often it marks them correct, bounding judge
