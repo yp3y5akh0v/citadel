@@ -4,8 +4,9 @@ Distribution packages built from this workspace. Each adapter is versioned from 
 tag and `citadeldb-mcp` from the workspace crate version; each is built and published by
 its own workflow under [`.github/workflows/`](../.github/workflows).
 
-Every adapter requires `citadeldb>=2.0,<3`. Requiring an explicit embedder is an
-adapter-side contract and uses the region APIs already released in 2.0.
+Every adapter requires `citadeldb>=2.2,<3`. CrewAI, Haystack, LangChain, and LlamaIndex
+consume expanded hit-scoring or core MMR APIs; the other five use the cancellation-aware
+embedder protocol added in 2.2.
 Their test jobs build the core wheel in-run and constrain adapter dependency resolution
 to that exact version, so PyPI cannot silently replace the wheel under test.
 

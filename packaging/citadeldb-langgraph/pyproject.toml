@@ -18,9 +18,9 @@ classifiers = [
   "Topic :: Database",
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-# A key replaces under its own name, which needs the keyed write added in 2.0.
+# Requires the cancellation-aware embedder protocol added in citadeldb 2.2.
 dependencies = [
-  "citadeldb>=2.0,<3",
+  "citadeldb>=2.2,<3",
   "langgraph>=0.2.32,<2",
   "langgraph-checkpoint>=2.0.19,<5",
 ]

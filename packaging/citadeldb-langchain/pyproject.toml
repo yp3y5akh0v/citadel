@@ -18,8 +18,8 @@ classifiers = [
   "Topic :: Database",
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-# The precomputed vector needs the `embedding` field added in citadeldb 2.0.
-dependencies = ["citadeldb>=2.0,<3", "langchain-core>=0.3.22,<2"]
+# Requires the core MMR recall API added in citadeldb 2.2.
+dependencies = ["citadeldb>=2.2,<3", "langchain-core>=0.3.22,<2"]
 
 [project.optional-dependencies]
 # langchain-tests carries the suite that test_conformance.py runs.

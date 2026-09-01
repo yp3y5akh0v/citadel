@@ -18,10 +18,8 @@ classifiers = [
   "Topic :: Database",
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-# The floor is the version whose session protocol this was built against.
-# A filtered recall answers `k` matching rows from 2.0; before it, a session's
-# own items could rank outside the scan and search would return short.
-dependencies = ["citadeldb>=2.0,<3", "openai-agents>=0.20.0,<1"]
+# Requires the cancellation-aware embedder protocol added in citadeldb 2.2.
+dependencies = ["citadeldb>=2.2,<3", "openai-agents>=0.20.0,<1"]
 
 [project.optional-dependencies]
 test = ["pytest>=8", "pytest-asyncio>=0.23"]
