@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Citadel Studio
+GenericName=Encrypted Database Client
+Comment=Read an encrypted vault and prove what has happened to it
+Exec=citadel-studio
+Icon=dev.citadeldb.studio
+Terminal=false
+Categories=Development;Database;
+Keywords=database;encrypted;vector;sql;citadeldb;
+StartupWMClass=dev.citadeldb.studio

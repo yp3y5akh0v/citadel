@@ -4,120 +4,205 @@ on:
   push:
     tags:
       - "v[0-9]+.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release, or dry-run to build and package without publishing"
+        required: true
+        default: dry-run
+        type: string
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+  cancel-in-progress: false
 
 jobs:
-  create-release:
+  plan:
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.plan.outputs.tag }}
+      short_version: ${{ steps.plan.outputs.short_version }}
+      publishing: ${{ steps.plan.outputs.publishing }}
+      source_sha: ${{ steps.plan.outputs.source_sha }}
+      release_date: ${{ steps.plan.outputs.release_date }}
     steps:
-      - uses: actions/checkout@v5
-
-      - name: Validate tag matches Cargo.toml version
+      - name: Validate requested tag
+        if: github.event_name == 'workflow_dispatch' && inputs.tag != 'dry-run'
+        shell: bash
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          DISPATCH_REF: ${{ github.ref }}
         run: |
-          TAG="${GITHUB_REF#refs/tags/v}"
-          CARGO_VER=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
-          if [ "$TAG" != "$CARGO_VER" ]; then
-            echo "::error::Tag v$TAG does not match Cargo.toml version $CARGO_VER"
+          if [[ ! "$INPUT_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::release tag must be a stable vMAJOR.MINOR.PATCH tag"
+            exit 1
+          fi
+          if [ "$DISPATCH_REF" != "refs/tags/$INPUT_TAG" ]; then
+            echo "::error::publishing dispatch must run at $INPUT_TAG; use: gh workflow run release.yml --ref $INPUT_TAG -f tag=$INPUT_TAG"
             exit 1
           fi
 
-      - name: Create draft release
+      - name: Checkout triggering revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - id: plan
+        shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
-          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
-            || gh release create "$GITHUB_REF_NAME" --draft --verify-tag --title "$GITHUB_REF_NAME"
+          CARGO_VER=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          if [ "$EVENT" = push ]; then
+            TAG="${GITHUB_REF#refs/tags/}"; PUBLISHING=true
+          elif [ "$EVENT" = workflow_dispatch ] && [ "$INPUT_TAG" != dry-run ]; then
+            TAG="$INPUT_TAG"; PUBLISHING=true
+          else
+            TAG="v$CARGO_VER"; PUBLISHING=false
+          fi
+          if [[ ! "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::release workflow supports stable vMAJOR.MINOR.PATCH tags"
+            exit 1
+          fi
+          if [ "$TAG" != "v$CARGO_VER" ]; then
+            echo "::error::Tag $TAG does not match Cargo.toml version $CARGO_VER"
+            exit 1
+          fi
+          SHORT=${TAG#v}
+          IFS=. read -r MAJOR MINOR PATCH <<< "$SHORT"
+          if (( 10#$MAJOR > 255 || 10#$MINOR > 255 || 10#$PATCH > 65535 )); then
+            echo "::error::version $SHORT exceeds Windows Installer numeric limits"
+            exit 1
+          fi
+          SOURCE_SHA=$(git rev-parse HEAD)
+          RELEASE_DATE=$(git show -s --format=%cs HEAD)
+          {
+            printf 'tag=%s\n' "$TAG"
+            printf 'short_version=%s\n' "$SHORT"
+            printf 'publishing=%s\n' "$PUBLISHING"
+            printf 'source_sha=%s\n' "$SOURCE_SHA"
+            printf 'release_date=%s\n' "$RELEASE_DATE"
+          } >> "$GITHUB_OUTPUT"
 
   build-release:
-    needs: create-release
+    needs: plan
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Standard builds
+          # Studio needs windowing/GPU libraries absent from musl and aarch64 cross images.
           - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
+            os: ubuntu-22.04
             use-cross: true
             cli: true
             ffi: false
+            studio: false
             fips: false
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-22.04
             use-cross: false
             cli: false
             ffi: true
+            studio: true
             fips: false
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-22.04
             use-cross: true
             cli: true
             ffi: true
+            studio: false
             fips: false
           - target: x86_64-apple-darwin
             os: macos-15-intel
             use-cross: false
             cli: true
             ffi: true
+            studio: true
             fips: false
           - target: aarch64-apple-darwin
-            os: macos-latest
+            os: macos-15
             use-cross: false
             cli: true
             ffi: true
+            studio: true
             fips: false
           - target: x86_64-pc-windows-msvc
-            os: windows-latest
+            os: windows-2022
             use-cross: false
             cli: true
             ffi: true
+            studio: true
             fips: false
 
-          # FIPS builds
           - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
+            os: ubuntu-22.04
             use-cross: true
             cli: true
             ffi: false
+            studio: false
             fips: true
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-22.04
             use-cross: false
             cli: false
             ffi: true
+            studio: false
             fips: true
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-22.04
             use-cross: true
             cli: true
             ffi: true
+            studio: false
             fips: true
           - target: x86_64-apple-darwin
             os: macos-15-intel
             use-cross: false
             cli: true
             ffi: true
+            studio: false
             fips: true
           - target: aarch64-apple-darwin
-            os: macos-latest
+            os: macos-15
             use-cross: false
             cli: true
             ffi: true
+            studio: false
             fips: true
           - target: x86_64-pc-windows-msvc
-            os: windows-latest
+            os: windows-2022
             use-cross: false
             cli: true
             ffi: true
+            studio: false
             fips: true
 
     runs-on: ${{ matrix.os }}
     name: build ${{ matrix.fips && 'fips-' || '' }}${{ matrix.target }}
+    permissions:
+      contents: read
     env:
       CARGO: ${{ matrix.use-cross && 'cross' || 'cargo' }}
+      TAG: ${{ needs.plan.outputs.tag }}
+      SHORT_VERSION: ${{ needs.plan.outputs.short_version }}
+      SOURCE_SHA: ${{ needs.plan.outputs.source_sha }}
+      RELEASE_DATE: ${{ needs.plan.outputs.release_date }}
+      RELEASE_DIR: dist/release
+      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
+      CROSS_TARGET_X86_64_UNKNOWN_LINUX_MUSL_IMAGE: >-
+        ghcr.io/cross-rs/x86_64-unknown-linux-musl@sha256:77db671d8356a64ae72a3e1415e63f547f26d374fbe3c4762c1cd36c7eac7b99
+      CROSS_TARGET_AARCH64_UNKNOWN_LINUX_GNU_IMAGE: >-
+        ghcr.io/cross-rs/aarch64-unknown-linux-gnu@sha256:7f8308a8734d9fcd2ebbe9a3e4bdea74af293f0799d80c3cc341e340cda49a4c
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.source_sha }}
+          persist-credentials: false
 
       - name: Install pinned toolchain (rust-toolchain.toml)
         run: |
@@ -126,126 +211,376 @@ jobs:
 
       - name: Install cross
         if: matrix.use-cross
-        run: cargo install cross --locked
+        run: cargo install cross --version 0.2.5 --locked
 
       - name: Build CLI
         if: matrix.cli
         shell: bash
         run: |
-          FEATURES=""
+          LIST=""
           if [ "${{ contains(matrix.target, 'linux') }}" = "true" ]; then
-            FEATURES="--features io-uring"
+            LIST="io-uring"
           fi
           if [ "${{ matrix.fips }}" = "true" ]; then
-            if [ -n "$FEATURES" ]; then
-              FEATURES="$FEATURES,fips"
-            else
-              FEATURES="--features fips"
-            fi
+            LIST="${LIST:+$LIST,}fips"
           fi
-          ${{ env.CARGO }} build --release --locked --target ${{ matrix.target }} -p citadeldb-cli $FEATURES
+          FEATURES=()
+          if [ -n "$LIST" ]; then
+            FEATURES=(--features "$LIST")
+          fi
+          ${{ env.CARGO }} build --release --locked --target ${{ matrix.target }} -p citadeldb-cli "${FEATURES[@]}"
 
       - name: Build FFI
         if: matrix.ffi
         shell: bash
         run: |
-          FEATURES=""
+          FEATURES=()
           if [ "${{ matrix.fips }}" = "true" ]; then
-            FEATURES="--features fips"
+            FEATURES=(--features fips)
           fi
-          ${{ env.CARGO }} build --release --locked --target ${{ matrix.target }} -p citadeldb-ffi $FEATURES
+          ${{ env.CARGO }} build --release --locked --target ${{ matrix.target }} -p citadeldb-ffi "${FEATURES[@]}"
+
+      - name: Install Studio build dependencies (linux)
+        if: matrix.studio && runner.os == 'Linux'
+        uses: ./.github/actions/studio-deps
+        with:
+          gpu: "true"
+
+      - name: Build Studio
+        if: matrix.studio
+        shell: bash
+        # Match the app bundle's LSMinimumSystemVersion.
+        env:
+          MACOSX_DEPLOYMENT_TARGET: ${{ runner.os == 'macOS' && '11.0' || '' }}
+        run: cargo build --release --locked --target ${{ matrix.target }} -p citadeldb-studio
+
+      - name: Verify Windows binaries do not require the VC++ Redistributable
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $installation = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $dumpbin = Get-ChildItem -Path (Join-Path $installation 'VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe') |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if (!$dumpbin) {
+            throw 'Visual Studio dumpbin.exe was not found'
+          }
+
+          $release = 'target/${{ matrix.target }}/release'
+          $binaries = @()
+          if ('${{ matrix.cli }}' -eq 'true') { $binaries += Join-Path $release 'citadel.exe' }
+          if ('${{ matrix.ffi }}' -eq 'true') { $binaries += Join-Path $release 'citadel_ffi.dll' }
+          if ('${{ matrix.studio }}' -eq 'true') { $binaries += Join-Path $release 'citadel-studio.exe' }
+          foreach ($binary in $binaries) {
+            $imports = (& $dumpbin.FullName /dependents $binary | Out-String)
+            if ($LASTEXITCODE -ne 0) {
+              throw "dumpbin failed for $binary"
+            }
+            $imports
+            if ($imports -match '(?i)\b(?:vcruntime|msvcp|concrt)[^\s]*\.dll\b|\bucrtbase\.dll\b') {
+              throw "$binary still depends on the VC++ Redistributable"
+            }
+          }
+
+      - name: Package Studio (macos)
+        if: matrix.studio && runner.os == 'macOS'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: bash packaging/macos/build-dmg.sh
+
+      - name: Install WiX (windows)
+        if: matrix.studio && runner.os == 'Windows'
+        shell: bash
+        run: |
+          dotnet tool install --global wix --version 6.0.1
+          wix extension add -g WixToolset.UI.wixext/6.0.1
+
+      - name: Package Studio (windows)
+        if: matrix.studio && runner.os == 'Windows'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: bash packaging/windows/build-msi.sh
+
+      - name: Smoke test Studio installer (windows)
+        if: matrix.studio && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $msi = (Resolve-Path $env:STUDIO_ARCHIVE).Path
+          $install = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @(
+            '/i', "`"$msi`"", '/qn', '/norestart'
+          )
+          if ($install.ExitCode -notin 0, 3010) {
+            throw "MSI install failed with exit code $($install.ExitCode)"
+          }
+          $installed = Join-Path $env:LOCALAPPDATA 'Citadel Studio\citadel-studio.exe'
+          $notices = Join-Path $env:LOCALAPPDATA 'Citadel Studio\Licences\THIRD_PARTY_LICENSES.html'
+          $sqlNotice = Join-Path $env:LOCALAPPDATA 'Citadel Studio\Licences\sql-json-path-NOTICE.txt'
+          try {
+            if (!(Test-Path $installed) -or !(Test-Path $notices) -or !(Test-Path $sqlNotice)) {
+              throw 'MSI did not install the executable and required third-party notices'
+            }
+          } finally {
+            $uninstall = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @(
+              '/x', "`"$msi`"", '/qn', '/norestart'
+            )
+            if ($uninstall.ExitCode -notin 0, 3010) {
+              throw "MSI uninstall failed with exit code $($uninstall.ExitCode)"
+            }
+          }
+          $installRoot = Join-Path $env:LOCALAPPDATA 'Citadel Studio'
+          if (Test-Path $installRoot) {
+            throw 'MSI uninstall left the Studio installation directory behind'
+          }
+
+      # AppImage dependencies are collected on the oldest declared Linux base.
+      - name: Package Studio (linux)
+        if: matrix.studio && runner.os == 'Linux'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: bash packaging/linux/build-appimage.sh
 
       - name: Package CLI (unix)
         if: matrix.cli && runner.os != 'Windows'
         shell: bash
         run: |
-          TAG="${GITHUB_REF#refs/tags/}"
+          mkdir -p "$RELEASE_DIR"
           PREFIX=${{ matrix.fips && 'citadel-fips' || 'citadel' }}
-          ARCHIVE="${PREFIX}-${TAG}-${{ matrix.target }}.tar.gz"
+          ARCHIVE_NAME="${PREFIX}-${TAG}-${{ matrix.target }}.tar.gz"
+          ARCHIVE="$RELEASE_DIR/$ARCHIVE_NAME"
           STAGING=$(mktemp -d)
+          trap 'rm -rf "$STAGING"' EXIT
           cp "target/${{ matrix.target }}/release/citadel" "$STAGING/"
-          cp README.md LICENSE-APACHE "$STAGING/"
+          cp README.md LICENSE-APACHE packaging/licenses/THIRD_PARTY_LICENSES.html "$STAGING/"
+          cp crates/sql-json-path/NOTICE "$STAGING/sql-json-path-NOTICE.txt"
           tar czf "$ARCHIVE" -C "$STAGING" .
-          shasum -a 256 "$ARCHIVE" > "${ARCHIVE}.sha256"
+          (cd "$RELEASE_DIR" && shasum -a 256 "$ARCHIVE_NAME" > "${ARCHIVE_NAME}.sha256")
           echo "CLI_ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
 
       - name: Package CLI (windows)
         if: matrix.cli && runner.os == 'Windows'
         shell: bash
         run: |
-          TAG="${GITHUB_REF#refs/tags/}"
+          mkdir -p "$RELEASE_DIR"
           PREFIX=${{ matrix.fips && 'citadel-fips' || 'citadel' }}
-          ARCHIVE="${PREFIX}-${TAG}-${{ matrix.target }}.zip"
+          ARCHIVE_NAME="${PREFIX}-${TAG}-${{ matrix.target }}.zip"
+          ARCHIVE="$RELEASE_DIR/$ARCHIVE_NAME"
           STAGING=$(mktemp -d)
+          trap 'rm -rf "$STAGING"' EXIT
           cp "target/${{ matrix.target }}/release/citadel.exe" "$STAGING/"
-          cp README.md LICENSE-APACHE "$STAGING/"
-          cd "$STAGING" && 7z a -tzip "$OLDPWD/$ARCHIVE" . && cd "$OLDPWD"
-          sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256"
+          cp README.md LICENSE-APACHE packaging/licenses/THIRD_PARTY_LICENSES.html "$STAGING/"
+          cp crates/sql-json-path/NOTICE "$STAGING/sql-json-path-NOTICE.txt"
+          ROOT=$PWD
+          (cd "$STAGING" && 7z a -tzip "$ROOT/$ARCHIVE" .)
+          (cd "$RELEASE_DIR" && sha256sum "$ARCHIVE_NAME" > "${ARCHIVE_NAME}.sha256")
           echo "CLI_ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
 
       - name: Package FFI (linux)
         if: matrix.ffi && runner.os == 'Linux'
         shell: bash
         run: |
-          TAG="${GITHUB_REF#refs/tags/}"
+          mkdir -p "$RELEASE_DIR"
           PREFIX=${{ matrix.fips && 'citadel-ffi-fips' || 'citadel-ffi' }}
-          ARCHIVE="${PREFIX}-${TAG}-${{ matrix.target }}.tar.gz"
+          ARCHIVE_NAME="${PREFIX}-${TAG}-${{ matrix.target }}.tar.gz"
+          ARCHIVE="$RELEASE_DIR/$ARCHIVE_NAME"
           STAGING=$(mktemp -d)
+          trap 'rm -rf "$STAGING"' EXIT
           RELEASE="target/${{ matrix.target }}/release"
           [ -f "$RELEASE/libcitadel_ffi.so" ] && cp "$RELEASE/libcitadel_ffi.so" "$STAGING/libcitadel.so"
           [ -f "$RELEASE/libcitadel_ffi.a" ] && cp "$RELEASE/libcitadel_ffi.a" "$STAGING/libcitadel.a"
           ls "$STAGING"/libcitadel.* >/dev/null 2>&1 || { echo "::error::No FFI libraries found"; exit 1; }
           cp crates/citadel-ffi/citadel.h "$STAGING/"
-          cp LICENSE-APACHE "$STAGING/"
+          cp LICENSE-APACHE packaging/licenses/THIRD_PARTY_LICENSES.html "$STAGING/"
+          cp crates/sql-json-path/NOTICE "$STAGING/sql-json-path-NOTICE.txt"
           tar czf "$ARCHIVE" -C "$STAGING" .
-          shasum -a 256 "$ARCHIVE" > "${ARCHIVE}.sha256"
+          (cd "$RELEASE_DIR" && shasum -a 256 "$ARCHIVE_NAME" > "${ARCHIVE_NAME}.sha256")
           echo "FFI_ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
 
       - name: Package FFI (macos)
         if: matrix.ffi && runner.os == 'macOS'
         shell: bash
         run: |
-          TAG="${GITHUB_REF#refs/tags/}"
+          mkdir -p "$RELEASE_DIR"
           PREFIX=${{ matrix.fips && 'citadel-ffi-fips' || 'citadel-ffi' }}
-          ARCHIVE="${PREFIX}-${TAG}-${{ matrix.target }}.tar.gz"
+          ARCHIVE_NAME="${PREFIX}-${TAG}-${{ matrix.target }}.tar.gz"
+          ARCHIVE="$RELEASE_DIR/$ARCHIVE_NAME"
           STAGING=$(mktemp -d)
+          trap 'rm -rf "$STAGING"' EXIT
           RELEASE="target/${{ matrix.target }}/release"
           [ -f "$RELEASE/libcitadel_ffi.dylib" ] && cp "$RELEASE/libcitadel_ffi.dylib" "$STAGING/libcitadel.dylib"
           [ -f "$RELEASE/libcitadel_ffi.a" ] && cp "$RELEASE/libcitadel_ffi.a" "$STAGING/libcitadel.a"
           ls "$STAGING"/libcitadel.* >/dev/null 2>&1 || { echo "::error::No FFI libraries found"; exit 1; }
           cp crates/citadel-ffi/citadel.h "$STAGING/"
-          cp LICENSE-APACHE "$STAGING/"
+          cp LICENSE-APACHE packaging/licenses/THIRD_PARTY_LICENSES.html "$STAGING/"
+          cp crates/sql-json-path/NOTICE "$STAGING/sql-json-path-NOTICE.txt"
           tar czf "$ARCHIVE" -C "$STAGING" .
-          shasum -a 256 "$ARCHIVE" > "${ARCHIVE}.sha256"
+          (cd "$RELEASE_DIR" && shasum -a 256 "$ARCHIVE_NAME" > "${ARCHIVE_NAME}.sha256")
           echo "FFI_ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
 
       - name: Package FFI (windows)
         if: matrix.ffi && runner.os == 'Windows'
         shell: bash
         run: |
-          TAG="${GITHUB_REF#refs/tags/}"
+          mkdir -p "$RELEASE_DIR"
           PREFIX=${{ matrix.fips && 'citadel-ffi-fips' || 'citadel-ffi' }}
-          ARCHIVE="${PREFIX}-${TAG}-${{ matrix.target }}.zip"
+          ARCHIVE_NAME="${PREFIX}-${TAG}-${{ matrix.target }}.zip"
+          ARCHIVE="$RELEASE_DIR/$ARCHIVE_NAME"
           STAGING=$(mktemp -d)
+          trap 'rm -rf "$STAGING"' EXIT
           RELEASE="target/${{ matrix.target }}/release"
           [ -f "$RELEASE/citadel_ffi.dll" ] && cp "$RELEASE/citadel_ffi.dll" "$STAGING/citadel.dll"
           [ -f "$RELEASE/citadel_ffi.lib" ] && cp "$RELEASE/citadel_ffi.lib" "$STAGING/citadel.lib"
           [ -f "$RELEASE/citadel_ffi.dll.lib" ] && cp "$RELEASE/citadel_ffi.dll.lib" "$STAGING/citadel.dll.lib"
           ls "$STAGING"/citadel.{dll,lib,dll.lib} >/dev/null 2>&1 || { echo "::error::No FFI libraries found"; exit 1; }
           cp crates/citadel-ffi/citadel.h "$STAGING/"
-          cp LICENSE-APACHE "$STAGING/"
-          cd "$STAGING" && 7z a -tzip "$OLDPWD/$ARCHIVE" . && cd "$OLDPWD"
-          sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256"
+          cp LICENSE-APACHE packaging/licenses/THIRD_PARTY_LICENSES.html "$STAGING/"
+          cp crates/sql-json-path/NOTICE "$STAGING/sql-json-path-NOTICE.txt"
+          ROOT=$PWD
+          (cd "$STAGING" && 7z a -tzip "$ROOT/$ARCHIVE" .)
+          (cd "$RELEASE_DIR" && sha256sum "$ARCHIVE_NAME" > "${ARCHIVE_NAME}.sha256")
           echo "FFI_ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
 
-      - name: Upload CLI
-        if: matrix.cli
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release upload --clobber "${{ github.ref_name }}" "${{ env.CLI_ARCHIVE }}" "${{ env.CLI_ARCHIVE }}.sha256"
+      # Upload archives only: raw .app uploads lose symlinks and invalidate signatures.
+      - name: Upload packages for inspection
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ matrix.fips && 'fips-' || '' }}${{ matrix.target }}
+          path: |
+            ${{ env.RELEASE_DIR }}/*.dmg
+            ${{ env.RELEASE_DIR }}/*.msi
+            ${{ env.RELEASE_DIR }}/*.AppImage
+            ${{ env.RELEASE_DIR }}/*.tar.gz
+            ${{ env.RELEASE_DIR }}/*.zip
+            ${{ env.RELEASE_DIR }}/*.sha256
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 7
 
-      - name: Upload FFI
-        if: matrix.ffi
+  verify-dry-run:
+    needs: [plan, build-release]
+    if: needs.plan.outputs.publishing != 'true'
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    env:
+      TAG: ${{ needs.plan.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.source_sha }}
+          persist-credentials: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: artifacts
+          pattern: release-*
+
+      - name: Verify complete dry-run package set
+        run: bash packaging/verify-release-artifacts.sh artifacts "$TAG"
+
+  attest-release:
+    needs: [plan, build-release]
+    if: needs.plan.outputs.publishing == 'true'
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      TAG: ${{ needs.plan.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.source_sha }}
+          persist-credentials: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: artifacts
+          pattern: release-*
+
+      - name: Verify downloaded packages
+        shell: bash
+        run: bash packaging/verify-release-artifacts.sh artifacts "$TAG"
+
+      # Verify with: gh attestation verify <file> --repo ${{ github.repository }}
+      - name: Attest release packages
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            artifacts/**/*.AppImage
+            artifacts/**/*.dmg
+            artifacts/**/*.msi
+            artifacts/**/*.tar.gz
+            artifacts/**/*.zip
+
+  publish-release:
+    needs: [plan, build-release, attest-release]
+    if: needs.plan.outputs.publishing == 'true'
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    env:
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ needs.plan.outputs.tag }}
+      SOURCE_SHA: ${{ needs.plan.outputs.source_sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.source_sha }}
+          persist-credentials: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: artifacts
+          pattern: release-*
+
+      - name: Verify downloaded packages
+        shell: bash
+        run: bash packaging/verify-release-artifacts.sh artifacts "$TAG"
+
+      - name: Collect packages without filename collisions
+        shell: bash
+        run: |
+          mkdir upload
+          while IFS= read -r -d '' file; do
+            name=$(basename "$file")
+            if [ -e "upload/$name" ]; then
+              echo "::error::duplicate release artifact name: $name"
+              exit 1
+            fi
+            cp "$file" "upload/$name"
+          done < <(find artifacts -type f -print0)
+          [ -n "$(find upload -maxdepth 1 -type f -print -quit)" ] || {
+            echo "::error::no release artifacts were downloaded"
+            exit 1
+          }
+
+      - name: Create draft and upload packages
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload --clobber "${{ github.ref_name }}" "${{ env.FFI_ARCHIVE }}" "${{ env.FFI_ARCHIVE }}.sha256"
+        run: |
+          TAG_REFS=$(git ls-remote "https://github.com/$GH_REPO.git" \
+            "refs/tags/$TAG" "refs/tags/$TAG^{}")
+          TAG_SHA=$(printf '%s\n' "$TAG_REFS" \
+            | awk '$2 ~ /\^\{\}$/ { print $1; found=1 } END { if (!found) print first } NR==1 { first=$1 }')
+          if [ "$TAG_SHA" != "$SOURCE_SHA" ]; then
+            echo "::error::tag $TAG moved from planned source $SOURCE_SHA to $TAG_SHA"
+            exit 1
+          fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            if [ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" != true ]; then
+              echo "::error::refusing to replace assets on published release $TAG"
+              exit 1
+            fi
+            while IFS= read -r asset; do
+              [ -n "$asset" ] && gh release delete-asset "$TAG" "$asset" --yes
+            done < <(gh release view "$TAG" --json assets --jq '.assets[].name')
+          else
+            gh release create "$TAG" --draft --verify-tag --title "$TAG"
+          fi
+          gh release upload "$TAG" upload/*

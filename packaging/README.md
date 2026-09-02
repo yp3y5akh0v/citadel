@@ -39,6 +39,31 @@ the built wheel in CI.
 |---|---|---|
 | [`citadeldb-mcp`](https://pypi.org/project/citadeldb-mcp/) | MCP server, registered as `dev.citadeldb/mcp` | [`../crates/citadel-mcp`](../crates/citadel-mcp) |
 
+## Desktop installers
+
+Citadel Studio is packaged for Linux, macOS, and Windows.
+
+| Platform | Installer | Architecture |
+|---|---|---|
+| Linux | `.AppImage` | x86_64 |
+| macOS | `.dmg` | Apple Silicon or Intel |
+| Windows | `.msi` | x86_64 |
+
+The macOS app is ad-hoc signed, not Developer ID signed or notarized; the DMG is unsigned.
+Gatekeeper may require **Open Anyway** in **System Settings > Privacy & Security**.
+The Windows installer and executable are unsigned; SmartScreen may warn or block
+installation. Organization security policies may also prevent installation.
+
+Released installers have `.sha256` checksum files and GitHub build-provenance attestations.
+These do not replace OS publisher signing or suppress its warnings. Verify provenance with:
+
+```console
+gh attestation verify <installer> --repo yp3y5akh0v/citadel
+```
+
+Installers include the project licence and applicable third-party notices.
+See [third-party licences](licenses/THIRD_PARTY_LICENSES.html).
+
 ## Sharing one database
 
 Citadel is embedded, and a database file is held under a whole-file exclusive lock, so a
