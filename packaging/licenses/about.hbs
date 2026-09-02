@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Citadel release artifacts third-party licences</title>
+  <style>
+    body { color: #1d2630; font: 15px/1.5 system-ui, sans-serif; margin: 2rem auto; max-width: 64rem; padding: 0 1rem; }
+    a { color: #086d7a; }
+    pre { background: #f4f6f8; border: 1px solid #dce1e6; overflow: auto; padding: 1rem; white-space: pre-wrap; }
+    @media (prefers-color-scheme: dark) {
+      body { background: #11171d; color: #e4ebf1; }
+      a { color: #5dd5df; }
+      pre { background: #182129; border-color: #35434e; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Citadel release artifacts third-party licences</h1>
+    <p>This inventory covers the Rust workspace packages and dependencies used across the supported release targets.</p>
+    <h2>Licence inventory</h2>
+    <ul>
+      {{#each overview}}
+      <li><a href="#{{id}}">{{name}}</a> ({{count}})</li>
+      {{/each}}
+    </ul>
+    {{#each licenses}}
+    <section>
+{{#if first_of_kind}}
+      <h2 id="{{id}}">{{name}}</h2>
+{{/if}}
+      <h3>Used by</h3>
+      <ul>
+        {{#each used_by}}
+        <li><a href="{{#if crate.repository}}{{crate.repository}}{{else}}https://crates.io/crates/{{crate.name}}{{/if}}">{{crate.name}} {{crate.version}}</a></li>
+        {{/each}}
+      </ul>
+      <pre>{{text}}</pre>
+    </section>
+    {{/each}}
+  </main>
+</body>
+</html>

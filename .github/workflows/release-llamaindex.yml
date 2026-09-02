@@ -33,7 +33,7 @@ jobs:
           set -e
           ls dist
           # A dev version means the tag is unreachable; never publish it.
-          if ls dist | grep -q "dev"; then
+          if compgen -G 'dist/*dev*' >/dev/null; then
             echo "version resolved to a dev build; the tag is not reachable" >&2
             exit 1
           fi

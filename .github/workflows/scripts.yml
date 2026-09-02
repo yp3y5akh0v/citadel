@@ -9,23 +9,64 @@ on:
       - 'scripts/**'
       - 'packaging/**'
       - '.github/workflows/*.yml'
+      - '.github/actions/**'
+      - 'Cargo.lock'
+      - '**/Cargo.toml'
+      - 'crates/citadel-studio/licenses/**'
+      - 'crates/sql-json-path/NOTICE'
   pull_request:
     branches: [master]
     paths:
       - 'scripts/**'
       - 'packaging/**'
       - '.github/workflows/*.yml'
+      - '.github/actions/**'
+      - 'Cargo.lock'
+      - '**/Cargo.toml'
+      - 'crates/citadel-studio/licenses/**'
+      - 'crates/sql-json-path/NOTICE'
+
+permissions:
+  contents: read
 
 jobs:
   syntax:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned workflow linters
+        run: |
+          ARCHIVE="$RUNNER_TEMP/actionlint.tar.gz"
+          curl -fsSLo "$ARCHIVE" \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  $ARCHIVE" \
+            | sha256sum -c -
+          tar -xzf "$ARCHIVE" -C "$RUNNER_TEMP" actionlint
+
+          SHELLCHECK_ARCHIVE="$RUNNER_TEMP/shellcheck.tar.xz"
+          curl -fsSLo "$SHELLCHECK_ARCHIVE" \
+            https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.xz
+          echo "8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198  $SHELLCHECK_ARCHIVE" \
+            | sha256sum -c -
+          tar -xJf "$SHELLCHECK_ARCHIVE" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+          echo "$RUNNER_TEMP/shellcheck-v0.11.0" >> "$GITHUB_PATH"
+
+      - name: actionlint
+        run: actionlint .github/workflows/*.yml
       - name: bash syntax
         run: |
-          for f in scripts/*.sh; do
+          for f in scripts/*.sh packaging/*.sh packaging/*/*.sh; do
             [ -e "$f" ] || continue
             bash -n "$f"
+          done
+      - name: shellcheck
+        run: |
+          for f in scripts/*.sh packaging/*.sh packaging/*/*.sh; do
+            [ -e "$f" ] || continue
+            shellcheck "$f"
           done
       - name: node syntax
         run: |
@@ -33,6 +74,25 @@ jobs:
             [ -e "$f" ] || continue
             node --check "$f"
           done
+
+      - name: Release third-party licence inventory is current
+        run: |
+          cargo install cargo-about --version 0.9.1 --locked
+          GENERATED="$RUNNER_TEMP/THIRD_PARTY_LICENSES.html"
+          cargo about generate \
+            --manifest-path Cargo.toml \
+            --workspace --all-features \
+            --config packaging/licenses/about.toml \
+            --locked --fail \
+            --output-file "$GENERATED" \
+            packaging/licenses/about.hbs
+          # Normalize upstream whitespace for reproducible licence inventories.
+          sed -i -E 's/\r$//; s/[[:blank:]]+$//' "$GENERATED"
+          if ! cmp -s packaging/licenses/THIRD_PARTY_LICENSES.html "$GENERATED"; then
+            echo "::error::Release third-party licence inventory is stale"
+            diff -u packaging/licenses/THIRD_PARTY_LICENSES.html "$GENERATED" || true
+            exit 1
+          fi
       # A package under packaging/ with no release workflow ships nothing on a tag, and
       # the omission only shows up when someone goes looking for it on PyPI.
       - name: every packaged project has a release workflow
