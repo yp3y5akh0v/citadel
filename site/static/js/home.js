@@ -192,28 +192,38 @@ wtx.<span class="fn">commit</span>()?;`,
     },
     wasm: {
       file: 'main.js',
-      code: `<span class="k">import</span> { <span class="t">CitadelDb</span> } <span class="k">from</span> <span class="s">"@citadeldb/wasm"</span>;
+      code: `<span class="k">import</span> init, { <span class="t">CitadelDb</span> } <span class="k">from</span> <span class="s">"@citadeldb/wasm"</span>;
+
+<span class="k">await</span> <span class="fn">init</span>();
 
 <span class="k">const</span> db = <span class="k">new</span> <span class="t">CitadelDb</span>(<span class="s">"secret"</span>);
 db.<span class="fn">run</span>(<span class="s">"CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);"</span>);
 db.<span class="fn">run</span>(<span class="s">"INSERT INTO t (id, name) VALUES (1, 'Alice');"</span>);
 
 <span class="k">const</span> result = db.<span class="fn">run</span>(<span class="s">"SELECT * FROM t;"</span>);
-<span class="c">// [{ type: "query", columns: ["id","name"], rows: [[1,"Alice"]] }]</span>`,
+console.<span class="fn">log</span>(result);
+db.<span class="fn">free</span>();`,
     },
     c: {
       file: 'example.c',
       code: `<span class="k">#include</span> <span class="s">"citadel.h"</span>
 
-<span class="t">CitadelDb</span> *db = <span class="n">NULL</span>;
-<span class="fn">citadel_create</span>(<span class="s">"my.db"</span>, <span class="s">"secret"</span>, <span class="n">6</span>, &amp;db);
-
-<span class="t">CitadelSqlConn</span> *conn = <span class="n">NULL</span>;
-<span class="fn">citadel_sql_open</span>(db, &amp;conn);
-<span class="t">CitadelSqlResult</span> *result = <span class="n">NULL</span>;
-<span class="fn">citadel_sql_execute</span>(conn, <span class="s">"SELECT * FROM users;"</span>, &amp;result);
-
-<span class="fn">citadel_close</span>(db);`,
+<span class="k">int</span> <span class="fn">main</span>(<span class="k">void</span>) {
+    <span class="k">struct</span> CitadelDb *db = <span class="n">NULL</span>;
+    <span class="k">struct</span> CitadelSqlConn *conn = <span class="n">NULL</span>;
+    <span class="k">struct</span> CitadelSqlResult *result = <span class="n">NULL</span>;
+    citadel_error_t status = <span class="fn">citadel_create</span>(
+        <span class="s">"my.db"</span>, (<span class="k">const</span> uint8_t *)<span class="s">"secret"</span>, <span class="n">6</span>, <span class="n">NULL</span>, &amp;db);
+    <span class="k">if</span> (status != CITADEL_ERROR_T_OK) <span class="k">goto</span> cleanup;
+    status = <span class="fn">citadel_sql_open</span>(db, &amp;conn);
+    <span class="k">if</span> (status != CITADEL_ERROR_T_OK) <span class="k">goto</span> cleanup;
+    status = <span class="fn">citadel_sql_execute</span>(conn, <span class="s">"SELECT 1 + 1 AS value;"</span>, &amp;result);
+cleanup:
+    <span class="fn">citadel_sql_result_free</span>(result);
+    <span class="fn">citadel_sql_close</span>(conn);
+    <span class="fn">citadel_close</span>(db);
+    <span class="k">return</span> status == CITADEL_ERROR_T_OK ? <span class="n">0</span> : <span class="n">1</span>;
+}`,
     },
   };
   const qsCode = document.getElementById('qsCode');

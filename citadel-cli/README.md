@@ -4,9 +4,12 @@ Interactive SQL shell for the [Citadel](https://github.com/yp3y5akh0v/citadel) e
 
 ## Install
 
+```sh
+cargo install --locked citadeldb-cli
 ```
-cargo install citadeldb-cli
-```
+
+Building from source requires Rust 1.95 or later. Prebuilt CLI archives are listed on
+the [downloads page](https://citadeldb.dev/download/).
 
 ## Usage
 
@@ -20,7 +23,13 @@ citadel> INSERT INTO users (id, name) VALUES (1, 'Alice'), (2, 'Bob');
 citadel> SELECT * FROM users;
 ```
 
-Supports 27 dot-commands (`.backup`, `.verify`, `.upgrade`, `.stats`, `.sync`, `.keygen`, etc.), tab completion, syntax highlighting, and multiple output modes. `.upgrade` migrates a database created by an older release to the authenticated commit-slot format (one-way).
+The interactive shell prompts for the passphrase when it is omitted. Use `.help` to list the
+27 dot-commands, including `.backup`, `.verify`, `.audit`, `.rekey`, `.stats`, and `.sync`.
+It supports tab completion, syntax highlighting, and box, table, CSV, JSON, and line
+output modes.
+
+`.upgrade` migrates legacy commit slots to the authenticated format. This is a one-way
+operation; make a backup first.
 
 ## License
 

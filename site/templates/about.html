@@ -4,16 +4,16 @@
 {% block description %}Citadel is a single-author Rust workspace: a local-first encrypted memory engine for AI agents, built on an embedded SQL/vector database. {{ config.extra.crates }} crates, encryption that cannot be turned off, cryptographic forgetting, reproducible benchmarks.{% endblock %}
 
 {% block content %}
-<main class="shell">
+<div class="shell">
 
   <section class="about-hero">
     <div>
       <div class="kicker">About / The project</div>
       <h1>A single-author Rust project with <em>no unencrypted mode</em>.</h1>
-      <p class="sub">Not an option, not an extension, not a wrapper. A {{ config.extra.crates }}-crate Rust workspace: an encrypted memory engine with cryptographic forgetting, hybrid vector recall, and an MCP server - built on a full SQL engine with AES-256-CTR + HMAC page encryption, shadow paging, and a reproducible benchmark suite.</p>
+      <p class="sub">An encrypted memory engine with hybrid recall and an MCP server, built on an embedded SQL/vector database. Citadel Studio provides a native interface for SQL, stored memory, and vault diagnostics.</p>
     </div>
     <aside class="card">
-      <div class="row"><span class="k">version</span><span class="v"><span class="ac">v{{ config.extra.version }}</span> / stable</span></div>
+      <div class="row"><span class="k">version</span><span class="v"><span class="ac">{{ release.tag }}</span> / stable</span></div>
       <div class="row"><span class="k">license</span><span class="v">Apache-2.0</span></div>
       <div class="row"><span class="k">crates</span><span class="v">{{ config.extra.crates }}</span></div>
       <div class="row"><span class="k">tests</span><span class="v">thousands / CI-gated</span></div>
@@ -31,35 +31,35 @@
             <div class="t-num">i.</div>
             <div>
               <h3>The file format is <span class="ac">always encrypted</span>.</h3>
-              <p>Every page is AES-256-CTR ciphertext with an HMAC-SHA256 tag. There is no unencrypted mode. You cannot disable it, forget to enable it, or ship a build without it.</p>
+              <p>Page payloads use AES-256-CTR with HMAC-SHA256 authentication. There is no unencrypted storage mode. File headers and commit metadata are not hidden.</p>
             </div>
           </div>
           <div class="tenet">
             <div class="t-num">ii.</div>
             <div>
               <h3>Crash-safety without a <span class="ac">WAL</span>.</h3>
-              <p>Commits use shadow paging: modified pages are written to fresh locations, then a single-byte flip in the file header atomically publishes the new commit slot. No separate log to replay, no fsync storm, no partial-write window.</p>
+              <p>Commits use shadow paging: modified pages are written to fresh locations before publishing a new commit slot. Durable commits flush the pages and commit metadata in order; recovery validates the retained slots.</p>
             </div>
           </div>
           <div class="tenet">
             <div class="t-num">iii.</div>
             <div>
               <h3>Embedded means <span class="ac">no server</span>.</h3>
-              <p>Citadel is a library. There is no daemon, no listener, no network code path in the default build. Your application's process <i>is</i> the database, the same deployment model as SQLite, with crypto as a property of the file format.</p>
+              <p>The database runs inside your application and needs no separate server. Network sync and the stdio MCP server are explicit integrations.</p>
             </div>
           </div>
           <div class="tenet">
             <div class="t-num">iv.</div>
             <div>
               <h3>Memory is encrypted the <span class="ac">same way</span>.</h3>
-              <p>The memory engine, <code>citadel-mem</code>, stores vectors, atoms, and edges on the exact same encrypted pages. Forgetting is cryptographic: destroy an atom's or region's key and the ciphertext that remains is unrecoverable, with a verifiable erasure receipt.</p>
+              <p>The memory engine stores vectors, atoms, and edges through the encrypted database. Encrypted regions support per-atom and per-region key erasure with receipts. External backups, copied keys, and exported plaintext are outside that erasure.</p>
             </div>
           </div>
           <div class="tenet">
             <div class="t-num">v.</div>
             <div>
               <h3>The benchmarks are <span class="ac">reproducible</span>.</h3>
-              <p>The {{ config.extra.benchmarks }} head-to-head benchmarks against unencrypted SQLite live in <code>citadeldb-sql/benches/h2h_bench.rs</code>. Run them yourself with <code>cargo bench</code>. We publish what the bench output says, not a marketing average.</p>
+              <p>The {{ config.extra.benchmarks }} head-to-head benchmarks against unencrypted SQLite live in <code>crates/citadel-sql/benches/h2h_bench.rs</code>. They compare engine overhead with durability disabled. Commands and measured results are in the <a href="{{ config.extra.github }}#speed-benchmarks">README</a>.</p>
             </div>
           </div>
         </div>
@@ -91,6 +91,7 @@
           <div class="crate"><div class="name">citadel-ai</div><div class="desc">Agent runtime: ReAct + Reflexion, budget caps.</div></div>
           <div class="crate"><div class="name">citadel-mcp</div><div class="desc">MCP server exposing memory as {{ config.extra.mcp_tools }} tools.</div></div>
           <div class="crate"><div class="name">citadel-cli</div><div class="desc">REPL with 27 dot-commands, tab completion.</div></div>
+          <div class="crate"><div class="name">citadel-studio</div><div class="desc">Native SQL, stored-memory, and vault inspection client.</div></div>
           <div class="crate"><div class="name">citadel-ffi</div><div class="desc">Panic-safe C ABI. cbindgen header.</div></div>
           <div class="crate"><div class="name">citadel-wasm</div><div class="desc">WebAssembly build. <code>@citadeldb/wasm</code> on npm.</div></div>
           <div class="crate"><div class="name">citadel-python</div><div class="desc">PyO3 bindings. <code>citadeldb</code> wheel on PyPI.</div></div>
@@ -103,17 +104,14 @@
 
   <section class="sec">
     <div class="about-grid">
-      <div class="sec-index"><span class="num">03</span><span class="label">Facts, verified</span></div>
+      <div class="sec-index"><span class="num">03</span><span class="label">Specifications</span></div>
       <div>
-        <p style="margin:0 0 22px; color:var(--fg-2); font-size:14.5px; line-height:1.65; max-width:62ch;">
-          Every number here is either in the README, in a source file, or returned by the test suite. No marketing approximations.
-        </p>
         <div class="spec-table">
           <div class="spec-row"><div class="k">Language</div><div class="v"><code>Rust {{ config.extra.msrv }}+</code></div><div class="note">stable toolchain</div></div>
           <div class="spec-row"><div class="k">License</div><div class="v"><span class="ac">Apache-2.0</span></div><div class="note">permissive</div></div>
           <div class="spec-row"><div class="k">Workspace crates</div><div class="v"><span class="ac">{{ config.extra.crates }}</span> / {{ config.extra.published }} published</div><div class="note">see section 02</div></div>
           <div class="spec-row"><div class="k">Tests</div><div class="v"><span class="ac">Workspace-wide</span></div><div class="note">cargo test --workspace</div></div>
-          <div class="spec-row"><div class="k">Head-to-head</div><div class="v"><span class="ac">{{ config.extra.benchmarks }} / {{ config.extra.benchmarks }}</span> faster vs SQLite</div><div class="note">execution geo mean ~3.4&times;</div></div>
+          <div class="spec-row"><div class="k">Head-to-head</div><div class="v"><span class="ac">{{ config.extra.benchmarks }} / {{ config.extra.benchmarks }}</span> faster vs SQLite</div><div class="note">durability off / <a href="{{ config.extra.github }}#speed-benchmarks">methodology</a></div></div>
           <div class="spec-row"><div class="k">Page size</div><div class="v"><span class="ac">8,208 B</span> on disk</div><div class="note">16 IV + 8,160 ct + 32 MAC</div></div>
           <div class="spec-row"><div class="k">Cipher</div><div class="v"><code>AES-256-CTR</code></div><div class="note">per-page HMAC-SHA256</div></div>
           <div class="spec-row"><div class="k">MAC</div><div class="v"><code>HMAC-SHA256</code></div><div class="note">per-page tag</div></div>
@@ -139,7 +137,7 @@
         <div class="audit">
           <div class="audit-row">
             <div class="cat">core</div>
-            <div class="claim">Cipher, MAC, KDF, page size, shadow paging, workspace-wide tests, {{ config.extra.benchmarks }}/{{ config.extra.benchmarks }} head-to-head, {{ config.extra.crates }} crates, a panic-safe C ABI, and {{ config.extra.mcp_tools }} MCP tools, all grounded in the README and source tree.</div>
+            <div class="claim">Encrypted pages and key management in <code>citadel-crypto</code>; transactions and authenticated commit slots in <code>citadel-txn</code>; public database APIs in <code>citadel</code>.</div>
           </div>
           <div class="audit-row">
             <div class="cat">sql</div>
@@ -151,7 +149,7 @@
           </div>
           <div class="audit-row">
             <div class="cat">targets</div>
-            <div class="claim">Rust on crates.io, Python on PyPI, WebAssembly on npm, C ABI via <code>citadel-ffi</code>, and the <code>citadel</code> CLI.</div>
+            <div class="claim">Rust on crates.io, Python on PyPI, WebAssembly on npm, C ABI via <code>citadel-ffi</code>, the <code>citadel</code> CLI, and Citadel Studio. See <a href="{{ get_url(path='@/download/_index.md') }}">downloads and build instructions</a>.</div>
           </div>
           <div class="audit-row">
             <div class="cat">playground</div>
@@ -188,11 +186,11 @@
     <blockquote>
       Encrypted <span class="ac">by construction</span>. Not by option.
     </blockquote>
-    <div class="sig">citadel / v{{ config.extra.version }}</div>
+    <div class="sig">citadel / {{ release.tag }}</div>
     <div class="final-actions">
       <a class="btn" href="{{ get_url(path='@/demo/_index.md') }}">Open playground</a>
       <a class="btn ghost" href="{{ config.base_url }}/">Back to overview</a>
     </div>
   </section>
-</main>
+</div>
 {% endblock %}

@@ -790,17 +790,17 @@ section.block { padding-top: 64px; padding-bottom: 64px; }
 .unlock-err.ok { color: var(--ok); }
 .unlock-err code { color: inherit; background: transparent; padding: 0; }
 
-.about-hero { padding: 72px 0 56px; display: grid; grid-template-columns: 1fr 360px; gap: 56px; align-items: end; border-bottom: 1px solid var(--line); }
-.about-hero .kicker { font-family: var(--f-mono); font-size: 11.5px; letter-spacing: 0.16em; text-transform: uppercase; color: var(--accent); margin-bottom: 18px; }
-.about-hero h1 { font-size: clamp(32px, 3.6vw, 44px); line-height: 1.15; letter-spacing: -0.02em; font-weight: 500; margin: 0 0 22px; color: var(--fg); max-width: 26ch; text-wrap: balance; }
-.about-hero h1 em { font-style: normal; color: var(--accent-2); font-weight: 600; }
-.about-hero .sub { font-size: 16px; line-height: 1.6; color: var(--fg-2); max-width: 60ch; margin: 0; }
-.about-hero .card { border: 1px solid var(--line); border-radius: 10px; background: var(--bg-2); padding: 22px 24px; font-family: var(--f-mono); font-size: 12.5px; line-height: 1.8; color: var(--fg-2); }
-.about-hero .card .row { display: flex; justify-content: space-between; gap: 16px; }
-.about-hero .card .row + .row { border-top: 1px dashed var(--line); padding-top: 6px; margin-top: 6px; }
-.about-hero .card .k { color: var(--fg-3); }
-.about-hero .card .v { color: var(--fg); }
-.about-hero .card .v .ac { color: var(--accent-2); }
+.about-hero, .dl-hero { padding: 72px 0 56px; display: grid; grid-template-columns: 1fr 360px; gap: 56px; align-items: end; border-bottom: 1px solid var(--line); }
+.about-hero .kicker, .dl-hero .kicker { font-family: var(--f-mono); font-size: 11.5px; letter-spacing: 0.16em; text-transform: uppercase; color: var(--accent); margin-bottom: 18px; }
+.about-hero h1, .dl-hero h1 { font-size: clamp(32px, 3.6vw, 44px); line-height: 1.15; letter-spacing: -0.02em; font-weight: 500; margin: 0 0 22px; color: var(--fg); max-width: 26ch; text-wrap: balance; }
+.about-hero h1 em, .dl-hero h1 em { font-style: normal; color: var(--accent-2); font-weight: 600; }
+.about-hero .sub, .dl-hero .sub { font-size: 16px; line-height: 1.6; color: var(--fg-2); max-width: 60ch; margin: 0; }
+.about-hero .card, .dl-hero .card { border: 1px solid var(--line); border-radius: 10px; background: var(--bg-2); padding: 22px 24px; font-family: var(--f-mono); font-size: 12.5px; line-height: 1.8; color: var(--fg-2); }
+.about-hero .card .row, .dl-hero .card .row { display: flex; justify-content: space-between; gap: 16px; }
+.about-hero .card .row + .row, .dl-hero .card .row + .row { border-top: 1px dashed var(--line); padding-top: 6px; margin-top: 6px; }
+.about-hero .card .k, .dl-hero .card .k { color: var(--fg-3); }
+.about-hero .card .v, .dl-hero .card .v { color: var(--fg); }
+.about-hero .card .v .ac, .dl-hero .card .v .ac { color: var(--accent-2); }
 
 .sec { padding: 72px 0; border-bottom: 1px solid var(--line); }
 .about-grid { display: grid; grid-template-columns: 180px 1fr; gap: 56px; align-items: start; }
@@ -1009,6 +1009,29 @@ section.block { padding-top: 64px; padding-bottom: 64px; }
 .tag { background: var(--bg-2); border: 1px solid var(--line); color: var(--accent-2); padding: 3px 10px; border-radius: 999px; font-size: 12px; font-family: var(--f-mono); }
 a.tag:hover { border-color: color-mix(in oklab, var(--accent) 40%, var(--line)); color: var(--accent); }
 
+.dl-table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 10px; }
+.dl-table { width: 100%; border-collapse: collapse; font-family: var(--f-mono); font-size: 13px; text-align: left; }
+.dl-table th, .dl-table td { padding: 12px 18px; border-bottom: 1px solid var(--line); }
+.dl-table th { font-weight: 500; }
+.dl-table thead { background: var(--bg-2); color: var(--fg-3); }
+.dl-table tbody tr:last-child > * { border-bottom: none; }
+.dl-table tbody tr:hover { background: var(--bg-2); }
+.dl-table a, .binding p a, .dl-note a, .dl-hero .card a { color: var(--accent); text-underline-offset: 3px; }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }
+.dl-note { font-size: 13.5px; line-height: 1.6; color: var(--fg-3); margin: 18px 0 0; max-width: 78ch; }
+.dl-verify { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.dl-verify h4 { font-size: 14px; font-weight: 600; margin: 0 0 10px; color: var(--fg); }
+.dl-verify .inst { font-family: var(--f-mono); font-size: 12px; line-height: 1.7; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg-2); color: var(--fg); white-space: pre-wrap; word-break: break-word; }
+.dl-verify .inst .prompt { color: var(--accent); margin-right: 8px; }
+.int-code { border: 1px solid var(--line); border-radius: 10px; background: var(--bg-2); overflow-x: auto; }
+.int-code pre { margin: 0; padding: 20px 22px; }
+.int-code code { font-family: var(--f-mono); font-size: 12.5px; line-height: 1.75; color: var(--fg-2); }
+.dl-note + .int-code { margin-top: 18px; }
+.binding .top { flex-wrap: wrap; }
+.studio-heading { display: flex; align-items: center; gap: 16px; }
+.studio-heading img { width: 64px; height: 64px; flex-shrink: 0; }
+.studio-shot { display: block; width: 100%; height: auto; margin-top: 24px; border: 1px solid var(--line); border-radius: 10px; }
+
 @media (max-width: 1100px) {
   .demo { grid-template-columns: 200px 1fr 240px; }
 }
@@ -1022,6 +1045,8 @@ a.tag:hover { border-color: color-mix(in oklab, var(--accent) 40%, var(--line));
   .kpi { border-bottom: 1px solid var(--line); }
   .bench-table .row { grid-template-columns: 1fr 92px 68px; }
   .bench-table .row > :nth-child(2), .bench-table .row > :nth-child(4) { display: none; }
+  .dl-verify { grid-template-columns: 1fr; }
+  .about-hero, .dl-hero { grid-template-columns: 1fr; gap: 32px; }
   .proof { grid-template-columns: 1fr; gap: 12px; }
 }
 @media (max-width: 900px) {
@@ -1057,7 +1082,7 @@ a.tag:hover { border-color: color-mix(in oklab, var(--accent) 40%, var(--line));
   .demo-status { grid-template-columns: 1fr 1fr; }
   .cta-band { grid-template-columns: 1fr; gap: 18px; }
 }
-@media (max-width: 800px) {
+@media (max-width: 1100px) {
   .foot-grid { grid-template-columns: 1fr 1fr; }
   .nav-links {
     display: none;

@@ -3,53 +3,112 @@ name: Deploy Site
 on:
   push:
     branches: [master]
-    paths-ignore:
-      - 'LICENSE-*'
-      - 'SECURITY.md'
-      - '.github/FUNDING.yml'
-      - '.github/*.png'
-      - 'README.md'
-      - 'crates/*/README.md'
-      - 'scripts/**'
+  release:
+    types: [published]
   workflow_dispatch:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 concurrency:
-  group: pages
-  cancel-in-progress: true
+  group: ${{ github.event_name == 'release' && 'site-release-dispatch' || 'pages' }}
+  cancel-in-progress: false
 
 jobs:
-  build:
+  refresh:
+    if: github.event_name == 'release' && !github.event.release.draft && !github.event.release.prerelease
     runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Request website deployment from master
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh api --method POST "repos/$GH_REPO/actions/workflows/deploy-site.yml/dispatches" -f ref=master
+
+  build:
+    if: github.event_name != 'release' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      site_sha: ${{ steps.source.outputs.sha }}
+      release_fingerprint: ${{ steps.release.outputs.release_fingerprint }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: refs/heads/master
+          persist-credentials: false
+
+      - name: Record website source
+        id: source
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve published downloads
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node site/scripts/release.cjs
+
+      - name: Cache released playground
+        id: wasm
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/citadel-site-wasm
+          key: site-wasm-v1-${{ runner.os }}-${{ steps.release.outputs.release_sha }}-${{ hashFiles('.github/workflows/deploy-site.yml') }}
+
+      - name: Check out released engine
+        if: steps.wasm.outputs.cache-hit != 'true'
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ steps.release.outputs.release_sha }}
+          path: .site-release
+          persist-credentials: false
 
       - name: Install pinned toolchain (rust-toolchain.toml)
+        if: steps.wasm.outputs.cache-hit != 'true'
+        working-directory: .site-release
         run: rustup toolchain install
 
       - name: Install wasm-pack
+        if: steps.wasm.outputs.cache-hit != 'true'
+        working-directory: .site-release
         run: cargo install wasm-pack --version 0.14.0 --locked
 
       - name: Install binaryen (provides wasm-opt)
+        if: steps.wasm.outputs.cache-hit != 'true'
         run: sudo apt-get update && sudo apt-get install -y binaryen
 
       - name: Build WASM
+        if: steps.wasm.outputs.cache-hit != 'true'
+        working-directory: .site-release
         run: |
           bash scripts/publish-wasm.sh
+          mkdir -p "$RUNNER_TEMP/citadel-site-wasm"
+          cp crates/citadel-wasm/pkg/citadel_wasm_bg.wasm "$RUNNER_TEMP/citadel-site-wasm/"
+          cp crates/citadel-wasm/pkg/citadel_wasm.js "$RUNNER_TEMP/citadel-site-wasm/"
+
+      - name: Install released playground
+        run: |
+          test -s "$RUNNER_TEMP/citadel-site-wasm/citadel_wasm_bg.wasm"
+          test -s "$RUNNER_TEMP/citadel-site-wasm/citadel_wasm.js"
           mkdir -p site/static/wasm
-          cp crates/citadel-wasm/pkg/citadel_wasm_bg.wasm site/static/wasm/
-          cp crates/citadel-wasm/pkg/citadel_wasm.js site/static/wasm/
+          cp "$RUNNER_TEMP/citadel-site-wasm/"* site/static/wasm/
 
       - name: Install Zola
         run: |
-          curl -sL https://github.com/getzola/zola/releases/download/v0.22.1/zola-v0.22.1-x86_64-unknown-linux-gnu.tar.gz | tar xz -C /usr/local/bin
+          ARCHIVE="$RUNNER_TEMP/zola.tar.gz"
+          curl --fail --silent --show-error --location -o "$ARCHIVE" \
+            https://github.com/getzola/zola/releases/download/v0.22.1/zola-v0.22.1-x86_64-unknown-linux-gnu.tar.gz
+          echo "0ca09aa40376aaa9ddfb512ff9ad963262ef95edb0d0f2d5ec6961b6f5cf22ef  $ARCHIVE" \
+            | sha256sum -c -
+          tar -xzf "$ARCHIVE" -C /usr/local/bin zola
 
-      - name: Build site
-        run: zola --root site build
+      - name: Check and build site
+        run: |
+          node --test site/tests/*.test.cjs
+          zola --root site check --skip-external-links
+          zola --root site build
 
       - uses: actions/upload-pages-artifact@v4
         with:
@@ -59,10 +118,26 @@ jobs:
     runs-on: ubuntu-latest
     needs: build
     timeout-minutes: 10
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.build.outputs.site_sha }}
+          persist-credentials: false
+      - name: Check deployment is still current
+        id: current
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_SITE_SHA: ${{ needs.build.outputs.site_sha }}
+          EXPECTED_RELEASE: ${{ needs.build.outputs.release_fingerprint }}
+        run: node site/scripts/release.cjs --check-current
       - name: Deploy to GitHub Pages
+        if: steps.current.outputs.current == 'true'
         id: deployment
         uses: actions/deploy-pages@v4

@@ -8,21 +8,27 @@ that destroy the key, not just the row.
 pip install citadeldb-llamaindex
 ```
 
-Requires `llama-index-core>=0.13.1`; that is the first release carrying the
-metadata-filter evaluator used to match LlamaIndex's filter semantics.
+Requires `citadeldb>=2.2,<3` and `llama-index-core>=0.13.1,<0.15`.
+The example also requires `pip install llama-index-embeddings-openai` and
+`OPENAI_API_KEY`; document and query text are sent to the embedding provider.
 
 ```python
-from llama_index.core import Document, Settings, StorageContext, VectorStoreIndex
+from llama_index.core import Document, StorageContext, VectorStoreIndex
+from llama_index.embeddings.openai import OpenAIEmbedding
 from citadeldb_llamaindex import CitadelVectorStore
 
-embed_model = Settings.embed_model
+embed_model = OpenAIEmbedding(model="text-embedding-3-small")
 store = CitadelVectorStore(
     "corpus.cdl",
     key="your-passphrase",
     embed_model=embed_model,
     dim=1536,
 )
-documents = [Document(text="the deployment failed because the disk was full")]
+documents = [Document(
+    id_="doc-42",
+    text="the deployment failed because the disk was full",
+    metadata={"year": 2026},
+)]
 
 index = VectorStoreIndex.from_documents(
     documents,
@@ -30,7 +36,7 @@ index = VectorStoreIndex.from_documents(
     embed_model=embed_model,
 )
 
-index.as_query_engine().query("why did the release break?")
+index.as_retriever(similarity_top_k=1).retrieve("why did the release break?")
 ```
 
 `dim` must match your embedding model: 1536 for OpenAI `text-embedding-3-small`, 3072 for
@@ -41,8 +47,9 @@ in that order. For a custom model without any of those attributes, pass a stable
 
 ## Deletes destroy the key
 
-Every node is sealed under its own key. Deleting destroys that key and then removes the
-row, so any ciphertext surviving elsewhere stays unreadable.
+Every node is sealed under its own key. Deleting destroys that key and removes the
+row. Pre-erasure backups or snapshots containing keys, and exported plaintext, are outside
+that erasure.
 
 ```python
 index.delete_ref_doc("doc-42")  # every node from that document
@@ -50,18 +57,13 @@ store.forget_document("doc-42")  # the same, returning a count for the record
 store.clear()  # the whole corpus
 ```
 
-The node's key is gone, not just its entry in an index.
-
 ## Filters
 
-Filtering matches LlamaIndex's own evaluator, and `similarity_top_k` is honoured: a filter
-matching only distant nodes still returns them, however many others outrank them. The same
-holds for `node_ids` and `doc_ids`, which name nodes exactly.
+Metadata filters, `node_ids`, and `doc_ids` restrict candidates before final top-k selection.
 
-String equality under a top-level `AND` is pushed into the scan so it narrows candidates
-before top-k. Everything else is evaluated afterwards, so the two agree: numbers are not
-pushed, because `EQ` here is Python's `==` (`1 == 1.0`) where the stored comparison is
-JSON-type exact.
+String equality under a top-level `AND` is passed to Citadel as a payload filter. Other
+predicates filter ranked candidates; the search window expands until
+`similarity_top_k` matches survive or the region is exhausted.
 
 ```python
 from llama_index.core.vector_stores.types import (
@@ -79,17 +81,13 @@ index.as_retriever(
 ).retrieve("...")
 ```
 
-Filter semantics come from LlamaIndex's own evaluator, so every operator behaves exactly
-as it does with the reference store. Under `OR` or `NOT` nothing is pushed, because a
-pushed leaf would drop rows the filter keeps.
+Leaf operators use LlamaIndex's filter evaluator. The adapter handles `AND`, `OR`,
+and `NOT`, including `NOT` on versions whose evaluator does not implement it.
 
 ## Notes
 
-LlamaIndex normally embeds before it calls a store, so a node's supplied vector is written
-straight onto the atom. The store requires the same `embed_model` as an explicit constructor
-argument; if a node arrives without a vector, Citadel uses that model instead of opening a
-degraded region or inventing a placeholder. Pass the same object to the index and
-store so every write and query stays in one vector space.
+Supplied vectors are stored as-is; nodes without a vector use the required
+`embed_model`. Pass the same model to the index and store.
 
 The node is stored whole, minus its text, which is kept once as the atom's searchable
 content and restored on read. Metadata, relationships and node type all round-trip.

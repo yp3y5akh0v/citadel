@@ -29,16 +29,9 @@ passphrase (`export CITADEL_KEY="your-passphrase"` on macOS/Linux or
 uvx citadeldb-mcp --db memory.cdl --embedder e5-large --reranker ms-marco-minilm
 ```
 
-`e5-large` + `ms-marco-minilm` is the highest-recall setup and the exact config behind the
-memory benchmark numbers. Models are never downloaded automatically.
-
-For an intentional lexical-only smoke test, select the deterministic mock explicitly:
-
-```sh
-uvx citadeldb-mcp --db memory.cdl --embedder mock
-```
-
-The mock performs no semantic matching and is not a substitute for the configuration above.
+`e5-large` + `ms-marco-minilm` is the recommended semantic-recall setup. See the
+[memory benchmarks](https://github.com/yp3y5akh0v/citadel/tree/HEAD/crates/citadel-membench)
+for measured configurations. Models are never downloaded automatically.
 
 Built-in pulls use release-pinned Hugging Face revisions. Each complete snapshot is verified
 against compiled sizes and SHA-256 digests, then stored with a BLAKE3 manifest under
@@ -55,7 +48,7 @@ then wire it into Claude Desktop (`claude_desktop_config.json`):
   "mcpServers": {
     "citadel": {
       "command": "citadeldb-mcp",
-      "args": ["--db", "memory.cdl", "--embedder", "e5-large", "--reranker", "ms-marco-minilm"],
+      "args": ["--db", "/absolute/path/to/memory.cdl", "--embedder", "e5-large", "--reranker", "ms-marco-minilm"],
       "env": { "CITADEL_KEY": "your-passphrase" }
     }
   }
@@ -84,20 +77,18 @@ Tools (over a bounded, cancellable JSON-RPC 2.0 stdio transport):
 
 The `citadeldb-mcp` binary reads the passphrase from `CITADEL_KEY` and serves one region
 (encrypted by default); only protocol messages go to stdout, diagnostics to stderr.
+`--region-mode plaintext` disables per-atom encryption and cryptographic erasure for
+that region; the database remains encrypted at rest. Erasure does not revoke plaintext
+exports or keys retained in pre-erasure backups or snapshots.
 
-Every server invocation must select an embedder. Use `--embedder mock` only when keyword-only
-recall is intentional. The (CPU) Candle embedder is compiled into the default build;
-models are fetched only on explicit `pull`, never automatically. `e5-large` + the
-`ms-marco-minilm` reranker (shown above) is the recommended, highest-recall setup.
+Every server invocation must select an embedder. The CPU Candle embedder is compiled into the standalone server's
+default build, including the `citadeldb-mcp` Python package; it is not included in the
+default `citadeldb` library wheel. Models are fetched only on explicit `pull`.
 
 Embedder pull names: `e5-large` (recommended), `e5-large-v2`, `bge-small`, `bge-base`,
 `bge-large`, `minilm`. Reranker: `ms-marco-minilm`. Or point `--model-dir` at a
 compatible local checkpoint for the selected catalog pipeline, and build with
 `--features cuda-embed` to run on an NVIDIA GPU.
-
-Managed snapshots fetched by `pull` are manifest- and checksum-verified. A directory
-supplied through `--model-dir` or `--reranker-dir` is an operator-trusted input and is
-not validated against the managed snapshot manifest.
 
 This crate is part of the Citadel workspace.
 

@@ -1,8 +1,8 @@
 # citadeldb
 
 Local-first encrypted memory for AI agents. Raw conversation turns are stored as
-written, with no summarizer LLM in the ingest path, in a single encrypted file that
-lives inside your process.
+written, with no summarizer LLM in the ingest path. Citadel runs inside your process;
+the database uses a companion `.citadel-keys` file for its encryption keys.
 
 ## Install
 
@@ -10,65 +10,83 @@ lives inside your process.
 pip install citadeldb
 ```
 
-The only runtime dependency is NumPy; embeddings are bring-your-own.
+Requires Python 3.10 or later. The only runtime dependency is NumPy; embeddings are
+bring-your-own. `CandleEmbedder` and `CrossEncoder` are not included in the default wheel.
 
-## Repairing memory-model provenance
+This guide covers the 2.2 source APIs. Until 2.2 is published, activate a virtual
+environment and build from this repository's root with Rust installed:
 
-`CandleEmbedder.model_id` binds the friendly model name to the exact model,
-tokenizer, and configuration bytes, the selected preset, and Citadel's embedding
-pipeline revision. `MockEmbedder` records a versioned algorithm identity instead of
-a generic `mock` label. A legacy region carrying an earlier identity will not attach
-to the current embedder automatically.
-
-If—and only if—the embedder is exactly the one that produced the stored vectors,
-update the recorded provenance and reattach. For a region created with the old mock
-identity, use its original dimension and metric (replace these example values):
-
-```python
-embedder = citadeldb.MockEmbedder(dim=64, metric="cosine")
-mem.reclassify_region("chat", embedder.model_id)
-mem.attach_existing_region("chat", embedder)
+```console
+pip install maturin
+maturin develop --release
 ```
 
-For a Candle region, builds with the `candle-embed` feature can perform the same
-repair when the model files and preset are unchanged:
+## Semantic embeddings
 
-```python
-embedder = citadeldb.CandleEmbedder("/path/to/model", preset="e5-large")
-mem.reclassify_region("chat", embedder.model_id)
-mem.attach_existing_region("chat", embedder)
+The default wheel can use a local [Sentence Transformers](https://sbert.net/docs/package_reference/sentence_transformer/model.html)
+model through Citadel's cancellation-aware embedder protocol:
+
+```console
+pip install sentence-transformers
 ```
 
-`reclassify_region` changes provenance only; it does not verify or recompute vectors.
-If the embedder changed, or you cannot prove it is unchanged, recompute the vectors
-instead:
-
 ```python
-report = mem.reembed_region("chat", embedder)
+from sentence_transformers import SentenceTransformer
+
+
+class LocalEmbedder:
+    metric = "cosine"
+
+    def __init__(self):
+        name = "sentence-transformers/all-MiniLM-L6-v2"
+        revision = "1110a243fdf4706b3f48f1d95db1a4f5529b4d41"
+        self.model = SentenceTransformer(name, revision=revision, device="cpu")
+        self.dim = self.model.get_sentence_embedding_dimension()
+        self.model_id = f"{name}@{revision}:sentence-transformers:normalized:v1"
+
+    def embed_with_cancel(self, texts, cancel_token):
+        vectors = []
+        for start in range(0, len(texts), 16):
+            if cancel_token is not None:
+                cancel_token.check()
+            vectors.extend(self.model.encode(
+                texts[start:start + 16], normalize_embeddings=True,
+                show_progress_bar=False,
+            ).tolist())
+            if cancel_token is not None:
+                cancel_token.check()
+        return vectors
+
+
+embedder = LocalEmbedder()
 ```
 
-Re-embedding refuses a vector-bearing atom whose original text was not stored,
-because such a vector cannot be recomputed safely.
+The model is downloaded on first construction and runs locally. Keep the model
+revision and encoding settings unchanged when reopening a region. This wrapper checks
+cancellation between batches, not during a batch's model inference.
+
+CitadelDB 2.2 requires `dim`, `metric`, `model_id`, and
+`embed_with_cancel(texts, cancel_token)`. Return one `dim`-wide vector per input and
+accept `None` as the token. Asymmetric models should also implement
+`embed_queries_with_cancel` for query-specific encoding. `MockEmbedder` is only a
+deterministic lexical test backend, not a semantic model.
 
 ## Memory
 
-The default wheel accepts bring-your-own embeddings. The zero-download example below uses
-`MockEmbedder` only as a deterministic lexical API demo; it does not provide semantic
-recall. For production semantic recall, use the e5-large MCP setup below or a source build
-with the `candle-embed` feature.
+Use the `embedder` from the example above:
 
 ```python
 import citadeldb
 
 db = citadeldb.connect("memory.cdl", key="your-passphrase", region_keys=True)
 mem = db.memory()
-mem.create_encrypted_region("chat", citadeldb.MockEmbedder(dim=64))
+mem.create_encrypted_region("chat", embedder)
 
 mochi = mem.remember("chat", {"kind": "fact", "text": "Alice's cat is named Mochi"})
 berlin = mem.remember("chat", {"kind": "fact", "text": "Alice lives in Berlin"})
 mem.link("chat", berlin, mochi, "refines")
 
-for hit in mem.recall("chat", text="Alice lives", k=2):
+for hit in mem.recall("chat", text="Where does Alice live?", k=2):
     assert hit.relevance is not None
     print(f"{hit.relevance:.3f}  {hit.text}")
 
@@ -76,31 +94,48 @@ for edge in mem.fetch_edges("chat", src=berlin, limit=100):
     print(edge["kind"], edge["dst"])
 ```
 
-Recall fuses vector similarity, keyword match, recency, and importance. Nothing is
-summarized or rewritten on the way in, so a date or a number recalls exactly as it
-was said.
+Recall fuses vector similarity, keyword match, recency, and importance. Stored text
+is not summarized or rewritten. `AtomHit.relevance` is a higher-is-better ranking
+score; `distance` is the metric distance when available. Either can be `None` on
+hits returned by operations that do not calculate that value.
+
+`mem.recall_mmr("chat", text="Alice", k=2, fetch_k=10, lambda_mult=0.5)` selects
+diverse results using the stored candidate vectors, without re-embedding documents.
+MMR requires a cosine region.
 
 Edges are region-scoped: both endpoints must be live in the named region. Kind
 summaries are bounded pages; pass `next_after_kind` back as `after_kind` until it
 is `None`. `mem.profile(...)` returns recalled atoms together with their induced
 region-local edges, and `mem.unlink(...)` removes one exact typed edge.
 
-With a `candle-embed` build, replace the region setup above with the real embedder and
-attach a local cross-encoder:
+## Local Candle models
+
+To use the Rust-native embedder and cross-encoder in Python, activate a virtual
+environment and run these commands from the repository root. Building requires Rust:
+
+```console
+pip install maturin
+maturin develop --release --features candle-embed
+pip install citadeldb-mcp
+citadeldb-mcp pull e5-large
+citadeldb-mcp pull ms-marco-minilm
+```
+
+Use the snapshot directories printed by `pull` below. For a new region, replace
+`LocalEmbedder()` in the memory example with this `CandleEmbedder`, then set the
+reranker on `mem`. An existing region requires re-embedding to change its model.
 
 ```python
 embedder = citadeldb.CandleEmbedder("/path/to/e5-large", preset="e5-large")
-mem.create_encrypted_region("chat", embedder)  # replaces the MockEmbedder call above
 mem.set_reranker(citadeldb.CrossEncoder("/path/to/ms-marco-minilm"))
 ```
 
-Operational memory always has an explicit embedder. Inspection and erasure are a
-separate capability for tools that reopen an unfamiliar vault and do not have its
-model:
+`CandleEmbedder.model_id` binds the model, tokenizer, configuration, preset, and
+embedding pipeline revision. These local directories are user-trusted inputs.
 
-A bring-your-own Python embedder exposes `dim`, `metric`, `model_id`, and
-`embed_with_cancel(texts, cancel_token)`. Poll `cancel_token.check()` between bounded
-batches; an asymmetric model may also provide `embed_queries_with_cancel`.
+## Inspection and model changes
+
+Inspect stored memory without loading an embedder:
 
 ```python
 maintenance = db.memory_maintenance()
@@ -109,12 +144,24 @@ for item in maintenance.inventory():
 ```
 
 `MemoryMaintenance` can inventory, fetch, verify, and forget existing atoms. It
-cannot remember or recall, so opening it never invents a replacement embedding model.
+cannot remember or recall.
+
+When a model changes, `mem.reembed_region("chat", embedder)` recomputes vectors from
+stored text while preserving atom ids and authored edges. Managed similarity edges
+are rebuilt. It refuses vector-bearing atoms whose original text was not stored.
+
+For a provenance-only repair, use `mem.reclassify_region("chat", embedder.model_id)`
+and then `mem.attach_existing_region("chat", embedder)`. Do this only if the model,
+artifacts, and encoding settings are exactly those that produced the stored vectors:
+reclassification neither verifies nor recomputes them.
 
 ## Forgetting
 
-Deleting a memory destroys the key its ciphertext was sealed with, so the bytes on
-disk stay unreadable rather than being marked deleted.
+On encrypted regions, forgetting destroys the key that sealed each erased atom.
+It does not erase plaintext already exported or copies of keys held in pre-erasure
+backups or snapshots. Plaintext regions do not provide per-atom cryptographic erasure.
+Targeted forgetting skips immutable atoms unless `force=True`; their ids appear in
+`receipt.immutable_skipped`.
 
 ```python
 receipt = mem.forget("chat", [berlin])
@@ -123,7 +170,8 @@ print(receipt.cryptographic_erasure, receipt.algorithm)
 ```
 
 Pass `cascade_dependents=True` to erase the selected atoms together with their
-transitive `derived_from` dependents. The default remains targeted deletion.
+transitive `derived_from` dependents. Without `force=True`, an immutable atom in
+that closure rejects the entire cascade. The default remains targeted deletion.
 
 ## SQL and vector search
 
@@ -145,9 +193,12 @@ token = citadeldb.CancelToken()
 db.set_cancel(token)
 # another thread may call token.cancel()
 
-report = db.integrity_check(quiet=True)
-for finding in report["errors"]:
-    print(finding["kind"], finding["message"], finding["tampered"])
+try:
+    report = db.integrity_check(quiet=True)
+    for finding in report["errors"]:
+        print(finding["kind"], finding["message"], finding["tampered"])
+finally:
+    db.set_cancel(None)
 ```
 
 ## MCP
@@ -161,12 +212,7 @@ citadeldb-mcp pull ms-marco-minilm
 citadeldb-mcp --db memory.cdl --embedder e5-large --reranker ms-marco-minilm
 ```
 
-Set `CITADEL_KEY` before serving an encrypted vault. Use `--embedder mock` only for an
-intentional lexical-only smoke test.
-
-The main `citadeldb` wheel also exposes
-`citadeldb.mcp.serve("memory.cdl", embedder="mock")` for programmatic keyword-only
-serving; set `CITADEL_KEY` before calling it.
+Set `CITADEL_KEY` to the vault passphrase before serving.
 
 Full documentation is at [citadeldb.dev](https://citadeldb.dev); source and the Rust
 API are in the [main repository](https://github.com/yp3y5akh0v/citadel).

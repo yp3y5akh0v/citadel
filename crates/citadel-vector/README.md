@@ -6,8 +6,9 @@ product, `<=>` cosine), and a [PRISM](https://github.com/yp3y5akh0v/prism)-backe
 reads through Citadel's encrypted page storage, so the index is encrypted at rest like every
 other page.
 
-This crate is part of the Citadel workspace. For SQL vector queries depend on the main
-[`citadeldb`](https://crates.io/crates/citadeldb) crate; for the memory engine see
+This crate is part of the Citadel workspace. For SQL vector queries use
+[`citadeldb`](https://crates.io/crates/citadeldb) with
+[`citadeldb-sql`](https://crates.io/crates/citadeldb-sql); for the memory engine see
 [`citadeldb-mem`](https://crates.io/crates/citadeldb-mem).
 
 ## License

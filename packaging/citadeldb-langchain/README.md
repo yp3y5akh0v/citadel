@@ -8,7 +8,13 @@ embedded in your process, and deletes that destroy the key, not just the row.
 pip install citadeldb-langchain
 ```
 
+Requires `citadeldb>=2.2,<3` and `langchain-core>=0.3.22,<2`.
+
 ## Vector store
+
+The example uses `langchain-openai` (`pip install langchain-openai`) and requires
+`OPENAI_API_KEY`. Text is sent to the configured embedding provider; use a local
+LangChain `Embeddings` implementation to keep embedding inference local.
 
 ```python
 from langchain_openai import OpenAIEmbeddings
@@ -33,16 +39,16 @@ duplicate it.
 
 ### Deletes destroy the key
 
-Every document is sealed under its own key. Deleting destroys that key and then removes the
-row, so any ciphertext surviving elsewhere stays unreadable.
+Every document is sealed under its own key. Deleting destroys that key and removes the
+row. Pre-erasure backups or snapshots containing keys, and exported plaintext, are outside
+that erasure.
 
 ```python
 store.delete(["note-1"])  # named ids
-store.clear()  # the whole corpus, deliberately
+store.clear()  # the whole corpus
 ```
 
-`delete()` with no ids is a no-op, matching `InMemoryVectorStore`. Emptying the store is
-`clear()`, because erasure cannot be undone.
+`delete()` with no ids is a no-op. Use `clear()` to empty the store.
 
 ### Filters
 
@@ -50,28 +56,35 @@ store.clear()  # the whole corpus, deliberately
 store.similarity_search("...", k=4, filter={"source": "handbook.pdf"})
 ```
 
-The filter is evaluated inside the scan, so it narrows candidates before top-k rather than
-trimming results after it, and `k` is `k`: a filter matching only distant documents still
-returns them, however many others outrank them.
+Filters narrow candidates before final top-k selection.
 
 MMR selection runs inside Citadel over the exact vectors stored for the recalled candidates.
 Stored vectors do not cross the Python boundary, and the document embedding model is not run
 again during search.
 
+```python
+retriever = store.as_retriever(
+    search_type="mmr",
+    search_kwargs={"k": 4, "fetch_k": 20, "lambda_mult": 0.5},
+)
+```
+
 ## Chat history
+
+Chat history reads complete sessions by id. This example uses local e5-large and
+requires the [Candle source build and model setup](https://github.com/yp3y5akh0v/citadel/blob/HEAD/python/README.md#local-candle-models).
+The default wheel accepts a [bring-your-own semantic embedder](https://github.com/yp3y5akh0v/citadel/blob/HEAD/python/README.md#semantic-embeddings).
 
 ```python
 import citadeldb
 from citadeldb_langchain import CitadelChatMessageHistory
 
+embedder = citadeldb.CandleEmbedder("/path/to/e5-large", preset="e5-large")
 history = CitadelChatMessageHistory(
     "user-123",
     "chats.cdl",
     key="your-passphrase",
-    # Required, and no default. This history reads by session id rather than by
-    # vector, so the mock is the honest choice unless you want semantic recall
-    # over turns; either way the region records which model wrote it.
-    embedder=citadeldb.MockEmbedder(dim=64),
+    embedder=embedder,
 )
 history.add_user_message("remember my dog is called Mochi")
 history.messages
@@ -92,8 +105,8 @@ chain = RunnableWithMessageHistory(
     lambda session_id: CitadelChatMessageHistory(
         session_id,
         "chats.cdl",
-        key="...",
-        embedder=citadeldb.MockEmbedder(dim=64),
+        key="your-passphrase",
+        embedder=embedder,
     ),
     input_messages_key="input",
     history_messages_key="history",
@@ -105,6 +118,11 @@ chain = RunnableWithMessageHistory(
 Citadel is embedded and one process owns the file. A path already open on this thread,
 under the same passphrase, is shared, so the vector store and the chat history can sit on
 one encrypted database; construct them on the same thread.
+
+A custom chat-history embedder must expose `dim`, `metric`, `model_id`, and
+`embed_with_cancel(texts, cancel_token)`. Accept `None` as the token; otherwise check
+it between bounded batches. An asymmetric model can also provide
+`embed_queries_with_cancel`.
 
 ## License
 

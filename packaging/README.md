@@ -1,22 +1,16 @@
 # Packages
 
-Distribution packages built from this workspace. Each adapter is versioned from the release
-tag and `citadeldb-mcp` from the workspace crate version; each is built and published by
-its own workflow under [`.github/workflows/`](../.github/workflows).
+Python framework adapters, the MCP server, and desktop installers for Citadel.
 
-Every adapter requires `citadeldb>=2.2,<3`. CrewAI, Haystack, LangChain, and LlamaIndex
-consume expanded hit-scoring or core MMR APIs; the other five use the cancellation-aware
-embedder protocol added in 2.2.
-Their test jobs build the core wheel in-run and constrain adapter dependency resolution
-to that exact version, so PyPI cannot silently replace the wheel under test.
+Every adapter requires `citadeldb>=2.2,<3`. Framework-specific version
+requirements are listed in each package's README and manifest.
 
 ## Agent framework adapters
 
-Each implements the framework's own storage interface, so a project swaps one constructor
-and keeps every other feature. Deletes destroy the record's key, not just its row, and
-the database is encrypted with no unencrypted mode. Where the framework hands over a query
-string, search is hybrid vector + keyword recall; the vector-store adapters rank on the
-embedding the framework supplies.
+Each implements a framework storage interface and stores records in encrypted regions.
+Deletes destroy the selected records' keys; pre-erasure backups, snapshots, and exported
+plaintext remain outside that erasure. Text-query adapters use hybrid recall; vector-store
+adapters rank on the embeddings supplied by their framework.
 
 | Framework | Package | Implements | Source |
 |---|---|---|---|
@@ -30,8 +24,7 @@ embedding the framework supplies.
 | [Microsoft Agent Framework](https://github.com/microsoft/agent-framework) | [`citadeldb-ms-agent-framework`](https://pypi.org/project/citadeldb-ms-agent-framework/) | `agent_framework.HistoryProvider`, `agent_framework.ContextProvider` | [`citadeldb-ms-agent-framework/`](citadeldb-ms-agent-framework) |
 | [Strands Agents](https://github.com/strands-agents/harness-sdk) | [`citadeldb-strands-agents`](https://pypi.org/project/citadeldb-strands-agents/) | `strands.session.SessionRepository` | [`citadeldb-strands-agents/`](citadeldb-strands-agents) |
 
-Each package's README carries its own usage, and each ships its own test suite run against
-the built wheel in CI.
+Each package's README contains setup, supported operations, and limitations.
 
 ## Server
 
@@ -42,6 +35,7 @@ the built wheel in CI.
 ## Desktop installers
 
 Citadel Studio is packaged for Linux, macOS, and Windows.
+See [downloads](https://citadeldb.dev/download/) for release availability.
 
 | Platform | Installer | Architecture |
 |---|---|---|
@@ -54,7 +48,7 @@ Gatekeeper may require **Open Anyway** in **System Settings > Privacy & Security
 The Windows installer and executable are unsigned; SmartScreen may warn or block
 installation. Organization security policies may also prevent installation.
 
-Released installers have `.sha256` checksum files and GitHub build-provenance attestations.
+The release workflow produces `.sha256` checksum files and GitHub build-provenance attestations.
 These do not replace OS publisher signing or suppress its warnings. Verify provenance with:
 
 ```console
@@ -66,10 +60,8 @@ See [third-party licences](licenses/THIRD_PARTY_LICENSES.html).
 
 ## Sharing one database
 
-Citadel is embedded, and a database file is held under a whole-file exclusive lock, so a
-second open of the same path fails even inside one process. `citadeldb.connect` returns a
-handle onto the database this process already holds instead, so two adapters can back onto
-one encrypted file rather than needing a file each:
+Adapters constructed on the same thread can share one encrypted database through
+`citadeldb.connect`. Use the same passphrase and distinct region names:
 
 ```python
 import citadeldb
@@ -77,37 +69,23 @@ from citadeldb_langgraph import CitadelStore
 from citadeldb_openai_agents import CitadelSession
 
 PATH, KEY = "agent.cdl", "your-passphrase"
-# No adapter defaults an embedder: silent substitution would change ranking
-# semantics and persist different provenance.
-# This example performs keyed state and transcript reads only, so the mock avoids
-# model work that neither adapter invokes here. Use a real embedder before semantic search.
-EMB = citadeldb.MockEmbedder(dim=64)
+EMB = citadeldb.CandleEmbedder("/path/to/e5-large", preset="e5-large")
 
-store = CitadelStore(PATH, key=KEY, embedder=EMB)            # LangGraph state
-session = CitadelSession(                                    # Agents SDK transcripts
+store = CitadelStore(PATH, key=KEY, embedder=EMB)
+session = CitadelSession(
     "user-123", db_path=PATH, key=KEY, embedder=EMB
 )
 ```
 
-There is one database here, not two. Each adapter writes to its own region inside it
-(`store` and `sessions` by default), so the state and the transcripts stay separate without
-a second database to open, back up or erase.
+This example requires the [Candle source build and model setup](../python/README.md#local-candle-models).
+The default Python wheel instead accepts a [bring-your-own semantic embedder](../python/README.md#semantic-embeddings).
+Use the same model identity and encoding settings each time a region is reopened.
 
-Treat a region as owned by one adapter family. Multiple adapter types may reuse the same
-database, but they must use distinct region names: their record kinds, keyed identities,
-and payload schemas are not an interchange format and can overlap.
+The default regions above are `store` and `sessions`. Regions belong to one adapter
+family; record schemas are not interchangeable. Closing one handle leaves other
+holders usable. The file lock is released after the last handle and engine are dropped.
 
-Every adapter keeps the constructor shape of the framework it plugs into, which is why
-`CitadelSession` takes the session id first: the SDK's own `SQLiteSession(session_id,
-db_path=...)` does the same.
-
-Each holder gets its own handle over one shared connection. Closing is per holder, so an
-adapter's `with` block cannot disable the application's handle, and the file is released
-once the last handle and any engine built from it have dropped.
-
-The exclusive lock itself is unchanged. Sharing removes only the second open inside the
-process that already owns the file; everything else is still refused, and each refusal
-names its cause:
+Connection-sharing rules:
 
 | Second open | Result |
 |---|---|
@@ -118,12 +96,5 @@ names its cause:
 | Another thread, once every handle has closed | it takes the file over |
 | Another OS process | `OperationalError` |
 
-The passphrase is checked against the key file, and the key file is hashed, so anything
-that rewrites it takes effect at once: `change_passphrase` and `restore_key_from_backup`
-both admit the new passphrase and refuse the old. What is retained is a digest under a
-per-process random key, never a passphrase.
-
-A connection belongs to the thread that opened it, so dispatch work to that thread or pass
-the `Memory` engine, which is safe to use from any thread and is what these adapters hand
-to their workers. One engine serves the whole database, so a region one adapter creates is
-visible to the next.
+Connections belong to their opening thread. The shared `Memory` engine can be passed
+to worker threads.
