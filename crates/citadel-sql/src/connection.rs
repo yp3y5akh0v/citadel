@@ -704,6 +704,24 @@ impl<'a> Connection<'a> {
 
     /// Execute `;`-separated SQL statements. Stops at the first failure.
     pub fn execute_script(&self, sql: &str) -> ScriptExecution {
+        self.execute_script_impl(sql, None)
+    }
+
+    /// Execute a script while sharing one storage-materialization budget across its
+    /// read-only SELECT statements.
+    ///
+    /// Mutating and transaction-control statements retain their normal semantics. This
+    /// does not rewrite SQL or impose a row limit; it refuses a read before its admitted
+    /// storage materialization exceeds `budget` and returns the already-completed prefix.
+    pub fn execute_script_with_read_budget(
+        &self,
+        sql: &str,
+        budget: &ReadBudget,
+    ) -> ScriptExecution {
+        self.execute_script_impl(sql, Some(budget))
+    }
+
+    fn execute_script_impl(&self, sql: &str, budget: Option<&ReadBudget>) -> ScriptExecution {
         let stmts = match parser::parse_sql_multi(sql) {
             Ok(s) => s,
             Err(e) => {
@@ -715,7 +733,16 @@ impl<'a> Connection<'a> {
         };
         let mut completed = Vec::with_capacity(stmts.len());
         for stmt in stmts {
-            match self.with_schema_retry(|inner| inner.dispatch(self.db, &stmt, &[])) {
+            let result = self.with_schema_retry(|inner| {
+                if let Some(budget) = budget.filter(|_| {
+                    matches!(&stmt, Statement::Select(_)) && !executor::stmt_mutates(&stmt)
+                }) {
+                    inner.execute_read_statement_bounded_impl(self.db, &stmt, &[], budget.clone())
+                } else {
+                    inner.dispatch(self.db, &stmt, &[])
+                }
+            });
+            match result {
                 Ok(r) => completed.push(r),
                 Err(e) => {
                     return ScriptExecution {
@@ -1118,14 +1145,31 @@ impl<'a> ConnectionInner<'a> {
             ));
         }
 
+        let result = self.execute_read_statement_bounded_impl(db, &stmt, params, budget)?;
+        Self::bounded_query_result(result)
+    }
+
+    fn execute_read_statement_bounded_impl(
+        &mut self,
+        db: &'a Database,
+        stmt: &Statement,
+        params: &[Value],
+        budget: ReadBudget,
+    ) -> Result<ExecutionResult> {
+        if !matches!(stmt, Statement::Select(_)) || executor::stmt_mutates(stmt) {
+            return Err(SqlError::Unsupported(
+                "bounded queries accept read-only SELECT statements only".into(),
+            ));
+        }
+
         if self.active_txn.is_active() {
             let previous = self.active_txn.replace_read_budget(Some(budget));
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                self.dispatch(db, &stmt, params)
+                self.dispatch(db, stmt, params)
             }));
             self.active_txn.replace_read_budget(previous);
             return match outcome {
-                Ok(result) => Self::bounded_query_result(result?),
+                Ok(result) => result,
                 Err(payload) => std::panic::resume_unwind(payload),
             };
         }
@@ -1137,21 +1181,20 @@ impl<'a> ConnectionInner<'a> {
         rtx.set_read_budget(Some(budget));
         let execute = || {
             if params.is_empty() {
-                executor::execute_with_read(&mut rtx, &self.schema, &stmt, params)
+                executor::execute_with_read(&mut rtx, &self.schema, stmt, params)
             } else {
                 crate::eval::with_scoped_params(params, || {
-                    executor::execute_with_read(&mut rtx, &self.schema, &stmt, params)
+                    executor::execute_with_read(&mut rtx, &self.schema, stmt, params)
                 })
             }
         };
-        let result = crate::datetime::with_session_timezone(timezone, || {
+        crate::datetime::with_session_timezone(timezone, || {
             crate::datetime::with_statement_clock(Some(statement_timestamp), || {
                 crate::datetime::with_txn_clock(Some(statement_timestamp), || {
                     crate::json::with_jsonpath_session_context(jsonpath_context, execute)
                 })
             })
-        })?;
-        Self::bounded_query_result(result)
+        })
     }
 
     fn bounded_query_result(result: ExecutionResult) -> Result<QueryResult> {
@@ -1947,6 +1990,46 @@ mod tests {
         assert_eq!(
             conn.query("SELECT COUNT(*) FROM docs").unwrap().rows[0][0],
             Value::Integer(1)
+        );
+    }
+
+    #[test]
+    fn bounded_script_preserves_mutations_and_stops_at_the_read_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT NOT NULL)")
+            .unwrap();
+        conn.execute("INSERT INTO docs VALUES (1, 'abc')").unwrap();
+        conn.execute("CREATE TABLE events (id INTEGER PRIMARY KEY)")
+            .unwrap();
+
+        let probe = ReadBudget::new(128, 128);
+        let before = probe.remaining();
+        conn.query_params_bounded("SELECT body FROM docs", &[], &probe)
+            .unwrap();
+        let charged = before - probe.remaining();
+        assert!(charged > 0);
+
+        let budget = ReadBudget::new(charged, charged * 2 - 1);
+        let run = conn.execute_script_with_read_budget(
+            "INSERT INTO events VALUES (1); \
+             SELECT body FROM docs; \
+             SELECT body FROM docs;",
+            &budget,
+        );
+
+        assert_eq!(run.completed.len(), 2, "the committed prefix is retained");
+        assert!(matches!(
+            run.error,
+            Some(SqlError::Storage(
+                citadel_core::Error::ReadBudgetExceeded { .. }
+            ))
+        ));
+        assert_eq!(
+            conn.query("SELECT COUNT(*) FROM events").unwrap().rows[0][0],
+            Value::Integer(1),
+            "a bounded read must not roll back an earlier independent write"
         );
     }
 

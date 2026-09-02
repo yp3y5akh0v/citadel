@@ -1,0 +1,24 @@
+name: Studio build dependencies
+description: System libraries eframe links against, and optionally a software GPU driver.
+
+inputs:
+  gpu:
+    description: Install a software Vulkan/GL driver, needed to run the render tests.
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        GPU: ${{ inputs.gpu }}
+      run: |
+        sudo apt-get update
+        sudo apt-get install --no-install-recommends -y \
+          libgtk-3-dev libxkbcommon-dev libwayland-dev \
+          libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libx11-dev
+        if [ "$GPU" = "true" ]; then
+          sudo apt-get install --no-install-recommends -y \
+            mesa-vulkan-drivers libgl1-mesa-dri
+        fi

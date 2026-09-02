@@ -1,0 +1,70 @@
+[package]
+name = "citadeldb-studio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["gui", "database-client", "encrypted-database", "egui", "desktop"]
+categories = ["database", "gui", "visualization"]
+description = "Native desktop client for the Citadel encrypted database"
+readme = "README.md"
+# Shipped as an installer, not from crates.io. `cargo install` cannot declare the system
+# libraries eframe links against, so it would fail on a bare Linux box.
+publish = false
+
+[lib]
+name = "citadel_studio"
+path = "src/lib.rs"
+
+[[bin]]
+name = "citadel-studio"
+path = "src/main.rs"
+
+# Not in workspace.dependencies: no other crate links the GUI tree.
+# egui 0.36 also requires Rust 1.95, matching the workspace MSRV.
+[dependencies]
+# Default features carry wgpu, x11, wayland and links. `persistence` adds
+# `eframe::set_value`, which stores the theme and density.
+eframe = { version = "0.36", features = ["persistence"] }
+egui = "0.36"
+# The vector cloud's GPU buffers. Casting to bytes by hand would need unsafe.
+bytemuck = { version = "1.25", features = ["derive"] }
+fontdb = "0.24"
+# `common-controls-v6` selects the v6 Windows dialogs.
+rfd = { version = "0.17.2", features = ["common-controls-v6"] }
+# Default features include variable-fonts and glyph-names, used by `fonts` to test
+# script coverage.
+ttf-parser = "0.25.1"
+# Passphrases live in `State` for as long as a form is open. `Zeroizing` clears them on
+# drop rather than leaving them in a freed allocation.
+zeroize = { workspace = true }
+
+# The engine. `citadel` re-exports the core error, KDF and Argon2 types, so Studio takes
+# no direct citadel-core dependency and holds no mirror of them.
+citadel = { workspace = true }
+citadel-sql = { workspace = true }
+citadel-mem = { workspace = true }
+# A Connection borrows its Database, so a session owning both is self-referential.
+# citadel-python and citadel-wasm solve the same problem the same way.
+self_cell = "1"
+# The demo vault is a real encrypted database, and an encrypted region needs a file.
+tempfile = "3"
+
+rusqlite = { workspace = true, features = ["hooks"] }
+serde = { workspace = true }
+
+# Decodes the window icon into raw RGBA at build time.
+[build-dependencies]
+image = { version = "0.25.6", default-features = false, features = ["png"] }
+
+# Embeds the icon and version strings in the executable.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
+[dev-dependencies]
+egui_kittest = { version = "0.36", features = ["wgpu", "eframe"] }
+image = { version = "0.25.6", default-features = false, features = ["png"] }
+sha2 = { workspace = true }

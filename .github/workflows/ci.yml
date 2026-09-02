@@ -39,6 +39,8 @@ jobs:
       - uses: actions/checkout@v5
       - name: Install pinned toolchain (rust-toolchain.toml)
         run: rustup toolchain install
+      # --all-targets builds citadeldb-studio and its render tests, which link eframe.
+      - uses: ./.github/actions/studio-deps
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Verify generated C header is current
@@ -57,6 +59,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - uses: ./.github/actions/studio-deps
       - uses: Swatinem/rust-cache@v2
         with:
           key: msrv
@@ -94,6 +97,11 @@ jobs:
           df -h /
       - name: Install pinned toolchain (rust-toolchain.toml)
         run: rustup toolchain install
+      # The Studio render tests ask wgpu for an adapter, so the driver is not optional.
+      - uses: ./.github/actions/studio-deps
+        if: runner.os == 'Linux'
+        with:
+          gpu: "true"
       # citadeldb-python is a pyo3 cdylib member; its test harness links libpython.
       - uses: actions/setup-python@v5
         with:

@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" role="img" aria-labelledby="title desc">
+  <title id="title">Citadel Studio app icon</title>
+  <desc id="desc">Square unmasked full-bleed tile with a flat Citadel keep and keyhole glyph. Geometry is authored on a 48 by 48 grid. No mask, corner rounding, outlines, shadows, gradients, or filters are applied.</desc>
+  <g id="background" data-layer="Background tile">
+    <rect x="0" y="0" width="1024" height="1024" fill="#1F7AA6"/>
+  </g>
+  <g id="glyph" data-layer="Citadel keep and keyhole" transform="scale(21.333333333333)" shape-rendering="geometricPrecision">
+    <path d="M 7.5 8
+L 14 8
+L 14 12
+L 20 12
+L 20 5
+L 28 5
+L 28 12
+L 34 12
+L 34 8
+L 40.5 8
+L 40.5 18.5
+L 37.5 21
+Q 24 16.6 10.5 21
+L 7.5 18.5
+Z" fill="#FFFFFF"/>
+    <path d="M 12 22.5
+Q 24 18.5 36 22.5
+L 33.8 37.1
+L 24 43
+L 14.2 37.1
+Z
+M 24 24.4
+C 22.59 24.4 21.45 25.54 21.45 26.95
+C 21.45 27.90 21.98 28.80 22.77 29.25
+L 20.9 34.8
+L 27.1 34.8
+L 25.23 29.25
+C 26.02 28.80 26.55 27.90 26.55 26.95
+C 26.55 25.54 25.41 24.4 24 24.4
+Z" fill="#FFFFFF" fill-rule="evenodd" clip-rule="evenodd"/>
+  </g>
+</svg>
