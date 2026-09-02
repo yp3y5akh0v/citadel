@@ -254,7 +254,7 @@ def _search_item(hit, *, scored: bool) -> SearchItem:
         value=p["value"],
         created_at=_when(p.get("created_at")),
         updated_at=_when(p.get("updated_at")),
-        score=getattr(hit, "score", None) if scored else None,
+        score=hit.relevance if scored else None,
     )
 
 
