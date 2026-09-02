@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use citadel::{Argon2Profile, Database, DatabaseBuilder};
-use citadel_mem::{AtomInput, MemoryEngine, MockEmbedder};
+use citadel_mem::{AtomInput, MemError, MemoryEngine, MockEmbedder};
 
 fn create_db(dir: &std::path::Path) -> Arc<Database> {
     Arc::new(
@@ -70,15 +70,15 @@ fn cold_attach_races_drop_for_plaintext_and_encrypted() {
     for round in 0..25 {
         for encrypted in [false, true] {
             let name = format!("r{round}{}", u8::from(encrypted));
-            if encrypted {
+            let region_id = if encrypted {
                 owner
                     .create_encrypted_region(&name, Arc::new(MockEmbedder::new(8)))
-                    .unwrap();
+                    .unwrap()
             } else {
                 owner
                     .create_region(&name, Arc::new(MockEmbedder::new(8)))
-                    .unwrap();
-            }
+                    .unwrap()
+            };
             let atom = owner
                 .remember(&name, AtomInput::new("fact", "exact bytes"))
                 .unwrap();
@@ -101,15 +101,25 @@ fn cold_attach_races_drop_for_plaintext_and_encrypted() {
                 });
                 let dropper = scope.spawn(|| {
                     barrier.wait();
-                    owner.drop_region(&name).unwrap();
+                    owner.drop_region(&name)
                 });
                 attacher.join().unwrap();
-                dropper.join().unwrap();
+                match dropper.join().unwrap() {
+                    Ok(()) => {}
+                    Err(MemError::Core(citadel_core::Error::RegionInUse {
+                        region_id: busy_region,
+                    })) if busy_region == region_id as u64 => {
+                        // Plaintext fetches reserve the region outside the lifecycle
+                        // lock. The joined attacher has released that reservation.
+                        owner.drop_region(&name).unwrap();
+                    }
+                    Err(error) => panic!("unexpected drop error for '{name}': {error:?}"),
+                }
             });
+            let absent = cold.attach_existing_region(&name, Arc::new(MockEmbedder::new(8)));
             assert!(
-                cold.attach_existing_region(&name, Arc::new(MockEmbedder::new(8)))
-                    .is_err(),
-                "after the drop, cold attach must fail-if-absent"
+                matches!(&absent, Err(MemError::RegionNotFound(missing)) if missing == &name),
+                "after the drop, cold attach must fail-if-absent: {absent:?}"
             );
         }
     }
