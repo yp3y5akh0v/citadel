@@ -18,11 +18,13 @@ members = [
     "crates/citadel-mcp",
     "crates/citadel-membench",
     "crates/citadel-swe",
+    "crates/citadel-studio",
     "citadel",
     "citadel-cli",
     "crates/citadel-python",
 ]
-# Excludes citadel-python; it needs a Python interpreter at build.
+# Excludes citadel-python (Python interpreter) and citadel-studio (desktop system
+# libraries); both require host dependencies beyond the default workspace build.
 default-members = [
     "crates/citadel-core",
     "crates/citadel-crypto",
