@@ -1,7 +1,39 @@
 use citadel_buffer::btree::BTree;
 use citadel_core::types::PageId;
+use citadel_core::Result;
+use parking_lot::Mutex;
+use rustc_hash::FxHashMap;
 
 pub const TABLE_DESCRIPTOR_SIZE: usize = 20;
+
+const RESOLVED_CATALOG_LIMIT: usize = 256;
+
+/// Exact-name descriptors for one immutable catalog generation, without
+/// commit-slot overrides. Old snapshots retain their own cache after DDL.
+#[derive(Default)]
+pub(crate) struct ResolvedCatalog {
+    tables: Mutex<FxHashMap<Vec<u8>, TableDescriptor>>,
+}
+
+impl ResolvedCatalog {
+    pub(crate) fn resolve(
+        &self,
+        name: &[u8],
+        load: impl FnOnce() -> Result<TableDescriptor>,
+    ) -> Result<TableDescriptor> {
+        if let Some(descriptor) = self.tables.lock().get(name).cloned() {
+            return Ok(descriptor);
+        }
+
+        // Do not hold the cache lock during I/O or cancellation checks.
+        let descriptor = load()?;
+        let mut tables = self.tables.lock();
+        if tables.len() < RESOLVED_CATALOG_LIMIT {
+            tables.insert(name.to_vec(), descriptor.clone());
+        }
+        Ok(descriptor)
+    }
+}
 
 /// On-disk descriptor for a named table, stored as a value in the catalog B+ tree.
 #[derive(Debug, Clone)]

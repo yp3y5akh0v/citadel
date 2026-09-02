@@ -512,8 +512,8 @@ fn a_reopened_legacy_collision_fails_closed_in_read_and_write_fast_paths() {
     let (dek, mac_key, _) = test_keys();
     let reopened = TxnManager::open(Box::new(io.share()), dek, mac_key, 1, 256).unwrap();
 
-    let mut reader = reopened.begin_read();
-    for (requested, existing) in [(FIRST, SECOND), (SECOND, FIRST)] {
+    for (requested, existing) in [(FIRST, SECOND), (SECOND, FIRST), (FIRST, SECOND)] {
+        let mut reader = reopened.begin_read();
         assert!(matches!(
             reader.table_get(requested, b"key"),
             Err(Error::NamedTableHashCollision {
@@ -523,8 +523,6 @@ fn a_reopened_legacy_collision_fails_closed_in_read_and_write_fast_paths() {
             }) if error_requested.as_bytes() == requested && error_existing.as_bytes() == existing
         ));
     }
-    drop(reader);
-
     let mut writer = reopened.begin_write().unwrap();
     assert!(matches!(
         writer.table_get(FIRST, b"key"),
@@ -564,7 +562,7 @@ fn opening_is_lazy_and_schema_listing_populates_the_collision_index() {
         dek,
         mac_key,
         1,
-        256,
+        1,
     )
     .unwrap();
     assert_eq!(reads.load(std::sync::atomic::Ordering::Relaxed), 0);
@@ -582,6 +580,123 @@ fn opening_is_lazy_and_schema_listing_populates_the_collision_index() {
     // hash-only slot entry, then reuses that resolved descriptor.
     assert_eq!(reader.table_entry_count(b"table").unwrap(), 1);
     assert_eq!(reads.load(std::sync::atomic::Ordering::Relaxed), 0);
+    drop(reader);
+
+    let slot = reopened.current_slot();
+    let root = slot.named_entry_root(b"table").unwrap().0;
+    drop(
+        reopened
+            .fetch_reachable_page(root, slot.high_water_mark)
+            .unwrap(),
+    );
+    assert_eq!(reads.load(std::sync::atomic::Ordering::Relaxed), 1);
+    reads.store(0, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        reopened.begin_read().table_entry_count(b"table").unwrap(),
+        1
+    );
+    assert_eq!(
+        reads.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "a fresh reader must reuse the descriptor after the catalog page is evicted"
+    );
+}
+
+#[test]
+fn cold_catalog_resolutions_reuse_authenticated_buffer_pages() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let (mgr, io) = create_manager_with_raw_io();
+    let mut writer = mgr.begin_write().unwrap();
+    writer.create_table(b"alpha").unwrap();
+    writer.create_table(b"beta").unwrap();
+    writer.commit().unwrap();
+    drop(mgr);
+
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (dek, mac_key, _) = test_keys();
+    let reopened = TxnManager::open(
+        Box::new(CountingPageReadsIO {
+            inner: io.share(),
+            reads: Arc::clone(&reads),
+        }),
+        dek,
+        mac_key,
+        1,
+        8,
+    )
+    .unwrap();
+    assert_eq!(reopened.list_tables().unwrap().len(), 2);
+    let slot = reopened.current_slot();
+    let catalog = reopened
+        .fetch_reachable_page(slot.catalog_root, slot.high_water_mark)
+        .unwrap();
+    assert_eq!(catalog.page_type(), Some(PageType::Leaf));
+    drop(catalog);
+    reads.store(0, Ordering::Relaxed);
+
+    for name in [b"alpha".as_slice(), b"beta".as_slice()] {
+        assert_eq!(reopened.begin_read().table_entry_count(name).unwrap(), 0);
+    }
+    assert_eq!(
+        reads.load(Ordering::Relaxed),
+        0,
+        "first-time name resolutions must not re-read authenticated cached pages"
+    );
+}
+
+#[test]
+fn warm_catalog_cache_does_not_hide_damage_from_diagnostics() {
+    let (mgr, io) = create_manager_with_raw_io();
+    let mut writer = mgr.begin_write().unwrap();
+    writer.create_table(b"items").unwrap();
+    writer.commit().unwrap();
+    assert_eq!(mgr.begin_read().table_entry_count(b"items").unwrap(), 0);
+
+    let root = mgr.current_slot().catalog_root;
+    flip_raw_byte(&io, page_offset(root) as usize + PAGE_SIZE - 1);
+    assert_eq!(mgr.begin_read().table_entry_count(b"items").unwrap(), 0);
+    assert!(matches!(
+        mgr.begin_read().list_tables(),
+        Err(Error::PageTampered(_))
+    ));
+    assert!(!mgr.integrity_check().unwrap().is_ok());
+}
+
+#[test]
+fn cold_missing_catalog_lookup_observes_cancellation_after_io() {
+    let (mgr, io) = create_manager_with_raw_io();
+    let mut writer = mgr.begin_write().unwrap();
+    writer.create_table(b"present").unwrap();
+    writer.commit().unwrap();
+    drop(mgr);
+
+    let token = citadel_core::CancelToken::new();
+    let (dek, mac_key, _) = test_keys();
+    let reopened = TxnManager::open(
+        Box::new(CancelOnPageReadIO {
+            inner: io.share(),
+            token: token.clone(),
+        }),
+        dek,
+        mac_key,
+        1,
+        8,
+    )
+    .unwrap();
+    assert!(!token.is_cancelled());
+    let mut reader = reopened.begin_read();
+    reader.set_cancel(Some(token.clone()));
+    assert!(matches!(
+        reader.table_entry_count(b"missing"),
+        Err(Error::Interrupted)
+    ));
+    assert!(token.is_cancelled(), "catalog page read was not reached");
+    assert!(matches!(
+        reopened.begin_read().table_entry_count(b"missing"),
+        Err(Error::TableNotFound(_))
+    ));
 }
 
 #[test]
