@@ -79,6 +79,88 @@ def test_search_filter(store):
     assert [h.value["n"] for h in hits] == [2]
 
 
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize("offset", [0, 1])
+def test_search_preserves_native_relevance(tmp_path, asynchronous, offset):
+    import asyncio
+    import math
+
+    s = CitadelStore(str(tmp_path / "scores.cdl"), key="pw", embedder=MOCK)
+    namespace = ("scores",)
+    s.put(namespace, "apples", {"text": "apples", "keep": True}, ttl=60.0)
+    s.put(namespace, "oranges", {"text": "oranges", "keep": True}, ttl=60.0)
+    s.put(namespace, "filtered", {"text": "apples", "keep": False})
+    s.put(namespace, "unindexed", {"text": "apples", "keep": True}, index=False)
+    native = s._mem
+
+    class RecordingMemory:
+        def __init__(self):
+            self.hits = []
+
+        def __getattr__(self, name):
+            return getattr(native, name)
+
+        def recall(self, *args, **kwargs):
+            hits = native.recall(*args, **kwargs)
+            self.hits.extend(hits)
+            return hits
+
+    recorded = RecordingMemory()
+    s._mem = recorded
+
+    def search(**kwargs):
+        if asynchronous:
+            return asyncio.run(s.asearch(namespace, **kwargs))
+        return s.search(namespace, **kwargs)
+
+    items = search(
+        query="apples", filter={"keep": True}, limit=3, offset=offset, refresh_ttl=True
+    )
+    ranked = [hit for hit in recorded.hits if hit.payload["value"]["keep"]]
+    assert {hit.payload["key"] for hit in ranked} == {"apples", "oranges"}
+    assert all(not hasattr(hit, "score") for hit in ranked)
+    assert all(
+        hit.relevance is not None and math.isfinite(hit.relevance) for hit in ranked
+    )
+    assert [item.key for item in items] == [
+        *[hit.payload["key"] for hit in ranked],
+        "unindexed",
+    ][offset:]
+    assert [item.score for item in items] == [
+        *[hit.relevance for hit in ranked],
+        None,
+    ][offset:]
+    scores = [item.score for item in items[:-1]]
+    assert scores == sorted(scores, reverse=True)
+
+    for query in (None, ""):
+        unranked = search(query=query, filter={"keep": True}, limit=3)
+        assert len(unranked) == 3
+        assert all(item.score is None for item in unranked)
+
+
+@pytest.mark.parametrize("relevance", [0.0, -0.5, 1.25, None])
+def test_search_item_preserves_relevance_without_fallback(relevance):
+    from types import SimpleNamespace
+
+    from citadeldb_langgraph.store import _search_item
+
+    hit = SimpleNamespace(
+        payload={
+            "ns": _join(("scores",)),
+            "key": "k",
+            "value": {},
+            "created_at": 1_000_000,
+            "updated_at": 1_000_000,
+        },
+        relevance=relevance,
+        importance=0.75,
+        distance=0.25,
+    )
+    assert _search_item(hit, scored=True).score == relevance
+    assert _search_item(hit, scored=False).score is None
+
+
 def test_index_false_is_scoreless_and_cannot_outrank_indexed_items(tmp_path):
     s = CitadelStore(str(tmp_path / "index-false.cdl"), key="pw", embedder=MOCK)
     namespace = ("indexing",)
