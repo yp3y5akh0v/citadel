@@ -1,5 +1,4 @@
-//! Pending-free chain: freed pages that can't be reused until no older reader
-//! exists.
+//! Durable retirement records for data pages and pending-free chain pages.
 //!
 //! Format: linked list of PendingFree pages on disk.
 //! Each page contains an array of PendingFreeEntry structs.
@@ -12,6 +11,7 @@ use citadel_core::{
 };
 use citadel_page::page::Page;
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::ops::Deref;
 
 /// A pending-free entry: a page that was freed at a specific transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,7 +25,9 @@ pub struct PendingFreeEntry {
 pub(crate) const MAX_ENTRIES_PER_PAGE: usize = PENDING_FREE_ENTRIES_PER_PAGE;
 
 /// Decode one pending-free page without trusting its entry count.
-pub(crate) fn read_page_entries(page: &Page) -> Result<Vec<PendingFreeEntry>> {
+pub(crate) fn read_page_entries(
+    page: &Page,
+) -> Result<impl ExactSizeIterator<Item = PendingFreeEntry> + '_> {
     if page.page_type() != Some(PageType::PendingFree) {
         return Err(Error::InvalidPageType(page.page_type_raw(), page.page_id()));
     }
@@ -35,54 +37,94 @@ pub(crate) fn read_page_entries(page: &Page) -> Result<Vec<PendingFreeEntry>> {
     }
 
     let data_start = PAGE_HEADER_SIZE + 4;
-    let mut entries = Vec::with_capacity(entry_count);
-    for index in 0..entry_count {
-        entries.push(read_entry_at(
-            &page.data,
-            data_start + index * PENDING_FREE_ENTRY_SIZE,
-        ));
-    }
-    Ok(entries)
+    Ok((0..entry_count)
+        .map(move |index| read_entry_at(&page.data, data_start + index * PENDING_FREE_ENTRY_SIZE)))
 }
 
 /// Read all entries from the pending-free chain stored in the page map.
 pub fn read_chain(pages: &FxHashMap<PageId, Page>, root: PageId) -> Result<Vec<PendingFreeEntry>> {
-    if !root.is_valid() {
-        return Ok(Vec::new());
+    Ok(ChainSnapshot::read(root, |id| pages.get(&id).ok_or(Error::PageOutOfBounds(id)))?.entries)
+}
+
+/// Validated entries and structure used for reclamation and CoW updates.
+pub(crate) struct ChainSnapshot {
+    entries: Vec<PendingFreeEntry>,
+    page_ids: Vec<PageId>,
+    head_entry_count: usize,
+    entry_indices: FxHashMap<PageId, usize>,
+}
+
+impl ChainSnapshot {
+    pub(crate) fn read<P: Deref<Target = Page>>(
+        root: PageId,
+        load: impl FnMut(PageId) -> Result<P>,
+    ) -> Result<Self> {
+        Self::read_checked(root, load, |_| Ok(()))
     }
 
-    let mut entries = Vec::new();
-    let mut current = root;
-    let mut chain_pages = FxHashSet::default();
-    let mut entry_pages = FxHashSet::default();
-
-    while current.is_valid() {
-        if !chain_pages.insert(current) {
-            return Err(Error::DatabaseCorrupted);
-        }
-        let page = pages.get(&current).ok_or(Error::PageOutOfBounds(current))?;
-        if page.page_id() != current {
-            return Err(Error::DatabaseCorrupted);
-        }
-        for entry in read_page_entries(page)? {
-            if !entry_pages.insert(entry.page_id) {
+    pub(crate) fn read_committed<P: Deref<Target = Page>>(
+        root: PageId,
+        high_water_mark: u32,
+        slot_txn: TxnId,
+        load: impl FnMut(PageId) -> Result<P>,
+    ) -> Result<Self> {
+        Self::read_checked(root, load, |entry| {
+            if !entry.page_id.is_valid()
+                || entry.page_id.as_u32() >= high_water_mark
+                || entry.freed_at_txn == TxnId::ZERO
+                || entry.freed_at_txn > slot_txn
+            {
                 return Err(Error::DatabaseCorrupted);
             }
-            entries.push(entry);
-        }
-
-        // Next page in chain via right_child field (INVALID = end of chain)
-        current = page.right_child();
-        if !current.is_valid() {
-            break;
-        }
+            Ok(())
+        })
     }
 
-    if entry_pages.iter().any(|page| chain_pages.contains(page)) {
-        return Err(Error::DatabaseCorrupted);
-    }
+    fn read_checked<P: Deref<Target = Page>>(
+        root: PageId,
+        mut load: impl FnMut(PageId) -> Result<P>,
+        mut check_entry: impl FnMut(PendingFreeEntry) -> Result<()>,
+    ) -> Result<Self> {
+        let mut entries = Vec::new();
+        let mut page_ids = Vec::new();
+        let mut head_entry_count = 0;
+        let mut entry_indices = FxHashMap::default();
+        let mut seen = FxHashSet::default();
+        let mut current = root;
 
-    Ok(entries)
+        while current.is_valid() {
+            if !seen.insert(current) {
+                return Err(Error::DatabaseCorrupted);
+            }
+            let page = load(current)?;
+            if page.page_id() != current {
+                return Err(Error::DatabaseCorrupted);
+            }
+            page_ids.push(current);
+            let page_entries = read_page_entries(&page)?;
+            if page_ids.len() == 1 {
+                head_entry_count = page_entries.len();
+            }
+            for entry in page_entries {
+                check_entry(entry)?;
+                if entry_indices.insert(entry.page_id, entries.len()).is_some() {
+                    return Err(Error::DatabaseCorrupted);
+                }
+                entries.push(entry);
+            }
+            current = page.right_child();
+        }
+
+        if page_ids.iter().any(|id| entry_indices.contains_key(id)) {
+            return Err(Error::DatabaseCorrupted);
+        }
+        Ok(Self {
+            entries,
+            page_ids,
+            head_entry_count,
+            entry_indices,
+        })
+    }
 }
 
 /// Number of chain pages needed to hold `entry_count` entries.
@@ -106,34 +148,47 @@ pub fn write_chain(
     let num_pages = chain_pages_needed(entries.len());
     debug_assert_eq!(num_pages, page_ids.len());
 
-    let mut entry_idx = 0;
-    for (i, &page_id) in page_ids.iter().enumerate() {
-        let mut page = Page::new(page_id, PageType::PendingFree, txn_id);
-
-        let next = if i + 1 < num_pages {
-            page_ids[i + 1]
-        } else {
-            PageId::INVALID
-        };
-        page.set_right_child(next);
-
-        let entries_this_page = std::cmp::min(MAX_ENTRIES_PER_PAGE, entries.len() - entry_idx);
-
-        page.data[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + 4]
-            .copy_from_slice(&(entries_this_page as u32).to_le_bytes());
-
-        let data_start = PAGE_HEADER_SIZE + 4;
-        for j in 0..entries_this_page {
-            let offset = data_start + j * PENDING_FREE_ENTRY_SIZE;
-            write_entry_at(&mut page.data, offset, &entries[entry_idx + j]);
-        }
-
-        entry_idx += entries_this_page;
-        page.update_checksum();
-        pages.insert(page_id, page);
+    for (i, chunk) in entries.chunks(MAX_ENTRIES_PER_PAGE).enumerate() {
+        let next = page_ids.get(i + 1).copied().unwrap_or(PageId::INVALID);
+        write_chain_page(pages, txn_id, page_ids[i], next, chunk);
     }
 
     page_ids[0]
+}
+
+fn write_chain_page(
+    pages: &mut FxHashMap<PageId, Page>,
+    txn_id: TxnId,
+    page_id: PageId,
+    next: PageId,
+    entries: &[PendingFreeEntry],
+) {
+    let mut page = Page::new(page_id, PageType::PendingFree, txn_id);
+    page.set_right_child(next);
+    page.data[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + 4]
+        .copy_from_slice(&(entries.len() as u32).to_le_bytes());
+    for (index, entry) in entries.iter().enumerate() {
+        let offset = PAGE_HEADER_SIZE + 4 + index * PENDING_FREE_ENTRY_SIZE;
+        write_entry_at(&mut page.data, offset, entry);
+    }
+    page.update_checksum();
+    pages.insert(page_id, page);
+}
+
+fn prepend_chain(
+    pages: &mut FxHashMap<PageId, Page>,
+    alloc: &mut PageAllocator,
+    txn_id: TxnId,
+    entries: &[PendingFreeEntry],
+    mut tail: PageId,
+) -> PageId {
+    // Keep spare capacity at the head, so later appends replace at most one page.
+    for chunk in entries.rchunks(MAX_ENTRIES_PER_PAGE) {
+        let page_id = alloc.allocate();
+        write_chain_page(pages, txn_id, page_id, tail, chunk);
+        tail = page_id;
+    }
+    tail
 }
 
 /// Collect all page IDs that form the chain (for deferred freeing after write).
@@ -179,10 +234,10 @@ pub struct ChainCommit<'a> {
     pub reclaim_horizon: TxnId,
 }
 
-/// Drop consumed entries, draw new structure pages from the loan first (CoW,
-/// never reusing old chain pages), and add this txn's frees plus the old
-/// chain pages as new entries. Entries stay listed until a commit records
-/// their consumption, so an abort/no-op/shutdown strands nothing.
+/// Remove consumed entries and record new frees. Without consumption or loans,
+/// share the unchanged tail and pack new entries at the head. Otherwise rewrite
+/// the chain using loan pages first. Replaced structure pages remain pending;
+/// entries leave the durable chain only when a commit records their consumption.
 ///
 /// Returns `(new_chain_root, available_entries)`; entries carry freed_at_txn
 /// so the caller can zero each page once for secure delete.
@@ -192,72 +247,181 @@ pub fn process_chain(
     loan_pool: &mut Vec<PageId>,
     commit: &ChainCommit<'_>,
 ) -> Result<(PageId, Vec<PendingFreeEntry>)> {
-    let ChainCommit {
-        txn_id,
-        current_root,
-        freed_this_txn,
-        consumed,
-        reclaim_horizon,
-    } = *commit;
-    let existing = read_chain(pages, current_root)?;
-    let old_chain_pages = collect_chain_page_ids(pages, current_root)?;
+    ChainSnapshot::read(commit.current_root, |id| {
+        pages.get(&id).ok_or(Error::PageOutOfBounds(id))
+    })?
+    .process(pages, alloc, loan_pool, commit)
+}
 
-    let mut surviving: Vec<PendingFreeEntry> = existing
-        .into_iter()
-        .filter(|entry| !consumed.contains(&entry.page_id))
-        .collect();
-    let new_count = old_chain_pages.len() + freed_this_txn.len();
-
-    // Structure pages, loan pool first. Every loan page has exactly one
-    // surviving entry (it came from the chain and was not consumed by the
-    // txn body); taking it removes that entry.
-    let mut structure: Vec<PageId> = Vec::new();
-    let mut taken: FxHashMap<PageId, TxnId> = FxHashMap::default();
-    while structure.len() < chain_pages_needed(surviving.len() + new_count) {
-        let Some(page_id) = loan_pool.pop() else {
-            break;
-        };
-        let idx = surviving
-            .iter()
-            .position(|entry| entry.page_id == page_id)
-            .expect("loan page must have an unconsumed chain entry");
-        taken.insert(page_id, surviving.swap_remove(idx).freed_at_txn);
-        structure.push(page_id);
+impl ChainSnapshot {
+    pub(crate) fn process(
+        self,
+        pages: &mut FxHashMap<PageId, Page>,
+        alloc: &mut PageAllocator,
+        loan_pool: &mut Vec<PageId>,
+        commit: &ChainCommit<'_>,
+    ) -> Result<(PageId, Vec<PendingFreeEntry>)> {
+        self.process_with_metadata(pages, alloc, loan_pool, commit, &mut FxHashMap::default())
     }
-    // Removing an entry can lower the page count below what was already
-    // taken; hand the overshoot back (at most one page).
-    while structure.len() > chain_pages_needed(surviving.len() + new_count) {
-        let page_id = structure.pop().unwrap();
-        surviving.push(PendingFreeEntry {
-            page_id,
-            freed_at_txn: taken.remove(&page_id).unwrap(),
+
+    pub(crate) fn process_with_metadata(
+        self,
+        pages: &mut FxHashMap<PageId, Page>,
+        alloc: &mut PageAllocator,
+        loan_pool: &mut Vec<PageId>,
+        commit: &ChainCommit<'_>,
+        retired_chain_pages: &mut FxHashMap<PageId, TxnId>,
+    ) -> Result<(PageId, Vec<PendingFreeEntry>)> {
+        if self.page_ids.first().copied().unwrap_or(PageId::INVALID) != commit.current_root
+            || alloc.ready_count() != 0
+        {
+            return Err(Error::DatabaseCorrupted);
+        }
+        if commit.consumed.is_empty() && loan_pool.is_empty() {
+            return Ok(self.prepend_frees(pages, alloc, commit, retired_chain_pages));
+        }
+        let Self {
+            mut entries,
+            page_ids,
+            mut entry_indices,
+            ..
+        } = self;
+        let ChainCommit {
+            txn_id,
+            freed_this_txn,
+            consumed,
+            reclaim_horizon,
+            ..
+        } = *commit;
+
+        if !consumed.is_empty() {
+            let mut next_index = 0;
+            entries.retain(|entry| {
+                if consumed.contains(&entry.page_id) {
+                    entry_indices.remove(&entry.page_id);
+                    retired_chain_pages.remove(&entry.page_id);
+                    false
+                } else {
+                    *entry_indices.get_mut(&entry.page_id).unwrap() = next_index;
+                    next_index += 1;
+                    true
+                }
+            });
+        }
+        let new_count = page_ids.len() + freed_this_txn.len();
+
+        // Every loan page has one surviving entry. Reuse its validated index
+        // and repair the index of the entry moved by swap_remove.
+        let mut structure = Vec::new();
+        let mut taken = Vec::new();
+        while structure.len() < chain_pages_needed(entries.len() + new_count) {
+            let Some(page_id) = loan_pool.pop() else {
+                break;
+            };
+            let idx = entry_indices
+                .remove(&page_id)
+                .ok_or(Error::DatabaseCorrupted)?;
+            taken.push(entries.swap_remove(idx));
+            if let Some(moved) = entries.get(idx) {
+                *entry_indices.get_mut(&moved.page_id).unwrap() = idx;
+            }
+            structure.push(page_id);
+        }
+        // Removing an entry can reduce the required number of chain pages.
+        while structure.len() > chain_pages_needed(entries.len() + new_count) {
+            let page_id = structure.pop().unwrap();
+            let entry = taken.pop().unwrap();
+            debug_assert_eq!(entry.page_id, page_id);
+            entry_indices.insert(page_id, entries.len());
+            entries.push(entry);
+            loan_pool.push(page_id);
+        }
+        drop(entry_indices);
+        for page_id in &structure {
+            retired_chain_pages.remove(page_id);
+        }
+        while structure.len() < chain_pages_needed(entries.len() + new_count) {
+            structure.push(alloc.allocate());
+        }
+
+        let surviving_len = entries.len();
+        for &page_id in page_ids.iter().chain(freed_this_txn) {
+            entries.push(PendingFreeEntry {
+                page_id,
+                freed_at_txn: txn_id,
+            });
+        }
+        let new_root = write_chain(pages, txn_id, &entries, &structure);
+
+        // Old structure and current frees remain referenced by the previous
+        // slot. Only surviving entries may be returned to the allocator.
+        entries.truncate(surviving_len);
+        entries.retain(|entry| {
+            entry.freed_at_txn <= reclaim_horizon
+                || retired_chain_pages.get(&entry.page_id) == Some(&entry.freed_at_txn)
         });
-        loan_pool.push(page_id);
-    }
-    while structure.len() < chain_pages_needed(surviving.len() + new_count) {
-        structure.push(alloc.allocate());
+        for page_id in page_ids {
+            retired_chain_pages.insert(page_id, txn_id);
+        }
+        Ok((new_root, entries))
     }
 
-    // Reuse is safe iff freed_at <= horizon (see reclaim_horizon). A page
-    // freed at this txn is excluded: the previous slot still references it
-    // until the next commit rewrites its location.
-    let available = surviving
-        .iter()
-        .filter(|entry| entry.freed_at_txn.as_u64() <= reclaim_horizon.as_u64())
-        .copied()
-        .collect();
+    fn prepend_frees(
+        self,
+        pages: &mut FxHashMap<PageId, Page>,
+        alloc: &mut PageAllocator,
+        commit: &ChainCommit<'_>,
+        retired_chain_pages: &mut FxHashMap<PageId, TxnId>,
+    ) -> (PageId, Vec<PendingFreeEntry>) {
+        let Self {
+            mut entries,
+            page_ids,
+            head_entry_count,
+            entry_indices,
+        } = self;
+        drop(entry_indices);
+        let mut new_root = commit.current_root;
+        let mut retired_head = None;
+        if !commit.freed_this_txn.is_empty() {
+            let replace_head = new_root.is_valid() && head_entry_count < MAX_ENTRIES_PER_PAGE;
+            let copied = if replace_head { head_entry_count } else { 0 };
+            let mut prefix = Vec::with_capacity(
+                copied + usize::from(replace_head) + commit.freed_this_txn.len(),
+            );
+            prefix.extend_from_slice(&entries[..copied]);
+            let tail = if replace_head {
+                retired_head = Some(new_root);
+                prefix.push(PendingFreeEntry {
+                    page_id: new_root,
+                    freed_at_txn: commit.txn_id,
+                });
+                page_ids.get(1).copied().unwrap_or(PageId::INVALID)
+            } else {
+                new_root
+            };
+            prefix.extend(
+                commit
+                    .freed_this_txn
+                    .iter()
+                    .map(|&page_id| PendingFreeEntry {
+                        page_id,
+                        freed_at_txn: commit.txn_id,
+                    }),
+            );
+            new_root = prepend_chain(pages, alloc, commit.txn_id, &prefix, tail);
+        }
 
-    let mut entries = surviving;
-    for &page_id in old_chain_pages.iter().chain(freed_this_txn) {
-        entries.push(PendingFreeEntry {
-            page_id,
-            freed_at_txn: txn_id,
+        // Reader release must make old entries available even when the chain is
+        // shared. Current frees and the replaced head are not reusable yet.
+        entries.retain(|entry| {
+            entry.freed_at_txn <= commit.reclaim_horizon
+                || retired_chain_pages.get(&entry.page_id) == Some(&entry.freed_at_txn)
         });
+        if let Some(page_id) = retired_head {
+            retired_chain_pages.insert(page_id, commit.txn_id);
+        }
+        (new_root, entries)
     }
-
-    let new_root = write_chain(pages, txn_id, &entries, &structure);
-
-    Ok((new_root, available))
 }
 
 fn read_entry_count(page: &Page) -> usize {

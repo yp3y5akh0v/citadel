@@ -346,6 +346,22 @@ impl Drop for WriterExclusion<'_> {
 /// memory.
 const COMMIT_ARENA_PAGES: usize = 64;
 
+enum PendingFreePage<'a> {
+    Borrowed(&'a Page),
+    Cached(Arc<Page>),
+}
+
+impl std::ops::Deref for PendingFreePage<'_> {
+    type Target = Page;
+
+    fn deref(&self) -> &Page {
+        match self {
+            Self::Borrowed(page) => page,
+            Self::Cached(page) => page,
+        }
+    }
+}
+
 struct ManagerState {
     active_slot: usize,
     current_slot: Arc<CommitSlot>,
@@ -361,9 +377,13 @@ struct ManagerState {
     /// loaned to the writer by clone and re-derived every commit, so an
     /// abort/no-op/shutdown never strands a page.
     reclaimed_pages: Vec<PageId>,
-    /// Secure delete: highest freed_at_txn whose available pages have been
+    /// Known metadata retirements retain their durable age but need no data
+    /// reader horizon. Empty on reopen: no pre-open reader can survive it.
+    retired_chain_pages: FxHashMap<PageId, TxnId>,
+    /// Secure delete: highest freed_at_txn whose available data pages have been
     /// zero-filled. RAM-only; a reopen re-zeroes once, which is harmless.
     zeroed_up_to: TxnId,
+    zeroed_chain_up_to: TxnId,
     recycled_pages: Option<FxHashMap<PageId, Page>>,
 }
 
@@ -481,7 +501,9 @@ impl TxnManager {
                 cached_file_size: file_size,
                 reader_table: BTreeMap::new(),
                 reclaimed_pages: Vec::new(),
+                retired_chain_pages: FxHashMap::default(),
                 zeroed_up_to: TxnId(0),
+                zeroed_chain_up_to: TxnId(0),
                 recycled_pages: None,
             }),
             sync_mode,
@@ -597,7 +619,9 @@ impl TxnManager {
                 cached_file_size: file_size,
                 reader_table: BTreeMap::new(),
                 reclaimed_pages: Vec::new(),
+                retired_chain_pages: FxHashMap::default(),
                 zeroed_up_to: TxnId(0),
+                zeroed_chain_up_to: TxnId(0),
                 recycled_pages: None,
             }),
             sync_mode,
@@ -854,12 +878,15 @@ impl TxnManager {
         // Validate durable reclaim metadata before touching allocator state or
         // the recovery marker, so a structural error leaves this process and
         // the next open on the unchanged committed slot.
-        self.load_pending_free_chain(
+        let pending_free = self.load_pending_free_chain(
             pages,
             old_slot.pending_free_root,
             old_slot.high_water_mark,
             old_slot.txn_id,
         )?;
+        // Publish provenance only with the new slot. Failed commits must leave
+        // the current slot's classifications unchanged.
+        let mut retired_chain_pages = self.state.lock().retired_chain_pages.clone();
 
         if self.sync_mode != citadel_core::types::SyncMode::Off {
             let recovery_god_byte = current_god_byte | GOD_BIT_RECOVERY;
@@ -873,9 +900,9 @@ impl TxnManager {
             pages.remove(&page_id);
         }
 
-        // Every sync mode gates reuse on the reader horizon (Off relaxes
-        // durability, not isolation). Consumption is the loan minus this
-        // remainder, which also supplies the chain rewrite's structure pages.
+        // Data-page reuse respects readers; metadata needs only recovery-slot
+        // protection. Consumption is the loan minus this remainder, which also
+        // supplies the chain rewrite's structure pages.
         let mut loan_pool = alloc.take_ready_to_use();
         let consumed: FxHashSet<PageId> = {
             // Set lookup: a Vec::contains scan here is quadratic in the
@@ -890,7 +917,7 @@ impl TxnManager {
                 .collect()
         };
         let (new_pf_root, available) = {
-            pending_free::process_chain(
+            pending_free.process_with_metadata(
                 pages,
                 alloc,
                 &mut loan_pool,
@@ -901,6 +928,7 @@ impl TxnManager {
                     consumed: &consumed,
                     reclaim_horizon,
                 },
+                &mut retired_chain_pages,
             )?
         };
 
@@ -1023,20 +1051,33 @@ impl TxnManager {
             }
         }
 
-        // Secure delete: zero freed pages past all readers (reader- and
-        // crash-safe: unreferenced by either slot). Zeros ride the commit
-        // fsync; the watermark zeroes each page once as it becomes available.
+        // Metadata can retire ahead of reader-pinned data. Separate watermarks
+        // prevent early metadata erasure from skipping that data later.
         let zeroed_watermark = if self.secure_delete.load(Ordering::Relaxed) {
-            let zeroed_up_to = self.state.lock().zeroed_up_to;
+            let (zeroed_up_to, zeroed_chain_up_to) = {
+                let state = self.state.lock();
+                (state.zeroed_up_to, state.zeroed_chain_up_to)
+            };
             let zeros = [0u8; PAGE_SIZE];
             let mut high = zeroed_up_to;
+            let mut chain_high = zeroed_chain_up_to;
             for entry in &available {
-                if entry.freed_at_txn.as_u64() > zeroed_up_to.as_u64() {
+                let is_chain = retired_chain_pages.get(&entry.page_id) == Some(&entry.freed_at_txn);
+                let watermark = if is_chain {
+                    zeroed_chain_up_to
+                } else {
+                    zeroed_up_to
+                };
+                if entry.freed_at_txn > watermark {
                     self.io.write_page(page_offset(entry.page_id), &zeros)?;
-                    high = high.max(entry.freed_at_txn);
+                    if is_chain {
+                        chain_high = chain_high.max(entry.freed_at_txn);
+                    } else {
+                        high = high.max(entry.freed_at_txn);
+                    }
                 }
             }
-            Some(high)
+            Some((high, chain_high))
         } else {
             None
         };
@@ -1118,8 +1159,10 @@ impl TxnManager {
             // Availability is re-derived from the durable chain every commit,
             // so an abort, no-op commit, or shutdown strands nothing.
             state.reclaimed_pages = available.iter().map(|entry| entry.page_id).collect();
-            if let Some(watermark) = zeroed_watermark {
+            state.retired_chain_pages = retired_chain_pages;
+            if let Some((watermark, chain_watermark)) = zeroed_watermark {
                 state.zeroed_up_to = watermark;
+                state.zeroed_chain_up_to = chain_watermark;
             }
             state.recycled_pages = Some(std::mem::take(pages));
             self.commit_generation.fetch_add(1, Ordering::Release) + 1
@@ -2334,54 +2377,27 @@ impl TxnManager {
 
     fn load_pending_free_chain(
         &self,
-        pages: &mut FxHashMap<PageId, Page>,
+        pages: &FxHashMap<PageId, Page>,
         root: PageId,
         high_water_mark: u32,
         slot_txn: TxnId,
-    ) -> Result<()> {
+    ) -> Result<pending_free::ChainSnapshot> {
         // Local reclaim invariants only. Proving an entry is absent from every
         // live tree needs an O(database) walk per commit, so that stays behind
         // the explicit integrity_check boundary.
-        if !root.is_valid() {
-            return Ok(());
-        }
-
-        let mut current = root;
-        let mut chain_pages = FxHashSet::default();
-        let mut entry_pages = FxHashSet::default();
-        while current.is_valid() {
-            if current.as_u32() >= high_water_mark {
-                return Err(Error::PageOutOfBounds(current));
+        pending_free::ChainSnapshot::read_committed(root, high_water_mark, slot_txn, |page_id| {
+            if page_id.as_u32() >= high_water_mark {
+                return Err(Error::PageOutOfBounds(page_id));
             }
-            if !chain_pages.insert(current) {
+            let page = match pages.get(&page_id) {
+                Some(page) => PendingFreePage::Borrowed(page),
+                None => PendingFreePage::Cached(self.fetch_page(page_id)?),
+            };
+            if page.txn_id() > slot_txn {
                 return Err(Error::DatabaseCorrupted);
             }
-            if let std::collections::hash_map::Entry::Vacant(entry) = pages.entry(current) {
-                let page = self.fetch_page_owned(current)?;
-                entry.insert(page);
-            }
-            let page = pages.get(&current).unwrap();
-            if page.page_id() != current || page.txn_id() > slot_txn {
-                return Err(Error::DatabaseCorrupted);
-            }
-            for entry in pending_free::read_page_entries(page)? {
-                if !entry.page_id.is_valid()
-                    || entry.page_id.as_u32() >= high_water_mark
-                    || entry.freed_at_txn == TxnId::ZERO
-                    || entry.freed_at_txn > slot_txn
-                    || !entry_pages.insert(entry.page_id)
-                {
-                    return Err(Error::DatabaseCorrupted);
-                }
-            }
-            current = page.right_child();
-        }
-
-        if entry_pages.iter().any(|page| chain_pages.contains(page)) {
-            return Err(Error::DatabaseCorrupted);
-        }
-
-        Ok(())
+            Ok(page)
+        })
     }
 
     pub(crate) fn fetch_page_owned(&self, page_id: PageId) -> Result<Page> {

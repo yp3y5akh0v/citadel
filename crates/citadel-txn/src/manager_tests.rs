@@ -98,6 +98,77 @@ impl PageIO for MemIO {
     }
 }
 
+/// Growth regressions must fail before their in-memory backing can grow without
+/// bound. The guard also covers preallocation and the default batched writes.
+struct CappedCommitIO<T> {
+    inner: T,
+    max_bytes: u64,
+}
+
+impl<T: PageIO> CappedCommitIO<T> {
+    fn new(inner: T, max_bytes: u64) -> Self {
+        assert!(inner.file_size().unwrap() <= max_bytes);
+        Self { inner, max_bytes }
+    }
+
+    fn check_end(&self, end: Option<u64>) -> Result<()> {
+        if end.is_some_and(|end| end <= self.max_bytes) {
+            Ok(())
+        } else {
+            Err(Error::Io(std::io::Error::other(
+                "bounded commit test exceeded its I/O limit",
+            )))
+        }
+    }
+}
+
+impl<T: PageIO> PageIO for CappedCommitIO<T> {
+    fn read_page(&self, offset: u64, buf: &mut [u8; PAGE_SIZE]) -> Result<()> {
+        self.inner.read_page(offset, buf)
+    }
+
+    fn write_page(&self, offset: u64, buf: &[u8; PAGE_SIZE]) -> Result<()> {
+        self.check_end(offset.checked_add(PAGE_SIZE as u64))?;
+        self.inner.write_page(offset, buf)
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        self.inner.read_at(offset, buf)
+    }
+
+    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
+        self.check_end(offset.checked_add(buf.len() as u64))?;
+        self.inner.write_at(offset, buf)
+    }
+
+    fn fsync(&self) -> Result<()> {
+        self.inner.fsync()
+    }
+
+    fn file_size(&self) -> Result<u64> {
+        self.inner.file_size()
+    }
+
+    fn truncate(&self, size: u64) -> Result<()> {
+        self.check_end(Some(size))?;
+        self.inner.truncate(size)
+    }
+}
+
+#[test]
+fn capped_commit_io_refuses_growth_before_modifying_backing() {
+    let backing = MemIO::new(PAGE_SIZE);
+    let capped = CappedCommitIO::new(backing.share(), PAGE_SIZE as u64);
+    assert!(capped.write_page(1, &[1; PAGE_SIZE]).is_err());
+    assert!(capped.write_at(PAGE_SIZE as u64, &[1]).is_err());
+    assert!(capped.write_at(u64::MAX, &[1]).is_err());
+    assert!(capped.truncate(PAGE_SIZE as u64 + 1).is_err());
+    assert_eq!(backing.file_size().unwrap(), PAGE_SIZE as u64);
+    assert!(backing.data.lock().unwrap().iter().all(|&byte| byte == 0));
+    capped.write_page(0, &[1; PAGE_SIZE]).unwrap();
+    assert!(backing.data.lock().unwrap().iter().all(|&byte| byte == 1));
+}
+
 pub fn test_keys() -> ([u8; DEK_SIZE], [u8; MAC_KEY_SIZE], [u8; 32]) {
     let rek = [0x42u8; 32];
     let keys = derive_keys_from_rek(&rek);
@@ -123,9 +194,77 @@ fn commit_insert(mgr: &TxnManager, key: &[u8], val: &[u8]) {
     wtx.commit().unwrap();
 }
 
-fn reopen_with_pending_fixture<F>(build: F) -> (TxnManager, MemIO)
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CommitIoEffects {
+    page_writes: usize,
+    metadata_writes: usize,
+    truncates: usize,
+}
+
+#[derive(Clone, Default)]
+struct CommitIoRecorder(Arc<StdMutex<Option<CommitIoEffects>>>);
+
+impl CommitIoRecorder {
+    fn arm(&self) {
+        *self.0.lock().unwrap() = Some(CommitIoEffects::default());
+    }
+
+    fn record(&self, update: impl FnOnce(&mut CommitIoEffects)) {
+        if let Some(effects) = self.0.lock().unwrap().as_mut() {
+            update(effects);
+        }
+    }
+
+    fn effects(&self) -> CommitIoEffects {
+        self.0.lock().unwrap().expect("commit recorder is armed")
+    }
+}
+
+struct RecordingCommitIO {
+    inner: MemIO,
+    recorder: CommitIoRecorder,
+}
+
+impl PageIO for RecordingCommitIO {
+    fn read_page(&self, offset: u64, buf: &mut [u8; PAGE_SIZE]) -> Result<()> {
+        self.inner.read_page(offset, buf)
+    }
+
+    fn write_page(&self, offset: u64, buf: &[u8; PAGE_SIZE]) -> Result<()> {
+        self.recorder.record(|effects| effects.page_writes += 1);
+        self.inner.write_page(offset, buf)
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        self.inner.read_at(offset, buf)
+    }
+
+    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
+        self.recorder.record(|effects| effects.metadata_writes += 1);
+        self.inner.write_at(offset, buf)
+    }
+
+    fn fsync(&self) -> Result<()> {
+        self.inner.fsync()
+    }
+
+    fn file_size(&self) -> Result<u64> {
+        self.inner.file_size()
+    }
+
+    fn truncate(&self, size: u64) -> Result<()> {
+        self.recorder.record(|effects| effects.truncates += 1);
+        self.inner.truncate(size)
+    }
+}
+
+// Keep physical and embedded IDs separate so a checksummed, authenticated
+// page with the wrong embedded ID reaches the commit-time validation.
+type PendingFixturePages = Vec<(PageId, Page)>;
+
+fn reopen_with_pending_fixture<F>(build: F) -> (TxnManager, MemIO, CommitIoRecorder)
 where
-    F: FnOnce(PageId, TxnId) -> (Vec<Page>, u32),
+    F: FnOnce(PageId, TxnId) -> (PendingFixturePages, u32),
 {
     use citadel_io::file_manager::{read_commit_slot, read_god_byte, write_commit_slot};
 
@@ -141,18 +280,17 @@ where
     let (pages, high_water_mark) = build(root, slot.txn_id);
     assert!(!pages.is_empty());
     assert!(high_water_mark > root.as_u32());
-    for page in &pages {
+    for (physical, page) in &pages {
         let mut encrypted = [0u8; PAGE_SIZE];
         page_cipher::encrypt_page(
             &dek,
             &mac_key,
-            page.page_id(),
+            *physical,
             slot.encryption_epoch,
             page.as_bytes(),
             &mut encrypted,
         );
-        io.write_page(page_offset(page.page_id()), &encrypted)
-            .unwrap();
+        io.write_page(page_offset(*physical), &encrypted).unwrap();
     }
     slot.pending_free_root = root;
     slot.total_pages = high_water_mark;
@@ -161,25 +299,57 @@ where
     write_commit_slot(&io, active, &slot).unwrap();
     drop(mgr);
 
-    let reopened = TxnManager::open(Box::new(io.share()), dek, mac_key, 1, 256).unwrap();
-    (reopened, io)
+    let recorder = CommitIoRecorder::default();
+    let reopened = TxnManager::open(
+        Box::new(RecordingCommitIO {
+            inner: io.share(),
+            recorder: recorder.clone(),
+        }),
+        dek,
+        mac_key,
+        1,
+        256,
+    )
+    .unwrap();
+    (reopened, io, recorder)
 }
 
-fn assert_pending_fixture_refuses_commit<F>(build: F)
+fn assert_pending_fixture_refuses_commit<F>(case: &str, build: F) -> Error
 where
-    F: FnOnce(PageId, TxnId) -> (Vec<Page>, u32),
+    F: FnOnce(PageId, TxnId) -> (PendingFixturePages, u32),
 {
     use citadel_io::file_manager::read_god_byte;
 
-    let (mgr, io) = reopen_with_pending_fixture(build);
+    let (mgr, io, recorder) = reopen_with_pending_fixture(build);
     let god_before = read_god_byte(&io).unwrap();
+    let slot_before = mgr.current_slot();
+    let generation_before = mgr.commit_generation();
     let mut txn = mgr.begin_write().unwrap();
     txn.insert(b"after", b"value").unwrap();
-    assert!(txn.commit().is_err());
+    recorder.arm();
+    let error = txn.commit().expect_err(case);
+    assert!(
+        matches!(
+            error,
+            Error::DatabaseCorrupted | Error::PageOutOfBounds(_) | Error::InvalidPageType(_, _)
+        ),
+        "{case}: expected a metadata validation error, got {error:?}"
+    );
+    assert_eq!(
+        recorder.effects(),
+        CommitIoEffects::default(),
+        "{case}: validation must precede all commit writes and truncation"
+    );
+    assert_eq!(mgr.current_slot(), slot_before, "{case}: slot changed");
+    assert_eq!(
+        mgr.commit_generation(),
+        generation_before,
+        "{case}: generation changed"
+    );
     assert_eq!(
         read_god_byte(&io).unwrap(),
         god_before,
-        "validation must fail before publishing recovery metadata"
+        "{case}: validation must fail before publishing recovery metadata"
     );
     mgr.begin_write().unwrap().abort();
     drop(mgr);
@@ -191,6 +361,8 @@ where
         reader.get(b"seed").unwrap().as_deref(),
         Some(b"value".as_slice())
     );
+    assert_eq!(reader.get(b"after").unwrap(), None, "{case}");
+    error
 }
 
 const OVERFLOW_TABLE: &[u8] = b"overflow_table";
@@ -241,14 +413,14 @@ fn overflow_first_page(mgr: &TxnManager, root: PageId, key: &[u8]) -> PageId {
 /// through, and the shared MemIO keeps whatever landed before the crash.
 struct FaultingIO {
     inner: MemIO,
-    writes_left: std::sync::atomic::AtomicI64,
+    writes_left: Arc<std::sync::atomic::AtomicI64>,
 }
 
 impl FaultingIO {
     fn new(inner: MemIO, budget: i64) -> Self {
         Self {
             inner,
-            writes_left: std::sync::atomic::AtomicI64::new(budget),
+            writes_left: Arc::new(std::sync::atomic::AtomicI64::new(budget)),
         }
     }
 
@@ -292,9 +464,8 @@ impl PageIO for FaultingIO {
     }
 }
 
-/// Finding 11 (Off-mode process-crash guarantee): a crash at any write of the
-/// second commit - data pages, chain pages, slot, or god byte - must leave
-/// the first commit's generation fully readable after reopen.
+/// A process crash at any write in the second commit must leave the first
+/// commit's generation fully readable after reopen.
 #[test]
 fn off_mode_crash_mid_commit_preserves_previous_generation() {
     let (dek, mac_key, dek_id) = test_keys();
@@ -350,6 +521,793 @@ fn off_mode_crash_mid_commit_preserves_previous_generation() {
                 "row k{i:02} wrong after crash at write budget {budget}"
             );
         }
+    }
+}
+
+#[test]
+fn crash_with_reclaimed_chain_pages_preserves_reader_and_durable_snapshot() {
+    let (dek, mac_key, dek_id) = test_keys();
+    let keys: Vec<Vec<u8>> = (0..64)
+        .map(|i| format!("loan-{i:02}").into_bytes())
+        .collect();
+    let oldest_value = vec![b'c'; 512];
+    let durable_value = vec![b'd'; 512];
+    let new_value = vec![b'e'; 512];
+
+    let run = |sync_mode, fail_after: Option<i64>| {
+        let io = MemIO::new(1024 * 1024);
+        let faulty = FaultingIO::new(io.share(), i64::MAX);
+        let writes_left = Arc::clone(&faulty.writes_left);
+        let mgr = TxnManager::create_with_sync(
+            Box::new(faulty),
+            dek,
+            mac_key,
+            1,
+            0x1234,
+            dek_id,
+            256,
+            sync_mode,
+        )
+        .unwrap();
+        for byte in *b"abc" {
+            let mut txn = mgr.begin_write().unwrap();
+            for key in &keys {
+                txn.insert(key, &[byte; 512]).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        let oldest_slot = mgr.current_slot();
+        let mut oldest_reader = mgr.begin_read();
+        let mut txn = mgr.begin_write().unwrap();
+        for key in &keys {
+            txn.insert(key, &durable_value).unwrap();
+        }
+        txn.commit().unwrap();
+
+        let before = mgr.current_slot();
+        assert!(before.txn_id > oldest_slot.txn_id);
+        assert_eq!(mgr.reclaim_horizon(), oldest_slot.txn_id);
+        let before_tags = mgr.state.lock().retired_chain_pages.clone();
+        assert!(
+            !before_tags.is_empty(),
+            "fixture must carry published metadata provenance"
+        );
+        let loan = {
+            let mut state = mgr.state.lock();
+            let ids: FxHashSet<_> = state.reclaimed_pages.iter().copied().collect();
+            let tagged = state
+                .reclaimed_pages
+                .iter()
+                .position(|id| before_tags.contains_key(id))
+                .expect("fixture must offer a tagged metadata loan");
+            let last = state.reclaimed_pages.len() - 1;
+            // Change only allocation order: put an already-eligible metadata
+            // page first in the allocator's LIFO body allocation path.
+            state.reclaimed_pages.swap(tagged, last);
+            assert_eq!(
+                state
+                    .reclaimed_pages
+                    .iter()
+                    .copied()
+                    .collect::<FxHashSet<_>>(),
+                ids
+            );
+            state.reclaimed_pages.clone()
+        };
+        let tagged_body = *loan.last().unwrap();
+        assert!(
+            loan.len() > 2,
+            "fixture must offer data and structure loans"
+        );
+        let mut txn = mgr.begin_write().unwrap();
+        txn.insert(&keys[0], &new_value).unwrap();
+        let target_txn = txn.txn_id();
+        assert_eq!(
+            mgr.state.lock().retired_chain_pages,
+            before_tags,
+            "uncommitted body allocation must not publish tag removal"
+        );
+        let budget = fail_after.unwrap_or(i64::MAX);
+        writes_left.store(budget, Ordering::SeqCst);
+        let result = txn.commit();
+        let write_attempts = budget - writes_left.load(Ordering::SeqCst);
+        assert_eq!(
+            result.is_ok(),
+            fail_after.is_none(),
+            "{sync_mode:?}, budget {fail_after:?}: {result:?}"
+        );
+        if let Some(limit) = fail_after {
+            assert!(matches!(result, Err(Error::Io(_))));
+            assert!(write_attempts > limit, "the injected write fault must fire");
+            assert_eq!(
+                mgr.state.lock().retired_chain_pages,
+                before_tags,
+                "failed loan consumption must not alter published metadata provenance"
+            );
+        } else {
+            assert!(
+                loan.contains(&mgr.current_slot().pending_free_root),
+                "successful control must use a remaining loan as chain structure"
+            );
+            assert!(!mgr
+                .state
+                .lock()
+                .retired_chain_pages
+                .contains_key(&tagged_body));
+            let reused = mgr.read_page_from_disk(tagged_body).unwrap();
+            assert_eq!(reused.txn_id(), target_txn);
+            assert!(
+                matches!(reused.page_type(), Some(PageType::Leaf | PageType::Branch)),
+                "successful control must consume the tagged loan as data, not structure"
+            );
+        }
+
+        // No earlier reads populated this reader's local cache. Evict the
+        // shared cache too, so a partial overwrite cannot hide behind old pages.
+        mgr.pool.lock().clear();
+        assert_eq!(oldest_reader.entry_count(), keys.len() as u64);
+        for key in &keys {
+            assert_eq!(
+                oldest_reader.get(key).unwrap().as_deref(),
+                Some(oldest_value.as_slice()),
+                "old reader: {sync_mode:?}, budget {fail_after:?}"
+            );
+        }
+        let expected_slot = if fail_after.is_some() {
+            before
+        } else {
+            mgr.current_slot()
+        };
+        drop(oldest_reader);
+        drop(mgr);
+
+        let reopened =
+            TxnManager::open_with_sync(Box::new(io), dek, mac_key, 1, 256, sync_mode).unwrap();
+        // seal() computes the MAC, but serialize() materializes the checksum
+        // without updating the live slot. Compare every decoded wire field.
+        assert_eq!(
+            reopened.current_slot(),
+            CommitSlot::deserialize(&expected_slot.serialize())
+        );
+        let mut reader = reopened.begin_read();
+        assert_eq!(reader.entry_count(), keys.len() as u64);
+        for (index, key) in keys.iter().enumerate() {
+            let expected = if index == 0 && fail_after.is_none() {
+                &new_value
+            } else {
+                &durable_value
+            };
+            assert_eq!(
+                reader.get(key).unwrap().as_deref(),
+                Some(expected.as_slice()),
+                "reopened: {sync_mode:?}, budget {fail_after:?}"
+            );
+        }
+        drop(reader);
+        let report = reopened.integrity_check().unwrap();
+        assert!(
+            report.is_ok(),
+            "{sync_mode:?}, budget {fail_after:?}: {report:?}"
+        );
+        write_attempts
+    };
+
+    for sync_mode in [SyncMode::Off, SyncMode::Full] {
+        let writes = run(sync_mode, None);
+        assert!((1..=16).contains(&writes), "keep the fault matrix bounded");
+        for budget in 0..writes {
+            run(sync_mode, Some(budget));
+        }
+    }
+}
+
+fn pending_chain_pages(mgr: &TxnManager, root: PageId) -> Vec<Page> {
+    let mut pages = Vec::new();
+    let mut seen = FxHashSet::default();
+    let mut next = root;
+    while next.is_valid() {
+        assert!(seen.insert(next), "pending-free chain must not cycle");
+        let page = mgr.read_page_from_disk(next).unwrap();
+        assert_eq!(page.page_id(), next);
+        let _ = pending_free::read_page_entries(&page).unwrap();
+        next = page.right_child();
+        pages.push(page);
+    }
+    pages
+}
+
+#[test]
+fn held_reader_pending_free_growth_is_linear_and_reuses_after_release() {
+    const COMMITS: usize = 3000;
+    const MAX_BYTES: u64 = 64 * 1024 * 1024;
+    let (dek, mac_key, dek_id) = test_keys();
+    for sync_mode in [SyncMode::Off, SyncMode::Full] {
+        let io = MemIO::new(1024 * 1024);
+        let mgr = TxnManager::create_with_sync(
+            Box::new(CappedCommitIO::new(io.share(), MAX_BYTES)),
+            dek,
+            mac_key,
+            1,
+            0x1234,
+            dek_id,
+            32,
+            sync_mode,
+        )
+        .unwrap();
+        mgr.set_secure_delete(true);
+        commit_insert(&mgr, b"key", b"original");
+        let original_slot = mgr.current_slot();
+        let initial_entries: usize = pending_chain_pages(&mgr, original_slot.pending_free_root)
+            .iter()
+            .map(|page| pending_free::read_page_entries(page).unwrap().len())
+            .sum();
+        let mut oldest = mgr.begin_read();
+        let mut data_retirements = 0;
+        for sequence in 1..=COMMITS {
+            let before = mgr.current_slot().high_water_mark;
+            let mut txn = mgr.begin_write().unwrap();
+            txn.insert(b"key", &(sequence as u64).to_le_bytes())
+                .unwrap();
+            let retired = txn.pending_free_count();
+            assert_eq!(retired, 1, "fixture must replace exactly one data page");
+            data_retirements += retired;
+            txn.commit().unwrap_or_else(|error| {
+                panic!("{sync_mode:?}, held-reader commit {sequence}: {error}")
+            });
+            // One data replacement, plus a head and at most one packing spill.
+            assert!(
+                mgr.current_slot().high_water_mark <= before + retired as u32 + 2,
+                "{sync_mode:?}, commit {sequence}: allocated beyond the per-update page budget"
+            );
+        }
+        assert_eq!(mgr.reclaim_horizon(), original_slot.txn_id);
+        // Data stays pinned, but already-durable retired chain structure has no
+        // reader lifetime. Every early loan must have exact metadata provenance.
+        {
+            let state = mgr.state.lock();
+            let chain = pending_chain_pages(&mgr, state.current_slot.pending_free_root);
+            let entries: FxHashMap<_, _> = chain
+                .iter()
+                .flat_map(|page| pending_free::read_page_entries(page).unwrap())
+                .map(|entry| (entry.page_id, entry.freed_at_txn))
+                .collect();
+            for page in &state.reclaimed_pages {
+                assert_eq!(state.retired_chain_pages.get(page), entries.get(page));
+                assert!(state.retired_chain_pages.contains_key(page));
+            }
+        }
+        let held_slot = mgr.current_slot();
+        let chain = pending_chain_pages(&mgr, held_slot.pending_free_root);
+        let entries: usize = chain
+            .iter()
+            .map(|page| pending_free::read_page_entries(page).unwrap().len())
+            .sum();
+        let entry_budget = initial_entries + data_retirements + COMMITS;
+        assert!(chain.len() >= 3, "exercise shared multi-page tails");
+        assert!(
+            entries <= entry_budget,
+            "{sync_mode:?}: {entries} entries exceed {entry_budget}; retired metadata fed back"
+        );
+        // A full rewrite can leave one legacy partial tail. New prefixes must
+        // still be packed, rather than adding a one-entry page on every commit.
+        assert!(chain.len() <= entries.div_ceil(pending_free::MAX_ENTRIES_PER_PAGE) + 1);
+        let page_budget = original_slot.high_water_mark as usize
+            + data_retirements
+            + COMMITS
+            + entry_budget.div_ceil(pending_free::MAX_ENTRIES_PER_PAGE);
+        assert!(
+            held_slot.high_water_mark as usize <= page_budget,
+            "{sync_mode:?}: {} allocated pages exceed linear budget {page_budget}",
+            held_slot.high_water_mark
+        );
+        assert!(io.file_size().unwrap() <= MAX_BYTES);
+
+        // This reader has never loaded the row; clear the shared cache as well.
+        mgr.pool.lock().clear();
+        assert_eq!(oldest.entry_count(), 1);
+        assert_eq!(
+            oldest.get(b"key").unwrap().as_deref(),
+            Some(b"original".as_slice())
+        );
+        drop(oldest);
+
+        commit_insert(&mgr, b"key", &((COMMITS + 1) as u64).to_le_bytes());
+        let available = mgr.state.lock().reclaimed_pages.clone();
+        assert!(available.len() >= data_retirements);
+        assert!(available.contains(&original_slot.tree_root));
+        let mut erased = [0xff; PAGE_SIZE];
+        io.read_page(page_offset(original_slot.tree_root), &mut erased)
+            .unwrap();
+        assert!(
+            erased.iter().all(|&byte| byte == 0),
+            "released original page must be securely erased"
+        );
+        let reuse_high_water = mgr.current_slot().high_water_mark;
+        for sequence in COMMITS + 2..=COMMITS + 65 {
+            commit_insert(&mgr, b"key", &(sequence as u64).to_le_bytes());
+            assert_eq!(
+                mgr.current_slot().high_water_mark,
+                reuse_high_water,
+                "{sync_mode:?}: eligible entries must fund later data and chain pages"
+            );
+        }
+        let expected_slot = mgr.current_slot();
+        drop(mgr);
+        let reopened = TxnManager::open_with_sync(
+            Box::new(CappedCommitIO::new(io, MAX_BYTES)),
+            dek,
+            mac_key,
+            1,
+            32,
+            sync_mode,
+        )
+        .unwrap();
+        assert_eq!(
+            reopened.current_slot(),
+            CommitSlot::deserialize(&expected_slot.serialize())
+        );
+        assert_eq!(
+            reopened.begin_read().get(b"key").unwrap(),
+            Some(((COMMITS + 65) as u64).to_le_bytes().to_vec())
+        );
+        let report = reopened.integrity_check().unwrap();
+        assert!(report.is_ok(), "{sync_mode:?}: {report:?}");
+    }
+}
+
+#[test]
+fn shared_pending_free_tail_survives_each_commit_write_failure() {
+    use citadel_io::file_manager::{read_commit_slot, write_god_byte};
+
+    const MAX_BYTES: u64 = 32 * 1024 * 1024;
+    let (dek, mac_key, dek_id) = test_keys();
+    // One bounded overflow value produces several pages of retirement entries
+    // without replaying thousands of setup commits for every injected fault.
+    let original =
+        vec![b'o'; (2 * pending_free::MAX_ENTRIES_PER_PAGE + 32) * citadel_core::USABLE_SIZE];
+    let prepare = |sync_mode| {
+        let io = MemIO::new(1024 * 1024);
+        let mgr = TxnManager::create_with_sync(
+            Box::new(CappedCommitIO::new(io.share(), MAX_BYTES)),
+            dek,
+            mac_key,
+            1,
+            0x1234,
+            dek_id,
+            32,
+            sync_mode,
+        )
+        .unwrap();
+        mgr.set_secure_delete(true);
+        commit_insert(&mgr, b"key", &original);
+        let mut original_reader = mgr.begin_read();
+        commit_insert(&mgr, b"key", b"durable0");
+        commit_insert(&mgr, b"key", b"durable1");
+        mgr.pool.lock().clear();
+        assert_eq!(
+            original_reader.get(b"key").unwrap().as_deref(),
+            Some(original.as_slice())
+        );
+        drop(original_reader);
+        drop(mgr);
+        // The loan-backed commit left a full head. Reopen naturally clears the
+        // loan map, so the next small commit prepends a partial head. Both
+        // physical slots now contain small rows instead of the bulk setup value.
+        let mgr = TxnManager::open_with_sync(
+            Box::new(CappedCommitIO::new(io.share(), MAX_BYTES)),
+            dek,
+            mac_key,
+            1,
+            32,
+            sync_mode,
+        )
+        .unwrap();
+        let chain = pending_chain_pages(&mgr, mgr.current_slot().pending_free_root);
+        assert_eq!(
+            pending_free::read_page_entries(&chain[0]).unwrap().len(),
+            pending_free::MAX_ENTRIES_PER_PAGE
+        );
+        commit_insert(&mgr, b"key", b"durable2");
+        drop(mgr);
+        io
+    };
+    let run = |base: &MemIO, sync_mode, fail_after: Option<i64>| {
+        let io = base.deep_clone();
+        // Each independent reopen starts with no loans/provenance. Pin the new
+        // snapshot before any write so the target exercises the no-removal lane.
+        // Do not enable secure delete here: probing the older physical slot
+        // after an interrupted commit requires retaining its old data too.
+        let faulty = FaultingIO::new(io.share(), i64::MAX);
+        let writes_left = Arc::clone(&faulty.writes_left);
+        let mgr = TxnManager::open_with_sync(
+            Box::new(CappedCommitIO::new(faulty, MAX_BYTES)),
+            dek,
+            mac_key,
+            1,
+            32,
+            sync_mode,
+        )
+        .unwrap();
+        let mut oldest = mgr.begin_read();
+        assert!(mgr.state.lock().reclaimed_pages.is_empty());
+        let before = mgr.current_slot();
+        let chain = pending_chain_pages(&mgr, before.pending_free_root);
+        assert!(
+            chain.len() >= 3,
+            "fault target needs a multi-page shared tail"
+        );
+        let head_entries = pending_free::read_page_entries(&chain[0]).unwrap().len();
+        assert!((1..pending_free::MAX_ENTRIES_PER_PAGE - 2).contains(&head_entries));
+        let old_bytes: Vec<_> = chain
+            .iter()
+            .map(|page| {
+                let mut bytes = [0u8; PAGE_SIZE];
+                io.read_page(page_offset(page.page_id()), &mut bytes)
+                    .unwrap();
+                (page.page_id(), bytes)
+            })
+            .collect();
+        let before_slots = [
+            read_commit_slot(&io, 0).unwrap(),
+            read_commit_slot(&io, 1).unwrap(),
+        ];
+        assert_ne!(before_slots[0].txn_id, before_slots[1].txn_id);
+        assert_ne!(before_slots[0].tree_root, before_slots[1].tree_root);
+        let before_values = before_slots.each_ref().map(|slot| {
+            if slot.tree_root == before.tree_root {
+                b"durable2".as_slice()
+            } else {
+                b"durable1".as_slice()
+            }
+        });
+        let before_tags = mgr.state.lock().retired_chain_pages.clone();
+        assert!(before_tags.is_empty());
+
+        let mut txn = mgr.begin_write().unwrap();
+        txn.insert(b"key", b"newvalue").unwrap();
+        let target_txn = txn.txn_id();
+        assert_eq!(txn.pending_free_count(), 1);
+        let budget = fail_after.unwrap_or(i64::MAX);
+        writes_left.store(budget, Ordering::SeqCst);
+        let result = txn.commit();
+        let attempts = budget - writes_left.load(Ordering::SeqCst);
+        assert_eq!(
+            result.is_ok(),
+            fail_after.is_none(),
+            "{sync_mode:?}, {fail_after:?}: {result:?}"
+        );
+        if let Some(limit) = fail_after {
+            assert!(matches!(result, Err(Error::Io(_))));
+            assert!(attempts > limit, "the write fault must actually fire");
+            assert_eq!(
+                mgr.state.lock().retired_chain_pages,
+                before_tags,
+                "failed commit must not publish candidate metadata provenance"
+            );
+        } else {
+            let after_chain = pending_chain_pages(&mgr, mgr.current_slot().pending_free_root);
+            assert_ne!(after_chain[0].page_id(), chain[0].page_id());
+            assert_eq!(after_chain[0].right_child(), chain[0].right_child());
+            assert_eq!(after_chain.len(), chain.len());
+            let retirement = pending_free::read_page_entries(&after_chain[0])
+                .unwrap()
+                .find(|entry| entry.page_id == chain[0].page_id())
+                .expect("replaced head is retired");
+            assert_eq!(retirement.freed_at_txn, target_txn);
+            let state = mgr.state.lock();
+            assert!(
+                !state.reclaimed_pages.contains(&chain[0].page_id()),
+                "newly retired head must not become a loan"
+            );
+            assert_eq!(
+                state.retired_chain_pages.get(&chain[0].page_id()),
+                Some(&target_txn)
+            );
+        }
+        for (id, expected) in &old_bytes {
+            let mut actual = [0u8; PAGE_SIZE];
+            io.read_page(page_offset(*id), &mut actual).unwrap();
+            assert_eq!(
+                &actual, expected,
+                "{sync_mode:?}, {fail_after:?}: shared or retired page {id} overwritten"
+            );
+        }
+        mgr.pool.lock().clear();
+        assert_eq!(
+            oldest.get(b"key").unwrap().as_deref(),
+            Some(b"durable2".as_slice()),
+            "{sync_mode:?}, {fail_after:?}: cold oldest snapshot changed"
+        );
+        let expected_slot = if fail_after.is_none() {
+            mgr.current_slot()
+        } else {
+            before
+        };
+        drop(oldest);
+        drop(mgr);
+
+        let reopened = TxnManager::open_with_sync(
+            Box::new(CappedCommitIO::new(io.share(), MAX_BYTES)),
+            dek,
+            mac_key,
+            1,
+            32,
+            sync_mode,
+        )
+        .unwrap();
+        assert_eq!(
+            reopened.current_slot(),
+            CommitSlot::deserialize(&expected_slot.serialize())
+        );
+        let expected = if fail_after.is_none() {
+            b"newvalue"
+        } else {
+            b"durable2"
+        };
+        assert_eq!(
+            reopened.begin_read().get(b"key").unwrap().as_deref(),
+            Some(expected.as_slice())
+        );
+        let report = reopened.integrity_check().unwrap();
+        assert!(report.is_ok(), "{sync_mode:?}, {fail_after:?}: {report:?}");
+        drop(reopened);
+
+        // Independently select each complete, authenticated physical slot in a
+        // fork. Normal recovery still follows its god byte above; these probes
+        // additionally prove neither recovery generation lost its shared tail.
+        for slot_index in 0..2 {
+            let slot = read_commit_slot(&io, slot_index).unwrap();
+            let expected = if slot.txn_id == target_txn {
+                b"newvalue".as_slice()
+            } else {
+                assert_eq!(slot, before_slots[slot_index]);
+                before_values[slot_index]
+            };
+            let fork = io.deep_clone();
+            write_god_byte(&fork, slot_index as u8).unwrap();
+            let recovered = TxnManager::open_with_sync(
+                Box::new(CappedCommitIO::new(fork, MAX_BYTES)),
+                dek,
+                mac_key,
+                1,
+                32,
+                sync_mode,
+            )
+            .unwrap();
+            assert_eq!(recovered.current_slot(), slot);
+            assert_eq!(
+                recovered.begin_read().get(b"key").unwrap().as_deref(),
+                Some(expected),
+                "{sync_mode:?}, {fail_after:?}, physical slot {slot_index}"
+            );
+        }
+        attempts
+    };
+    for sync_mode in [SyncMode::Off, SyncMode::Full] {
+        let base = prepare(sync_mode);
+        let writes = run(&base, sync_mode, None);
+        assert!((1..=8).contains(&writes), "keep the fault matrix bounded");
+        for budget in 0..writes {
+            run(&base, sync_mode, Some(budget));
+        }
+    }
+}
+
+#[test]
+fn rolling_readers_bound_retired_metadata_and_survive_reopen() {
+    const LAG: usize = 1000;
+    const COMMITS: usize = 4500;
+    const MAX_BYTES: u64 = 64 * 1024 * 1024;
+    let (dek, mac_key, dek_id) = test_keys();
+    for sync_mode in [SyncMode::Off, SyncMode::Full] {
+        let io = MemIO::new(1024 * 1024);
+        let mgr = TxnManager::create_with_sync(
+            Box::new(CappedCommitIO::new(io.share(), MAX_BYTES)),
+            dek,
+            mac_key,
+            1,
+            0x1234,
+            dek_id,
+            32,
+            sync_mode,
+        )
+        .unwrap();
+        mgr.set_secure_delete(true);
+        commit_insert(&mgr, b"key", &0u64.to_le_bytes());
+        let mut readers = std::collections::VecDeque::new();
+        readers.push_back((0usize, mgr.begin_read()));
+        let mut data_retirements = 0usize;
+        for sequence in 1..=COMMITS {
+            let mut txn = mgr.begin_write().unwrap();
+            txn.insert(b"key", &(sequence as u64).to_le_bytes())
+                .unwrap();
+            assert_eq!(txn.pending_free_count(), 1);
+            data_retirements += txn.pending_free_count();
+            txn.commit().unwrap_or_else(|error| {
+                panic!("{sync_mode:?}, rolling commit {sequence}: {error}")
+            });
+            readers.push_back((sequence, mgr.begin_read()));
+            if readers.len() > LAG {
+                readers.pop_front();
+            }
+            if sequence % 250 == 0 {
+                let slot = mgr.current_slot();
+                let chain = pending_chain_pages(&mgr, slot.pending_free_root);
+                let entries: usize = chain
+                    .iter()
+                    .map(|page| pending_free::read_page_entries(page).unwrap().len())
+                    .sum();
+                // The retained data window is 1000 single-page retirements.
+                // Generous slack covers two-slot staging and transient packing,
+                // not a budget proportional to the number of elapsed commits.
+                assert!(
+                    entries <= 2 * LAG + 64,
+                    "{sync_mode:?}, commit {sequence}: {entries} entries exceed the reader window"
+                );
+                assert!(
+                    slot.high_water_mark as usize <= 4 * LAG + 128,
+                    "{sync_mode:?}, commit {sequence}: {} pages exceed the reader window",
+                    slot.high_water_mark
+                );
+                assert!(mgr.state.lock().retired_chain_pages.len() <= entries);
+            }
+        }
+        assert_eq!(data_retirements, COMMITS);
+        assert_eq!(readers.len(), LAG);
+        assert_eq!(readers.front().unwrap().0, COMMITS - LAG + 1);
+        mgr.pool.lock().clear();
+        for (sequence, reader) in &mut readers {
+            assert_eq!(
+                reader.get(b"key").unwrap(),
+                Some((*sequence as u64).to_le_bytes().to_vec()),
+                "{sync_mode:?}: rolling snapshot {sequence}"
+            );
+        }
+        drop(readers);
+        drop(mgr);
+
+        let reopened = TxnManager::open_with_sync(
+            Box::new(CappedCommitIO::new(io, MAX_BYTES)),
+            dek,
+            mac_key,
+            1,
+            32,
+            sync_mode,
+        )
+        .unwrap();
+        assert!(reopened.state.lock().retired_chain_pages.is_empty());
+        assert!(reopened.state.lock().reclaimed_pages.is_empty());
+        // No write or maintenance pass is allowed before this first new reader.
+        let mut pinned = reopened.begin_read();
+        reopened.set_secure_delete(true);
+        let before = reopened.current_slot().high_water_mark;
+        for sequence in COMMITS + 1..=COMMITS + 256 {
+            commit_insert(&reopened, b"key", &(sequence as u64).to_le_bytes());
+        }
+        assert!(reopened.current_slot().high_water_mark <= before + 512);
+        reopened.pool.lock().clear();
+        assert_eq!(
+            pinned.get(b"key").unwrap(),
+            Some((COMMITS as u64).to_le_bytes().to_vec())
+        );
+        drop(pinned);
+        let report = reopened.integrity_check().unwrap();
+        assert!(report.is_ok(), "{sync_mode:?}: {report:?}");
+    }
+}
+
+#[test]
+fn metadata_reused_as_data_loses_early_reclamation_provenance() {
+    const MAX_BYTES: u64 = 8 * 1024 * 1024;
+    let (dek, mac_key, dek_id) = test_keys();
+    for sync_mode in [SyncMode::Off, SyncMode::Full] {
+        let mgr = TxnManager::create_with_sync(
+            Box::new(CappedCommitIO::new(MemIO::new(1024 * 1024), MAX_BYTES)),
+            dek,
+            mac_key,
+            1,
+            0x1234,
+            dek_id,
+            32,
+            sync_mode,
+        )
+        .unwrap();
+        mgr.set_secure_delete(true);
+        commit_insert(&mgr, b"key", &0u64.to_le_bytes());
+        let oldest = mgr.begin_read();
+        let mut reused = None;
+        for sequence in 1..=32u64 {
+            let tags = mgr.state.lock().retired_chain_pages.clone();
+            commit_insert(&mgr, b"key", &sequence.to_le_bytes());
+            let root = mgr.current_slot().tree_root;
+            if tags.contains_key(&root) {
+                assert!(
+                    !mgr.state.lock().retired_chain_pages.contains_key(&root),
+                    "a body allocation must invalidate its previous metadata lifetime"
+                );
+                reused = Some((root, sequence, mgr.begin_read()));
+                break;
+            }
+        }
+        let (reused_page, expected, mut reader) =
+            reused.expect("fixture must reuse a tagged metadata page as live data");
+        drop(oldest);
+        for sequence in 100..132u64 {
+            commit_insert(&mgr, b"key", &sequence.to_le_bytes());
+            let state = mgr.state.lock();
+            assert!(!state.retired_chain_pages.contains_key(&reused_page));
+            assert!(
+                !state.reclaimed_pages.contains(&reused_page),
+                "its new data lifetime must honor the reader horizon"
+            );
+        }
+        mgr.pool.lock().clear();
+        assert_eq!(
+            reader.get(b"key").unwrap(),
+            Some(expected.to_le_bytes().to_vec())
+        );
+        drop(reader);
+        let report = mgr.integrity_check().unwrap();
+        assert!(report.is_ok(), "{sync_mode:?}: {report:?}");
+    }
+}
+
+#[test]
+fn early_metadata_zeroing_does_not_skip_later_reader_pinned_data() {
+    const MAX_BYTES: u64 = 8 * 1024 * 1024;
+    let (dek, mac_key, dek_id) = test_keys();
+    for sync_mode in [SyncMode::Off, SyncMode::Full] {
+        let io = MemIO::new(1024 * 1024);
+        let mgr = TxnManager::create_with_sync(
+            Box::new(CappedCommitIO::new(io.share(), MAX_BYTES)),
+            dek,
+            mac_key,
+            1,
+            0x1234,
+            dek_id,
+            32,
+            sync_mode,
+        )
+        .unwrap();
+        mgr.set_secure_delete(true);
+        commit_insert(&mgr, b"key", b"original");
+        let original_page = mgr.current_slot().tree_root;
+        let mut reader = mgr.begin_read();
+        commit_insert(&mgr, b"key", &1u64.to_le_bytes());
+        let retired_at = mgr.current_slot().txn_id;
+        for sequence in 2..=16u64 {
+            commit_insert(&mgr, b"key", &sequence.to_le_bytes());
+        }
+        {
+            let state = mgr.state.lock();
+            assert!(
+                state.zeroed_chain_up_to > retired_at,
+                "fixture must zero newer metadata while older data remains pinned"
+            );
+            assert!(
+                state.zeroed_up_to < retired_at,
+                "metadata erasure must not advance the data watermark"
+            );
+            assert!(!state.retired_chain_pages.contains_key(&original_page));
+        }
+        mgr.pool.lock().clear();
+        assert_eq!(
+            reader.get(b"key").unwrap().as_deref(),
+            Some(b"original".as_slice())
+        );
+        drop(reader);
+        commit_insert(&mgr, b"key", b"released");
+        assert!(mgr.state.lock().reclaimed_pages.contains(&original_page));
+        let mut bytes = [0xff; PAGE_SIZE];
+        io.read_page(page_offset(original_page), &mut bytes)
+            .unwrap();
+        assert!(
+            bytes.iter().all(|&byte| byte == 0),
+            "older data must still be zeroed after newer metadata advanced its separate watermark"
+        );
+        assert!(mgr.state.lock().zeroed_up_to >= retired_at);
+        let report = mgr.integrity_check().unwrap();
+        assert!(report.is_ok(), "{sync_mode:?}: {report:?}");
     }
 }
 
@@ -1434,7 +2392,7 @@ fn compaction_preserves_a_slot_only_named_root() {
 
 #[test]
 fn a_pending_free_cycle_refuses_the_next_commit() {
-    assert_pending_fixture_refuses_commit(|root, txn_id| {
+    assert_pending_fixture_refuses_commit("cycle", |root, txn_id| {
         let second = PageId(root.as_u32() + 1);
         let mut first_page = Page::new(root, PageType::PendingFree, txn_id);
         first_page.set_right_child(second);
@@ -1442,31 +2400,34 @@ fn a_pending_free_cycle_refuses_the_next_commit() {
         let mut second_page = Page::new(second, PageType::PendingFree, txn_id);
         second_page.set_right_child(root);
         second_page.update_checksum();
-        (vec![first_page, second_page], second.as_u32() + 1)
+        (
+            vec![(root, first_page), (second, second_page)],
+            second.as_u32() + 1,
+        )
     });
 }
 
 #[test]
 fn an_oversized_pending_free_entry_count_refuses_the_next_commit() {
-    assert_pending_fixture_refuses_commit(|root, txn_id| {
+    assert_pending_fixture_refuses_commit("oversized count", |root, txn_id| {
         let mut page = Page::new(root, PageType::PendingFree, txn_id);
         let count = (pending_free::MAX_ENTRIES_PER_PAGE as u32) + 1;
         page.data[citadel_core::PAGE_HEADER_SIZE..citadel_core::PAGE_HEADER_SIZE + 4]
             .copy_from_slice(&count.to_le_bytes());
         page.update_checksum();
-        (vec![page], root.as_u32() + 1)
+        (vec![(root, page)], root.as_u32() + 1)
     });
 }
 
 #[test]
 fn a_wrong_type_or_duplicate_pending_free_entry_refuses_the_next_commit() {
-    assert_pending_fixture_refuses_commit(|root, txn_id| {
+    assert_pending_fixture_refuses_commit("wrong page type", |root, txn_id| {
         let mut page = Page::new(root, PageType::Leaf, txn_id);
         page.update_checksum();
-        (vec![page], root.as_u32() + 1)
+        (vec![(root, page)], root.as_u32() + 1)
     });
 
-    assert_pending_fixture_refuses_commit(|root, txn_id| {
+    assert_pending_fixture_refuses_commit("duplicate on one page", |root, txn_id| {
         let free_page = PageId(root.as_u32() + 1);
         let mut page = Page::new(root, PageType::PendingFree, txn_id);
         page.data[citadel_core::PAGE_HEADER_SIZE..citadel_core::PAGE_HEADER_SIZE + 4]
@@ -1478,8 +2439,142 @@ fn a_wrong_type_or_duplicate_pending_free_entry_refuses_the_next_commit() {
             page.data[offset + 4..offset + 12].copy_from_slice(&txn_id.as_u64().to_le_bytes());
         }
         page.update_checksum();
-        (vec![page], free_page.as_u32() + 1)
+        (vec![(root, page)], free_page.as_u32() + 1)
     });
+}
+
+fn pending_fixture_page(
+    page_id: PageId,
+    txn_id: TxnId,
+    entries: &[(PageId, TxnId)],
+    next: PageId,
+) -> Page {
+    assert!(entries.len() <= pending_free::MAX_ENTRIES_PER_PAGE);
+    let mut page = Page::new(page_id, PageType::PendingFree, txn_id);
+    page.data[citadel_core::PAGE_HEADER_SIZE..citadel_core::PAGE_HEADER_SIZE + 4]
+        .copy_from_slice(&(entries.len() as u32).to_le_bytes());
+    for (index, (entry, freed_at)) in entries.iter().enumerate() {
+        let offset =
+            citadel_core::PAGE_HEADER_SIZE + 4 + index * citadel_core::PENDING_FREE_ENTRY_SIZE;
+        page.data[offset..offset + 4].copy_from_slice(&entry.as_u32().to_le_bytes());
+        page.data[offset + 4..offset + 12].copy_from_slice(&freed_at.as_u64().to_le_bytes());
+    }
+    page.set_right_child(next);
+    page.update_checksum();
+    page
+}
+
+#[test]
+fn pending_free_metadata_validation_precedes_commit_io() {
+    #[derive(Clone, Copy, Debug)]
+    enum Damage {
+        CrossPageDuplicate,
+        EntryNamesLaterChainPage,
+        InvalidEntry,
+        EntryAtHighWater,
+        NextAtHighWater,
+        ZeroFreedAt,
+        FutureFreedAt,
+        FuturePageTxn,
+        WrongEmbeddedPageId,
+    }
+
+    for damage in [
+        Damage::CrossPageDuplicate,
+        Damage::EntryNamesLaterChainPage,
+        Damage::InvalidEntry,
+        Damage::EntryAtHighWater,
+        Damage::NextAtHighWater,
+        Damage::ZeroFreedAt,
+        Damage::FutureFreedAt,
+        Damage::FuturePageTxn,
+        Damage::WrongEmbeddedPageId,
+    ] {
+        let mut expected_bounds = None;
+        let error =
+            assert_pending_fixture_refuses_commit(&format!("{damage:?}"), |root, txn_id| {
+                let second = PageId(root.as_u32() + 1);
+                let free = PageId(root.as_u32() + 2);
+                let mut high_water_mark = free.as_u32() + 1;
+                let mut entries = vec![(free, txn_id)];
+                let mut next = PageId::INVALID;
+                let mut embedded_id = root;
+                let mut page_txn = txn_id;
+                let mut tail_entries = Vec::new();
+                match damage {
+                    Damage::CrossPageDuplicate => {
+                        next = second;
+                        tail_entries.push((free, txn_id));
+                    }
+                    Damage::EntryNamesLaterChainPage => {
+                        next = second;
+                        entries[0].0 = second;
+                    }
+                    Damage::InvalidEntry => entries[0].0 = PageId::INVALID,
+                    Damage::EntryAtHighWater => entries[0].0 = PageId(high_water_mark),
+                    Damage::NextAtHighWater => {
+                        entries.clear();
+                        next = second;
+                        high_water_mark = second.as_u32();
+                        expected_bounds = Some(second);
+                    }
+                    Damage::ZeroFreedAt => entries[0].1 = TxnId::ZERO,
+                    Damage::FutureFreedAt => entries[0].1 = TxnId(txn_id.as_u64() + 1),
+                    Damage::FuturePageTxn => page_txn = TxnId(txn_id.as_u64() + 1),
+                    Damage::WrongEmbeddedPageId => embedded_id = second,
+                }
+                let first = pending_fixture_page(embedded_id, page_txn, &entries, next);
+                let mut pages = vec![(root, first)];
+                if next.is_valid() {
+                    // The out-of-bounds case is physically present and authenticated;
+                    // only the slot's high-water check may reject it.
+                    let tail = pending_fixture_page(second, txn_id, &tail_entries, PageId::INVALID);
+                    pages.push((second, tail));
+                }
+                (pages, high_water_mark)
+            });
+        if let Some(expected) = expected_bounds {
+            assert!(
+                matches!(error, Error::PageOutOfBounds(actual) if actual == expected),
+                "{damage:?}: expected bounds rejection at {expected}, got {error:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn healthy_pending_free_fixture_records_commit_writes() {
+    let (mgr, io, recorder) = reopen_with_pending_fixture(|root, txn_id| {
+        let free = PageId(root.as_u32() + 1);
+        let page = pending_fixture_page(root, txn_id, &[(free, txn_id)], PageId::INVALID);
+        (vec![(root, page)], free.as_u32() + 1)
+    });
+    let generation_before = mgr.commit_generation();
+    let mut txn = mgr.begin_write().unwrap();
+    txn.insert(b"after", b"value").unwrap();
+    recorder.arm();
+    txn.commit().unwrap();
+    let effects = recorder.effects();
+    assert!(
+        effects.page_writes > 0,
+        "data/chain writes were not observed"
+    );
+    assert!(
+        effects.metadata_writes > 0,
+        "metadata writes were not observed"
+    );
+    assert_eq!(mgr.commit_generation(), generation_before + 1);
+    drop(mgr);
+
+    let (dek, mac_key, _) = test_keys();
+    let reopened = TxnManager::open(Box::new(io), dek, mac_key, 1, 256).unwrap();
+    let mut reader = reopened.begin_read();
+    for key in [b"seed".as_slice(), b"after".as_slice()] {
+        assert_eq!(
+            reader.get(key).unwrap().as_deref(),
+            Some(b"value".as_slice())
+        );
+    }
 }
 
 #[test]
