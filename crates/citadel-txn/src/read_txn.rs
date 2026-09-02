@@ -13,7 +13,7 @@ use citadel_page::{branch_node, leaf_node};
 
 use citadel_buffer::cursor::{Cursor, PageLoader, PageMap};
 
-use crate::catalog::TableDescriptor;
+use crate::catalog::{ResolvedCatalog, TableDescriptor};
 use crate::manager::TxnManager;
 use crate::overflow_io;
 use crate::ReadBudget;
@@ -201,6 +201,7 @@ pub struct ReadTxn<'a> {
     manager: &'a TxnManager,
     txn_id: TxnId,
     snapshot: Arc<CommitSlot>,
+    resolved_catalog: Arc<ResolvedCatalog>,
     commit_generation: u64,
     page_cache: FxHashMap<PageId, Arc<Page>>,
     /// Exact catalog resolutions for this immutable snapshot. Commit-slot
@@ -222,12 +223,14 @@ impl<'db> ReadTxn<'db> {
         manager: &'db TxnManager,
         txn_id: TxnId,
         snapshot: Arc<CommitSlot>,
+        resolved_catalog: Arc<ResolvedCatalog>,
         commit_generation: u64,
     ) -> Self {
         Self {
             manager,
             txn_id,
             snapshot,
+            resolved_catalog,
             commit_generation,
             page_cache: FxHashMap::default(),
             resolved_tables: FxHashMap::default(),
@@ -861,6 +864,28 @@ impl<'db> ReadTxn<'db> {
     fn lookup_table_uncached(&self, name: &[u8]) -> Result<TableDescriptor> {
         self.check_cancel()?;
 
+        let mut desc = self
+            .resolved_catalog
+            .resolve(name, || self.read_catalog_descriptor(name))?;
+
+        // Prove the exact name before consulting the hash-only slot cache.
+        // Off-mode roots/counts can be newer than the shared catalog descriptor.
+        if let Some((root, depth)) = self.snapshot.named_entry_root(name) {
+            self.manager
+                .reject_named_table_hash_collision(name, self.cancel.as_ref())?;
+            let Some(entry_count) = self.snapshot.named_entry_count(name) else {
+                return Err(Error::DatabaseCorrupted);
+            };
+            desc.root_page = root;
+            desc.depth = depth;
+            desc.entry_count = entry_count;
+        }
+
+        self.check_cancel()?;
+        Ok(desc)
+    }
+
+    fn read_catalog_descriptor(&self, name: &[u8]) -> Result<TableDescriptor> {
         let catalog_root = self.snapshot.catalog_root;
         if !catalog_root.is_valid() {
             return Err(Error::TableNotFound(
@@ -870,12 +895,15 @@ impl<'db> ReadTxn<'db> {
 
         let mut current = catalog_root;
         let mut visited = FxHashSet::default();
-        let mut desc = loop {
+        let descriptor = loop {
             self.check_cancel()?;
             if !visited.insert(current) {
                 return Err(Error::DatabaseCorrupted);
             }
-            let page = self.read_reachable_page(current)?;
+            let page = self
+                .manager
+                .fetch_reachable_page(current, self.snapshot.high_water_mark)?;
+            self.check_cancel()?;
             match page.page_type() {
                 Some(PageType::Leaf) => {
                     let cells = leaf_node::read_cells_checked(&page)
@@ -925,23 +953,8 @@ impl<'db> ReadTxn<'db> {
             }
         }?;
 
-        // The catalog proves the exact name exists. Only now is it safe to
-        // consult the hash-only slot cache; in Off mode this root/count can be
-        // newer than the descriptor. A legacy catalog with two live names for
-        // this hash remains ambiguous and is rejected by the lazy index.
-        if let Some((root, depth)) = self.snapshot.named_entry_root(name) {
-            self.manager
-                .reject_named_table_hash_collision(name, self.cancel.as_ref())?;
-            let Some(entry_count) = self.snapshot.named_entry_count(name) else {
-                return Err(Error::DatabaseCorrupted);
-            };
-            desc.root_page = root;
-            desc.depth = depth;
-            desc.entry_count = entry_count;
-        }
-
         self.check_cancel()?;
-        Ok(desc)
+        Ok(descriptor)
     }
 
     /// Search for a key in an arbitrary B+ tree starting at `root`.

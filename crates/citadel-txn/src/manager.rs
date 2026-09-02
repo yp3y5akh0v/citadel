@@ -26,7 +26,7 @@ use citadel_io::file_manager::{
 use citadel_io::traits::PageIO;
 use citadel_page::page::Page;
 
-use crate::catalog::TableDescriptor;
+use crate::catalog::{ResolvedCatalog, TableDescriptor};
 use crate::integrity::{self, IntegrityReport};
 use crate::pending_free;
 use crate::read_txn::ReadTxn;
@@ -349,6 +349,8 @@ const COMMIT_ARENA_PAGES: usize = 64;
 struct ManagerState {
     active_slot: usize,
     current_slot: Arc<CommitSlot>,
+    /// Replaced on every root transition, even when a physical root ID is reused.
+    resolved_catalog: Arc<ResolvedCatalog>,
     cached_god_byte: u8,
     cached_file_size: u64,
     /// Active readers keyed by SNAPSHOT txn id (not the reader's own id), so
@@ -474,6 +476,7 @@ impl TxnManager {
             state: Mutex::new(ManagerState {
                 active_slot,
                 current_slot: Arc::new(slot),
+                resolved_catalog: Arc::default(),
                 cached_god_byte: active_slot as u8 & GOD_BIT_ACTIVE_SLOT,
                 cached_file_size: file_size,
                 reader_table: BTreeMap::new(),
@@ -589,6 +592,7 @@ impl TxnManager {
             state: Mutex::new(ManagerState {
                 active_slot: 0,
                 current_slot: Arc::new(slot),
+                resolved_catalog: Arc::default(),
                 cached_god_byte: 0,
                 cached_file_size: file_size,
                 reader_table: BTreeMap::new(),
@@ -617,13 +621,14 @@ impl TxnManager {
         let mut state = self.state.lock();
         let txn_id = TxnId(self.next_txn_id.fetch_add(1, Ordering::SeqCst));
         let snapshot = state.current_slot.clone();
+        let resolved_catalog = Arc::clone(&state.resolved_catalog);
         let commit_generation = self.commit_generation.load(Ordering::Acquire);
 
         // Key by snapshot id (see reader_table): a reader beginning mid-write
         // gets an id above the writer's but a snapshot predating its commit.
         *state.reader_table.entry(snapshot.txn_id).or_insert(0) += 1;
 
-        ReadTxn::new(self, txn_id, snapshot, commit_generation)
+        ReadTxn::new(self, txn_id, snapshot, resolved_catalog, commit_generation)
     }
 
     pub fn commit_generation(&self) -> u64 {
@@ -1104,6 +1109,9 @@ impl TxnManager {
         let generation = {
             let mut state = self.state.lock();
             state.active_slot = inactive_slot_idx;
+            if new_slot.catalog_root != state.current_slot.catalog_root {
+                state.resolved_catalog = Arc::default();
+            }
             state.current_slot = Arc::new(new_slot);
             state.cached_god_byte = new_god_byte;
             state.cached_file_size = new_file_size;

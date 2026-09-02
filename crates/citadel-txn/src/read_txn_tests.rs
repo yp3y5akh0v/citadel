@@ -150,6 +150,158 @@ fn read_nonexistent_table() {
 }
 
 #[test]
+fn shared_catalog_keeps_off_mode_slot_overrides_snapshot_local() {
+    use crate::manager::tests::create_test_manager_with_sync;
+    use citadel_core::types::SyncMode;
+    use std::sync::Arc;
+
+    let mgr = create_test_manager_with_sync(SyncMode::Off);
+    let mut writer = mgr.begin_write().unwrap();
+    writer.create_table(b"items").unwrap();
+    writer.table_insert(b"items", b"key", b"old").unwrap();
+    writer.commit().unwrap();
+    let mut old = mgr.begin_read();
+
+    let mut writer = mgr.begin_write().unwrap();
+    writer.table_insert(b"items", b"key", b"new").unwrap();
+    writer.table_insert(b"items", b"extra", b"row").unwrap();
+    writer.commit().unwrap();
+    let mut new = mgr.begin_read();
+
+    assert_eq!(old.snapshot.catalog_root, new.snapshot.catalog_root);
+    assert!(Arc::ptr_eq(&old.resolved_catalog, &new.resolved_catalog));
+    assert_ne!(
+        old.snapshot.named_entry_root(b"items"),
+        new.snapshot.named_entry_root(b"items")
+    );
+    assert_eq!(
+        new.table_get(b"items", b"key").unwrap(),
+        Some(b"new".to_vec())
+    );
+    assert_eq!(new.table_entry_count(b"items").unwrap(), 2);
+    assert_eq!(
+        old.table_get(b"items", b"key").unwrap(),
+        Some(b"old".to_vec())
+    );
+    assert_eq!(old.table_entry_count(b"items").unwrap(), 1);
+    assert_eq!(old.table_get(b"items", b"extra").unwrap(), None);
+}
+
+#[test]
+fn catalog_cache_generations_isolate_rename_drop_and_recreate() {
+    use citadel_core::Error;
+    use std::sync::Arc;
+
+    let mgr = create_test_manager();
+    let mut writer = mgr.begin_write().unwrap();
+    writer.create_table(b"alpha").unwrap();
+    writer.table_insert(b"alpha", b"key", b"old").unwrap();
+    writer.commit().unwrap();
+    let mut original = mgr.begin_read();
+    assert_eq!(original.table_entry_count(b"alpha").unwrap(), 1);
+
+    let mut writer = mgr.begin_write().unwrap();
+    writer.rename_table(b"alpha", b"beta").unwrap();
+    writer.commit().unwrap();
+    let mut renamed = mgr.begin_read();
+    assert!(!Arc::ptr_eq(
+        &original.resolved_catalog,
+        &renamed.resolved_catalog
+    ));
+    assert_eq!(renamed.table_entry_count(b"beta").unwrap(), 1);
+    assert!(matches!(renamed.table_root_page(b"alpha"), Ok(None)));
+
+    let mut writer = mgr.begin_write().unwrap();
+    writer.drop_table(b"beta").unwrap();
+    writer.create_table(b"alpha").unwrap();
+    writer.table_insert(b"alpha", b"key", b"new").unwrap();
+    writer.commit().unwrap();
+    let mut recreated = mgr.begin_read();
+    assert!(!Arc::ptr_eq(
+        &renamed.resolved_catalog,
+        &recreated.resolved_catalog
+    ));
+    assert_eq!(
+        recreated.table_get(b"alpha", b"key").unwrap(),
+        Some(b"new".to_vec())
+    );
+    assert!(matches!(
+        recreated.table_get(b"beta", b"key"),
+        Err(Error::TableNotFound(_))
+    ));
+    assert_eq!(
+        original.table_get(b"alpha", b"key").unwrap(),
+        Some(b"old".to_vec())
+    );
+    assert_eq!(
+        renamed.table_get(b"beta", b"key").unwrap(),
+        Some(b"old".to_vec())
+    );
+}
+
+#[test]
+fn recycled_catalog_root_gets_a_new_resolution_cache() {
+    use citadel_core::Error;
+    use rustc_hash::FxHashMap;
+    use std::sync::Arc;
+
+    let mgr = create_test_manager();
+    let mut name = b"generation_0".to_vec();
+    let mut writer = mgr.begin_write().unwrap();
+    writer.create_table(&name).unwrap();
+    writer.commit().unwrap();
+
+    let mut seen = FxHashMap::<_, (Vec<u8>, _)>::default();
+    for generation in 1..=128 {
+        let mut reader = mgr.begin_read();
+        assert_eq!(reader.table_entry_count(&name).unwrap(), 0);
+        let root = reader.snapshot.catalog_root;
+        if let Some((previous_name, previous_cache)) = seen.get(&root) {
+            assert!(!Arc::ptr_eq(previous_cache, &reader.resolved_catalog));
+            assert!(matches!(
+                reader.table_get(previous_name, b"key"),
+                Err(Error::TableNotFound(_))
+            ));
+            return;
+        }
+        seen.insert(root, (name.clone(), Arc::clone(&reader.resolved_catalog)));
+        drop(reader);
+
+        let next_name = format!("generation_{generation}").into_bytes();
+        let mut writer = mgr.begin_write().unwrap();
+        writer.rename_table(&name, &next_name).unwrap();
+        writer.commit().unwrap();
+        name = next_name;
+    }
+    panic!("fixture did not recycle a catalog root");
+}
+
+#[test]
+fn shared_catalog_cache_hits_remain_cancellable() {
+    use citadel_core::{CancelToken, Error};
+
+    let mgr = create_test_manager();
+    let mut writer = mgr.begin_write().unwrap();
+    writer.create_table(b"items").unwrap();
+    writer.commit().unwrap();
+    assert_eq!(mgr.begin_read().table_entry_count(b"items").unwrap(), 0);
+
+    let token = CancelToken::new();
+    token.cancel();
+    let mut cancelled = mgr.begin_read();
+    cancelled.set_cancel(Some(token));
+    assert!(matches!(
+        cancelled.table_root_page(b"items"),
+        Err(Error::Interrupted)
+    ));
+    assert!(matches!(
+        cancelled.table_entry_count(b"items"),
+        Err(Error::Interrupted)
+    ));
+    assert_eq!(mgr.begin_read().table_entry_count(b"items").unwrap(), 0);
+}
+
+#[test]
 fn list_tables_uses_one_catalog_snapshot() {
     let mgr = create_test_manager();
 
