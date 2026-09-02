@@ -1,54 +1,77 @@
 # citadeldb-studio
 
 Native desktop client for [CitadelDB](https://github.com/yp3y5akh0v/citadel). Browse an
-encrypted vault, run SQL, inspect stored vectors, and distinguish authenticated data from
-views that carry no per-row proof.
+encrypted vault, run SQL, inspect stored vectors, and verify or erase memory atoms.
+Studio uses the database, SQL, and memory engines locally; no server or embedding model
+is required.
 
 <img src="docs/demo.gif" width="860"
      alt="Opening the disposable demo, authenticating visible memory rows, running SQL, and inspecting stored vectors">
 
-Stored-data views clearly show verification status and scope, including how many visible
-items were checked.
+Stored-data views show verification status and scope, including how many visible items
+were checked. SQL results and vector plots carry no per-atom attestation.
 
-## Quick start
+## Install and run
 
+Studio is packaged as an AppImage for Linux x86_64, a DMG for macOS Intel or Apple Silicon,
+and an MSI for Windows x86_64. See [downloads](https://citadeldb.dev/download/) and the
+[installation notes](../../packaging/README.md). Studio is not published to crates.io.
+
+To build from this repository, use Rust 1.95 or later:
+
+```sh
+cargo run --locked -p citadeldb-studio
 ```
-cargo run -p citadeldb-studio
-```
 
-Opens on Home. `Open disposable demo` needs no file and no passphrase, and is the fastest
-way to see everything below. Its encrypted working copy is real, but every change is
-discarded when the demo closes. Vaults you create or open keep their changes normally.
+Linux builds also need the desktop libraries listed in
+[the build dependency setup](../../.github/actions/studio-deps/action.yml). Studio is
+excluded from the default workspace build and must be selected explicitly.
+
+On Home, create a vault, open an existing vault, or select `Open disposable demo`.
+The demo needs no file or passphrase and discards its temporary encrypted vault when
+closed. Changes to other vaults persist normally. Close a vault in other Citadel
+processes before opening it in Studio; the database uses an exclusive file lock.
+
+## Memory and security
+
+Browse memory regions and atoms, verify visible atoms from storage, and forget selected
+atoms. Verification is limited to the checked atoms, not the whole region. Encrypted
+regions support per-atom attestation and cryptographic erasure; plaintext regions do not.
+Studio preserves immutable atoms and displays erasure receipts for the current session.
+
+The security view shows cipher and key-derivation settings, audit-chain status when
+available, full-vault integrity checks, and passphrase changes.
 
 ## SQL
 
-Syntax highlighting, wrap-aware line numbers, and results carrying the plan that produced
-them. `Explain` plans without execution, while `Analyze (runs)` executes the statement
-and reports actual time plus scanned and emitted rows. `Format` preserves leading
-comments and hints, and refuses inline comments it cannot restore exactly. Vector cells
-render as a summarisation line over a magnitude strip, so two embeddings in adjacent rows
-are comparable without reading a digit.
+The SQL editor supports syntax highlighting, formatting, multi-statement scripts, and
+query plans. `Explain` plans without execution; `Analyze (runs)` executes the statement
+and reports actual time plus scanned and emitted rows. The result grid retains up to
+2,000 rows per statement. A script stops at its first error; earlier committed changes
+remain.
+
+SQLite schema import opens the source read-only and translates column types and primary
+keys into table definitions. Every source table must have a primary key. It does not
+copy rows or translate defaults, other constraints, indexes, triggers, or views.
 
 ## Vectors
 
 Pan, zoom and pick a bounded sample of a vector column. The plot maps the first two stored
 dimensions and normalizes each independently over that sample; it is not dimensionality
-reduction, and screen distance is not index distance. A compute shader accumulates
-subpixel-aware radial coverage, so sparse points remain legible and overlap stays
-order-independent. If different evidence states share a pixel, the worst state wins.
+reduction, and screen distance is not index distance.
 
 ## Tests
 
-```
-cargo test -p citadeldb-studio
+```sh
+cargo test --locked -p citadeldb-studio
 ```
 
-Drives the application headless through `egui_kittest` on a real wgpu device using the
-same `Studio::wire` path as the window. Screen renders are written to
-`target/studio-shots/` and asserted non-blank.
+The headless application tests use `egui_kittest` with a wgpu device, write screen renders
+to `target/studio-shots/`, and check that they are non-blank. A compatible hardware or
+software GPU driver is required.
 
-`docs/` holds the demo above, re-recorded by `scripts/studio-demo.sh`, and the three
-stills the Linux package's AppStream metadata points at.
+`docs/` contains the demo recording and memory, SQL, and vector screenshots. Regenerate
+the recording with [studio-demo.sh](../../scripts/studio-demo.sh).
 
 ## License
 

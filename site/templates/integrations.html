@@ -1,0 +1,68 @@
+{% extends "base.html" %}
+
+{% block title %}Integrations - Citadel{% endblock %}
+{% block description %}Encrypted storage and memory adapters for LangGraph, CrewAI, LangChain, LlamaIndex, Haystack, OpenAI Agents, Google ADK, Microsoft Agent Framework, and Strands Agents.{% endblock %}
+
+{% block content %}
+{% set adapters = config.extra.adapters %}
+<div class="shell">
+  <section class="dl-hero">
+    <div>
+      <div class="kicker">Integrations / Citadel 2.2</div>
+      <h1>Encrypted memory for <em>your framework</em>.</h1>
+      <p class="sub">Framework-specific adapters for storage, sessions, and retrieval. Each requires an explicit embedder; search behavior and filters follow the adapter's interface.</p>
+    </div>
+    <aside class="card">
+      <div class="row"><span class="k">frameworks</span><span class="v">{{ adapters | length }}</span></div>
+      <div class="row"><span class="k">2.2 core requirement</span><span class="v">citadeldb &gt;=2.2,&lt;3</span></div>
+      <div class="row"><span class="k">embedder</span><span class="v">explicitly supplied</span></div>
+      <div class="row"><span class="k">storage</span><span class="v">encrypted at rest</span></div>
+    </aside>
+  </section>
+
+  <section class="block">
+    <div class="sec-head">
+      <div class="eyebrow">Agent frameworks</div>
+      <h2>Choose an adapter.</h2>
+      <p>Setup examples and supported operations are documented per package. The 2.2 APIs are available in the source tree; PyPI lists published versions.</p>
+    </div>
+    <div class="bindings">
+      {% for adapter in adapters %}
+      <div class="binding">
+        <div class="top"><h4>{{ adapter[0] }}</h4><span class="ver">{{ adapter[1] }}</span></div>
+        <p>{{ adapter[3] }}</p>
+        <p><a href="{{ config.extra.github }}/tree/HEAD/packaging/citadeldb-{{ adapter[2] }}">Setup and API</a> · <a href="https://pypi.org/project/citadeldb-{{ adapter[2] }}/">PyPI versions</a></p>
+        <div class="inst">pip install citadeldb-{{ adapter[2] }}</div>
+      </div>
+      {% endfor %}
+    </div>
+  </section>
+
+  <section class="block">
+    <div class="sec-head">
+      <div class="eyebrow">Embedding and storage</div>
+      <h2>Use a semantic embedder.</h2>
+      <p>The default Python wheel accepts user-supplied embeddings. A custom backend provides <code>dim</code>, <code>metric</code>, <code>model_id</code>, and <code>embed_with_cancel(texts, cancel_token)</code>. Check cancellation between bounded batches.</p>
+    </div>
+    <p class="dl-note">The <a href="{{ config.extra.github }}/tree/HEAD/python#semantic-embeddings">Python guide</a> includes a complete semantic-memory example. Framework-native embedding interfaces are supported where documented by the adapter. Candle and cross-encoder classes require a Python source build with <code>candle-embed</code>.</p>
+    <p class="dl-note">Adapters can share a database on the same thread with compatible open options. Use separate adapter-owned regions; see the <a href="{{ config.extra.github }}/tree/HEAD/packaging#sharing-one-database">shared-database guide</a>. Cryptographic forgetting affects the active vault's keys, not external backups, replicas, or physical-media copies.</p>
+  </section>
+
+  <section class="block" id="mcp">
+    <div class="sec-head">
+      <div class="eyebrow">Model Context Protocol</div>
+      <h2>Connect an MCP client.</h2>
+      <p>The standalone server includes local Candle models and runs over stdio. Supply a vault path, passphrase, and embedder. A cross-encoder reranker is optional.</p>
+    </div>
+    <div class="int-code">
+      <pre><code>uvx citadeldb-mcp pull e5-large
+uvx citadeldb-mcp pull ms-marco-minilm</code></pre>
+    </div>
+    <p class="dl-note">Model pulls do not need a vault key. Before serving, set <code>CITADEL_KEY</code> to the vault passphrase: <code>export CITADEL_KEY="your-passphrase"</code> on macOS/Linux, or <code>$env:CITADEL_KEY = "your-passphrase"</code> in PowerShell.</p>
+    <div class="int-code">
+      <pre><code>uvx citadeldb-mcp --db memory.cdl --embedder e5-large --reranker ms-marco-minilm</code></pre>
+    </div>
+    <p class="dl-note">For a desktop MCP client, use an absolute database path and set <code>CITADEL_KEY</code> in its server environment. See the <a href="{{ config.extra.github }}/tree/HEAD/crates/citadel-mcp#install">client configuration</a>. Managed downloads are pinned and verified; user-supplied model directories are outside managed-cache validation.</p>
+  </section>
+</div>
+{% endblock %}

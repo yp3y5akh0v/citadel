@@ -1,15 +1,17 @@
 # citadeldb-strands-agents
 
 A [Strands Agents](https://strandsagents.com/) session manager backed by
-[Citadel](https://citadeldb.dev). Encrypted at rest, embedded in your process, and
-redaction that removes the redacted content rather than annotating it.
+[Citadel](https://citadeldb.dev). Encrypted at rest and embedded in your process.
 
 ```
 pip install citadeldb-strands-agents
 ```
 
-Requires `strands-agents>=1.15,<2`; 1.15 is the first release carrying the
-multi-agent session API implemented by this manager.
+Requires `citadeldb>=2.2,<3` and `strands-agents>=1.15,<2`.
+
+The manager reads sessions by key; it has no semantic-recall method. This example
+uses local e5-large and requires the [Candle source build and model setup](https://github.com/yp3y5akh0v/citadel/blob/HEAD/python/README.md#local-candle-models).
+The default wheel accepts a [bring-your-own semantic embedder](https://github.com/yp3y5akh0v/citadel/blob/HEAD/python/README.md#semantic-embeddings).
 
 ```python
 import citadeldb
@@ -20,39 +22,20 @@ sessions = CitadelSessionManager(
     "user-123",
     "sessions.cdl",
     key="your-passphrase",
-    # Required, and no default. This manager reads sessions by key and exposes
-    # no semantic-recall operation, so an explicit mock avoids unused model work.
-    embedder=citadeldb.MockEmbedder(dim=64),
+    embedder=citadeldb.CandleEmbedder("/path/to/e5-large", preset="e5-large"),
 )
 agent = Agent(session_manager=sessions)
 ```
 
-Built the way the shipped managers are: it implements `SessionRepository` and inherits
-`RepositorySessionManager`, exactly as `FileSessionManager` and `S3SessionManager` do.
+Implements `SessionRepository` and inherits `RepositorySessionManager`.
 
-## Redaction actually redacts
+## Redaction
 
-Strands redacts by setting a `redact_message` field beside the original and updating the
-record:
+For a valid `redact_message`, the adapter destroys the original record's key
+and stores the redaction as the replacement message. Ordinary updates store the
+supplied message.
 
-```python
-# from strands RepositorySessionManager.redact_latest_message
-latest_agent_message.redact_message = redact_message
-return self.session_repository.update_message(...)
-```
-
-The original `message` stays in the record. Strands reads a redacted message through
-`to_message()`, which returns the redaction, so the original is never read again. This
-manager therefore does not keep it: the superseded record's key is destroyed and the
-replacement carries the redaction in place of the original.
-
-```python
-after = sessions.read_message("user-123", agent.agent_id, 0)
-after.to_message()  # {'content': [{'text': '[REDACTED]'}], 'role': 'user'}
-after.message  # the redaction, not the original
-```
-
-An ordinary update is unaffected: only a message carrying a redaction drops its original.
+Redactions must include `role` and `content`; `{}` is not a valid message.
 
 ## Erasure
 
@@ -62,6 +45,8 @@ sessions.forget_session("user-123")  # returns the number of records erased
 
 Strands has no delete in its repository protocol. This destroys the session, its agents
 and every message key.
+Pre-erasure backups or snapshots containing keys, and exported plaintext, are outside
+that erasure.
 
 ## Notes
 
@@ -71,6 +56,10 @@ earlier turn does not move it to the end of the history.
 Citadel is embedded and one process owns the file. A path already open on this thread,
 under the same passphrase, is shared, so many sessions and other Citadel adapters can share
 one database; construct them on the same thread.
+
+`embedder=` is required. Custom embedders expose `dim`, `metric`, `model_id`, and
+`embed_with_cancel(texts, cancel_token)`. Accept `None` as the token; otherwise poll
+`cancel_token.check()` between bounded batches.
 
 ## License
 

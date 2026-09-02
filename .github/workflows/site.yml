@@ -1,0 +1,35 @@
+name: Website checks
+
+on:
+  pull_request:
+    branches: [master]
+    paths: ['site/**', '.github/workflows/site.yml', '.github/workflows/deploy-site.yml']
+  push:
+    branches: [master]
+    paths: ['site/**', '.github/workflows/site.yml', '.github/workflows/deploy-site.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Resolve published downloads
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node site/scripts/release.cjs
+      - name: Install Zola
+        run: |
+          ARCHIVE="$RUNNER_TEMP/zola.tar.gz"
+          curl --fail --silent --show-error --location -o "$ARCHIVE" \
+            https://github.com/getzola/zola/releases/download/v0.22.1/zola-v0.22.1-x86_64-unknown-linux-gnu.tar.gz
+          echo "0ca09aa40376aaa9ddfb512ff9ad963262ef95edb0d0f2d5ec6961b6f5cf22ef  $ARCHIVE" \
+            | sha256sum -c -
+          tar -xzf "$ARCHIVE" -C /usr/local/bin zola
+      - name: Check and build site
+        run: |
+          node --test site/tests/*.test.cjs
+          zola --root site check --skip-external-links
+          zola --root site build

@@ -1,0 +1,138 @@
+{% extends "base.html" %}
+
+{% block title %}Download - Citadel{% endblock %}
+{% block description %}Download Citadel {{ release.version }} for Windows, macOS, and Linux. CLI and C/C++ archives, language bindings, and Citadel Studio.{% endblock %}
+
+{% block content %}
+<div class="shell">
+  <section class="dl-hero">
+    <div>
+      <div class="kicker">Download / {{ release.tag }}</div>
+      <h1>Run <em>Citadel</em>.</h1>
+      <p class="sub">An encrypted database and memory engine for Windows, macOS, and Linux. Choose a CLI archive, a language binding, or the Studio desktop client.</p>
+    </div>
+    <aside class="card">
+      <div class="row"><span class="k">published release</span><span class="v"><a href="{{ release.url }}">{{ release.tag }}</a></span></div>
+      <div class="row"><span class="k">license</span><span class="v">Apache-2.0</span></div>
+      <div class="row"><span class="k">Rust</span><span class="v">{{ config.extra.msrv }}+</span></div>
+      <div class="row"><span class="k">archive checksums</span><span class="v">SHA-256</span></div>
+    </aside>
+  </section>
+
+  <section class="block" id="studio">
+    <div class="sec-head">
+      <div class="eyebrow">Desktop</div>
+      <h2>Citadel Studio.</h2>
+      <p>Open and create encrypted vaults, browse tables and stored memory, run SQL with EXPLAIN and ANALYZE, inspect vectors, and verify integrity.</p>
+    </div>
+    <div class="bindings">
+      <div class="binding">
+        <div class="top"><h4>Windows</h4><span class="ver">x86_64 / MSI</span></div>
+        <p>Per-user installation with Start menu and uninstall entries. The unsigned installer can show an Unknown Publisher or SmartScreen warning.</p>
+        {% if release.studio %}
+        <p><a class="btn sm" href="{{ release.studio.windows.url }}">Download MSI</a> <a href="{{ release.studio.windows.checksum.url }}">SHA-256</a></p>
+        {% endif %}
+      </div>
+      <div class="binding">
+        <div class="top"><h4>macOS</h4><span class="ver">Apple Silicon + Intel / DMG</span></div>
+        <p>Separate builds for each architecture. The app is ad-hoc signed, not Developer ID signed or notarized; Gatekeeper can block opening it.</p>
+        {% if release.studio %}
+        <p><a class="btn sm" href="{{ release.studio.macos_arm64.url }}">Apple Silicon DMG</a> <a href="{{ release.studio.macos_arm64.checksum.url }}">SHA-256</a></p>
+        <p><a class="btn sm" href="{{ release.studio.macos_x86_64.url }}">Intel DMG</a> <a href="{{ release.studio.macos_x86_64.checksum.url }}">SHA-256</a></p>
+        {% endif %}
+      </div>
+      <div class="binding">
+        <div class="top"><h4>Linux</h4><span class="ver">x86_64 / AppImage</span></div>
+        <p>A portable desktop app. Mark the AppImage executable before launching; systems without FUSE can use AppImage extraction.</p>
+        {% if release.studio %}
+        <p><a class="btn sm" href="{{ release.studio.linux.url }}">Download AppImage</a> <a href="{{ release.studio.linux.checksum.url }}">SHA-256</a></p>
+        {% endif %}
+      </div>
+    </div>
+    {% if not release.studio %}
+    <p class="dl-note">Studio installers are not included in {{ release.tag }}. See the <a href="{{ config.extra.github }}/tree/HEAD/crates/citadel-studio#install-and-run">source-build instructions</a>.</p>
+    {% endif %}
+    <p class="dl-note">Studio opens on Home; choose Open disposable demo to explore without keeping a vault.</p>
+  </section>
+
+  <section class="block" id="archives">
+    <div class="sec-head">
+      <div class="eyebrow">Native packages</div>
+      <h2>CLI and C/C++ libraries.</h2>
+      <p>The CLI provides SQL, tab completion, backups, integrity checks, and sync. C/C++ archives include the generated header and native libraries.</p>
+    </div>
+    <div class="dl-table-wrap">
+      <table class="dl-table">
+        <caption class="sr-only">Citadel {{ release.version }} native packages</caption>
+        <thead><tr><th scope="col">Platform</th><th scope="col">CLI</th><th scope="col">C/C++</th><th scope="col">FIPS-oriented at-rest profile</th></tr></thead>
+        <tbody>
+          {% for target in release.native %}
+          <tr>
+            <th scope="row">{{ target.platform }}</th>
+            <td><a href="{{ target.cli.url }}">{{ target.extension }}</a></td>
+            <td><a href="{{ target.ffi.url }}">{{ target.extension }}</a></td>
+            <td><a href="{{ target.cli_fips.url }}">CLI</a> / <a href="{{ target.ffi_fips.url }}">C/C++</a></td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <p class="dl-note">Linux x86_64 CLI archives use musl; C/C++ archives use glibc. The FIPS-oriented profile uses PBKDF2-HMAC-SHA256 with AES-256-CTR for storage. Citadel is not a FIPS-validated cryptographic module or product.</p>
+  </section>
+
+  <section class="block">
+    <div class="sec-head"><div class="eyebrow">Libraries</div><h2>Add Citadel to a project.</h2></div>
+    <div class="bindings">
+      <div class="binding">
+        <div class="top"><h4>Rust</h4><span class="ver">crates.io</span></div>
+        <p>The database API and SQL frontend. Add <code>citadeldb-mem</code> for semantic memory.</p>
+        <div class="inst"><span class="prompt">$</span> cargo add citadeldb citadeldb-sql</div>
+      </div>
+      <div class="binding">
+        <div class="top"><h4>Python</h4><span class="ver">PyPI / citadeldb</span></div>
+        <p>SQL, vector search, memory, and type stubs. The default wheel uses a user-supplied embedder; <a href="{{ config.extra.github }}/tree/HEAD/python">see Python setup</a>.</p>
+        <div class="inst"><span class="prompt">$</span> pip install citadeldb</div>
+      </div>
+      <div class="binding">
+        <div class="top"><h4>WebAssembly</h4><span class="ver">npm / @citadeldb/wasm</span></div>
+        <p>The encrypted in-memory database used by the <a href="{{ get_url(path='@/demo/_index.md') }}">SQL playground</a>.</p>
+        <div class="inst"><span class="prompt">$</span> npm install @citadeldb/wasm</div>
+      </div>
+      <div class="binding">
+        <div class="top"><h4>C / C++</h4><span class="ver">citadel.h</span></div>
+        <p>A panic-safe C ABI with static and dynamic libraries. Choose an archive in the <a href="#archives">native packages table</a>.</p>
+        <div class="inst">#include &lt;citadel.h&gt;</div>
+      </div>
+      <div class="binding">
+        <div class="top"><h4>MCP server</h4><span class="ver">PyPI / citadeldb-mcp</span></div>
+        <p>A separate executable with local Candle models. <a href="{{ get_url(path='@/integrations/_index.md') }}#mcp">Configure a vault and embedder</a> before serving.</p>
+        <div class="inst"><span class="prompt">$</span> pip install citadeldb-mcp</div>
+      </div>
+      <div class="binding">
+        <div class="top"><h4>CLI from source</h4><span class="ver">Rust {{ config.extra.msrv }}+</span></div>
+        <p>Build and install the SQL shell with Cargo.</p>
+        <div class="inst"><span class="prompt">$</span> cargo install citadeldb-cli</div>
+      </div>
+    </div>
+  </section>
+
+  <section class="block">
+    <div class="sec-head">
+      <div class="eyebrow">Verification</div>
+      <h2>Check the download.</h2>
+      <p>Download the matching <code>.sha256</code> sidecar from the <a href="{{ release.url }}">release assets</a> into the same directory as the archive. A checksum checks file integrity, not publisher identity.</p>
+    </div>
+    <div class="dl-verify">
+      <div>
+        <h4>Linux</h4>
+        <div class="inst">sha256sum -c {{ release.native[0].cli.checksum.name }}</div>
+      </div>
+      <div>
+        <h4>macOS</h4>
+        <div class="inst">shasum -a 256 -c {{ release.native[2].cli.checksum.name }}</div>
+      </div>
+    </div>
+    <p class="dl-note">On Windows, compare <code>Get-FileHash -Algorithm SHA256 &lt;archive&gt;</code> with the sidecar. For packages with GitHub build attestations, verify them with <code>gh attestation verify &lt;archive&gt; --repo yp3y5akh0v/citadel</code>.</p>
+  </section>
+</div>
+{% endblock %}

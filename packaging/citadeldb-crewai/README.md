@@ -8,19 +8,23 @@ just its row.
 pip install citadeldb-crewai
 ```
 
-Requires `crewai>=1.14.7,<2`. CrewAI 1.14.7 is the first stable release with
-both the storage-backend protocol and the storage-factory hook used by this adapter.
+Requires `citadeldb>=2.2,<3` and `crewai>=1.14.7,<2`.
 
-Route your crews' memory through Citadel in one call at startup:
+Provide a cancellation-aware embedder for the same model CrewAI uses. The
+[Python semantic-embedder example](https://github.com/yp3y5akh0v/citadel/blob/HEAD/python/README.md#semantic-embeddings) shows
+the required protocol. In the examples below, `my_embeddings` is your application
+module exporting that configured `embedder`; it is not part of this package.
+
+Route CrewAI's default memory backend through Citadel at startup:
 
 ```python
 from citadeldb_crewai import use_citadel
+from my_embeddings import embedder
 
-embedder = MyEmbedder()  # see the embedder contract below
 use_citadel("crew_memory.cdl", key="your-passphrase", embedder=embedder)
 ```
 
-Crews then work unchanged:
+Enable memory on the crew:
 
 ```python
 from crewai import Crew
@@ -28,11 +32,8 @@ from crewai import Crew
 crew = Crew(agents=[...], tasks=[...], memory=True)
 ```
 
-A crew naming a backend Citadel does not claim keeps it, so this will not displace a
-deliberate `storage="qdrant-edge"` or a LanceDB path. `"lancedb"` is CrewAI's default spec
-and is claimed, so a crew naming it explicitly still routes here. Crews may also name
-Citadel outright once `use_citadel` has run:
-`Memory(storage="citadel")`.
+`use_citadel` handles CrewAI's default storage, `storage="lancedb"`, and
+`storage="citadel"`. Other backend names and LanceDB paths are left unchanged.
 
 To route one crew instead of the whole process, hand the backend over directly and skip the
 startup call:
@@ -46,7 +47,7 @@ backend = CitadelBackend("crew_memory.cdl", key="your-passphrase", embedder=embe
 crew = Crew(agents=[...], tasks=[...], memory=Memory(storage=backend))
 ```
 
-## Or drive the backend directly
+## Direct use
 
 ```python
 from citadeldb_crewai import CitadelBackend
@@ -66,7 +67,8 @@ backend.save(
     ]
 )
 
-query_embedding = [0.0] * 1536  # whatever your crew embedded the query with
+embed_query = getattr(embedder, "embed_queries_with_cancel", embedder.embed_with_cancel)
+query_embedding = embed_query(["Why did the release break?"], None)[0]
 hits = backend.search(query_embedding, scope_prefix="/team", limit=5)
 for record, score in hits:
     print(f"{score:.3f}  {record.content}")
@@ -91,10 +93,11 @@ backend.reset("/users/alice")  # a whole subtree
 
 `reset` on a per-user scope destroys the key of every record in that subtree.
 
-## Importance is a real ranking signal
+## Importance
 
-`MemoryRecord.importance` maps onto Citadel's native atom importance, so it survives as something
-recall ranks by rather than as metadata the store carries and ignores.
+`MemoryRecord.importance` is retained in the record. Backend `search` returns
+vector similarity; CrewAI applies its composite
+scoring, including importance, after the storage call.
 
 ## Notes
 
@@ -105,24 +108,17 @@ Citadel is embedded and one process owns the file. A path already open on this t
 under the same passphrase, is shared, so this can sit on the same database as another
 Citadel adapter; construct them on the same thread.
 
-Your crew's own embeddings are stored as-is, so recall runs in the same vector space the crew
-queries with. A record that arrives without a vector is embedded by the required model instead
-of receiving a placeholder. A record read back carries no embedding, which is what
-`Memory.update()` saves after editing a field, so an update that leaves the content alone keeps
-the stored vector rather than replacing it.
+Supplied vectors are stored as-is. Records without a vector are embedded by the
+configured model. An update without a supplied vector preserves the stored vector
+when the text is unchanged.
 
 The embedder must expose `dim`, `metric`, and `model_id`, plus
 `embed_with_cancel(list[str], cancel_token) -> list[list[float]]`; asymmetric models may
-also provide `embed_queries_with_cancel`. Poll `cancel_token.check()` between bounded
-batches. Pass the same model (or a thin adapter over it) to CrewAI and Citadel so supplied
+also provide `embed_queries_with_cancel`. Accept `None` as the token; otherwise poll
+`cancel_token.check()` between bounded batches. Pass the same model to CrewAI and Citadel so supplied
 and generated vectors share one space.
-A cosine metric is required because CrewAI's storage contract exposes normalized similarity
-scores; L2 and inner-product distances have no equivalent bounded score without inventing a
-model-specific calibration.
-A region is pinned to that model identity and width, so switching models requires an explicit
-re-embed or a new region.
-
-A missing `embedder=` is an error; the adapter never substitutes a mock model.
+A cosine metric is required. Regions persist the model identity and dimension;
+switching models requires re-embedding or a new region.
 
 ## License
 

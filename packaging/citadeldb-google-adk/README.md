@@ -8,9 +8,12 @@ that destroy the key, not just the row.
 pip install citadeldb-google-adk
 ```
 
+Requires `citadeldb>=2.2,<3` and `google-adk>=2.0,<3`.
+
 The semantic example uses a local e5-large model. `CandleEmbedder` requires a
-`citadeldb` source wheel built with `--features candle-embed`; the default wheel accepts
-an equivalent real bring-your-own embedder.
+[Candle source build and model setup](https://github.com/yp3y5akh0v/citadel/blob/HEAD/python/README.md#local-candle-models);
+the default wheel accepts a [bring-your-own semantic embedder](https://github.com/yp3y5akh0v/citadel/blob/HEAD/python/README.md#semantic-embeddings)
+instead.
 
 ```python
 import citadeldb
@@ -31,21 +34,17 @@ runner = Runner(
 )
 ```
 
-## Search is ranked recall, not word matching
+## Search
 
-ADK hands the service a query string, so Citadel embeds it and runs hybrid recall: vector
-distance, keyword rank and recency, fused into one score. The reference
-`InMemoryMemoryService` returns only turns sharing a word with the query; nothing here is
-dropped for lacking one. With e5-large, differently worded questions and memories can
-still match:
+Search combines vector similarity, keyword rank, recency, and importance:
 
 ```python
 await memory.add_session_to_memory(session)  # a Session your Runner already ran
 
-await memory.search_memory(
+result = await memory.search_memory(
     app_name="my_app", user_id="alice", query="why did the release break?"
 )
-# SearchMemoryResponse(memories=[MemoryEntry(...disk was full...)])
+print(result)
 ```
 
 ## Deletes destroy the key
@@ -59,12 +58,9 @@ memory.forget_user("my_app", "alice")  # returns the number erased
 memory.forget_session("my_app", "alice", "s-42")
 ```
 
-ADK's own memory services expose no erasure method.
+## Direct writes
 
-## Direct writes are supported
-
-`add_memory` writes memories without going through a session. The reference
-`InMemoryMemoryService` raises `NotImplementedError` for it.
+`add_memory` writes memories without a session:
 
 ```python
 from google.adk.memory.memory_entry import MemoryEntry
@@ -74,25 +70,22 @@ entry = MemoryEntry(content=types.Content(parts=[types.Part(text="prefers dark m
 await memory.add_memory(app_name="my_app", user_id="alice", memories=[entry])
 ```
 
-`add_events_to_memory` likewise persists the events you pass rather than a whole session.
+`add_events_to_memory` stores text-bearing events without requiring a whole session.
 An event with an existing id replaces that event; anonymous events are always appended.
 
 ## Notes
 
-`add_session_to_memory` sets the session's events, as `InMemoryMemoryService` does:
-re-adding never duplicates rows, and an event dropped from the session is dropped from
-memory. `add_events_to_memory` is additive across ids, replacing an existing id rather
-than duplicating it.
+`add_session_to_memory` replaces the session's stored text-bearing events.
+`add_events_to_memory` adds new ids and replaces existing ids.
 
 Citadel is embedded and one process owns the file. A path already open on this thread,
 under the same passphrase, is shared, so this can sit on the same database as another
 Citadel adapter; construct them on the same thread.
 
-`embedder=` is required. There is no default: substituting a different model changes
-ranking semantics and persisted provenance. A bring-your-own object exposes `dim`,
+`embedder=` is required. A bring-your-own object exposes `dim`,
 `metric`, `model_id`, and `embed_with_cancel(texts, cancel_token)`; asymmetric models
-may also provide `embed_queries_with_cancel`. Use `MockEmbedder` only for a deliberate
-lexical-only test.
+may also provide `embed_queries_with_cancel`. Accept `None` as the cancellation token; otherwise poll
+`cancel_token.check()` between bounded batches.
 
 ## License
 

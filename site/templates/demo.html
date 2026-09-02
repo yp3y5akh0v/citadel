@@ -1,15 +1,15 @@
 {% extends "base.html" %}
 
 {% block title %}Playground - Citadel{% endblock %}
-{% block description %}Run real SQL against an encrypted Citadel database compiled to WebAssembly, right in your browser. No server, nothing leaves your machine.{% endblock %}
+{% block description %}Run SQL against an encrypted Citadel database compiled to WebAssembly. SQL and database contents stay in your browser.{% endblock %}
 
 {% block content %}
-<main class="shell demo-wrap">
+<div class="shell demo-wrap">
   <div class="demo-head">
     <div>
-      <div class="eyebrow">Playground / runs in your browser</div>
+      <div class="eyebrow">Playground / {{ release.tag }} / runs in your browser</div>
       <h1>Explore SQL against a <span class="ac">sealed</span> database.</h1>
-      <p>A real Citadel database compiled to WebAssembly. Your SQL runs locally against an encrypted in-memory engine - no server, nothing leaves your machine.</p>
+      <p>Citadel compiled to WebAssembly. SQL and database contents stay in your browser, in an encrypted in-memory database. Reloading the page discards the data.</p>
     </div>
     <div class="demo-kpi">
       <div><b id="kpiTables">4</b>tables</div>
@@ -32,8 +32,8 @@
       </div>
       <div class="actions">
         <button id="runBtn" class="primary" title="Ctrl/Cmd+Enter" disabled>Run</button>
-        <button id="fmtBtn">Format</button>
-        <button id="resetBtn">Reset</button>
+        <button id="fmtBtn" title="Uppercase unquoted SQL keywords; preserve quoted text, comments, and spacing">Format</button>
+        <button id="resetBtn">Reset SQL</button>
       </div>
       <div class="runtime">WASM / @citadeldb/wasm</div>
     </div>
@@ -114,17 +114,16 @@
 
   <div class="demo-status">
     <div><span class="lab">Runtime</span><span class="val"><em>WASM</em> / in-browser</span></div>
-    <div><span class="lab">On-disk</span><span class="val"><em>100%</em> ciphertext</span></div>
+    <div><span class="lab">Page payloads</span><span class="val"><em>AES-256-CTR</em></span></div>
     <div><span class="lab">Isolation</span><span class="val"><em>snapshot</em> (CoW B+tree)</span></div>
     <div><span class="lab">Session</span><span class="val" id="sessTime">00:00:00</span></div>
-    <div><span class="lab">Build</span><span class="val">v{{ config.extra.version }}</span></div>
   </div>
 
   <div class="explainers">
     <div class="explainer">
       <div class="num">01 / this is the real engine</div>
       <h4>Not a simulation.</h4>
-      <p>Citadel is compiled to WebAssembly and runs entirely in your tab via <code>@citadeldb/wasm</code>. Your SQL executes against a real encrypted in-memory database; nothing is sent anywhere.</p>
+      <p>Citadel runs in your tab via <code>@citadeldb/wasm</code>. Queries execute against the encrypted in-memory database without sending SQL or database contents to a server.</p>
     </div>
     <div class="explainer">
       <div class="num">02 / every page is 8,208 B</div>
@@ -137,7 +136,7 @@
       <p><code>cargo bench -p citadeldb-sql --bench h2h_bench</code> runs the {{ config.extra.benchmarks }} head-to-head benchmarks against unencrypted SQLite at equal cache budgets.</p>
     </div>
   </div>
-</main>
+</div>
 {% endblock %}
 
 {% block scripts %}

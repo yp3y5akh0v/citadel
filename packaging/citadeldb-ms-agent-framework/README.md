@@ -8,7 +8,9 @@ deletes that destroy the key, not just the row.
 pip install citadeldb-ms-agent-framework
 ```
 
-Two providers for two jobs, matching how the framework's own Redis integration is split:
+Requires `citadeldb>=2.2,<3` and `agent-framework-core>=1.13,<2`.
+
+The package provides two storage interfaces:
 
 | Class | Implements | Use when |
 |---|---|---|
@@ -16,9 +18,8 @@ Two providers for two jobs, matching how the framework's own Redis integration i
 | `CitadelContextProvider` | `ContextProvider` | an agent should recall relevant facts across sessions |
 
 The context provider performs semantic recall. This example uses local e5-large;
-`CandleEmbedder` requires a `citadeldb` source wheel built with
-`--features candle-embed`, while the default wheel accepts an equivalent real
-bring-your-own embedder.
+`CandleEmbedder` requires the [Candle source build and model setup](https://github.com/yp3y5akh0v/citadel/blob/HEAD/python/README.md#local-candle-models),
+while the default wheel accepts a [bring-your-own semantic embedder](https://github.com/yp3y5akh0v/citadel/blob/HEAD/python/README.md#semantic-embeddings).
 
 ```python
 from agent_framework import Agent
@@ -41,9 +42,6 @@ agent = Agent(
 Both can share one encrypted file: a path already open on this thread, under the same
 passphrase, is shared. Construct them on the same thread.
 
-These are the framework's own extension points, with the file encrypted and a key per
-message. The built-in `FileHistoryProvider` writes plaintext JSONL or MessagePack.
-
 ## Deletes destroy the key
 
 ```python
@@ -56,14 +54,14 @@ await history.forget("session-42")  # returns the number erased
 await memory.forget()  # this provider's whole scope
 ```
 
-Clearing a conversation destroys each message's own key and then deletes its row, so any
-ciphertext surviving elsewhere stays unreadable.
+Clearing a conversation destroys each message's own key and deletes its row.
+Pre-erasure backups or snapshots containing keys, and exported plaintext, are outside
+that erasure.
 
 ## History provider
 
-Implements `get_messages` and `save_messages`; the base class's `before_run`/`after_run`
-handle loading and storing according to its configuration flags, so an audit-only or
-evaluation-only provider works as documented:
+Implements `get_messages` and `save_messages`. Set `load_messages=False` to store
+messages without loading history before a run:
 
 ```python
 CitadelHistoryProvider(
@@ -79,10 +77,7 @@ multi-part contents and `additional_properties` all survive.
 
 ## Context provider
 
-Recalls with Citadel's hybrid search: vector distance, keyword rank and recency, fused
-into one score. `embedder=` is required and has no default: silent substitution would change
-ranking semantics and persist different provenance. Use `MockEmbedder` only for a deliberate
-lexical-only test or a history-only provider that never performs recall.
+Uses Citadel's hybrid recall. `embedder=` is required.
 
 ```python
 memory = CitadelContextProvider(
@@ -92,6 +87,11 @@ memory = CitadelContextProvider(
 
 Memories are scoped rather than session-bound, so a later conversation can recall an
 earlier one. `scope` is the boundary an erasure request applies to.
+
+Custom embedders expose `dim`, `metric`, `model_id`, and
+`embed_with_cancel(texts, cancel_token)`. Accept `None` as the token; otherwise poll
+`cancel_token.check()` between bounded batches. Asymmetric models may also provide
+`embed_queries_with_cancel`.
 
 ## License
 

@@ -71,6 +71,22 @@
   </div>
 </div>
 
+<section class="block shell" id="studio">
+  <div class="sec-head">
+    <div class="eyebrow">Desktop client</div>
+    <div class="studio-heading">
+      <img src="{{ get_url(path='studio/icon.svg') }}" alt="Citadel Studio logo" width="64" height="64">
+      <h2>Citadel Studio.</h2>
+    </div>
+    <p>A native client for Windows, macOS, and Linux. Open encrypted vaults, browse tables and stored memory, run SQL with EXPLAIN and ANALYZE, and inspect vectors and integrity results.</p>
+  </div>
+  <div class="hero-cta">
+    <a class="btn" href="{{ get_url(path='@/download/_index.md') }}#studio">Install and build options</a>
+    <a class="btn ghost" href="{{ config.extra.github }}/tree/HEAD/crates/citadel-studio">Studio guide</a>
+  </div>
+  <img class="studio-shot" src="{{ get_url(path='studio/memory.png') }}" alt="Citadel Studio showing stored memory and integrity results" loading="lazy">
+</section>
+
 <section class="block shell">
   <div class="sec-head">
     <div class="eyebrow">One substrate, two faces</div>
@@ -92,7 +108,7 @@
     <div class="pillar">
       <div class="tag">citadeldb / citadeldb-sql</div>
       <h3>Encrypted database</h3>
-      <p>A complete embedded SQL + key-value engine. ACID without a WAL, snapshot isolation, and a single self-contained file - faster than unencrypted SQLite at equal cache budgets.</p>
+      <p>An embedded SQL + key-value engine with snapshot isolation and shadow paging. Encrypted pages live in the database file; encryption keys live in a companion key file.</p>
       <ul>
         <li>SQL: FULL OUTER &amp; LATERAL joins, recursive CTEs, window functions, triggers, materialized views</li>
         <li>JSON / JSONB with 14 PostgreSQL operators, GIN indexes, full-text search</li>
@@ -149,12 +165,12 @@
     <div class="feat">
       <svg class="feat-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M7 3v18M3 7h18M3 12h18M3 17h18M12 3v18"/></svg>
       <h3>Three-tier key hierarchy</h3>
-      <p>Passphrase &rarr; Argon2id &rarr; Master Key &rarr; AES-KW &rarr; REK &rarr; HKDF &rarr; DEK + MAC. Instant rekey, no page re-encryption.</p>
+      <p>Passphrase &rarr; Argon2id &rarr; Master Key &rarr; AES-KW &rarr; REK &rarr; HKDF &rarr; DEK + MAC. Passphrase changes need no page re-encryption.</p>
     </div>
     <div class="feat">
       <svg class="feat-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="4" width="18" height="12" rx="1"/><path d="M8 20h8M12 16v4"/></svg>
       <h3>Cross-platform bindings</h3>
-      <p>Windows, Linux, macOS. Python, a panic-safe C FFI, and WebAssembly from one Rust core. An HMAC-SHA256 chain detects record edits and broken retained links; no external anti-rollback anchor.</p>
+      <p>Windows, Linux, macOS. Python, a panic-safe C FFI, and WebAssembly from one Rust core.</p>
     </div>
   </div>
 </section>
@@ -162,8 +178,8 @@
 <section class="block shell" id="quickstart">
   <div class="sec-head">
     <div class="eyebrow">Quickstart</div>
-    <h2>Open a database in six lines.</h2>
-    <p>The API is small on purpose. One builder, one connection, one passphrase.</p>
+    <h2>Open an encrypted database.</h2>
+    <p>Create a vault, connect to SQL, and run a query.</p>
   </div>
 
   <div class="qs">
@@ -172,7 +188,7 @@
         <div class="qs-step"><div class="n">1</div><div><h4>Add the crates</h4><p>Engine + SQL frontend from crates.io.</p></div></div>
         <div class="qs-step"><div class="n">2</div><div><h4>Open with a passphrase</h4><p>Argon2id derives the master key in memory. Keys live in <code>{dbname}.citadel-keys</code>, not inside the database.</p></div></div>
         <div class="qs-step"><div class="n">3</div><div><h4>Run SQL, or use the KV API</h4><p>Both are first class. Mix them in the same transaction.</p></div></div>
-        <div class="qs-step"><div class="n">4</div><div><h4>Ship a single file</h4><p>Embedded, zero-config. No servers, no daemons, no runtime dependencies.</p></div></div>
+        <div class="qs-step"><div class="n">4</div><div><h4>Keep the vault together</h4><p>The database has a separate key file and optional key and audit sidecars. Use the backup API for a consistent snapshot.</p></div></div>
       </div>
     </div>
 
@@ -242,7 +258,7 @@
               <span class="kh-stat">params: <b>t=3, m=64 MiB, p=4</b></span>
               <span class="kh-stat" id="khArgonProg">filling memory...</span>
             </div>
-            <div class="row narrate" id="khN1">Fills 64 MiB of memory across three passes. Slow by design: a GPU attacker pays the same cost you do.</div>
+            <div class="row narrate" id="khN1">Uses 64 MiB of memory across three passes to derive the master key.</div>
             <div class="row" style="margin-top:2px">
               <span class="kh-arrow">&rarr;</span>
               <div class="kh-chip derived" id="khMkChip"><span class="tag">master key</span><span class="hex" id="khMkHex">-</span><span class="size">32 B</span></div>
@@ -362,15 +378,15 @@
   <div class="arch" style="margin-top:36px">
     <div class="arch-copy">
       <p><b style="color:var(--fg)">Hybrid fusion recall.</b> A query over-fetches ANN candidates, then scores each on normalized semantic distance, BM25 keyword overlap, recency (30-day half-life), and importance. An optional cross-encoder reranker (replace or reciprocal-rank-fusion) sharpens the top results, and a graph walk pulls in linked neighbors.</p>
-      <p><b style="color:var(--fg)">Forgetting that is real.</b> On encrypted regions every atom is sealed under its own key, wrapped by a per-region key. <code>forget</code> and <code>evict</code> destroy those keys and return an erasure receipt; the ciphertext that remains is unrecoverable. Re-verify any atom off disk: authentic, tampered, or key-erased.</p>
-      <p><b style="color:var(--fg)">Bring your own embedder.</b> A keyword-only mock for tests, or Candle models (E5-large, MiniLM, BGE small/base/large) and a cross-encoder reranker, pulled on demand. CUDA optional.</p>
+      <p><b style="color:var(--fg)">Cryptographic forgetting.</b> Encrypted regions seal atoms under individual keys. Forgetting destroys the active vault's key copies and returns a receipt. External backups, replicas, and physical-media copies are outside that scope.</p>
+      <p><b style="color:var(--fg)">Explicit semantic embeddings.</b> Use local Candle models such as E5-large or BGE, or a custom embedding backend. Cross-encoder reranking and CUDA support are optional. Stored-memory inspection through <code>MemoryMaintenance</code> needs no model.</p>
     </div>
     <div>
       <div class="bench-kpis cols-2" style="margin-bottom:0">
         <div class="kpi"><div class="val"><em>{{ config.extra.locomo }}</em>%</div><div class="lab">LoCoMo (gpt-4o-mini)</div></div>
         <div class="kpi"><div class="val"><em>{{ config.extra.longmemeval }}</em>%</div><div class="lab">LongMemEval-S (gpt-4o)</div></div>
         <div class="kpi"><div class="val"><em>{{ config.extra.locomo_ceiling }}</em>%</div><div class="lab">LoCoMo retrieval ceiling</div></div>
-        <div class="kpi"><div class="val"><em>7</em></div><div class="lab">typed edge kinds</div></div>
+        <div class="kpi"><div class="val"><em>8</em></div><div class="lab">typed edge kinds</div></div>
       </div>
       <p class="bench-note">Two long-term-memory benchmarks, each on its official prompt and judge. LoCoMo: encrypted regions, gpt-4o-mini reader and judge, zero LLM at ingest or retrieval. LongMemEval-S (full-haystack, ~40-50 sessions/question): {{ config.extra.longmemeval }}% with a gpt-4o reader and the official gpt-4o judge. Protocol and full numbers in <code>citadeldb-membench</code>.</p>
     </div>
@@ -391,6 +407,7 @@
         <ul>
           <li>mem_recall</li>
           <li>mem_fetch</li>
+          <li>mem_get</li>
           <li>mem_edges</li>
           <li>mem_profile</li>
           <li>mem_summarize</li>
@@ -404,6 +421,7 @@
           <li>mem_remember_batch</li>
           <li>mem_update</li>
           <li>mem_link</li>
+          <li>mem_unlink</li>
           <li>mem_evolve</li>
           <li>mem_evict</li>
           <li>mem_forget</li>
@@ -418,7 +436,7 @@
     "citadel": {
       "command": "citadeldb-mcp",
       "args": [
-        "--db", "memory.cdl",
+        "--db", "/absolute/path/to/memory.cdl",
         "--embedder", "e5-large",
         "--reranker", "ms-marco-minilm"
       ],
@@ -427,7 +445,7 @@
   }
 }{% endraw %}</pre>
       </div>
-      <p class="bench-note">One-time setup: <code>citadeldb-mcp pull e5-large</code> and <code>pull ms-marco-minilm</code> download the embedder and reranker (the best-recall config; models are never fetched automatically). Every server invocation must select an embedder; use <code>--embedder mock</code> explicitly for keyword-only recall. Recall hits carry provenance, per-hit integrity verdicts, and <code>memory://atom/{id}</code> resource links.</p>
+      <p class="bench-note">Install with <code>pip install citadeldb-mcp</code>, then run <code>citadeldb-mcp pull e5-large</code> and <code>citadeldb-mcp pull ms-marco-minilm</code>. Pulls need no vault key; serving requires <code>CITADEL_KEY</code>, <code>--db</code>, and <code>--embedder</code>. Managed model downloads are pinned and verified. Recall hits include provenance and integrity results. See <a href="{{ get_url(path='@/integrations/_index.md') }}#mcp">MCP setup</a>.</p>
     </div>
   </div>
 </section>
@@ -436,7 +454,7 @@
   <div class="sec-head">
     <div class="eyebrow">Benchmarks</div>
     <h2>Faster on all {{ config.extra.benchmarks }} head-to-head benchmarks.</h2>
-    <p>Single-threaded, 100K rows, <code class="mono" style="color:var(--accent)">(id INTEGER PK, name TEXT, age INTEGER)</code>. Equal cache budgets (~32 MB). Ratio is SQLite / Citadel time; higher means a larger Citadel speedup. Two-run medians, two regimes: execution speed (every iteration computes its result; geometric mean ~3.4&times;) and memoized repeat-reads (identical parameters against unchanged data, served from a generation-keyed result cache that any commit invalidates; SQLite has no result cache and re-executes every query).</p>
+    <p>Recorded single-threaded results with durability off, measuring engine overhead. Most cases use 100K rows of <code class="mono" style="color:var(--accent)">(id INTEGER PK, name TEXT, age INTEGER)</code>; cache budgets are equal (~32 MB). Ratios are SQLite / Citadel time, using two-run medians. Execution cases recompute results; memoized cases repeat identical reads against unchanged data. See the <a href="{{ config.extra.github }}#speed-benchmarks">full methodology</a>.</p>
   </div>
 
   <div class="bench-kpis">
@@ -474,12 +492,13 @@
   <div class="sec-head">
     <div class="eyebrow">Architecture</div>
     <h2>{{ config.extra.crates }} crates, one file format.</h2>
-    <p>A layered engine: each crate has one job, depends only on the layers beneath it, and can be read on its own.</p>
+    <p>Desktop, CLI, bindings, and agent interfaces share the database, SQL, and memory APIs. Studio uses those APIs directly, without an MCP server.</p>
   </div>
 
   <div class="arch">
     <div class="arch-stack">
       <div class="arch-row multi">
+        <div><span class="crate">citadel-studio</span><span class="desc">desktop client</span></div>
         <div><span class="crate">citadel-cli</span><span class="desc">interactive shell</span></div>
         <div><span class="crate">citadel-python</span><span class="desc">Python wheel</span></div>
         <div><span class="crate">citadel-ffi</span><span class="desc">Panic-safe C ABI</span></div>
@@ -513,9 +532,9 @@
     </div>
 
     <div class="arch-copy">
-      <p><b style="color:var(--fg)">Page layout is 8,208 bytes.</b> Sixteen bytes of random IV, 8,160 bytes of ciphertext, 32 bytes of HMAC-SHA256. Corrupt pages fail loud, not silent.</p>
+      <p><b style="color:var(--fg)">Page layout is 8,208 bytes.</b> Sixteen bytes of random IV, 8,160 bytes of ciphertext, and 32 bytes of HMAC-SHA256. Authentication is checked before decryption.</p>
       <p><b style="color:var(--fg)">Commit protocol is shadow paging.</b> Dirty pages go to new locations, BLAKE3 Merkle hashes climb bottom-up, the inactive 240-byte commit slot is updated, then one byte in the file header flips to publish the new root. No write-ahead log.</p>
-      <p><b style="color:var(--fg)">The memory layers reuse the same pages.</b> Vectors, atoms, and edges are stored, encrypted, and committed exactly like table rows - one file format, one crypto path. <code>citadel-membench</code> is the LoCoMo harness that measures recall on top.</p>
+      <p><b style="color:var(--fg)">Memory uses the same storage engine.</b> Vectors, atoms, and edges use authenticated pages and database transactions. <code>citadel-membench</code> measures recall on LoCoMo and LongMemEval.</p>
     </div>
   </div>
 
@@ -681,7 +700,7 @@
         <li>RETURNING (OLD / NEW)</li>
         <li>TRUNCATE / SAVEPOINT</li>
         <li>PREPARED / $1, $2, ...</li>
-        <li>EXPLAIN</li>
+        <li>EXPLAIN / EXPLAIN ANALYZE</li>
       </ul>
     </div>
     <div class="sql-cap">
@@ -731,25 +750,25 @@
 <section class="block shell" id="security">
   <div class="sec-head">
     <div class="eyebrow">Security</div>
-    <h2>Keys are handled like they matter.</h2>
+    <h2>Encryption, keys, and integrity.</h2>
   </div>
 
   <div class="sec-grid">
     <div class="sec-card">
       <h4><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="4" y="10" width="16" height="11" rx="1"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>No plaintext on disk</h4>
-      <p>Every page is encrypted before writing, authenticated before reading. The database file is indistinguishable from random.</p>
+      <p>Page payloads are encrypted before writing and authenticated before decryption. File headers and commit metadata are not hidden.</p>
     </div>
     <div class="sec-card">
       <h4><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 12h18M12 3v18M7 7l10 10M17 7L7 17"/></svg>Keys live outside the database</h4>
       <p>Encryption material lives in <code>{dbname}.citadel-keys</code>. The passphrase derives a master key in memory via Argon2id and never touches disk.</p>
     </div>
     <div class="sec-card">
-      <h4><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 12a8 8 0 1 1 16 0M20 12l-3-3M20 12l3-3"/><path d="M20 12a8 8 0 0 1-16 0M4 12l3 3M4 12l-3 3"/></svg>Instant rekey</h4>
-      <p>Changing a passphrase re-wraps the root key only. No pages are re-encrypted. The operation is instant regardless of database size.</p>
+      <h4><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 12a8 8 0 1 1 16 0M20 12l-3-3M20 12l3-3"/><path d="M20 12a8 8 0 0 1-16 0M4 12l3 3M4 12l-3 3"/></svg>Passphrase rotation</h4>
+      <p>Changing a passphrase derives new wrapping material and re-wraps the root key. It does not re-encrypt pages; the work is independent of the database's page count.</p>
     </div>
     <div class="sec-card">
       <h4><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3l8 4v5c0 5-3.5 7.5-8 9-4.5-1.5-8-4-8-9V7z"/><path d="M9 12l2 2 4-4"/></svg>Cryptographic erasure</h4>
-      <p>citadel-mem seals each atom and region under its own key. Forgetting destroys the key and issues a receipt; the remaining ciphertext cannot be recovered.</p>
+      <p>Encrypted regions use per-atom keys. Forgetting destroys the active key copies and issues a receipt; it does not erase external backups, replicas, or physical-media remnants.</p>
     </div>
     <div class="sec-card">
       <h4><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="6" cy="12" r="3"/><circle cx="18" cy="12" r="3"/><path d="M9 12h6"/></svg>Forward-secret sync</h4>
@@ -760,22 +779,23 @@
       <p>A feature flag uses PBKDF2-HMAC-SHA256 (600,000+ iterations) with AES-256-CTR for database storage. This is not a claim of whole-product validation.</p>
     </div>
   </div>
+  <p class="dl-note">Audit verification detects edits and broken links in retained history. It cannot detect restoration of a complete, older authentic vault snapshot, including its keys and audit files. Freshness requires an external anchor. See the <a href="{{ config.extra.github }}/blob/HEAD/SECURITY.md">security policy</a>.</p>
 </section>
 
 <section class="block shell" id="bindings">
   <div class="sec-head">
     <div class="eyebrow">Distribution</div>
-    <h2>Rust, Python, C, WebAssembly, and a CLI.</h2>
+    <h2>Desktop, CLI, and language bindings.</h2>
   </div>
   <div class="bindings">
     <div class="binding">
       <div class="top"><h4>Rust</h4><span class="ver">crates.io / citadeldb</span></div>
-      <p>The reference API. Builder-style open, typed transactions, no hidden allocation. {{ config.extra.published }} crates published.</p>
+      <p>The database API and SQL frontend, with typed transactions. {{ config.extra.published }} crates published.</p>
       <div class="inst"><span class="prompt">$</span> cargo add citadeldb citadeldb-sql</div>
     </div>
     <div class="binding">
       <div class="top"><h4>Python</h4><span class="ver">PyPI / citadeldb</span></div>
-      <p>The full engine in one wheel: encrypted SQL, vector search, the memory engine, and the MCP server. Typed, with numpy vectors.</p>
+      <p>Encrypted SQL, vector search, and memory with type stubs. Bring your own embedder; the standalone MCP server is a separate package.</p>
       <div class="inst"><span class="prompt">$</span> pip install citadeldb</div>
     </div>
     <div class="binding">
@@ -790,7 +810,7 @@
     </div>
     <div class="binding">
       <div class="top"><h4>CLI</h4><span class="ver">crates.io / citadeldb-cli</span></div>
-      <p>An interactive SQL shell with tab completion, syntax highlighting, and 26 dot-commands.</p>
+      <p>An interactive SQL shell with tab completion, syntax highlighting, and 27 dot-commands.</p>
       <div class="inst"><span class="prompt">$</span> cargo install citadeldb-cli</div>
     </div>
   </div>

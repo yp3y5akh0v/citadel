@@ -2,7 +2,9 @@
 
 WebAssembly bindings for [Citadel](https://github.com/yp3y5akh0v/citadel), an encrypted-first embedded database engine.
 
-Every page is encrypted at rest with AES-256-CTR + HMAC-SHA256. Runs entirely in the browser or Node.js with no server required.
+Uses AES-256-CTR + HMAC-SHA256 for encrypted page storage. Runs entirely in the browser
+or Node.js with no server required. Databases are in-memory only; data is lost when the
+database is freed or the runtime exits.
 
 ## Install
 
@@ -125,7 +127,7 @@ const db = new CitadelDb("my-passphrase");
 - Arithmetic: AGE, TIMEDIFF, AT_TIMEZONE, JUSTIFY_DAYS, JUSTIFY_HOURS, JUSTIFY_INTERVAL, ISFINITE
 - IANA zone support, BC dates, `+infinity`/`-infinity` sentinels, PG-normalized INTERVAL comparison
 
-**Prepared statements** - `$1, $2, ...` positional parameters with LRU statement cache plus snapshot-tagged plan caching for joins and compound queries (cache invalidates only on commit, never per-call)
+The JavaScript API accepts SQL strings; it does not expose parameter binding.
 
 ## License
 

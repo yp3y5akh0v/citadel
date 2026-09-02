@@ -17,12 +17,23 @@ name = "tags"
 [extra]
 author = "Yuriy Peysakhov"
 github = "https://github.com/yp3y5akh0v/citadel"
-version = "2.1.0"
 msrv = "1.95"
-crates = 21
+crates = 22
 published = 16
 locomo = "87.2"
 locomo_ceiling = "94.5"
 longmemeval = "86.2"
 benchmarks = 58
-mcp_tools = 13
+mcp_tools = 15
+
+adapters = [
+  ["LangGraph", "BaseStore", "langgraph", "Namespace and keyed-item storage, TTL, and multi-field vector search."],
+  ["CrewAI", "StorageBackend", "crewai", "Memory persistence with cosine similarity and cryptographic forgetting."],
+  ["LangChain", "VectorStore + chat history", "langchain", "Vector retrieval, MMR over stored vectors, metadata filters, and conversation history."],
+  ["LlamaIndex", "BasePydanticVectorStore", "llamaindex", "Encrypted vector storage with metadata filtering."],
+  ["Haystack", "DocumentStore", "haystack", "Document persistence, embedding retrieval, and metadata filters."],
+  ["OpenAI Agents SDK", "Session", "openai-agents", "Encrypted conversation history keyed by session ID."],
+  ["Google ADK", "BaseMemoryService", "google-adk", "Session ingestion and hybrid memory recall."],
+  ["Microsoft Agent Framework", "History + Context", "ms-agent-framework", "Persistent history and memory context for agents."],
+  ["Strands Agents", "SessionRepository", "strands-agents", "Encrypted session, agent-state, and message persistence."],
+]

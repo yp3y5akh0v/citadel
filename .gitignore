@@ -5,6 +5,7 @@
 *~
 .DS_Store
 site/public/
+site/data/release.json
 site/static/wasm/*.wasm
 site/static/wasm/*.js
 /notes/

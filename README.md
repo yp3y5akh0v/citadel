@@ -17,51 +17,36 @@
 
 ## Quick Start
 
-```bash
-pip install citadeldb
+For semantic memory through MCP, install [uv](https://docs.astral.sh/uv/) and pull the
+local embedder and optional cross-encoder reranker:
+
+```console
+uvx citadeldb-mcp pull e5-large
+uvx citadeldb-mcp pull ms-marco-minilm
 ```
 
-The default wheel uses bring-your-own embeddings. This zero-download example uses
-`MockEmbedder` only as a deterministic lexical API demo; it does not provide semantic
-recall. For production semantic recall, use the e5-large MCP setup below or a source
-build with the `candle-embed` feature.
+Set `CITADEL_KEY` to your vault passphrase (`export CITADEL_KEY="your-passphrase"`
+on macOS/Linux or `$env:CITADEL_KEY = "your-passphrase"` in PowerShell), then start:
 
-```python
-import citadeldb
-
-db = citadeldb.connect("memory.cdl", key="your-passphrase", region_keys=True)
-mem = db.memory()
-mem.create_encrypted_region("chat", citadeldb.MockEmbedder(dim=64))
-
-mem.remember("chat", {"kind": "fact", "text": "Alice's cat is named Mochi"})
-berlin = mem.remember("chat", {"kind": "fact", "text": "Alice lives in Berlin"})
-
-for hit in mem.recall("chat", text="Alice lives", k=2):
-    assert hit.relevance is not None
-    print(f"{hit.relevance:.3f}  {hit.text}")
-
-# Forgetting destroys the atom's key, so the ciphertext is unrecoverable.
-receipt = mem.forget("chat", [berlin])
-print(receipt.cryptographic_erasure, receipt.algorithm)
-# True AES-256-KW(RFC3394)
+```console
+uvx citadeldb-mcp --db memory.cdl --embedder e5-large --reranker ms-marco-minilm
 ```
 
-With a `candle-embed` build, replace the region setup above with the real embedder and
-add the benchmark reranker:
+The server communicates over stdio. See [MCP](#mcp) for client configuration.
+Model downloads do not need a vault key; serving does.
 
-```python
-embedder = citadeldb.CandleEmbedder("/path/to/e5-large", preset="e5-large")
-mem.create_encrypted_region("chat", embedder)  # replaces the MockEmbedder call above
-mem.set_reranker(citadeldb.CrossEncoder("/path/to/ms-marco-minilm"))
-```
+### Memory (Python)
 
-A Python bring-your-own backend implements `embed_with_cancel(texts, cancel_token)` and
-polls `cancel_token.check()` between bounded batches; asymmetric models may also implement
-`embed_queries_with_cancel`.
+Install the published package with `pip install citadeldb`. For the 2.2 APIs in this
+branch, follow the [Python source-build and semantic-memory guide](python/README.md).
+Embedders implement `embed_with_cancel(texts, cancel_token)` and check cancellation
+between bounded batches. Local Candle models require the `candle-embed` build feature.
 
 ### Memory (Rust)
 
-Uses the `citadeldb` and `citadeldb-mem` crates (enable `citadeldb-mem`'s `candle-embed` feature). `e5_large` loads the recommended local embedder, and adding a `CrossEncoder` reranker gives the best recall (the benchmark config). Other presets (`bge_large`, `bge_small`, ...) or a custom `Embedder` work too.
+Uses `citadeldb` and `citadeldb-mem` with the `candle-embed` feature. This example
+loads e5-large and a local cross-encoder reranker. Other presets or a custom
+`Embedder` are supported.
 
 ```rust
 use std::sync::Arc;
@@ -75,7 +60,6 @@ let db = DatabaseBuilder::new("memory.db")
     .create()?;
 let mem = MemoryEngine::open(Arc::new(db))?;
 
-// Local embedder (e5-large) + cross-encoder reranker = the best-recall setup
 let embedder = Arc::new(CandleEmbedder::e5_large("/path/to/e5-large")?);
 mem.create_encrypted_region("chat", embedder)?;
 mem.set_reranker(
@@ -163,11 +147,20 @@ citadel> .listen 4248 <KEY>              # Terminal A
 citadel> .sync 127.0.0.1:4248 <KEY>      # Terminal B
 ```
 
+### Citadel Studio
+
+A native desktop client for Windows, macOS, and Linux. Open encrypted vaults,
+browse tables and memory, run SQL with EXPLAIN and ANALYZE, and inspect vectors
+and integrity results.
+
+See the [Studio guide](crates/citadel-studio/README.md) for screenshots and build
+instructions, and [downloads](https://citadeldb.dev/download/) for release availability.
+
 ### Agent frameworks
 
-Each package implements that framework's own storage interface, so existing code keeps
-working and only the constructor changes. Deleting through any of them destroys the
-record's key, not just its row, and search is ranked recall rather than a `LIKE`.
+The adapters implement framework-specific storage, session, and retrieval interfaces.
+Each requires an explicit embedder. See the package README for setup, search behavior,
+and supported filters.
 
 | Framework | Package | Implements |
 |---|---|---|
@@ -183,21 +176,6 @@ record's key, not just its row, and search is ranked recall rather than a `LIKE`
 
 ```bash
 pip install citadeldb-langgraph
-```
-
-```python
-import citadeldb
-from citadeldb_langgraph import CitadelStore
-
-store = CitadelStore(
-    "agent.cdl",
-    key="your-passphrase",
-    # This example lists namespaces without a semantic query, so no model work is needed.
-    embedder=citadeldb.MockEmbedder(dim=64),
-)
-store.put(("users", "alice"), "prefs", {"theme": "dark"})
-store.search(("users",))                     # every namespace under users/
-store.forget_namespace(("users", "alice"))   # cryptographic erasure, returns a count
 ```
 
 One database serves every adapter on the thread that opened it, so a graph's long-term
@@ -226,9 +204,7 @@ uvx citadeldb-mcp --db memory.cdl --embedder e5-large --reranker ms-marco-minilm
 ```
 
 `--db`, `--embedder`, and `CITADEL_KEY` are required when serving. The reranker is optional,
-but `e5-large` with `ms-marco-minilm` is the recommended highest-recall configuration used
-for the memory benchmarks. `--embedder mock` is a keyword-only option, not a semantic
-embedder.
+but `e5-large` with `ms-marco-minilm` is the configuration used for the memory benchmarks.
 
 To install the executable instead, run `pip install citadeldb-mcp` or
 `cargo install citadeldb-mcp`. Pull the same models with `citadeldb-mcp pull e5-large` and
@@ -288,12 +264,11 @@ the memory engine:
 
 ### Zero-LLM memory path
 
-citadeldb-mem uses no LLM at ingest or retrieval: it stores raw conversation content
-and recalls with embeddings, BM25 keyword matching, and a cross-encoder reranker.
-Remembering costs zero tokens, recall is deterministic, and the conversation is never
-sent to an LLM to build or search the memory. The readers and judges above are separate
-LLMs - gpt-4o-mini for LoCoMo, gpt-4o for LongMemEval. Protocol and a comparison with
-published systems are in
+citadeldb-mem stores raw conversation content without a summarizer LLM. Recall uses
+embeddings, BM25 keyword matching, and an optional reranker. Local embedding and
+reranking backends keep this processing on-device; custom backends determine their
+own network use and costs. The benchmark readers and judges are separate LLMs -
+gpt-4o-mini for LoCoMo, gpt-4o for LongMemEval. The protocol and results are in
 [citadel-membench](https://github.com/yp3y5akh0v/citadel/blob/HEAD/crates/citadel-membench/RESULTS.md).
 
 ## Agent runtime
@@ -309,14 +284,15 @@ published systems are in
 - **Authenticated commit slots** - the commit metadata (table roots, catalog) carries its own HMAC; older files migrate one-way via `.upgrade`
 - **P2P sync** - Merkle-based table diffing over Noise-encrypted channels with PSK auth
 - **CLI** - SQL shell with tab completion, syntax highlighting, 27 dot-commands (.backup, .verify, .upgrade, .rekey, .sync, .dump, ...)
+- **Citadel Studio** - Native desktop client for SQL, stored memory, vector inspection, and vault diagnostics
 - **3-tier key hierarchy** - Passphrase -> Argon2id -> Master Key -> AES-KW -> REK -> HKDF -> DEK + MAC
-- **Cryptographic forgetting** - Erase data by destroying its key, not by overwriting: whole-store, and per-region / per-atom via [citadeldb-mem](https://github.com/yp3y5akh0v/citadel/tree/HEAD/crates/citadel-mem). A forgotten region or atom is unrecoverable
+- **Cryptographic forgetting** - Whole-store and per-region / per-atom key erasure via [citadeldb-mem](https://github.com/yp3y5akh0v/citadel/tree/HEAD/crates/citadel-mem). Pre-erasure backups, copied keys, and exported plaintext are outside that erasure
 - **FIPS-oriented at-rest profile** - PBKDF2-HMAC-SHA256 + AES-256-CTR for database storage; not a claim of whole-product validation
 - **Audit log** - HMAC-SHA256 chained within files and across retained v2 generations; retained-history verification detects record edits and broken retained links, but there is no external anti-rollback anchor
 - **Hot backup** - Consistent snapshots via MVCC, no write blocking
-- **Overflow pages** - Large values handled transparently, no size limits
+- **Overflow pages** - Large values handled transparently, up to 1 GiB per value
 - **Cross-platform** - Windows, Linux, macOS. Python, C FFI, and WebAssembly bindings
-- **Thousands of tests** - Unit, integration, and torture tests across 21 crates
+- **Thousands of tests** - Unit, integration, and torture tests across the workspace
 
 ## Speed benchmarks
 
@@ -566,31 +542,36 @@ Reproduce with `cargo bench -p citadeldb-sql --bench h2h_bench`
 ## Architecture
 
 ```
-Agent layer:
+Clients and bindings:
 +---------------------------------------------+
-|                 citadel-ai                  |  Agent runtime (ReAct + Reflexion)
-+---------------------------------------------+
-|                 citadel-llm                 |  LLM client layer: Claude, OpenAI, Ollama, Gemini
-+---------------------------------------------+
-
-Memory layer:
-+---------------------------------------------+
-|                 citadel-mcp                 |  MCP server: memory tools for any MCP client
-+---------------------------------------------+
-|                 citadel-mem                 |  Memory engine: regions, atoms, recall, erasure
-+---------------------------------------------+
-|                citadel-vector               |  VECTOR(N) type + PRISM filtered ANN index
-+---------------------------------------------+
-
-Encrypted database engine:
+|               citadel-studio                |  Memory, SQL, and vault client
 +----------------------+----------------------+
 |     citadel-cli      |    citadel-python    |  CLI, Python wheel
 +----------------------+----------------------+
 |     citadel-ffi      |     citadel-wasm     |  C FFI, WebAssembly
 +----------------------+----------------------+
-|                 citadel-sql                 |  SQL parser, planner, executor
+
+Agent layer:
 +---------------------------------------------+
-|                   citadel                   |  Database API, builder, sync
+|                 citadel-ai                  |  Agent runtime (ReAct + Reflexion)
++---------------------------------------------+
+|                 citadel-llm                 |  LLM clients: Claude, OpenAI, Ollama, Gemini
++---------------------------------------------+
+
+Memory layer:
++---------------------------------------------+
+|                 citadel-mcp                 |  MCP server for memory tools
++---------------------------------------------+
+|                 citadel-mem                 |  Regions, atoms, recall, erasure
++---------------------------------------------+
+|                citadel-vector               |  VECTOR(N) type + PRISM filtered ANN
++---------------------------------------------+
+
+Encrypted database engine:
++----------------------+----------------------+
+|     citadel-sql      |    sql-json-path     |  SQL frontend, SQL/JSON paths
++----------------------+----------------------+
+|                   citadel                   |  Database API, builder, vault lifecycle
 +-------------+--------------+----------------+
 | citadel-txn | citadel-sync | citadel-crypto |  Transactions, replication, keys
 +-------------+--------------+----------------+
@@ -598,9 +579,17 @@ Encrypted database engine:
 +----------------------------+----------------+
 |                 citadel-io                  |  File I/O, fsync, io_uring
 +---------------------------------------------+
-|                citadel-core                 |  Types, errors, constants
+|                citadel-core                 |  Types, errors, cancellation
 +---------------------------------------------+
+
+Evaluation harnesses:
++----------------------+----------------------+
+|   citadel-membench   |     citadel-swe      |  Memory and agent benchmarks
++----------------------+----------------------+
 ```
+
+Studio calls the database and SQL APIs directly and uses `MemoryMaintenance` for
+stored-memory inspection and erasure. It needs no MCP server or embedding model.
 
 ### Page Layout (8,208 bytes)
 
@@ -638,20 +627,24 @@ Static or dynamic library with auto-generated `citadel.h` (cbindgen). Exported e
 ```c
 #include "citadel.h"
 
-CitadelDb *db = NULL;
-citadel_create("my.db", (const uint8_t*)"secret", 6, NULL, &db);
+int main(void) {
+    struct CitadelDb *db = NULL;
+    struct CitadelSqlConn *conn = NULL;
+    struct CitadelSqlResult *result = NULL;
+    citadel_error_t status = citadel_create(
+        "my.db", (const uint8_t *)"secret", 6, NULL, &db);
+    if (status != CITADEL_ERROR_T_OK) goto cleanup;
 
-CitadelWriteTxn *wtx = NULL;
-citadel_write_begin(db, &wtx);
-citadel_write_put(wtx, (const uint8_t*)"key", 3, (const uint8_t*)"val", 3, NULL);
-citadel_write_commit(wtx);
+    status = citadel_sql_open(db, &conn);
+    if (status != CITADEL_ERROR_T_OK) goto cleanup;
+    status = citadel_sql_execute(conn, "SELECT 1 + 1 AS value;", &result);
 
-CitadelSqlConn *conn = NULL;
-citadel_sql_open(db, &conn);
-CitadelSqlResult *result = NULL;
-citadel_sql_execute(conn, "SELECT * FROM users;", &result);
-
-citadel_close(db);
+cleanup:
+    citadel_sql_result_free(result);
+    citadel_sql_close(conn);
+    citadel_close(db);
+    return status == CITADEL_ERROR_T_OK ? 0 : 1;
+}
 ```
 
 ### WebAssembly
@@ -671,6 +664,7 @@ const result = db.query("SELECT * FROM t;");
 // { columns: ["id", "name"], rows: [[1, "Alice"]] }
 
 db.put(new Uint8Array([1, 2, 3]), new Uint8Array([4, 5, 6]));
+db.free();
 ```
 
 Build the npm package: `bash scripts/publish-wasm.sh`

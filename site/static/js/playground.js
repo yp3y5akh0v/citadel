@@ -76,29 +76,77 @@ window.CitadelPlayground = (() => {
   let lastResultHtml = '';
   const log = [];
 
-  const KW = new Set('SELECT FROM WHERE AND OR ORDER BY LIMIT OFFSET GROUP HAVING JOIN LEFT RIGHT INNER FULL OUTER CROSS LATERAL ON AS WITH RECURSIVE UNION ALL INTERSECT EXCEPT INSERT INTO VALUES UPDATE SET DELETE CREATE TABLE ALTER ADD COLUMN DROP INDEX VIEW MATERIALIZED TRIGGER PRIMARY KEY NOT NULL DEFAULT UNIQUE CHECK REFERENCES FOREIGN INTERVAL DATE TIME TIMESTAMP JSONB OVER PARTITION ROWS RANGE PRECEDING FOLLOWING CURRENT ROW BETWEEN DESC ASC EXPLAIN DISTINCT IN IS LIKE CASE WHEN THEN ELSE END CONFLICT DO RETURNING EXCLUDED EXISTS'.split(' '));
+  const KW = new Set('SELECT FROM WHERE AND OR ORDER BY LIMIT OFFSET GROUP HAVING JOIN LEFT RIGHT INNER FULL OUTER CROSS LATERAL ON AS WITH RECURSIVE UNION ALL INTERSECT EXCEPT INSERT INTO VALUES UPDATE SET DELETE CREATE TABLE ALTER ADD COLUMN DROP INDEX VIEW MATERIALIZED TRIGGER PRIMARY KEY NOT NULL DEFAULT UNIQUE CHECK REFERENCES FOREIGN INTERVAL DATE TIME TIMESTAMP JSONB OVER PARTITION ROWS RANGE PRECEDING FOLLOWING CURRENT ROW BETWEEN DESC ASC EXPLAIN DISTINCT IN IS LIKE CASE WHEN THEN ELSE END CONFLICT DO NOTHING RETURNING EXCLUDED EXISTS'.split(' '));
   const FN = new Set('COUNT SUM AVG MIN MAX ROW_NUMBER RANK DENSE_RANK NTILE LAG LEAD FIRST_VALUE LAST_VALUE DATE_TRUNC DATE_PART EXTRACT NOW LENGTH UPPER LOWER COALESCE CAST JSON_EXTRACT TO_TSVECTOR TS_RANK'.split(' '));
   function esc(t) { return t.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
-  function highlight(s) {
-    let out = '', i = 0;
-    const n = s.length;
-    while (i < n) {
-      const c = s[i];
-      if (c === '-' && s[i + 1] === '-') { let j = i; while (j < n && s[j] !== '\n') j++; out += `<span class="c">${esc(s.slice(i, j))}</span>`; i = j; continue; }
-      if (c === "'") { let j = i + 1; while (j < n && s[j] !== "'" && s[j] !== '\n') j++; if (s[j] === "'") j++; out += `<span class="s">${esc(s.slice(i, j))}</span>`; i = j; continue; }
-      if (c === '"') { let j = i + 1; while (j < n && s[j] !== '"' && s[j] !== '\n') j++; if (s[j] === '"') j++; out += `<span class="s">${esc(s.slice(i, j))}</span>`; i = j; continue; }
-      if (c >= '0' && c <= '9') { let j = i; while (j < n && /[0-9.]/.test(s[j])) j++; out += `<span class="n">${esc(s.slice(i, j))}</span>`; i = j; continue; }
-      if (/[A-Za-z_]/.test(c)) {
-        let j = i; while (j < n && /[A-Za-z0-9_]/.test(s[j])) j++;
-        const word = s.slice(i, j), upper = word.toUpperCase();
-        if (KW.has(upper)) out += `<span class="k">${esc(word)}</span>`;
-        else if (FN.has(upper) && s[j] === '(') out += `<span class="fn">${esc(word)}</span>`;
-        else out += esc(word);
-        i = j; continue;
+  function quotedEnd(s, start, quote, backslash, triple) {
+    const delimiter = triple && s.startsWith(quote.repeat(3), start) ? quote.repeat(3) : quote;
+    let i = start + delimiter.length;
+    while (i < s.length) {
+      if (backslash && s[i] === '\\') { i += 2; continue; }
+      if (s.startsWith(delimiter, i)) {
+        i += delimiter.length;
+        if (delimiter.length === 1 && s[i] === quote) { i++; continue; }
+        return i;
       }
-      out += esc(c); i++;
+      i++;
+    }
+    return s.length;
+  }
+  function mapSql(s, visit) {
+    const wordPart = /[A-Za-z0-9_$@#\u0080-\uFFFF]/;
+    const dollarTag = /\$[A-Za-z0-9_\u0080-\uFFFF]*\$/y;
+    let out = '', i = 0;
+    while (i < s.length) {
+      const start = i, c = s[i];
+      let kind = '';
+      if (s.startsWith('--', i)) {
+        i += 2;
+        while (i < s.length && s[i] !== '\n' && s[i] !== '\r') i++;
+        kind = 'c';
+      } else if (s.startsWith('/*', i)) {
+        i += 2;
+        let depth = 1;
+        while (i < s.length && depth) {
+          if (s.startsWith('/*', i)) { depth++; i += 2; }
+          else if (s.startsWith('*/', i)) { depth--; i += 2; }
+          else i++;
+        }
+        kind = 'c';
+      } else if (c === "'" || c === '"' || c === '`') {
+        i = quotedEnd(s, i, c, false, false);
+        kind = 's';
+      } else if (/[eExXnNbBrR]/.test(c) && (s[i + 1] === "'" || /[bBrR]/.test(c) && s[i + 1] === '"')) {
+        i = quotedEnd(s, i + 1, s[i + 1], /[eExX]/.test(c), /[rR]/.test(c));
+        kind = 's';
+      } else if (/[uU]/.test(c) && s[i + 1] === '&' && (s[i + 2] === "'" || s[i + 2] === '"')) {
+        i = quotedEnd(s, i + 2, s[i + 2], false, false);
+        kind = 's';
+      } else {
+        dollarTag.lastIndex = i;
+        const tag = c === '$' ? dollarTag.exec(s) : null;
+        if (tag) {
+          const end = s.indexOf(tag[0], dollarTag.lastIndex);
+          i = end < 0 ? s.length : end + tag[0].length;
+          kind = 's';
+        } else if (c === ':' && s[i + 1] === ':') {
+          i += 2;
+        } else if (wordPart.test(c) || c === ':' && wordPart.test(s[i + 1] || '')) {
+          i++;
+          while (i < s.length && wordPart.test(s[i])) i++;
+          const word = s.slice(start, i);
+          const upper = /^[A-Za-z_][A-Za-z0-9_]*$/.test(word) ? word.toUpperCase() : '';
+          if (KW.has(upper)) kind = 'k';
+          else if (FN.has(upper) && s[i] === '(') kind = 'fn';
+          else if (/^\d+(?:\.\d+)?$/.test(word)) kind = 'n';
+        } else i++;
+      }
+      out += visit(s.slice(start, i), kind);
     }
     return out;
+  }
+  function highlight(s) {
+    return mapSql(s, (text, kind) => kind ? `<span class="${kind}">${esc(text)}</span>` : esc(text));
   }
   function updateGutter() {
     const lines = ta.value.split('\n').length;
@@ -164,7 +212,7 @@ window.CitadelPlayground = (() => {
         html += `<div class="result-msg" style="padding-top:10px">${r.rows.length} row${r.rows.length === 1 ? '' : 's'}</div>`;
         rows += r.rows.length;
       } else if (r.type === 'rowsAffected') {
-        html += `<div class="result-msg"><span class="ok">OK</span> / ${r.value} row${r.value === 1 ? '' : 's'} affected / committed</div>`;
+        html += `<div class="result-msg"><span class="ok">OK</span> / ${r.value} row${r.value === 1 ? '' : 's'} affected</div>`;
       } else if (r.type === 'error') {
         html += `<div class="result-msg"><span class="err">Error:</span> ${esc(r.message)}</div>`;
       } else {
@@ -268,7 +316,7 @@ window.CitadelPlayground = (() => {
     const resetBtn = document.getElementById('resetBtn');
     if (runBtn) runBtn.onclick = runQuery;
     if (fmtBtn) fmtBtn.onclick = () => {
-      ta.value = ta.value.replace(/\b(select|from|where|and|or|order by|limit|offset|group by|having|join|left|right|inner|full|outer|cross|lateral|on|as|with|recursive|union all|union|intersect|except|insert|into|values|update|set|delete|create|table|view|materialized|trigger|alter|add|column|drop|index|primary key|not null|default|unique|check|references|foreign|interval|date|time|timestamp|over|partition by|rows|range|preceding|following|current row|between|desc|asc|explain|distinct|in|is|like|case|when|then|else|end|on conflict|do update|do nothing|returning|exists)\b/gi, m => m.toUpperCase());
+      ta.value = mapSql(ta.value, (text, kind) => kind === 'k' ? text.toUpperCase() : text);
       render();
     };
     if (resetBtn) resetBtn.onclick = () => { ta.value = DEFAULT_SQL; render(); runQuery(); };
