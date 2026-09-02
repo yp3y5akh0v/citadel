@@ -124,7 +124,7 @@ def _persisted(session_message: SessionMessage) -> dict:
 
 def _text_of(session_message: SessionMessage) -> str:
     """An atom needs text to embed; the index identifies it otherwise."""
-    content = session_message.redact_message or session_message.message
+    content = session_message.to_message()
     parts = content.get("content") or [] if isinstance(content, dict) else []
     text = " ".join(
         p["text"]

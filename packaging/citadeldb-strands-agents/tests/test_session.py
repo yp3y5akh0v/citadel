@@ -190,6 +190,57 @@ def test_a_redaction_at_creation_time_also_drops_the_original():
     assert secret not in str(m.read_message(SID, AID, 0).to_dict())
 
 
+@pytest.mark.parametrize("operation", ["create", "update"])
+@pytest.mark.parametrize(
+    ("redaction", "expected_text"),
+    [
+        pytest.param({}, "message 0", id="empty-dict"),
+        pytest.param({"role": "user", "content": []}, "message 0", id="empty-content"),
+        pytest.param(
+            {"role": "user", "content": [{"text": "[REDACTED]"}]},
+            "[REDACTED]",
+            id="text",
+        ),
+        pytest.param(
+            {
+                "role": "user",
+                "content": [
+                    {"image": {"format": "png", "source": {"bytes": b"\x89PNG"}}}
+                ],
+            },
+            "message 0",
+            id="binary-content",
+        ),
+    ],
+)
+def test_redaction_replaces_payload_and_searchable_text(
+    tmp_path, operation, redaction, expected_text
+):
+    m = seeded(mgr(str(tmp_path / "redaction.cdl")), 0)
+    secret = "secret that must not survive redaction"
+    incoming = msg(0, secret)
+    if operation == "update":
+        m.create_message(SID, AID, incoming)
+        incoming = m.read_message(SID, AID, 0)
+        assert incoming.message["content"][0]["text"] == secret
+
+    incoming.redact_message = redaction
+    if operation == "create":
+        m.create_message(SID, AID, incoming)
+    else:
+        m.update_message(SID, AID, incoming)
+
+    restored = m.read_message(SID, AID, 0)
+    assert restored.message == redaction
+    assert restored.to_message() == redaction
+    hits = m._mem.fetch(
+        m._region, "message", payload_filter={"sid": SID, "aid": AID, "mid": 0}
+    )
+    assert len(hits) == 1
+    assert secret not in str(hits[0].payload)
+    assert hits[0].text == expected_text
+
+
 def test_an_unredacted_message_keeps_its_content():
     """Only a redaction drops the original; an ordinary update must not."""
     m = seeded(mgr(), 0)
@@ -198,6 +249,11 @@ def test_an_unredacted_message_keeps_its_content():
     after = m.read_message(SID, AID, 0)
     assert after.to_message()["content"][0]["text"] == "edited content"
     assert after.redact_message is None
+    hits = m._mem.fetch(
+        m._region, "message", payload_filter={"sid": SID, "aid": AID, "mid": 0}
+    )
+    assert len(hits) == 1
+    assert hits[0].text == "edited content"
 
 
 def test_a_redaction_replaces_the_stored_record():
