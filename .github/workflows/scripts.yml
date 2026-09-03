@@ -77,7 +77,7 @@ jobs:
 
       - name: Release third-party licence inventory is current
         run: |
-          cargo install cargo-about --version 0.9.1 --locked
+          cargo install cargo-about --version 0.9.1 --locked --features cli
           GENERATED="$RUNNER_TEMP/THIRD_PARTY_LICENSES.html"
           cargo about generate \
             --manifest-path Cargo.toml \
