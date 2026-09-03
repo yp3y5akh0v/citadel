@@ -274,11 +274,7 @@ impl<'a> Rows<'a> {
     /// Step to the next row, if any.
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Result<Option<Row<'_>>> {
-        let next: Option<Vec<Value>> = match &mut self.source {
-            RowSource::Materialized(iter) => iter.next(),
-            RowSource::Streaming(stream) => stream.next_row()?,
-        };
-        match next {
+        match self.next_values()? {
             Some(values) => {
                 self.buf = values;
                 Ok(Some(Row {
@@ -287,6 +283,13 @@ impl<'a> Rows<'a> {
                 }))
             }
             None => Ok(None),
+        }
+    }
+
+    fn next_values(&mut self) -> Result<Option<Vec<Value>>> {
+        match &mut self.source {
+            RowSource::Materialized(iter) => Ok(iter.next()),
+            RowSource::Streaming(stream) => stream.next_row(),
         }
     }
 
@@ -301,8 +304,8 @@ impl<'a> Rows<'a> {
     /// Drain all remaining rows into a [`QueryResult`].
     pub fn collect(mut self) -> Result<QueryResult> {
         let mut rows = Vec::new();
-        while let Some(row) = self.next()? {
-            rows.push(row.to_vec());
+        while let Some(values) = self.next_values()? {
+            rows.push(values);
         }
         Ok(QueryResult {
             columns: self.columns,
@@ -426,4 +429,175 @@ fn derive_from_select_stmt(sel: &SelectStmt, schema: &SchemaManager) -> Vec<Stri
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    struct TestStream<'a> {
+        columns: Vec<String>,
+        rows: std::vec::IntoIter<Result<Vec<Value>>>,
+        calls: &'a Cell<usize>,
+    }
+
+    impl RowSourceIter for TestStream<'_> {
+        fn next_row(&mut self) -> Result<Option<Vec<Value>>> {
+            self.calls.set(self.calls.get() + 1);
+            self.rows.next().transpose()
+        }
+
+        fn columns(&self) -> &[String] {
+            &self.columns
+        }
+    }
+
+    fn blob_rows() -> Vec<Vec<Value>> {
+        (1..=3)
+            .map(|id| vec![Value::Integer(id), Value::Blob(vec![id as u8; 256])])
+            .collect()
+    }
+
+    fn allocation_pointers(rows: &[Vec<Value>]) -> Vec<(*const Value, *const u8)> {
+        rows.iter()
+            .map(|row| {
+                let Value::Blob(blob) = &row[1] else {
+                    panic!("expected a heap-allocated Blob")
+                };
+                (row.as_ptr(), blob.as_ptr())
+            })
+            .collect()
+    }
+
+    fn make_rows<'a>(streaming: bool, rows: Vec<Vec<Value>>, calls: &'a Cell<usize>) -> Rows<'a> {
+        let columns = vec!["id".into(), "payload".into()];
+        if streaming {
+            Rows::streaming(Box::new(TestStream {
+                columns,
+                rows: rows.into_iter().map(Ok).collect::<Vec<_>>().into_iter(),
+                calls,
+            }))
+        } else {
+            Rows::materialized(columns, rows)
+        }
+    }
+
+    fn assert_collect_moves_allocations(streaming: bool) {
+        let input = blob_rows();
+        let pointers = allocation_pointers(&input);
+        let calls = Cell::new(0);
+        let rows = make_rows(streaming, input, &calls);
+        let columns_ptr = rows.column_names().as_ptr();
+
+        let result = rows.collect().unwrap();
+
+        assert_eq!(result.columns, ["id", "payload"]);
+        assert_eq!(result.columns.as_ptr(), columns_ptr);
+        assert_eq!(result.rows, blob_rows());
+        assert_eq!(allocation_pointers(&result.rows), pointers);
+        assert_eq!(calls.get(), if streaming { 4 } else { 0 });
+    }
+
+    #[test]
+    fn materialized_collect_moves_row_and_blob_allocations() {
+        assert_collect_moves_allocations(false);
+    }
+
+    #[test]
+    fn streaming_collect_moves_row_and_blob_allocations() {
+        assert_collect_moves_allocations(true);
+    }
+
+    #[test]
+    fn collect_after_next_moves_only_remaining_rows() {
+        for streaming in [false, true] {
+            let input = blob_rows();
+            let pointers = allocation_pointers(&input);
+            let calls = Cell::new(0);
+            let mut rows = make_rows(streaming, input, &calls);
+            let columns_ptr = rows.column_names().as_ptr();
+
+            let first = rows.next().unwrap().unwrap();
+            assert_eq!(first.get_by_name("id"), Some(&Value::Integer(1)));
+            assert_eq!(first.column_name(1), Some("payload"));
+            assert_eq!(first.as_slice().as_ptr(), pointers[0].0);
+
+            let result = rows.collect().unwrap();
+
+            assert_eq!(result.columns, ["id", "payload"]);
+            assert_eq!(result.columns.as_ptr(), columns_ptr);
+            assert_eq!(result.rows, blob_rows()[1..]);
+            assert_eq!(allocation_pointers(&result.rows), pointers[1..]);
+            assert_eq!(calls.get(), if streaming { 4 } else { 0 });
+        }
+    }
+
+    #[test]
+    fn collect_empty_and_exhausted_rows_preserves_columns() {
+        for streaming in [false, true] {
+            for input in [Vec::new(), blob_rows()] {
+                let calls = Cell::new(0);
+                let mut rows = make_rows(streaming, input, &calls);
+                let columns_ptr = rows.column_names().as_ptr();
+                while rows.next().unwrap().is_some() {}
+
+                let result = rows.collect().unwrap();
+
+                assert!(result.rows.is_empty());
+                assert_eq!(result.columns, ["id", "payload"]);
+                assert_eq!(result.columns.as_ptr(), columns_ptr);
+            }
+        }
+    }
+
+    fn collect_stream_error(error: SqlError, consume_first: bool) -> SqlError {
+        let calls = Cell::new(0);
+        let mut rows = Rows::streaming(Box::new(TestStream {
+            columns: vec!["id".into()],
+            rows: vec![
+                Ok(vec![Value::Integer(1)]),
+                Err(error),
+                Ok(vec![Value::Integer(3)]),
+            ]
+            .into_iter(),
+            calls: &calls,
+        }));
+        if consume_first {
+            assert!(rows.next().unwrap().is_some());
+        }
+
+        let error = rows.collect().unwrap_err();
+
+        assert_eq!(calls.get(), 2, "collect must stop at the first error");
+        error
+    }
+
+    #[test]
+    fn collect_propagates_stream_errors() {
+        for consume_first in [false, true] {
+            let error = collect_stream_error(
+                SqlError::InvalidValue("stream failure".into()),
+                consume_first,
+            );
+            assert!(
+                matches!(error, SqlError::InvalidValue(message) if message == "stream failure")
+            );
+        }
+    }
+
+    #[test]
+    fn collect_propagates_stream_cancellation() {
+        for consume_first in [false, true] {
+            let error = collect_stream_error(
+                SqlError::Storage(citadel_core::Error::Interrupted),
+                consume_first,
+            );
+            assert!(matches!(
+                error,
+                SqlError::Storage(citadel_core::Error::Interrupted)
+            ));
+        }
+    }
 }

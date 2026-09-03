@@ -43,6 +43,76 @@ fn i(n: i64) -> Value {
 }
 
 #[test]
+fn full_row_decode_rejects_truncated_headers_without_panicking() {
+    let table = schema(
+        "t",
+        cols(&[("id", DataType::Integer), ("v", DataType::Integer)]),
+        vec![0],
+    );
+    let key = encode_composite_key(&[i(1)]);
+    for data in [&[][..], &[1][..], &[1, 0][..]] {
+        let outcome =
+            std::panic::catch_unwind(|| decode_full_row_with_cancel(&table, &key, data, None));
+        assert!(matches!(outcome, Ok(Err(SqlError::InvalidValue(_)))));
+    }
+}
+
+#[test]
+fn projected_decode_fallback_preserves_keys_values_and_nulls() {
+    use crate::encoding::encode_row;
+
+    let encode_v1 = |values: &[Value]| {
+        let mut row = (values.len() as u16).to_le_bytes().to_vec();
+        if !values.is_empty() {
+            row.push(0);
+        }
+        for (idx, value) in values.iter().enumerate() {
+            let bytes = match value {
+                Value::Integer(n) => n.to_le_bytes(),
+                Value::Real(n) => n.to_le_bytes(),
+                Value::Null => {
+                    row[2] |= 1 << idx;
+                    continue;
+                }
+                _ => panic!("numeric fixture required"),
+            };
+            row.push(value.data_type().type_tag());
+            row.extend_from_slice(&8u32.to_le_bytes());
+            row.extend_from_slice(&bytes);
+        }
+        row
+    };
+
+    let table = schema(
+        "t",
+        cols(&[
+            ("id", DataType::Real),
+            ("a", DataType::Integer),
+            ("b", DataType::Real),
+        ]),
+        vec![0],
+    );
+    let key = encode_composite_key(&[Value::Real(1.5)]);
+    for projection in [vec![0, 1, 2], vec![2, 0, 1], vec![0], vec![2]] {
+        let decoder = ProjectedDecoder::try_new(&table, &projection).unwrap();
+        for values in [
+            vec![i(7), Value::Real(2.5)],
+            vec![Value::Null, Value::Real(2.5)],
+            vec![i(7), Value::Null],
+            vec![i(7)],
+            vec![],
+            vec![i(7), i(2)],
+        ] {
+            for encoded in [encode_row(&values), encode_v1(&values)] {
+                let full = decode_full_row_with_cancel(&table, &key, &encoded, None).unwrap();
+                let expected: Vec<_> = projection.iter().map(|&col| full[col].clone()).collect();
+                assert_eq!(decoder.decode(&key, &encoded).unwrap(), expected);
+            }
+        }
+    }
+}
+
+#[test]
 fn posting_lists_sort_by_length_stably() {
     let lists = vec![vec![1, 2], vec![3], vec![4, 5], vec![]];
     assert_eq!(

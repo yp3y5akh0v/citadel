@@ -952,32 +952,28 @@ impl ProjectedDecoder {
     }
 
     pub(super) fn decode(&self, key: &[u8], value: &[u8]) -> Result<Vec<Value>> {
+        let mut out = Vec::with_capacity(self.arity);
         if self.monotonic {
-            match &self.offset_plan {
-                Some(plan) => {
-                    let mut out = Vec::with_capacity(self.arity);
-                    out.push(self.decode_pk(key)?);
-                    if plan.decode_push(value, &mut out)? {
-                        return Ok(out);
-                    }
-                    // Layout mismatch: discard the partial push, fall to the index path.
+            out.push(self.decode_pk(key)?);
+            if let Some(plan) = &self.offset_plan {
+                if plan.decode_push(value, &mut out)? {
+                    return Ok(out);
                 }
-                None if self.nonpk_targets.is_empty() => {
-                    return Ok(vec![self.decode_pk(key)?]);
-                }
-                None => {}
+                out.truncate(1);
             }
-        }
-        let mut out = vec![Value::Null; self.arity];
-        if let Some(j) = self.single_pk_out {
-            out[j] = self.decode_pk(key)?;
-        }
-        if !self.nonpk_targets.is_empty() {
+            out.resize(self.arity, Value::Null);
+        } else {
+            out.resize(self.arity, Value::Null);
+            if let Some(j) = self.single_pk_out {
+                out[j] = self.decode_pk(key)?;
+            }
             if let Some(plan) = &self.offset_plan {
                 if plan.decode_into(value, &mut out)? {
                     return Ok(out);
                 }
             }
+        }
+        if !self.nonpk_targets.is_empty() {
             decode_columns_into(value, &self.nonpk_targets, &self.nonpk_out, &mut out)?;
         }
         Ok(out)
@@ -1052,8 +1048,8 @@ pub(crate) fn decode_full_row_into_with_cancel(
         schema.pk_indices(),
     )?;
     let mapping = schema.decode_col_mapping();
-    let stored_count = row_non_pk_count(value);
     decode_row_into(value, row, mapping)?;
+    let stored_count = row_non_pk_count(value);
     if stored_count < mapping.len() {
         for &logical_idx in mapping.iter().skip(stored_count) {
             if logical_idx != usize::MAX {

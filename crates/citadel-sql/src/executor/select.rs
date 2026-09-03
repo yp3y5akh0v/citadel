@@ -5167,8 +5167,8 @@ impl SimpleScanPlan {
                 });
             }
             let mut out = Vec::with_capacity(rows.len());
-            for row in &rows {
-                out.push(self.project(col_map, row, cancel)?);
+            for mut row in rows {
+                out.push(self.proj.project_decoded(&mut row, cancel)?);
             }
             return Ok(QueryResult {
                 columns: self.columns.clone(),
@@ -5183,39 +5183,23 @@ impl SimpleScanPlan {
             plan,
         )?;
         let mut out = Vec::with_capacity(rows.len());
-        for row in &rows {
+        for mut row in rows {
             if !filtered {
                 if let Some(w) = &self.where_expr {
                     if !is_truthy(&eval_expr(
                         w,
-                        &EvalCtx::new(col_map, row).with_cancel(cancel),
+                        &EvalCtx::new(col_map, &row).with_cancel(cancel),
                     )?) {
                         continue;
                     }
                 }
             }
-            out.push(self.project(col_map, row, cancel)?);
+            out.push(self.proj.project_decoded(&mut row, cancel)?);
         }
         Ok(QueryResult {
             columns: self.columns.clone(),
             rows: out,
         })
-    }
-
-    fn project(
-        &self,
-        col_map: &ColumnMap,
-        row: &[Value],
-        cancel: Option<&CancelToken>,
-    ) -> Result<Vec<Value>> {
-        match &self.proj {
-            StreamProj::Identity { .. } => Ok(row.to_vec()),
-            StreamProj::Columns { idxs, .. } => Ok(idxs.iter().map(|&i| row[i].clone()).collect()),
-            StreamProj::Exprs { exprs, .. } => {
-                let ectx = EvalCtx::new(col_map, row).with_cancel(cancel);
-                exprs.iter().map(|e| eval_expr(e, &ectx)).collect()
-            }
-        }
     }
 }
 
@@ -5236,23 +5220,14 @@ impl PkPointPlan {
             .map_err(SqlError::Storage)?
         {
             Some(value) => {
-                let row = decode_full_row_with_cancel(&self.table_schema, &key, &value, cancel)?;
+                let mut row =
+                    decode_full_row_with_cancel(&self.table_schema, &key, &value, cancel)?;
                 let col_map = self.table_schema.column_map();
                 match eval_expr(
                     &self.where_expr,
                     &EvalCtx::new(col_map, &row).with_cancel(cancel),
                 ) {
-                    Ok(v) if is_truthy(&v) => {
-                        let mut scratch: Vec<Value> = Vec::new();
-                        vec![decode_and_project(
-                            &self.proj,
-                            &self.table_schema,
-                            &key,
-                            &value,
-                            &mut scratch,
-                            cancel,
-                        )?]
-                    }
+                    Ok(v) if is_truthy(&v) => vec![self.proj.project_decoded(&mut row, cancel)?],
                     Ok(_) => Vec::new(),
                     Err(e) => return Err(e),
                 }
@@ -5639,6 +5614,32 @@ enum StreamProj {
     },
 }
 
+impl StreamProj {
+    /// Project an already decoded row, transferring owned values where possible.
+    /// Column/expression projections retain the scratch allocation for reuse.
+    fn project_decoded(
+        &self,
+        row: &mut Vec<Value>,
+        cancel: Option<&CancelToken>,
+    ) -> Result<Vec<Value>> {
+        check_cancel(cancel)?;
+        match self {
+            Self::Identity { .. } => Ok(std::mem::take(row)),
+            Self::Columns { idxs, unique, .. } => {
+                if *unique {
+                    Ok(idxs.iter().map(|&i| std::mem::take(&mut row[i])).collect())
+                } else {
+                    Ok(idxs.iter().map(|&i| row[i].clone()).collect())
+                }
+            }
+            Self::Exprs { col_map, exprs, .. } => {
+                let ectx = EvalCtx::new(col_map, row).with_cancel(cancel);
+                exprs.iter().map(|expr| eval_expr(expr, &ectx)).collect()
+            }
+        }
+    }
+}
+
 struct StreamingSelect<'db> {
     iter: citadel_txn::TableIter<citadel_txn::read_txn::OwnedReadTxnAdapter<'db>>,
     table_schema: Arc<TableSchema>,
@@ -5693,42 +5694,15 @@ fn decode_and_project(
             decode_full_row_with_cancel(schema, key, value, cancel)
         }
         StreamProj::Columns {
-            idxs,
-            proj_decoder,
-            ctx,
-            unique,
-        } => {
-            if let Some(pd) = proj_decoder {
-                return pd.decode(key, value);
-            }
+            proj_decoder: Some(pd),
+            ..
+        } => pd.decode(key, value),
+        StreamProj::Columns { ctx, .. } | StreamProj::Exprs { ctx, .. } => {
             match ctx {
                 Some(c) => c.decode_into_with_cancel(key, value, scratch, cancel)?,
                 None => decode_full_row_into_with_cancel(schema, key, value, scratch, cancel)?,
             }
-            if *unique {
-                Ok(idxs
-                    .iter()
-                    .map(|&i| std::mem::take(&mut scratch[i]))
-                    .collect())
-            } else {
-                Ok(idxs.iter().map(|&i| scratch[i].clone()).collect())
-            }
-        }
-        StreamProj::Exprs {
-            col_map,
-            exprs,
-            ctx,
-        } => {
-            match ctx {
-                Some(c) => c.decode_into_with_cancel(key, value, scratch, cancel)?,
-                None => decode_full_row_into_with_cancel(schema, key, value, scratch, cancel)?,
-            }
-            let ectx = EvalCtx::new(col_map, scratch).with_cancel(cancel);
-            let mut out = Vec::with_capacity(exprs.len());
-            for e in exprs {
-                out.push(eval_expr(e, &ectx)?);
-            }
-            Ok(out)
+            proj.project_decoded(scratch, cancel)
         }
     }
 }
