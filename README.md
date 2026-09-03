@@ -154,7 +154,7 @@ browse tables and memory, run SQL with EXPLAIN and ANALYZE, and inspect vectors
 and integrity results.
 
 See the [Studio guide](crates/citadel-studio/README.md) for screenshots and build
-instructions, and [downloads](https://citadeldb.dev/download/) for release availability.
+instructions. [Download Citadel Studio for Windows, macOS, or Linux](https://citadeldb.dev/download/#studio).
 
 ### Agent frameworks
 

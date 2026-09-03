@@ -14,8 +14,8 @@ were checked. SQL results and vector plots carry no per-atom attestation.
 ## Install and run
 
 Studio is packaged as an AppImage for Linux x86_64, a DMG for macOS Intel or Apple Silicon,
-and an MSI for Windows x86_64. See [downloads](https://citadeldb.dev/download/) and the
-[installation notes](../../packaging/README.md). Studio is not published to crates.io.
+and an MSI for Windows x86_64. [Download Citadel Studio](https://citadeldb.dev/download/#studio)
+or see the [installation notes](../../packaging/README.md). Studio is not published to crates.io.
 
 To build from this repository, use Rust 1.95 or later:
 

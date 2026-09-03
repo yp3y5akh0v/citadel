@@ -190,6 +190,22 @@ for (const [tag, studio] of [['v2.1.0', false], ['v2.2.0', true]]) {
         .map(a => a.browser_download_url);
       assert.deepEqual(links.toSorted(), expected.toSorted());
       assert.equal(html.includes('Studio installers are not included'), !studio);
+      if (studio) {
+        const studioSection = html.slice(
+          html.indexOf('<section class=block id=studio>'),
+          html.indexOf('<section class=block id=archives>'),
+        );
+        const buttonLabels = [...studioSection.matchAll(
+          /<a class="btn sm" href=(?:"[^"]+"|[^\s>]+)>([^<]+)<\/a>/g,
+        )].map(match => match[1]);
+        assert.equal((studioSection.match(/<p class=download-actions>/g) ?? []).length, 4);
+        assert.deepEqual(buttonLabels, [
+          'Download MSI',
+          'Apple Silicon DMG',
+          'Intel DMG',
+          'Download AppImage',
+        ]);
+      }
       assert.ok(html.includes(`citadeldb / ${tag}`));
       assert.ok(!html.includes('version-chip.js'));
       assert.ok(!html.includes('does not include GitHub build attestations'));
@@ -202,3 +218,11 @@ for (const [tag, studio] of [['v2.1.0', false], ['v2.2.0', true]]) {
     }
   });
 }
+
+test('download link styles preserve the button foreground', () => {
+  const css = readFileSync(join(__dirname, '..', 'static/css/style.css'), 'utf8');
+  assert.match(css, /\.btn\s*\{[^}]*color:\s*var\(--accent-ink\)/s);
+  assert.match(css, /\.binding p a:not\(\.btn\)/);
+  assert.match(css, /\.binding \.download-actions\s*\{[^}]*gap:\s*12px/s);
+  assert.match(css, /\.btn:focus-visible\s*\{[^}]*outline:/s);
+});

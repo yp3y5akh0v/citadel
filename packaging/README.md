@@ -35,7 +35,7 @@ Each package's README contains setup, supported operations, and limitations.
 ## Desktop installers
 
 Citadel Studio is packaged for Linux, macOS, and Windows.
-See [downloads](https://citadeldb.dev/download/) for release availability.
+[Download Citadel Studio](https://citadeldb.dev/download/#studio) for the current release.
 
 | Platform | Installer | Architecture |
 |---|---|---|

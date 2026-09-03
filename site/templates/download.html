@@ -30,22 +30,22 @@
         <div class="top"><h4>Windows</h4><span class="ver">x86_64 / MSI</span></div>
         <p>Per-user installation with Start menu and uninstall entries. The unsigned installer can show an Unknown Publisher or SmartScreen warning.</p>
         {% if release.studio %}
-        <p><a class="btn sm" href="{{ release.studio.windows.url }}">Download MSI</a> <a href="{{ release.studio.windows.checksum.url }}">SHA-256</a></p>
+        <p class="download-actions"><a class="btn sm" href="{{ release.studio.windows.url }}">Download MSI</a><a href="{{ release.studio.windows.checksum.url }}">SHA-256</a></p>
         {% endif %}
       </div>
       <div class="binding">
         <div class="top"><h4>macOS</h4><span class="ver">Apple Silicon + Intel / DMG</span></div>
         <p>Separate builds for each architecture. The app is ad-hoc signed, not Developer ID signed or notarized; Gatekeeper can block opening it.</p>
         {% if release.studio %}
-        <p><a class="btn sm" href="{{ release.studio.macos_arm64.url }}">Apple Silicon DMG</a> <a href="{{ release.studio.macos_arm64.checksum.url }}">SHA-256</a></p>
-        <p><a class="btn sm" href="{{ release.studio.macos_x86_64.url }}">Intel DMG</a> <a href="{{ release.studio.macos_x86_64.checksum.url }}">SHA-256</a></p>
+        <p class="download-actions"><a class="btn sm" href="{{ release.studio.macos_arm64.url }}">Apple Silicon DMG</a><a href="{{ release.studio.macos_arm64.checksum.url }}">SHA-256</a></p>
+        <p class="download-actions"><a class="btn sm" href="{{ release.studio.macos_x86_64.url }}">Intel DMG</a><a href="{{ release.studio.macos_x86_64.checksum.url }}">SHA-256</a></p>
         {% endif %}
       </div>
       <div class="binding">
         <div class="top"><h4>Linux</h4><span class="ver">x86_64 / AppImage</span></div>
         <p>A portable desktop app. Mark the AppImage executable before launching; systems without FUSE can use AppImage extraction.</p>
         {% if release.studio %}
-        <p><a class="btn sm" href="{{ release.studio.linux.url }}">Download AppImage</a> <a href="{{ release.studio.linux.checksum.url }}">SHA-256</a></p>
+        <p class="download-actions"><a class="btn sm" href="{{ release.studio.linux.url }}">Download AppImage</a><a href="{{ release.studio.linux.checksum.url }}">SHA-256</a></p>
         {% endif %}
       </div>
     </div>
