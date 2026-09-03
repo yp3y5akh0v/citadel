@@ -79,13 +79,23 @@ jobs:
         run: |
           cargo install cargo-about --version 0.9.1 --locked --features cli
           GENERATED="$RUNNER_TEMP/THIRD_PARTY_LICENSES.html"
-          cargo about generate \
+          LOG="$RUNNER_TEMP/cargo-about.log"
+          if ! cargo about generate \
             --manifest-path Cargo.toml \
             --workspace --all-features \
             --config packaging/licenses/about.toml \
             --locked --fail \
             --output-file "$GENERATED" \
-            packaging/licenses/about.hbs
+            packaging/licenses/about.hbs > "$LOG" 2>&1; then
+            cat "$LOG"
+            exit 1
+          fi
+          cat "$LOG"
+          # A stale clarification checksum only warns; cargo-about then scans silently.
+          if grep -q 'failed to validate all files specified in clarification' "$LOG"; then
+            echo "::error::a clarification in packaging/licenses/about.toml no longer matches its crate"
+            exit 1
+          fi
           # Normalize upstream whitespace for reproducible licence inventories.
           sed -i -E 's/\r$//; s/[[:blank:]]+$//' "$GENERATED"
           if ! cmp -s packaging/licenses/THIRD_PARTY_LICENSES.html "$GENERATED"; then
