@@ -95,7 +95,6 @@ cat > "$APPDIR/usr/share/metainfo/$ID.appdata.xml" <<META
   </screenshots>
   <url type="homepage">https://citadeldb.dev</url>
   <url type="bugtracker">https://github.com/${GITHUB_REPOSITORY}/issues</url>
-  <url type="vcs-browser">https://github.com/${GITHUB_REPOSITORY}</url>
   <content_rating type="oars-1.1"/>
   <releases>
     <release version="${TAG#v}" date="${RELEASE_DATE}"/>
@@ -103,7 +102,8 @@ cat > "$APPDIR/usr/share/metainfo/$ID.appdata.xml" <<META
 </component>
 META
 
-sudo apt-get install --no-install-recommends -y desktop-file-utils appstream xauth xvfb
+sudo apt-get install --no-install-recommends -y desktop-file-utils appstream xauth xvfb \
+  libxkbcommon-x11-0
 desktop-file-validate "$APPDIR/usr/share/applications/$ID.desktop"
 appstreamcli validate --no-net "$APPDIR/usr/share/metainfo/$ID.appdata.xml"
 
@@ -131,11 +131,16 @@ echo "2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d  $RUNTIME
   | sha256sum -c -
 
 # AppStream was validated offline; skip the plugin's network validation.
+# winit dlopens xkbcommon, so ldd-based bundling misses it and a host without
+# libxkbcommon-x11 aborts at launch.
+LIBDIR=/usr/lib/x86_64-linux-gnu
 ARCH=x86_64 LDAI_VERSION="${TAG#v}" LDAI_OUTPUT="$OUT" LDAI_NO_APPSTREAM=1 \
   LDAI_RUNTIME_FILE="$RUNTIME" \
   "$LINUXDEPLOY" --appimage-extract-and-run \
   --appdir "$APPDIR" \
   --executable "$APPDIR/usr/bin/citadel-studio" \
+  --library "$LIBDIR/libxkbcommon.so.0" \
+  --library "$LIBDIR/libxkbcommon-x11.so.0" \
   --desktop-file "$APPDIR/usr/share/applications/$ID.desktop" \
   --icon-file "$APPDIR/usr/share/icons/hicolor/256x256/apps/$ID.png" \
   --output appimage
@@ -145,6 +150,12 @@ if grep -q 'not found' "$TMP_ROOT/ldd.txt"; then
   echo "::error::linuxdeploy left an unresolved Studio library"
   exit 1
 fi
+for lib in libxkbcommon.so.0 libxkbcommon-x11.so.0; do
+  if [ ! -f "$APPDIR/usr/lib/$lib" ]; then
+    echo "::error::AppImage does not bundle $lib"
+    exit 1
+  fi
+done
 
 # Exit 124 means the app remained running until timeout.
 set +e
