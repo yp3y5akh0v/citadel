@@ -707,3 +707,55 @@ fn composite_key_with_vector_component() {
     let vals = decode_composite_key(&buf, 2).unwrap();
     assert_eq!(vals[1], Value::Integer(42));
 }
+
+#[test]
+fn fixed_width_v1_cells_require_exact_payload_lengths() {
+    for (kind, width) in [
+        (DataType::Integer, 8),
+        (DataType::Real, 8),
+        (DataType::Boolean, 1),
+        (DataType::Date, 4),
+        (DataType::Time, 8),
+        (DataType::Timestamp, 8),
+        (DataType::Interval, 16),
+    ] {
+        for len in [0, width - 1, width, width + 1] {
+            let mut data = vec![1, 0, 0, kind.type_tag()];
+            data.extend_from_slice(&(len as u32).to_le_bytes());
+            data.resize(data.len() + len, 0);
+            for outcome in [
+                std::panic::catch_unwind(|| decode_row(&data).map(|_| ())),
+                std::panic::catch_unwind(|| decode_column_raw(&data, 0).map(|_| ())),
+                std::panic::catch_unwind(|| decode_column_with_offset(&data, 0).map(|_| ())),
+            ] {
+                if len == width {
+                    assert!(matches!(outcome, Ok(Ok(()))), "{kind:?}: {outcome:?}");
+                    continue;
+                }
+                assert!(
+                    matches!(outcome, Ok(Err(SqlError::InvalidValue(_)))),
+                    "{kind:?} payload of {len} bytes must return an error: {outcome:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn skipped_cell_bodies_are_checked_before_a_null_target() {
+    for version in [0, V2_FLAG] {
+        let mut data = (2u16 | version).to_le_bytes().to_vec();
+        data.extend_from_slice(&[0b10, DataType::Text.type_tag()]);
+        data.extend_from_slice(&u32::MAX.to_le_bytes());
+        for outcome in [
+            std::panic::catch_unwind(|| decode_columns(&data, &[1]).map(|_| ())),
+            std::panic::catch_unwind(|| decode_column_raw(&data, 1).map(|_| ())),
+            std::panic::catch_unwind(|| decode_column_with_offset(&data, 1).map(|_| ())),
+        ] {
+            assert!(
+                matches!(outcome, Ok(Err(SqlError::InvalidValue(_)))),
+                "a NULL target must not hide a truncated preceding cell: {outcome:?}"
+            );
+        }
+    }
+}

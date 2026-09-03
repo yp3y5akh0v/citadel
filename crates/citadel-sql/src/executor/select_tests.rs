@@ -68,10 +68,208 @@ fn empty_select(from: &str) -> SelectStmt {
     }
 }
 
-/// The agreement test the refactor stands on.
-///
-/// `choose_strategy` is the only place a single-table SELECT's path is decided,
-/// and EXPLAIN reads the same answer. These pin which path each shape takes.
+mod owned_projection {
+    use super::*;
+
+    fn schema() -> TableSchema {
+        TableSchema::new(
+            "t".into(),
+            cols(&[
+                ("id", DataType::Integer),
+                ("payload", DataType::Blob),
+                ("label", DataType::Text),
+            ]),
+            vec![0],
+            vec![],
+            vec![],
+            vec![],
+        )
+    }
+
+    fn projection(sql: &str) -> StreamProj {
+        build_stream_proj(&agg_select_stmt(sql).columns, &schema()).unwrap()
+    }
+
+    fn row() -> Vec<Value> {
+        vec![
+            i(7),
+            Value::Blob(vec![0x5a; 16 * 1024]),
+            Value::Text("label".repeat(1024).into()),
+        ]
+    }
+
+    fn blob_ptr(value: &Value) -> *const u8 {
+        match value {
+            Value::Blob(bytes) => bytes.as_ptr(),
+            _ => panic!("expected Blob"),
+        }
+    }
+
+    fn text_ptr(value: &Value) -> *const u8 {
+        match value {
+            Value::Text(text) => text.as_str().as_ptr(),
+            _ => panic!("expected Text"),
+        }
+    }
+
+    #[test]
+    fn identity_transfers_row_and_large_value_allocations() {
+        let mut input = row();
+        let row_ptr = input.as_ptr();
+        let payload_ptr = blob_ptr(&input[1]);
+        let label_ptr = text_ptr(&input[2]);
+        let output = projection("SELECT * FROM t")
+            .project_decoded(&mut input, None)
+            .unwrap();
+        assert_eq!(
+            output.as_ptr(),
+            row_ptr,
+            "identity must transfer the Vec, not clone it"
+        );
+        assert_eq!(blob_ptr(&output[1]), payload_ptr);
+        assert_eq!(text_ptr(&output[2]), label_ptr);
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn unique_columns_move_values_and_retain_scratch_allocation() {
+        let mut input = row();
+        let scratch_ptr = input.as_ptr();
+        let payload_ptr = blob_ptr(&input[1]);
+        let label_ptr = text_ptr(&input[2]);
+        let output = projection("SELECT label AS name, payload FROM t")
+            .project_decoded(&mut input, None)
+            .unwrap();
+        assert_eq!(text_ptr(&output[0]), label_ptr, "large Text must move");
+        assert_eq!(blob_ptr(&output[1]), payload_ptr, "large Blob must move");
+        assert_eq!(input.as_ptr(), scratch_ptr);
+        assert_eq!(input, vec![i(7), Value::Null, Value::Null]);
+    }
+
+    #[test]
+    fn duplicates_keep_every_selected_value() {
+        let mut input = row();
+        let expected = vec![
+            input[1].clone(),
+            input[2].clone(),
+            input[1].clone(),
+            input[2].clone(),
+        ];
+        let proj = projection("SELECT payload, label, payload AS again, label AS name FROM t");
+        assert!(matches!(proj, StreamProj::Columns { unique: false, .. }));
+        assert_eq!(proj.project_decoded(&mut input, None).unwrap(), expected);
+    }
+
+    #[test]
+    fn expressions_share_the_original_row_and_propagate_errors() {
+        let mut input = row();
+        let expected = vec![
+            input[2].clone(),
+            Value::Text("label".repeat(2048).into()),
+            i(14),
+        ];
+        let output = projection("SELECT label, label || label, id + id FROM t")
+            .project_decoded(&mut input, None)
+            .unwrap();
+        assert_eq!(output, expected);
+        let error = projection("SELECT id / (id - id) FROM t")
+            .project_decoded(&mut input, None)
+            .unwrap_err();
+        assert!(matches!(error, SqlError::DivisionByZero));
+    }
+
+    #[test]
+    fn cancellation_precedes_projection_or_value_moves() {
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        for sql in [
+            "SELECT * FROM t",
+            "SELECT label, payload FROM t",
+            "SELECT payload, payload FROM t",
+            "SELECT id + id FROM t",
+        ] {
+            let mut input = row();
+            let expected = input.clone();
+            let error = projection(sql)
+                .project_decoded(&mut input, Some(&cancel))
+                .unwrap_err();
+            assert!(
+                matches!(error, SqlError::Storage(citadel_core::Error::Interrupted)),
+                "{sql}: {error}"
+            );
+            assert_eq!(input, expected, "cancelled projection must not move values");
+        }
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn compiled_point_and_filter_lanes_preserve_projection_results() {
+        use crate::connection::Connection;
+        let dir = tempfile::tempdir().unwrap();
+        let db = citadel::DatabaseBuilder::new(dir.path().join("projection.db"))
+            .passphrase(b"x")
+            .argon2_profile(citadel::Argon2Profile::Iot)
+            .create()
+            .unwrap();
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, payload BLOB, label TEXT)")
+            .unwrap();
+        let original = row();
+        conn.execute_params("INSERT INTO t VALUES ($1, $2, $3)", &original)
+            .unwrap();
+        conn.execute_params(
+            "INSERT INTO t VALUES ($1, $2, $3)",
+            &[i(8), Value::Blob(vec![1]), Value::Text("other".into())],
+        )
+        .unwrap();
+        conn.execute("ALTER TABLE t ADD COLUMN added TEXT DEFAULT 'legacy'")
+            .unwrap();
+        let schema = SchemaManager::load(&db).unwrap();
+        for predicate in ["id = 7", "id >= 7 AND id < 8"] {
+            for (select, expected) in [
+                (
+                    "*",
+                    vec![
+                        i(7),
+                        original[1].clone(),
+                        original[2].clone(),
+                        Value::Text("legacy".into()),
+                    ],
+                ),
+                (
+                    "label AS name, payload",
+                    vec![original[2].clone(), original[1].clone()],
+                ),
+                (
+                    "payload, payload AS again, added",
+                    vec![
+                        original[1].clone(),
+                        original[1].clone(),
+                        Value::Text("legacy".into()),
+                    ],
+                ),
+                ("id + id AS twice, id - 1 AS previous", vec![i(14), i(6)]),
+            ] {
+                let sql = format!("SELECT {select} FROM t WHERE {predicate}");
+                let lane = build_select_lane(&schema, &agg_select_stmt(&sql))
+                    .expect("must use compiled lane");
+                assert_eq!(
+                    matches!(lane, CompiledSelectLane::Point(_)),
+                    predicate == "id = 7"
+                );
+                let actual = lane.run(&mut db.begin_read()).unwrap();
+                assert_eq!(actual.rows, vec![expected], "{sql}");
+            }
+        }
+        let missing = build_select_lane(
+            &schema,
+            &agg_select_stmt("SELECT label FROM t WHERE id = 404"),
+        )
+        .unwrap();
+        assert!(missing.run(&mut db.begin_read()).unwrap().rows.is_empty());
+    }
+}
+
 mod strategy {
     use super::*;
     use crate::executor::select::{choose_strategy, Strategy};
@@ -164,10 +362,7 @@ mod strategy {
     }
 }
 
-/// Driven through `process_select` directly rather than through SQL, because a
-/// query would stop at the scan and never reach a phase boundary at all. The
-/// rows are already materialized here, which is exactly the state these checks
-/// exist for: the scan is over, and the sort or filter still has to run.
+// Materialized rows isolate cancellation after the scan.
 mod post_scan_cancellation {
     use super::*;
     use citadel::CancelToken;
@@ -239,7 +434,6 @@ mod post_scan_cancellation {
         assert!(is_interrupted(&err), "got {err:?}");
     }
 
-    /// The default path is untouched: no token, identical results.
     #[test]
     fn no_token_means_no_behaviour_change() {
         let columns = schema_cols();
@@ -694,7 +888,6 @@ mod post_scan_cancellation {
         }
     }
 
-    /// A token that was never tripped must not interfere either.
     #[test]
     fn an_untripped_token_lets_every_phase_run() {
         use crate::parser::OrderByItem;
@@ -986,8 +1179,7 @@ fn merge_sum_matches_serial_feed() {
     assert_eq!(left.finish(), serial.finish());
 }
 
-/// Overflow behavior is profile-dependent (`+=` panics in debug, wraps in
-/// release); the merge must diverge from serial feeding in NEITHER profile.
+// Merged and serial aggregates must agree in both debug and release profiles.
 #[test]
 fn merge_sum_overflow_parity_with_serial_feed() {
     use std::panic::{catch_unwind, AssertUnwindSafe};

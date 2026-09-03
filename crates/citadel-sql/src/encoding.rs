@@ -625,6 +625,7 @@ pub fn encode_row_with_template(
 }
 
 fn decode_value(type_tag: u8, data: &[u8]) -> Result<Value> {
+    validate_fixed_width(type_tag, data)?;
     match DataType::from_tag(type_tag) {
         Some(DataType::Integer) => Ok(Value::Integer(i64::from_le_bytes(
             data[..8].try_into().unwrap(),
@@ -649,9 +650,6 @@ fn decode_value(type_tag: u8, data: &[u8]) -> Result<Value> {
             data[..8].try_into().unwrap(),
         ))),
         Some(DataType::Interval) => {
-            if data.len() < 16 {
-                return Err(SqlError::InvalidValue("truncated interval".into()));
-            }
             let months = i32::from_le_bytes(data[0..4].try_into().unwrap());
             let days = i32::from_le_bytes(data[4..8].try_into().unwrap());
             let micros = i64::from_le_bytes(data[8..16].try_into().unwrap());
@@ -890,6 +888,16 @@ pub(crate) fn fixed_width_size(type_tag: u8) -> Option<usize> {
     }
 }
 
+#[inline]
+fn validate_fixed_width(type_tag: u8, data: &[u8]) -> Result<()> {
+    if fixed_width_size(type_tag).is_some_and(|width| data.len() != width) {
+        return Err(SqlError::InvalidValue(
+            "invalid fixed-width column length".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Resolve a cell's `(data_len, body_pos)` from its tag. Variable-width cells carry a
 /// u32 length prefix; V2 fixed-width cells omit it.
 #[inline]
@@ -906,15 +914,11 @@ fn cell_extent(
     if let Some(n) = fixed {
         return Ok((n, after_tag));
     }
-    if after_tag + 4 > data.len() {
-        return Err(SqlError::InvalidValue("truncated column data".into()));
-    }
-    let len = u32::from_le_bytes([
-        data[after_tag],
-        data[after_tag + 1],
-        data[after_tag + 2],
-        data[after_tag + 3],
-    ]) as usize;
+    let bytes = data
+        .get(after_tag..)
+        .and_then(|rest| rest.get(..4))
+        .ok_or_else(|| SqlError::InvalidValue("truncated column data".into()))?;
+    let len = u32::from_le_bytes(bytes.try_into().unwrap()) as usize;
     Ok((len, after_tag + 4))
 }
 
@@ -925,25 +929,16 @@ fn read_cell(data: &[u8], pos: usize, version: RowVersion) -> Result<(u8, &[u8],
     }
     let type_tag = data[pos];
     let (data_len, body_pos) = cell_extent(data, type_tag, pos + 1, version)?;
-    if body_pos + data_len > data.len() {
-        return Err(SqlError::InvalidValue("truncated column value".into()));
-    }
-    Ok((
-        type_tag,
-        &data[body_pos..body_pos + data_len],
-        body_pos + data_len,
-    ))
+    let body = data
+        .get(body_pos..)
+        .and_then(|rest| rest.get(..data_len))
+        .ok_or_else(|| SqlError::InvalidValue("truncated column value".into()))?;
+    Ok((type_tag, body, body_pos + data_len))
 }
 
-/// Next cell position by offset; the body is left unsliced (the next read validates it).
 #[inline]
 fn skip_cell(data: &[u8], pos: usize, version: RowVersion) -> Result<usize> {
-    if pos >= data.len() {
-        return Err(SqlError::InvalidValue("truncated column data".into()));
-    }
-    let type_tag = data[pos];
-    let (data_len, body_pos) = cell_extent(data, type_tag, pos + 1, version)?;
-    Ok(body_pos + data_len)
+    read_cell(data, pos, version).map(|(_, _, next)| next)
 }
 
 fn copy_cell_to_v2(
@@ -1213,7 +1208,7 @@ impl ProjectedOffsetPlan {
         let after_tag = pos + 1;
         let (len, body_pos) = match t.fixed_width {
             Some(n) => (n, after_tag),
-            None => match data.get(after_tag..after_tag + 4) {
+            None => match data.get(after_tag..).and_then(|rest| rest.get(..4)) {
                 Some(lb) => (
                     u32::from_le_bytes(lb.try_into().unwrap()) as usize,
                     after_tag + 4,
@@ -1221,7 +1216,7 @@ impl ProjectedOffsetPlan {
                 None => return Ok(None),
             },
         };
-        match data.get(body_pos..body_pos + len) {
+        match data.get(body_pos..).and_then(|rest| rest.get(..len)) {
             Some(body) => Ok(Some(decode_value(t.tag, body)?)),
             None => Ok(None),
         }
@@ -1242,7 +1237,7 @@ impl ProjectedOffsetPlan {
     }
 
     /// Push planned columns onto `out` (monotonic projection only). `Ok(false)` = layout
-    /// mismatch; `out` may be left partially pushed and must be discarded by the caller.
+    /// mismatch; the caller must remove any partially pushed values.
     pub(crate) fn decode_push(&self, data: &[u8], out: &mut Vec<Value>) -> Result<bool> {
         if !self.layout_ok(data) {
             return Ok(false);
@@ -1403,6 +1398,7 @@ impl<'a> RawColumn<'a> {
 }
 
 fn decode_value_raw(type_tag: u8, data: &[u8]) -> Result<RawColumn<'_>> {
+    validate_fixed_width(type_tag, data)?;
     match DataType::from_tag(type_tag) {
         Some(DataType::Integer) => Ok(RawColumn::Integer(i64::from_le_bytes(
             data[..8].try_into().unwrap(),
@@ -1427,9 +1423,6 @@ fn decode_value_raw(type_tag: u8, data: &[u8]) -> Result<RawColumn<'_>> {
             data[..8].try_into().unwrap(),
         ))),
         Some(DataType::Interval) => {
-            if data.len() < 16 {
-                return Err(SqlError::InvalidValue("truncated interval".into()));
-            }
             let months = i32::from_le_bytes(data[0..4].try_into().unwrap());
             let days = i32::from_le_bytes(data[4..8].try_into().unwrap());
             let micros = i64::from_le_bytes(data[8..16].try_into().unwrap());
@@ -1560,33 +1553,26 @@ pub fn patch_row_column(
 }
 
 pub fn decode_column_raw(data: &[u8], target: usize) -> Result<RawColumn<'_>> {
-    let (version, col_count, bitmap, mut pos) = parse_row_header(data)?;
-    if target >= col_count {
-        return Ok(RawColumn::Null);
-    }
+    Ok(decode_stored_column_raw(data, target)?.unwrap_or(RawColumn::Null))
+}
 
-    for col in 0..=target {
-        let is_null = bitmap[col / 8] & (1 << (col % 8)) != 0;
-
-        if col == target {
-            if is_null {
-                return Ok(RawColumn::Null);
-            }
-            let (type_tag, body, _) = read_cell(data, pos, version)?;
-            return decode_value_raw(type_tag, body);
-        } else if !is_null {
-            pos = skip_cell(data, pos, version)?;
-        }
-    }
-
-    unreachable!()
+/// `None` identifies a missing physical column; a stored NULL is `Some(Null)`.
+pub(crate) fn decode_stored_column_raw(
+    data: &[u8],
+    target: usize,
+) -> Result<Option<RawColumn<'_>>> {
+    Ok(read_column_with_offset(data, target)?.map(|(raw, _)| raw))
 }
 
 /// Like `decode_column_raw` but also returns the byte offset (usize::MAX if NULL).
 pub fn decode_column_with_offset(data: &[u8], target: usize) -> Result<(RawColumn<'_>, usize)> {
+    Ok(read_column_with_offset(data, target)?.unwrap_or((RawColumn::Null, usize::MAX)))
+}
+
+fn read_column_with_offset(data: &[u8], target: usize) -> Result<Option<(RawColumn<'_>, usize)>> {
     let (version, col_count, bitmap, mut pos) = parse_row_header(data)?;
     if target >= col_count {
-        return Ok((RawColumn::Null, usize::MAX));
+        return Ok(None);
     }
 
     for col in 0..=target {
@@ -1594,12 +1580,12 @@ pub fn decode_column_with_offset(data: &[u8], target: usize) -> Result<(RawColum
 
         if col == target {
             if is_null {
-                return Ok((RawColumn::Null, usize::MAX));
+                return Ok(Some((RawColumn::Null, usize::MAX)));
             }
             let tag_offset = pos;
             let (type_tag, body, _) = read_cell(data, pos, version)?;
             let raw = decode_value_raw(type_tag, body)?;
-            return Ok((raw, tag_offset));
+            return Ok(Some((raw, tag_offset)));
         } else if !is_null {
             pos = skip_cell(data, pos, version)?;
         }

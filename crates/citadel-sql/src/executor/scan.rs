@@ -2,8 +2,8 @@ use citadel::Database;
 use citadel_txn::read_txn::ReadTxn;
 
 use crate::encoding::{
-    decode_column_raw, decode_composite_key, decode_key_value, decode_pk_integer,
-    encode_composite_key, row_non_pk_count, RawColumn,
+    decode_composite_key, decode_key_value, decode_stored_column_raw, encode_composite_key,
+    RawColumn,
 };
 use crate::error::{Result, SqlError};
 use crate::eval::{eval_expr, is_truthy, referenced_columns, ColumnMap, CompiledExpr, EvalCtx};
@@ -1408,110 +1408,33 @@ pub(super) struct SimplePredicate {
     op: BinOp,
     literal: Value,
     num_pk_cols: usize,
-    precomputed_int: Option<i64>,
-    default_int: Option<i64>,
     default_val: Option<Value>,
 }
 
 impl SimplePredicate {
     pub(super) fn matches_raw(&self, key: &[u8], value: &[u8]) -> Result<bool> {
-        if let Some(target) = self.precomputed_int {
-            return Ok(self.match_nonpk_int_inline(value, target));
-        }
-        let raw = if self.is_pk {
+        if self.is_pk {
             if self.num_pk_cols == 1 {
-                RawColumn::Integer(decode_pk_integer(key)?)
-            } else {
-                let pk = decode_composite_key(key, self.num_pk_cols)?;
-                match &pk[self.pk_pos] {
-                    Value::Integer(i) => RawColumn::Integer(*i),
-                    Value::Real(r) => RawColumn::Real(*r),
-                    Value::Boolean(b) => RawColumn::Boolean(*b),
-                    _ => {
-                        return Ok(raw_matches_op_value(
-                            &pk[self.pk_pos],
-                            self.op,
-                            &self.literal,
-                        ))
-                    }
-                }
+                return Ok(raw_matches_op_value(
+                    &decode_key_value(key)?.0,
+                    self.op,
+                    &self.literal,
+                ));
             }
-        } else if self.nonpk_idx >= row_non_pk_count(value) {
-            return Ok(match &self.default_val {
-                Some(d) => raw_matches_op_value(d, self.op, &self.literal),
-                None => false,
-            });
-        } else {
-            decode_column_raw(value, self.nonpk_idx)?
-        };
-        Ok(raw_matches_op(&raw, self.op, &self.literal))
-    }
-
-    #[inline(always)]
-    fn match_nonpk_int_inline(&self, data: &[u8], target: i64) -> bool {
-        let raw = u16::from_le_bytes(data[0..2].try_into().unwrap());
-        let is_v2 = raw & crate::encoding::V2_FLAG != 0;
-        let col_count = (raw & crate::encoding::COL_COUNT_MASK) as usize;
-
-        if self.nonpk_idx >= col_count {
-            return match self.default_int {
-                Some(v) => match self.op {
-                    BinOp::Eq => v == target,
-                    BinOp::NotEq => v != target,
-                    BinOp::Lt => v < target,
-                    BinOp::Gt => v > target,
-                    BinOp::LtEq => v <= target,
-                    BinOp::GtEq => v >= target,
-                    _ => false,
-                },
-                None => false,
-            };
+            let pk = decode_composite_key(key, self.num_pk_cols)?;
+            return Ok(raw_matches_op_value(
+                &pk[self.pk_pos],
+                self.op,
+                &self.literal,
+            ));
         }
-
-        let bm_bytes = col_count.div_ceil(8);
-
-        if data[2 + self.nonpk_idx / 8] & (1 << (self.nonpk_idx % 8)) != 0 {
-            return false;
-        }
-
-        let mut pos = 2 + bm_bytes;
-
-        for col in 0..self.nonpk_idx {
-            if data[2 + col / 8] & (1 << (col % 8)) == 0 {
-                let tag = data[pos];
-                let cell_len = if is_v2 {
-                    match crate::encoding::fixed_width_size(tag) {
-                        Some(n) => 1 + n,
-                        None => {
-                            let len = u32::from_le_bytes(data[pos + 1..pos + 5].try_into().unwrap())
-                                as usize;
-                            5 + len
-                        }
-                    }
-                } else {
-                    let len =
-                        u32::from_le_bytes(data[pos + 1..pos + 5].try_into().unwrap()) as usize;
-                    5 + len
-                };
-                pos += cell_len;
-            }
-        }
-
-        let v = if is_v2 {
-            i64::from_le_bytes(data[pos + 1..pos + 9].try_into().unwrap())
-        } else {
-            i64::from_le_bytes(data[pos + 5..pos + 13].try_into().unwrap())
-        };
-
-        match self.op {
-            BinOp::Eq => v == target,
-            BinOp::NotEq => v != target,
-            BinOp::Lt => v < target,
-            BinOp::Gt => v > target,
-            BinOp::LtEq => v <= target,
-            BinOp::GtEq => v >= target,
-            _ => false,
-        }
+        Ok(match decode_stored_column_raw(value, self.nonpk_idx)? {
+            Some(raw) => raw_matches_op(&raw, self.op, &self.literal),
+            None => self
+                .default_val
+                .as_ref()
+                .is_some_and(|default| raw_matches_op_value(default, self.op, &self.literal)),
+        })
     }
 }
 
@@ -1529,37 +1452,18 @@ pub(super) struct BetweenPredicate {
 
 impl BetweenPredicate {
     pub(super) fn matches_raw(&self, key: &[u8], value: &[u8]) -> Result<bool> {
-        let raw = if self.is_pk {
+        if self.is_pk {
             if self.num_pk_cols == 1 {
-                RawColumn::Integer(decode_pk_integer(key)?)
-            } else {
-                let pk = decode_composite_key(key, self.num_pk_cols)?;
-                match &pk[self.pk_pos] {
-                    Value::Integer(i) => RawColumn::Integer(*i),
-                    Value::Real(r) => RawColumn::Real(*r),
-                    Value::Boolean(b) => RawColumn::Boolean(*b),
-                    other => {
-                        let in_range = raw_matches_op_value(other, BinOp::GtEq, &self.low)
-                            && raw_matches_op_value(other, BinOp::LtEq, &self.high);
-                        return Ok(if self.negated { !in_range } else { in_range });
-                    }
-                }
+                return Ok(self.matches_value(&decode_key_value(key)?.0));
             }
-        } else if self.nonpk_idx >= row_non_pk_count(value) {
-            return Ok(match &self.default_val {
-                Some(d) => {
-                    let in_range = raw_matches_op_value(d, BinOp::GtEq, &self.low)
-                        && raw_matches_op_value(d, BinOp::LtEq, &self.high);
-                    if self.negated {
-                        !in_range
-                    } else {
-                        in_range
-                    }
-                }
-                None => false,
-            });
-        } else {
-            decode_column_raw(value, self.nonpk_idx)?
+            let pk = decode_composite_key(key, self.num_pk_cols)?;
+            return Ok(self.matches_value(&pk[self.pk_pos]));
+        }
+        let Some(raw) = decode_stored_column_raw(value, self.nonpk_idx)? else {
+            return Ok(self
+                .default_val
+                .as_ref()
+                .is_some_and(|default| self.matches_value(default)));
         };
         if matches!(raw, RawColumn::Null) {
             return Ok(false);
@@ -1568,6 +1472,19 @@ impl BetweenPredicate {
         let le = raw_matches_op(&raw, BinOp::LtEq, &self.high);
         let in_range = ge && le;
         Ok(if self.negated { !in_range } else { in_range })
+    }
+
+    fn matches_value(&self, value: &Value) -> bool {
+        if value.is_null() {
+            return false;
+        }
+        let in_range = raw_matches_op_value(value, BinOp::GtEq, &self.low)
+            && raw_matches_op_value(value, BinOp::LtEq, &self.high);
+        if self.negated {
+            !in_range
+        } else {
+            in_range
+        }
     }
 }
 
@@ -1613,6 +1530,9 @@ pub(super) fn try_between_predicate(expr: &Expr, schema: &TableSchema) -> Option
     };
     let low = coerce_bound(low)?;
     let high = coerce_bound(high)?;
+    if !raw_comparison_supported(col_type, &low) || !raw_comparison_supported(col_type, &high) {
+        return None;
+    }
 
     let non_pk = schema.non_pk_indices();
 
@@ -1696,6 +1616,9 @@ pub(super) fn try_simple_predicate(expr: &Expr, schema: &TableSchema) -> Option<
     } else {
         literal
     };
+    if !raw_comparison_supported(col_type, &literal) {
+        return None;
+    }
     let literal = &literal;
     let non_pk = schema.non_pk_indices();
 
@@ -1711,25 +1634,15 @@ pub(super) fn try_simple_predicate(expr: &Expr, schema: &TableSchema) -> Option<
             op,
             literal: literal.clone(),
             num_pk_cols: schema.primary_key_columns.len(),
-            precomputed_int: None,
-            default_int: None,
             default_val: None,
         })
     } else {
         let nonpk_order = non_pk.iter().position(|&i| i == col_idx)?;
         let nonpk_idx = schema.encoding_positions()[nonpk_order] as usize;
-        let precomputed_int = match literal {
-            Value::Integer(i) => Some(*i),
-            _ => None,
-        };
         let default_val = schema.columns[col_idx]
             .default_expr
             .as_ref()
             .and_then(|expr| eval_const_expr(expr).ok());
-        let default_int = default_val.as_ref().and_then(|v| match v {
-            Value::Integer(i) => Some(*i),
-            _ => None,
-        });
         Some(SimplePredicate {
             is_pk: false,
             pk_pos: 0,
@@ -1737,8 +1650,6 @@ pub(super) fn try_simple_predicate(expr: &Expr, schema: &TableSchema) -> Option<
             op,
             literal: literal.clone(),
             num_pk_cols: schema.primary_key_columns.len(),
-            precomputed_int,
-            default_int,
             default_val,
         })
     }
@@ -1756,11 +1667,8 @@ impl JsonbContainsPredicate {
         value: &[u8],
         cancel: Option<&citadel::CancelToken>,
     ) -> Result<bool> {
-        if self.nonpk_idx >= row_non_pk_count(value) {
-            return Ok(false);
-        }
-        match decode_column_raw(value, self.nonpk_idx)? {
-            RawColumn::Jsonb(bytes) => {
+        match decode_stored_column_raw(value, self.nonpk_idx)? {
+            Some(RawColumn::Jsonb(bytes)) => {
                 crate::json::jsonb_contains_bytes_with_cancel(bytes, &self.literal, cancel)
             }
             _ => Ok(false),
@@ -1876,10 +1784,29 @@ pub(super) fn flip_cmp_op(op: BinOp) -> Option<BinOp> {
     }
 }
 
+fn raw_comparison_supported(column_type: DataType, literal: &Value) -> bool {
+    if literal.is_null() || matches!(column_type, DataType::Interval | DataType::Vector { .. }) {
+        return false;
+    }
+    let literal_type = literal.data_type();
+    column_type == literal_type
+        || (matches!(column_type, DataType::Integer | DataType::Real)
+            && matches!(literal_type, DataType::Integer | DataType::Real))
+}
+
 pub(super) fn raw_matches_op(raw: &RawColumn, op: BinOp, literal: &Value) -> bool {
-    // SQL NULL semantics: any comparison involving NULL yields NULL (falsy)
     if matches!(raw, RawColumn::Null) || literal.is_null() {
         return false;
+    }
+    // Keep mixed numeric and NaN comparisons identical to expression evaluation.
+    match raw {
+        RawColumn::Integer(value) => {
+            return raw_matches_op_value(&Value::Integer(*value), op, literal);
+        }
+        RawColumn::Real(value) => {
+            return raw_matches_op_value(&Value::Real(*value), op, literal);
+        }
+        _ => {}
     }
     match op {
         BinOp::Eq => raw.eq_value(literal),
@@ -1897,9 +1824,12 @@ pub(super) fn raw_matches_op(raw: &RawColumn, op: BinOp, literal: &Value) -> boo
 }
 
 pub(super) fn raw_matches_op_value(val: &Value, op: BinOp, literal: &Value) -> bool {
+    if val.is_null() || literal.is_null() {
+        return false;
+    }
     match op {
         BinOp::Eq => val == literal,
-        BinOp::NotEq => val != literal && !val.is_null(),
+        BinOp::NotEq => val != literal,
         BinOp::Lt => val < literal,
         BinOp::Gt => val > literal,
         BinOp::LtEq => val <= literal,
