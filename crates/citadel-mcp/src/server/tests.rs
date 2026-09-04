@@ -1236,10 +1236,8 @@ fn similar_to_edges_round_trip_through_the_tools() {
     assert_eq!(edges[0]["kind"], "similar_to");
 }
 
-/// Recall hides atoms a newer atom supersedes; `include_superseded` is the way back.
-/// Without the flag an MCP client cannot reach superseded history at all.
 #[test]
-fn mem_recall_excludes_superseded_unless_asked() {
+fn mem_recall_excludes_superseded_seeds_but_preserves_graph_history() {
     let (_d, eng) = engine();
     let old = eng
         .remember("r", AtomInput::new("fact", "alpha old value"))
@@ -1271,6 +1269,20 @@ fn mem_recall_excludes_superseded_unless_asked() {
         ids(&opted).contains(&old),
         "include_superseded must bring it back"
     );
+    let expanded = call(
+        &eng,
+        "mem_recall",
+        json!({
+            "query": "alpha",
+            "k": 10,
+            "include_superseded": false,
+            "graph_depth": 1,
+            "graph_edge_kinds": ["supersedes"]
+        }),
+    );
+    let expanded_ids = ids(&expanded);
+    assert!(expanded_ids.contains(&new));
+    assert!(expanded_ids.contains(&old));
 }
 
 /// `mem_recall` attaches a `resource_link` content block per hit, each a dereferenceable
