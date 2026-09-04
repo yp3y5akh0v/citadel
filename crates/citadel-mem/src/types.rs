@@ -312,7 +312,8 @@ impl AtomInput {
 }
 
 /// Recall fusion weights (need not sum to 1); each signal is normalized to
-/// [0,1] first.
+/// [0,1] first. Weights must be finite, and their positive and negative sums
+/// must remain finite in `f32`.
 #[derive(Debug, Clone, Copy)]
 pub struct FusionWeights {
     pub semantic: f32,
@@ -354,6 +355,7 @@ pub enum RerankStrategy {
     /// Reciprocal Rank Fusion of cross-encoder and fusion ranks; `k` is the
     /// damping constant (60 is the literature standard; lower trusts top ranks
     /// more).
+    /// `k` must be positive and finite, with a finite two-ranking RRF sum.
     Rrf { k: f32 },
 }
 
@@ -444,6 +446,8 @@ pub struct MemoryProfileReport {
 }
 
 /// Recall graph expansion: walk `memory_edges` up to `depth` hops over `kinds`.
+/// Outgoing edge inspection is independently capped by [`crate::MAX_GRAPH_EXPANSION_EDGES`].
+/// Exceeding either budget returns an error rather than incomplete expansion.
 #[derive(Debug, Clone)]
 pub struct GraphExpand {
     pub depth: usize,
@@ -577,6 +581,7 @@ pub struct MultiRecallQuery {
     /// One cross-encoder pass over the merged pool; `None` keeps the pure RRF order.
     pub rerank_query: Option<String>,
     /// RRF damping constant (60 is the literature standard; lower trusts top ranks).
+    /// Must be positive and finite, with a finite RRF sum across all sub-queries.
     pub rrf_k: f32,
 }
 

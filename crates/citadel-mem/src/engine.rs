@@ -1,5 +1,7 @@
 //! MemoryEngine: region lifecycle on top of citadel's encrypted SQL store.
 
+pub(crate) mod graph_snapshot;
+
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -28,6 +30,7 @@ use crate::fusion::{
     fuse_rank, fuse_rerank, recency_score, rerank_hits, rrf_merge, Candidate, RerankContext,
     RERANK_POOL,
 };
+use crate::plaintext::{zeroize_atom_content, zeroize_json_strings, ProtectedHit};
 use crate::read_limits::{
     atom_content_bytes, charge_atom_content, charge_edge_evidence, charge_materialized_bytes,
     charge_returned_atom_content, charge_returned_bytes, charge_returned_edge_evidence,
@@ -349,64 +352,9 @@ struct CachedAtom {
 
 impl Drop for CachedAtom {
     fn drop(&mut self) {
+        self.kind.zeroize();
         self.text.zeroize();
         zeroize_json_strings(&mut self.payload);
-    }
-}
-
-/// Nulls every owned string (keys included); returns count so tests prove recursion.
-fn zeroize_json_strings(value: &mut serde_json::Value) -> usize {
-    let mut scrubbed = 0;
-    match value {
-        serde_json::Value::String(text) => {
-            text.zeroize();
-            scrubbed += 1;
-        }
-        serde_json::Value::Array(values) => {
-            for value in values.iter_mut() {
-                scrubbed += zeroize_json_strings(value);
-            }
-            values.clear();
-        }
-        serde_json::Value::Object(fields) => {
-            for (mut key, mut value) in std::mem::take(fields) {
-                key.zeroize();
-                scrubbed += 1;
-                scrubbed += zeroize_json_strings(&mut value);
-            }
-        }
-        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
-    }
-    *value = serde_json::Value::Null;
-    scrubbed
-}
-
-fn zeroize_atom_content(text: &mut String, payload: &mut serde_json::Value) {
-    text.zeroize();
-    zeroize_json_strings(payload);
-}
-
-struct ScrubbedHitSlots(Vec<Option<AtomHit>>);
-
-impl ScrubbedHitSlots {
-    fn from_hits(hits: Vec<AtomHit>) -> Self {
-        Self(hits.into_iter().map(Some).collect())
-    }
-
-    fn with_capacity(capacity: usize) -> Self {
-        Self(Vec::with_capacity(capacity))
-    }
-
-    fn into_hits(mut self) -> Vec<AtomHit> {
-        std::mem::take(&mut self.0).into_iter().flatten().collect()
-    }
-}
-
-impl Drop for ScrubbedHitSlots {
-    fn drop(&mut self) {
-        for hit in self.0.iter_mut().filter_map(Option::as_mut) {
-            zeroize_atom_content(&mut hit.text, &mut hit.payload);
-        }
     }
 }
 
@@ -442,6 +390,13 @@ fn charge_returned_hits(hits: &mut [AtomHit]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn export_recall_hits(hits: Vec<ProtectedHit>) -> Result<Vec<AtomHit>> {
+    for hit in &hits {
+        charge_returned_atom_content(&hit.kind, &hit.text, &hit.payload)?;
+    }
+    Ok(hits.into_iter().map(ProtectedHit::into_inner).collect())
 }
 
 fn charge_returned_hit(hit: &mut Option<AtomHit>) -> Result<()> {
@@ -5907,27 +5862,26 @@ impl MemoryEngine {
                 };
                 let (emb, text, payload) = open_atom(atom_wrap, wrapped, id, sealed_row)?;
                 let emb = Zeroizing::new(emb);
+                let kind = kind.to_string();
+                let owned_content_bytes = atom_content_bytes(&kind, &text, &payload, usize::MAX);
+                let cached_atom = CachedAtom {
+                    kind,
+                    text,
+                    payload,
+                    owned_content_bytes,
+                    importance: score,
+                    confidence,
+                    created_micros: created,
+                    immutable,
+                    expires_micros: expires,
+                };
+                validate_embedding("sealed ANN", h.dim, &emb, "stored")?;
                 if h.metric == EmbeddingMetric::Cosine && emb.iter().all(|value| *value == 0.0) {
                     zero_norm_atoms.insert(id);
                 }
                 vectors[slot as usize * dim..(slot as usize + 1) * dim].copy_from_slice(&emb);
                 filled += 1;
-                let kind = kind.to_string();
-                let owned_content_bytes = atom_content_bytes(&kind, &text, &payload, usize::MAX);
-                cached.insert(
-                    id,
-                    CachedAtom {
-                        kind,
-                        text,
-                        payload,
-                        owned_content_bytes,
-                        importance: score,
-                        confidence,
-                        created_micros: created,
-                        immutable,
-                        expires_micros: expires,
-                    },
-                );
+                cached.insert(id, cached_atom);
                 Ok(true)
             },
         )?;
@@ -6590,9 +6544,8 @@ impl MemoryEngine {
     /// BM25, not SQL `ts_rank`.
     pub fn recall(&self, region: &str, q: RecallQuery) -> Result<Vec<AtomHit>> {
         let cancel = check_db_cancel(&self.db)?;
-        let mut hits = self.recall_impl(region, q, RecallMode::USER, None, cancel.as_ref())?;
-        charge_returned_hits(&mut hits)?;
-        Ok(hits)
+        let hits = self.recall_impl(region, q, RecallMode::USER, None, cancel.as_ref())?;
+        export_recall_hits(hits)
     }
 
     /// Validate an MMR request against the currently attached region without
@@ -6638,36 +6591,29 @@ impl MemoryEngine {
         if q.k == 0 || k == 0 {
             return Ok(Vec::new());
         }
-        let mut hits = self.recall_impl(
+        let hits = self.recall_impl(
             region,
             q,
             RecallMode::USER,
             Some(MmrSelection { k, lambda_mult }),
             cancel.as_ref(),
         )?;
-        charge_returned_hits(&mut hits)?;
-        Ok(hits)
+        export_recall_hits(hits)
     }
 
     fn select_mmr_hits(
         &self,
         key: &str,
         h: &RegionHandle,
-        hits: Vec<AtomHit>,
+        hits: Vec<ProtectedHit>,
         query_vector: &[f32],
         selection: MmrSelection,
         cancel: Option<&citadel_core::CancelToken>,
-    ) -> Result<Vec<AtomHit>> {
-        let mut hits = ScrubbedHitSlots::from_hits(hits);
-        if hits.0.is_empty() || selection.k == 0 {
+    ) -> Result<Vec<ProtectedHit>> {
+        if hits.is_empty() || selection.k == 0 {
             return Ok(Vec::new());
         }
-        let ids = hits
-            .0
-            .iter()
-            .filter_map(Option::as_ref)
-            .map(|hit| hit.id)
-            .collect::<Vec<_>>();
+        let ids = hits.iter().map(|hit| hit.id).collect::<Vec<_>>();
         let _atom_reservation = self.reserve_plaintext_atoms(key, h, ids.iter().copied())?;
         check_cancel(cancel)?;
         let mut embeddings = if h.atom_wrap.is_some() {
@@ -6683,19 +6629,12 @@ impl MemoryEngine {
         };
         check_cancel(cancel)?;
 
-        let mut live_hits = ScrubbedHitSlots::with_capacity(hits.0.len());
-        let mut live_embeddings = Vec::with_capacity(hits.0.len());
-        for slot in &mut hits.0 {
-            let hit = slot.take().expect("MMR input hit is present");
-            match embeddings.remove(&hit.id) {
-                Some(embedding) => {
-                    live_hits.0.push(Some(hit));
-                    live_embeddings.push(embedding);
-                }
-                None => {
-                    let mut discarded = hit;
-                    zeroize_atom_content(&mut discarded.text, &mut discarded.payload);
-                }
+        let mut live_hits = Vec::with_capacity(hits.len());
+        let mut live_embeddings = Vec::with_capacity(hits.len());
+        for hit in hits {
+            if let Some(embedding) = embeddings.remove(&hit.id) {
+                live_hits.push(Some(hit));
+                live_embeddings.push(embedding);
             }
         }
         let vectors = live_embeddings
@@ -6709,40 +6648,28 @@ impl MemoryEngine {
             selection.lambda_mult,
             cancel,
         )?;
-        let mut result = ScrubbedHitSlots::with_capacity(selected.len());
+        let mut result = Vec::with_capacity(selected.len());
         for index in selected {
-            result.0.push(Some(
-                live_hits.0[index]
+            result.push(
+                live_hits[index]
                     .take()
                     .expect("MMR returns each candidate at most once"),
-            ));
+            );
         }
         check_cancel(cancel)?;
-        Ok(result.into_hits())
+        Ok(result)
     }
 
     fn finish_recall_hits(
         &self,
         region_id: RegionId,
-        mut hits: Vec<AtomHit>,
+        hits: Vec<ProtectedHit>,
         mode: RecallMode,
-        scrub_on_error: bool,
         cancel: Option<&citadel_core::CancelToken>,
-    ) -> Result<Vec<AtomHit>> {
-        let finish = (|| {
-            check_cancel(cancel)?;
-            if mode.record_access {
-                self.note_access(region_id, hits.iter().map(|hit| hit.id), cancel)?;
-            }
-            Ok(())
-        })();
-        if let Err(error) = finish {
-            if scrub_on_error {
-                for hit in &mut hits {
-                    zeroize_atom_content(&mut hit.text, &mut hit.payload);
-                }
-            }
-            return Err(error);
+    ) -> Result<Vec<ProtectedHit>> {
+        check_cancel(cancel)?;
+        if mode.record_access {
+            self.note_access(region_id, hits.iter().map(|hit| hit.id), cancel)?;
         }
         Ok(hits)
     }
@@ -6787,7 +6714,7 @@ impl MemoryEngine {
         if q.k == 0 || q.queries.is_empty() {
             return Ok(Vec::new());
         }
-        validate_rrf_k(q.rrf_k, "multi-query RRF constant")?;
+        validate_rrf_k(q.rrf_k, q.queries.len(), "multi-query RRF constant")?;
         for query in &q.queries {
             validate_fusion_weights(query.weights)?;
         }
@@ -6858,7 +6785,7 @@ impl MemoryEngine {
         let mut merged = rrf_merge(lists, q.rrf_k);
         check_cancel(cancel.as_ref())?;
 
-        let mut hits = match (reranker.as_ref(), &q.rerank_query) {
+        let hits = match (reranker.as_ref(), &q.rerank_query) {
             (Some((r, strategy)), Some(text)) => {
                 check_cancel(cancel.as_ref())?;
                 let _callback = self.reserve_plaintext_atoms(
@@ -6886,8 +6813,7 @@ impl MemoryEngine {
                 merged
             }
         };
-        charge_returned_hits(&mut hits)?;
-        Ok(hits)
+        export_recall_hits(hits)
     }
 
     fn recall_impl(
@@ -6897,7 +6823,7 @@ impl MemoryEngine {
         mode: RecallMode,
         mmr: Option<MmrSelection>,
         cancel: Option<&citadel_core::CancelToken>,
-    ) -> Result<Vec<AtomHit>> {
+    ) -> Result<Vec<ProtectedHit>> {
         let cancel = cancel.cloned();
         let key = region.to_ascii_lowercase();
         let h = self.region_handle(&key)?;
@@ -7007,7 +6933,7 @@ impl MemoryEngine {
                 expanded.retain(|hit| !present.contains(&hit.id));
                 hits.extend(expanded);
             }
-            return self.finish_recall_hits(h.id, hits, mode, mmr.is_some(), cancel.as_ref());
+            return self.finish_recall_hits(h.id, hits, mode, cancel.as_ref());
         }
 
         let distop = match h.metric {
@@ -7137,7 +7063,7 @@ impl MemoryEngine {
             expanded.retain(|e| !present.contains(&e.id));
             hits.extend(expanded);
         }
-        self.finish_recall_hits(h.id, hits, mode, mmr.is_some(), cancel.as_ref())
+        self.finish_recall_hits(h.id, hits, mode, cancel.as_ref())
     }
 
     /// Create a raw global edge for tests that exercise legacy/corrupt states.
@@ -9165,21 +9091,11 @@ impl MemoryEngine {
                 let Some(wrapped) = wrapped else {
                     continue;
                 };
-                let (mut text, mut payload) =
-                    open_atom_content(atom_wrap, &wrapped, id, as_blob(&row[2])?)?;
-                if let Some(filter) = &q.payload_filter {
-                    if !json_contains(&payload, filter) {
-                        zeroize_atom_content(&mut text, &mut payload);
-                        continue;
-                    }
-                }
-                let kind = as_text(&row[1])?.to_string();
-                charge_owned_atom_content(&kind, &mut text, &mut payload)?;
-                cands.push(Candidate {
+                let mut candidate = Candidate {
                     id,
-                    kind,
-                    text,
-                    payload,
+                    kind: as_text(&row[1])?.to_string(),
+                    text: String::new(),
+                    payload: serde_json::Value::Null,
                     dist: dist_by_id.get(&id).copied().flatten(),
                     text_rank: 0.0,
                     importance: as_f32(&row[3])?,
@@ -9187,7 +9103,17 @@ impl MemoryEngine {
                     created_micros: as_ts(&row[5])?,
                     expires_micros: opt_ts(&row[7])?,
                     immutable: as_bool(&row[6])?,
-                });
+                };
+                (candidate.text, candidate.payload) =
+                    open_atom_content(atom_wrap, &wrapped, id, as_blob(&row[2])?)?;
+                if q.payload_filter
+                    .as_ref()
+                    .is_some_and(|filter| !json_contains(&candidate.payload, filter))
+                {
+                    continue;
+                }
+                charge_atom_content(&candidate.kind, &candidate.text, &candidate.payload)?;
+                cands.push(candidate);
             }
         }
 
@@ -9201,9 +9127,6 @@ impl MemoryEngine {
                     cache.take();
                 }
                 drop(cache);
-                for candidate in &mut cands {
-                    zeroize_atom_content(&mut candidate.text, &mut candidate.payload);
-                }
                 return Err(MemError::Invalid(format!(
                     "atom table '{}' changed during sealed recall; retry",
                     h.table
@@ -9293,7 +9216,7 @@ impl MemoryEngine {
             let mut kind_codes: FxHashMap<String, u32> = FxHashMap::default();
             let mut cached: FxHashMap<AtomId, CachedAtom> = FxHashMap::default();
             let mut zero_norm_atoms = FxHashSet::default();
-            let mut triples: Vec<(u64, Vec<f32>, Vec<u32>)> = Vec::with_capacity(rows.0.len());
+            let mut triples = Zeroizing::new(Vec::with_capacity(rows.0.len()));
             for (
                 id,
                 emb,
@@ -9305,33 +9228,38 @@ impl MemoryEngine {
                 created_micros,
                 immutable,
                 expires_micros,
-            ) in rows.drain()
+            ) in &mut rows.0
             {
                 check_cancel(cancel)?;
                 let next = kind_codes.len() as u32;
                 let code = *kind_codes.entry(kind.clone()).or_insert(next);
                 if h.metric == EmbeddingMetric::Cosine && emb.iter().all(|value| *value == 0.0) {
-                    zero_norm_atoms.insert(id);
+                    zero_norm_atoms.insert(*id);
                 }
-                let owned_content_bytes = atom_content_bytes(&kind, &text, &payload, usize::MAX);
+                let owned_content_bytes = atom_content_bytes(kind, text, payload, usize::MAX);
                 cached.insert(
-                    id,
+                    *id,
                     CachedAtom {
-                        kind,
-                        text,
-                        payload,
+                        kind: std::mem::take(kind),
+                        text: std::mem::take(text),
+                        payload: std::mem::take(payload),
                         owned_content_bytes,
-                        importance,
-                        confidence,
-                        created_micros,
-                        immutable,
-                        expires_micros,
+                        importance: *importance,
+                        confidence: *confidence,
+                        created_micros: *created_micros,
+                        immutable: *immutable,
+                        expires_micros: *expires_micros,
                     },
                 );
-                triples.push((id as u64, emb, vec![code]));
+                triples.push((*id as u64, std::mem::take(emb), vec![code]));
             }
-            let index = AnnIndex::build_with_attrs(triples, 1, ann_metric(h.metric), h.dim)
-                .map_err(|e| MemError::Invalid(format!("sealed ANN index build: {e}")))?;
+            let index = AnnIndex::build_with_attrs(
+                std::mem::take(&mut *triples),
+                1,
+                ann_metric(h.metric),
+                h.dim,
+            )
+            .map_err(|e| MemError::Invalid(format!("sealed ANN index build: {e}")))?;
             check_cancel(cancel)?;
             if atom_table_root_stamp(&self.db, &h.table)? != table_stamp {
                 return Err(MemError::Invalid(format!(
@@ -9835,16 +9763,17 @@ fn search_sealed_index(
     if max_id > snap {
         let ttl_now = now_micros();
         let mut tail = decrypt_scan(conn, db, atom_wrap, &h.table, h.id, Some(snap), cancel)?;
-        for (id, mut emb, kind, mut text, mut payload, _, _, _, _, expires) in tail.drain() {
+        for (id, emb, kind, text, payload, _, _, _, _, expires) in &mut tail.0 {
             check_cancel(cancel)?;
-            let included = (q.kinds.is_empty() || q.kinds.iter().any(|k| k == &kind))
+            let included = (q.kinds.is_empty() || q.kinds.iter().any(|k| k == kind))
                 && expires.is_none_or(|expires| expires > ttl_now);
             if included {
-                ranked.push((id, vec_distance(h.metric, qvec, &emb)));
+                ranked.push((*id, vec_distance(h.metric, qvec, emb)?));
             }
             emb.zeroize();
+            kind.zeroize();
             text.zeroize();
-            zeroize_json_strings(&mut payload);
+            zeroize_json_strings(payload);
         }
     }
 
@@ -10198,16 +10127,13 @@ impl DecryptedAtoms {
     fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
-
-    fn drain(&mut self) -> std::vec::Drain<'_, DecryptedAtom> {
-        self.0.drain(..)
-    }
 }
 
 impl Drop for DecryptedAtoms {
     fn drop(&mut self) {
-        for (_, embedding, _, text, payload, ..) in &mut self.0 {
+        for (_, embedding, kind, text, payload, ..) in &mut self.0 {
             embedding.zeroize();
+            kind.zeroize();
             text.zeroize();
             zeroize_json_strings(payload);
         }
@@ -10455,22 +10381,27 @@ fn decrypt_scan(
     for (row, wrapped) in qr.rows.iter().zip(wrapped) {
         check_cancel(cancel)?;
         let id = as_int(&row[0])?;
-        let kind = as_text(&row[1])?.to_string();
         let Some(wrapped) = wrapped else {
             continue;
         };
+        let importance = as_f32(&row[3])?;
+        let confidence = as_f32(&row[4])?;
+        let created = as_ts(&row[5])?;
+        let immutable = as_bool(&row[6])?;
+        let expires = opt_ts(&row[7])?;
+        let kind = as_text(&row[1])?;
         let (emb, text, payload) = open_atom(atom_wrap, &wrapped, id, as_blob(&row[2])?)?;
         out.0.push((
             id,
             emb,
-            kind,
+            kind.to_owned(),
             text,
             payload,
-            as_f32(&row[3])?,
-            as_f32(&row[4])?,
-            as_ts(&row[5])?,
-            as_bool(&row[6])?,
-            opt_ts(&row[7])?,
+            importance,
+            confidence,
+            created,
+            immutable,
+            expires,
         ));
     }
     check_cancel(cancel)?;
@@ -10835,9 +10766,16 @@ fn open_atom(
     ack.zeroize();
     let blob = Zeroizing::new(blob_seal::open(&seal_keys, id as u64, sealed)?);
     let (emb, text, payload_json) = decode_atom_blob(&blob)?;
+    let mut emb = Zeroizing::new(emb);
+    let mut text = Zeroizing::new(text);
     let payload_json = Zeroizing::new(payload_json);
-    let payload = serde_json::from_str(&payload_json).unwrap_or(serde_json::Value::Null);
-    Ok((emb, text, payload))
+    let payload = serde_json::from_str(&payload_json)
+        .map_err(|error| MemError::Invalid(format!("sealed payload is invalid JSON: {error}")))?;
+    Ok((
+        std::mem::take(&mut *emb),
+        std::mem::take(&mut *text),
+        payload,
+    ))
 }
 
 /// Open only text+payload; the embedding is never materialized as a `Vec<f32>`.
@@ -10852,9 +10790,11 @@ fn open_atom_content(
     ack.zeroize();
     let blob = Zeroizing::new(blob_seal::open(&seal_keys, id as u64, sealed)?);
     let (text, payload_json) = decode_atom_content(&blob)?;
+    let mut text = Zeroizing::new(text);
     let payload_json = Zeroizing::new(payload_json);
-    let payload = serde_json::from_str(&payload_json).unwrap_or(serde_json::Value::Null);
-    Ok((text, payload))
+    let payload = serde_json::from_str(&payload_json)
+        .map_err(|error| MemError::Invalid(format!("sealed payload is invalid JSON: {error}")))?;
+    Ok((std::mem::take(&mut *text), payload))
 }
 
 /// Open only the vector; the RAII zeroizer scrubs the blob on every return path.
@@ -10957,8 +10897,8 @@ fn reseal_atom(
 
 /// Distance between two vectors, matching citadel-sql's `<->`/`<#>`/`<=>` so
 /// sealed decrypt-then-rank recall matches the plaintext index path.
-fn vec_distance(metric: EmbeddingMetric, a: &[f32], b: &[f32]) -> Option<f32> {
-    match metric {
+fn vec_distance(metric: EmbeddingMetric, a: &[f32], b: &[f32]) -> Result<Option<f32>> {
+    let distance = match metric {
         EmbeddingMetric::L2 => {
             let mut sum = 0.0f64;
             for (x, y) in a.iter().zip(b.iter()) {
@@ -10989,25 +10929,32 @@ fn vec_distance(metric: EmbeddingMetric, a: &[f32], b: &[f32]) -> Option<f32> {
                 Some((1.0 - dot / denom) as f32)
             }
         }
+    };
+    if distance.is_some_and(|distance| !distance.is_finite()) {
+        return Err(MemError::Invalid(
+            "vector distance is outside the finite f32 range".into(),
+        ));
     }
+    Ok(distance)
 }
 
 /// Language-agnostic word tokens (UAX#29 boundaries, lowercased); spaceless
 /// scripts (CJK/Thai) fall back to per-character tokens.
-fn tokenize(text: &str) -> Vec<String> {
+fn tokenize(text: &str) -> impl Iterator<Item = Zeroizing<String>> + '_ {
     use unicode_segmentation::UnicodeSegmentation;
-    text.unicode_words().map(str::to_lowercase).collect()
+    text.unicode_words()
+        .map(|word| Zeroizing::new(word.to_lowercase()))
 }
 
 /// Distinct query tokens for the BM25 keyword signal (UAX#29, lowercased,
 /// deduped).
-fn query_keyword_terms(text: Option<&str>) -> Vec<String> {
+fn query_keyword_terms(text: Option<&str>) -> Vec<Zeroizing<String>> {
     let Some(t) = text else {
         return Vec::new();
     };
-    let mut v = tokenize(t);
-    v.sort();
-    v.dedup();
+    let mut v: Vec<_> = tokenize(t).collect();
+    v.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    v.dedup_by(|left, right| left.as_str() == right.as_str());
     v
 }
 
@@ -11016,7 +10963,7 @@ fn query_keyword_terms(text: Option<&str>) -> Vec<String> {
 /// so no stoplist or stemmer is needed.
 fn assign_bm25_ranks(
     cands: &mut [Candidate],
-    query_terms: &[String],
+    query_terms: &[Zeroizing<String>],
     cancel: Option<&citadel_core::CancelToken>,
 ) -> Result<()> {
     if query_terms.is_empty() || cands.is_empty() {
@@ -11025,14 +10972,23 @@ fn assign_bm25_ranks(
     const K1: f32 = 1.2;
     const B: f32 = 0.75;
     let n = cands.len() as f32;
-    // Tokenize each candidate once: per-term frequency + document length.
-    let mut docs: Vec<(FxHashMap<String, u32>, f32)> = Vec::with_capacity(cands.len());
+    let term_indices: FxHashMap<&str, usize> = query_terms
+        .iter()
+        .enumerate()
+        .map(|(index, term)| (term.as_str(), index))
+        .collect();
+    let mut docs: Vec<(FxHashMap<usize, usize>, f32)> = Vec::with_capacity(cands.len());
     for candidate in cands.iter() {
         check_cancel(cancel)?;
-        let mut tf: FxHashMap<String, u32> = FxHashMap::default();
-        let mut len = 0u32;
+        let mut tf: FxHashMap<usize, usize> = FxHashMap::default();
+        let mut len = 0usize;
         for tok in tokenize(&candidate.text) {
-            *tf.entry(tok).or_insert(0) += 1;
+            if len.is_multiple_of(64) {
+                check_cancel(cancel)?;
+            }
+            if let Some(&index) = term_indices.get(tok.as_str()) {
+                *tf.entry(index).or_insert(0) += 1;
+            }
             len += 1;
         }
         docs.push((tf, len as f32));
@@ -11040,16 +10996,19 @@ fn assign_bm25_ranks(
     let avgdl = (docs.iter().map(|(_, l)| *l).sum::<f32>() / n).max(1.0);
     // IDF per query term over the pool (Lucene's +1 form, never negative).
     let mut idf = Vec::with_capacity(query_terms.len());
-    for term in query_terms {
+    for index in 0..query_terms.len() {
         check_cancel(cancel)?;
-        let df = docs.iter().filter(|(tf, _)| tf.contains_key(term)).count() as f32;
+        let df = docs
+            .iter()
+            .filter(|(tf, _)| tf.contains_key(&index))
+            .count() as f32;
         idf.push(((n - df + 0.5) / (df + 0.5) + 1.0).ln());
     }
     for (c, (tf, dl)) in cands.iter_mut().zip(&docs) {
         check_cancel(cancel)?;
         let mut score = 0.0;
-        for (t, &w) in query_terms.iter().zip(&idf) {
-            let f = tf.get(t).copied().unwrap_or(0) as f32;
+        for (index, &w) in idf.iter().enumerate() {
+            let f = tf.get(&index).copied().unwrap_or(0) as f32;
             if f > 0.0 {
                 score += w * (f * (K1 + 1.0)) / (f + K1 * (1.0 - B + B * dl / avgdl));
             }
@@ -13027,6 +12986,8 @@ fn validate_edge_weight(weight: f32) -> Result<()> {
 }
 
 fn validate_fusion_weights(weights: FusionWeights) -> Result<()> {
+    let mut lower = 0.0f32;
+    let mut upper = 0.0f32;
     for (name, value) in [
         ("semantic", weights.semantic),
         ("keyword", weights.keyword),
@@ -13038,22 +12999,39 @@ fn validate_fusion_weights(weights: FusionWeights) -> Result<()> {
                 "recall fusion weight '{name}' must be finite"
             )));
         }
+        lower += value.min(0.0);
+        upper += value.max(0.0);
+    }
+    if !lower.is_finite() || !upper.is_finite() {
+        return Err(MemError::Invalid(
+            "recall fusion weights exceed the finite score range".into(),
+        ));
     }
     Ok(())
 }
 
-fn validate_rrf_k(k: f32, label: &str) -> Result<()> {
+fn validate_rrf_k(k: f32, contributors: usize, label: &str) -> Result<()> {
     if !k.is_finite() || k <= 0.0 {
         return Err(MemError::Invalid(format!(
             "{label} must be finite and greater than zero"
         )));
+    }
+    let contribution = 1.0 / k;
+    let mut upper = 0.0f32;
+    for _ in 0..contributors {
+        upper += contribution;
+        if !upper.is_finite() {
+            return Err(MemError::Invalid(format!(
+                "{label} exceeds the finite score range for {contributors} contributing rankings"
+            )));
+        }
     }
     Ok(())
 }
 
 fn validate_rerank_strategy(strategy: RerankStrategy) -> Result<()> {
     if let RerankStrategy::Rrf { k } = strategy {
-        validate_rrf_k(k, "reranker RRF constant")?;
+        validate_rrf_k(k, 2, "reranker RRF constant")?;
     }
     Ok(())
 }
@@ -13304,20 +13282,30 @@ fn would_cycle(conn: &Connection<'_>, src: AtomId, dst: AtomId, kind: EdgeKind) 
     if src == dst {
         return Ok(true);
     }
-    let qr = conn.query_params(
-        "WITH RECURSIVE reach(node) AS (\
-           SELECT $1 \
-           UNION \
-           SELECT e.dst_id FROM memory_edges e JOIN reach r ON e.src_id = r.node \
-           WHERE e.kind = $3\
-         ) SELECT 1 FROM reach WHERE node = $2 LIMIT 1",
-        &[
-            Value::Integer(dst),
-            Value::Integer(src),
-            Value::Text(kind.as_str().into()),
-        ],
-    )?;
-    Ok(!qr.rows.is_empty())
+    let mut visited = FxHashSet::default();
+    visited.insert(dst);
+    let mut wave = vec![dst];
+    let mut budget = GraphTraversalBudget::new(HARD_GRAPH_EXPANSION_MAX_NODES);
+    while !wave.is_empty() {
+        let mut next = Vec::new();
+        for source in wave {
+            for edge in source_edge_rows(conn, source, &mut budget.edges)? {
+                if as_text(&edge[1])? != kind.as_str() {
+                    continue;
+                }
+                let target = as_int(&edge[0])?;
+                if target == src {
+                    return Ok(true);
+                }
+                if visited.insert(target) {
+                    budget.inspect_node()?;
+                    next.push(target);
+                }
+            }
+        }
+        wave = next;
+    }
+    Ok(false)
 }
 
 /// Region-safe cycle check for `link_in_region`. The caller has already proved
@@ -13345,25 +13333,27 @@ fn would_cycle_in_region(
     let mut wave = vec![dst];
     let mut visited = FxHashSet::default();
     visited.insert(dst);
-    let mut inspected = 0usize;
+    let mut budget = GraphTraversalBudget::new(HARD_GRAPH_EXPANSION_MAX_NODES);
     while !wave.is_empty() {
         check_cancel(cancel)?;
-        let remaining = HARD_GRAPH_EXPANSION_MAX_NODES.saturating_sub(inspected);
-        let (candidates, examined, overflowed) = region_edge_wave(
+        let candidates = region_edge_wave(
             conn,
             scope,
             &wave,
             &visited,
             std::slice::from_ref(&kind),
-            remaining,
+            &mut budget,
             cancel,
-        )?;
-        if overflowed {
-            return Err(MemError::Invalid(format!(
+        )
+        .map_err(|error| match error {
+            MemError::WorkLimitExceeded {
+                operation: "graph expansion",
+                ..
+            } => MemError::Invalid(format!(
                 "region cycle check exceeds the engine limit {HARD_GRAPH_EXPANSION_MAX_NODES}"
-            )));
-        }
-        inspected += examined;
+            )),
+            other => other,
+        })?;
         let mut next = Vec::with_capacity(candidates.len());
         for id in candidates {
             check_cancel(cancel)?;
@@ -13380,6 +13370,84 @@ fn would_cycle_in_region(
 }
 
 const HARD_GRAPH_EXPANSION_MAX_NODES: usize = 100_000;
+
+/// Outgoing edge budget for one graph expansion, diffusion build, or cycle check.
+/// Rejected kinds, duplicate destinations, and expired or foreign destinations count.
+/// Exceeding this resource ceiling returns `WorkLimitExceeded`, not partial results.
+/// At most one extra record is read to detect exhaustion.
+pub const MAX_GRAPH_EXPANSION_EDGES: usize = 100_000;
+
+struct GraphTraversalBudget {
+    nodes: usize,
+    node_limit: usize,
+    edges: GraphEdgeBudget,
+}
+
+impl GraphTraversalBudget {
+    fn new(node_limit: usize) -> Self {
+        Self {
+            nodes: 0,
+            node_limit,
+            edges: GraphEdgeBudget::new(),
+        }
+    }
+
+    fn inspect_node(&mut self) -> Result<()> {
+        if self.nodes == self.node_limit {
+            return Err(MemError::WorkLimitExceeded {
+                operation: "graph expansion",
+                limit: self.node_limit,
+            });
+        }
+        self.nodes += 1;
+        Ok(())
+    }
+}
+
+struct GraphEdgeBudget {
+    examined: usize,
+    limit: usize,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static GRAPH_EDGE_LIMIT_FOR_TEST: std::cell::Cell<Option<usize>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+impl GraphEdgeBudget {
+    fn new() -> Self {
+        let limit = MAX_GRAPH_EXPANSION_EDGES;
+        #[cfg(test)]
+        let limit =
+            GRAPH_EDGE_LIMIT_FOR_TEST.with(|override_limit| override_limit.get().unwrap_or(limit));
+        Self { examined: 0, limit }
+    }
+}
+
+fn source_edge_rows(
+    conn: &Connection<'_>,
+    source: AtomId,
+    budget: &mut GraphEdgeBudget,
+) -> Result<Vec<Vec<Value>>> {
+    let remaining = budget.limit.saturating_sub(budget.examined);
+    let row_limit = remaining.saturating_add(1);
+    let edges = conn.query_params(
+        &format!(
+            "SELECT dst_id, kind, weight FROM memory_edges WHERE src_id = $1 LIMIT {row_limit}"
+        ),
+        &[Value::Integer(source)],
+    )?;
+    if edges.rows.len() > remaining {
+        return Err(MemError::WorkLimitExceeded {
+            operation: "graph edge inspection",
+            limit: budget.limit,
+        });
+    }
+    budget.examined += edges.rows.len();
+    Ok(edges.rows)
+}
 
 /// BFS depth of each non-seed atom reachable from `seeds` over `memory_edges`.
 /// Each wave is bounded before it is materialized. Sealed rows become a source
@@ -13424,7 +13492,7 @@ fn graph_walk_depths(
     let seed_set: FxHashSet<AtomId> = seeds.iter().copied().collect();
     let mut visited = seed_set.clone();
     let mut depth_of: FxHashMap<AtomId, usize> = FxHashMap::default();
-    let mut inspected = 0usize;
+    let mut budget = GraphTraversalBudget::new(ge.max_nodes);
 
     for depth in 1..=ge.depth {
         check_cancel(cancel)?;
@@ -13432,16 +13500,8 @@ fn graph_walk_depths(
             break;
         }
 
-        let remaining = ge.max_nodes.saturating_sub(inspected);
-        let (candidates, examined, overflowed) =
-            region_edge_wave(conn, scope, &wave, &visited, &ge.kinds, remaining, cancel)?;
-        if overflowed {
-            return Err(MemError::WorkLimitExceeded {
-                operation: "graph expansion",
-                limit: ge.max_nodes,
-            });
-        }
-        inspected += examined;
+        let candidates =
+            region_edge_wave(conn, scope, &wave, &visited, &ge.kinds, &mut budget, cancel)?;
 
         let mut next = Vec::with_capacity(candidates.len());
         for id in candidates {
@@ -13477,76 +13537,78 @@ fn live_graph_row_ids(
         .collect()
 }
 
-/// One bounded BFS wave over edges whose source and destination are live in the
-/// selected region. `examined` includes stale sealed candidates so corrupted
-/// key metadata cannot be used to evade the work budget.
+/// Seek each source's primary-key prefix, charging edges before endpoint filtering.
 fn region_edge_wave(
     conn: &Connection<'_>,
     scope: GraphFetchScope<'_>,
     wave: &[AtomId],
     visited: &FxHashSet<AtomId>,
     edge_kinds: &[EdgeKind],
-    remaining: usize,
+    budget: &mut GraphTraversalBudget,
     cancel: Option<&citadel_core::CancelToken>,
-) -> Result<(Vec<AtomId>, usize, bool)> {
-    let mut params = vec![
-        Value::Integer(scope.region_id),
-        Value::Timestamp(now_micros()),
-    ];
-    let kind_clause = if edge_kinds.is_empty() {
-        String::new()
+) -> Result<Vec<AtomId>> {
+    let selected_columns = if scope.sealed_db.is_some() {
+        "id, key_slot, key_gen"
     } else {
-        let mut placeholders = Vec::with_capacity(edge_kinds.len());
-        for kind in edge_kinds {
-            check_cancel(cancel)?;
-            params.push(Value::Text(kind.as_str().into()));
-            placeholders.push(format!("${}", params.len()));
+        "id"
+    };
+    let endpoint_sql = format!(
+        "SELECT {selected_columns} FROM {} WHERE id = $1 AND region_id = $2 \
+         AND (expires_at IS NULL OR expires_at > $3)",
+        scope.table
+    );
+    let now = Value::Timestamp(now_micros());
+    let mut candidates = BTreeMap::new();
+    for &source in wave {
+        check_cancel(cancel)?;
+        let source_rows = conn.query_params(
+            &endpoint_sql,
+            &[
+                Value::Integer(source),
+                Value::Integer(scope.region_id),
+                now.clone(),
+            ],
+        )?;
+        if live_graph_row_ids(scope, &source_rows.rows, cancel)?.is_empty() {
+            continue;
         }
-        format!(" AND e.kind IN ({})", placeholders.join(", "))
-    };
-    let destination_columns = if scope.sealed_db.is_some() {
-        "dst.id, dst.key_slot, dst.key_gen"
-    } else {
-        "dst.id"
-    };
-    let mut visited_ids: Vec<AtomId> = visited.iter().copied().collect();
-    visited_ids.sort_unstable();
-    let row_limit = remaining.saturating_add(1);
-    let rows = conn.query_params(
-        &format!(
-            "SELECT DISTINCT {destination_columns} FROM memory_edges e \
-             JOIN {table} src ON src.id = e.src_id \
-             JOIN {table} dst ON dst.id = e.dst_id \
-             WHERE e.src_id IN ({wave}) \
-             AND src.region_id = $1 AND dst.region_id = $1 \
-             AND (src.expires_at IS NULL OR src.expires_at > $2) \
-             AND (dst.expires_at IS NULL OR dst.expires_at > $2) \
-             AND dst.id NOT IN ({visited}){kind_clause} \
-             ORDER BY dst.id LIMIT {row_limit}",
-            table = scope.table,
-            wave = id_list(wave),
-            visited = id_list(&visited_ids),
-        ),
-        &params,
-    )?;
-    check_cancel(cancel)?;
-    let examined = rows.rows.len();
-    if examined > remaining {
-        return Ok((Vec::new(), examined, true));
+        let edges = source_edge_rows(conn, source, &mut budget.edges)?;
+        for edge in &edges {
+            check_cancel(cancel)?;
+            let destination = as_int(&edge[0])?;
+            if visited.contains(&destination)
+                || candidates.contains_key(&destination)
+                || (!edge_kinds.is_empty()
+                    && !edge_kinds.iter().any(|kind| {
+                        matches!(&edge[1], Value::Text(value) if value.as_str() == kind.as_str())
+                    }))
+            {
+                continue;
+            }
+            let endpoint = conn.query_params(
+                &endpoint_sql,
+                &[
+                    Value::Integer(destination),
+                    Value::Integer(scope.region_id),
+                    now.clone(),
+                ],
+            )?;
+            if let Some(row) = endpoint.rows.into_iter().next() {
+                budget.inspect_node()?;
+                candidates.insert(destination, row);
+            }
+        }
     }
-    Ok((
-        live_graph_row_ids(scope, &rows.rows, cancel)?,
-        examined,
-        false,
-    ))
+    let rows: Vec<_> = candidates.into_values().collect();
+    live_graph_row_ids(scope, &rows, cancel)
 }
 
 /// Order graph-reached `(depth, hit)` pairs nearest-first (ties by id),
 /// dropping depth.
 fn order_graph_hits(
-    mut hits: Vec<(usize, AtomHit)>,
+    mut hits: Vec<(usize, ProtectedHit)>,
     cancel: Option<&citadel_core::CancelToken>,
-) -> Result<Vec<AtomHit>> {
+) -> Result<Vec<ProtectedHit>> {
     check_cancel(cancel)?;
     hits.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.id.cmp(&b.1.id)));
     check_cancel(cancel)?;
@@ -13611,7 +13673,7 @@ fn expand_graph(
     seeds: &[AtomId],
     ge: &GraphExpand,
     cancel: Option<&citadel_core::CancelToken>,
-) -> Result<Vec<AtomHit>> {
+) -> Result<Vec<ProtectedHit>> {
     if seeds.is_empty() || ge.depth == 0 {
         return Ok(Vec::new());
     }
@@ -13629,37 +13691,34 @@ fn expand_graph(
     );
     let fetched = conn.query_params(&fetch_sql, &fparams)?;
 
-    let mut hits: Vec<(usize, AtomHit)> = Vec::with_capacity(fetched.rows.len());
+    let mut hits: Vec<(usize, ProtectedHit)> = Vec::with_capacity(fetched.rows.len());
     for row in &fetched.rows {
         check_cancel(cancel)?;
         let id = as_int(&row[0])?;
         let depth = *depth_of.get(&id).unwrap_or(&1);
-        let mut payload = parse_payload(&row[2])?;
+        let mut hit = ProtectedHit::new(AtomHit {
+            id,
+            importance: as_f32(&row[6])?,
+            confidence: as_f32(&row[7])?,
+            relevance: None,
+            distance: None,
+            graph_depth: Some(depth),
+            created_at: as_ts(&row[5])?,
+            expires_at: opt_ts(&row[8])?,
+            immutable: as_bool(&row[4])?,
+            kind: as_text(&row[1])?.to_string(),
+            text: String::new(),
+            payload: serde_json::Value::Null,
+        });
+        hit.payload = parse_payload(&row[2])?;
         if let Some(filter) = scope.payload_filter {
-            if !json_contains(&payload, filter) {
+            if !json_contains(&hit.payload, filter) {
                 continue;
             }
         }
-        let kind = as_text(&row[1])?.to_string();
-        let mut text = opt_text(&row[3])?;
-        charge_owned_atom_content(&kind, &mut text, &mut payload)?;
-        hits.push((
-            depth,
-            AtomHit {
-                id,
-                kind,
-                payload,
-                text,
-                importance: as_f32(&row[6])?,
-                confidence: as_f32(&row[7])?,
-                relevance: None,
-                distance: None,
-                graph_depth: Some(depth),
-                created_at: as_ts(&row[5])?,
-                expires_at: opt_ts(&row[8])?,
-                immutable: as_bool(&row[4])?,
-            },
-        ));
+        hit.text = opt_text(&row[3])?;
+        charge_atom_content(&hit.kind, &hit.text, &hit.payload)?;
+        hits.push((depth, hit));
     }
     order_graph_hits(hits, cancel)
 }
@@ -13674,7 +13733,7 @@ fn expand_graph_sealed(
     seeds: &[AtomId],
     ge: &GraphExpand,
     cancel: Option<&citadel_core::CancelToken>,
-) -> Result<Vec<AtomHit>> {
+) -> Result<Vec<ProtectedHit>> {
     if seeds.is_empty() || ge.depth == 0 {
         return Ok(Vec::new());
     }
@@ -13693,7 +13752,7 @@ fn expand_graph_sealed(
     let fetched = conn.query_params(&fetch_sql, &fparams)?;
     let wrapped = exact_live_atom_wrapped_rows(db, &fetched.rows, 0, 7, 8)?;
 
-    let mut hits: Vec<(usize, AtomHit)> = Vec::with_capacity(fetched.rows.len());
+    let mut hits: Vec<(usize, ProtectedHit)> = Vec::with_capacity(fetched.rows.len());
     for (row, wrapped) in fetched.rows.iter().zip(wrapped) {
         check_cancel(cancel)?;
         let id = as_int(&row[0])?;
@@ -13701,33 +13760,29 @@ fn expand_graph_sealed(
         let Some(wrapped) = wrapped else {
             continue;
         };
-        let (mut text, mut payload) =
-            open_atom_content(atom_wrap, &wrapped, id, as_blob(&row[2])?)?;
+        let mut hit = ProtectedHit::new(AtomHit {
+            id,
+            importance: as_f32(&row[9])?,
+            confidence: as_f32(&row[5])?,
+            relevance: None,
+            distance: None,
+            graph_depth: Some(depth),
+            created_at: as_ts(&row[4])?,
+            expires_at: opt_ts(&row[6])?,
+            immutable: as_bool(&row[3])?,
+            kind: as_text(&row[1])?.to_string(),
+            text: String::new(),
+            payload: serde_json::Value::Null,
+        });
+        let atom = &mut *hit;
+        (atom.text, atom.payload) = open_atom_content(atom_wrap, &wrapped, id, as_blob(&row[2])?)?;
         if let Some(filter) = scope.payload_filter {
-            if !json_contains(&payload, filter) {
-                zeroize_atom_content(&mut text, &mut payload);
+            if !json_contains(&hit.payload, filter) {
                 continue;
             }
         }
-        let kind = as_text(&row[1])?.to_string();
-        charge_owned_atom_content(&kind, &mut text, &mut payload)?;
-        hits.push((
-            depth,
-            AtomHit {
-                id,
-                kind,
-                payload,
-                text,
-                importance: as_f32(&row[9])?,
-                confidence: as_f32(&row[5])?,
-                relevance: None,
-                distance: None,
-                graph_depth: Some(depth),
-                created_at: as_ts(&row[4])?,
-                expires_at: opt_ts(&row[6])?,
-                immutable: as_bool(&row[3])?,
-            },
-        ));
+        charge_atom_content(&hit.kind, &hit.text, &hit.payload)?;
+        hits.push((depth, hit));
     }
     order_graph_hits(hits, cancel)
 }
@@ -13763,15 +13818,11 @@ fn parse_candidate(row: &[Value]) -> Result<Candidate> {
     if row.len() < 11 {
         return Err(MemError::Invalid("unexpected recall row shape".into()));
     }
-    let kind = as_text(&row[1])?.to_string();
-    let mut payload = parse_payload(&row[2])?;
-    let mut text = opt_text(&row[3])?;
-    charge_owned_atom_content(&kind, &mut text, &mut payload)?;
-    Ok(Candidate {
+    let mut candidate = Candidate {
         id: as_int(&row[0])?,
-        kind,
-        payload,
-        text,
+        kind: as_text(&row[1])?.to_string(),
+        payload: serde_json::Value::Null,
+        text: String::new(),
         importance: as_f32(&row[4])?,
         confidence: as_f32(&row[5])?,
         created_micros: as_ts(&row[6])?,
@@ -13779,7 +13830,11 @@ fn parse_candidate(row: &[Value]) -> Result<Candidate> {
         dist: dist_value(&row[8])?,
         text_rank: as_f32(&row[9])?,
         immutable: as_bool(&row[10])?,
-    })
+    };
+    candidate.payload = parse_payload(&row[2])?;
+    candidate.text = opt_text(&row[3])?;
+    charge_atom_content(&candidate.kind, &candidate.text, &candidate.payload)?;
+    Ok(candidate)
 }
 
 /// Columns: id, kind, payload(text), text_content, score, confidence,
@@ -14150,3 +14205,7 @@ fn now_micros() -> i64 {
 #[cfg(test)]
 #[path = "engine_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "engine/graph_traversal_tests.rs"]
+mod graph_traversal_tests;

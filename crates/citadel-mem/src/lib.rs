@@ -7,6 +7,7 @@ pub mod engine;
 pub mod error;
 mod fusion;
 pub mod graph;
+mod plaintext;
 pub mod profile;
 mod read_limits;
 pub mod types;
@@ -17,7 +18,7 @@ pub use citadel_sql::executor::{AnnIndexSource, AnnSegmentInfo};
 pub use embed::{EmbedError, Embedder, EmbeddingMetric, MockEmbedder, MockReranker, Reranker};
 pub use engine::{
     owns_table, MemoryEngine, MemoryMaintenance, RegionId, DEFAULT_SUMMARY_KIND_LIMIT,
-    MAX_DEPENDENT_FORGET_ATOMS, MAX_SUMMARY_KIND_LIMIT,
+    MAX_DEPENDENT_FORGET_ATOMS, MAX_GRAPH_EXPANSION_EDGES, MAX_SUMMARY_KIND_LIMIT,
 };
 pub use error::{MemError, Result};
 pub use graph::{
