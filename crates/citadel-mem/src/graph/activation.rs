@@ -114,7 +114,7 @@ impl Diffusion {
     }
 }
 
-/// Built once per scored run: per-question edge refetch dominated recall latency.
+/// A graph cache bound to one database and region until reset.
 #[derive(Default)]
 pub struct DiffusionCache {
     slot: std::sync::Mutex<Option<CachedDiffusion>>,
@@ -127,12 +127,37 @@ impl DiffusionCache {
     }
 }
 
-/// Graph + the inputs it was built from; mismatched inputs fail loud.
 struct CachedDiffusion {
+    database: std::sync::Weak<citadel::Database>,
     region: String,
     turn_kind: String,
     derived_kind: String,
     graph: std::sync::Arc<Diffusion>,
+}
+
+impl CachedDiffusion {
+    fn checked_graph(
+        &self,
+        database: &std::sync::Weak<citadel::Database>,
+        region: &str,
+        turn_kind: &str,
+        derived_kind: &str,
+    ) -> crate::Result<std::sync::Arc<Diffusion>> {
+        if !self.database.ptr_eq(database) {
+            return Err(crate::MemError::Invalid(
+                "diffusion cache bound to a different database; reset before reuse".into(),
+            ));
+        }
+        if self.region != region || self.turn_kind != turn_kind || self.derived_kind != derived_kind
+        {
+            return Err(crate::MemError::Invalid(format!(
+                "diffusion cache bound to region '{}' kinds '{}'/'{}', not '{region}' \
+                 '{turn_kind}'/'{derived_kind}'",
+                self.region, self.turn_kind, self.derived_kind
+            )));
+        }
+        Ok(std::sync::Arc::clone(&self.graph))
+    }
 }
 
 fn graph_for(
@@ -142,21 +167,25 @@ fn graph_for(
     turn_kind: &str,
     derived_kind: &str,
 ) -> crate::Result<Option<std::sync::Arc<Diffusion>>> {
+    let database = eng.database_identity();
     if let Some(c) = cache.slot.lock().unwrap().as_ref() {
-        if c.region != region || c.turn_kind != turn_kind || c.derived_kind != derived_kind {
-            return Err(crate::MemError::Invalid(format!(
-                "diffusion cache bound to region '{}' kinds '{}'/'{}', not '{region}' \
-                 '{turn_kind}'/'{derived_kind}'",
-                c.region, c.turn_kind, c.derived_kind
-            )));
-        }
-        return Ok(Some(std::sync::Arc::clone(&c.graph)));
+        return c
+            .checked_graph(&database, region, turn_kind, derived_kind)
+            .map(Some);
     }
-    let Some(g) = build_diffusion(eng, region, turn_kind, derived_kind)? else {
+    let built = build_diffusion(eng, region, turn_kind, derived_kind)?;
+    let mut slot = cache.slot.lock().unwrap();
+    if let Some(c) = slot.as_ref() {
+        return c
+            .checked_graph(&database, region, turn_kind, derived_kind)
+            .map(Some);
+    }
+    let Some(g) = built else {
         return Ok(None);
     };
     let g = std::sync::Arc::new(g);
-    *cache.slot.lock().unwrap() = Some(CachedDiffusion {
+    *slot = Some(CachedDiffusion {
+        database,
         region: region.to_string(),
         turn_kind: turn_kind.to_string(),
         derived_kind: derived_kind.to_string(),
@@ -184,21 +213,13 @@ pub fn activation_rerank_cached(
     )
 }
 
-/// Activation of a region's turns from seed score + diffusion, as
-/// `(turn id, activation)` sorted by descending activation (ties break by
-/// ascending id), truncated to `k`. The graph builds once per cache slot
-/// and is reused for every later call - the edge set is immutable once
-/// enrichment has converged, and the per-question rebuild (a full-turn
-/// page plus two global edge scans each) dominated diag wall time.
+/// Return up to `k` cached turns as `(atom id, activation)`, ordered by
+/// descending activation then ascending id. Seeds may be turns or derived notes.
 ///
-/// `seeds` are `(atom id, score)` pairs from the deterministic fusion
-/// ranking (rank-reciprocal scores work well; scale is irrelevant to the
-/// ordering as long as it is fixed) - derived-note hits may seed alongside
-/// turns. Every turn in the region participates, so evidence OUTSIDE the
-/// seeded pool can rise into the view. The activation itself is the score:
-/// seeds carry their fusion rank mass, everything else carries what the
-/// graph transmitted to it - so `score - seed` is the mass the graph added,
-/// a question-side evidence-strength signal no single hit provides.
+/// The cached graph is a snapshot, not a live view. Callers must exclude
+/// mutations while building it and reset before reuse after atom, edge, or
+/// region mutations, including erasure, or TTL changes/expiry. Cache hits do
+/// not revalidate atom liveness or automatically invalidate the snapshot.
 pub fn activation_scores_cached(
     cache: &DiffusionCache,
     eng: &MemoryEngine,
@@ -281,18 +302,26 @@ mod tests {
     use crate::AtomInput;
 
     fn engine(dir: &std::path::Path) -> MemoryEngine {
+        engine_with_database(dir).1
+    }
+
+    fn engine_with_database(
+        dir: &std::path::Path,
+    ) -> (std::sync::Arc<citadel::Database>, MemoryEngine) {
         use crate::MockEmbedder;
         use citadel::{Argon2Profile, DatabaseBuilder};
         use std::sync::Arc;
-        let db = DatabaseBuilder::new(dir.join("m.db"))
-            .passphrase(b"test-passphrase")
-            .argon2_profile(Argon2Profile::Iot)
-            .create()
-            .unwrap();
-        let eng = MemoryEngine::open(Arc::new(db)).unwrap();
+        let db = Arc::new(
+            DatabaseBuilder::new(dir.join("m.db"))
+                .passphrase(b"test-passphrase")
+                .argon2_profile(Argon2Profile::Iot)
+                .create()
+                .unwrap(),
+        );
+        let eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
         eng.create_region("r", Arc::new(MockEmbedder::new(64)))
             .unwrap();
-        eng
+        (db, eng)
     }
 
     /// Single-shot rank through a fresh cache (the only production path).
@@ -487,6 +516,110 @@ mod tests {
         // A reset drops the binding: the refused inputs now rebuild cleanly.
         cache.reset();
         activation_rerank_cached(&cache, &eng, "r", "turn", "note", &[(a, 1.0)], 1).unwrap();
+    }
+
+    #[test]
+    fn cache_refuses_a_different_database_until_reset() {
+        let first_dir = tempfile::tempdir().unwrap();
+        let second_dir = tempfile::tempdir().unwrap();
+        let first = engine(first_dir.path());
+        let second = engine(second_dir.path());
+        let insert_turns = |eng: &MemoryEngine| {
+            ["seed", "neighbor"]
+                .map(|text| eng.remember("r", AtomInput::new("turn", text)).unwrap())
+        };
+        let first_ids = insert_turns(&first);
+        let second_ids = insert_turns(&second);
+        assert_eq!(first_ids, second_ids);
+        first
+            .remember_derived(
+                "r",
+                AtomInput::new("derived", "shared fact"),
+                &first_ids,
+                None,
+            )
+            .unwrap();
+        let seeds = [(first_ids[0], 1.0)];
+        let score = |cache: &DiffusionCache, eng: &MemoryEngine| {
+            activation_scores_cached(cache, eng, "r", "turn", "derived", &seeds, 2)
+        };
+        let cache = DiffusionCache::default();
+        let first_scores = score(&cache, &first).unwrap();
+        let second_scores = score(&DiffusionCache::default(), &second).unwrap();
+        assert_ne!(first_scores, second_scores);
+
+        let error = score(&cache, &second).unwrap_err();
+        assert!(error.to_string().contains("diffusion cache bound"));
+        assert_eq!(score(&cache, &first).unwrap(), first_scores);
+
+        cache.reset();
+        assert_eq!(score(&cache, &second).unwrap(), second_scores);
+    }
+
+    #[test]
+    fn cache_accepts_shared_database_handles_without_retaining_the_database() {
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (db, first) = engine_with_database(dir.path());
+        let id = first.remember("r", AtomInput::new("turn", "seed")).unwrap();
+        let second = MemoryEngine::open(Arc::clone(&db)).unwrap();
+        second
+            .attach_existing_region("r", Arc::new(crate::MockEmbedder::new(64)))
+            .unwrap();
+        let weak = Arc::downgrade(&db);
+        let cache = DiffusionCache::default();
+        let first_scores =
+            activation_scores_cached(&cache, &first, "r", "turn", "derived", &[(id, 1.0)], 1)
+                .unwrap();
+        let second_scores =
+            activation_scores_cached(&cache, &second, "r", "turn", "derived", &[(id, 1.0)], 1)
+                .unwrap();
+        assert_eq!(first_scores, second_scores);
+        drop(first);
+        drop(second);
+        drop(db);
+        assert!(weak.upgrade().is_none());
+        assert!(cache.slot.lock().unwrap().is_some());
+    }
+
+    #[test]
+    fn concurrent_first_use_binds_exactly_one_database() {
+        let first_dir = tempfile::tempdir().unwrap();
+        let second_dir = tempfile::tempdir().unwrap();
+        let first = engine(first_dir.path());
+        let second = engine(second_dir.path());
+        let first_id = first
+            .remember("r", AtomInput::new("turn", "first database"))
+            .unwrap();
+        let second_id = second
+            .remember("r", AtomInput::new("turn", "second database"))
+            .unwrap();
+        assert_eq!(first_id, second_id);
+        let cache = DiffusionCache::default();
+        let start = std::sync::Barrier::new(2);
+        let score = |eng: &MemoryEngine| {
+            activation_scores_cached(&cache, eng, "r", "turn", "derived", &[(first_id, 1.0)], 1)
+        };
+        let (first_result, second_result) = std::thread::scope(|scope| {
+            let first_call = scope.spawn(|| {
+                start.wait();
+                score(&first)
+            });
+            let second_call = scope.spawn(|| {
+                start.wait();
+                score(&second)
+            });
+            (first_call.join().unwrap(), second_call.join().unwrap())
+        });
+        let (winner, loser, error) = match (first_result, second_result) {
+            (Ok(_), Err(error)) => (&first, &second, error),
+            (Err(error), Ok(_)) => (&second, &first, error),
+            other => panic!("expected exactly one database binding, got {other:?}"),
+        };
+        assert!(error.to_string().contains("diffusion cache bound"));
+        assert!(score(winner).is_ok());
+        assert!(score(loser).is_err());
     }
 
     #[test]

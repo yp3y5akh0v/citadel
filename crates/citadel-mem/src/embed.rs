@@ -113,7 +113,8 @@ pub trait Embedder: Send + Sync {
 pub trait Reranker: Send + Sync {
     fn model_id(&self) -> &str;
     /// Cooperatively rerank passages, polling `cancel` during tokenization and
-    /// inference. Returns one relevance score per passage, in input order.
+    /// inference. Returns one finite relevance score per passage, in input order.
+    /// Scores may be negative and need not lie in a fixed range.
     fn rerank_with_cancel(
         &self,
         query: &str,
