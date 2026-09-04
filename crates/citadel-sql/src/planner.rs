@@ -77,6 +77,10 @@ pub enum ScanPlan {
         /// otherwise a superset prefilter: consumers must re-apply the WHERE.
         full_cover: bool,
     },
+    PkPrefixScan {
+        prefix: Vec<u8>,
+        prefix_values: Vec<Value>,
+    },
     PkRangeScan {
         start_key: Vec<u8>,
         range_conds: Vec<(BinOp, Value)>,
@@ -303,11 +307,20 @@ fn plan_select_inner(
         }
     }
 
+    let mut pk_prefix = try_pk_prefix_scan(schema, &predicates, &simple);
+    // Each admitted prefix column requires a distinct direct equality conjunct.
+    if let Some(plan) = pk_prefix.take_if(|plan| {
+        matches!(plan, ScanPlan::PkPrefixScan { prefix_values, .. }
+            if prefix_values.len() == predicates.len())
+    }) {
+        return plan;
+    }
+
     if let Some(plan) = try_best_index(schema, where_expr, &simple) {
         return plan;
     }
 
-    ScanPlan::SeqScan
+    pk_prefix.unwrap_or(ScanPlan::SeqScan)
 }
 
 fn try_inverted_scan(schema: &TableSchema, where_expr: &Expr) -> Option<ScanPlan> {
@@ -568,6 +581,70 @@ fn pk_range_full_cover(
             if resolve_column_name(col_expr).and_then(|n| schema.column_index(n)) == Some(pk_col)
                 && resolve_literal(low).is_some()
                 && resolve_literal(high).is_some()),
+    })
+}
+
+fn try_pk_prefix_scan(
+    schema: &TableSchema,
+    expressions: &[&Expr],
+    predicates: &[Option<SimplePredicate>],
+) -> Option<ScanPlan> {
+    use crate::types::{Collation, DataType};
+
+    let mut prefix_values = Vec::new();
+    for &column in &schema.primary_key_columns {
+        if schema.primary_key_columns[..prefix_values.len()].contains(&column) {
+            break;
+        }
+        let column = column as usize;
+        let Some(predicate) =
+            predicates
+                .iter()
+                .zip(expressions)
+                .find_map(|(predicate, expression)| {
+                    let predicate = predicate.as_ref()?;
+                    if predicate.col_idx != column || predicate.op != BinOp::Eq {
+                        return None;
+                    }
+                    let Expr::BinaryOp { left, right, .. } = expression else {
+                        return None;
+                    };
+                    let literal_bound = |expression: &Expr| {
+                        matches!(expression, Expr::Literal(_) | Expr::Parameter(_))
+                    };
+                    ((resolve_column_name(left).is_some() && literal_bound(right))
+                        || (literal_bound(left) && resolve_column_name(right).is_some()))
+                    .then_some(predicate)
+                })
+        else {
+            break;
+        };
+        let definition = &schema.columns[column];
+        let value = &predicate.value;
+        if value.is_null()
+            || value.data_type() != definition.data_type
+            || !matches!(
+                definition.data_type,
+                DataType::Integer
+                    | DataType::Boolean
+                    | DataType::Text
+                    | DataType::Blob
+                    | DataType::Date
+                    | DataType::Time
+                    | DataType::Timestamp
+            )
+            || (definition.data_type == DataType::Text && definition.collation != Collation::Binary)
+        {
+            break;
+        }
+        prefix_values.push(value.clone());
+    }
+    if prefix_values.is_empty() || prefix_values.len() == schema.primary_key_columns.len() {
+        return None;
+    }
+    Some(ScanPlan::PkPrefixScan {
+        prefix: encode_composite_key(&prefix_values),
+        prefix_values,
     })
 }
 
@@ -832,6 +909,22 @@ pub fn describe_plan(plan: &ScanPlan, table_schema: &TableSchema) -> String {
                 .map(|(col, val)| format!("{col} = {}", format_value(val)))
                 .collect();
             format!("USING PRIMARY KEY ({})", conditions.join(", "))
+        }
+
+        ScanPlan::PkPrefixScan { prefix_values, .. } => {
+            let conditions: Vec<String> = table_schema
+                .primary_key_columns
+                .iter()
+                .zip(prefix_values)
+                .map(|(&column, value)| {
+                    format!(
+                        "{} = {}",
+                        table_schema.columns[column as usize].name,
+                        format_value(value)
+                    )
+                })
+                .collect();
+            format!("USING PRIMARY KEY PREFIX ({})", conditions.join(", "))
         }
 
         ScanPlan::PkRangeScan { range_conds, .. } => {

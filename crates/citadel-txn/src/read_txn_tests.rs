@@ -1,6 +1,50 @@
 use crate::manager::tests::create_test_manager;
 
 #[test]
+fn table_prefix_scan_respects_empty_missing_and_early_stop() {
+    let mgr = create_test_manager();
+    let mut writer = mgr.begin_write().unwrap();
+    writer.create_table(b"prefix").unwrap();
+    for key in [b"aa", b"ab", b"ba"] {
+        writer.table_insert(b"prefix", key, key).unwrap();
+    }
+    writer.commit().unwrap();
+    let mut reader = mgr.begin_read();
+    for (prefix, expected) in [
+        (
+            b"".as_slice(),
+            vec![b"aa".to_vec(), b"ab".to_vec(), b"ba".to_vec()],
+        ),
+        (b"a".as_slice(), vec![b"aa".to_vec(), b"ab".to_vec()]),
+        (b"az".as_slice(), vec![]),
+    ] {
+        let mut keys = Vec::new();
+        reader
+            .table_scan_prefix(b"prefix", prefix, |key, _| {
+                keys.push(key.to_vec());
+                Ok(true)
+            })
+            .unwrap();
+        assert_eq!(keys, expected);
+    }
+    let mut emitted = 0;
+    reader
+        .table_scan_prefix(b"prefix", b"", |_, _| {
+            emitted += 1;
+            Ok(false)
+        })
+        .unwrap();
+    assert_eq!(emitted, 1);
+    let token = citadel_core::CancelToken::new();
+    token.cancel();
+    reader.set_cancel(Some(token));
+    assert!(matches!(
+        reader.table_scan_prefix(b"prefix", b"a", |_, _| panic!("cancelled scan emitted")),
+        Err(citadel_core::Error::Interrupted)
+    ));
+}
+
+#[test]
 fn read_empty_tree() {
     let mgr = create_test_manager();
     let mut rtx = mgr.begin_read();

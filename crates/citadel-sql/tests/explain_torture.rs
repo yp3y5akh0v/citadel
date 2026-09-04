@@ -94,15 +94,26 @@ fn composite_pk_lookup() {
 }
 
 #[test]
-fn partial_composite_pk_is_seq_scan() {
+fn partial_composite_pk_uses_a_prefix_scan() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let conn = Connection::open(&db).unwrap();
     conn.execute("CREATE TABLE assoc (a INTEGER, b INTEGER, val TEXT, PRIMARY KEY (a, b))")
         .unwrap();
+    conn.execute(
+        "INSERT INTO assoc VALUES (0, 2, 'before'), (1, 2, 'first'), \
+         (1, 3, 'second'), (2, 2, 'after')",
+    )
+    .unwrap();
 
     let lines = explain_lines(&conn, "EXPLAIN SELECT * FROM assoc WHERE a = 1");
-    assert!(lines[0].contains("SCAN TABLE assoc"));
+    assert!(lines[0].contains("SEARCH TABLE assoc"));
+    assert!(lines[0].contains("USING PRIMARY KEY PREFIX (a = 1)"));
+
+    let measurement = db.measure_scans();
+    let rows = conn.query("SELECT b FROM assoc WHERE a = 1").unwrap().rows;
+    assert_eq!(rows, vec![vec![Value::Integer(2)], vec![Value::Integer(3)]]);
+    assert_eq!(measurement.rows_scanned(), 2);
 }
 
 #[test]

@@ -589,6 +589,35 @@ pub(super) fn collect_rows_with_read_planned(
             }
         }
 
+        ScanPlan::PkPrefixScan { prefix, .. } => {
+            let mut rows = Vec::new();
+            let mut scan_err = None;
+            let col_map = table_schema.column_map();
+            rtx.table_scan_prefix(lower_name.as_bytes(), &prefix, |key, value| {
+                let row = decode(key, value).and_then(|row| {
+                    let keep = match &where_clause {
+                        Some(expr) => is_truthy(&eval_expr(
+                            expr,
+                            &EvalCtx::new(col_map, &row).with_cancel(cancel),
+                        )?),
+                        None => true,
+                    };
+                    Ok(keep.then_some(row))
+                });
+                match row {
+                    Ok(Some(row)) => rows.push(row),
+                    Ok(None) => {}
+                    Err(error) => scan_err = Some(error),
+                }
+                Ok(scan_err.is_none() && limit.is_none_or(|limit| rows.len() < limit))
+            })
+            .map_err(SqlError::Storage)?;
+            if let Some(error) = scan_err {
+                return Err(error);
+            }
+            Ok((rows, true))
+        }
+
         ScanPlan::PkRangeScan {
             ref start_key,
             ref range_conds,
@@ -964,6 +993,35 @@ pub(super) fn collect_rows_write(
             }
         }
 
+        ScanPlan::PkPrefixScan { prefix, .. } => {
+            let mut rows = Vec::new();
+            let mut scan_err = None;
+            let col_map = table_schema.column_map();
+            wtx.table_scan_prefix(lower_name.as_bytes(), &prefix, |key, value| {
+                let row = decode(key, value).and_then(|row| {
+                    let keep = match &where_clause {
+                        Some(expr) => is_truthy(&eval_expr(
+                            expr,
+                            &EvalCtx::new(col_map, &row).with_cancel(cancel),
+                        )?),
+                        None => true,
+                    };
+                    Ok(keep.then_some(row))
+                });
+                match row {
+                    Ok(Some(row)) => rows.push(row),
+                    Ok(None) => {}
+                    Err(error) => scan_err = Some(error),
+                }
+                Ok(scan_err.is_none() && limit.is_none_or(|limit| rows.len() < limit))
+            })
+            .map_err(SqlError::Storage)?;
+            if let Some(error) = scan_err {
+                return Err(error);
+            }
+            Ok((rows, true))
+        }
+
         ScanPlan::PkRangeScan {
             ref start_key,
             ref range_conds,
@@ -1151,6 +1209,23 @@ pub(super) fn collect_keyed_rows_with_read(
             }
         }
 
+        ScanPlan::PkPrefixScan { prefix, .. } => {
+            let mut rows = Vec::new();
+            let mut scan_err = None;
+            rtx.table_scan_prefix(lower_name.as_bytes(), &prefix, |key, value| {
+                match decode(key, value) {
+                    Ok(row) => rows.push((key.to_vec(), row)),
+                    Err(error) => scan_err = Some(error),
+                }
+                Ok(scan_err.is_none())
+            })
+            .map_err(SqlError::Storage)?;
+            if let Some(error) = scan_err {
+                return Err(error);
+            }
+            Ok(rows)
+        }
+
         ScanPlan::PkRangeScan {
             ref start_key,
             ref range_conds,
@@ -1295,6 +1370,23 @@ pub(super) fn collect_keyed_rows_write(
                 }
                 None => Ok(vec![]),
             }
+        }
+
+        ScanPlan::PkPrefixScan { prefix, .. } => {
+            let mut rows = Vec::new();
+            let mut scan_err = None;
+            wtx.table_scan_prefix(lower_name.as_bytes(), &prefix, |key, value| {
+                match decode(key, value) {
+                    Ok(row) => rows.push((key.to_vec(), row)),
+                    Err(error) => scan_err = Some(error),
+                }
+                Ok(scan_err.is_none())
+            })
+            .map_err(SqlError::Storage)?;
+            if let Some(error) = scan_err {
+                return Err(error);
+            }
+            Ok(rows)
         }
 
         ScanPlan::PkRangeScan {

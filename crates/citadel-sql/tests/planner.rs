@@ -60,6 +60,7 @@ fn assert_plan(db: &citadel::Database, sql: &str, expected: &str) {
     let plan_name = match &plan {
         ScanPlan::SeqScan => "SeqScan",
         ScanPlan::PkLookup { .. } => "PkLookup",
+        ScanPlan::PkPrefixScan { .. } => "PkPrefixScan",
         ScanPlan::PkRangeScan { .. } => "PkRangeScan",
         ScanPlan::IndexScan { index_name, .. } => {
             if let Some(expected_idx) = expected.strip_prefix("IndexScan:") {
@@ -1308,7 +1309,7 @@ fn composite_pk_lookup() {
 }
 
 #[test]
-fn partial_composite_pk_is_not_pk_lookup() {
+fn partial_composite_pk_uses_a_prefix_scan() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let conn = Connection::open(&db).unwrap();
@@ -1323,8 +1324,7 @@ fn partial_composite_pk_is_not_pk_lookup() {
     conn.execute("INSERT INTO orders VALUES (2, 100, 30.0)")
         .unwrap();
 
-    // Only one PK column specified - can't do PK lookup
-    assert_plan(&db, "SELECT * FROM orders WHERE cust = 1", "SeqScan");
+    assert_plan(&db, "SELECT * FROM orders WHERE cust = 1", "PkPrefixScan");
 
     let qr = query_result(
         conn.execute("SELECT amount FROM orders WHERE cust = 1 ORDER BY ord")

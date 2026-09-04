@@ -2,6 +2,51 @@ use crate::manager::tests::create_test_manager;
 use citadel_core::types::PageId;
 
 #[test]
+fn table_prefix_scan_tracks_uncommitted_rows_and_does_not_load_the_next_prefix() {
+    let mgr = create_test_manager();
+    let mut writer = mgr.begin_write().unwrap();
+    writer.create_table(b"prefix").unwrap();
+    writer.table_insert(b"prefix", b"aa", b"ok").unwrap();
+    writer
+        .table_insert(b"prefix", b"ba", &vec![0x5a; 32_768])
+        .unwrap();
+    writer.set_read_budget(Some(crate::ReadBudget::new(8, 16)));
+    let mut keys = Vec::new();
+    writer
+        .table_scan_prefix(b"prefix", b"a", |key, value| {
+            keys.push(key.to_vec());
+            assert_eq!(value, b"ok");
+            Ok(true)
+        })
+        .unwrap();
+    assert_eq!(keys, vec![b"aa".to_vec()]);
+    writer.set_read_budget(None);
+    let mut all = 0;
+    writer
+        .table_scan_prefix(b"prefix", b"", |_, _| {
+            all += 1;
+            Ok(true)
+        })
+        .unwrap();
+    assert_eq!(all, 2);
+    let mut missing = 0;
+    writer
+        .table_scan_prefix(b"prefix", b"az", |_, _| {
+            missing += 1;
+            Ok(true)
+        })
+        .unwrap();
+    assert_eq!(missing, 0);
+    let token = citadel_core::CancelToken::new();
+    token.cancel();
+    writer.set_cancel(Some(token));
+    assert!(matches!(
+        writer.table_scan_prefix(b"prefix", b"a", |_, _| panic!("cancelled scan emitted")),
+        Err(citadel_core::Error::Interrupted)
+    ));
+}
+
+#[test]
 fn table_root_stamp_tracks_the_write_view_and_root_page_txn() {
     let mgr = create_test_manager();
     let mut create = mgr.begin_write().unwrap();
