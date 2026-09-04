@@ -569,7 +569,28 @@ impl<'db> ReadTxn<'db> {
     }
 
     /// Lazy scan from `start_key`. Callback returns `false` to stop.
-    pub fn table_scan_from<F>(&mut self, table: &[u8], start_key: &[u8], mut f: F) -> Result<()>
+    pub fn table_scan_from<F>(&mut self, table: &[u8], start_key: &[u8], f: F) -> Result<()>
+    where
+        F: FnMut(&[u8], &[u8]) -> Result<bool>,
+    {
+        self.table_scan_from_impl(table, start_key, None, f)
+    }
+
+    /// Lazy prefix scan. Out-of-prefix values are not materialized or charged.
+    pub fn table_scan_prefix<F>(&mut self, table: &[u8], prefix: &[u8], f: F) -> Result<()>
+    where
+        F: FnMut(&[u8], &[u8]) -> Result<bool>,
+    {
+        self.table_scan_from_impl(table, prefix, Some(prefix), f)
+    }
+
+    fn table_scan_from_impl<F>(
+        &mut self,
+        table: &[u8],
+        start_key: &[u8],
+        prefix: Option<&[u8]>,
+        mut f: F,
+    ) -> Result<()>
     where
         F: FnMut(&[u8], &[u8]) -> Result<bool>,
     {
@@ -589,6 +610,9 @@ impl<'db> ReadTxn<'db> {
         while let Some(c) = cursor.current_ref_lazy(&mut view) {
             if let Some(t) = cancel.as_ref() {
                 t.check()?;
+            }
+            if prefix.is_some_and(|prefix| !c.key.starts_with(prefix)) {
+                break;
             }
             count.rows += 1;
             let kind = c.val_type;
