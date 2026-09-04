@@ -57,11 +57,22 @@ pub const MAX_SUMMARY_KIND_LIMIT: usize = 4096;
 pub const MAX_DEPENDENT_FORGET_ATOMS: usize = 10_000;
 
 /// Over-fetch factor for ANN candidates before fusion re-ranking.
-const CAND_OVERFETCH: usize = 8;
+const CAND_OVERFETCH: usize = 4;
 /// Floor on ANN candidates evaluated (small-k recall stability).
-const MIN_CANDIDATES: usize = 64;
-/// Min ANN candidates over-fetched before fusion on the plaintext path.
-const MIN_OVERFETCH: usize = 4096;
+const MIN_CANDIDATES: usize = 4096;
+const ANN_SEARCH_OVERFETCH: usize = 8;
+const MIN_ANN_SEARCH_CANDIDATES: usize = 64;
+
+fn recall_candidate_limit(k: usize) -> usize {
+    k.saturating_mul(CAND_OVERFETCH).max(MIN_CANDIDATES)
+}
+
+fn recall_search_window(k: usize, candidate_limit: usize) -> usize {
+    // Preserve ANN exploration even when a repair needs only a few survivors.
+    k.saturating_mul(ANN_SEARCH_OVERFETCH)
+        .max(MIN_ANN_SEARCH_CANDIDATES)
+        .max(candidate_limit)
+}
 
 #[cfg(test)]
 std::thread_local! {
@@ -3273,6 +3284,7 @@ impl MemoryEngine {
                 },
                 &conn,
                 kl,
+                query.k,
                 cancel,
             )?
         } else {
@@ -5277,6 +5289,10 @@ impl MemoryEngine {
         self.db.data_path()
     }
 
+    pub(crate) fn database_identity(&self) -> std::sync::Weak<Database> {
+        Arc::downgrade(&self.db)
+    }
+
     /// Run one operation with a request-scoped cancellation token.
     ///
     /// The token applies only to work started synchronously by `operation` on
@@ -6928,6 +6944,7 @@ impl MemoryEngine {
                     },
                     conn,
                     _kl,
+                    recall_candidate_limit(q.k),
                     cancel.as_ref(),
                 )
             })?;
@@ -7047,7 +7064,7 @@ impl MemoryEngine {
 
         // Over-fetch trades query latency for better ranking of keyword/recency
         // hits.
-        let overfetch = q.k.saturating_mul(4).max(MIN_OVERFETCH);
+        let overfetch = recall_candidate_limit(q.k);
         let sql = format!(
             "SELECT id, kind, CAST(payload AS TEXT), text_content, score, confidence, \
              created_at, expires_at, embedding {distop} $1, 0.0, immutable \
@@ -8969,24 +8986,39 @@ impl MemoryEngine {
     /// per region and zeroized on drop.
     ///
     /// Supersession, expiry and the payload filter read plaintext, so they can
-    /// only discard after the window is cut. Widen until `k` survive or the
-    /// window spans the region.
+    /// only discard after the window is cut. Widen until the candidate budget
+    /// survives or the window spans the region.
     fn recall_sealed_candidates(
         &self,
         h: &RegionHandle,
         resolved: ResolvedRecall<'_>,
         conn: &Connection<'_>,
         kl: &KeyLifecycleGuard<'_>,
+        candidate_limit: usize,
         cancel: Option<&citadel_core::CancelToken>,
     ) -> Result<Vec<Candidate>> {
         let q = resolved.query;
-        let mut cand_k = q.k.saturating_mul(CAND_OVERFETCH).max(MIN_CANDIDATES);
+        let mut cand_k = recall_search_window(q.k, candidate_limit);
         loop {
-            let (cands, spanned) =
+            let (mut cands, spanned) =
                 self.sealed_window_candidates(h, resolved, conn, kl, cand_k, cancel)?;
             // Short is ambiguous: survivors ran out, or the window did. The window
             // is the nearest `cand_k`, so widening only appends.
-            if spanned || cands.len() >= q.k {
+            if spanned || cands.len() >= candidate_limit {
+                cands.sort_by(|a, b| {
+                    match (a.dist, b.dist) {
+                        (Some(left), Some(right)) => left
+                            .partial_cmp(&right)
+                            .unwrap_or(std::cmp::Ordering::Equal),
+                        (Some(_), None) => std::cmp::Ordering::Less,
+                        (None, Some(_)) => std::cmp::Ordering::Greater,
+                        (None, None) => std::cmp::Ordering::Equal,
+                    }
+                    .then(a.id.cmp(&b.id))
+                });
+                cands.truncate(candidate_limit);
+                assign_bm25_ranks(&mut cands, &query_keyword_terms(q.text.as_deref()), cancel)?;
+                check_cancel(cancel)?;
                 return Ok(cands);
             }
             cand_k = cand_k.saturating_mul(2);
@@ -9058,7 +9090,6 @@ impl MemoryEngine {
         // Build candidates from the index-build cache, so the hot path touches
         // no decryption. Only post-snapshot tail atoms miss and fall through to
         // the fetch + decrypt below.
-        let query_terms = query_keyword_terms(q.text.as_deref());
         // TTL runs on the wall clock (unlike as_of grading).
         let ttl_now = now_micros();
         let mut cands: Vec<Candidate> = Vec::with_capacity(ranked.len());
@@ -9180,7 +9211,6 @@ impl MemoryEngine {
             }
         }
 
-        assign_bm25_ranks(&mut cands, &query_terms, cancel)?;
         check_cancel(cancel)?;
         Ok((cands, spanned))
     }

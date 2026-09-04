@@ -158,6 +158,22 @@ fn ranks_desc(keys: &[f32]) -> Vec<usize> {
     rank
 }
 
+fn validate_reranker_scores(scores: &[f32], passages: usize) -> Result<(), EmbedError> {
+    if scores.len() != passages {
+        return Err(EmbedError::Backend(format!(
+            "reranker returned {} scores for {} passages",
+            scores.len(),
+            passages
+        )));
+    }
+    if let Some(index) = scores.iter().position(|score| !score.is_finite()) {
+        return Err(EmbedError::Backend(format!(
+            "reranker returned a non-finite score for passage {index}"
+        )));
+    }
+    Ok(())
+}
+
 /// Re-rank candidates with a cross-encoder, then keep the top `k`. `strategy` is
 /// Replace (trust the logit) or Rrf (blend cross-encoder and fusion ranks).
 pub(crate) fn fuse_rerank(
@@ -193,13 +209,7 @@ pub(crate) fn fuse_rerank(
     }
     let passages: Vec<&str> = cands.iter().map(|c| c.text.as_str()).collect();
     let ce_scores = reranker.rerank_with_cancel(context.query, &passages, context.cancel)?;
-    if ce_scores.len() != passages.len() {
-        return Err(EmbedError::Backend(format!(
-            "reranker returned {} scores for {} passages",
-            ce_scores.len(),
-            passages.len()
-        )));
-    }
+    validate_reranker_scores(&ce_scores, passages.len())?;
 
     let scores: Vec<f32> = match context.strategy {
         RerankStrategy::Replace => ce_scores,
@@ -283,13 +293,7 @@ pub(crate) fn rerank_hits(
     hits.truncate(RERANK_POOL);
     let passages: Vec<&str> = hits.iter().map(|h| h.text.as_str()).collect();
     let ce_scores = reranker.rerank_with_cancel(context.query, &passages, context.cancel)?;
-    if ce_scores.len() != passages.len() {
-        return Err(EmbedError::Backend(format!(
-            "reranker returned {} scores for {} passages",
-            ce_scores.len(),
-            passages.len()
-        )));
-    }
+    validate_reranker_scores(&ce_scores, passages.len())?;
     let scores: Vec<f32> = match context.strategy {
         RerankStrategy::Replace => ce_scores,
         RerankStrategy::Rrf { k: rrf_k } => {
@@ -706,6 +710,100 @@ mod tests {
             created_at: 0,
             expires_at: None,
             immutable: false,
+        }
+    }
+
+    struct FixedScoreReranker(f32);
+
+    impl Reranker for FixedScoreReranker {
+        fn model_id(&self) -> &str {
+            "fixed-score"
+        }
+
+        fn rerank_with_cancel(
+            &self,
+            _: &str,
+            passages: &[&str],
+            cancel: Option<&CancelToken>,
+        ) -> Result<Vec<f32>, EmbedError> {
+            crate::embed::check_cancel(cancel)?;
+            Ok(vec![self.0; passages.len()])
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum RerankPath {
+        Candidates,
+        Hits,
+    }
+
+    fn rerank_fixed_score(
+        path: RerankPath,
+        score: f32,
+        strategy: RerankStrategy,
+    ) -> Result<Vec<AtomHit>, EmbedError> {
+        let reranker = FixedScoreReranker(score);
+        let context = RerankContext {
+            query: "query",
+            strategy,
+            k: 1,
+            cancel: None,
+        };
+        match path {
+            RerankPath::Candidates => fuse_rerank(
+                &reranker,
+                vec![cand_text(1, "passage")],
+                FusionWeights::default(),
+                0,
+                context,
+            ),
+            RerankPath::Hits => rerank_hits(&reranker, vec![hit(1, "passage")], context),
+        }
+    }
+
+    #[test]
+    fn reranker_score_validation_preserves_cardinality_errors() {
+        for scores in [&[0.0][..], &[f32::NAN][..]] {
+            let error = validate_reranker_scores(scores, 2).unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("reranker returned 1 scores for 2 passages"));
+        }
+    }
+
+    #[test]
+    fn reranking_rejects_nonfinite_backend_scores() {
+        let mut failures = Vec::new();
+        for path in [RerankPath::Candidates, RerankPath::Hits] {
+            for strategy in [RerankStrategy::Replace, RerankStrategy::Rrf { k: 20.0 }] {
+                for score in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                    match rerank_fixed_score(path, score, strategy) {
+                        Err(EmbedError::Backend(message)) if message.contains("non-finite") => {}
+                        result => {
+                            failures.push(format!("{path:?}, {strategy:?}, {score:?}: {result:?}"))
+                        }
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn reranking_accepts_finite_backend_scores_without_clamping() {
+        for path in [RerankPath::Candidates, RerankPath::Hits] {
+            for strategy in [RerankStrategy::Replace, RerankStrategy::Rrf { k: 20.0 }] {
+                for score in [f32::MIN, -7.5, -0.0, 0.0, 11.25, f32::MAX] {
+                    let hits = rerank_fixed_score(path, score, strategy).unwrap();
+                    assert_eq!(hits.len(), 1);
+                    assert_eq!(hits[0].id, 1);
+                    let expected = match strategy {
+                        RerankStrategy::Replace => score,
+                        RerankStrategy::Rrf { k } => 1.0 / k + 1.0 / k,
+                    };
+                    assert_eq!(hits[0].relevance.unwrap().to_bits(), expected.to_bits());
+                }
+            }
         }
     }
 

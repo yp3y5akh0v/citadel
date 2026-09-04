@@ -78,6 +78,19 @@ fn create_enc_db(path: &std::path::Path) -> Arc<Database> {
 }
 
 #[test]
+fn recall_search_window_preserves_ann_breadth() {
+    for (k, limit, expected) in [
+        (1, 1, 64),
+        (9, 9, 72),
+        (50, 4096, 4096),
+        (2000, 8000, 16000),
+        (usize::MAX, usize::MAX, usize::MAX),
+    ] {
+        assert_eq!(recall_search_window(k, limit), expected);
+    }
+}
+
+#[test]
 fn create_region_is_idempotent_reattach() {
     let dir = tempfile::tempdir().unwrap();
     let eng = MemoryEngine::open(create_db(dir.path())).unwrap();
