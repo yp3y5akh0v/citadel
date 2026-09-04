@@ -4,10 +4,12 @@
 use std::sync::Arc;
 
 use citadel::{Argon2Profile, Database, DatabaseBuilder};
-use citadel_llm::testing;
-use citadel_mem::{Embedder, MemoryEngine, MockEmbedder};
-use citadel_membench::benchmarks::longmemeval::{dataset, run, LmevalConfig};
-use citadel_membench::{BenchConfig, Pacer};
+use citadel_llm::{testing, CompletionResponse, Message};
+use citadel_mem::{AtomInput, Embedder, FetchQuery, MemoryEngine, MockEmbedder};
+use citadel_membench::benchmarks::longmemeval::{
+    dataset, ingest, prompts, retrieval, run, LmevalConfig,
+};
+use citadel_membench::{BenchConfig, BenchError, Pacer};
 use serde_json::json;
 
 const DIM: usize = 64;
@@ -54,6 +56,192 @@ fn fixture() -> serde_json::Value {
             "answer_session_ids": []
         }
     ])
+}
+
+#[test]
+fn repeated_session_ids_preserve_occurrences_and_official_evidence_ids() {
+    let samples = dataset::parse_root(&json!([{
+        "question_id": "q_repeated",
+        "question_type": "multi-session",
+        "question": "what happened?",
+        "answer": "three chats",
+        "question_date": "2023/05/20 (Sat) 02:21",
+        "haystack_session_ids": ["shared", "shared", "shared"],
+        "haystack_dates": [
+            "2023/05/03 (Wed) 09:00",
+            "2023/05/01 (Mon) 09:00",
+            "2023/05/03 (Wed) 09:00"
+        ],
+        "haystack_sessions": [
+            [{"role": "user", "content": "first occurrence", "has_answer": true},
+             {"role": "assistant", "content": "reply to first", "has_answer": false}],
+            [{"role": "user", "content": "older occurrence", "has_answer": true}],
+            [{"role": "user", "content": "same-date occurrence", "has_answer": true}]
+        ],
+        "answer_session_ids": ["shared"]
+    }]))
+    .unwrap();
+    let sample = &samples[0];
+    assert_eq!(
+        sample
+            .turns
+            .iter()
+            .map(|t| t.session_occurrence)
+            .collect::<Vec<_>>(),
+        [0, 0, 1, 2]
+    );
+    assert!(sample.turns.iter().all(|t| t.session_id == "shared"));
+    assert_eq!(sample.evidence, ["shared"]);
+
+    let dir = tempfile::tempdir().unwrap();
+    let eng = engine(dir.path());
+    eng.create_region(&sample.question_id, Arc::new(MockEmbedder::new(DIM)))
+        .unwrap();
+    ingest::ingest_sample(&eng, &sample.question_id, sample).unwrap();
+    let mut hits = eng
+        .fetch_range(&sample.question_id, &FetchQuery::new(10))
+        .unwrap();
+    assert_eq!(
+        hits.iter()
+            .map(|h| h.payload["session_occurrence"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        [0, 0, 1, 2]
+    );
+    assert_eq!(retrieval::distinct_session_ids(&hits), ["shared"]);
+    let prompt =
+        prompts::build_reader_prompt(&hits, &sample.question, &sample.question_date).unwrap();
+    hits.reverse();
+    let reversed =
+        prompts::build_reader_prompt(&hits, &sample.question, &sample.question_date).unwrap();
+    let (Message::User(text), Message::User(reversed_text)) = (&prompt[0], &reversed[0]) else {
+        panic!("expected user messages");
+    };
+    assert_eq!(text, reversed_text);
+    assert_eq!(text.matches("### Session ").count(), 3);
+    let older = text.find("user: older occurrence").unwrap();
+    let first = text.find("user: first occurrence").unwrap();
+    let reply = text.find("assistant: reply to first").unwrap();
+    let same_date = text.find("user: same-date occurrence").unwrap();
+    assert!(older < first && first < reply && reply < same_date);
+}
+
+#[test]
+fn source_dates_reject_invalid_values_and_preserve_unknown_dates() {
+    let mut data = fixture();
+    data[0]["haystack_dates"][0] = json!("2023/02/29 (Wed) 09:00");
+    let error = dataset::parse_root(&data).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("invalid haystack date at session occurrence 0"));
+    data[0]["haystack_dates"][0] = json!("");
+    let samples = dataset::parse_root(&data).unwrap();
+    assert!(samples[0].turns[0].date.is_empty());
+    assert_eq!(samples[0].turns[0].event_micros, None);
+}
+
+#[test]
+fn reuse_accepts_exact_corpus_without_reingestion() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = engine(dir.path());
+    let samples = dataset::parse_root(&fixture()).unwrap();
+    let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::new(DIM));
+    for sample in &samples {
+        eng.create_region(&sample.question_id, Arc::clone(&embedder))
+            .unwrap();
+        ingest::ingest_sample(&eng, &sample.question_id, sample).unwrap();
+    }
+    let reader = testing::capturing(vec![
+        CompletionResponse::text("first"),
+        CompletionResponse::text("second"),
+    ]);
+    let output = run(
+        &eng,
+        &samples,
+        embedder,
+        &*reader.client(),
+        &Pacer::unbounded(),
+        &LmevalConfig {
+            bench: BenchConfig::default(),
+            encrypted: false,
+            reuse: true,
+            reader_concurrency: 1,
+        },
+        &mut |_, _, _| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(output.len(), 2);
+    assert_eq!(reader.requests().len(), 2);
+    for sample in &samples {
+        assert_eq!(
+            eng.count_region(&sample.question_id).unwrap(),
+            sample.turns.len() as u64
+        );
+    }
+}
+
+#[test]
+fn reuse_rejects_missing_region_empty_corpus_and_legacy_payload_before_reader_calls() {
+    for cache_state in ["missing", "empty", "legacy"] {
+        let dir = tempfile::tempdir().unwrap();
+        let eng = engine(dir.path());
+        let samples = dataset::parse_root(&fixture()).unwrap();
+        let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::new(DIM));
+        let first = &samples[0];
+        eng.create_region(&first.question_id, Arc::clone(&embedder))
+            .unwrap();
+        ingest::ingest_sample(&eng, &first.question_id, first).unwrap();
+        let last = &samples[1];
+        if cache_state != "missing" {
+            eng.create_region(&last.question_id, Arc::clone(&embedder))
+                .unwrap();
+        }
+        if cache_state == "legacy" {
+            let atoms = last
+                .turns
+                .iter()
+                .map(|t| {
+                    AtomInput::new("turn", ingest::turn_content(t))
+                        .with_payload(json!({
+                            "session_id": t.session_id,
+                            "role": t.role,
+                            "has_answer": t.has_answer,
+                        }))
+                        .with_created_at(t.event_micros.unwrap())
+                })
+                .collect();
+            eng.remember_batch(&last.question_id, atoms).unwrap();
+        }
+        let reader = testing::capturing(Vec::new());
+        let error = run(
+            &eng,
+            &samples,
+            Arc::clone(&embedder),
+            &*reader.client(),
+            &Pacer::unbounded(),
+            &LmevalConfig {
+                bench: BenchConfig::default(),
+                encrypted: false,
+                reuse: true,
+                reader_concurrency: 1,
+            },
+            &mut |_, _, _| panic!("invalid cache must not emit"),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, BenchError::Dataset(_)),
+            "{cache_state}: {error}"
+        );
+        assert!(
+            error.to_string().contains(&last.question_id),
+            "{cache_state}: {error}"
+        );
+        assert!(reader.requests().is_empty(), "{cache_state}");
+        if cache_state == "missing" {
+            assert!(eng
+                .attach_existing_region(&last.question_id, embedder)
+                .is_err());
+        }
+    }
 }
 
 #[test]

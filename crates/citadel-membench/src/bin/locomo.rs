@@ -25,7 +25,7 @@
 //!   CITADEL_LOCOMO_LIVE_TRACE=path    stream one JSON line per question
 //!   CITADEL_LOCOMO_AUDIT_PATH=path    per-question audit JSON at the end
 //!   CITADEL_LOCOMO_DB_PATH=path       persist + reuse the encrypted DB
-//!                             (skip ingest; ENCRYPTED must match the build)
+//!                             (validate before reuse; ENCRYPTED must match)
 //!   CITADEL_LOCOMO_DRY_RUN=1          load + print dataset stats, then exit
 //!   CITADEL_LOCOMO_RETRIEVAL_DIAG=1   token-free layered recall@k, then exit
 //!                             (needs embedder, no key; finds the lossy layer)
@@ -112,7 +112,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let db = Arc::clone(&bench_db.db);
     if bench_db.reuse {
         eprintln!(
-            "db: reuse {} (encrypted_regions={encrypted}) - skipping ingest",
+            "db: reuse {} (encrypted_regions={encrypted}) - corpus validation required",
             bench_db.path.display()
         );
     } else {
@@ -320,6 +320,8 @@ impl LiveProgress {
                 "question": r.question,
                 "gold": r.gold,
                 "predicted": r.predicted,
+                "reader_finish_reasons": r.reader_finish_reasons,
+                "judge": r.judge,
                 "retrieved": r.retrieved,
                 "gold_evidence": r.gold_evidence,
                 "gold_turn_texts": r.gold_turn_texts,

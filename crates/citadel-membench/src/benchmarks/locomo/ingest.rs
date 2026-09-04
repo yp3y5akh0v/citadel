@@ -33,23 +33,25 @@ pub fn turn_content(t: &Turn) -> String {
 /// chronologically) with the session's parsed date as event-time `created_at`.
 /// The caller must create `region` (bound to the embedder) first.
 pub fn ingest_sample(eng: &MemoryEngine, region: &str, sample: &Sample) -> Result<Vec<AtomId>> {
-    let atoms = sample
-        .turns
-        .iter()
-        .map(|t| {
-            let mut input = AtomInput::new("turn", turn_content(t)).with_payload(json!({
-                "session": t.session,
-                "date_time": t.date_time,
-                "speaker": t.speaker,
-                "dia_id": t.dia_id,
-                "blip_caption": t.blip_caption,
-                "query": t.query,
-            }));
-            if let Some(event) = t.event_micros() {
-                input = input.with_created_at(event);
-            }
-            input
-        })
-        .collect();
+    let atoms = sample.turns.iter().map(atom_input).collect();
     Ok(eng.remember_batch(region, atoms)?)
+}
+
+pub fn validate_reuse(eng: &MemoryEngine, region: &str, sample: &Sample) -> Result<()> {
+    crate::core::db::validate_ingested_atoms(eng, region, sample.turns.iter().map(atom_input))
+}
+
+fn atom_input(t: &Turn) -> AtomInput {
+    let mut input = AtomInput::new("turn", turn_content(t)).with_payload(json!({
+        "session": t.session,
+        "date_time": t.date_time,
+        "speaker": t.speaker,
+        "dia_id": t.dia_id,
+        "blip_caption": t.blip_caption,
+        "query": t.query,
+    }));
+    if let Some(event) = t.event_micros() {
+        input = input.with_created_at(event);
+    }
+    input
 }

@@ -5,11 +5,12 @@ pub mod dataset;
 pub mod ingest;
 pub mod prompts;
 
-use citadel_llm::{LLMClient, Message, TokenUsage};
+use citadel_llm::{LLMClient, Message};
 use citadel_mem::AtomHit;
 
 use crate::core::benchmark::Benchmark;
 use crate::core::error::Result;
+use crate::core::eval::JudgeOutcome;
 use crate::core::ratelimit::Pacer;
 
 /// The LoCoMo benchmark plugin.
@@ -29,8 +30,17 @@ impl Benchmark for Locomo {
     }
 
     // LoCoMo dialogue lines carry their own dates; there is no separate current-date anchor.
-    fn reader_prompt(&self, hits: &[AtomHit], question: &str, _current_date: &str) -> Vec<Message> {
-        prompts::build_reader_prompt(hits, question, self.session_headers)
+    fn reader_prompt(
+        &self,
+        hits: &[AtomHit],
+        question: &str,
+        _current_date: &str,
+    ) -> Result<Vec<Message>> {
+        Ok(prompts::build_reader_prompt(
+            hits,
+            question,
+            self.session_headers,
+        ))
     }
 
     fn known_flaws(&self) -> &str {
@@ -49,11 +59,11 @@ impl Locomo {
         question: &str,
         gold: &str,
         predicted: &str,
-    ) -> Result<(bool, TokenUsage)> {
+    ) -> Result<JudgeOutcome> {
         if scored || !gold.trim().is_empty() {
-            prompts::judge_correct(judge, pacer, question, gold, predicted)
+            prompts::judge_correct_observed(judge, pacer, question, gold, predicted)
         } else {
-            prompts::judge_abstained(judge, pacer, question, predicted)
+            prompts::judge_abstained_observed(judge, pacer, question, predicted)
         }
     }
 }

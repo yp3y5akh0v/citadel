@@ -31,7 +31,7 @@ CPU: swap `cuda-embed` -> `candle-embed`.
 - `CITADEL_LONGMEMEVAL_READER_TPM` - per-model tokens/min (default is model-aware: gpt-4o-mini -> 2M, else 200k).
 - `CITADEL_LONGMEMEVAL_MAX_SAMPLES=N` - cap to the first N questions.
 - `CITADEL_LONGMEMEVAL_ENCRYPTED=true` - seal atoms per-region key (default plaintext).
-- `CITADEL_LONGMEMEVAL_DB_PATH=<PATH>.cdl` - persist the encrypted DB; a later run reopens + reuses it (skip the ~2h ingest). Keep `ENCRYPTED` identical between build and reuse.
+- `CITADEL_LONGMEMEVAL_DB_PATH=<PATH>.cdl` - persist the DB; later runs validate and reuse its stored corpus. Keep `ENCRYPTED` identical between build and reuse.
 - `CITADEL_LONGMEMEVAL_RETRIEVAL_DIAG=1` - token-free recall@k diagnostic (no reader/key).
 - `CITADEL_MEMBENCH_MAX_TOKENS` - reader output cap OVERRIDE (LongMemEval defaults to 800 = CoT gen_length).
 
@@ -44,16 +44,22 @@ Phase 1 ingests one region per question (`ingested N/500`); phase 2 runs the rea
 (`answered N/500`, where OpenAI charges happen) and writes the JSONL at the end.
 Reader defaults: gpt-4o, the official CoT prompt, max_tokens 800.
 
-## Reuse a persisted DB (skip the ~2h ingest)
-Full-haystack ingest dominates wall-clock (~2h for `longmemeval_s_cleaned.json`; the work
-scales with turn count, ~493 turns/region). Set `CITADEL_LONGMEMEVAL_DB_PATH=<PATH>.cdl` to
-persist the encrypted DB and reuse it:
-- first run (path missing): builds + ingests once, then persists (reusable next run);
-- later runs (path present): reopen + re-attach every region and SKIP ingest (phase 1 prints
-  `re-attach`), recalling from the stored vectors (the ANN segment rebuilds on first recall).
-Only the reader re-runs, so prompt / `TOP_K` / reader sweeps drop to seconds. The retrieval
-diagnostic honours the same reuse. `ENCRYPTED` must match between the build run and every
-reuse run. The cache is the `.cdl` PLUS its sidecars - `.cdl.citadel-keys`, `.citadel-regions`,
+## Reuse a persisted DB
+
+Set `CITADEL_LONGMEMEVAL_DB_PATH=<PATH>.cdl` to retain the ingested corpus:
+
+- First run (path missing): create the database and ingest the selected haystacks.
+- Later runs (path present): attach existing regions, verify their stored turns against
+  the current ingestion inputs, then recall from the stored vectors without re-embedding.
+
+Missing, extra or changed live turns fail validation before reader calls. A different encryption
+mode or embedder identity also fails. Use a new database path to rebuild; validation never
+overwrites an existing corpus. Older LongMemEval corpora without `session_occurrence`
+metadata must be rebuilt. This field distinguishes repeated session IDs; the official
+session ID remains the retrieval-scoring key.
+
+The retrieval diagnostic performs the same validation. The cache is the `.cdl` PLUS
+its sidecars - `.cdl.citadel-keys`, `.citadel-regions`,
 `.citadel-atomkeys`, `.citadel-audit` - copy or delete them as a set (a missing `.citadel-regions`
 fails re-attach with `RegionForgotten`). LoCoMo has the same `CITADEL_LOCOMO_DB_PATH` for its
 scored run (its token-free modes need a fresh DB).

@@ -10,6 +10,7 @@ use citadel_mem::{Embedder, MemoryEngine};
 
 use super::dataset::LmSample;
 use super::{ingest, LongMemEval};
+use crate::core::db::attach_reused_region;
 use crate::core::error::{BenchError, Result};
 use crate::core::eval::{answer_question, Question};
 use crate::core::ratelimit::{Gate, Pacer};
@@ -18,7 +19,7 @@ use crate::BenchConfig;
 pub struct LmevalConfig {
     pub bench: BenchConfig,
     pub encrypted: bool,
-    /// Reopened persisted DB: re-attach regions and skip ingest.
+    /// Reopened persisted DB: validate and re-attach regions without ingestion.
     pub reuse: bool,
     pub reader_concurrency: usize,
 }
@@ -54,12 +55,15 @@ pub fn run(
     let t_ingest = Instant::now();
     let n = samples.len();
     for (i, s) in samples.iter().enumerate() {
-        if cfg.encrypted {
-            eng.create_encrypted_region(&s.question_id, Arc::clone(&embedder))?;
+        if cfg.reuse {
+            attach_reused_region(eng, &s.question_id, Arc::clone(&embedder), cfg.encrypted)?;
+            ingest::validate_reuse(eng, &s.question_id, s)?;
         } else {
-            eng.create_region(&s.question_id, Arc::clone(&embedder))?;
-        }
-        if !cfg.reuse {
+            if cfg.encrypted {
+                eng.create_encrypted_region(&s.question_id, Arc::clone(&embedder))?;
+            } else {
+                eng.create_region(&s.question_id, Arc::clone(&embedder))?;
+            }
             ingest::ingest_sample(eng, &s.question_id, s)?;
         }
         if (i + 1) % 25 == 0 || i + 1 == n {

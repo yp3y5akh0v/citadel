@@ -140,6 +140,9 @@ pub struct QuestionResult {
     pub question: String,
     pub gold: String,
     pub predicted: String,
+    pub reader_finish_reasons: Vec<core::eval::CompletionFinish>,
+    /// Absent only when an unscorable question made no judge call.
+    pub judge: Option<core::eval::JudgeOutcome>,
 }
 
 /// Per-category roll-up (scored categories only).
@@ -255,8 +258,8 @@ pub fn run_sample(
 }
 
 /// Like [`run_sample`] but invokes `on_result` per question as it scores
-/// (live tracing); scoring is identical. `reuse = true` skips ingest and
-/// recalls from a reopened persisted DB.
+/// (live tracing); scoring is identical. `reuse = true` validates the persisted
+/// corpus before recalling without ingestion.
 #[allow(clippy::too_many_arguments)]
 pub fn run_sample_observed(
     eng: &MemoryEngine,
@@ -269,11 +272,12 @@ pub fn run_sample_observed(
     pacer: &Pacer,
     on_result: &mut (dyn FnMut(&QuestionResult) -> Result<()> + Send),
 ) -> Result<Vec<QuestionResult>> {
-    // One region per conversation. Ingest is the single-writer phase and must
-    // finish before questions fan out; a reused DB skips it (atoms already
-    // present).
-    create_bench_region(eng, &sample.sample_id, embedder)?;
-    if !reuse {
+    // Ingest or validate the conversation before question workers start.
+    if reuse {
+        core::db::attach_reused_region(eng, &sample.sample_id, embedder, encrypted_regions())?;
+        benchmarks::locomo::ingest::validate_reuse(eng, &sample.sample_id, sample)?;
+    } else {
+        create_bench_region(eng, &sample.sample_id, embedder)?;
         ingest_sample(eng, &sample.sample_id, sample)?;
     }
 
@@ -429,6 +433,8 @@ fn process_one_question(
             question: qa.question.clone(),
             gold: qa.gold.clone(),
             predicted: String::new(),
+            reader_finish_reasons: Vec::new(),
+            judge: None,
         });
     }
 
@@ -442,7 +448,7 @@ fn process_one_question(
         answer_question(&bench, reader, pacer, eng, region, q, config)?
     };
 
-    let (correct, judge_usage) = {
+    let judge_outcome = {
         let _permit = judge_gate.acquire();
         bench.judge(
             judge,
@@ -464,24 +470,24 @@ fn process_one_question(
         qa_index,
         category: qa.category,
         scorable: true,
-        correct,
+        correct: judge_outcome.correct,
         recall_micros: outcome.recall_micros,
         input_tokens: outcome
             .usage
             .input_tokens
-            .saturating_add(judge_usage.input_tokens),
+            .saturating_add(judge_outcome.usage.input_tokens),
         output_tokens: outcome
             .usage
             .output_tokens
-            .saturating_add(judge_usage.output_tokens),
+            .saturating_add(judge_outcome.usage.output_tokens),
         cost_usd: token_cost(
             reader.model_id(),
             outcome.usage.input_tokens,
             outcome.usage.output_tokens,
         ) + token_cost(
             judge.model_id(),
-            judge_usage.input_tokens,
-            judge_usage.output_tokens,
+            judge_outcome.usage.input_tokens,
+            judge_outcome.usage.output_tokens,
         ),
         retrieved: outcome.retrieved,
         gold_evidence: qa.evidence.clone(),
@@ -490,6 +496,8 @@ fn process_one_question(
         question: qa.question.clone(),
         gold: qa.gold.clone(),
         predicted: outcome.answer,
+        reader_finish_reasons: outcome.reader_finish_reasons,
+        judge: Some(judge_outcome),
     })
 }
 
