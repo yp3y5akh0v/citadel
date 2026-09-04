@@ -207,6 +207,7 @@ pub(crate) fn fuse_rerank(
     if cands.is_empty() {
         return Ok(Vec::new());
     }
+    let mut admission_scores = None;
     if cands.len() > RERANK_POOL {
         let pre = fusion_scores(&cands, w, now_micros);
         let mut idx: Vec<usize> = (0..cands.len()).collect();
@@ -219,12 +220,15 @@ pub(crate) fn fuse_rerank(
         idx.truncate(RERANK_POOL);
         idx.sort_unstable();
         let mut kept = Vec::with_capacity(RERANK_POOL);
-        for (i, c) in cands.into_iter().enumerate() {
+        let mut kept_scores = Vec::with_capacity(RERANK_POOL);
+        for ((i, c), score) in cands.into_iter().enumerate().zip(pre) {
             if idx.binary_search(&i).is_ok() {
                 kept.push(c);
+                kept_scores.push(score);
             }
         }
         cands = kept;
+        admission_scores = Some(kept_scores);
     }
     let passages: Vec<&str> = cands.iter().map(|c| c.text.as_str()).collect();
     let ce_scores = reranker.rerank_with_cancel(context.query, &passages, context.cancel)?;
@@ -233,7 +237,8 @@ pub(crate) fn fuse_rerank(
     let scores: Vec<f32> = match context.strategy {
         RerankStrategy::Replace => ce_scores,
         RerankStrategy::Rrf { k: rrf_k } => {
-            let fusion_scores = fusion_scores(&cands, w, now_micros);
+            let fusion_scores =
+                admission_scores.unwrap_or_else(|| fusion_scores(&cands, w, now_micros));
             let ce_rank = ranks_desc(&ce_scores);
             let fusion_rank = ranks_desc(&fusion_scores);
             (0..cands.len())
@@ -739,6 +744,52 @@ mod tests {
             crate::embed::check_cancel(cancel)?;
             assert_eq!(passages, self.passages);
             Ok(self.scores.clone())
+        }
+    }
+
+    #[test]
+    fn rerank_rrf_preserves_admission_scores_across_the_pool_boundary() {
+        for count in [RERANK_POOL - 1, RERANK_POOL, RERANK_POOL + 1] {
+            let cands = pretrim_fixture(count);
+            let full_scores = fusion_scores(&cands, pretrim_weights(), 0);
+            assert!(full_scores[1] > full_scores[0]);
+            assert!(full_scores[0] > full_scores[2]);
+            assert!(full_scores[2] > full_scores[count - 1]);
+            let retained = count.min(RERANK_POOL);
+            let reranker = PoolReranker {
+                passages: (1..=retained).map(|id| id.to_string()).collect(),
+                scores: (1..=retained)
+                    .map(|id| match id {
+                        1 => 1.0,
+                        2 => 2.0,
+                        id if id == count => -1.0,
+                        _ => 0.0,
+                    })
+                    .collect(),
+            };
+            let hits = fuse_rerank(
+                &reranker,
+                cands,
+                pretrim_weights(),
+                0,
+                RerankContext {
+                    query: "query",
+                    strategy: RerankStrategy::Rrf { k: 20.0 },
+                    k: retained,
+                    cancel: None,
+                },
+            )
+            .unwrap();
+            let expected_ids: Vec<_> = [2, 1].into_iter().chain(3..=retained as AtomId).collect();
+            assert_eq!(
+                hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+                expected_ids,
+                "candidate count {count}"
+            );
+            for (rank, hit) in hits.iter().enumerate() {
+                let expected = 1.0 / (20.0 + rank as f32) + 1.0 / (20.0 + rank as f32);
+                assert_eq!(hit.relevance.unwrap().to_bits(), expected.to_bits());
+            }
         }
     }
 

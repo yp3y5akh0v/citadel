@@ -354,7 +354,8 @@ pub enum RerankStrategy {
     Replace,
     /// Reciprocal Rank Fusion of cross-encoder and fusion ranks; `k` is the
     /// damping constant (60 is the literature standard; lower trusts top ranks
-    /// more).
+    /// more). Retained candidates keep their original fusion scores: signals
+    /// are not renormalized after the rerank pool is trimmed.
     /// `k` must be positive and finite, with a finite two-ranking RRF sum.
     Rrf { k: f32 },
 }
