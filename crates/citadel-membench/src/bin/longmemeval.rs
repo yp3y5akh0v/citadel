@@ -22,7 +22,7 @@
 //!   CITADEL_MEMBENCH_MAX_TOKENS         reader output-token cap (default 800)
 //!   CITADEL_LONGMEMEVAL_ENCRYPTED=true  seal atoms per-key (default false)
 //!   CITADEL_LONGMEMEVAL_DB_PATH=path    persist + reuse the encrypted DB
-//!                             (skip the ~2h ingest; ENCRYPTED must match)
+//!                             (validate before reuse; ENCRYPTED must match)
 //!   CITADEL_LONGMEMEVAL_MOCK_EMBED=1    deterministic embedder (smoke only)
 //!   CITADEL_LONGMEMEVAL_EMBEDDER=m      e5-large|e5-large-v2|bge-*|granite-r2
 //!   CITADEL_RERANKER_DIR=/path          cross-encoder reranker dir
@@ -132,7 +132,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let eng = MemoryEngine::open(Arc::clone(&bench_db.db))?;
     if bench_db.reuse {
         eprintln!(
-            "db: reuse {} (encrypted_regions={encrypted}) - skipping ingest",
+            "db: reuse {} (encrypted_regions={encrypted}) - corpus validation required",
             bench_db.path.display()
         );
     } else if std::env::var("CITADEL_LONGMEMEVAL_DB_PATH").is_ok() {
@@ -279,12 +279,20 @@ fn run_retrieval_diag(
     // once on first recall.
     let t_ing = std::time::Instant::now();
     for s in samples {
-        if encrypted {
-            eng.create_encrypted_region(&s.question_id, Arc::clone(&embedder))?;
+        if reuse {
+            citadel_membench::core::db::attach_reused_region(
+                eng,
+                &s.question_id,
+                Arc::clone(&embedder),
+                encrypted,
+            )?;
+            ingest::validate_reuse(eng, &s.question_id, s)?;
         } else {
-            eng.create_region(&s.question_id, Arc::clone(&embedder))?;
-        }
-        if !reuse {
+            if encrypted {
+                eng.create_encrypted_region(&s.question_id, Arc::clone(&embedder))?;
+            } else {
+                eng.create_region(&s.question_id, Arc::clone(&embedder))?;
+            }
             ingest::ingest_sample(eng, &s.question_id, s)?;
         }
     }

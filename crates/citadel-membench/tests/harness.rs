@@ -5,12 +5,13 @@
 use std::sync::Arc;
 
 use citadel::{Argon2Profile, DatabaseBuilder};
-use citadel_llm::{testing, CompletionResponse, LlmError, Message};
+use citadel_llm::{testing, CompletionResponse, FinishReason, LlmError, Message, TokenUsage};
 use citadel_mem::{Embedder, MemoryEngine, MockEmbedder};
+use citadel_membench::core::eval::CompletionFinish;
 use citadel_membench::{
-    aggregate, build_reader_prompt, ingest_sample, judge_correct, parse_root, provenance,
-    reader_view, run_sample, run_sample_observed, turn_content, BenchConfig, BenchError, Category,
-    Pacer, QuestionResult, ReaderOrder, Turn,
+    aggregate, build_reader_prompt, ingest_sample, judge_abstained, judge_correct, parse_root,
+    provenance, reader_view, run_sample, run_sample_observed, turn_content, BenchConfig,
+    BenchError, Category, Pacer, QuestionResult, ReaderOrder, Turn,
 };
 use serde_json::{json, Value};
 
@@ -362,21 +363,240 @@ fn aggregate_excludes_adversarial_from_overall_and_reports_abstention() {
 }
 
 #[test]
-fn judge_parses_correct_wrong_including_the_not_correct_trap() {
-    let pacer = citadel_membench::Pacer::unbounded();
-    let correct = testing::reply_once("CORRECT");
-    let (ok, _) = judge_correct(&*correct, &pacer, "q", "gold", "pred").unwrap();
-    assert!(ok);
+fn judge_parses_final_json_and_exact_plain_labels() {
+    for (reply, expected) in [
+        ("CORRECT", true),
+        ("WRONG", false),
+        (r#"{"label":"CORRECT"}"#, true),
+        (r#"{"label":"WRONG"}"#, false),
+        ("The dates match.\n{\"label\":\"CORRECT\"}\n\n", true),
+        ("The dates differ.\n{\"label\":\"WRONG\"}", false),
+        (
+            "Example: {\"label\":\"CORRECT\"}\n{\"label\":\"WRONG\"}",
+            false,
+        ),
+        (
+            "Example: {\"label\":\"WRONG\"}\n{\"label\":\"CORRECT\"}",
+            true,
+        ),
+    ] {
+        let judge = testing::reply_once(reply);
+        let (actual, _) = judge_correct(&*judge, &Pacer::unbounded(), "q", "gold", "pred").unwrap();
+        assert_eq!(actual, expected);
+    }
+}
 
-    let wrong = testing::reply_once("WRONG");
-    let (bad, _) = judge_correct(&*wrong, &pacer, "q", "gold", "pred").unwrap();
-    assert!(!bad);
+#[test]
+fn judge_rejects_invalid_verdicts_and_preserves_response() {
+    for reply in [
+        "",
+        "INCORRECT",
+        "NOT CORRECT",
+        "This is not correct, it is WRONG",
+        "correct",
+        r#""label":"CORRECT""#,
+        r#"{"label":"CORRECT""#,
+        r#"{"label":"INCORRECT"}"#,
+        r#"{"label":"correct"}"#,
+        r#"{"label":true}"#,
+        r#"{"label":"CORRECT","extra":0}"#,
+        r#"{"label":"WRONG","label":"CORRECT"}"#,
+        "{\"label\":\"CORRECT\"}\nmore text",
+    ] {
+        let judge = testing::reply_once(reply);
+        let error = judge_correct(&*judge, &Pacer::unbounded(), "q", "gold", "pred").unwrap_err();
+        let BenchError::InvalidJudgeResponse {
+            response,
+            finish_reason,
+            ..
+        } = error
+        else {
+            panic!("expected an invalid judge response");
+        };
+        assert_eq!(response, reply);
+        assert_eq!(finish_reason, FinishReason::Stop);
+    }
+}
 
-    // The trap: a reply that contains "correct" but is a rejection must be
-    // wrong.
-    let trap_client = testing::reply_once("This is not correct, it is WRONG");
-    let (trap, _) = judge_correct(&*trap_client, &pacer, "q", "gold", "pred").unwrap();
-    assert!(!trap, "must parse by prefix, not contains(\"correct\")");
+#[test]
+fn judge_rejects_abnormal_completions_even_with_valid_labels() {
+    for finish_reason in [
+        FinishReason::Length,
+        FinishReason::ToolUse,
+        FinishReason::Refusal,
+        FinishReason::ContentFilter,
+        FinishReason::Error,
+    ] {
+        let mut response = CompletionResponse::text("CORRECT");
+        response.finish_reason = finish_reason;
+        response.usage = TokenUsage {
+            input_tokens: 12,
+            output_tokens: 3,
+            cost_usd: Some(0.01),
+        };
+        let expected_usage = response.usage;
+        for abstention in [false, true] {
+            let judge = testing::scripted(vec![response.clone()]);
+            let result = if abstention {
+                judge_abstained(&*judge, &Pacer::unbounded(), "q", "pred")
+            } else {
+                judge_correct(&*judge, &Pacer::unbounded(), "q", "gold", "pred")
+            };
+            let BenchError::InvalidJudgeResponse {
+                response,
+                finish_reason: actual_finish,
+                usage,
+                ..
+            } = result.unwrap_err()
+            else {
+                panic!("expected an invalid judge response");
+            };
+            assert_eq!(response, "CORRECT");
+            assert_eq!(actual_finish, finish_reason);
+            assert_eq!(usage, expected_usage);
+        }
+    }
+}
+
+#[test]
+fn abstention_judge_requires_an_exact_response() {
+    for (reply, expected) in [(" CORRECT\n", true), ("WRONG", false)] {
+        let judge = testing::reply_once(reply);
+        assert_eq!(
+            judge_abstained(&*judge, &Pacer::unbounded(), "q", "pred")
+                .unwrap()
+                .0,
+            expected
+        );
+    }
+    for reply in [
+        "",
+        "INCORRECT",
+        "NOT CORRECT",
+        "CORRECT but WRONG",
+        "CORRECT\nWRONG",
+        r#"{"label":"CORRECT"}"#,
+    ] {
+        let judge = testing::reply_once(reply);
+        assert!(matches!(
+            judge_abstained(&*judge, &Pacer::unbounded(), "q", "pred"),
+            Err(BenchError::InvalidJudgeResponse { .. })
+        ));
+    }
+}
+
+#[test]
+fn invalid_judge_response_aborts_run_without_emitting_a_score() {
+    let mut sample = parse_root(&fixture()).unwrap().remove(0);
+    sample.qa.truncate(1);
+    let (_dir, eng) = open_engine();
+    let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::new(DIM));
+    let reader = testing::constant("golden retriever");
+    let judge = testing::constant("INCORRECT");
+    let mut observed = 0;
+    let result = run_sample_observed(
+        &eng,
+        &sample,
+        embedder,
+        &*reader,
+        &*judge,
+        BenchConfig::default(),
+        false,
+        &Pacer::unbounded(),
+        &mut |_| {
+            observed += 1;
+            Ok(())
+        },
+    );
+    assert!(matches!(
+        result,
+        Err(BenchError::InvalidJudgeResponse { .. })
+    ));
+    assert_eq!(observed, 0);
+}
+
+#[test]
+fn run_sample_preserves_reader_and_judge_completion_audit() {
+    let mut sample = parse_root(&fixture()).unwrap().remove(0);
+    sample.qa.truncate(1);
+    let (_dir, eng) = open_engine();
+    let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::new(DIM));
+    let mut reader_response = CompletionResponse::text("partial answer");
+    reader_response.finish_reason = FinishReason::Length;
+    let reader = testing::scripted(vec![reader_response]);
+    let raw_judge = "The answer is incomplete.\n{\"label\":\"WRONG\"}";
+    let mut judge_response = CompletionResponse::text(raw_judge);
+    judge_response.usage = TokenUsage {
+        input_tokens: 12,
+        output_tokens: 7,
+        cost_usd: Some(0.01),
+    };
+    let judge = testing::scripted(vec![judge_response]);
+
+    let results = run_sample(
+        &eng,
+        &sample,
+        embedder,
+        &*reader,
+        &*judge,
+        BenchConfig::default(),
+    )
+    .unwrap();
+    assert_eq!(results.len(), 1);
+    let result = &results[0];
+    assert!(result.scorable);
+    assert!(!result.correct);
+    assert_eq!(result.predicted, "partial answer");
+    assert_eq!(result.reader_finish_reasons, [CompletionFinish::Length]);
+    let row = serde_json::to_value(result).unwrap();
+    assert_eq!(row["reader_finish_reasons"], json!(["length"]));
+    assert_eq!(row["judge"]["response"], raw_judge);
+    assert_eq!(row["judge"]["finish_reason"], "stop");
+    assert_eq!(row["judge"]["correct"], false);
+    assert_eq!(
+        row["judge"]["usage"],
+        json!({"input_tokens":12,"output_tokens":7,"cost_usd":0.01})
+    );
+    assert_eq!(aggregate(&results, prov()).overall_total, 1);
+}
+
+#[test]
+fn agentic_audit_preserves_both_completions_including_fallback() {
+    for (extraction, extraction_finish, answer_finish) in [
+        (
+            r#"[{"item":"Rex"}]"#,
+            FinishReason::Length,
+            FinishReason::Stop,
+        ),
+        (
+            "NOT_ENUMERATION",
+            FinishReason::ContentFilter,
+            FinishReason::Length,
+        ),
+    ] {
+        let mut sample = parse_root(&fixture()).unwrap().remove(0);
+        sample.qa.truncate(1);
+        sample.qa[0].question = "How many dogs did Alice adopt?".into();
+        let (_dir, eng) = open_engine();
+        let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::new(DIM));
+        let mut extracted = CompletionResponse::text(extraction);
+        extracted.finish_reason = extraction_finish;
+        let mut answer = CompletionResponse::text("One dog.");
+        answer.finish_reason = answer_finish;
+        let reader = testing::scripted(vec![extracted, answer]);
+        let judge = testing::reply_once("CORRECT");
+        let config = BenchConfig {
+            agentic: true,
+            ..BenchConfig::default()
+        };
+        let results = run_sample(&eng, &sample, embedder, &*reader, &*judge, config).unwrap();
+        assert_eq!(
+            results[0].reader_finish_reasons,
+            [extraction_finish.into(), answer_finish.into()]
+        );
+        assert_eq!(results[0].predicted, "One dog.");
+        assert!(results[0].judge.as_ref().unwrap().correct);
+    }
 }
 
 #[test]
@@ -406,6 +626,94 @@ fn run_sample_is_token_free_end_to_end() {
     assert_eq!(report.overall_correct, 4);
     assert_eq!(report.adversarial_total, 1);
     assert!((report.adversarial_abstention - 1.0).abs() < 1e-9);
+}
+
+#[test]
+fn run_sample_reuses_an_unchanged_corpus() {
+    let mut sample = parse_root(&fixture()).unwrap().remove(0);
+    sample.qa.truncate(1);
+    let (_dir, eng) = open_engine();
+    let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::new(DIM));
+    let reader = testing::constant("golden retriever");
+    let judge = testing::constant("CORRECT");
+    let fresh = run_sample(
+        &eng,
+        &sample,
+        embedder.clone(),
+        &*reader,
+        &*judge,
+        BenchConfig::default(),
+    )
+    .unwrap();
+    let mut observed = 0;
+    let reused = run_sample_observed(
+        &eng,
+        &sample,
+        embedder,
+        &*reader,
+        &*judge,
+        BenchConfig::default(),
+        true,
+        &Pacer::unbounded(),
+        &mut |_| {
+            observed += 1;
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(observed, 1);
+    assert_eq!(reused.len(), 1);
+    assert_eq!(reused[0].retrieved, fresh[0].retrieved);
+    assert_eq!(reused[0].predicted, fresh[0].predicted);
+    assert_eq!(
+        eng.count_region(&sample.sample_id).unwrap(),
+        sample.turns.len() as u64
+    );
+}
+
+#[test]
+fn run_sample_rejects_changed_or_missing_corpus_before_model_calls() {
+    let mut sample = parse_root(&fixture()).unwrap().remove(0);
+    sample.qa.truncate(1);
+    let (_dir, eng) = open_engine();
+    let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::new(DIM));
+    eng.create_region(&sample.sample_id, embedder.clone())
+        .unwrap();
+    ingest_sample(&eng, &sample.sample_id, &sample).unwrap();
+    let forbidden = testing::error(|| panic!("invalid corpus reached a model call"));
+    for missing in [false, true] {
+        let mut changed = sample.clone();
+        if missing {
+            changed.sample_id = "missing-corpus".into();
+        } else {
+            changed.turns[0].text.push_str(" changed");
+        }
+        let mut observed = 0;
+        let result = run_sample_observed(
+            &eng,
+            &changed,
+            embedder.clone(),
+            &*forbidden,
+            &*forbidden,
+            BenchConfig::default(),
+            true,
+            &Pacer::unbounded(),
+            &mut |_| {
+                observed += 1;
+                Ok(())
+            },
+        );
+        assert!(matches!(result, Err(BenchError::Dataset(_))));
+        assert_eq!(observed, 0);
+    }
+    assert!(eng
+        .stored_region_identity("missing-corpus")
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        eng.count_region(&sample.sample_id).unwrap(),
+        sample.turns.len() as u64
+    );
 }
 
 #[test]
@@ -659,6 +967,8 @@ fn res(category: Category, correct: bool) -> QuestionResult {
         question: String::new(),
         gold: String::new(),
         predicted: String::new(),
+        reader_finish_reasons: Vec::new(),
+        judge: None,
     }
 }
 
@@ -681,6 +991,8 @@ fn unscorable(category: Category) -> QuestionResult {
         question: String::new(),
         gold: String::new(),
         predicted: String::new(),
+        reader_finish_reasons: Vec::new(),
+        judge: None,
     }
 }
 

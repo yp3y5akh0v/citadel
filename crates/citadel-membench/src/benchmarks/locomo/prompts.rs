@@ -4,7 +4,7 @@ use citadel_llm::{LLMClient, Message, TokenUsage};
 use citadel_mem::AtomHit;
 
 use crate::core::error::Result;
-use crate::core::eval::{complete_judge, judge_label, starts_with_token};
+use crate::core::eval::{abstention_label, complete_judge, judge_label, JudgeOutcome};
 use crate::core::ratelimit::Pacer;
 
 /// LoCoMo's documented weaknesses, surfaced in every report.
@@ -118,6 +118,17 @@ pub fn judge_correct(
     gold: &str,
     predicted: &str,
 ) -> Result<(bool, TokenUsage)> {
+    let outcome = judge_correct_observed(judge, pacer, question, gold, predicted)?;
+    Ok((outcome.correct, outcome.usage))
+}
+
+pub(crate) fn judge_correct_observed(
+    judge: &dyn LLMClient,
+    pacer: &Pacer,
+    question: &str,
+    gold: &str,
+    predicted: &str,
+) -> Result<JudgeOutcome> {
     let system = "Your task is to label an answer to a question as CORRECT or WRONG. \
          You are given (1) a question one user asked about another user, (2) a gold \
          (ground-truth) answer, and (3) a generated answer to score.\n\
@@ -135,8 +146,8 @@ pub fn judge_correct(
          and WRONG anywhere in your reply.";
     let user = format!("Question: {question}\nGold answer: {gold}\nGenerated answer: {predicted}");
     let resp = complete_judge(judge, pacer, system, &user)?;
-    let correct = judge_label(&resp.message.content);
-    Ok((correct, resp.usage))
+    let correct = judge_label(&resp)?;
+    Ok(JudgeOutcome::from_response(correct, resp))
 }
 
 /// Adversarial questions: did the reader abstain rather than fabricate? `(abstained, usage)`.
@@ -146,12 +157,22 @@ pub fn judge_abstained(
     question: &str,
     predicted: &str,
 ) -> Result<(bool, TokenUsage)> {
+    let outcome = judge_abstained_observed(judge, pacer, question, predicted)?;
+    Ok((outcome.correct, outcome.usage))
+}
+
+pub(crate) fn judge_abstained_observed(
+    judge: &dyn LLMClient,
+    pacer: &Pacer,
+    question: &str,
+    predicted: &str,
+) -> Result<JudgeOutcome> {
     let system = "You check whether an answer correctly indicates that the \
          information is unknown or not available, rather than fabricating a \
          specific answer. Reply with exactly CORRECT if it abstains, or WRONG if \
          it fabricates a specific answer.";
     let user = format!("Question: {question}\nPredicted answer: {predicted}");
     let resp = complete_judge(judge, pacer, system, &user)?;
-    let abstained = starts_with_token(&resp.message.content, "CORRECT");
-    Ok((abstained, resp.usage))
+    let abstained = abstention_label(&resp)?;
+    Ok(JudgeOutcome::from_response(abstained, resp))
 }

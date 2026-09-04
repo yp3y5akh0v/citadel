@@ -53,6 +53,8 @@ impl LmKind {
 #[derive(Debug, Clone)]
 pub struct LmTurn {
     pub session_id: String,
+    /// Position in `haystack_sessions`, independent of the official session ID.
+    pub session_occurrence: usize,
     pub role: String,
     pub content: String,
     pub date: String,
@@ -117,6 +119,11 @@ fn parse_sample(v: &Value) -> Result<LmSample> {
         let session_id = &session_ids[idx];
         let date = &dates[idx];
         let event_micros = parse_lmeval_datetime(date);
+        if !date.is_empty() && event_micros.is_none() {
+            return Err(BenchError::Dataset(format!(
+                "invalid haystack date at session occurrence {idx} in {question_id}"
+            )));
+        }
         let session_turns = session
             .as_array()
             .ok_or_else(|| BenchError::Dataset("haystack session must be an array".into()))?;
@@ -126,6 +133,7 @@ fn parse_sample(v: &Value) -> Result<LmSample> {
                 .ok_or_else(|| BenchError::Dataset("turn must be an object".into()))?;
             turns.push(LmTurn {
                 session_id: session_id.clone(),
+                session_occurrence: idx,
                 role: t
                     .get("role")
                     .and_then(Value::as_str)
@@ -190,7 +198,7 @@ fn render_answer(v: Option<&Value>) -> String {
 }
 
 /// Parse LongMemEval's strict `%Y/%m/%d (%a) %H:%M` stamp to epoch micros (`None` if off-format).
-fn parse_lmeval_datetime(s: &str) -> Option<i64> {
+pub(super) fn parse_lmeval_datetime(s: &str) -> Option<i64> {
     let mut parts = s.split_whitespace();
     let date = parts.next()?;
     let _weekday = parts.next()?;
@@ -270,9 +278,12 @@ mod tests {
         assert_eq!(s.gold, "not answerable: never mentioned");
         assert_eq!(s.turns.len(), 3);
         assert_eq!(s.turns[0].session_id, "answer_a_1");
+        assert_eq!(s.turns[0].session_occurrence, 0);
+        assert_eq!(s.turns[1].session_occurrence, 0);
         assert!(s.turns[0].has_answer);
         assert!(!s.turns[1].has_answer);
         assert_eq!(s.turns[2].session_id, "noans_b_2");
+        assert_eq!(s.turns[2].session_occurrence, 1);
         assert_eq!(s.evidence, vec!["answer_a_1".to_string()]);
         assert!(s.turns[0].event_micros.is_some());
     }

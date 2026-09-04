@@ -11,6 +11,7 @@ use citadel_llm::Message;
 use citadel_mem::AtomHit;
 
 use crate::core::benchmark::Benchmark;
+use crate::core::error::Result;
 
 pub use run::{run, LmevalConfig};
 
@@ -21,7 +22,12 @@ impl Benchmark for LongMemEval {
         "session_id"
     }
 
-    fn reader_prompt(&self, hits: &[AtomHit], question: &str, current_date: &str) -> Vec<Message> {
+    fn reader_prompt(
+        &self,
+        hits: &[AtomHit],
+        question: &str,
+        current_date: &str,
+    ) -> Result<Vec<Message>> {
         prompts::build_reader_prompt(hits, question, current_date)
     }
 

@@ -9,14 +9,14 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use citadel_llm::{
-    CompletionRequest, CompletionResponse, LLMClient, LlmError, Message, TokenUsage,
+    CompletionRequest, CompletionResponse, FinishReason, LLMClient, LlmError, Message, TokenUsage,
 };
 use citadel_mem::{AtomHit, AtomId, MemoryEngine, RecallProfile, RecallQuery};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::core::agentic;
 use crate::core::benchmark::Benchmark;
-use crate::core::error::Result;
+use crate::core::error::{BenchError, Result};
 use crate::core::ratelimit::Pacer;
 use crate::{BenchConfig, ReaderOrder};
 
@@ -270,6 +270,8 @@ fn session_grouped(view: Vec<AtomHit>) -> Result<Vec<AtomHit>> {
 /// instrumentation).
 pub struct AnswerOutcome {
     pub answer: String,
+    /// Completion states in call order, including a discarded extraction.
+    pub reader_finish_reasons: Vec<CompletionFinish>,
     /// Recall plus neighbor-expansion latency: everything the memory system
     /// does to assemble the reader's context.
     pub recall_micros: u128,
@@ -304,13 +306,14 @@ fn read_assembled(
                 .map(str::to_string)
         })
         .collect();
-    let mut req = CompletionRequest::new(bench.reader_prompt(&view, q.text, q.date));
+    let mut req = CompletionRequest::new(bench.reader_prompt(&view, q.text, q.date)?);
     req.temperature = Some(0.0);
     req.seed = Some(SAMPLING_SEED);
     req.max_tokens = Some(max_output_tokens(reader_max_tokens));
     let resp = paced_complete(pacer, reader, &req)?;
     Ok(AnswerOutcome {
         answer: resp.message.content,
+        reader_finish_reasons: vec![resp.finish_reason.into()],
         recall_micros,
         usage: resp.usage,
         retrieved,
@@ -345,7 +348,7 @@ pub fn answer_question(
                 })
             }
             // Unusable extraction: fall back, but keep its spend on the ledger.
-            Aggregation::FellBack(spent) => {
+            Aggregation::FellBack(spent, finish_reason) => {
                 let mut out = read_assembled(
                     bench,
                     reader,
@@ -356,6 +359,7 @@ pub fn answer_question(
                     recall_micros,
                 )?;
                 add_usage(&mut out.usage, &spent);
+                out.reader_finish_reasons.insert(0, finish_reason);
                 return Ok(out);
             }
         }
@@ -375,7 +379,7 @@ pub fn answer_question(
 /// the discarded extraction call already spent.
 enum Aggregation {
     Answered(AnswerOutcome),
-    FellBack(TokenUsage),
+    FellBack(TokenUsage, CompletionFinish),
 }
 
 /// Accumulate `b` into `a` (tokens add; cost adds when both sides price it).
@@ -400,17 +404,20 @@ fn answer_aggregation(
     reader_max_tokens: u32,
     view: &[AtomHit],
 ) -> Result<Aggregation> {
+    let mut messages = bench.reader_prompt(view, q.text, q.date)?;
     let mut extract = CompletionRequest::new(agentic::extraction_messages(view, q.text, q.date));
     extract.temperature = Some(0.0);
     extract.seed = Some(SAMPLING_SEED);
     extract.max_tokens = Some(max_output_tokens(reader_max_tokens));
     let extracted = paced_complete(pacer, reader, &extract)?;
     let Some(items) = agentic::parse_items(&extracted.message.content) else {
-        return Ok(Aggregation::FellBack(extracted.usage));
+        return Ok(Aggregation::FellBack(
+            extracted.usage,
+            extracted.finish_reason.into(),
+        ));
     };
     let items = agentic::dedup_and_sort(items);
 
-    let mut messages = bench.reader_prompt(view, q.text, q.date);
     messages.push(agentic::anchor_message(&items));
     let mut answer = CompletionRequest::new(messages);
     answer.temperature = Some(0.0);
@@ -431,10 +438,68 @@ fn answer_aggregation(
     add_usage(&mut usage, &resp.usage);
     Ok(Aggregation::Answered(AnswerOutcome {
         answer: resp.message.content,
+        reader_finish_reasons: vec![extracted.finish_reason.into(), resp.finish_reason.into()],
         recall_micros: 0,
         usage,
         retrieved,
     }))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompletionFinish {
+    Stop,
+    Length,
+    ToolUse,
+    Refusal,
+    ContentFilter,
+    Error,
+}
+
+impl From<FinishReason> for CompletionFinish {
+    fn from(reason: FinishReason) -> Self {
+        match reason {
+            FinishReason::Stop => Self::Stop,
+            FinishReason::Length => Self::Length,
+            FinishReason::ToolUse => Self::ToolUse,
+            FinishReason::Refusal => Self::Refusal,
+            FinishReason::ContentFilter => Self::ContentFilter,
+            FinishReason::Error => Self::Error,
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct JudgeOutcome {
+    pub correct: bool,
+    pub response: String,
+    pub finish_reason: CompletionFinish,
+    #[serde(serialize_with = "serialize_usage")]
+    pub usage: TokenUsage,
+}
+
+impl JudgeOutcome {
+    pub(crate) fn from_response(correct: bool, response: CompletionResponse) -> Self {
+        Self {
+            correct,
+            response: response.message.content,
+            finish_reason: response.finish_reason.into(),
+            usage: response.usage,
+        }
+    }
+}
+
+fn serialize_usage<S: serde::Serializer>(
+    usage: &TokenUsage,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    use serde::ser::SerializeStruct;
+
+    let mut fields = serializer.serialize_struct("TokenUsage", 3)?;
+    fields.serialize_field("input_tokens", &usage.input_tokens)?;
+    fields.serialize_field("output_tokens", &usage.output_tokens)?;
+    fields.serialize_field("cost_usd", &usage.cost_usd)?;
+    fields.end()
 }
 
 pub(crate) fn complete_judge(
@@ -450,46 +515,67 @@ pub(crate) fn complete_judge(
     req.temperature = Some(0.0);
     req.seed = Some(SAMPLING_SEED);
     req.max_tokens = Some(max_output_tokens(DEFAULT_MAX_TOKENS));
-    paced_complete(pacer, judge, &req)
+    let response = paced_complete(pacer, judge, &req)?;
+    if response.finish_reason != FinishReason::Stop {
+        return Err(invalid_judge_response(
+            &response,
+            "completion did not finish normally",
+        ));
+    }
+    Ok(response)
 }
 
-/// Parse the judge reply to a bool: prefer JSON `{"label": ...}`, else the last
-/// non-empty line. Anchored on the final signal so the reasoning can't flip it.
-pub(crate) fn judge_label(reply: &str) -> bool {
-    if let Some(v) = json_label(reply) {
-        return v.eq_ignore_ascii_case("CORRECT");
-    }
-    let last = reply
+#[derive(serde::Deserialize)]
+enum JudgeLabel {
+    #[serde(rename = "CORRECT")]
+    Correct,
+    #[serde(rename = "WRONG")]
+    Wrong,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JudgeVerdict {
+    label: JudgeLabel,
+}
+
+/// Accept a final JSON verdict or an exact plain label used by earlier clients.
+pub(crate) fn judge_label(response: &CompletionResponse) -> Result<bool> {
+    let last = response
+        .message
+        .content
         .lines()
         .rev()
         .map(str::trim)
         .find(|l| !l.is_empty())
         .unwrap_or("");
-    let up = last.to_ascii_uppercase();
-    // The label appearing last wins (the prompt forbids emitting both).
-    match (up.rfind("WRONG"), up.rfind("CORRECT")) {
-        (Some(w), Some(c)) => c > w,
-        (Some(_), None) => false,
-        (None, Some(_)) => true,
-        (None, None) => false,
+    match last {
+        "CORRECT" => Ok(true),
+        "WRONG" => Ok(false),
+        _ => serde_json::from_str::<JudgeVerdict>(last)
+            .map(|verdict| matches!(verdict.label, JudgeLabel::Correct))
+            .map_err(|_| {
+                invalid_judge_response(response, "expected a final CORRECT/WRONG verdict")
+            }),
     }
 }
 
-/// Extract the string value of the first `"label"` key in a JSON-ish reply.
-fn json_label(reply: &str) -> Option<&str> {
-    let after = &reply[reply.find("\"label\"")? + "\"label\"".len()..];
-    let rest = after[after.find(':')? + 1..].trim_start();
-    let rest = rest.strip_prefix('"')?;
-    Some(&rest[..rest.find('"')?])
+pub(crate) fn abstention_label(response: &CompletionResponse) -> Result<bool> {
+    match response.message.content.trim() {
+        "CORRECT" => Ok(true),
+        "WRONG" => Ok(false),
+        _ => Err(invalid_judge_response(
+            response,
+            "expected exactly CORRECT or WRONG",
+        )),
+    }
 }
 
-/// True iff the trimmed upper-cased reply begins with `token` as a whole word.
-pub(crate) fn starts_with_token(reply: &str, token: &str) -> bool {
-    match reply.trim().to_ascii_uppercase().strip_prefix(token) {
-        Some(rest) => rest
-            .chars()
-            .next()
-            .is_none_or(|c| !c.is_ascii_alphanumeric()),
-        None => false,
+fn invalid_judge_response(response: &CompletionResponse, reason: &'static str) -> BenchError {
+    BenchError::InvalidJudgeResponse {
+        reason,
+        response: response.message.content.clone(),
+        finish_reason: response.finish_reason,
+        usage: response.usage,
     }
 }
