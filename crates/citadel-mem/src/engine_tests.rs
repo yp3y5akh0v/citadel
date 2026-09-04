@@ -78,6 +78,92 @@ fn create_enc_db(path: &std::path::Path) -> Arc<Database> {
 }
 
 #[test]
+fn cold_scan_validates_metadata_before_decrypting_content() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_enc_db(dir.path());
+    let eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
+    eng.create_encrypted_region("s", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let id = eng
+        .remember("s", AtomInput::new("fact", "private text"))
+        .unwrap();
+    let handle = eng.region_handle("s").unwrap();
+    let conn = Connection::open(&db).unwrap();
+    conn.execute_params(
+        &format!(
+            "UPDATE {} SET score = $1, sealed = $2 WHERE id = $3",
+            handle.table
+        ),
+        &[Value::Real(1e300), Value::Blob(vec![0]), Value::Integer(id)],
+    )
+    .unwrap();
+    let result = decrypt_scan(
+        &conn,
+        &db,
+        handle.atom_wrap.as_ref().unwrap(),
+        &handle.table,
+        handle.id,
+        None,
+        None,
+    );
+    assert!(matches!(
+        result,
+        Err(MemError::Invalid(message)) if message.contains("outside the finite f32 range")
+    ));
+}
+
+#[test]
+fn persisted_cache_rehydration_rejects_a_wrong_dimension_without_panicking() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_enc_db(dir.path());
+    let eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
+    eng.create_encrypted_region("s", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let id = eng
+        .remember("s", AtomInput::new("fact", "private text"))
+        .unwrap();
+    eng.persist_ann_index("s").unwrap();
+    let handle = eng.region_handle("s").unwrap();
+    let (slot, _, _) = db
+        .atom_store_live_bindings()
+        .unwrap()
+        .into_iter()
+        .find(|(_, owner, _)| *owner == id as u64)
+        .unwrap();
+    let wrapped = db.atom_store_slot(slot).unwrap().wrapped;
+    let malformed = reseal_atom(
+        handle.atom_wrap.as_ref().unwrap(),
+        &wrapped,
+        id,
+        &[1.0],
+        "private text",
+        "{}",
+    )
+    .unwrap();
+    let conn = Connection::open(&db).unwrap();
+    conn.execute_params(
+        &format!("UPDATE {} SET sealed = $1 WHERE id = $2", handle.table),
+        &[Value::Blob(malformed), Value::Integer(id)],
+    )
+    .unwrap();
+    let result = eng.try_load_sealed_segment(
+        &handle,
+        &conn,
+        db.cache_epoch(),
+        atom_table_root_stamp(&db, &handle.table).unwrap(),
+        None,
+    );
+    assert!(matches!(
+        result,
+        Err(MemError::DimMismatch {
+            expected: 8,
+            got: 1,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn recall_search_window_preserves_ann_breadth() {
     for (k, limit, expected) in [
         (1, 1, 64),
@@ -1031,6 +1117,157 @@ fn atom_inputs_and_passage_vectors_are_finite_before_plain_or_sealed_writes() {
                 "rejected sealed inputs must not allocate an ACK slot"
             );
         }
+    }
+}
+
+#[test]
+fn fusion_score_bounds_preserve_representable_signed_weights() {
+    for weights in [
+        FusionWeights::default(),
+        FusionWeights::semantic_only(),
+        FusionWeights {
+            semantic: f32::MAX,
+            keyword: -f32::MAX,
+            recency: 0.0,
+            importance: 0.0,
+        },
+        FusionWeights {
+            semantic: -2.0,
+            keyword: 3.0,
+            recency: -4.0,
+            importance: 1.0,
+        },
+    ] {
+        validate_fusion_weights(weights).unwrap();
+        for mask in 0..16 {
+            let signal = |index| ((mask >> index) & 1) as f32;
+            let score = weights.semantic * signal(0)
+                + weights.keyword * signal(1)
+                + weights.recency * signal(2)
+                + weights.importance * signal(3);
+            assert!(score.is_finite());
+        }
+    }
+    for values in [
+        [f32::MAX, f32::MAX, 0.0, 0.0],
+        [-f32::MAX, -f32::MAX, 0.0, 0.0],
+        [f32::MAX, f32::MAX, -f32::MAX, -f32::MAX],
+    ] {
+        assert!(values.iter().all(|value| value.is_finite()));
+        let error = validate_fusion_weights(FusionWeights {
+            semantic: values[0],
+            keyword: values[1],
+            recency: values[2],
+            importance: values[3],
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("finite score range"));
+    }
+}
+
+#[test]
+fn rrf_score_bounds_include_every_contributing_ranking() {
+    for k in [0.5, 20.0, 60.0, f32::MAX] {
+        for contributors in [1, 2, 1_000] {
+            validate_rrf_k(k, contributors, "test RRF").unwrap();
+        }
+    }
+    for (k, allowed, overflowing) in [(f32::MIN_POSITIVE / 2.0, 1, 2), (f32::MIN_POSITIVE, 3, 4)] {
+        validate_rrf_k(k, allowed, "test RRF").unwrap();
+        let error = validate_rrf_k(k, overflowing, "test RRF").unwrap_err();
+        assert!(error.to_string().contains("finite score range"));
+    }
+    assert!(validate_rrf_k(f32::from_bits(1), 1, "test RRF").is_err());
+    assert!(validate_rerank_strategy(RerankStrategy::Rrf {
+        k: f32::MIN_POSITIVE / 2.0,
+    })
+    .is_err());
+}
+
+#[test]
+fn score_bounds_reject_single_and_multi_recall_before_embedding() {
+    for encrypted in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = if encrypted {
+            create_enc_db(dir.path())
+        } else {
+            create_db(dir.path())
+        };
+        let eng = MemoryEngine::open(db).unwrap();
+        let embedder = Arc::new(SideCountingEmbedder {
+            inner: MockEmbedder::new(8),
+            passages: Default::default(),
+            queries: Default::default(),
+        });
+        if encrypted {
+            eng.create_encrypted_region("bounds", embedder.clone())
+                .unwrap();
+        } else {
+            eng.create_region("bounds", embedder.clone()).unwrap();
+        }
+        eng.remember(
+            "bounds",
+            AtomInput::new("fact", "seed").with_embedding(unit(8, 0)),
+        )
+        .unwrap();
+        let weights = FusionWeights {
+            semantic: f32::MAX,
+            keyword: f32::MAX,
+            recency: 0.0,
+            importance: 0.0,
+        };
+        let error = eng
+            .recall(
+                "bounds",
+                RecallQuery::by_text("seed", 1).with_weights(weights),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("finite score range"));
+
+        let error = eng
+            .recall_many(
+                "bounds",
+                MultiRecallQuery::new(
+                    vec![
+                        RecallQuery::by_text("seed", 1),
+                        RecallQuery::by_text("seed", 1).with_weights(weights),
+                    ],
+                    1,
+                ),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("finite score range"));
+
+        let error = eng
+            .recall_many(
+                "bounds",
+                MultiRecallQuery::new(vec![RecallQuery::by_text("seed", 1); 2], 1)
+                    .with_rrf_k(f32::MIN_POSITIVE / 2.0),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("finite score range"));
+
+        eng.set_reranker(
+            Arc::new(crate::embed::MockReranker),
+            RerankStrategy::Rrf {
+                k: f32::MIN_POSITIVE / 2.0,
+            },
+        );
+        let error = eng
+            .recall("bounds", RecallQuery::by_text("seed", 1))
+            .unwrap_err();
+        assert!(error.to_string().contains("finite score range"));
+        let error = eng
+            .recall_many(
+                "bounds",
+                MultiRecallQuery::new(vec![RecallQuery::by_text("seed", 1)], 1)
+                    .with_rerank_query("seed"),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("finite score range"));
+        assert_eq!(embedder.queries.load(Ordering::Relaxed), 0);
+        assert_eq!(embedder.passages.load(Ordering::Relaxed), 0);
+        assert!(eng.access_stats.lock().unwrap().is_empty());
     }
 }
 
@@ -4475,14 +4712,122 @@ fn text_only_atom_decoder_never_materializes_payload() {
 }
 
 #[test]
+fn recall_rejects_distances_outside_the_finite_score_range() {
+    for (metric, component) in [
+        (EmbeddingMetric::L2, 0.0),
+        (EmbeddingMetric::InnerProduct, 1.0),
+        (EmbeddingMetric::InnerProduct, -1.0),
+    ] {
+        for encrypted in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = if encrypted {
+                create_enc_db(dir.path())
+            } else {
+                create_db(dir.path())
+            };
+            let eng = MemoryEngine::open(db).unwrap();
+            let embedder = Arc::new(MockEmbedder::with_metric(8, metric));
+            if encrypted {
+                eng.create_encrypted_region("distance", embedder).unwrap();
+            } else {
+                eng.create_region("distance", embedder).unwrap();
+            }
+            let id = eng
+                .remember(
+                    "distance",
+                    AtomInput::new("fact", "seed").with_embedding(vec![component; 8]),
+                )
+                .unwrap();
+            let hits = eng
+                .recall(
+                    "distance",
+                    RecallQuery::by_embedding(vec![0.0; 8], 1)
+                        .with_weights(FusionWeights::semantic_only()),
+                )
+                .unwrap();
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].id, id);
+            assert!(hits[0].distance.is_some_and(f32::is_finite));
+            let result = eng.recall(
+                "distance",
+                RecallQuery::by_embedding(vec![f32::MAX; 8], 1)
+                    .with_weights(FusionWeights::semantic_only()),
+            );
+            assert!(
+                result.is_err(),
+                "{metric:?}, component {component}, encrypted {encrypted}: {result:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn sealed_tail_recall_rejects_distance_overflow() {
+    for (metric, component) in [
+        (EmbeddingMetric::L2, f32::MAX),
+        (EmbeddingMetric::InnerProduct, f32::MAX),
+        (EmbeddingMetric::InnerProduct, -f32::MAX),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_enc_db(dir.path());
+        let eng = MemoryEngine::open(db).unwrap();
+        eng.create_encrypted_region("distance", Arc::new(MockEmbedder::with_metric(8, metric)))
+            .unwrap();
+        for n in 0..4 {
+            eng.remember(
+                "distance",
+                AtomInput::new("seed", format!("seed {n}")).with_embedding(vec![0.0; 8]),
+            )
+            .unwrap();
+        }
+        let query =
+            RecallQuery::by_embedding(vec![1.0; 8], 1).with_weights(FusionWeights::semantic_only());
+        assert_eq!(eng.recall("distance", query.clone()).unwrap().len(), 1);
+        let h = eng.region_handle("distance").unwrap();
+        let snapshot_max = h.ann.read().unwrap().as_ref().unwrap().index.snapshot_max;
+        let tail_id = eng
+            .remember(
+                "distance",
+                AtomInput::new("tail", "tail").with_embedding(vec![component; 8]),
+            )
+            .unwrap();
+        assert!(tail_id as u64 > snapshot_max);
+        {
+            let guard = h.ann.read().unwrap();
+            let sa = guard.as_ref().unwrap();
+            assert_eq!(sa.index.snapshot_max, snapshot_max);
+            assert!(!sa.index.tail_is_stale(tail_id as u64));
+            assert!(!sa.kind_codes.contains_key("tail"));
+        }
+        let result = eng.recall("distance", query.with_kinds(vec!["tail".into()]));
+        assert!(
+            matches!(result, Err(MemError::Invalid(ref message)) if message == "vector distance is outside the finite f32 range"),
+            "{metric:?}, {component}: {result:?}",
+        );
+        assert_eq!(
+            h.ann.read().unwrap().as_ref().unwrap().index.snapshot_max,
+            snapshot_max,
+        );
+    }
+}
+
+#[test]
 fn vec_distance_matches_sql_metrics() {
     // L2 = sqrt(sum sq): [3,4] vs [0,0] -> 5
     assert!(
-        (vec_distance(EmbeddingMetric::L2, &[3.0, 4.0], &[0.0, 0.0]).unwrap() - 5.0).abs() < 1e-5
+        (vec_distance(EmbeddingMetric::L2, &[3.0, 4.0], &[0.0, 0.0])
+            .unwrap()
+            .unwrap()
+            - 5.0)
+            .abs()
+            < 1e-5
     );
     // Inner = -dot: -([1,2].[3,4]) = -11
     assert!(
-        (vec_distance(EmbeddingMetric::InnerProduct, &[1.0, 2.0], &[3.0, 4.0]).unwrap() - (-11.0))
+        (vec_distance(EmbeddingMetric::InnerProduct, &[1.0, 2.0], &[3.0, 4.0])
+            .unwrap()
+            .unwrap()
+            - (-11.0))
             .abs()
             < 1e-5
     );
@@ -4490,15 +4835,20 @@ fn vec_distance_matches_sql_metrics() {
     assert!(
         vec_distance(EmbeddingMetric::Cosine, &[1.0, 0.0], &[1.0, 0.0])
             .unwrap()
+            .unwrap()
             .abs()
             < 1e-6
     );
     assert!(
-        (vec_distance(EmbeddingMetric::Cosine, &[1.0, 0.0], &[0.0, 1.0]).unwrap() - 1.0).abs()
+        (vec_distance(EmbeddingMetric::Cosine, &[1.0, 0.0], &[0.0, 1.0])
+            .unwrap()
+            .unwrap()
+            - 1.0)
+            .abs()
             < 1e-6
     );
     assert_eq!(
-        vec_distance(EmbeddingMetric::Cosine, &[3.0, 4.0], &[0.0, 0.0]),
+        vec_distance(EmbeddingMetric::Cosine, &[3.0, 4.0], &[0.0, 0.0]).unwrap(),
         None,
         "cosine distance is undefined for a zero-norm vector"
     );
@@ -4524,7 +4874,9 @@ fn ann_index_distances_match_vec_distance_for_all_metrics() {
         assert_eq!(hits.len(), rows.len());
         for (rid, d) in hits {
             let v = &rows.iter().find(|(id, _)| *id == rid).unwrap().1;
-            let exact = vec_distance(m, &q, v).expect("fixture vectors have nonzero norms");
+            let exact = vec_distance(m, &q, v)
+                .unwrap()
+                .expect("fixture vectors have nonzero norms");
             assert!(
                 (d - exact).abs() < 1e-4,
                 "{m:?} row {rid}: index dist {d} vs exact {exact}"
@@ -6122,11 +6474,12 @@ fn cancellation_landing_inside_a_reranker_is_observed_from_its_snapshot() {
         } else {
             eng.create_region("cancelled-rerank", embedder).unwrap();
         }
-        eng.remember(
-            "cancelled-rerank",
-            AtomInput::new("note", "rerank candidate").with_embedding(unit(8, 0)),
-        )
-        .unwrap();
+        let id = eng
+            .remember(
+                "cancelled-rerank",
+                AtomInput::new("note", "rerank candidate").with_embedding(unit(8, 0)),
+            )
+            .unwrap();
 
         let recall_token = citadel_core::CancelToken::new();
         let recall_reranker = Arc::new(CancelAndClearReranker {
@@ -6136,10 +6489,14 @@ fn cancellation_landing_inside_a_reranker_is_observed_from_its_snapshot() {
         });
         eng.set_reranker(recall_reranker.clone(), RerankStrategy::Replace);
         db.set_cancel(Some(recall_token));
-        assert_mem_interrupted(eng.recall(
-            "cancelled-rerank",
-            RecallQuery::by_embedding(unit(8, 0), 1).with_text("rerank candidate"),
-        ));
+        let (result, scrubbed) = crate::plaintext::observe_scrubbed_atoms(|| {
+            eng.recall(
+                "cancelled-rerank",
+                RecallQuery::by_embedding(unit(8, 0), 1).with_text("rerank candidate"),
+            )
+        });
+        assert_mem_interrupted(result);
+        assert_eq!(scrubbed, [id]);
         assert_eq!(recall_reranker.calls.load(Ordering::Relaxed), 1);
 
         let many_token = citadel_core::CancelToken::new();
@@ -6150,7 +6507,7 @@ fn cancellation_landing_inside_a_reranker_is_observed_from_its_snapshot() {
         });
         eng.set_reranker(many_reranker.clone(), RerankStrategy::Replace);
         db.set_cancel(Some(many_token));
-        assert_mem_interrupted(
+        let (result, scrubbed) = crate::plaintext::observe_scrubbed_atoms(|| {
             eng.recall_many(
                 "cancelled-rerank",
                 MultiRecallQuery::new(
@@ -6158,8 +6515,10 @@ fn cancellation_landing_inside_a_reranker_is_observed_from_its_snapshot() {
                     1,
                 )
                 .with_rerank_query("rerank candidate"),
-            ),
-        );
+            )
+        });
+        assert_mem_interrupted(result);
+        assert_eq!(scrubbed, [id]);
         assert_eq!(many_reranker.calls.load(Ordering::Relaxed), 1);
     }
 }
@@ -6375,7 +6734,9 @@ fn evolve_retain_requires_both_id_and_distance() {
 
 #[test]
 fn vec_distance_l2_uses_difference_not_sum() {
-    let d = vec_distance(EmbeddingMetric::L2, &[1.0, 2.0], &[5.0, 10.0]).unwrap();
+    let d = vec_distance(EmbeddingMetric::L2, &[1.0, 2.0], &[5.0, 10.0])
+        .unwrap()
+        .unwrap();
     assert!(
         (d - 80.0_f32.sqrt()).abs() < 1e-3,
         "L2 = sqrt(80) ~ 8.944, not sqrt(180)"
@@ -6384,7 +6745,9 @@ fn vec_distance_l2_uses_difference_not_sum() {
 
 #[test]
 fn vec_distance_cosine_divides_by_denominator() {
-    let d = vec_distance(EmbeddingMetric::Cosine, &[1.0, 1.0], &[1.0, 0.0]).unwrap();
+    let d = vec_distance(EmbeddingMetric::Cosine, &[1.0, 1.0], &[1.0, 0.0])
+        .unwrap()
+        .unwrap();
     let expected = 1.0_f32 - 1.0 / 2.0_f32.sqrt();
     assert!(
         (d - expected).abs() < 1e-3,
@@ -6402,14 +6765,17 @@ fn dist_value_coerces_integer_to_f32() {
 #[test]
 fn query_keyword_terms_tokenizes_lowercases_sorts_dedups() {
     assert_eq!(
-        query_keyword_terms(Some("Beta alpha Beta gamma")),
+        query_keyword_terms(Some("Beta alpha Beta gamma"))
+            .iter()
+            .map(|term| term.to_string())
+            .collect::<Vec<_>>(),
         vec![
             String::from("alpha"),
             String::from("beta"),
             String::from("gamma")
         ]
     );
-    assert_eq!(query_keyword_terms(None), Vec::<String>::new());
+    assert!(query_keyword_terms(None).is_empty());
 }
 
 #[test]
@@ -9512,4 +9878,161 @@ fn fetch_newest_respects_after_id_as_a_lower_bound() {
         .map(|h| h.text)
         .collect();
     assert_eq!(texts, vec!["2".to_string(), "3".to_string()]);
+}
+
+#[test]
+fn authenticated_atom_payloads_reject_invalid_json() {
+    let atom_wrap = derive_atom_wrap_key(&[7u8; citadel_core::KEY_SIZE]);
+    for payload in ["{", "[1,", "null trailing"] {
+        let (sealed, wrapped) = seal_atom(&atom_wrap, 41, &[1.0; 8], "private text", payload);
+        assert!(matches!(open_atom(&atom_wrap, &wrapped, 41, &sealed),
+            Err(MemError::Invalid(message)) if message.contains("sealed payload is invalid JSON")));
+        assert!(
+            matches!(open_atom_content(&atom_wrap, &wrapped, 41, &sealed),
+            Err(MemError::Invalid(message)) if message.contains("sealed payload is invalid JSON"))
+        );
+    }
+    for payload in ["null", "{\"field\":[\"value\",2]}"] {
+        let (sealed, wrapped) = seal_atom(&atom_wrap, 42, &[1.0; 8], "private text", payload);
+        let expected: serde_json::Value = serde_json::from_str(payload).unwrap();
+        let (embedding, text, json) = open_atom(&atom_wrap, &wrapped, 42, &sealed).unwrap();
+        assert_eq!(embedding, [1.0; 8]);
+        assert_eq!(text, "private text");
+        assert_eq!(json, expected);
+        assert_eq!(
+            open_atom_content(&atom_wrap, &wrapped, 42, &sealed).unwrap(),
+            (text, expected)
+        );
+    }
+}
+
+#[test]
+fn candidate_parse_error_scrubs_materialized_payload() {
+    let row = vec![
+        Value::Integer(42),
+        Value::Text("fact".into()),
+        Value::Text("{\"private-key\":[\"private-value\"]}".into()),
+        Value::Integer(10),
+        Value::Real(0.5),
+        Value::Real(0.75),
+        Value::Timestamp(0),
+        Value::Null,
+        Value::Real(0.1),
+        Value::Real(0.0),
+        Value::Integer(0),
+    ];
+    let (result, scrubbed) = crate::plaintext::observe_scrubbed_atoms(|| parse_candidate(&row));
+    assert!(result.is_err());
+    assert_eq!(scrubbed, [42]);
+}
+
+#[test]
+fn recall_export_budget_failure_scrubs_all_owned_hits() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = MemoryEngine::open(create_db(dir.path())).unwrap();
+    let (result, mut scrubbed) = crate::plaintext::observe_scrubbed_atoms(|| {
+        let hits = (1..=2)
+            .map(|id| {
+                ProtectedHit::new(AtomHit {
+                    id,
+                    kind: "private kind".into(),
+                    text: "private text".into(),
+                    payload: serde_json::json!({"private-key": "private-value"}),
+                    importance: 0.0,
+                    confidence: 1.0,
+                    relevance: Some(1.0),
+                    distance: Some(0.0),
+                    graph_depth: None,
+                    created_at: 0,
+                    expires_at: None,
+                    immutable: false,
+                })
+            })
+            .collect();
+        eng.with_read_limits(MemoryReadLimits::new(usize::MAX, usize::MAX, 0), |_| {
+            export_recall_hits(hits)
+        })
+    });
+    assert!(matches!(result, Err(MemError::ReadLimitExceeded { .. })));
+    scrubbed.sort_unstable();
+    assert_eq!(scrubbed, [1, 2]);
+}
+
+#[test]
+fn bm25_numeric_term_storage_preserves_score_bits() {
+    use unicode_segmentation::UnicodeSegmentation;
+
+    let texts = [
+        "Common common ZEBRA!",
+        "café Café, naïve; Straße STRASSE",
+        "中文 单词 中文",
+        "unmatched words length affects normalization",
+        "",
+        "zebra café 中文",
+        "!!!",
+    ];
+    let query = query_keyword_terms(Some("ZEBRA café 中文 common zebra missing STRASSE"));
+    let mut candidates: Vec<_> = texts
+        .iter()
+        .enumerate()
+        .map(|(id, text)| Candidate {
+            id: id as AtomId,
+            kind: "fact".into(),
+            text: (*text).into(),
+            payload: serde_json::Value::Null,
+            dist: Some(0.0),
+            text_rank: 0.0,
+            importance: 0.0,
+            confidence: 1.0,
+            created_micros: 0,
+            expires_micros: None,
+            immutable: false,
+        })
+        .collect();
+    let docs: Vec<_> = texts
+        .iter()
+        .map(|text| {
+            let mut frequencies = FxHashMap::<String, u32>::default();
+            let mut length = 0;
+            for word in text.unicode_words().map(str::to_lowercase) {
+                *frequencies.entry(word).or_default() += 1;
+                length += 1;
+            }
+            (frequencies, length as f32)
+        })
+        .collect();
+    let n = docs.len() as f32;
+    let average_length = (docs.iter().map(|(_, length)| *length).sum::<f32>() / n).max(1.0);
+    let idf: Vec<_> = query
+        .iter()
+        .map(|term| {
+            let frequency = docs
+                .iter()
+                .filter(|(tf, _)| tf.contains_key(term.as_str()))
+                .count() as f32;
+            ((n - frequency + 0.5) / (frequency + 0.5) + 1.0).ln()
+        })
+        .collect();
+    let expected: Vec<_> = docs
+        .iter()
+        .map(|(tf, length)| {
+            let mut score = 0.0_f32;
+            for (term, &weight) in query.iter().zip(&idf) {
+                let frequency = tf.get(term.as_str()).copied().unwrap_or(0) as f32;
+                if frequency > 0.0 {
+                    score += weight * (frequency * (1.2 + 1.0))
+                        / (frequency + 1.2 * (1.0 - 0.75 + 0.75 * length / average_length));
+                }
+            }
+            score.to_bits()
+        })
+        .collect();
+    assign_bm25_ranks(&mut candidates, &query, None).unwrap();
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|candidate| candidate.text_rank.to_bits())
+            .collect::<Vec<_>>(),
+        expected
+    );
 }

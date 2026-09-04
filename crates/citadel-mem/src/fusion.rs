@@ -3,10 +3,12 @@
 
 use rustc_hash::FxHashMap;
 use serde_json::Value as Json;
+use zeroize::Zeroize;
 
 use citadel_core::CancelToken;
 
 use crate::embed::{EmbedError, Reranker};
+use crate::plaintext::{zeroize_atom_content, ProtectedHit};
 use crate::types::{AtomHit, AtomId, FusionWeights, RerankStrategy};
 
 const RECENCY_HALF_LIFE_DAYS: f32 = 30.0;
@@ -27,6 +29,38 @@ pub(crate) struct Candidate {
     pub created_micros: i64,
     pub expires_micros: Option<i64>,
     pub immutable: bool,
+}
+
+impl Candidate {
+    fn into_hit(mut self, score: f32) -> ProtectedHit {
+        ProtectedHit::new(AtomHit {
+            id: self.id,
+            kind: std::mem::take(&mut self.kind),
+            text: std::mem::take(&mut self.text),
+            payload: std::mem::take(&mut self.payload),
+            importance: self.importance,
+            confidence: self.confidence,
+            relevance: Some(score),
+            distance: self.dist,
+            graph_depth: None,
+            created_at: self.created_micros,
+            expires_at: self.expires_micros,
+            immutable: self.immutable,
+        })
+    }
+}
+
+impl Drop for Candidate {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        let owned = !self.kind.is_empty() || !self.text.is_empty() || !self.payload.is_null();
+        self.kind.zeroize();
+        zeroize_atom_content(&mut self.text, &mut self.payload);
+        #[cfg(test)]
+        if owned {
+            crate::plaintext::record_scrubbed_atom(self.id);
+        }
+    }
 }
 
 pub(crate) struct RerankContext<'a> {
@@ -108,28 +142,15 @@ pub(crate) fn fuse_rank(
     w: FusionWeights,
     now_micros: i64,
     k: usize,
-) -> Vec<AtomHit> {
+) -> Vec<ProtectedHit> {
     if cands.is_empty() {
         return Vec::new();
     }
     let scores = fusion_scores(&cands, w, now_micros);
-    let mut scored: Vec<AtomHit> = cands
+    let mut scored: Vec<ProtectedHit> = cands
         .into_iter()
         .zip(scores)
-        .map(|(c, score)| AtomHit {
-            id: c.id,
-            kind: c.kind,
-            text: c.text,
-            payload: c.payload,
-            importance: c.importance,
-            confidence: c.confidence,
-            relevance: Some(score),
-            distance: c.dist,
-            graph_depth: None,
-            created_at: c.created_micros,
-            expires_at: c.expires_micros,
-            immutable: c.immutable,
-        })
+        .map(|(candidate, score)| candidate.into_hit(score))
         .collect();
 
     scored.sort_by(|a, b| {
@@ -182,12 +203,10 @@ pub(crate) fn fuse_rerank(
     w: FusionWeights,
     now_micros: i64,
     context: RerankContext<'_>,
-) -> std::result::Result<Vec<AtomHit>, EmbedError> {
+) -> std::result::Result<Vec<ProtectedHit>, EmbedError> {
     if cands.is_empty() {
         return Ok(Vec::new());
     }
-    // Pre-trim to the top RERANK_POOL by linear fusion; the dropped tail is
-    // the low-fusion, likely-irrelevant remainder.
     if cands.len() > RERANK_POOL {
         let pre = fusion_scores(&cands, w, now_micros);
         let mut idx: Vec<usize> = (0..cands.len()).collect();
@@ -223,23 +242,10 @@ pub(crate) fn fuse_rerank(
         }
     };
 
-    let mut scored: Vec<AtomHit> = cands
+    let mut scored: Vec<ProtectedHit> = cands
         .into_iter()
         .zip(scores)
-        .map(|(c, s)| AtomHit {
-            id: c.id,
-            kind: c.kind,
-            text: c.text,
-            payload: c.payload,
-            importance: c.importance,
-            confidence: c.confidence,
-            relevance: Some(s),
-            distance: c.dist,
-            graph_depth: None,
-            created_at: c.created_micros,
-            expires_at: c.expires_micros,
-            immutable: c.immutable,
-        })
+        .map(|(candidate, score)| candidate.into_hit(score))
         .collect();
     scored.sort_by(|a, b| {
         b.relevance
@@ -252,8 +258,8 @@ pub(crate) fn fuse_rerank(
 }
 
 /// RRF-merge hit lists: sum of 1/(rrf_k + rank), first-seen fields, id tiebreak.
-pub(crate) fn rrf_merge(lists: Vec<Vec<AtomHit>>, rrf_k: f32) -> Vec<AtomHit> {
-    let mut merged: Vec<AtomHit> = Vec::new();
+pub(crate) fn rrf_merge(lists: Vec<Vec<ProtectedHit>>, rrf_k: f32) -> Vec<ProtectedHit> {
+    let mut merged: Vec<ProtectedHit> = Vec::new();
     let mut index: FxHashMap<AtomId, usize> = FxHashMap::default();
     for list in lists {
         for (rank, hit) in list.into_iter().enumerate() {
@@ -284,9 +290,9 @@ pub(crate) fn rrf_merge(lists: Vec<Vec<AtomHit>>, rrf_k: f32) -> Vec<AtomHit> {
 /// One cross-encoder pass over the merged pool: pre-trim, Replace/Rrf-blend, top k.
 pub(crate) fn rerank_hits(
     reranker: &dyn Reranker,
-    mut hits: Vec<AtomHit>,
+    mut hits: Vec<ProtectedHit>,
     context: RerankContext<'_>,
-) -> std::result::Result<Vec<AtomHit>, EmbedError> {
+) -> std::result::Result<Vec<ProtectedHit>, EmbedError> {
     if hits.is_empty() {
         return Ok(Vec::new());
     }
@@ -390,10 +396,11 @@ mod tests {
             now - 300 * day,
         ];
         let cands: Vec<_> = (0..distances.len())
-            .map(|i| Candidate {
-                dist: distances[i],
-                created_micros: created[i],
-                ..cand(i as AtomId, 0.0, keywords[i], importance[i])
+            .map(|i| {
+                let mut candidate = cand(i as AtomId, 0.0, keywords[i], importance[i]);
+                candidate.dist = distances[i];
+                candidate.created_micros = created[i];
+                candidate
             })
             .collect();
         for weights in [FusionWeights::default(), FusionWeights::semantic_only()] {
@@ -503,17 +510,13 @@ mod tests {
 
     #[test]
     fn semantic_only_scores_ignore_extreme_timestamps() {
-        let cands = vec![
-            Candidate {
-                created_micros: i64::MIN,
-                ..cand(1, 0.0, 0.0, 0.0)
-            },
+        let mut cands = vec![
+            cand(1, 0.0, 0.0, 0.0),
             cand(2, 0.5, 0.0, 0.0),
-            Candidate {
-                created_micros: i64::MAX,
-                ..cand(3, 1.0, 0.0, 0.0)
-            },
+            cand(3, 1.0, 0.0, 0.0),
         ];
+        cands[0].created_micros = i64::MIN;
+        cands[2].created_micros = i64::MAX;
         for now in [i64::MIN, 0, 2, i64::MAX] {
             assert_eq!(
                 fusion_scores(&cands, FusionWeights::semantic_only(), now),
@@ -534,11 +537,10 @@ mod tests {
                     }
                 })
                 .collect();
-            cands.push(Candidate {
-                dist: Some(if extreme_importance { 0.0 } else { -f32::MAX }),
-                importance: if extreme_importance { f32::MAX } else { 0.0 },
-                ..cand_text(RERANK_POOL as AtomId, "target")
-            });
+            let mut target = cand_text(RERANK_POOL as AtomId, "target");
+            target.dist = Some(if extreme_importance { 0.0 } else { -f32::MAX });
+            target.importance = if extreme_importance { f32::MAX } else { 0.0 };
+            cands.push(target);
             let hits = fuse_rerank(
                 &MockReranker,
                 cands,
@@ -660,21 +662,18 @@ mod tests {
 
     #[test]
     fn rerank_rrf_blends_fusion_and_cross_encoder() {
-        // RRF blends both rankings; cand 2 wins on overlap and a small dist.
-        let cands = vec![
-            Candidate {
-                dist: Some(0.1),
-                ..cand_text(1, "the sky is blue today")
-            },
-            Candidate {
-                dist: Some(0.2),
-                ..cand_text(2, "quick brown fox jumps over")
-            },
-            Candidate {
-                dist: Some(0.9),
-                ..cand_text(3, "brown fox")
-            },
-        ];
+        let cands = [
+            (1, "the sky is blue today", 0.1),
+            (2, "quick brown fox jumps over", 0.2),
+            (3, "brown fox", 0.9),
+        ]
+        .into_iter()
+        .map(|(id, text, distance)| {
+            let mut candidate = cand_text(id, text);
+            candidate.dist = Some(distance);
+            candidate
+        })
+        .collect();
         let hits = fuse_rerank(
             &MockReranker,
             cands,
@@ -696,8 +695,148 @@ mod tests {
         );
     }
 
-    fn hit(id: AtomId, text: &str) -> AtomHit {
-        AtomHit {
+    fn pretrim_fixture(count: usize) -> Vec<Candidate> {
+        (1..=count)
+            .map(|id| {
+                let (distance, keyword) = match id {
+                    1 => (0.0, 0.0),
+                    2 => (0.5, 1.0),
+                    id if id == count => (2.0, 0.0),
+                    _ => (0.5, 0.0),
+                };
+                let mut candidate = cand(id as AtomId, distance, keyword, 0.0);
+                candidate.text = id.to_string();
+                candidate
+            })
+            .collect()
+    }
+
+    fn pretrim_weights() -> FusionWeights {
+        FusionWeights {
+            semantic: 0.45,
+            keyword: 0.20,
+            recency: 0.0,
+            importance: 0.0,
+        }
+    }
+
+    struct PoolReranker {
+        passages: Vec<String>,
+        scores: Vec<f32>,
+    }
+
+    impl Reranker for PoolReranker {
+        fn model_id(&self) -> &str {
+            "pretrim-fixture"
+        }
+
+        fn rerank_with_cancel(
+            &self,
+            _: &str,
+            passages: &[&str],
+            cancel: Option<&CancelToken>,
+        ) -> Result<Vec<f32>, EmbedError> {
+            crate::embed::check_cancel(cancel)?;
+            assert_eq!(passages, self.passages);
+            Ok(self.scores.clone())
+        }
+    }
+
+    #[test]
+    fn rerank_replace_preserves_pool_membership_and_backend_scores() {
+        for count in [RERANK_POOL - 1, RERANK_POOL, RERANK_POOL + 1] {
+            let retained = count.min(RERANK_POOL);
+            let reranker = PoolReranker {
+                passages: (1..=retained).map(|id| id.to_string()).collect(),
+                scores: (1..=retained).map(|id| id as f32 - 1.0).collect(),
+            };
+            let hits = fuse_rerank(
+                &reranker,
+                pretrim_fixture(count),
+                pretrim_weights(),
+                0,
+                RerankContext {
+                    query: "query",
+                    strategy: RerankStrategy::Replace,
+                    k: retained,
+                    cancel: None,
+                },
+            )
+            .unwrap();
+            assert_eq!(hits.len(), retained);
+            for (hit, id) in hits.iter().zip((1..=retained).rev()) {
+                assert_eq!(hit.id, id as AtomId);
+                assert_eq!(
+                    hit.relevance.unwrap().to_bits(),
+                    (id as f32 - 1.0).to_bits()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rerank_pretrim_preserves_input_order_tiebreaks() {
+        for strategy in [RerankStrategy::Replace, RerankStrategy::Rrf { k: 20.0 }] {
+            let cands = (1..=RERANK_POOL + 1)
+                .rev()
+                .map(|id| cand_text(id as AtomId, &id.to_string()))
+                .collect();
+            let reranker = PoolReranker {
+                passages: (2..=RERANK_POOL + 1)
+                    .rev()
+                    .map(|id| id.to_string())
+                    .collect(),
+                scores: vec![0.0; RERANK_POOL],
+            };
+            let hits = fuse_rerank(
+                &reranker,
+                cands,
+                FusionWeights::semantic_only(),
+                0,
+                RerankContext {
+                    query: "query",
+                    strategy,
+                    k: RERANK_POOL,
+                    cancel: None,
+                },
+            )
+            .unwrap();
+            let mut expected_ids: Vec<_> = (2..=RERANK_POOL as AtomId + 1).collect();
+            if matches!(strategy, RerankStrategy::Rrf { .. }) {
+                expected_ids.reverse();
+            }
+            assert_eq!(
+                hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+                expected_ids
+            );
+        }
+    }
+
+    #[test]
+    fn rerank_pretrim_preserves_cancellation() {
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        for strategy in [RerankStrategy::Replace, RerankStrategy::Rrf { k: 20.0 }] {
+            let error = fuse_rerank(
+                &FixedScoreReranker(0.0),
+                pretrim_fixture(RERANK_POOL + 1),
+                pretrim_weights(),
+                0,
+                RerankContext {
+                    query: "query",
+                    strategy,
+                    k: 1,
+                    cancel: Some(&cancel),
+                },
+            )
+            .unwrap_err();
+            assert!(matches!(error, EmbedError::Interrupted));
+            assert!(cancel.is_cancelled());
+        }
+    }
+
+    fn hit(id: AtomId, text: &str) -> ProtectedHit {
+        ProtectedHit::new(AtomHit {
             id,
             kind: "fact".into(),
             text: text.into(),
@@ -710,7 +849,7 @@ mod tests {
             created_at: 0,
             expires_at: None,
             immutable: false,
-        }
+        })
     }
 
     struct FixedScoreReranker(f32);
@@ -741,7 +880,7 @@ mod tests {
         path: RerankPath,
         score: f32,
         strategy: RerankStrategy,
-    ) -> Result<Vec<AtomHit>, EmbedError> {
+    ) -> Result<Vec<ProtectedHit>, EmbedError> {
         let reranker = FixedScoreReranker(score);
         let context = RerankContext {
             query: "query",
@@ -900,5 +1039,143 @@ mod tests {
         .unwrap();
         assert_eq!(hits.len(), 2);
         assert!(hits[0].relevance >= hits[1].relevance);
+    }
+
+    #[test]
+    fn discarded_candidate_content_is_scrubbed_before_return() {
+        for rerank in [false, true] {
+            let candidates = (0..RERANK_POOL + 4)
+                .map(|id| {
+                    let mut candidate = cand_text(id as AtomId, "private passage");
+                    candidate.payload = serde_json::json!({"private-key": ["private-value"]});
+                    candidate
+                })
+                .collect();
+            let (hits, mut scrubbed) = crate::plaintext::observe_scrubbed_atoms(|| {
+                if rerank {
+                    fuse_rerank(
+                        &FixedScoreReranker(1.0),
+                        candidates,
+                        FusionWeights::semantic_only(),
+                        0,
+                        RerankContext {
+                            query: "query",
+                            strategy: RerankStrategy::Replace,
+                            k: 1,
+                            cancel: None,
+                        },
+                    )
+                    .unwrap()
+                } else {
+                    fuse_rank(candidates, FusionWeights::semantic_only(), 0, 1)
+                }
+            });
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].id, 0);
+            scrubbed.sort_unstable();
+            assert_eq!(scrubbed, (1..RERANK_POOL as AtomId + 4).collect::<Vec<_>>());
+            let hit = hits.into_iter().next().unwrap().into_inner();
+            assert_eq!(hit.text, "private passage");
+            assert_eq!(
+                hit.payload,
+                serde_json::json!({"private-key": ["private-value"]})
+            );
+        }
+    }
+
+    #[test]
+    fn reranker_validation_failure_scrubs_the_entire_owned_pool() {
+        for path in [RerankPath::Candidates, RerankPath::Hits] {
+            let (result, mut scrubbed) = crate::plaintext::observe_scrubbed_atoms(|| {
+                let context = RerankContext {
+                    query: "query",
+                    strategy: RerankStrategy::Replace,
+                    k: 1,
+                    cancel: None,
+                };
+                match path {
+                    RerankPath::Candidates => fuse_rerank(
+                        &FixedScoreReranker(f32::NAN),
+                        (0..RERANK_POOL + 4)
+                            .map(|id| cand_text(id as AtomId, "private passage"))
+                            .collect(),
+                        FusionWeights::semantic_only(),
+                        0,
+                        context,
+                    ),
+                    RerankPath::Hits => rerank_hits(
+                        &FixedScoreReranker(f32::NAN),
+                        (0..RERANK_POOL + 4)
+                            .map(|id| hit(id as AtomId, "private passage"))
+                            .collect(),
+                        context,
+                    ),
+                }
+            });
+            assert!(
+                matches!(result, Err(EmbedError::Backend(message)) if message.contains("non-finite"))
+            );
+            scrubbed.sort_unstable();
+            assert_eq!(
+                scrubbed,
+                (0..RERANK_POOL as AtomId + 4).collect::<Vec<_>>(),
+                "{path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn panicking_reranker_scrubs_candidates_during_unwind() {
+        struct PanickingReranker;
+        impl Reranker for PanickingReranker {
+            fn model_id(&self) -> &str {
+                "panic-fixture"
+            }
+            fn rerank_with_cancel(
+                &self,
+                _: &str,
+                _: &[&str],
+                _: Option<&CancelToken>,
+            ) -> Result<Vec<f32>, EmbedError> {
+                panic!("injected reranker panic");
+            }
+        }
+        let (panic, mut scrubbed) = crate::plaintext::observe_scrubbed_atoms(|| {
+            std::panic::catch_unwind(|| {
+                fuse_rerank(
+                    &PanickingReranker,
+                    vec![cand_text(1, "private one"), cand_text(2, "private two")],
+                    FusionWeights::semantic_only(),
+                    0,
+                    RerankContext {
+                        query: "query",
+                        strategy: RerankStrategy::Replace,
+                        k: 1,
+                        cancel: None,
+                    },
+                )
+            })
+        });
+        assert!(panic.is_err());
+        scrubbed.sort_unstable();
+        assert_eq!(scrubbed, [1, 2]);
+    }
+
+    #[test]
+    fn rrf_merge_scrubs_duplicate_copies_only() {
+        let (hits, scrubbed) = crate::plaintext::observe_scrubbed_atoms(|| {
+            rrf_merge(
+                vec![
+                    vec![hit(1, "kept")],
+                    vec![hit(1, "duplicate"), hit(2, "also kept")],
+                ],
+                20.0,
+            )
+        });
+        assert_eq!(scrubbed, [1]);
+        assert_eq!(
+            hits.iter().map(|hit| hit.text.as_str()).collect::<Vec<_>>(),
+            ["kept", "also kept"]
+        );
     }
 }

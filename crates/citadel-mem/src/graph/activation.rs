@@ -1,6 +1,7 @@
 //! Deterministic spreading activation: co-evidence surfaces at zero lexical overlap.
 
-use crate::{AtomId, EdgeKind, FetchQuery, MemoryEngine};
+use crate::engine::graph_snapshot::{GraphLiveness, GraphRevision, GraphSnapshot};
+use crate::{AtomId, EdgeKind, MemoryEngine};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 /// turn -> fact -> fact/timeline -> turn needs 3; more recirculates capped mass.
@@ -12,29 +13,55 @@ const ACTIVATION_DECAY: f32 = 0.5;
 /// Activation ceiling: a hub cited by everything saturates instead of dominating.
 const ACTIVATION_CAP: f32 = 1.0;
 
-const ACTIVATION_PAGE: usize = 1024;
-
 /// The interned diffusion universe; edges are undirected and built once per cache slot.
 struct Diffusion {
     ids: Vec<AtomId>,
     index: FxHashMap<AtomId, usize>,
     adjacency: Vec<Vec<(usize, f32)>>,
-    fan: Vec<f32>,
+    fan: Vec<Fan>,
     turn_ids: Vec<AtomId>,
+    revision: GraphRevision,
+    liveness: GraphLiveness,
 }
 
-/// Build the diffusion graph, `None` without turns; ordered edges = deterministic.
+enum Fan {
+    Finite(f32),
+    Wide(f64),
+}
+
+impl Fan {
+    fn from_neighbors(neighbors: &[(usize, f32)]) -> Self {
+        let total = neighbors.iter().map(|(_, weight)| weight).sum::<f32>();
+        if total.is_finite() {
+            Self::Finite(total.max(1.0))
+        } else {
+            Self::Wide(neighbors.iter().map(|(_, weight)| f64::from(*weight)).sum())
+        }
+    }
+}
+
 fn build_diffusion(
-    eng: &MemoryEngine,
-    region: &str,
+    snapshot: &GraphSnapshot<'_, '_>,
     turn_kind: &str,
     derived_kind: &str,
-) -> crate::Result<Option<Diffusion>> {
-    let turn_ids = page_kind_ids(eng, region, turn_kind)?;
-    if turn_ids.is_empty() {
-        return Ok(None);
+) -> crate::Result<Diffusion> {
+    let turns = snapshot.atoms(turn_kind)?;
+    if turns.ids.is_empty() {
+        return Ok(Diffusion {
+            ids: Vec::new(),
+            index: FxHashMap::default(),
+            adjacency: Vec::new(),
+            fan: Vec::new(),
+            turn_ids: Vec::new(),
+            revision: snapshot.revision(),
+            liveness: turns.liveness,
+        });
     }
-    let derived_ids = page_kind_ids(eng, region, derived_kind)?;
+    let derived = snapshot.atoms(derived_kind)?;
+    let turn_ids = turns.ids;
+    let derived_ids = derived.ids;
+    let mut liveness = turns.liveness;
+    liveness.extend(derived.liveness);
     let region_ids: FxHashSet<AtomId> = turn_ids.iter().chain(&derived_ids).copied().collect();
 
     let mut index: FxHashMap<AtomId, usize> = FxHashMap::default();
@@ -49,50 +76,57 @@ fn build_diffusion(
         intern(t, &mut ids, &mut index);
     }
     let mut adjacency: Vec<Vec<(usize, f32)>> = vec![Vec::new(); ids.len()];
-    for kind in [EdgeKind::DerivedFrom, EdgeKind::SimilarTo] {
-        for edge in eng.fetch_all_edges_in_region(region, None, None, Some(kind))? {
-            if !region_ids.contains(&edge.src_id) || !region_ids.contains(&edge.dst_id) {
-                continue;
-            }
-            let s = intern(edge.src_id, &mut ids, &mut index);
-            let d = intern(edge.dst_id, &mut ids, &mut index);
-            while adjacency.len() < ids.len() {
-                adjacency.push(Vec::new());
-            }
-            let w = if kind == EdgeKind::SimilarTo {
-                edge.weight
-            } else {
-                1.0
-            };
-            // Mutual pairs double-transmit; kept as-is.
-            adjacency[s].push((d, w));
-            adjacency[d].push((s, w));
+    let sources: Vec<AtomId> = region_ids.iter().copied().collect();
+    for (src, dst, kind, weight) in snapshot.edges(&sources)? {
+        snapshot.check_cancel()?;
+        if kind == EdgeKind::SimilarTo && (!weight.is_finite() || weight < 0.0) {
+            return Err(crate::MemError::Invalid(format!(
+                "diffusion requires a finite nonnegative SimilarTo weight for edge {src} -> {dst}"
+            )));
         }
+        let s = intern(src, &mut ids, &mut index);
+        let d = intern(dst, &mut ids, &mut index);
+        while adjacency.len() < ids.len() {
+            adjacency.push(Vec::new());
+        }
+        let w = if kind == EdgeKind::SimilarTo {
+            weight
+        } else {
+            1.0
+        };
+        // Mutual pairs double-transmit; kept as-is.
+        adjacency[s].push((d, w));
+        adjacency[d].push((s, w));
     }
     while adjacency.len() < ids.len() {
         adjacency.push(Vec::new());
     }
 
     // Fan normalization: divide by sender's total weight so hubs spread thinner.
-    let fan: Vec<f32> = adjacency
-        .iter()
-        .map(|n| n.iter().map(|(_, w)| w).sum::<f32>().max(1.0))
-        .collect();
+    let fan = adjacency.iter().map(|n| Fan::from_neighbors(n)).collect();
 
-    Ok(Some(Diffusion {
+    Ok(Diffusion {
         ids,
         index,
         adjacency,
         fan,
         turn_ids,
-    }))
+        revision: snapshot.revision(),
+        liveness,
+    })
 }
 
 impl Diffusion {
     /// Synchronous id-ordered activation from `seeds`; `cap` bounds hub mass.
-    fn run(&self, seeds: &[(AtomId, f32)], cap: f32) -> Vec<f32> {
+    fn run(
+        &self,
+        seeds: &[(AtomId, f32)],
+        cap: f32,
+        check_cancel: impl Fn() -> crate::Result<()>,
+    ) -> crate::Result<Vec<f32>> {
         let mut activation = vec![0.0f32; self.ids.len()];
         for &(id, s) in seeds {
+            check_cancel()?;
             if let Some(&i) = self.index.get(&id) {
                 activation[i] = s.min(cap);
             }
@@ -100,17 +134,31 @@ impl Diffusion {
         for _ in 0..ACTIVATION_HOPS {
             let mut next = activation.clone();
             for (i, neighbors) in self.adjacency.iter().enumerate() {
+                check_cancel()?;
                 if activation[i] == 0.0 {
                     continue;
                 }
-                let send = activation[i] * ACTIVATION_DECAY / self.fan[i];
-                for &(j, w) in neighbors {
-                    next[j] = (next[j] + send * w).min(cap);
+                match self.fan[i] {
+                    Fan::Finite(fan) => {
+                        let send = activation[i] * ACTIVATION_DECAY / fan;
+                        for &(j, w) in neighbors {
+                            check_cancel()?;
+                            next[j] = (next[j] + send * w).min(cap);
+                        }
+                    }
+                    Fan::Wide(fan) => {
+                        let send = f64::from(activation[i]) * f64::from(ACTIVATION_DECAY) / fan;
+                        for &(j, w) in neighbors {
+                            check_cancel()?;
+                            next[j] = (next[j] + (send * f64::from(w)) as f32).min(cap);
+                        }
+                    }
                 }
             }
             activation = next;
         }
-        activation
+        check_cancel()?;
+        Ok(activation)
     }
 }
 
@@ -121,7 +169,7 @@ pub struct DiffusionCache {
 }
 
 impl DiffusionCache {
-    /// Drop the cached graph; the controller must serialize resets against reads.
+    /// Drop the binding. An in-flight read may populate it again after reset.
     pub fn reset(&self) {
         *self.slot.lock().unwrap() = None;
     }
@@ -160,38 +208,19 @@ impl CachedDiffusion {
     }
 }
 
-fn graph_for(
+fn cached_graph(
     cache: &DiffusionCache,
-    eng: &MemoryEngine,
+    database: &std::sync::Weak<citadel::Database>,
     region: &str,
     turn_kind: &str,
     derived_kind: &str,
 ) -> crate::Result<Option<std::sync::Arc<Diffusion>>> {
-    let database = eng.database_identity();
     if let Some(c) = cache.slot.lock().unwrap().as_ref() {
         return c
-            .checked_graph(&database, region, turn_kind, derived_kind)
+            .checked_graph(database, region, turn_kind, derived_kind)
             .map(Some);
     }
-    let built = build_diffusion(eng, region, turn_kind, derived_kind)?;
-    let mut slot = cache.slot.lock().unwrap();
-    if let Some(c) = slot.as_ref() {
-        return c
-            .checked_graph(&database, region, turn_kind, derived_kind)
-            .map(Some);
-    }
-    let Some(g) = built else {
-        return Ok(None);
-    };
-    let g = std::sync::Arc::new(g);
-    *slot = Some(CachedDiffusion {
-        database,
-        region: region.to_string(),
-        turn_kind: turn_kind.to_string(),
-        derived_kind: derived_kind.to_string(),
-        graph: std::sync::Arc::clone(&g),
-    });
-    Ok(Some(g))
+    Ok(None)
 }
 
 /// [`activation_scores_cached`] keeping only the ranked turn ids - the
@@ -215,11 +244,11 @@ pub fn activation_rerank_cached(
 
 /// Return up to `k` cached turns as `(atom id, activation)`, ordered by
 /// descending activation then ascending id. Seeds may be turns or derived notes.
+/// Seed scores and participating `SimilarTo` weights must be finite and nonnegative.
 ///
-/// The cached graph is a snapshot, not a live view. Callers must exclude
-/// mutations while building it and reset before reuse after atom, edge, or
-/// region mutations, including erasure, or TTL changes/expiry. Cache hits do
-/// not revalidate atom liveness or automatically invalidate the snapshot.
+/// Reads use one validated database snapshot. Mutations and TTL expiry rebuild
+/// the graph; cached encrypted bindings are revalidated before use. A concurrent
+/// raw database write can fail the read with an explicit retry error.
 pub fn activation_scores_cached(
     cache: &DiffusionCache,
     eng: &MemoryEngine,
@@ -229,15 +258,56 @@ pub fn activation_scores_cached(
     seeds: &[(AtomId, f32)],
     k: usize,
 ) -> crate::Result<Vec<(AtomId, f32)>> {
-    let Some(graph) = graph_for(cache, eng, region, turn_kind, derived_kind)? else {
+    for &(id, score) in seeds {
+        if !score.is_finite() || score < 0.0 {
+            return Err(crate::MemError::Invalid(format!(
+                "diffusion requires a finite nonnegative seed score for atom {id}"
+            )));
+        }
+    }
+    if k == 0 {
         return Ok(Vec::new());
-    };
-    Ok(rank_turns(&graph, seeds, k))
+    }
+    let database = eng.database_identity();
+    let cached = cached_graph(cache, &database, region, turn_kind, derived_kind)?;
+    let (graph, ranked) = eng.with_graph_snapshot(region, |snapshot| {
+        let graph = match cached {
+            Some(graph)
+                if graph.revision == snapshot.revision()
+                    && snapshot.is_live(&graph.liveness)? =>
+            {
+                graph
+            }
+            _ => std::sync::Arc::new(build_diffusion(snapshot, turn_kind, derived_kind)?),
+        };
+        let ranked = rank_turns(&graph, seeds, k, || snapshot.check_cancel())?;
+        snapshot.ensure_live(&graph.liveness)?;
+        Ok((graph, ranked))
+    })?;
+    let mut slot = cache.slot.lock().unwrap();
+    if let Some(current) = slot.as_ref() {
+        current.checked_graph(&database, region, turn_kind, derived_kind)?;
+    }
+    let retired = slot.replace(CachedDiffusion {
+        database,
+        region: region.to_owned(),
+        turn_kind: turn_kind.to_owned(),
+        derived_kind: derived_kind.to_owned(),
+        graph,
+    });
+    drop(slot);
+    drop(retired);
+    Ok(ranked)
 }
 
 /// Activation-ordered `(turn id, score)` prefix of a built graph.
-fn rank_turns(graph: &Diffusion, seeds: &[(AtomId, f32)], k: usize) -> Vec<(AtomId, f32)> {
-    let activation = graph.run(seeds, ACTIVATION_CAP);
+fn rank_turns(
+    graph: &Diffusion,
+    seeds: &[(AtomId, f32)],
+    k: usize,
+    check_cancel: impl Fn() -> crate::Result<()>,
+) -> crate::Result<Vec<(AtomId, f32)>> {
+    let activation = graph.run(seeds, ACTIVATION_CAP, &check_cancel)?;
     let mut ranked: Vec<(AtomId, f32)> = graph
         .turn_ids
         .iter()
@@ -245,26 +315,8 @@ fn rank_turns(graph: &Diffusion, seeds: &[(AtomId, f32)], k: usize) -> Vec<(Atom
         .collect();
     ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap().then(a.0.cmp(&b.0)));
     ranked.truncate(k);
-    ranked
-}
-
-/// All live ids of `kind` in the region, paged in id order.
-fn page_kind_ids(eng: &MemoryEngine, region: &str, kind: &str) -> crate::Result<Vec<AtomId>> {
-    let mut out: Vec<AtomId> = Vec::new();
-    let mut after: Option<AtomId> = None;
-    loop {
-        let mut q = FetchQuery::new(ACTIVATION_PAGE).with_kind(kind);
-        if let Some(id) = after {
-            q = q.with_after_id(id);
-        }
-        let page = eng.fetch_range(region, &q)?;
-        let Some(last) = page.last() else {
-            break;
-        };
-        after = Some(last.id);
-        out.extend(page.iter().map(|h| h.id));
-    }
-    Ok(out)
+    check_cancel()?;
+    Ok(ranked)
 }
 
 /// Guarantee `pinned` ids a slot in `ranked`: each absent id evicts the
@@ -315,6 +367,7 @@ mod tests {
             DatabaseBuilder::new(dir.join("m.db"))
                 .passphrase(b"test-passphrase")
                 .argon2_profile(Argon2Profile::Iot)
+                .enable_region_keys(true)
                 .create()
                 .unwrap(),
         );
@@ -450,6 +503,128 @@ mod tests {
     }
 
     #[test]
+    fn invalid_seed_scores_fail_on_cold_and_warm_caches() {
+        let dir = tempfile::tempdir().unwrap();
+        let eng = engine(dir.path());
+        let atom = eng.remember("r", AtomInput::new("turn", "seed")).unwrap();
+        let cache = DiffusionCache::default();
+        for warm in [false, true] {
+            if warm {
+                activation_scores_cached(&cache, &eng, "r", "turn", "derived", &[(atom, 1.0)], 1)
+                    .unwrap();
+            }
+            for score in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -1.0] {
+                for id in [atom, i64::MAX] {
+                    let error = activation_scores_cached(
+                        &cache,
+                        &eng,
+                        "r",
+                        "turn",
+                        "derived",
+                        &[(id, score)],
+                        1,
+                    )
+                    .unwrap_err();
+                    assert!(error.to_string().contains("nonnegative seed score"));
+                    assert!(error.to_string().contains(&id.to_string()));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn empty_graph_still_rejects_invalid_seed_scores() {
+        let dir = tempfile::tempdir().unwrap();
+        let eng = engine(dir.path());
+        let error = activation_scores_cached(
+            &DiffusionCache::default(),
+            &eng,
+            "r",
+            "turn",
+            "derived",
+            &[(1, f32::NAN)],
+            0,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("nonnegative seed score"));
+    }
+
+    #[test]
+    fn signed_edges_are_rejected_by_activation_not_by_storage() {
+        let dir = tempfile::tempdir().unwrap();
+        let eng = engine(dir.path());
+        let seed = eng.remember("r", AtomInput::new("turn", "seed")).unwrap();
+        let neighbor = eng
+            .remember("r", AtomInput::new("turn", "neighbor"))
+            .unwrap();
+        eng.link(seed, neighbor, EdgeKind::SimilarTo, -0.5).unwrap();
+
+        let error = activation_scores_cached(
+            &DiffusionCache::default(),
+            &eng,
+            "r",
+            "turn",
+            "derived",
+            &[(seed, 1.0)],
+            2,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("nonnegative SimilarTo weight"));
+    }
+
+    #[test]
+    fn overflowing_positive_fan_preserves_activation() {
+        let dir = tempfile::tempdir().unwrap();
+        let eng = engine(dir.path());
+        let ids = ["seed", "first", "second"]
+            .map(|text| eng.remember("r", AtomInput::new("turn", text)).unwrap());
+        for neighbor in &ids[1..] {
+            eng.link(ids[0], *neighbor, EdgeKind::SimilarTo, f32::MAX)
+                .unwrap();
+        }
+        let graph = eng
+            .with_graph_snapshot("r", |snapshot| build_diffusion(snapshot, "turn", "derived"))
+            .unwrap();
+        let activation = graph
+            .run(&[(ids[0], 1.0)], ACTIVATION_CAP, || Ok(()))
+            .unwrap();
+        for neighbor in &ids[1..] {
+            let score = activation[graph.index[neighbor]];
+            assert_eq!(score, 0.75);
+        }
+        assert!(activation
+            .iter()
+            .all(|score| score.is_finite() && *score <= 1.0));
+    }
+
+    #[test]
+    fn finite_fan_keeps_existing_score_bits() {
+        let dir = tempfile::tempdir().unwrap();
+        let eng = engine(dir.path());
+        let seed = eng.remember("r", AtomInput::new("turn", "seed")).unwrap();
+        let neighbor = eng
+            .remember("r", AtomInput::new("turn", "neighbor"))
+            .unwrap();
+        eng.link(seed, neighbor, EdgeKind::SimilarTo, 0.25).unwrap();
+        let graph = eng
+            .with_graph_snapshot("r", |snapshot| build_diffusion(snapshot, "turn", "derived"))
+            .unwrap();
+        assert!(graph.fan.iter().all(|fan| matches!(fan, Fan::Finite(_))));
+        let activation = graph
+            .run(
+                &[(seed, f32::MAX), (neighbor, -0.0)],
+                ACTIVATION_CAP,
+                || Ok(()),
+            )
+            .unwrap();
+        assert_eq!(activation[graph.index[&seed]].to_bits(), 1.0_f32.to_bits());
+        assert_eq!(
+            activation[graph.index[&neighbor]].to_bits(),
+            0.375_f32.to_bits()
+        );
+    }
+
+    #[test]
     fn cache_hit_matches_the_build_path_across_independent_caches() {
         let dir = tempfile::tempdir().unwrap();
         let eng = engine(dir.path());
@@ -495,6 +670,170 @@ mod tests {
             scored.iter().map(|&(id, _)| id).collect::<Vec<_>>(),
             "rerank is exactly the id projection of the scores"
         );
+    }
+
+    #[test]
+    fn cache_rebuilds_after_edge_and_atom_mutations() {
+        let dir = tempfile::tempdir().unwrap();
+        let eng = engine(dir.path());
+        let seed = eng.remember("r", AtomInput::new("turn", "seed")).unwrap();
+        let neighbor = eng
+            .remember("r", AtomInput::new("turn", "neighbor"))
+            .unwrap();
+        let cache = DiffusionCache::default();
+        let score = || {
+            activation_scores_cached(&cache, &eng, "r", "turn", "derived", &[(seed, 1.0)], 8)
+                .unwrap()
+        };
+        assert_eq!(score(), vec![(seed, 1.0), (neighbor, 0.0)]);
+        eng.link(seed, neighbor, EdgeKind::SimilarTo, 0.5).unwrap();
+        assert!(score().iter().find(|(id, _)| *id == neighbor).unwrap().1 > 0.0);
+        eng.unlink_in_region("r", seed, neighbor, EdgeKind::SimilarTo)
+            .unwrap();
+        assert_eq!(score(), vec![(seed, 1.0), (neighbor, 0.0)]);
+        let added = eng
+            .remember("r", AtomInput::new("turn", "new turn"))
+            .unwrap();
+        assert!(score().iter().any(|(id, _)| *id == added));
+        eng.forget_atom("r", neighbor).unwrap();
+        assert!(!score().iter().any(|(id, _)| *id == neighbor));
+    }
+
+    #[test]
+    fn cache_rebuilds_after_raw_sql_without_a_key_epoch_change() {
+        use citadel_sql::Connection;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (db, eng) = engine_with_database(dir.path());
+        let seed = eng.remember("r", AtomInput::new("turn", "seed")).unwrap();
+        let neighbor = eng
+            .remember("r", AtomInput::new("turn", "neighbor"))
+            .unwrap();
+        eng.link(seed, neighbor, EdgeKind::SimilarTo, 0.5).unwrap();
+        let cache = DiffusionCache::default();
+        let score = || {
+            activation_scores_cached(&cache, &eng, "r", "turn", "derived", &[(seed, 1.0)], 2)
+                .unwrap()
+        };
+        assert!(score().iter().find(|(id, _)| *id == neighbor).unwrap().1 > 0.0);
+        let epoch = db.cache_epoch();
+        Connection::open(&db)
+            .unwrap()
+            .execute("DELETE FROM memory_edges")
+            .unwrap();
+        assert_eq!(db.cache_epoch(), epoch);
+        assert_eq!(score(), vec![(seed, 1.0), (neighbor, 0.0)]);
+    }
+
+    #[test]
+    fn cache_rebuilds_after_ttl_expiry_without_a_write() {
+        use crate::engine::graph_snapshot::with_test_clock;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (db, eng) = engine_with_database(dir.path());
+        let expires_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as i64
+            + 60_000_000;
+        let atom = eng
+            .remember(
+                "r",
+                AtomInput::new("turn", "temporary").with_expires_at(expires_at),
+            )
+            .unwrap();
+        let cache = DiffusionCache::default();
+        let score = || {
+            activation_scores_cached(&cache, &eng, "r", "turn", "derived", &[(atom, 1.0)], 1)
+                .unwrap()
+        };
+        assert_eq!(with_test_clock(expires_at - 1, score), vec![(atom, 1.0)]);
+        let revision = db.manager().commit_generation();
+        assert!(with_test_clock(expires_at, score).is_empty());
+        assert_eq!(db.manager().commit_generation(), revision);
+    }
+
+    #[test]
+    fn cache_rejects_a_dropped_region() {
+        let dir = tempfile::tempdir().unwrap();
+        let eng = engine(dir.path());
+        let atom = eng.remember("r", AtomInput::new("turn", "seed")).unwrap();
+        let cache = DiffusionCache::default();
+        activation_scores_cached(&cache, &eng, "r", "turn", "derived", &[(atom, 1.0)], 1).unwrap();
+        eng.drop_region("r").unwrap();
+        assert!(matches!(
+            activation_scores_cached(&cache, &eng, "r", "turn", "derived", &[(atom, 1.0)], 1),
+            Err(crate::MemError::RegionNotAttached(_) | crate::MemError::RegionNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn cache_revalidates_key_first_erasure_without_a_row_commit() {
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (db, eng) = engine_with_database(dir.path());
+        eng.create_encrypted_region("s", Arc::new(crate::MockEmbedder::new(64)))
+            .unwrap();
+        let atom = eng.remember("s", AtomInput::new("turn", "sealed")).unwrap();
+        let cache = DiffusionCache::default();
+        let score = || {
+            activation_scores_cached(&cache, &eng, "s", "turn", "derived", &[(atom, 1.0)], 1)
+                .unwrap()
+        };
+        assert_eq!(score(), vec![(atom, 1.0)]);
+        let revision = db.manager().commit_generation();
+        let (slot, owner, generation) = db
+            .atom_store_live_bindings()
+            .unwrap()
+            .into_iter()
+            .find(|(_, owner, _)| *owner == atom as u64)
+            .unwrap();
+        db.atom_store_tombstone(slot, owner, generation).unwrap();
+        assert_eq!(db.manager().commit_generation(), revision);
+        assert!(score().is_empty());
+    }
+
+    #[test]
+    fn cache_revalidates_sidecar_presence_without_an_epoch_change() {
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (db, eng) = engine_with_database(dir.path());
+        eng.create_encrypted_region("s", Arc::new(crate::MockEmbedder::new(64)))
+            .unwrap();
+        let atom = eng.remember("s", AtomInput::new("turn", "sealed")).unwrap();
+        let cache = DiffusionCache::default();
+        activation_scores_cached(&cache, &eng, "s", "turn", "derived", &[(atom, 1.0)], 1).unwrap();
+        let epoch = db.cache_epoch();
+        let revision = db.manager().commit_generation();
+        std::fs::remove_file(db.atom_store_path()).unwrap();
+        assert_eq!(db.cache_epoch(), epoch);
+        assert_eq!(db.manager().commit_generation(), revision);
+        let error =
+            activation_scores_cached(&cache, &eng, "s", "turn", "derived", &[(atom, 1.0)], 1)
+                .unwrap_err();
+        assert!(error.to_string().contains("atom key store is missing"));
+    }
+
+    #[test]
+    fn warm_cache_observes_request_cancellation() {
+        let dir = tempfile::tempdir().unwrap();
+        let eng = engine(dir.path());
+        let atom = eng.remember("r", AtomInput::new("turn", "seed")).unwrap();
+        let cache = DiffusionCache::default();
+        activation_scores_cached(&cache, &eng, "r", "turn", "derived", &[(atom, 1.0)], 1).unwrap();
+        let cancel = citadel_core::CancelToken::new();
+        cancel.cancel();
+        let error = eng
+            .with_cancel_token(cancel, |eng| {
+                activation_scores_cached(&cache, eng, "r", "turn", "derived", &[(atom, 1.0)], 1)
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::MemError::Core(citadel_core::Error::Interrupted)
+        ));
     }
 
     #[test]
