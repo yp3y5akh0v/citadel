@@ -8258,6 +8258,155 @@ fn invalid_segment_id_or_generation_never_publishes_segment_state() {
 }
 
 #[test]
+fn recall_and_evolve_accept_finite_extreme_event_times() {
+    for encrypted in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = if encrypted {
+            create_enc_db(dir.path())
+        } else {
+            create_db(dir.path())
+        };
+        let eng = MemoryEngine::open(db).unwrap();
+        let embedder = Arc::new(MockEmbedder::new(2));
+        if encrypted {
+            eng.create_encrypted_region("ages", embedder).unwrap();
+        } else {
+            eng.create_region("ages", embedder).unwrap();
+        }
+        let old = eng
+            .remember(
+                "ages",
+                AtomInput::new("fact", "old")
+                    .with_created_at(i64::MIN + 1)
+                    .with_embedding(vec![1.0, 0.0]),
+            )
+            .unwrap();
+        let future = eng
+            .remember(
+                "ages",
+                AtomInput::new("fact", "future")
+                    .with_created_at(i64::MAX - 1)
+                    .with_embedding(vec![1.0, 0.0]),
+            )
+            .unwrap();
+        let hits = eng
+            .recall(
+                "ages",
+                RecallQuery::by_embedding(vec![1.0, 0.0], 2).with_weights(FusionWeights {
+                    semantic: 0.0,
+                    keyword: 0.0,
+                    recency: 1.0,
+                    importance: 0.0,
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+            [future, old]
+        );
+        assert_eq!(hits[0].relevance, Some(1.0));
+        assert_eq!(hits[1].relevance, Some(0.0));
+        assert_eq!(eng.evolve("ages", old, 0, 1.0).unwrap().importance, 0.0);
+        assert!(eng
+            .evolve("ages", future, 0, 1.0)
+            .unwrap()
+            .importance
+            .is_finite());
+    }
+}
+
+#[test]
+fn semantic_recall_is_finite_with_extreme_stored_importance() {
+    for encrypted in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = if encrypted {
+            create_enc_db(dir.path())
+        } else {
+            create_db(dir.path())
+        };
+        let eng = MemoryEngine::open(db).unwrap();
+        let embedder = Arc::new(MockEmbedder::new(2));
+        if encrypted {
+            eng.create_encrypted_region("weights", embedder).unwrap();
+        } else {
+            eng.create_region("weights", embedder).unwrap();
+        }
+        eng.remember(
+            "weights",
+            AtomInput::new("fact", "far")
+                .with_embedding(vec![0.0, 1.0])
+                .with_importance(-f32::MAX),
+        )
+        .unwrap();
+        let near = eng
+            .remember(
+                "weights",
+                AtomInput::new("fact", "near")
+                    .with_embedding(vec![1.0, 0.0])
+                    .with_importance(f32::MAX),
+            )
+            .unwrap();
+        let hits = eng
+            .recall(
+                "weights",
+                RecallQuery::by_embedding(vec![1.0, 0.0], 2)
+                    .with_weights(FusionWeights::semantic_only()),
+            )
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].id, near);
+        assert!(hits
+            .iter()
+            .all(|hit| hit.relevance.is_some_and(f32::is_finite)));
+    }
+}
+
+#[test]
+fn cancellation_after_batch_key_allocation_tombstones_every_new_slot() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_enc_db(dir.path());
+    let eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
+    eng.create_encrypted_region("facts", Arc::new(MockEmbedder::new(2)))
+        .unwrap();
+    let retained = eng
+        .remember("facts", AtomInput::new("fact", "retained"))
+        .unwrap();
+    let before = db.atom_store_live_bindings().unwrap();
+    let token = citadel_core::CancelToken::new();
+    db.set_cancel(Some(token.clone()));
+    CANCEL_AFTER_ATOM_KEY_ALLOCATION.with(|slot| {
+        assert!(slot.borrow_mut().replace(token.clone()).is_none());
+    });
+    let atoms = (0..3)
+        .map(|index| AtomInput::new("fact", format!("new fact {index}")))
+        .collect();
+
+    assert_mem_interrupted(eng.remember_batch("facts", atoms));
+    assert!(token.is_cancelled());
+    assert!(db.cancel_token().is_some_and(|token| token.is_cancelled()));
+    assert!(CANCEL_AFTER_ATOM_KEY_ALLOCATION.with(|slot| slot.borrow().is_none()));
+    db.set_cancel(None);
+    assert_eq!(db.atom_store_live_bindings().unwrap(), before);
+    assert_eq!(eng.count_region("facts").unwrap(), 1);
+    assert!(eng.fetch_one("facts", retained).unwrap().is_some());
+
+    let retried = eng
+        .remember_batch(
+            "facts",
+            (0..3)
+                .map(|index| AtomInput::new("fact", format!("new fact {index}")))
+                .collect(),
+        )
+        .unwrap();
+    assert_eq!(retried.len(), 3);
+    assert_eq!(eng.count_region("facts").unwrap(), 4);
+    assert_eq!(
+        db.atom_store_live_bindings().unwrap().len(),
+        before.len() + 3
+    );
+}
+
+#[test]
 fn a_negative_persisted_segment_owner_fails_closed_and_reconciles() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_enc_db(dir.path());

@@ -25,7 +25,8 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::embed::{Embedder, EmbeddingMetric, Reranker};
 use crate::error::{MemError, Result};
 use crate::fusion::{
-    fuse_rank, fuse_rerank, rerank_hits, rrf_merge, Candidate, RerankContext, RERANK_POOL,
+    fuse_rank, fuse_rerank, recency_score, rerank_hits, rrf_merge, Candidate, RerankContext,
+    RERANK_POOL,
 };
 use crate::read_limits::{
     atom_content_bytes, charge_atom_content, charge_edge_evidence, charge_materialized_bytes,
@@ -103,6 +104,8 @@ std::thread_local! {
         const { std::cell::RefCell::new(None) };
     /// Trip cancellation immediately after a persisted segment key is destroyed.
     static CANCEL_AFTER_SEGMENT_KEY_ERASURE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+    static CANCEL_AFTER_ATOM_KEY_ALLOCATION: std::cell::RefCell<Option<citadel_core::CancelToken>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -5070,8 +5073,13 @@ impl MemoryEngine {
                     key_items.push((id as u64, wrapped));
                 }
                 let slots = self.db.atom_store_allocate_batch(&key_items)?;
+                #[cfg(test)]
+                if let Some(token) =
+                    CANCEL_AFTER_ATOM_KEY_ALLOCATION.with(|slot| slot.borrow_mut().take())
+                {
+                    token.cancel();
+                }
                 for (&id, &(slot, generation)) in ids.iter().zip(&slots) {
-                    check_cancel(cancel)?;
                     pending.track(slot, id as u64, generation);
                 }
                 for (((atom, &id), sealed), &(slot, gen)) in
@@ -7636,8 +7644,7 @@ impl MemoryEngine {
             })
             .collect::<Vec<_>>();
 
-        let age_days = (now_micros() - state.created).max(0) as f32 / 1e6 / 86_400.0;
-        let recency = (-std::f32::consts::LN_2 * age_days / 30.0).exp();
+        let recency = recency_score(now_micros(), state.created);
         let new_score = recency * (1.0 + (state.access_count as f32).ln_1p());
 
         // Serialize the RSK liveness check with drop_region's key-first erase span.

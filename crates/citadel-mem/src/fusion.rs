@@ -36,6 +36,34 @@ pub(crate) struct RerankContext<'a> {
     pub cancel: Option<&'a CancelToken>,
 }
 
+enum NormalizationRange {
+    F32(f32),
+    F64(f64),
+}
+
+impl NormalizationRange {
+    fn new(min: f32, max: f32) -> Self {
+        let range = (max - min).max(f32::EPSILON);
+        if range.is_finite() {
+            Self::F32(range)
+        } else {
+            Self::F64(f64::from(max) - f64::from(min))
+        }
+    }
+
+    fn difference(&self, upper: f32, lower: f32) -> f32 {
+        match *self {
+            Self::F32(range) => (upper - lower) / range,
+            Self::F64(range) => ((f64::from(upper) - f64::from(lower)) / range) as f32,
+        }
+    }
+}
+
+pub(crate) fn recency_score(now_micros: i64, created_micros: i64) -> f32 {
+    let age_days = now_micros.saturating_sub(created_micros).max(0) as f32 / 1e6 / 86_400.0;
+    (-std::f32::consts::LN_2 * age_days / RECENCY_HALF_LIFE_DAYS).exp()
+}
+
 /// Per-candidate fusion score: each signal min-max normalized, then blended by `w`.
 fn fusion_scores(cands: &[Candidate], w: FusionWeights, now_micros: i64) -> Vec<f32> {
     let mut distance_bounds: Option<(f32, f32)> = None;
@@ -54,18 +82,18 @@ fn fusion_scores(cands: &[Candidate], w: FusionWeights, now_micros: i64) -> Vec<
         imax = imax.max(c.importance);
     }
     let (dmin, dmax) = distance_bounds.unwrap_or((0.0, 0.0));
-    let drange = (dmax - dmin).max(f32::EPSILON);
-    let irange = (imax - imin).max(f32::EPSILON);
-    let ln2 = std::f32::consts::LN_2;
+    let drange = NormalizationRange::new(dmin, dmax);
+    let irange = NormalizationRange::new(imin, imax);
 
     cands
         .iter()
         .map(|c| {
-            let semantic = c.dist.map_or(0.0, |distance| (dmax - distance) / drange); // nearest -> 1
+            let semantic = c
+                .dist
+                .map_or(0.0, |distance| drange.difference(dmax, distance));
             let keyword = if rmax > 0.0 { c.text_rank / rmax } else { 0.0 };
-            let age_days = (now_micros - c.created_micros).max(0) as f32 / 1e6 / 86_400.0;
-            let recency = (-ln2 * age_days / RECENCY_HALF_LIFE_DAYS).exp();
-            let importance = (c.importance - imin) / irange;
+            let recency = recency_score(now_micros, c.created_micros);
+            let importance = irange.difference(c.importance, imin);
             w.semantic * semantic
                 + w.keyword * keyword
                 + w.recency * recency
@@ -324,6 +352,203 @@ mod tests {
             created_micros: 0,
             expires_micros: None,
             immutable: false,
+        }
+    }
+
+    #[test]
+    fn finite_ranges_preserve_f32_score_bits() {
+        let now = 1_700_000_000_000_000i64;
+        let day = 86_400_000_000i64;
+        let distances = [
+            Some(0.95),
+            Some(0.17),
+            None,
+            Some(1.3),
+            Some(0.17000002),
+            Some(0.48),
+            Some(0.0),
+            Some(2.0),
+            Some(0.7),
+            Some(1.0),
+        ];
+        let importance = [-3.0, -1.0, 0.0, 0.1, 0.2, 0.5, 1.0, 8.0, 9.0, 3.0];
+        let keywords = [0.0, 0.1, 0.8, 1.0, 2.3, 0.0, 0.00001, 4.0, 2.0, 1.4];
+        let created = [
+            -1_000_000_000_000_000,
+            0,
+            1_000_000,
+            now + 1,
+            now,
+            now - day,
+            now - 30 * day,
+            now - 90 * day,
+            now - 60 * day,
+            now - 300 * day,
+        ];
+        let cands: Vec<_> = (0..distances.len())
+            .map(|i| Candidate {
+                dist: distances[i],
+                created_micros: created[i],
+                ..cand(i as AtomId, 0.0, keywords[i], importance[i])
+            })
+            .collect();
+        for weights in [FusionWeights::default(), FusionWeights::semantic_only()] {
+            let expected: Vec<_> = (0..distances.len())
+                .map(|i| {
+                    let semantic = distances[i].map_or(0.0, |distance| (2.0 - distance) / 2.0);
+                    let keyword = keywords[i] / 4.0;
+                    let age_days = (now - created[i]).max(0) as f32 / 1e6 / 86_400.0;
+                    let recency = (-std::f32::consts::LN_2 * age_days / 30.0).exp();
+                    let importance = (importance[i] - -3.0) / 12.0;
+                    (weights.semantic * semantic
+                        + weights.keyword * keyword
+                        + weights.recency * recency
+                        + weights.importance * importance)
+                        .to_bits()
+                })
+                .collect();
+            let bits: Vec<_> = fusion_scores(&cands, weights, now)
+                .into_iter()
+                .map(f32::to_bits)
+                .collect();
+            assert_eq!(bits, expected);
+        }
+    }
+
+    #[test]
+    fn small_and_equal_ranges_keep_epsilon_normalization() {
+        let range = NormalizationRange::new(0.0, f32::EPSILON / 2.0);
+        assert_eq!(range.difference(f32::EPSILON / 2.0, 0.0), 0.5);
+        assert_eq!(range.difference(f32::EPSILON / 4.0, 0.0), 0.25);
+        for value in [-f32::MAX, -1.0, 0.0, 1.0, f32::MAX] {
+            assert_eq!(
+                NormalizationRange::new(value, value).difference(value, value),
+                0.0
+            );
+        }
+    }
+
+    #[test]
+    fn finite_importance_extremes_stay_finite_with_zero_or_nonzero_weight() {
+        let values = [-f32::MAX, -f32::MAX / 2.0, 0.0, f32::MAX / 2.0, f32::MAX];
+        let cands: Vec<_> = values
+            .into_iter()
+            .enumerate()
+            .map(|(i, importance)| cand(i as AtomId, 1.0 - i as f32 / 4.0, 0.0, importance))
+            .collect();
+        let importance_only = FusionWeights {
+            semantic: 0.0,
+            keyword: 0.0,
+            recency: 0.0,
+            importance: 1.0,
+        };
+        assert_eq!(
+            fusion_scores(&cands, importance_only, 0),
+            [0.0, 0.25, 0.5, 0.75, 1.0]
+        );
+        assert_eq!(
+            fusion_scores(&cands, FusionWeights::semantic_only(), 0),
+            [0.0, 0.25, 0.5, 0.75, 1.0]
+        );
+        assert!(fusion_scores(&cands, FusionWeights::default(), 0)
+            .iter()
+            .all(|score| score.is_finite()));
+    }
+
+    #[test]
+    fn finite_distance_extremes_stay_finite_with_zero_or_nonzero_weight() {
+        let values = [-f32::MAX, -f32::MAX / 2.0, 0.0, f32::MAX / 2.0, f32::MAX];
+        let cands: Vec<_> = values
+            .into_iter()
+            .enumerate()
+            .map(|(i, distance)| cand(i as AtomId, distance, 0.0, 0.0))
+            .collect();
+        assert_eq!(
+            fusion_scores(&cands, FusionWeights::semantic_only(), 0),
+            [1.0, 0.75, 0.5, 0.25, 0.0]
+        );
+        let recency_only = FusionWeights {
+            semantic: 0.0,
+            keyword: 0.0,
+            recency: 1.0,
+            importance: 0.0,
+        };
+        assert_eq!(fusion_scores(&cands, recency_only, 0), [1.0; 5]);
+        assert!(fusion_scores(&cands, FusionWeights::default(), 0)
+            .iter()
+            .all(|score| score.is_finite()));
+    }
+
+    #[test]
+    fn recency_handles_the_entire_timestamp_range() {
+        let timestamps = [i64::MIN, i64::MIN + 1, -1, 0, 1, 2, i64::MAX - 1, i64::MAX];
+        for now in timestamps {
+            for created in timestamps {
+                let age_days =
+                    (i128::from(now) - i128::from(created)).max(0) as f64 / 1e6 / 86_400.0;
+                let expected = (-std::f64::consts::LN_2 * age_days / 30.0).exp() as f32;
+                let actual = recency_score(now, created);
+                assert!(actual.is_finite());
+                assert!(
+                    (actual - expected).abs() <= f32::EPSILON,
+                    "{now}, {created}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn semantic_only_scores_ignore_extreme_timestamps() {
+        let cands = vec![
+            Candidate {
+                created_micros: i64::MIN,
+                ..cand(1, 0.0, 0.0, 0.0)
+            },
+            cand(2, 0.5, 0.0, 0.0),
+            Candidate {
+                created_micros: i64::MAX,
+                ..cand(3, 1.0, 0.0, 0.0)
+            },
+        ];
+        for now in [i64::MIN, 0, 2, i64::MAX] {
+            assert_eq!(
+                fusion_scores(&cands, FusionWeights::semantic_only(), now),
+                [1.0, 0.5, 0.0]
+            );
+        }
+    }
+
+    #[test]
+    fn rerank_pretrim_keeps_best_distance_with_extreme_finite_signals() {
+        for extreme_importance in [false, true] {
+            let mut cands: Vec<_> = (0..RERANK_POOL)
+                .map(|i| {
+                    if extreme_importance {
+                        cand(i as AtomId, 1.0, 0.0, -f32::MAX)
+                    } else {
+                        cand(i as AtomId, f32::MAX, 0.0, 0.0)
+                    }
+                })
+                .collect();
+            cands.push(Candidate {
+                dist: Some(if extreme_importance { 0.0 } else { -f32::MAX }),
+                importance: if extreme_importance { f32::MAX } else { 0.0 },
+                ..cand_text(RERANK_POOL as AtomId, "target")
+            });
+            let hits = fuse_rerank(
+                &MockReranker,
+                cands,
+                FusionWeights::semantic_only(),
+                0,
+                RerankContext {
+                    query: "target",
+                    strategy: RerankStrategy::Replace,
+                    k: 1,
+                    cancel: None,
+                },
+            )
+            .unwrap();
+            assert_eq!(hits[0].id, RERANK_POOL as AtomId);
         }
     }
 
