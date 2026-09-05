@@ -21,6 +21,28 @@ fn value_numeric_mixed() {
 }
 
 #[test]
+fn equal_numeric_zeros_have_the_same_hash() {
+    use std::collections::hash_map::DefaultHasher;
+
+    let hash = |value: &Value| {
+        let mut state = DefaultHasher::new();
+        value.hash(&mut state);
+        state.finish()
+    };
+    let values = [Value::Integer(0), Value::Real(0.0), Value::Real(-0.0)];
+    for a in &values {
+        for b in &values {
+            assert_eq!(a, b);
+            assert_eq!(hash(a), hash(b), "{a:?}, {b:?}");
+            assert_eq!(
+                hash(&Value::Array(vec![a.clone()].into())),
+                hash(&Value::Array(vec![b.clone()].into()))
+            );
+        }
+    }
+}
+
+#[test]
 fn value_display() {
     assert_eq!(format!("{}", Value::Null), "NULL");
     assert_eq!(format!("{}", Value::Integer(42)), "42");

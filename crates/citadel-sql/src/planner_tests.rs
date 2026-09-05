@@ -1,6 +1,61 @@
 use super::*;
 use crate::types::{Collation, ColumnDef, DataType, IndexKind};
 
+#[test]
+fn typed_key_bounds_preserve_numeric_comparison_sets() {
+    use std::cmp::Ordering;
+
+    let matches = |actual: &Value, op: BinOp, bound: &Value| {
+        let order = actual.cmp(bound);
+        match op {
+            BinOp::Eq => order == Ordering::Equal,
+            BinOp::Lt => order == Ordering::Less,
+            BinOp::LtEq => order != Ordering::Greater,
+            BinOp::Gt => order == Ordering::Greater,
+            BinOp::GtEq => order != Ordering::Less,
+            _ => unreachable!(),
+        }
+    };
+    let mut integers = vec![i64::MIN, i64::MIN + 1, i64::MAX - 1, i64::MAX, 0];
+    for exponent in [0, 1, 31, 52, 53, 54, 62] {
+        for sign in [-1, 1] {
+            let center = sign * (1i64 << exponent);
+            integers.extend([center - 1, center, center + 1]);
+        }
+    }
+    let mut reals = vec![-0.0, 0.0];
+    for &integer in &integers {
+        reals.extend([integer as f64 - 0.5, integer as f64, integer as f64 + 0.5]);
+    }
+    let integer_values: Vec<_> = integers.into_iter().map(Value::Integer).collect();
+    let real_values: Vec<_> = reals.into_iter().map(Value::Real).collect();
+    for (data_type, values) in [
+        (DataType::Integer, &integer_values),
+        (DataType::Real, &real_values),
+    ] {
+        for bound in integer_values.iter().chain(&real_values) {
+            for op in [BinOp::Eq, BinOp::Lt, BinOp::LtEq, BinOp::Gt, BinOp::GtEq] {
+                if let Some((key_op, key_bound)) = key_predicate(data_type, op, bound) {
+                    assert_eq!(key_bound.data_type(), data_type);
+                    for actual in values {
+                        assert_eq!(
+                            matches(actual, op, bound),
+                            matches(actual, key_op, &key_bound),
+                            "{actual:?} {op:?} {bound:?} -> {key_op:?} {key_bound:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(
+        key_predicate(DataType::Integer, BinOp::Eq, &Value::Real(2.0)),
+        Some((BinOp::Eq, Value::Integer(2)))
+    );
+    assert!(key_predicate(DataType::Integer, BinOp::Eq, &Value::Real(2f64.powi(53))).is_none());
+    assert!(key_predicate(DataType::Real, BinOp::Eq, &Value::Real(-0.0)).is_none());
+}
+
 fn col(name: &str, dt: DataType, nullable: bool, pos: u16) -> ColumnDef {
     ColumnDef {
         name: name.into(),
@@ -271,14 +326,14 @@ fn reversed_literal_column() {
 fn reversed_comparison_flips_op() {
     let schema = test_schema();
     let where_clause = Some(Expr::BinaryOp {
-        left: Box::new(Expr::Literal(Value::Integer(5))),
+        left: Box::new(Expr::Literal(Value::Text("m".into()))),
         op: BinOp::Lt,
         right: Box::new(Expr::Column("name".into())),
     });
     let plan = plan_select(&schema, &where_clause);
     match plan {
         ScanPlan::IndexScan { range_conds, .. } => {
-            assert_eq!(range_conds[0].0, BinOp::Gt);
+            assert_eq!(range_conds, vec![(BinOp::Gt, Value::Text("m".into()))]);
         }
         other => panic!("expected IndexScan, got {other:?}"),
     }
