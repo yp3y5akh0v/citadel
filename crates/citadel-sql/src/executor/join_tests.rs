@@ -149,34 +149,53 @@ fn resolve_col_idx_unknown_returns_none() {
 }
 
 #[test]
-fn hash_key_extracts_indices_in_order() {
+fn join_key_hash_preserves_selected_column_order() {
     let row = vec![i(1), i(2), i(3), i(4)];
-    let key = hash_key(&row, &[2, 0], &[]);
-    assert_eq!(key, vec![i(3), i(1)]);
+    assert_eq!(
+        join_key_hash(&row, &[2, 0], &[]),
+        join_key_hash(&[i(3), i(1)], &[0, 1], &[])
+    );
+    assert_ne!(
+        join_key_hash(&row, &[2, 0], &[]),
+        join_key_hash(&row, &[0, 2], &[])
+    );
 }
 
 #[test]
-fn hash_key_empty_indices_yields_empty_key() {
+fn join_key_hash_empty_tuple_is_independent_of_row_contents() {
     let row = vec![i(1), i(2)];
-    let key = hash_key(&row, &[], &[]);
-    assert!(key.is_empty());
+    assert_eq!(join_key_hash(&row, &[], &[]), join_key_hash(&[], &[], &[]));
 }
 
 /// A collated key column folds, so two spellings the collation calls equal produce one key
 /// and land in the same hash bucket.
 #[test]
-fn hash_key_folds_a_collated_column() {
+fn join_key_hash_folds_a_collated_column() {
     let upper = vec![Value::Text("A".into()), i(1)];
     let lower = vec![Value::Text("a".into()), i(2)];
     let colls = [crate::types::Collation::NoCase];
 
     assert_eq!(
-        hash_key(&upper, &[0], &colls),
-        hash_key(&lower, &[0], &colls)
+        join_key_hash(&upper, &[0], &colls),
+        join_key_hash(&lower, &[0], &colls)
     );
     assert_ne!(
-        hash_key(&upper, &[0], &[crate::types::Collation::Binary]),
-        hash_key(&lower, &[0], &[crate::types::Collation::Binary])
+        join_key_hash(&upper, &[0], &[crate::types::Collation::Binary]),
+        join_key_hash(&lower, &[0], &[crate::types::Collation::Binary])
+    );
+}
+
+#[test]
+fn join_key_hash_collision_does_not_imply_numeric_equality() {
+    let first = i(9_007_199_254_740_992);
+    let second = i(9_007_199_254_740_993);
+    let real = Value::Real(9_007_199_254_740_992.0);
+    assert_ne!(first, second);
+    assert_eq!(first, real);
+    assert_eq!(second, real);
+    assert_eq!(
+        join_key_hash(&[first], &[0], &[]),
+        join_key_hash(&[second], &[0], &[])
     );
 }
 
@@ -474,4 +493,239 @@ fn residual_join_predicate_propagates_scalar_cancellation() {
     .expect_err("the residual ON expression discarded its cancellation token");
 
     assert_interrupted(err);
+}
+
+fn scalar_join_rows(
+    outer: &[Vec<Value>],
+    inner: &[Vec<Value>],
+    join: &JoinClause,
+    columns: &[ColumnDef],
+) -> Vec<Vec<Value>> {
+    let column_map = ColumnMap::new(columns);
+    let mut rows = Vec::new();
+    let mut inner_matched = vec![false; inner.len()];
+    for left in outer {
+        let mut matched = false;
+        for (index, right) in inner.iter().enumerate() {
+            let combined: Vec<_> = left.iter().chain(right).cloned().collect();
+            if is_truthy(
+                &eval_expr(
+                    join.on_clause.as_ref().unwrap(),
+                    &EvalCtx::new(&column_map, &combined),
+                )
+                .unwrap(),
+            ) {
+                rows.push(combined);
+                matched = true;
+                inner_matched[index] = true;
+            }
+        }
+        if !matched && matches!(join.join_type, JoinType::Left | JoinType::FullOuter) {
+            let mut padded = left.clone();
+            padded.resize(6, Value::Null);
+            rows.push(padded);
+        }
+    }
+    if matches!(join.join_type, JoinType::Right | JoinType::FullOuter) {
+        for (index, right) in inner.iter().enumerate() {
+            if !inner_matched[index] {
+                let mut padded = vec![Value::Null; 3];
+                padded.extend(right.iter().cloned());
+                rows.push(padded);
+            }
+        }
+    }
+    rows
+}
+
+fn sorted_row_debug(rows: &[Vec<Value>]) -> Vec<String> {
+    let mut rendered: Vec<_> = rows.iter().map(|row| format!("{row:?}")).collect();
+    rendered.sort();
+    rendered
+}
+
+fn check_numeric_join_paths(
+    outer: Vec<Vec<Value>>,
+    inner: Vec<Vec<Value>>,
+    two_keys: bool,
+    sorted_outer: bool,
+) {
+    let columns = cols(&[
+        ("a.key", DataType::Null),
+        ("a.guard", DataType::Integer),
+        ("a.id", DataType::Integer),
+        ("b.key", DataType::Null),
+        ("b.guard", DataType::Integer),
+        ("b.id", DataType::Integer),
+    ]);
+    let projected_columns = [2, 5, 2, 5, 0];
+    let projection = build_combine_projection(&projected_columns, 3);
+    for join_type in [
+        JoinType::Inner,
+        JoinType::Cross,
+        JoinType::Left,
+        JoinType::Right,
+        JoinType::FullOuter,
+    ] {
+        for residual in [false, true] {
+            let mut predicate = "a.key = b.key".to_string();
+            if two_keys {
+                predicate.push_str(" AND a.guard = b.guard");
+            }
+            if residual {
+                predicate.push_str(" AND a.id < b.id");
+            }
+            let join = JoinClause {
+                join_type,
+                table: TableRef {
+                    name: "b".into(),
+                    alias: None,
+                    args: None,
+                },
+                subquery: None,
+                on_clause: Some(crate::parser::parse_sql_expr(&predicate).unwrap()),
+            };
+            let equi = compute_equi_join_meta(&join, &columns, 3);
+            assert_eq!(equi.len(), if two_keys { 2 } else { 1 });
+            assert_eq!(equi.is_pure(), !residual);
+            let reference = scalar_join_rows(&outer, &inner, &join, &columns);
+            let probe = build_probe_index(&inner, &equi, None).unwrap();
+            if !residual && !two_keys {
+                assert!(matches!(probe, ProbeIndex::Int(_)));
+            }
+            for projected in [false, true] {
+                let expected = if projected && !residual {
+                    reference
+                        .iter()
+                        .map(|row| {
+                            projected_columns
+                                .iter()
+                                .map(|&index| row[index].clone())
+                                .collect()
+                        })
+                        .collect()
+                } else {
+                    reference.clone()
+                };
+                let expected = sorted_row_debug(&expected);
+                let projection = projected.then_some(&projection);
+                for outer_pk in [None, Some(0)] {
+                    if outer_pk.is_some() && !sorted_outer {
+                        continue;
+                    }
+                    let mut owned_inner = inner.clone();
+                    let owned = exec_join_step(
+                        outer.clone(),
+                        &mut owned_inner,
+                        &join,
+                        &columns,
+                        3,
+                        3,
+                        outer_pk,
+                        projection,
+                        &equi,
+                        None,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        sorted_row_debug(&owned),
+                        expected,
+                        "owned {join_type:?}, {predicate}, projected={projected}, pk={outer_pk:?}"
+                    );
+                    for (mode, cached) in [
+                        ("borrowed", None),
+                        ("cached", Some(&probe)),
+                        ("reused", Some(&probe)),
+                    ] {
+                        let actual = exec_join_step_borrowed(
+                            outer.clone(),
+                            &inner,
+                            &join,
+                            &columns,
+                            3,
+                            3,
+                            outer_pk,
+                            projection,
+                            &equi,
+                            cached,
+                            None,
+                        )
+                        .unwrap();
+                        assert_eq!(sorted_row_debug(&actual), expected,
+                            "{mode} {join_type:?}, {predicate}, projected={projected}, pk={outer_pk:?}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn numeric_join_paths_match_real_outer_to_integer_inner() {
+    check_numeric_join_paths(
+        vec![vec![Value::Real(1.0), i(0), i(10)]],
+        vec![vec![i(1), i(0), i(20)]],
+        false,
+        true,
+    );
+}
+
+#[test]
+fn numeric_join_paths_recheck_colliding_large_integer_pairs() {
+    let first = 9_007_199_254_740_992;
+    check_numeric_join_paths(
+        vec![vec![i(first), i(0), i(10)], vec![i(first + 1), i(0), i(30)]],
+        vec![vec![i(first), i(0), i(20)], vec![i(first + 1), i(0), i(25)]],
+        true,
+        false,
+    );
+}
+
+#[test]
+fn numeric_join_paths_keep_both_large_integer_matches_for_real_probe() {
+    let first = 9_007_199_254_740_992;
+    let real = Value::Real(first as f64);
+    assert_ne!(i(first), i(first + 1));
+    assert_eq!(real, i(first));
+    assert_eq!(real, i(first + 1));
+    check_numeric_join_paths(
+        vec![vec![real, i(0), i(10)]],
+        vec![vec![i(first), i(0), i(20)], vec![i(first + 1), i(0), i(30)]],
+        true,
+        false,
+    );
+}
+
+#[test]
+fn numeric_join_paths_pad_unmatched_collisions_and_null_keys() {
+    let first = 9_007_199_254_740_992;
+    check_numeric_join_paths(
+        vec![vec![i(first), i(0), i(10)], vec![Value::Null, i(0), i(11)]],
+        vec![
+            vec![i(first + 1), i(0), i(20)],
+            vec![Value::Null, i(0), i(21)],
+        ],
+        true,
+        false,
+    );
+}
+
+#[test]
+fn numeric_join_paths_do_not_drop_late_real_outer_rows() {
+    check_numeric_join_paths(
+        vec![vec![i(1), i(0), i(10)], vec![Value::Real(2.0), i(0), i(30)]],
+        vec![vec![i(1), i(0), i(20)], vec![i(2), i(0), i(25)]],
+        false,
+        false,
+    );
+}
+
+#[test]
+fn numeric_join_paths_preserve_repeated_projected_columns() {
+    check_numeric_join_paths(
+        vec![vec![i(1), i(0), i(10)], vec![i(2), i(0), i(30)]],
+        vec![vec![i(1), i(0), i(20)], vec![i(2), i(0), i(40)]],
+        false,
+        true,
+    );
 }
