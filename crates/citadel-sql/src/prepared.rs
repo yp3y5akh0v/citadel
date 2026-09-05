@@ -251,6 +251,7 @@ pub struct Rows<'a> {
 enum RowSource<'a> {
     Materialized(std::vec::IntoIter<Vec<Value>>),
     Streaming(Box<dyn RowSourceIter + 'a>),
+    Exhausted,
 }
 
 impl<'a> Rows<'a> {
@@ -287,10 +288,16 @@ impl<'a> Rows<'a> {
     }
 
     fn next_values(&mut self) -> Result<Option<Vec<Value>>> {
-        match &mut self.source {
+        let values = match &mut self.source {
             RowSource::Materialized(iter) => Ok(iter.next()),
             RowSource::Streaming(stream) => stream.next_row(),
+            RowSource::Exhausted => return Ok(None),
+        }?;
+        if values.is_none() {
+            self.source = RowSource::Exhausted;
+            self.buf.clear();
         }
+        Ok(values)
     }
 
     pub fn column_count(&self) -> usize {

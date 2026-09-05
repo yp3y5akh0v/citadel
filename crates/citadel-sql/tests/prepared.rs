@@ -950,3 +950,94 @@ fn prepared_insert_null_param_in_txn() {
     let qr = conn.query("SELECT v FROM t ORDER BY id").unwrap();
     assert_eq!(qr.rows, vec![vec![Value::Null], vec![Value::Integer(7)]]);
 }
+
+#[test]
+fn streaming_rows_release_their_snapshot_at_eof_before_drop() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
+    let stmt = conn.prepare("SELECT id FROM users").unwrap();
+    assert_eq!(db.reader_count(), 0);
+    let snapshot = db.manager().current_slot().txn_id;
+    let mut rows = stmt.query(&[]).unwrap();
+    assert_eq!(db.reader_count(), 1);
+
+    conn.execute("INSERT INTO users VALUES (4, 'Dave', 40)")
+        .unwrap();
+    assert_eq!(db.manager().reclaim_horizon(), snapshot);
+    for id in 1..=3 {
+        let row = rows.next().unwrap().unwrap();
+        assert_eq!(row.get(0), Some(&Value::Integer(id)));
+    }
+    assert_eq!(db.reader_count(), 1);
+    assert!(rows.next().unwrap().is_none());
+    assert_eq!(db.reader_count(), 0);
+    assert_eq!(
+        db.manager().reclaim_horizon(),
+        citadel_core::types::TxnId(u64::MAX)
+    );
+    assert!(rows.next().unwrap().is_none());
+    assert_eq!(rows.column_names(), ["id"]);
+    assert_eq!(rows.column_count(), 1);
+    assert!(rows.collect().unwrap().rows.is_empty());
+    assert_eq!(stmt.query_collect(&[]).unwrap().rows.len(), 4);
+}
+
+#[test]
+fn empty_streaming_rows_release_their_snapshot_at_first_eof() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE empty (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    let stmt = conn.prepare("SELECT id FROM empty").unwrap();
+    let mut rows = stmt.query(&[]).unwrap();
+    assert_eq!(db.reader_count(), 1);
+
+    assert!(rows.next().unwrap().is_none());
+    assert_eq!(db.reader_count(), 0);
+    assert!(rows.next().unwrap().is_none());
+    assert_eq!(rows.column_names(), ["id"]);
+}
+
+#[test]
+fn dropping_unfinished_streaming_rows_releases_only_their_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
+    let retained_reader = db.begin_read();
+    let stmt = conn.prepare("SELECT id FROM users").unwrap();
+    let mut rows = stmt.query(&[]).unwrap();
+    assert_eq!(db.reader_count(), 2);
+    assert!(rows.next().unwrap().is_some());
+    assert_eq!(db.reader_count(), 2);
+
+    drop(rows);
+    assert_eq!(db.reader_count(), 1);
+    drop(retained_reader);
+    assert_eq!(db.reader_count(), 0);
+}
+
+#[test]
+fn rows_eof_does_not_release_an_explicit_read_transaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
+    let stmt = conn.prepare("SELECT id FROM users").unwrap();
+    conn.execute("BEGIN READ ONLY").unwrap();
+    assert_eq!(db.reader_count(), 1);
+    let mut rows = stmt.query(&[]).unwrap();
+    let mut count = 0;
+    while rows.next().unwrap().is_some() {
+        count += 1;
+    }
+    assert_eq!(count, 3);
+    assert_eq!(db.reader_count(), 1);
+
+    conn.execute("COMMIT").unwrap();
+    assert_eq!(db.reader_count(), 0);
+    assert!(rows.next().unwrap().is_none());
+}
