@@ -34,3 +34,7 @@ parallel = ["dep:rayon"]
 [[bench]]
 name = "allocator_savepoints"
 harness = false
+
+[[bench]]
+name = "buffer_reads"
+harness = false
