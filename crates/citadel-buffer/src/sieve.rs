@@ -18,30 +18,28 @@ pub struct SieveCache<V> {
 
 struct SieveEntry<V> {
     key: u64,
-    value: V,
+    value: Option<V>,
     visited: bool,
     dirty: bool,
-    occupied: bool,
 }
 
 impl<V> SieveEntry<V> {
-    fn empty(value: V) -> Self {
+    fn empty() -> Self {
         Self {
             key: 0,
-            value,
+            value: None,
             visited: false,
             dirty: false,
-            occupied: false,
         }
     }
 }
 
-impl<V: Default> SieveCache<V> {
+impl<V> SieveCache<V> {
     pub fn new(capacity: usize) -> Self {
         assert!(capacity > 0, "cache capacity must be > 0");
         let mut entries = Vec::with_capacity(capacity);
         for _ in 0..capacity {
-            entries.push(SieveEntry::empty(V::default()));
+            entries.push(SieveEntry::empty());
         }
         Self {
             entries,
@@ -57,7 +55,7 @@ impl<V: Default> SieveCache<V> {
     pub fn get(&mut self, key: u64) -> Option<&V> {
         if let Some(&idx) = self.index.get(&key) {
             self.entries[idx].visited = true;
-            Some(&self.entries[idx].value)
+            self.entries[idx].value.as_ref()
         } else {
             None
         }
@@ -66,7 +64,7 @@ impl<V: Default> SieveCache<V> {
     pub fn get_mut(&mut self, key: u64) -> Option<&mut V> {
         if let Some(&idx) = self.index.get(&key) {
             self.entries[idx].visited = true;
-            Some(&mut self.entries[idx].value)
+            self.entries[idx].value.as_mut()
         } else {
             None
         }
@@ -80,34 +78,25 @@ impl<V: Default> SieveCache<V> {
     #[allow(clippy::result_unit_err)]
     pub fn insert(&mut self, key: u64, value: V) -> Result<Option<(u64, V)>, ()> {
         if let Some(&idx) = self.index.get(&key) {
-            self.entries[idx].value = value;
+            self.entries[idx].value = Some(value);
             self.entries[idx].visited = true;
             return Ok(None);
         }
 
-        if self.len < self.capacity {
-            let idx = self.take_free_slot();
-            self.entries[idx].key = key;
-            self.entries[idx].value = value;
-            self.entries[idx].visited = true;
-            self.entries[idx].dirty = false;
-            self.entries[idx].occupied = true;
-            self.index.insert(key, idx);
-            self.len += 1;
-            return Ok(None);
-        }
-
-        let evicted = self.evict()?;
+        let evicted = if self.len == self.capacity {
+            Some(self.evict()?)
+        } else {
+            None
+        };
         let idx = self.take_free_slot();
         self.entries[idx].key = key;
-        self.entries[idx].value = value;
+        self.entries[idx].value = Some(value);
         self.entries[idx].visited = true;
         self.entries[idx].dirty = false;
-        self.entries[idx].occupied = true;
         self.index.insert(key, idx);
         self.len += 1;
 
-        Ok(Some(evicted))
+        Ok(evicted)
     }
 
     fn evict(&mut self) -> Result<(u64, V), ()> {
@@ -123,7 +112,7 @@ impl<V: Default> SieveCache<V> {
             self.hand = (self.hand + 1) % self.capacity;
             scanned += 1;
 
-            if !self.entries[idx].occupied {
+            if self.entries[idx].value.is_none() {
                 continue;
             }
 
@@ -137,8 +126,7 @@ impl<V: Default> SieveCache<V> {
             }
 
             let evicted_key = self.entries[idx].key;
-            let evicted_value = std::mem::take(&mut self.entries[idx].value);
-            self.entries[idx].occupied = false;
+            let evicted_value = self.entries[idx].value.take().unwrap();
             self.free.push(idx);
             self.index.remove(&evicted_key);
             self.len -= 1;
@@ -175,29 +163,26 @@ impl<V: Default> SieveCache<V> {
     pub fn dirty_entries(&self) -> impl Iterator<Item = (u64, &V)> {
         self.entries
             .iter()
-            .filter(|e| e.occupied && e.dirty)
-            .map(|e| (e.key, &e.value))
+            .filter(|e| e.dirty)
+            .filter_map(|e| e.value.as_ref().map(|value| (e.key, value)))
     }
 
     pub fn dirty_entries_mut(&mut self) -> impl Iterator<Item = (u64, &mut V)> {
         self.entries
             .iter_mut()
-            .filter(|e| e.occupied && e.dirty)
-            .map(|e| (e.key, &mut e.value))
+            .filter(|e| e.dirty)
+            .filter_map(|e| e.value.as_mut().map(|value| (e.key, value)))
     }
 
     pub fn clear_all_dirty(&mut self) {
         for entry in &mut self.entries {
-            if entry.occupied {
-                entry.dirty = false;
-            }
+            entry.dirty = false;
         }
     }
 
     pub fn remove(&mut self, key: u64) -> Option<V> {
         if let Some(idx) = self.index.remove(&key) {
-            let value = std::mem::take(&mut self.entries[idx].value);
-            self.entries[idx].occupied = false;
+            let value = self.entries[idx].value.take().unwrap();
             self.free.push(idx);
             self.len -= 1;
             Some(value)
@@ -221,13 +206,13 @@ impl<V: Default> SieveCache<V> {
     pub fn dirty_count(&self) -> usize {
         self.entries
             .iter()
-            .filter(|e| e.occupied && e.dirty)
+            .filter(|e| e.value.is_some() && e.dirty)
             .count()
     }
 
     pub fn clear(&mut self) {
         for entry in &mut self.entries {
-            entry.occupied = false;
+            entry.value = None;
             entry.visited = false;
             entry.dirty = false;
         }

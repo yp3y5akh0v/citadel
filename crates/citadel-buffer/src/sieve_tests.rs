@@ -177,3 +177,204 @@ fn update_existing_key() {
     assert_eq!(cache.get(1), Some(&200));
     assert_eq!(cache.len(), 1);
 }
+
+thread_local! {
+    static DEFAULT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+struct CountedDefault;
+
+impl Default for CountedDefault {
+    fn default() -> Self {
+        DEFAULT_CALLS.with(|count| count.set(count.get() + 1));
+        Self
+    }
+}
+
+#[test]
+fn vacant_slots_do_not_construct_default_values() {
+    DEFAULT_CALLS.with(|count| count.set(0));
+    let cache = SieveCache::<CountedDefault>::new(8);
+    assert!(cache.is_empty());
+    DEFAULT_CALLS.with(|count| assert_eq!(count.get(), 0));
+}
+
+#[test]
+fn eviction_does_not_construct_a_replacement_value() {
+    let mut cache = SieveCache::<CountedDefault>::new(1);
+    cache.insert(1, CountedDefault).unwrap();
+    DEFAULT_CALLS.with(|count| count.set(0));
+    assert_eq!(cache.insert(2, CountedDefault).unwrap().unwrap().0, 1);
+    DEFAULT_CALLS.with(|count| assert_eq!(count.get(), 0));
+}
+
+#[test]
+fn removal_does_not_construct_a_replacement_value() {
+    let mut cache = SieveCache::<CountedDefault>::new(1);
+    cache.insert(1, CountedDefault).unwrap();
+    DEFAULT_CALLS.with(|count| count.set(0));
+    assert!(cache.remove(1).is_some());
+    DEFAULT_CALLS.with(|count| assert_eq!(count.get(), 0));
+}
+
+#[test]
+fn clear_drops_values_once_and_keeps_slots_reusable() {
+    #[derive(Default)]
+    struct Tracked(std::rc::Rc<std::cell::Cell<usize>>);
+
+    impl Drop for Tracked {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+
+    let drops = std::rc::Rc::new(std::cell::Cell::new(0));
+    let mut cache = SieveCache::new(2);
+    cache.insert(1, Tracked(drops.clone())).unwrap();
+    cache.insert(2, Tracked(drops.clone())).unwrap();
+    cache.set_dirty(1);
+    cache.clear();
+    assert_eq!(drops.get(), 2);
+    assert!(cache.is_empty());
+    assert_eq!(cache.dirty_count(), 0);
+    cache.clear();
+    assert_eq!(drops.get(), 2);
+    cache.insert(3, Tracked(drops.clone())).unwrap();
+    drop(cache);
+    assert_eq!(drops.get(), 3);
+}
+
+#[test]
+fn mixed_operations_preserve_eviction_order_and_dirty_pins() {
+    #[derive(Clone)]
+    struct Entry {
+        key: u64,
+        value: u32,
+        visited: bool,
+        dirty: bool,
+    }
+
+    const CAPACITY: usize = 7;
+    let mut cache = SieveCache::new(CAPACITY);
+    let mut reference: Vec<Option<Entry>> = vec![None; CAPACITY];
+    let mut free: Vec<_> = (0..CAPACITY).rev().collect();
+    let mut hand = 0;
+    let mut seed = 0x19d6_832au64;
+    for step in 0..5000u32 {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let key = (seed >> 32) % 19;
+        let position = reference
+            .iter()
+            .position(|entry| entry.as_ref().is_some_and(|entry| entry.key == key));
+        match seed % 11 {
+            0..=3 => {
+                let expected = if let Some(index) = position {
+                    let entry = reference[index].as_mut().unwrap();
+                    entry.value = step;
+                    entry.visited = true;
+                    Ok(None)
+                } else {
+                    let mut evicted = None;
+                    if free.is_empty() {
+                        for _ in 0..2 * CAPACITY {
+                            let index = hand;
+                            hand = (hand + 1) % CAPACITY;
+                            let entry = reference[index].as_mut().unwrap();
+                            if entry.dirty {
+                                continue;
+                            }
+                            if entry.visited {
+                                entry.visited = false;
+                                continue;
+                            }
+                            let entry = reference[index].take().unwrap();
+                            evicted = Some((entry.key, entry.value));
+                            free.push(index);
+                            break;
+                        }
+                    }
+                    if let Some(index) = free.pop() {
+                        reference[index] = Some(Entry {
+                            key,
+                            value: step,
+                            visited: true,
+                            dirty: false,
+                        });
+                        Ok(evicted)
+                    } else {
+                        Err(())
+                    }
+                };
+                assert_eq!(cache.insert(key, step), expected, "step {step}");
+            }
+            4 => {
+                let expected = position.map(|index| {
+                    let entry = reference[index].as_mut().unwrap();
+                    entry.visited = true;
+                    entry.value
+                });
+                assert_eq!(cache.get(key).copied(), expected);
+            }
+            5 => {
+                if let Some(index) = position {
+                    reference[index].as_mut().unwrap().dirty = true;
+                }
+                cache.set_dirty(key);
+            }
+            6 => {
+                if let Some(index) = position {
+                    reference[index].as_mut().unwrap().dirty = false;
+                }
+                cache.clear_dirty(key);
+            }
+            7 => {
+                let expected = position.map(|index| {
+                    free.push(index);
+                    reference[index].take().unwrap().value
+                });
+                assert_eq!(cache.remove(key), expected);
+            }
+            8 => {
+                for entry in reference.iter_mut().flatten() {
+                    entry.dirty = false;
+                }
+                cache.clear_all_dirty();
+            }
+            9 => {
+                for entry in reference.iter_mut().flatten().filter(|entry| entry.dirty) {
+                    entry.value += 1;
+                }
+                for (_, value) in cache.dirty_entries_mut() {
+                    *value += 1;
+                }
+            }
+            _ => {
+                reference.fill(None);
+                free.clear();
+                free.extend((0..CAPACITY).rev());
+                hand = 0;
+                cache.clear();
+            }
+        }
+        assert_eq!(cache.len(), reference.iter().flatten().count());
+        let mut actual: Vec<_> = cache
+            .dirty_entries()
+            .map(|(key, value)| (key, *value))
+            .collect();
+        let mut expected: Vec<_> = reference
+            .iter()
+            .flatten()
+            .filter(|entry| entry.dirty)
+            .map(|entry| (entry.key, entry.value))
+            .collect();
+        actual.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(actual, expected);
+        assert_eq!(cache.dirty_count(), expected.len());
+        for key in 0..19 {
+            let entry = reference.iter().flatten().find(|entry| entry.key == key);
+            assert_eq!(cache.contains(key), entry.is_some());
+            assert_eq!(cache.is_dirty(key), entry.is_some_and(|entry| entry.dirty));
+        }
+    }
+}

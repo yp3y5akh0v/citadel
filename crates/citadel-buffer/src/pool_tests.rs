@@ -186,3 +186,23 @@ fn discard_dirty_removes_from_cache() {
     pool.discard_dirty();
     assert_eq!(pool.len(), 0);
 }
+
+#[test]
+fn clear_releases_cached_pages_without_invalidating_readers() {
+    let mut pool = BufferPool::new(2);
+    let first = Arc::new(Page::new(PageId(1), PageType::Leaf, TxnId(1)));
+    let second = Arc::new(Page::new(PageId(2), PageType::Leaf, TxnId(1)));
+    let first_weak = Arc::downgrade(&first);
+    let second_weak = Arc::downgrade(&second);
+    pool.insert_if_absent(PageId(1), first);
+    pool.insert_if_absent(PageId(2), second);
+    let reader = pool.get_cached(PageId(2)).unwrap();
+
+    pool.clear();
+    assert!(pool.is_empty());
+    assert!(first_weak.upgrade().is_none());
+    assert_eq!(reader.page_id(), PageId(2));
+    assert!(second_weak.upgrade().is_some());
+    drop(reader);
+    assert!(second_weak.upgrade().is_none());
+}
