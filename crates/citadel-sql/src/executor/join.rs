@@ -11,11 +11,13 @@ use crate::types::*;
 use super::helpers::*;
 use super::scan::*;
 
+mod keys;
+use keys::ProbeTable;
+
 /// Amortize cancellation loads across CPU-only join work: building a probe map
 /// and expanding matches can outlast the scan that fed them.
 const JOIN_CANCEL_INTERVAL: usize = 256;
 type IntegerJoinAttempt = std::result::Result<Vec<Vec<Value>>, Vec<Vec<Value>>>;
-type ProbeBuckets = FxHashMap<u64, Vec<usize>>;
 
 struct JoinCancel<'a> {
     token: Option<&'a citadel::CancelToken>,
@@ -195,24 +197,30 @@ pub(super) fn join_key_hash(
     let mut state = FxHasher::default();
     col_indices.len().hash(&mut state);
     for (k, &i) in col_indices.iter().enumerate() {
-        if let Value::Interval {
-            months,
-            days,
-            micros,
-        } = &row[i]
-        {
-            8u8.hash(&mut state);
-            crate::datetime::interval_to_total_micros(*months, *days, *micros).hash(&mut state);
-            continue;
-        }
-        match key_colls.get(k) {
-            Some(Collation::NoCase | Collation::Rtrim) => {
-                key_colls[k].fold(row[i].clone()).hash(&mut state);
-            }
-            _ => row[i].hash(&mut state),
-        }
+        hash_join_value(
+            &row[i],
+            key_colls.get(k).copied().unwrap_or_default(),
+            &mut state,
+        );
     }
     state.finish()
+}
+
+fn hash_join_value(value: &Value, collation: Collation, state: &mut FxHasher) {
+    if let Value::Interval {
+        months,
+        days,
+        micros,
+    } = value
+    {
+        8u8.hash(state);
+        crate::datetime::interval_to_total_micros(*months, *days, *micros).hash(state);
+    } else {
+        match collation {
+            Collation::NoCase | Collation::Rtrim => collation.fold(value.clone()).hash(state),
+            Collation::Binary => value.hash(state),
+        }
+    }
 }
 
 /// The collation an equi-join key compares under: the syntactic left operand's, including
@@ -232,22 +240,6 @@ pub(super) fn equi_key_collations(
             }
         })
         .collect()
-}
-
-/// SQL `=` never matches NULL: rows with a NULL key stay out of probe maps.
-fn insert_probe_row(
-    map: &mut ProbeBuckets,
-    idx: usize,
-    inner: &[Value],
-    inner_key_cols: &[usize],
-    key_colls: &[crate::types::Collation],
-) {
-    if inner_key_cols.iter().any(|&c| inner[c].is_null()) {
-        return;
-    }
-    map.entry(join_key_hash(inner, inner_key_cols, key_colls))
-        .or_default()
-        .push(idx);
 }
 
 pub(super) fn count_conjuncts(expr: &Expr) -> usize {
@@ -312,10 +304,6 @@ impl EquiJoin {
         self.pairs[0]
     }
 
-    fn outer_cols(&self) -> Vec<usize> {
-        self.pairs.iter().map(|pair| pair.outer).collect()
-    }
-
     fn inner_cols(&self) -> Vec<usize> {
         self.pairs.iter().map(|pair| pair.inner).collect()
     }
@@ -376,6 +364,7 @@ pub(super) fn combine_row(outer: &[Value], inner: &[Value], cap: usize) -> Vec<V
 pub(super) struct CombineProjection {
     slots: Vec<(usize, bool)>,
     unique_sources: bool,
+    outer_prefix: Option<usize>,
 }
 
 impl CombineProjection {
@@ -391,6 +380,53 @@ impl CombineProjection {
                 } else {
                     &mut outer[index]
                 })
+            })
+            .collect()
+    }
+
+    fn finish_outer(&self, mut outer: Vec<Value>, inner: Option<&[Value]>) -> Vec<Value> {
+        if self.slots.is_empty() {
+            return Vec::new();
+        }
+        if let Some(prefix) = self.outer_prefix {
+            if (self.slots.len()..=self.slots.len().saturating_mul(2)).contains(&outer.capacity()) {
+                for destination in 0..prefix {
+                    let source = self.slots[destination].0;
+                    if destination != source {
+                        let value = std::mem::take(&mut outer[source]);
+                        outer[destination] = value;
+                    }
+                }
+                outer.truncate(prefix);
+                for &(index, _) in &self.slots[prefix..] {
+                    outer.push(inner.map_or(Value::Null, |row| row[index].clone()));
+                }
+                return outer;
+            }
+        }
+        self.slots
+            .iter()
+            .map(|&(index, is_inner)| {
+                if is_inner {
+                    inner.map_or(Value::Null, |row| row[index].clone())
+                } else if self.unique_sources {
+                    std::mem::take(&mut outer[index])
+                } else {
+                    outer[index].clone()
+                }
+            })
+            .collect()
+    }
+
+    fn unmatched_inner(&self, inner: &[Value]) -> Vec<Value> {
+        self.slots
+            .iter()
+            .map(|&(index, is_inner)| {
+                if is_inner {
+                    inner[index].clone()
+                } else {
+                    Value::Null
+                }
             })
             .collect()
     }
@@ -418,18 +454,24 @@ pub(super) fn build_combine_projection(
     outer_col_count: usize,
 ) -> CombineProjection {
     let mut seen = FxHashSet::default();
+    let slots: Vec<_> = needed_combined
+        .iter()
+        .map(|&column| {
+            if column < outer_col_count {
+                (column, false)
+            } else {
+                (column - outer_col_count, true)
+            }
+        })
+        .collect();
+    let prefix = slots.iter().take_while(|&&(_, inner)| !inner).count();
+    let outer_prefix = (slots[prefix..].iter().all(|&(_, inner)| inner)
+        && slots[..prefix].windows(2).all(|pair| pair[0].0 < pair[1].0))
+    .then_some(prefix);
     CombineProjection {
         unique_sources: needed_combined.iter().all(|&column| seen.insert(column)),
-        slots: needed_combined
-            .iter()
-            .map(|&ci| {
-                if ci < outer_col_count {
-                    (ci, false)
-                } else {
-                    (ci - outer_col_count, true)
-                }
-            })
-            .collect(),
+        slots,
+        outer_prefix,
     }
 }
 
@@ -810,7 +852,7 @@ pub(super) fn exec_join_step(
         }
     }
 
-    let buckets = build_probe_buckets(inner_rows, equi, &mut cancel)?;
+    let buckets = ProbeTable::build(inner_rows, equi, &mut cancel)?;
     exec_hash_join(
         outer_rows,
         inner_rows,
@@ -825,21 +867,6 @@ pub(super) fn exec_join_step(
     )
 }
 
-fn build_probe_buckets(
-    inner_rows: &[Vec<Value>],
-    equi: &EquiJoin,
-    cancel: &mut JoinCancel<'_>,
-) -> Result<ProbeBuckets> {
-    let columns = equi.inner_cols();
-    let mut buckets = ProbeBuckets::with_capacity_and_hasher(inner_rows.len(), Default::default());
-    for (index, inner) in inner_rows.iter().enumerate() {
-        cancel.work()?;
-        insert_probe_row(&mut buckets, index, inner, &columns, &equi.key_colls);
-    }
-    cancel.check()?;
-    Ok(buckets)
-}
-
 #[allow(clippy::too_many_arguments)]
 fn exec_hash_join(
     outer_rows: Vec<Vec<Value>>,
@@ -850,10 +877,9 @@ fn exec_hash_join(
     inner_col_count: usize,
     projection: Option<&CombineProjection>,
     equi: &EquiJoin,
-    buckets: &ProbeBuckets,
+    buckets: &ProbeTable,
     cancel: &mut JoinCancel<'_>,
 ) -> Result<Vec<Vec<Value>>> {
-    let outer_key_cols = equi.outer_cols();
     let preserve_outer = matches!(join.join_type, JoinType::Left | JoinType::FullOuter);
     let preserve_inner = matches!(join.join_type, JoinType::Right | JoinType::FullOuter);
     let mut inner_matched = if preserve_inner {
@@ -863,54 +889,72 @@ fn exec_hash_join(
     };
     let cap = outer_col_count + inner_col_count;
     let combined_map = ColumnMap::new(combined_cols);
-    let mut result = Vec::with_capacity(outer_rows.len());
+    let capacity_hint = outer_rows.len();
+    let mut result = Vec::new();
+    let mut emit = |row| {
+        if result.capacity() == 0 {
+            result.reserve_exact(capacity_hint);
+        }
+        result.push(row);
+    };
 
     for mut outer in outer_rows {
         cancel.work()?;
-        let key = join_key_hash(&outer, &outer_key_cols, &equi.key_colls);
         let mut matched = false;
         let mut pending = None;
-        if let Some(indices) = buckets.get(&key) {
-            for &index in indices {
-                cancel.work()?;
-                let inner = &inner_rows[index];
-                if equi.is_pure() {
-                    if !equi.keys_match(&outer, inner)? {
+        let comparison;
+        let indices = match buckets.cached_candidates(&outer, equi) {
+            Some(indices) => indices,
+            None => {
+                comparison = buckets.comparison_candidates(&outer, equi, inner_rows, cancel)?;
+                comparison.as_ref()
+            }
+        };
+        for &index in indices {
+            cancel.work()?;
+            let inner = &inner_rows[index];
+            if equi.is_pure() {
+                if !equi.keys_match(&outer, inner)? {
+                    continue;
+                }
+                if let Some(previous) = pending.replace(index) {
+                    let inner = &inner_rows[previous];
+                    emit(if let Some(projection) = projection {
+                        combine_row_projected(&outer, inner, projection)
+                    } else {
+                        combine_row(&outer, inner, cap)
+                    });
+                }
+            } else {
+                let combined = combine_row(&outer, inner, cap);
+                if let Some(on) = &join.on_clause {
+                    if !is_truthy(&eval_expr(
+                        on,
+                        &EvalCtx::new(&combined_map, &combined).with_cancel(cancel.token),
+                    )?) {
                         continue;
                     }
-                    if let Some(projection) = projection {
-                        result.push(combine_row_projected(&outer, inner, projection));
-                    } else if let Some(previous) = pending.replace(index) {
-                        result.push(combine_row(&outer, &inner_rows[previous], cap));
-                    }
-                } else {
-                    let combined = combine_row(&outer, inner, cap);
-                    if let Some(on) = &join.on_clause {
-                        if !is_truthy(&eval_expr(
-                            on,
-                            &EvalCtx::new(&combined_map, &combined).with_cancel(cancel.token),
-                        )?) {
-                            continue;
-                        }
-                    }
-                    result.push(combined);
                 }
-                matched = true;
-                if preserve_inner {
-                    inner_matched[index] = true;
-                }
+                emit(combined);
+            }
+            matched = true;
+            if preserve_inner {
+                inner_matched[index] = true;
             }
         }
         if let Some(last) = pending {
-            outer.extend(inner_rows[last].iter().cloned());
-            result.push(outer);
+            if let Some(projection) = projection {
+                emit(projection.finish_outer(outer, Some(&inner_rows[last])));
+            } else {
+                outer.extend(inner_rows[last].iter().cloned());
+                emit(outer);
+            }
         } else if !matched && preserve_outer {
             if let Some(projection) = projection {
-                let null_inner = vec![Value::Null; inner_col_count];
-                result.push(combine_row_projected(&outer, &null_inner, projection));
+                emit(projection.finish_outer(outer, None));
             } else {
                 outer.resize(cap, Value::Null);
-                result.push(outer);
+                emit(outer);
             }
         }
     }
@@ -920,13 +964,12 @@ fn exec_hash_join(
             cancel.work()?;
             if !inner_matched[index] {
                 if let Some(projection) = projection {
-                    let null_outer = vec![Value::Null; outer_col_count];
-                    result.push(combine_row_projected(&null_outer, inner, projection));
+                    emit(projection.unmatched_inner(inner));
                 } else {
                     let mut padded = Vec::with_capacity(cap);
                     padded.resize(outer_col_count, Value::Null);
                     padded.extend(inner.iter().cloned());
-                    result.push(padded);
+                    emit(padded);
                 }
             }
         }
@@ -1471,17 +1514,20 @@ fn try_integer_join_borrowed(
                 while kk < inner_rows.len() && key_at(kk, inner_rows) == ok {
                     cancel.work()?;
                     let inner = &inner_rows[kk];
+                    let is_last = kk + 1 >= inner_rows.len() || key_at(kk + 1, inner_rows) != ok;
+                    if is_last {
+                        if let Some(projection) = projection {
+                            result.push(projection.finish_outer(outer, Some(inner)));
+                        } else {
+                            outer.extend(inner.iter().cloned());
+                            result.push(outer);
+                        }
+                        kk += 1;
+                        break;
+                    }
                     if let Some(proj) = projection {
                         result.push(combine_row_projected(&outer, inner, proj));
                     } else {
-                        let is_last =
-                            kk + 1 >= inner_rows.len() || key_at(kk + 1, inner_rows) != ok;
-                        if is_last {
-                            outer.extend(inner.iter().cloned());
-                            result.push(outer);
-                            kk += 1;
-                            break;
-                        }
                         result.push(combine_row(&outer, inner, cap));
                     }
                     kk += 1;
@@ -1519,15 +1565,19 @@ fn try_integer_join_borrowed(
                 cancel.work()?;
                 let inner_idx = aux[kk].1;
                 let inner = &inner_rows[inner_idx];
+                let is_last = kk + 1 >= aux.len() || aux[kk + 1].0 != ok;
+                if is_last {
+                    if let Some(projection) = projection {
+                        result.push(projection.finish_outer(outer, Some(inner)));
+                    } else {
+                        outer.extend(inner.iter().cloned());
+                        result.push(outer);
+                    }
+                    break;
+                }
                 if let Some(proj) = projection {
                     result.push(combine_row_projected(&outer, inner, proj));
                 } else {
-                    let is_last = kk + 1 >= aux.len() || aux[kk + 1].0 != ok;
-                    if is_last {
-                        outer.extend(inner.iter().cloned());
-                        result.push(outer);
-                        break;
-                    }
                     result.push(combine_row(&outer, inner, cap));
                 }
                 kk += 1;
@@ -1587,131 +1637,69 @@ fn integer_join_with_map(
         inner_col_count,
         projection,
     } = *ctx;
-    let cap = projection.map_or(outer_col_count + inner_col_count, |p| p.slots.len());
-    let mut result = Vec::with_capacity(inner_rows.len());
+    let cap = outer_col_count + inner_col_count;
+    let preserve_outer = matches!(join_type, JoinType::Left | JoinType::FullOuter);
+    let preserve_inner = matches!(join_type, JoinType::Right | JoinType::FullOuter);
+    let mut inner_matched = if preserve_inner {
+        vec![false; inner_rows.len()]
+    } else {
+        Vec::new()
+    };
+    let mut result = Vec::with_capacity(outer_rows.len());
 
-    match join_type {
-        JoinType::Inner | JoinType::Cross => {
-            for outer in outer_rows {
+    for mut outer in outer_rows {
+        cancel.work()?;
+        let indices = match outer[outer_key_col] {
+            Value::Integer(key) => inner_map.get(&key).map_or(&[][..], Vec::as_slice),
+            _ => &[],
+        };
+        if let Some((&last, preceding)) = indices.split_last() {
+            for &index in preceding {
                 cancel.work()?;
-                if let Value::Integer(k) = outer[outer_key_col] {
-                    if let Some(indices) = inner_map.get(&k) {
-                        for &idx in indices {
-                            cancel.work()?;
-                            if let Some(proj) = projection {
-                                result.push(combine_row_projected(&outer, &inner_rows[idx], proj));
-                            } else {
-                                result.push(combine_row(&outer, &inner_rows[idx], cap));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        JoinType::Left => {
-            for mut outer in outer_rows {
-                cancel.work()?;
-                if let Value::Integer(k) = outer[outer_key_col] {
-                    if let Some(indices) = inner_map.get(&k) {
-                        for &idx in indices {
-                            cancel.work()?;
-                            if let Some(proj) = projection {
-                                result.push(combine_row_projected(&outer, &inner_rows[idx], proj));
-                            } else {
-                                result.push(combine_row(&outer, &inner_rows[idx], cap));
-                            }
-                        }
-                        continue;
-                    }
-                }
-                if let Some(proj) = projection {
-                    let null_inner = vec![Value::Null; inner_col_count];
-                    result.push(combine_row_projected(&outer, &null_inner, proj));
+                let inner = &inner_rows[index];
+                result.push(if let Some(projection) = projection {
+                    combine_row_projected(&outer, inner, projection)
                 } else {
-                    outer.resize(cap, Value::Null);
-                    result.push(outer);
+                    combine_row(&outer, inner, cap)
+                });
+                if preserve_inner {
+                    inner_matched[index] = true;
                 }
+            }
+            cancel.work()?;
+            if preserve_inner {
+                inner_matched[last] = true;
+            }
+            if let Some(projection) = projection {
+                result.push(projection.finish_outer(outer, Some(&inner_rows[last])));
+            } else {
+                outer.extend(inner_rows[last].iter().cloned());
+                result.push(outer);
+            }
+        } else if preserve_outer {
+            if let Some(projection) = projection {
+                result.push(projection.finish_outer(outer, None));
+            } else {
+                outer.resize(cap, Value::Null);
+                result.push(outer);
             }
         }
-        JoinType::Right => {
-            let mut inner_matched = vec![false; inner_rows.len()];
-            for outer in outer_rows {
-                cancel.work()?;
-                if let Value::Integer(k) = outer[outer_key_col] {
-                    if let Some(indices) = inner_map.get(&k) {
-                        for &idx in indices {
-                            cancel.work()?;
-                            if let Some(proj) = projection {
-                                result.push(combine_row_projected(&outer, &inner_rows[idx], proj));
-                            } else {
-                                result.push(combine_row(&outer, &inner_rows[idx], cap));
-                            }
-                            inner_matched[idx] = true;
-                        }
-                    }
-                }
-            }
-            for (j, inner) in inner_rows.iter().enumerate() {
-                cancel.work()?;
-                if !inner_matched[j] {
-                    if let Some(proj) = projection {
-                        let null_outer = vec![Value::Null; outer_col_count];
-                        result.push(combine_row_projected(&null_outer, inner, proj));
-                    } else {
-                        let mut padded = Vec::with_capacity(cap);
-                        padded.resize(outer_col_count, Value::Null);
-                        padded.extend(inner.iter().cloned());
-                        result.push(padded);
-                    }
-                }
-            }
-        }
-        JoinType::FullOuter => {
-            let mut inner_matched = vec![false; inner_rows.len()];
-            for mut outer in outer_rows {
-                cancel.work()?;
-                let mut matched = false;
-                if let Value::Integer(k) = outer[outer_key_col] {
-                    if let Some(indices) = inner_map.get(&k) {
-                        matched = true;
-                        for &idx in indices {
-                            cancel.work()?;
-                            if let Some(proj) = projection {
-                                result.push(combine_row_projected(&outer, &inner_rows[idx], proj));
-                            } else {
-                                result.push(combine_row(&outer, &inner_rows[idx], cap));
-                            }
-                            inner_matched[idx] = true;
-                        }
-                    }
-                }
-                if !matched {
-                    if let Some(proj) = projection {
-                        let null_inner = vec![Value::Null; inner_col_count];
-                        result.push(combine_row_projected(&outer, &null_inner, proj));
-                    } else {
-                        outer.resize(cap, Value::Null);
-                        result.push(outer);
-                    }
-                }
-            }
-            for (j, inner) in inner_rows.iter().enumerate() {
-                cancel.work()?;
-                if !inner_matched[j] {
-                    if let Some(proj) = projection {
-                        let null_outer = vec![Value::Null; outer_col_count];
-                        result.push(combine_row_projected(&null_outer, inner, proj));
-                    } else {
-                        let mut padded = Vec::with_capacity(cap);
-                        padded.resize(outer_col_count, Value::Null);
-                        padded.extend(inner.iter().cloned());
-                        result.push(padded);
-                    }
+    }
+    if preserve_inner {
+        for (index, inner) in inner_rows.iter().enumerate() {
+            cancel.work()?;
+            if !inner_matched[index] {
+                if let Some(projection) = projection {
+                    result.push(projection.unmatched_inner(inner));
+                } else {
+                    let mut padded = Vec::with_capacity(cap);
+                    padded.resize(outer_col_count, Value::Null);
+                    padded.extend(inner.iter().cloned());
+                    result.push(padded);
                 }
             }
         }
     }
-
     cancel.check()?;
     Ok(result)
 }
@@ -1719,7 +1707,7 @@ fn integer_join_with_map(
 /// Probe side of a pure-equi join step, cached per commit generation.
 pub(super) enum ProbeIndex {
     Int(FxHashMap<i64, Vec<usize>>),
-    Generic(ProbeBuckets),
+    Generic(ProbeTable),
     None,
 }
 
@@ -1754,7 +1742,7 @@ pub(super) fn build_probe_index(
             return Ok(ProbeIndex::Int(map));
         }
     }
-    Ok(ProbeIndex::Generic(build_probe_buckets(
+    Ok(ProbeIndex::Generic(ProbeTable::build(
         inner_rows,
         equi,
         &mut cancel,
@@ -1823,7 +1811,7 @@ pub(super) fn exec_join_step_borrowed(
     let buckets = match probe {
         Some(ProbeIndex::Generic(buckets)) => buckets,
         _ => {
-            built = build_probe_buckets(inner_rows, equi, &mut cancel)?;
+            built = ProbeTable::build(inner_rows, equi, &mut cancel)?;
             &built
         }
     };

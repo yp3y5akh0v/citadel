@@ -68,3 +68,7 @@ harness = false
 [[bench]]
 name = "join_probes"
 harness = false
+
+[[bench]]
+name = "temporal_join_probes"
+harness = false

@@ -758,3 +758,373 @@ fn interval_probe_hashes_normalize_before_collation_folding() {
         }
     }
 }
+
+fn projected_text(label: &str) -> Value {
+    Value::Text(format!("{label}:{}", "payload".repeat(16)).into())
+}
+
+fn text_pointer(value: &Value) -> *const u8 {
+    match value {
+        Value::Text(text) => text.as_ptr(),
+        _ => panic!("expected text"),
+    }
+}
+
+#[test]
+fn projected_outer_reuses_sized_buffer_and_moves_text() {
+    let mut outer = Vec::with_capacity(4);
+    outer.extend([i(1), projected_text("outer"), i(3)]);
+    let allocation = outer.as_ptr();
+    let payload = text_pointer(&outer[1]);
+    let inner = vec![projected_text("inner")];
+    let before = inner.clone();
+    let projection = build_combine_projection(&[1, 3], 3);
+    let result = projection.finish_outer(outer, Some(&inner));
+    assert_eq!(
+        result,
+        vec![projected_text("outer"), projected_text("inner")]
+    );
+    assert_eq!(result.as_ptr(), allocation);
+    assert_eq!(result.capacity(), 4);
+    assert_eq!(text_pointer(&result[0]), payload);
+    assert_ne!(text_pointer(&result[1]), text_pointer(&inner[0]));
+    assert_eq!(inner, before);
+}
+
+#[test]
+fn projected_outer_compacts_sparse_prefix_and_inner_only_output() {
+    let outer = vec![
+        i(0),
+        projected_text("first"),
+        i(2),
+        projected_text("second"),
+        i(4),
+    ];
+    let allocation = outer.as_ptr();
+    let payloads = [text_pointer(&outer[1]), text_pointer(&outer[3])];
+    let projection = build_combine_projection(&[1, 3, 5], 5);
+    let actual = projection.finish_outer(outer, Some(&[i(9)]));
+    assert_eq!(
+        actual,
+        vec![projected_text("first"), projected_text("second"), i(9)]
+    );
+    assert_eq!(actual.as_ptr(), allocation);
+    assert_eq!(text_pointer(&actual[0]), payloads[0]);
+    assert_eq!(text_pointer(&actual[1]), payloads[1]);
+
+    let outer = vec![projected_text("unused")];
+    let allocation = outer.as_ptr();
+    let projection = build_combine_projection(&[1], 1);
+    let actual = projection.finish_outer(outer, Some(&[i(7)]));
+    assert_eq!(actual, vec![i(7)]);
+    assert_eq!(actual.as_ptr(), allocation);
+}
+
+#[test]
+fn projected_outer_compacts_oversized_and_undersized_buffers() {
+    for capacity in [1, 128] {
+        let mut outer = Vec::with_capacity(capacity);
+        outer.push(projected_text("outer"));
+        let allocation = outer.as_ptr();
+        let payload = text_pointer(&outer[0]);
+        let projection = build_combine_projection(&[0, 1, 2], 1);
+        let result = projection.finish_outer(outer, Some(&[i(2), i(3)]));
+        assert_eq!(result, vec![projected_text("outer"), i(2), i(3)]);
+        assert_ne!(result.as_ptr(), allocation);
+        assert!(result.capacity() <= 6);
+        assert_eq!(text_pointer(&result[0]), payload);
+    }
+    let projection = build_combine_projection(&[], 2);
+    let empty = projection.finish_outer(vec![i(1), i(2)], Some(&[i(3)]));
+    assert!(empty.is_empty());
+    assert_eq!(empty.capacity(), 0);
+}
+
+#[test]
+fn projected_outer_moves_unique_nonmonotone_sources() {
+    let outer = vec![projected_text("first"), projected_text("second")];
+    let first = text_pointer(&outer[0]);
+    let second = text_pointer(&outer[1]);
+    let projection = build_combine_projection(&[1, 2, 0], 2);
+    assert!(projection.outer_prefix.is_none());
+    let result = projection.finish_outer(outer, Some(&[i(7)]));
+    assert_eq!(
+        result,
+        vec![projected_text("second"), i(7), projected_text("first")]
+    );
+    assert_eq!(text_pointer(&result[0]), second);
+    assert_eq!(text_pointer(&result[2]), first);
+}
+
+#[test]
+fn projected_outer_preserves_repeated_sources_and_null_padding() {
+    for columns in [&[1, 2, 1, 2, 0][..], &[0, 0, 2][..], &[1, 2, 2][..]] {
+        let projection = build_combine_projection(columns, 2);
+        let outer = vec![projected_text("first"), projected_text("second")];
+        let inner = vec![projected_text("inner")];
+        let expected = combine_row_projected(&outer, &inner, &projection);
+        assert_eq!(
+            projection.finish_outer(outer.clone(), Some(&inner)),
+            expected
+        );
+        let padded = combine_row_projected(&outer, &[Value::Null], &projection);
+        assert_eq!(projection.finish_outer(outer, None), padded);
+        let padded = combine_row_projected(&[Value::Null, Value::Null], &inner, &projection);
+        assert_eq!(projection.unmatched_inner(&inner), padded);
+    }
+    let mut outer = Vec::with_capacity(4);
+    outer.extend([i(0), projected_text("outer")]);
+    let allocation = outer.as_ptr();
+    let payload = text_pointer(&outer[1]);
+    let inner = vec![projected_text("inner")];
+    let projection = build_combine_projection(&[1, 2, 2], 2);
+    let expected = combine_row_projected(&outer, &inner, &projection);
+    let actual = projection.finish_outer(outer, Some(&inner));
+    assert_eq!(actual, expected);
+    assert_eq!(actual.as_ptr(), allocation);
+    assert_eq!(text_pointer(&actual[0]), payload);
+    assert_ne!(text_pointer(&actual[1]), text_pointer(&inner[0]));
+    assert_ne!(text_pointer(&actual[2]), text_pointer(&inner[0]));
+}
+
+#[test]
+fn borrowed_join_fanout_reuses_last_outer_without_mutating_inner() {
+    let columns = cols(&[
+        ("a.key", DataType::Null),
+        ("a.guard", DataType::Integer),
+        ("a.value", DataType::Text),
+        ("b.key", DataType::Null),
+        ("b.guard", DataType::Integer),
+        ("b.value", DataType::Text),
+    ]);
+    let projection = build_combine_projection(&[2, 5], 3);
+    for mode in ["integer", "composite", "temporal"] {
+        let key = |number| {
+            if mode == "temporal" {
+                Value::Date(number)
+            } else {
+                i(i64::from(number))
+            }
+        };
+        let inner_key = |number| {
+            if mode == "temporal" {
+                Value::Text(Value::Date(number).to_string().into())
+            } else {
+                i(i64::from(number))
+            }
+        };
+        let inner = vec![
+            vec![inner_key(1), i(0), projected_text("match-one")],
+            vec![inner_key(1), i(0), projected_text("match-two")],
+            vec![inner_key(3), i(0), projected_text("unmatched-inner")],
+            vec![Value::Null, i(0), projected_text("null-inner")],
+        ];
+        let inner_before = inner.clone();
+        for join_type in [
+            JoinType::Inner,
+            JoinType::Cross,
+            JoinType::Left,
+            JoinType::Right,
+            JoinType::FullOuter,
+        ] {
+            let join = JoinClause {
+                join_type,
+                table: TableRef {
+                    name: "b".into(),
+                    alias: None,
+                    args: None,
+                },
+                subquery: None,
+                on_clause: Some(
+                    crate::parser::parse_sql_expr(if mode == "composite" {
+                        "a.key = b.key AND a.guard = b.guard"
+                    } else {
+                        "a.key = b.key"
+                    })
+                    .unwrap(),
+                ),
+            };
+            let equi = compute_equi_join_meta(&join, &columns, 3);
+            let probe = build_probe_index(&inner, &equi, None).unwrap();
+            for cached in [None, Some(&probe), Some(&probe)] {
+                let outer = vec![
+                    vec![key(1), i(0), projected_text("matched-outer")],
+                    vec![key(2), i(0), projected_text("unmatched-outer")],
+                    vec![Value::Null, i(0), projected_text("null-outer")],
+                ];
+                let allocation = outer[0].as_ptr();
+                let payload = text_pointer(&outer[0][2]);
+                let expected: Vec<_> = scalar_join_rows(&outer, &inner, &join, &columns)
+                    .iter()
+                    .map(|row| vec![row[2].clone(), row[5].clone()])
+                    .collect();
+                let actual = exec_join_step_borrowed(
+                    outer,
+                    &inner,
+                    &join,
+                    &columns,
+                    3,
+                    3,
+                    None,
+                    Some(&projection),
+                    &equi,
+                    cached,
+                    None,
+                )
+                .unwrap();
+                assert_eq!(actual, expected, "{mode}, {join_type:?}");
+                assert_eq!(actual[1].as_ptr(), allocation);
+                assert_eq!(text_pointer(&actual[1][0]), payload);
+                assert_ne!(text_pointer(&actual[0][0]), payload);
+                assert_eq!(inner, inner_before);
+            }
+        }
+    }
+}
+
+#[test]
+fn generic_projected_join_reuses_last_accepted_not_last_candidate() {
+    let first = 1i64 << 53;
+    let columns = cols(&[
+        ("a.key", DataType::Integer),
+        ("a.guard", DataType::Integer),
+        ("a.value", DataType::Text),
+        ("b.key", DataType::Integer),
+        ("b.guard", DataType::Integer),
+        ("b.value", DataType::Text),
+    ]);
+    let join = JoinClause {
+        join_type: JoinType::Inner,
+        table: TableRef {
+            name: "b".into(),
+            alias: None,
+            args: None,
+        },
+        subquery: None,
+        on_clause: Some(
+            crate::parser::parse_sql_expr("a.key = b.key AND a.guard = b.guard").unwrap(),
+        ),
+    };
+    let equi = compute_equi_join_meta(&join, &columns, 3);
+    let outer = vec![vec![i(first), i(0), projected_text("outer")]];
+    let allocation = outer[0].as_ptr();
+    let inner = vec![
+        vec![i(first), i(0), projected_text("match")],
+        vec![i(first + 1), i(0), projected_text("collision")],
+    ];
+    let projection = build_combine_projection(&[2, 5], 3);
+    let actual = exec_join_step_borrowed(
+        outer,
+        &inner,
+        &join,
+        &columns,
+        3,
+        3,
+        None,
+        Some(&projection),
+        &equi,
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        actual,
+        vec![vec![projected_text("outer"), projected_text("match")]]
+    );
+    assert_eq!(actual[0].as_ptr(), allocation);
+}
+
+#[test]
+fn sorted_borrowed_integer_join_reuses_projected_outer_rows() {
+    for has_null in [false, true] {
+        let mut inner = vec![
+            vec![i(1), i(0), projected_text("first")],
+            vec![i(1), i(0), projected_text("second")],
+            vec![i(3), i(0), projected_text("third")],
+        ];
+        if has_null {
+            inner.push(vec![Value::Null, i(0), projected_text("null")]);
+        }
+        let before = inner.clone();
+        let outer = vec![
+            vec![i(1), i(0), projected_text("outer-one")],
+            vec![i(3), i(0), projected_text("outer-three")],
+        ];
+        let allocations = [outer[0].as_ptr(), outer[1].as_ptr()];
+        let projection = build_combine_projection(&[2, 5], 3);
+        let actual = try_integer_join_borrowed(
+            outer,
+            &inner,
+            &JoinType::Inner,
+            0,
+            0,
+            3,
+            3,
+            true,
+            Some(&projection),
+            &mut JoinCancel::new(None).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            actual,
+            vec![
+                vec![projected_text("outer-one"), projected_text("first")],
+                vec![projected_text("outer-one"), projected_text("second")],
+                vec![projected_text("outer-three"), projected_text("third")],
+            ]
+        );
+        assert_eq!(actual[1].as_ptr(), allocations[0]);
+        assert_eq!(actual[2].as_ptr(), allocations[1]);
+        assert_eq!(inner, before);
+    }
+}
+
+#[test]
+fn empty_generic_joins_do_not_reserve_result_rows() {
+    let first = 1i64 << 53;
+    let columns = cols(&[
+        ("a.key", DataType::Integer),
+        ("a.guard", DataType::Integer),
+        ("b.key", DataType::Integer),
+        ("b.guard", DataType::Integer),
+    ]);
+    let join = JoinClause {
+        join_type: JoinType::Inner,
+        table: TableRef {
+            name: "b".into(),
+            alias: None,
+            args: None,
+        },
+        subquery: None,
+        on_clause: Some(
+            crate::parser::parse_sql_expr("a.key = b.key AND a.guard = b.guard").unwrap(),
+        ),
+    };
+    let equi = compute_equi_join_meta(&join, &columns, 2);
+    let inner = vec![vec![i(first), i(0)]];
+    let probe = build_probe_index(&inner, &equi, None).unwrap();
+    let projection = build_combine_projection(&[0, 2], 2);
+    for key in [i(first + 1), i(99), Value::Null] {
+        for selected in [None, Some(&projection)] {
+            for cached in [None, Some(&probe)] {
+                let result = exec_join_step_borrowed(
+                    vec![vec![key.clone(), i(0)]],
+                    &inner,
+                    &join,
+                    &columns,
+                    2,
+                    2,
+                    None,
+                    selected,
+                    &equi,
+                    cached,
+                    None,
+                )
+                .unwrap();
+                assert!(result.is_empty());
+                assert_eq!(result.capacity(), 0);
+            }
+        }
+    }
+}
