@@ -234,3 +234,73 @@ fn fts_index_works_on_tsvector_column() {
     assert_eq!(rows.rows.len(), 1);
     assert_eq!(rows.rows[0][0], Value::Integer(1));
 }
+
+fn check_index_only_pagination(key_type: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute(&format!(
+        "CREATE TABLE docs (id {key_type} PRIMARY KEY, body TEXT)"
+    ))
+    .unwrap();
+    conn.execute("CREATE INDEX idx_body ON docs USING fts (body)")
+        .unwrap();
+    let key = |id: i64| match key_type {
+        "INTEGER" => Value::Integer(id),
+        "TEXT" => Value::Text(format!("doc-{id}").into()),
+        _ => unreachable!(),
+    };
+    for id in 0..=5 {
+        let body = if id == 0 { "fish swims" } else { "fox jumps" };
+        conn.execute_params(
+            "INSERT INTO docs VALUES ($1, $2)",
+            &[key(id), Value::Text(body.into())],
+        )
+        .unwrap();
+    }
+    drop(conn);
+
+    let cases: [(&str, &[i64]); 8] = [
+        ("ORDER BY id LIMIT 2 OFFSET 1", &[2, 3]),
+        ("ORDER BY id LIMIT 1 OFFSET 2", &[3]),
+        ("ORDER BY id OFFSET 2", &[3, 4, 5]),
+        ("ORDER BY id LIMIT 2 OFFSET 0", &[1, 2]),
+        ("ORDER BY id LIMIT 0 OFFSET 1", &[]),
+        ("ORDER BY id LIMIT 2 OFFSET 5", &[]),
+        ("ORDER BY id OFFSET 6", &[]),
+        ("ORDER BY id DESC LIMIT 2 OFFSET 1", &[4, 3]),
+    ];
+    for query in ["fox", "fox & jump", "fox <-> jump"] {
+        for (page, ids) in cases {
+            let sql = format!("SELECT id FROM docs WHERE body @@ to_tsquery('{query}') {page}");
+            let expected: Vec<_> = ids.iter().map(|&id| vec![key(id)]).collect();
+            for begin in [None, Some("BEGIN READ ONLY"), Some("BEGIN")] {
+                for prepared in [false, true] {
+                    let conn = Connection::open(&db).unwrap();
+                    if let Some(begin) = begin {
+                        conn.execute(begin).unwrap();
+                    }
+                    let rows = if prepared {
+                        conn.prepare(&sql).unwrap().query_collect(&[]).unwrap().rows
+                    } else {
+                        conn.query(&sql).unwrap().rows
+                    };
+                    assert_eq!(rows, expected, "{sql}; {begin:?}; prepared={prepared}");
+                    if begin.is_some() {
+                        conn.execute("ROLLBACK").unwrap();
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn fts_integer_index_only_results_apply_offset_before_limit() {
+    check_index_only_pagination("INTEGER");
+}
+
+#[test]
+fn fts_text_index_only_results_apply_offset_before_limit() {
+    check_index_only_pagination("TEXT");
+}
