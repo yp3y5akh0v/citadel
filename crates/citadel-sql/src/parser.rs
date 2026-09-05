@@ -1985,9 +1985,7 @@ fn convert_create_table(ct: sp::CreateTable) -> Result<Statement> {
                         sp::Expr::Identifier(ident) => ident.value.clone(),
                         _ => continue,
                     };
-                    if !inline_pk.contains(&col_name) {
-                        inline_pk.push(col_name.clone());
-                    }
+                    inline_pk.push(col_name.clone());
                     if let Some(col) = columns.iter_mut().find(|c| c.name == col_name) {
                         col.nullable = false;
                         col.is_primary_key = true;

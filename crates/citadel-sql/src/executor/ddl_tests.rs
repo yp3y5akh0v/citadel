@@ -25,6 +25,107 @@ fn i(n: i64) -> Value {
     Value::Integer(n)
 }
 
+fn repeated_primary_key_statement(columns: &str) -> CreateTableStmt {
+    let sql = format!(
+        "CREATE TABLE items (a INTEGER, z INTEGER, email TEXT UNIQUE, PRIMARY KEY ({columns}))"
+    );
+    let Statement::CreateTable(stmt) = crate::parser::parse_sql(&sql).unwrap() else {
+        panic!("expected CREATE TABLE");
+    };
+    assert_eq!(stmt.primary_key, columns.split(", ").collect::<Vec<_>>());
+    stmt
+}
+
+fn ddl_database() -> Database {
+    citadel::DatabaseBuilder::new("")
+        .passphrase(b"test-passphrase")
+        .argon2_profile(citadel::Argon2Profile::Iot)
+        .create_in_memory()
+        .unwrap()
+}
+
+#[test]
+fn repeated_primary_key_declarations_preserve_names_for_validation() {
+    let cases = [
+        (
+            "CREATE TABLE items (a INTEGER PRIMARY KEY, z INTEGER, PRIMARY KEY (a, z))",
+            vec!["a", "a", "z"],
+        ),
+        (
+            "CREATE TABLE items (a INTEGER PRIMARY KEY, z INTEGER, PRIMARY KEY (A, z))",
+            vec!["a", "A", "z"],
+        ),
+        (
+            "CREATE TABLE items (a INTEGER, z INTEGER, PRIMARY KEY (a), PRIMARY KEY (a, z))",
+            vec!["a", "a", "z"],
+        ),
+    ];
+    let columns = [col("a", DataType::Integer), col("z", DataType::Integer)];
+    for (sql, expected) in cases {
+        let Statement::CreateTable(stmt) = crate::parser::parse_sql(sql).unwrap() else {
+            panic!("expected CREATE TABLE");
+        };
+        assert_eq!(stmt.primary_key, expected);
+        assert!(matches!(
+            resolve_primary_key_columns(&columns, &stmt.primary_key),
+            Err(SqlError::DuplicateColumn(name)) if name.eq_ignore_ascii_case("a")
+        ));
+    }
+}
+
+#[test]
+fn create_table_rejects_repeated_primary_key_columns_without_catalog_changes() {
+    for columns in ["a, a, z", "a, A, z", "a, z, A"] {
+        let db = ddl_database();
+        let mut schema = SchemaManager::empty();
+        let before = db.manager().commit_generation();
+        let stmt = repeated_primary_key_statement(columns);
+
+        let error = exec_create_table(&db, &mut schema, &stmt).unwrap_err();
+        assert!(
+            matches!(error, SqlError::DuplicateColumn(ref name) if name.eq_ignore_ascii_case("a"))
+        );
+        assert!(schema.table_names().is_empty());
+        assert_eq!(db.manager().commit_generation(), before);
+        assert!(db.begin_read().list_tables().unwrap().is_empty());
+        assert!(SchemaManager::load(&db).unwrap().table_names().is_empty());
+
+        let mut valid = stmt;
+        valid.primary_key = vec!["a".into(), "z".into()];
+        exec_create_table(&db, &mut schema, &valid).unwrap();
+        assert_eq!(schema.get("items").unwrap().primary_key_columns, [0, 1]);
+    }
+}
+
+#[test]
+fn create_table_in_txn_rejects_repeated_primary_key_columns_without_catalog_changes() {
+    for columns in ["a, a, z", "a, A, z", "a, z, A"] {
+        let db = ddl_database();
+        let mut schema = SchemaManager::empty();
+        let stmt = repeated_primary_key_statement(columns);
+        let mut wtx = db.begin_write().unwrap();
+
+        let error = exec_create_table_in_txn(&mut wtx, &mut schema, &stmt).unwrap_err();
+        assert!(
+            matches!(error, SqlError::DuplicateColumn(ref name) if name.eq_ignore_ascii_case("a"))
+        );
+        assert!(schema.table_names().is_empty());
+        assert!(wtx.table_root_stamp(b"items").unwrap().is_none());
+        assert!(wtx.table_root_stamp(b"_schema").unwrap().is_none());
+        wtx.commit().unwrap();
+        assert!(db.begin_read().list_tables().unwrap().is_empty());
+        assert!(SchemaManager::load(&db).unwrap().table_names().is_empty());
+
+        let mut valid = stmt;
+        valid.primary_key = vec!["a".into(), "z".into()];
+        let mut wtx = db.begin_write().unwrap();
+        exec_create_table_in_txn(&mut wtx, &mut schema, &valid).unwrap();
+        wtx.commit().unwrap();
+        let loaded = SchemaManager::load(&db).unwrap();
+        assert_eq!(loaded.get("items").unwrap().primary_key_columns, [0, 1]);
+    }
+}
+
 #[test]
 fn collect_column_refs_simple_column() {
     let mut out = Vec::new();

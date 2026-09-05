@@ -423,12 +423,12 @@ fn residual_or_duplicate_conjuncts_do_not_promote_primary_key_prefixes() {
 fn repeated_primary_key_columns_do_not_hide_residual_predicates() {
     let db = database();
     let conn = Connection::open(&db).unwrap();
-    conn.execute("CREATE TABLE items (a INTEGER, z INTEGER, email TEXT, PRIMARY KEY (a, A, z))")
+    conn.execute("CREATE TABLE items (a INTEGER, z INTEGER, email TEXT, PRIMARY KEY (a, z))")
         .unwrap();
     conn.execute("CREATE UNIQUE INDEX items_email ON items (email)")
         .unwrap();
-    let schema = conn.table_schema("items").unwrap();
-    assert_eq!(schema.primary_key_columns, vec![0, 0, 1]);
+    let mut schema = conn.table_schema("items").unwrap();
+    schema.primary_key_columns = vec![0, 0, 1];
     let predicate = Some(
         citadel_sql::parser::parse_sql_expr("a = 1 AND email = 'selected@example.test'").unwrap(),
     );
