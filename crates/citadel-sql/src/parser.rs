@@ -1893,6 +1893,14 @@ fn find_non_immutable_expr(expr: &Expr) -> Option<NonImmutableExpr> {
     violation
 }
 
+pub(crate) fn expr_uses_parameters(expr: &Expr) -> bool {
+    let mut found = false;
+    visit_expr(expr, &mut |candidate| {
+        found |= matches!(candidate, Expr::Parameter(_));
+    });
+    found
+}
+
 pub(crate) fn expr_uses_session_dependent_jsonpath(expr: &Expr) -> bool {
     let mut dependent = false;
     visit_expr(expr, &mut |candidate| {
@@ -2182,33 +2190,38 @@ fn convert_create_index(ci: sp::CreateIndex) -> Result<Statement> {
     let mut collations: Vec<crate::types::Collation> = Vec::with_capacity(ci.columns.len());
     let mut key_exprs: Vec<Option<(Expr, String)>> = Vec::with_capacity(ci.columns.len());
     for idx_col in &ci.columns {
-        let (name, coll, expr_entry) = match &idx_col.column.expr {
+        let mut key_expr = &idx_col.column.expr;
+        while let sp::Expr::Nested(inner) = key_expr {
+            key_expr = inner;
+        }
+        let (name, coll, expr_entry) = match key_expr {
             sp::Expr::Identifier(ident) => {
                 (ident.value.clone(), crate::types::Collation::Binary, None)
             }
             sp::Expr::Collate {
                 expr: inner,
                 collation,
-            } => match inner.as_ref() {
-                sp::Expr::Identifier(ident) => {
-                    let coll_name = object_name_to_string(collation);
-                    let coll = crate::types::Collation::from_name(&coll_name).ok_or_else(|| {
-                        SqlError::Unsupported(format!(
-                            "collation '{coll_name}' not supported (BINARY/NOCASE/RTRIM only)"
-                        ))
-                    })?;
-                    (ident.value.clone(), coll, None)
+            } => {
+                let coll_name = object_name_to_string(collation);
+                let coll = crate::types::Collation::from_name(&coll_name).ok_or_else(|| {
+                    SqlError::Unsupported(format!(
+                        "collation '{coll_name}' not supported (BINARY/NOCASE/RTRIM only)"
+                    ))
+                })?;
+                match inner.as_ref() {
+                    sp::Expr::Identifier(ident) => (ident.value.clone(), coll, None),
+                    inner_expr => {
+                        if coll != crate::types::Collation::Binary {
+                            return Err(SqlError::Unsupported(
+                                "expression index keys require BINARY collation".into(),
+                            ));
+                        }
+                        let sql = inner_expr.to_string();
+                        let expr = convert_expr(inner_expr)?;
+                        (sql.clone(), coll, Some((expr, sql)))
+                    }
                 }
-                inner_expr => {
-                    let sql = inner_expr.to_string();
-                    let expr = convert_expr(inner_expr)?;
-                    (
-                        sql.clone(),
-                        crate::types::Collation::Binary,
-                        Some((expr, sql)),
-                    )
-                }
-            },
+            }
             other => {
                 let sql = other.to_string();
                 let expr = convert_expr(other)?;

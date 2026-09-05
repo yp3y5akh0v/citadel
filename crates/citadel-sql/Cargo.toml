@@ -60,3 +60,7 @@ harness = false
 [[bench]]
 name = "pk_range_bounds"
 harness = false
+
+[[bench]]
+name = "expression_numeric_indexes"
+harness = false

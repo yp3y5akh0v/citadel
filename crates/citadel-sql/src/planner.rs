@@ -89,6 +89,10 @@ enum CanonicalExpr {
         expr: Box<CanonicalExpr>,
         data_type: crate::types::DataType,
     },
+    Collate {
+        expr: Box<CanonicalExpr>,
+        collation: crate::types::Collation,
+    },
     Other(String),
 }
 
@@ -122,7 +126,13 @@ fn canonicalize(expr: &Expr) -> CanonicalExpr {
             expr: Box::new(canonicalize(inner)),
             data_type: *data_type,
         },
-        Expr::Collate { expr: inner, .. } => canonicalize(inner),
+        Expr::Collate {
+            expr: inner,
+            collation,
+        } => CanonicalExpr::Collate {
+            expr: Box::new(canonicalize(inner)),
+            collation: *collation,
+        },
         other => CanonicalExpr::Other(format!("{other:?}")),
     }
 }
@@ -785,6 +795,36 @@ fn try_best_index(
     best_plan
 }
 
+/// Proven non-NULL result types whose equality probes use typed key encoding.
+fn expression_key_type(expr: &Expr) -> Option<DataType> {
+    match expr {
+        Expr::Cast {
+            data_type: data_type @ (DataType::Integer | DataType::Real | DataType::Text),
+            ..
+        } => Some(*data_type),
+        Expr::Collate { expr, .. } => expression_key_type(expr),
+        Expr::Function { name, .. }
+            if matches!(
+                name.to_ascii_uppercase().as_str(),
+                "LOWER"
+                    | "UPPER"
+                    | "SUBSTR"
+                    | "SUBSTRING"
+                    | "TRIM"
+                    | "LTRIM"
+                    | "RTRIM"
+                    | "REPLACE"
+                    | "CONCAT"
+                    | "TYPEOF"
+                    | "HEX"
+            ) =>
+        {
+            Some(DataType::Text)
+        }
+        _ => None,
+    }
+}
+
 fn try_expr_index_scan(
     schema: &TableSchema,
     idx: &IndexDef,
@@ -796,6 +836,12 @@ fn try_expr_index_scan(
         IndexKey::Expr { expr, .. } => expr,
         IndexKey::Column { .. } => return None,
     };
+    if crate::parser::expr_uses_parameters(key_expr) {
+        return None;
+    }
+    let key_type = expression_key_type(key_expr)?;
+    let structural_match = matches!(key_type, DataType::Integer | DataType::Real)
+        || crate::eval::collation_of(key_expr).is_some();
     let canonical_key = canonicalize(key_expr);
 
     let mut matched: Option<Value> = None;
@@ -807,21 +853,35 @@ fn try_expr_index_scan(
         } = conj
         {
             let (expr_side, value_side) = match (left.as_ref(), right.as_ref()) {
-                (Expr::Literal(v), other) | (other, Expr::Literal(v)) => (other, v.clone()),
+                (value @ (Expr::Literal(_) | Expr::Parameter(_)), other)
+                | (other, value @ (Expr::Literal(_) | Expr::Parameter(_))) => (other, value),
                 _ => continue,
             };
-            if canonicalize(expr_side) == canonical_key {
-                matched = Some(value_side);
+            let matches_key = if structural_match || crate::eval::collation_of(expr_side).is_some()
+            {
+                // Operand order can select the inherited collation.
+                expr_structurally_eq(expr_side, key_expr)
+            } else {
+                canonicalize(expr_side) == canonical_key
+            };
+            if matches_key {
+                let value = key_predicate(key_type, BinOp::Eq, &resolve_literal(value_side)?)?.1;
+                let collation = idx.collation_at(0);
+                if matches!(value, Value::Text(_)) {
+                    let comparison =
+                        crate::eval::compile_collation(left, right, schema.column_map())
+                            .unwrap_or(crate::types::Collation::Binary);
+                    if comparison != collation {
+                        continue;
+                    }
+                }
+                matched = Some(fold_probe_value(value, collation));
                 break;
             }
         }
     }
 
     let value = matched?;
-    // Expression keys have no declared result type to normalize numeric probes.
-    if matches!(value, Value::Integer(_) | Value::Real(_)) {
-        return None;
-    }
     let score = IndexScore {
         num_equality: 1,
         has_range: false,

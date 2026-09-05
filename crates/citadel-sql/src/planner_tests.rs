@@ -119,6 +119,89 @@ fn test_schema() -> TableSchema {
     )
 }
 
+fn expression_schema(expression: &str) -> TableSchema {
+    let mut schema = test_schema();
+    schema.indices.truncate(1);
+    schema.indices[0].keys = vec![IndexKey::Expr {
+        expr: crate::parser::parse_sql_expr(expression).unwrap(),
+        original_sql: expression.into(),
+    }];
+    schema
+}
+
+#[test]
+fn numeric_cast_expression_probes_use_proven_key_types() {
+    for (expression, value, encoded) in [
+        ("CAST(name AS INTEGER)", Value::Real(2.0), Value::Integer(2)),
+        ("CAST(name AS REAL)", Value::Integer(2), Value::Real(2.0)),
+    ] {
+        let schema = expression_schema(expression);
+        for predicate in [format!("{expression} = $1"), format!("$1 = {expression}")] {
+            let where_clause = Some(crate::parser::parse_sql_expr(&predicate).unwrap());
+            let plan = crate::eval::with_scoped_params(std::slice::from_ref(&value), || {
+                plan_select(&schema, &where_clause)
+            });
+            let ScanPlan::IndexScan { prefix, .. } = plan else {
+                panic!("expected expression index: {predicate}")
+            };
+            assert_eq!(prefix, encode_composite_key(std::slice::from_ref(&encoded)));
+        }
+    }
+}
+
+#[test]
+fn expression_probes_decline_unmatched_unbound_and_ambiguous_numeric_keys() {
+    for (expression, predicate, params) in [
+        (
+            "CAST(name AS INTEGER)",
+            "CAST(email AS INTEGER) = $1",
+            vec![],
+        ),
+        (
+            "CAST(name AS INTEGER)",
+            "CAST(name AS INTEGER) = $1",
+            vec![],
+        ),
+        (
+            "CAST(name AS INTEGER)",
+            "CAST(name AS INTEGER) = $1",
+            vec![Value::Real(9_007_199_254_740_992.0)],
+        ),
+        (
+            "CAST(name AS REAL)",
+            "CAST(name AS REAL) = $1",
+            vec![Value::Integer(0)],
+        ),
+        (
+            "CAST(name AS REAL)",
+            "CAST(name AS REAL) = $1",
+            vec![Value::Real(f64::NAN)],
+        ),
+        (
+            "CAST(name AS INTEGER)",
+            "CAST(name AS INTEGER) = $1",
+            vec![Value::Null],
+        ),
+        (
+            "CAST($1 AS INTEGER)",
+            "CAST($1 AS INTEGER) = $2",
+            vec![Value::Integer(9), Value::Integer(9)],
+        ),
+        (
+            "CAST(CASE WHEN age > 0 THEN $1 ELSE 0 END AS INTEGER)",
+            "CAST(CASE WHEN age > 0 THEN $1 ELSE 0 END AS INTEGER) = $2",
+            vec![Value::Integer(9), Value::Integer(9)],
+        ),
+        ("age + 0", "age + 0 = $1", vec![Value::Real(2.0)]),
+        ("age + 0", "age + 0 = 2", vec![]),
+    ] {
+        let schema = expression_schema(expression);
+        let where_clause = Some(crate::parser::parse_sql_expr(predicate).unwrap());
+        let plan = crate::eval::with_scoped_params(&params, || plan_select(&schema, &where_clause));
+        assert!(matches!(plan, ScanPlan::SeqScan), "{predicate}: {plan:?}");
+    }
+}
+
 #[test]
 fn no_where_is_seq_scan() {
     let schema = test_schema();
