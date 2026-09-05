@@ -1011,7 +1011,7 @@ fn exec_pk_range_delete(
         .iter()
         .filter(|(op, _)| matches!(op, BinOp::GtEq | BinOp::Gt))
         .map(|(_, v)| crate::encoding::encode_composite_key(std::slice::from_ref(v)))
-        .min()
+        .max()
         .unwrap_or_default();
 
     bufs.kv_pairs.clear();
