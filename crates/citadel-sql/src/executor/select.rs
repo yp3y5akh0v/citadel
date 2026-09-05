@@ -1507,18 +1507,7 @@ fn try_inverted_index_only_with_read(
         })?;
     }
 
-    if let Some(ref limit_expr) = stmt.limit {
-        let limit = eval_const_int(limit_expr)?.max(0) as usize;
-        result_rows.truncate(limit);
-    }
-    if let Some(ref offset_expr) = stmt.offset {
-        let offset = eval_const_int(offset_expr)?.max(0) as usize;
-        if offset >= result_rows.len() {
-            result_rows.clear();
-        } else {
-            result_rows = result_rows.split_off(offset);
-        }
-    }
+    apply_offset_limit(&mut result_rows, stmt)?;
 
     check_cancel(cancel)?;
 
