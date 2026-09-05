@@ -6968,6 +6968,45 @@ fn foreign_or_expired_superseders_do_not_hide_a_live_local_atom() {
 }
 
 #[test]
+fn repair_supersession_filter_preserves_kind_parameters_and_opt_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = MemoryEngine::open(create_db(dir.path())).unwrap();
+    eng.create_region("repair", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let target = eng
+        .remember("repair", AtomInput::new("fact", "target"))
+        .unwrap();
+    let source = eng
+        .remember("repair", AtomInput::new("replacement", "superseder"))
+        .unwrap();
+    eng.link_in_region("repair", source, target, EdgeKind::Supersedes, 1.0)
+        .unwrap();
+    let handle = eng.region_handle("repair").unwrap();
+    let _lifecycle = eng.db.key_lifecycle_lock();
+    let _edges = eng.db.memory_edges_lock();
+    let conn = Connection::open(&eng.db).unwrap();
+    for kinds in [vec!["fact".into()], vec!["fact".into(), "other".into()]] {
+        for include_superseded in [false, true] {
+            let mut query = RecallQuery::by_embedding(unit(8, 0), 1).with_kinds(kinds.clone());
+            query.include_superseded = include_superseded;
+            let candidates = eng
+                .recall_plain_semantic_candidates(&handle, &query, &unit(8, 0), &conn, None)
+                .unwrap();
+            let ids: Vec<_> = candidates.iter().map(|candidate| candidate.id).collect();
+            assert_eq!(
+                ids,
+                if include_superseded {
+                    vec![target]
+                } else {
+                    vec![]
+                },
+                "kinds={kinds:?}, include_superseded={include_superseded}"
+            );
+        }
+    }
+}
+
+#[test]
 fn graph_expand_rejects_a_high_fanout_before_exceeding_its_node_budget() {
     let dir = tempfile::tempdir().unwrap();
     let eng = MemoryEngine::open(create_db(dir.path())).unwrap();

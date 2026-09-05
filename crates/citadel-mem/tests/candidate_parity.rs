@@ -186,3 +186,207 @@ fn sealed_filters_fill_the_candidate_pool_instead_of_only_the_final_result() {
     assert_keyword_target(&engine, true);
     assert_reranker_target(&engine, true, 3);
 }
+
+fn assert_payload_filter_parity(
+    payload: serde_json::Value,
+    filter: serde_json::Value,
+    expected: bool,
+) {
+    fn check(engine: &MemoryEngine, filter: &serde_json::Value, expected: bool, phase: &str) {
+        for region in REGIONS {
+            let hits = engine
+                .recall(
+                    region,
+                    RecallQuery::by_embedding(vec![1.0, 0.0], 1)
+                        .with_weights(FusionWeights::semantic_only())
+                        .with_payload_filter(filter.clone()),
+                )
+                .unwrap();
+            assert_eq!(hits.len(), usize::from(expected), "{region}: {phase}");
+            if expected {
+                assert_eq!(hits[0].text, TARGET, "{region}: {phase}");
+            }
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open_engine(dir.path(), true);
+    for region in REGIONS {
+        engine
+            .remember(
+                region,
+                atom(TARGET, true, true).with_payload(payload.clone()),
+            )
+            .unwrap();
+    }
+    check(&engine, &filter, expected, "cold");
+    check(&engine, &filter, expected, "warm");
+    drop(engine);
+
+    let reopened = open_engine(dir.path(), false);
+    check(&reopened, &filter, expected, "reopened");
+}
+
+#[test]
+fn payload_filter_does_not_match_an_object_inside_an_array_without_array_wrapper() {
+    assert_payload_filter_parity(
+        json!({"items": [{"a": 1, "b": 2}]}),
+        json!({"items": {"a": 1}}),
+        false,
+    );
+}
+
+#[test]
+fn payload_filter_does_not_match_a_scalar_inside_a_nested_array() {
+    assert_payload_filter_parity(json!({"items": [[1]]}), json!({"items": 1}), false);
+}
+
+#[test]
+fn payload_filter_matches_partial_objects_with_an_array_wrapper() {
+    assert_payload_filter_parity(
+        json!({"items": [{"a": 1, "b": 2}]}),
+        json!({"items": [{"a": 1}]}),
+        true,
+    );
+}
+
+#[test]
+fn payload_filter_matches_a_direct_scalar_array_member() {
+    assert_payload_filter_parity(json!([1, 2]), json!(1), true);
+}
+
+#[test]
+fn payload_filter_does_not_match_an_object_array_value_against_a_scalar() {
+    assert_payload_filter_parity(json!({"items": [1, 2]}), json!({"items": 1}), false);
+}
+
+#[test]
+fn payload_filter_matches_primitive_array_members_with_an_array_wrapper() {
+    assert_payload_filter_parity(json!({"items": [1, 2]}), json!({"items": [1]}), true);
+}
+
+#[test]
+fn payload_filter_preserves_integer_and_real_distinction() {
+    assert_payload_filter_parity(json!({"items": 1}), json!({"items": 1.0}), false);
+    assert_payload_filter_parity(json!({"items": 1.0}), json!({"items": 1}), false);
+}
+
+#[test]
+fn payload_filter_preserves_array_nesting() {
+    assert_payload_filter_parity(json!({"items": [[1, 2]]}), json!({"items": [1]}), false);
+}
+
+#[test]
+fn payload_filter_does_not_match_an_exact_object_without_array_wrapper() {
+    assert_payload_filter_parity(
+        json!({"items": [{"a": 1}]}),
+        json!({"items": {"a": 1}}),
+        false,
+    );
+}
+
+#[test]
+fn payload_filter_matches_a_nested_array_with_matching_nesting() {
+    assert_payload_filter_parity(json!({"items": [[1, 2]]}), json!({"items": [[1]]}), true);
+}
+
+fn assert_distance_order_parity(
+    vectors: &[(&str, [f32; 2])],
+    query: RecallQuery,
+    expected: &[(&str, f32, Option<f32>)],
+) {
+    fn check(
+        engine: &MemoryEngine,
+        query: &RecallQuery,
+        expected: &[(&str, f32, Option<f32>)],
+        phase: &str,
+    ) {
+        for region in REGIONS {
+            let hits = engine.recall(region, query.clone()).unwrap();
+            assert_eq!(hits.len(), expected.len(), "{region}: {phase}");
+            for (hit, &(text, score, distance)) in hits.iter().zip(expected) {
+                assert_eq!(hit.text, text, "{region}: {phase}");
+                assert_eq!(
+                    hit.relevance.map(f32::to_bits),
+                    Some(score.to_bits()),
+                    "{region}: {phase}: {text}"
+                );
+                assert_eq!(
+                    hit.distance.map(f32::to_bits),
+                    distance.map(f32::to_bits),
+                    "{region}: {phase}: {text}"
+                );
+            }
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open_engine(dir.path(), true);
+    for region in REGIONS {
+        for &(text, embedding) in vectors {
+            engine
+                .remember(
+                    region,
+                    atom(text, true, true).with_embedding(embedding.to_vec()),
+                )
+                .unwrap();
+        }
+    }
+    check(&engine, &query, expected, "cold");
+    check(&engine, &query, expected, "warm");
+    drop(engine);
+
+    let reopened = open_engine(dir.path(), false);
+    check(&reopened, &query, expected, "reopened");
+}
+
+#[test]
+fn semantic_recall_prefers_a_defined_exact_match_over_an_older_zero_vector() {
+    assert_distance_order_parity(
+        &[("zero", [0.0, 0.0]), ("exact", [1.0, 0.0])],
+        RecallQuery::by_embedding(vec![1.0, 0.0], 1).with_weights(FusionWeights::semantic_only()),
+        &[("exact", 0.0, Some(0.0))],
+    );
+}
+
+#[test]
+fn semantic_recall_prefers_the_worst_defined_distance_over_an_older_zero_vector() {
+    assert_distance_order_parity(
+        &[
+            ("zero", [0.0, 0.0]),
+            ("near", [1.0, 0.0]),
+            ("far", [0.0, 1.0]),
+        ],
+        RecallQuery::by_embedding(vec![1.0, 0.0], 2).with_weights(FusionWeights::semantic_only()),
+        &[("near", 1.0, Some(0.0)), ("far", 0.0, Some(1.0))],
+    );
+}
+
+#[test]
+fn semantic_recall_with_a_zero_query_preserves_id_ties_and_zero_scores() {
+    assert_distance_order_parity(
+        &[("zero", [0.0, 0.0]), ("nonzero", [1.0, 0.0])],
+        RecallQuery::by_embedding(vec![0.0, 0.0], 2).with_weights(FusionWeights::semantic_only()),
+        &[("zero", 0.0, None), ("nonzero", 0.0, None)],
+    );
+}
+
+#[test]
+fn zero_semantic_weight_does_not_prefer_defined_distances_on_score_ties() {
+    assert_distance_order_parity(
+        &[("zero", [0.0, 0.0]), ("nonzero", [1.0, 0.0])],
+        RecallQuery::by_embedding(vec![1.0, 0.0], 2)
+            .with_text("unmatched")
+            .with_weights(keyword_only()),
+        &[("zero", 0.0, None), ("nonzero", 0.0, Some(0.0))],
+    );
+}
+
+#[test]
+fn equal_defined_distances_preserve_id_ties_and_zero_scores() {
+    assert_distance_order_parity(
+        &[("first", [1.0, 0.0]), ("second", [1.0, 0.0])],
+        RecallQuery::by_embedding(vec![1.0, 0.0], 2).with_weights(FusionWeights::semantic_only()),
+        &[("first", 0.0, Some(0.0)), ("second", 0.0, Some(0.0))],
+    );
+}

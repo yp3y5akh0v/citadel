@@ -157,6 +157,13 @@ pub(crate) fn fuse_rank(
         b.relevance
             .partial_cmp(&a.relevance)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                if w.semantic > 0.0 {
+                    b.distance.is_some().cmp(&a.distance.is_some())
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
             .then(a.id.cmp(&b.id))
     });
     scored.truncate(k);

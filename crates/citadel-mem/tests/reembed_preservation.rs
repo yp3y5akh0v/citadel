@@ -553,6 +553,116 @@ fn replaced_managed_neighbor_is_counted_as_cleared() {
     assert_eq!((managed[0].0, managed[0].1), (source, new_neighbor));
 }
 
+fn assert_reembed_keeps_neighbor_with_superseder(encrypted: bool, expire_superseder: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fixture_vault(&dir.path().join("expired-superseder.citadel"));
+    let engine = MemoryEngine::open(Arc::clone(&db)).unwrap();
+    let original = Arc::new(NeighborSwapEmbedder { new_space: false });
+    let replacement = Arc::new(NeighborSwapEmbedder { new_space: true });
+    let texts = ["source", "retained-neighbor", "temporary-superseder"];
+    assert_eq!(
+        original.embed_with_cancel(&texts, None).unwrap(),
+        replacement.embed_with_cancel(&texts, None).unwrap()
+    );
+    if encrypted {
+        engine.create_encrypted_region("notes", original).unwrap();
+    } else {
+        engine.create_region("notes", original).unwrap();
+    }
+    let source = engine
+        .remember("notes", AtomInput::new("note", texts[0]))
+        .unwrap();
+    let target = engine
+        .remember("notes", AtomInput::new("note", texts[1]))
+        .unwrap();
+    let superseder = engine
+        .remember(
+            "notes",
+            AtomInput::new("note", texts[2]).with_expires_at(9_999_999_999_000_000),
+        )
+        .unwrap();
+    engine
+        .link_in_region(
+            "notes",
+            superseder,
+            target,
+            citadel_mem::EdgeKind::Supersedes,
+            1.0,
+        )
+        .unwrap();
+    assert!(matches!(
+        engine.fetch_by_ids("notes", &[superseder]).unwrap().as_slice(),
+        [Some(hit)] if hit.id == superseder
+    ));
+    let live_recall = engine
+        .recall(
+            "notes",
+            citadel_mem::RecallQuery::by_embedding(vec![1.0, 0.0], 3),
+        )
+        .unwrap();
+    assert!(live_recall.iter().any(|hit| hit.id == superseder));
+    assert!(live_recall.iter().all(|hit| hit.id != target));
+    if expire_superseder {
+        let suffix = if encrypted { "_enc" } else { "" };
+        let changed = citadel_sql::Connection::open(&db)
+            .unwrap()
+            .execute_params(
+                &format!("UPDATE memory_atoms_d2_cosine{suffix} SET expires_at = $1 WHERE id = $2"),
+                &[
+                    citadel_sql::Value::Timestamp(1),
+                    citadel_sql::Value::Integer(superseder),
+                ],
+            )
+            .unwrap();
+        assert!(matches!(
+            changed,
+            citadel_sql::ExecutionResult::RowsAffected(1)
+        ));
+        assert!(matches!(
+            engine
+                .fetch_by_ids("notes", &[superseder])
+                .unwrap()
+                .as_slice(),
+            [None]
+        ));
+    }
+
+    let evolved = engine.evolve("notes", source, 1, 1.0).unwrap();
+    assert_eq!(evolved.links_added, 1);
+    let before = read_managed_similarity_edges(&db);
+    let expected_neighbor = if expire_superseder {
+        target
+    } else {
+        superseder
+    };
+    assert_eq!(before, vec![(source, expected_neighbor, 0.5)]);
+
+    let report = engine.reembed_region("notes", replacement, None).unwrap();
+    assert_eq!(report.similarity_edges_rewoven, 1);
+    assert_eq!(report.similarity_edges_cleared, 0);
+    assert_eq!(read_managed_similarity_edges(&db), before);
+}
+
+#[test]
+fn plaintext_reembed_keeps_neighbor_with_expired_superseder() {
+    assert_reembed_keeps_neighbor_with_superseder(false, true);
+}
+
+#[test]
+fn sealed_reembed_keeps_neighbor_with_expired_superseder() {
+    assert_reembed_keeps_neighbor_with_superseder(true, true);
+}
+
+#[test]
+fn plaintext_reembed_keeps_neighbor_with_active_superseder() {
+    assert_reembed_keeps_neighbor_with_superseder(false, false);
+}
+
+#[test]
+fn sealed_reembed_keeps_neighbor_with_active_superseder() {
+    assert_reembed_keeps_neighbor_with_superseder(true, false);
+}
+
 #[test]
 fn an_authored_similarity_edge_is_not_reclassified_as_managed() {
     let dir = tempfile::tempdir().unwrap();
