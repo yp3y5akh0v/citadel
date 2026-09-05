@@ -676,6 +676,7 @@ pub struct CompiledDelete {
 
 struct CompiledDeleteFast {
     single_int_pk: bool,
+    pk_type: DataType,
     num_columns: usize,
     pk_idx: usize,
     shape: DeleteShape,
@@ -802,6 +803,7 @@ impl CompiledDelete {
                 };
                 CompiledDeleteFast {
                     single_int_pk,
+                    pk_type: table_schema.columns[pk_indices[0]].data_type,
                     num_columns: table_schema.columns.len(),
                     pk_idx: pk_indices[0],
                     shape,
@@ -827,12 +829,17 @@ impl CompiledDelete {
         fast: &CompiledDeleteFast,
         bufs: &mut UpdateBufs,
         empty_query_on_zero_match: bool,
-    ) -> Result<ExecutionResult> {
-        match &fast.shape {
+    ) -> Result<Option<ExecutionResult>> {
+        let result = match &fast.shape {
             DeleteShape::PkLookup(pk) => {
                 let pk_value = match &pk.source {
                     PkLookupSource::Literal(v) => v.clone(),
                     PkLookupSource::Parameter(n) => crate::eval::resolve_scoped_param(*n)?,
+                };
+                let Some((_, pk_value)) =
+                    crate::planner::key_predicate(fast.pk_type, BinOp::Eq, &pk_value)
+                else {
+                    return Ok(None);
                 };
                 exec_pk_lookup_delete(
                     wtx,
@@ -843,14 +850,29 @@ impl CompiledDelete {
                     empty_query_on_zero_match,
                 )
             }
-            DeleteShape::PkRange(bounds) => exec_pk_range_delete(
-                wtx,
-                &self.table_name_lower,
-                bounds,
-                fast.single_int_pk,
-                bufs,
-            ),
-        }
+            DeleteShape::PkRange(bounds) => {
+                let mut range_conds = Vec::with_capacity(bounds.len());
+                for (op, source) in bounds {
+                    let value = match source {
+                        PkLookupSource::Literal(value) => value.clone(),
+                        PkLookupSource::Parameter(n) => crate::eval::resolve_scoped_param(*n)?,
+                    };
+                    let Some(cond) = crate::planner::key_predicate(fast.pk_type, *op, &value)
+                    else {
+                        return Ok(None);
+                    };
+                    range_conds.push(cond);
+                }
+                exec_pk_range_delete(
+                    wtx,
+                    &self.table_name_lower,
+                    &range_conds,
+                    fast.single_int_pk,
+                    bufs,
+                )
+            }
+        }?;
+        Ok(Some(result))
     }
 }
 
@@ -893,7 +915,23 @@ impl CompiledPlan for CompiledDelete {
                 // No segment purge: this lane compiles only for index-free
                 // tables.
                 schema.mark_dml(&self.table_name_lower);
-                let result = with_update_scratch(|bufs| self.run_fast(&mut wtx, fast, bufs, true))?;
+                let result = with_update_scratch(|bufs| -> Result<ExecutionResult> {
+                    match self.run_fast(&mut wtx, fast, bufs, true)? {
+                        Some(result) => Ok(result),
+                        None => {
+                            let result = exec_delete_in_txn(&mut wtx, schema, del)?;
+                            match (&result, &fast.returning_fast) {
+                                (ExecutionResult::RowsAffected(0), Some(returning)) => {
+                                    Ok(ExecutionResult::Query(QueryResult {
+                                        columns: returning.col_names.clone(),
+                                        rows: Vec::new(),
+                                    }))
+                                }
+                                _ => Ok(result),
+                            }
+                        }
+                    }
+                })?;
                 super::helpers::drain_deferred_fk_checks(&mut wtx)?;
                 super::commit_with_ann_publication(wtx, schema)?;
                 Ok(result)
@@ -907,7 +945,10 @@ impl CompiledPlan for CompiledDelete {
                 };
                 // No mark_dml: index-free at compile generation, like the
                 // compiled UPDATE in-txn lane; fallbacks mark on their own.
-                with_update_scratch(|bufs| self.run_fast(outer, fast, bufs, false))
+                with_update_scratch(|bufs| match self.run_fast(outer, fast, bufs, false)? {
+                    Some(result) => Ok(result),
+                    None => exec_delete_in_txn(outer, schema, del),
+                })
             }
         }
     }
@@ -962,22 +1003,10 @@ fn exec_pk_lookup_delete(
 fn exec_pk_range_delete(
     wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
     table_name_lower: &str,
-    bounds: &[(BinOp, PkLookupSource)],
+    range_conds: &[(BinOp, Value)],
     single_int_pk: bool,
     bufs: &mut UpdateBufs,
 ) -> Result<ExecutionResult> {
-    let range_conds: Vec<(BinOp, Value)> = bounds
-        .iter()
-        .map(|(op, s)| {
-            Ok((
-                *op,
-                match s {
-                    PkLookupSource::Literal(v) => v.clone(),
-                    PkLookupSource::Parameter(n) => crate::eval::resolve_scoped_param(*n)?,
-                },
-            ))
-        })
-        .collect::<Result<_>>()?;
     let start_key = range_conds
         .iter()
         .filter(|(op, _)| matches!(op, BinOp::GtEq | BinOp::Gt))
@@ -990,7 +1019,7 @@ fn exec_pk_range_delete(
     wtx.table_scan_from(
         table_name_lower.as_bytes(),
         &start_key,
-        |key, _value| match range_in_bounds(key, single_int_pk, 1, &range_conds, &mut scan_err) {
+        |key, _value| match range_in_bounds(key, single_int_pk, 1, range_conds, &mut scan_err) {
             RangeStatus::Stop | RangeStatus::Err => Ok(false),
             RangeStatus::Skip => Ok(true),
             RangeStatus::Hit => {
@@ -2925,15 +2954,21 @@ fn exec_update_in_txn_compiled(
             PkLookupSource::Literal(v) => v.clone(),
             PkLookupSource::Parameter(n) => crate::eval::resolve_scoped_param(*n)?,
         };
-        return exec_pk_lookup_update(
-            wtx,
-            &compiled.table_name_lower,
+        if let Some((_, pk_value)) = crate::planner::key_predicate(
+            table_schema.columns[pk_idx_cache[0]].data_type,
+            BinOp::Eq,
             &pk_value,
-            fast,
-            ret_fast,
-            cancel,
-            bufs,
-        );
+        ) {
+            return exec_pk_lookup_update(
+                wtx,
+                &compiled.table_name_lower,
+                &pk_value,
+                fast,
+                ret_fast,
+                cancel,
+                bufs,
+            );
+        }
     }
 
     // Only the pk-lookup lane produces RETURNING rows; other plans fall back.

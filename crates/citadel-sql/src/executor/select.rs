@@ -4972,6 +4972,27 @@ enum PointSource {
     Param(usize),
 }
 
+fn resolve_point_key(sources: &[PointSource], schema: &TableSchema) -> Result<Option<Vec<u8>>> {
+    let mut values = sources
+        .iter()
+        .map(|source| match source {
+            PointSource::Literal(value) => Ok(value.clone()),
+            PointSource::Param(n) => crate::eval::resolve_scoped_param(*n),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for (value, &column) in values.iter_mut().zip(&schema.primary_key_columns) {
+        let Some((_, normalized)) = crate::planner::key_predicate(
+            schema.columns[column as usize].data_type,
+            BinOp::Eq,
+            value,
+        ) else {
+            return Ok(None);
+        };
+        *value = normalized;
+    }
+    Ok(Some(crate::encoding::encode_composite_key(&values)))
+}
+
 /// Every conjunct must be `pk_col = Literal|Parameter`, each pk col once.
 fn detect_pk_point_sources(
     where_expr: &Expr,
@@ -5207,14 +5228,23 @@ impl PkPointPlan {
     fn run(&self, rtx: &mut ReadTxn<'_>) -> Result<QueryResult> {
         let cancel = rtx.cancel_token().cloned();
         let cancel = cancel.as_ref();
-        let mut pk_values = Vec::with_capacity(self.pk_sources.len());
-        for s in &self.pk_sources {
-            pk_values.push(match s {
-                PointSource::Literal(v) => v.clone(),
-                PointSource::Param(n) => crate::eval::resolve_scoped_param(*n)?,
+        let Some(key) = resolve_point_key(&self.pk_sources, &self.table_schema)? else {
+            let (candidates, _) = super::scan::collect_rows_with_read_planned(
+                rtx,
+                &self.table_schema,
+                &Some(self.where_expr.clone()),
+                None,
+                crate::planner::ScanPlan::SeqScan,
+            )?;
+            let rows = candidates
+                .into_iter()
+                .map(|mut row| self.proj.project_decoded(&mut row, cancel))
+                .collect::<Result<_>>()?;
+            return Ok(QueryResult {
+                columns: self.columns.clone(),
+                rows,
             });
-        }
-        let key = crate::encoding::encode_composite_key(&pk_values);
+        };
         let rows = match rtx
             .table_get(self.table_lower.as_bytes(), &key)
             .map_err(SqlError::Storage)?
@@ -6060,15 +6090,11 @@ fn execute_cached_join_with_read(
     };
 
     let outer_schema = &plan.table_schemas[0];
-    let mut outer_rows = if let Some(sources) = &plan.outer_point {
-        let mut pk_values = Vec::with_capacity(sources.len());
-        for s in sources {
-            pk_values.push(match s {
-                PointSource::Literal(v) => v.clone(),
-                PointSource::Param(n) => crate::eval::resolve_scoped_param(*n)?,
-            });
-        }
-        let key = crate::encoding::encode_composite_key(&pk_values);
+    let outer_key = match &plan.outer_point {
+        Some(sources) => resolve_point_key(sources, outer_schema)?,
+        None => None,
+    };
+    let mut outer_rows = if let Some(key) = outer_key {
         match rtx
             .table_get(outer_schema.name.as_bytes(), &key)
             .map_err(SqlError::Storage)?

@@ -2,7 +2,70 @@
 
 use crate::encoding::encode_composite_key;
 use crate::parser::{BinOp, Expr};
-use crate::types::{IndexDef, IndexKey, IndexKind, InvertedKind, TableSchema, Value};
+use crate::types::{DataType, IndexDef, IndexKey, IndexKind, InvertedKind, TableSchema, Value};
+
+/// Normalize comparison bounds for typed key encoding.
+pub(crate) fn key_predicate(
+    data_type: DataType,
+    op: BinOp,
+    value: &Value,
+) -> Option<(BinOp, Value)> {
+    match (data_type, value) {
+        (DataType::Integer, Value::Real(v)) if v.is_finite() => {
+            if op == BinOp::Eq {
+                let i = *v as i64;
+                if i as f64 != *v
+                    || i.checked_sub(1).is_some_and(|n| n as f64 == *v)
+                    || i.checked_add(1).is_some_and(|n| n as f64 == *v)
+                {
+                    return None;
+                }
+                return Some((op, Value::Integer(i)));
+            }
+            if !is_range_op(op) {
+                return None;
+            }
+            let strict = matches!(op, BinOp::Gt | BinOp::LtEq);
+            let mut low = i64::MIN as i128;
+            let mut high = i64::MAX as i128 + 1;
+            while low < high {
+                let mid = low + (high - low) / 2;
+                let candidate = mid as i64 as f64;
+                if candidate > *v || (!strict && candidate == *v) {
+                    high = mid;
+                } else {
+                    low = mid + 1;
+                }
+            }
+            let bound = i64::try_from(low).ok()?;
+            let op = if matches!(op, BinOp::Gt | BinOp::GtEq) {
+                BinOp::GtEq
+            } else {
+                BinOp::Lt
+            };
+            Some((op, Value::Integer(bound)))
+        }
+        (DataType::Real, Value::Integer(v)) => {
+            key_predicate(data_type, op, &Value::Real(*v as f64))
+        }
+        (DataType::Real, Value::Real(v)) if !v.is_nan() => {
+            if *v == 0.0 {
+                // Both zero encodings compare equal; bracket the entire pair.
+                let bound = match op {
+                    BinOp::Gt | BinOp::LtEq => 0.0,
+                    BinOp::GtEq | BinOp::Lt => -0.0,
+                    _ => return None,
+                };
+                Some((op, Value::Real(bound)))
+            } else {
+                Some((op, value.clone()))
+            }
+        }
+        (_, Value::Null | Value::Real(_)) => None,
+        _ if data_type == value.data_type() => Some((op, value.clone())),
+        _ => None,
+    }
+}
 
 /// Canonical form of an expression for symbolic-equivalence matching against expression indexes.
 /// Strips table qualifiers, lowercases identifiers and function names, sorts commutative operands.
@@ -501,8 +564,8 @@ fn try_pk_range_scan(
     let conds: Vec<(BinOp, Value)> = range_preds
         .iter()
         .filter(|p| p.col_idx == pk_col)
-        .map(|p| (p.op, p.value.clone()))
-        .collect();
+        .map(|p| key_predicate(schema.columns[pk_col].data_type, p.op, &p.value))
+        .collect::<Option<_>>()?;
     if conds.is_empty() {
         return None;
     }
@@ -659,7 +722,9 @@ fn try_pk_lookup(schema: &TableSchema, predicates: &[Option<SimplePredicate>]) -
     for pred in predicates.iter().flatten() {
         if pred.op == BinOp::Eq {
             if let Some(pk_pos) = pk_cols.iter().position(|&c| c == pred.col_idx as u16) {
-                pk_values[pk_pos] = Some(pred.value.clone());
+                pk_values[pk_pos] =
+                    key_predicate(schema.columns[pred.col_idx].data_type, pred.op, &pred.value)
+                        .map(|(_, value)| value);
             }
         }
     }
@@ -753,6 +818,10 @@ fn try_expr_index_scan(
     }
 
     let value = matched?;
+    // Expression keys have no declared result type to normalize numeric probes.
+    if matches!(value, Value::Integer(_) | Value::Real(_)) {
+        return None;
+    }
     let score = IndexScore {
         num_equality: 1,
         has_range: false,
@@ -843,7 +912,12 @@ fn try_index_scan(
             }
             if let Some(sp) = pred {
                 if sp.col_idx == col_idx as usize && sp.op == BinOp::Eq {
-                    equality_values.push(fold_probe_value(sp.value.clone(), coll));
+                    let Some((_, value)) =
+                        key_predicate(schema.columns[col_idx as usize].data_type, sp.op, &sp.value)
+                    else {
+                        continue;
+                    };
+                    equality_values.push(fold_probe_value(value, coll));
                     used.push(i);
                     found_eq = true;
                     break;
@@ -857,7 +931,12 @@ fn try_index_scan(
                 }
                 if let Some(sp) = pred {
                     if sp.col_idx == col_idx as usize && is_range_op(sp.op) {
-                        range_conds.push((sp.op, fold_probe_value(sp.value.clone(), coll)));
+                        let (op, value) = key_predicate(
+                            schema.columns[col_idx as usize].data_type,
+                            sp.op,
+                            &sp.value,
+                        )?;
+                        range_conds.push((op, fold_probe_value(value, coll)));
                         used.push(i);
                     }
                 }

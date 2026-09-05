@@ -442,7 +442,8 @@ impl Hash for Value {
             }
             Value::Real(r) => {
                 1u8.hash(state);
-                r.to_bits().hash(state);
+                let bits = if *r == 0.0 { 0 } else { r.to_bits() };
+                bits.hash(state);
             }
             Value::Text(s) => {
                 2u8.hash(state);
