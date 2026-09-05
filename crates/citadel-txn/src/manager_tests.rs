@@ -583,7 +583,7 @@ fn crash_with_reclaimed_chain_pages_preserves_reader_and_durable_snapshot() {
             let last = state.reclaimed_pages.len() - 1;
             // Change only allocation order: put an already-eligible metadata
             // page first in the allocator's LIFO body allocation path.
-            state.reclaimed_pages.swap(tagged, last);
+            Arc::make_mut(&mut state.reclaimed_pages).swap(tagged, last);
             assert_eq!(
                 state
                     .reclaimed_pages
@@ -771,7 +771,7 @@ fn held_reader_pending_free_growth_is_linear_and_reuses_after_release() {
                 .flat_map(|page| pending_free::read_page_entries(page).unwrap())
                 .map(|entry| (entry.page_id, entry.freed_at_txn))
                 .collect();
-            for page in &state.reclaimed_pages {
+            for page in state.reclaimed_pages.iter() {
                 assert_eq!(state.retired_chain_pages.get(page), entries.get(page));
                 assert!(state.retired_chain_pages.contains_key(page));
             }
@@ -1688,6 +1688,52 @@ fn abort_and_noop_commit_do_not_leak_reclaimed_pages() {
         control.current_slot().high_water_mark,
         "aborted/no-op txns must not strand reclaimed pages"
     );
+}
+
+#[test]
+fn repeated_savepoint_rollback_preserves_the_reclaimed_loan_and_reader() {
+    let manager = create_test_manager();
+    let control = create_test_manager();
+    for manager in [&manager, &control] {
+        for _ in 0..4 {
+            commit_insert(manager, b"key", b"original");
+        }
+    }
+    let loan = manager.state.lock().reclaimed_pages.clone();
+    assert!(!loan.is_empty());
+    let before = manager.current_slot();
+    let mut reader = manager.begin_read();
+    let mut writer = manager.begin_write().unwrap();
+    let snapshot = writer.begin_savepoint();
+    for byte in 0..8 {
+        writer.insert(b"key", &vec![byte; 128 * 1024]).unwrap();
+        writer.restore_snapshot(snapshot.clone());
+        assert_eq!(
+            writer.get(b"key").unwrap().as_deref(),
+            Some(b"original".as_slice())
+        );
+        assert_eq!(writer.pending_free_count(), 0);
+    }
+    writer.commit().unwrap();
+    assert_eq!(manager.current_slot(), before);
+    assert_eq!(manager.state.lock().reclaimed_pages.as_ref(), loan.as_ref());
+    commit_insert(&manager, b"key", b"committed");
+    commit_insert(&control, b"key", b"committed");
+    assert_eq!(
+        manager.current_slot().high_water_mark,
+        control.current_slot().high_water_mark
+    );
+    manager.pool.lock().clear();
+    assert_eq!(
+        reader.get(b"key").unwrap().as_deref(),
+        Some(b"original".as_slice())
+    );
+    assert_eq!(
+        manager.begin_read().get(b"key").unwrap().as_deref(),
+        Some(b"committed".as_slice())
+    );
+    drop(reader);
+    assert!(manager.integrity_check().unwrap().is_ok());
 }
 
 /// Regression (Off commits persisted dirty pages with their pre-edit Merkle

@@ -374,9 +374,9 @@ struct ManagerState {
     /// refcounts: concurrent readers share a snapshot.
     reader_table: BTreeMap<TxnId, usize>,
     /// Reusable free pages, a RAM cache of the durable pending-free chain:
-    /// loaned to the writer by clone and re-derived every commit, so an
+    /// shared immutably with the writer and re-derived every commit, so an
     /// abort/no-op/shutdown never strands a page.
-    reclaimed_pages: Vec<PageId>,
+    reclaimed_pages: Arc<Vec<PageId>>,
     /// Known metadata retirements retain their durable age but need no data
     /// reader horizon. Empty on reopen: no pre-open reader can survive it.
     retired_chain_pages: FxHashMap<PageId, TxnId>,
@@ -500,7 +500,7 @@ impl TxnManager {
                 cached_god_byte: active_slot as u8 & GOD_BIT_ACTIVE_SLOT,
                 cached_file_size: file_size,
                 reader_table: BTreeMap::new(),
-                reclaimed_pages: Vec::new(),
+                reclaimed_pages: Arc::new(Vec::new()),
                 retired_chain_pages: FxHashMap::default(),
                 zeroed_up_to: TxnId(0),
                 zeroed_chain_up_to: TxnId(0),
@@ -618,7 +618,7 @@ impl TxnManager {
                 cached_god_byte: 0,
                 cached_file_size: file_size,
                 reader_table: BTreeMap::new(),
-                reclaimed_pages: Vec::new(),
+                reclaimed_pages: Arc::new(Vec::new()),
                 retired_chain_pages: FxHashMap::default(),
                 zeroed_up_to: TxnId(0),
                 zeroed_chain_up_to: TxnId(0),
@@ -713,17 +713,17 @@ impl TxnManager {
         let mut state = self.state.lock();
         let txn_id = TxnId(self.next_txn_id.fetch_add(1, Ordering::SeqCst));
         let snapshot = state.current_slot.clone();
-        // Loan the available batch by clone: state keeps ownership, and the
-        // pages stay listed in the durable pending-free chain until a commit
-        // records their consumption, so nothing is ever stranded.
-        let reclaimed = state.reclaimed_pages.clone();
+        // Keep the shared loan in state and the durable chain until a commit
+        // records its consumption.
+        let reclaimed =
+            (!state.reclaimed_pages.is_empty()).then(|| Arc::clone(&state.reclaimed_pages));
         let recycled = state.recycled_pages.take();
         drop(state);
 
-        let mut alloc = PageAllocator::new(snapshot.high_water_mark);
-        if !reclaimed.is_empty() {
-            alloc.add_ready_to_use(reclaimed);
-        }
+        let alloc = match reclaimed {
+            Some(pages) => PageAllocator::with_ready_pages(snapshot.high_water_mark, pages),
+            None => PageAllocator::new(snapshot.high_water_mark),
+        };
 
         let tree = BTree::from_existing(
             snapshot.tree_root,
@@ -1158,7 +1158,7 @@ impl TxnManager {
             state.cached_file_size = new_file_size;
             // Availability is re-derived from the durable chain every commit,
             // so an abort, no-op commit, or shutdown strands nothing.
-            state.reclaimed_pages = available.iter().map(|entry| entry.page_id).collect();
+            state.reclaimed_pages = Arc::new(available.iter().map(|entry| entry.page_id).collect());
             state.retired_chain_pages = retired_chain_pages;
             if let Some((watermark, chain_watermark)) = zeroed_watermark {
                 state.zeroed_up_to = watermark;
