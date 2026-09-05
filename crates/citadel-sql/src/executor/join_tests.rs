@@ -729,3 +729,32 @@ fn numeric_join_paths_preserve_repeated_projected_columns() {
         true,
     );
 }
+
+#[test]
+fn interval_probe_hashes_normalize_before_collation_folding() {
+    for (left, right) in [
+        ((1, 0, 0), (0, 30, 0)),
+        ((0, 1, 0), (0, 0, 86_400_000_000)),
+        ((1, -30, 0), (0, 0, 0)),
+        ((i32::MAX - 1, 0, i64::MAX), (i32::MAX, -30, i64::MAX)),
+        ((i32::MIN + 1, 0, i64::MIN), (i32::MIN, 30, i64::MIN)),
+    ] {
+        let value = |(months, days, micros)| Value::Interval {
+            months,
+            days,
+            micros,
+        };
+        let left = vec![value(left), i(7)];
+        let right = vec![value(right), i(7)];
+        for collation in [Collation::Binary, Collation::NoCase, Collation::Rtrim] {
+            assert!(crate::eval::collated_eq(&left[0], &right[0], Some(collation)).unwrap());
+            for columns in [&[0][..], &[0, 1][..]] {
+                assert_eq!(
+                    join_key_hash(&left, columns, &[collation, Collation::Binary]),
+                    join_key_hash(&right, columns, &[collation, Collation::Binary]),
+                    "{left:?}/{right:?}, {collation:?}, {columns:?}"
+                );
+            }
+        }
+    }
+}

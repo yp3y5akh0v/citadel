@@ -195,6 +195,16 @@ pub(super) fn join_key_hash(
     let mut state = FxHasher::default();
     col_indices.len().hash(&mut state);
     for (k, &i) in col_indices.iter().enumerate() {
+        if let Value::Interval {
+            months,
+            days,
+            micros,
+        } = &row[i]
+        {
+            8u8.hash(&mut state);
+            crate::datetime::interval_to_total_micros(*months, *days, *micros).hash(&mut state);
+            continue;
+        }
         match key_colls.get(k) {
             Some(Collation::NoCase | Collation::Rtrim) => {
                 key_colls[k].fold(row[i].clone()).hash(&mut state);
