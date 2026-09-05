@@ -145,6 +145,108 @@ fn jsonb_contains_bytes_missing_key_returns_false() {
 }
 
 #[test]
+fn containment_preserves_container_structure_on_all_paths() {
+    let cases = [
+        ("[1,2,3]", "[3,1,1]", true),
+        ("[1,2,3]", "[]", true),
+        ("[]", "[1]", false),
+        ("[[1,2]]", "[1]", false),
+        ("[1,2,[1,3]]", "[1,3]", false),
+        ("[1,2,[1,3]]", "[[1,3]]", true),
+        ("[[1,2]]", "[[2]]", true),
+        ("[[[1]]]", "[[1]]", false),
+        ("[[1]]", "[[[1]]]", false),
+        ("[[1]]", "[[]]", true),
+        ("[1]", "[[]]", false),
+        (r#"[{"a":1}]"#, r#"{"a":1}"#, false),
+        (r#"[{"a":1,"b":2}]"#, r#"{"a":1}"#, false),
+        (r#"[{"a":1,"b":2}]"#, r#"[{"a":1}]"#, true),
+        (r#"[{"a":1},{"b":2}]"#, r#"[{"a":1,"b":2}]"#, false),
+        (r#"[[{"a":1}]]"#, r#"[{"a":1}]"#, false),
+        (r#"[{"a":1}]"#, r#"[[{"a":1}]]"#, false),
+        (r#"[{"a":1}]"#, "{}", false),
+        (r#"[{"a":1}]"#, "[{}]", true),
+        (r#"{"a":1}"#, "{}", true),
+        (r#"{"a":1}"#, "[]", false),
+        (r#"{"a":[1,2]}"#, r#"{"a":1}"#, false),
+        (r#"{"a":[1,2]}"#, r#"{"a":[1]}"#, true),
+        (r#"{"a":[{"b":1}]}"#, r#"{"a":{"b":1}}"#, false),
+        (r#"{"a":[{"b":1}]}"#, r#"{"a":[{"b":1}]}"#, true),
+        (r#"{"foo":{"bar":"baz"}}"#, r#"{"bar":"baz"}"#, false),
+        (r#"{"foo":{"bar":"baz"}}"#, r#"{"foo":{}}"#, true),
+        (r#"["foo","bar"]"#, r#""bar""#, true),
+        (r#""bar""#, r#"["bar"]"#, false),
+        (r#"[["bar"]]"#, r#""bar""#, false),
+        ("[1,2]", "1", true),
+        ("[[1,2]]", "1", false),
+        ("[true,false]", "true", true),
+        ("[[true]]", "true", false),
+        ("[null]", "null", true),
+        ("[[null]]", "null", false),
+        ("null", "null", true),
+        ("1", "1", true),
+        ("1.5", "1.5", true),
+        ("1", r#""1""#, false),
+    ];
+    let token = CancelToken::new();
+    let mut failures = Vec::new();
+    for (left, right, expected) in cases {
+        let left_json = Value::Json(left.into());
+        let right_json = Value::Json(right.into());
+        let left_jsonb = text_to_jsonb(left).unwrap();
+        let right_jsonb = text_to_jsonb(right).unwrap();
+        for (lhs, rhs) in [
+            (&left_json, &right_json),
+            (&left_jsonb, &right_jsonb),
+            (&left_json, &right_jsonb),
+            (&left_jsonb, &right_json),
+        ] {
+            for cancel in [None, Some(&token)] {
+                for (operator, actual) in [
+                    ("@>", op_contains_with_cancel(lhs, rhs, cancel).unwrap()),
+                    ("<@", op_contained_by_with_cancel(rhs, lhs, cancel).unwrap()),
+                ] {
+                    if actual != Value::Boolean(expected) {
+                        failures.push(format!(
+                            "{left} @> {right}: expected {expected}, got {actual:?} \
+                             ({operator}, lhs_jsonb={}, rhs_jsonb={}, cancel={})",
+                            matches!(lhs, Value::Jsonb(_)),
+                            matches!(rhs, Value::Jsonb(_)),
+                            cancel.is_some(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    assert!(!token.is_cancelled());
+}
+
+#[test]
+fn containment_array_scan_remains_cancellable() {
+    let left = serde_json::json!(vec!["a"; 1024]);
+    let right = serde_json::json!("missing");
+    let mut left_bytes = Vec::new();
+    let mut right_bytes = Vec::new();
+    encode_canonical(&left, &mut left_bytes).unwrap();
+    encode_canonical(&right, &mut right_bytes).unwrap();
+    for encoded in [false, true] {
+        let token = CancelToken::new();
+        let _guard = cancel_json_after(token.clone(), 32);
+        let result = if encoded {
+            jsonb_contains_bytes_with_cancel(&left_bytes, &right_bytes, Some(&token))
+        } else {
+            run_json_work(Some(&token), |work| {
+                json_contains_with_work(&left, &right, work)
+            })
+        };
+        assert_interrupted(result);
+        assert!(token.is_cancelled());
+    }
+}
+
+#[test]
 fn find_object_key_streaming_returns_slice() {
     let v = text_to_jsonb(r#"{"role":"admin","name":"alice"}"#).unwrap();
     let bytes = match &v {

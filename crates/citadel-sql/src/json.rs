@@ -703,7 +703,9 @@ pub fn jsonb_contains_bytes(lhs: &[u8], rhs: &[u8]) -> Result<bool> {
                     let lv_total = skip_value(&lpay[lv_start..])?;
                     if lk == rk {
                         let lv = &lpay[lv_start..lv_start + lv_total];
-                        if !jsonb_contains_bytes(lv, rv)? {
+                        if read_header(lv)?.0 != read_header(rv)?.0
+                            || !jsonb_contains_bytes(lv, rv)?
+                        {
                             return Ok(false);
                         }
                         found = true;
@@ -723,12 +725,13 @@ pub fn jsonb_contains_bytes(lhs: &[u8], rhs: &[u8]) -> Result<bool> {
             while rp < rpay.len() {
                 let rv_total = skip_value(&rpay[rp..])?;
                 let rv = &rpay[rp..rp + rv_total];
+                let rv_type = read_header(rv)?.0;
                 let mut lp = 0usize;
                 let mut found = false;
                 while lp < lpay.len() {
                     let lv_total = skip_value(&lpay[lp..])?;
                     let lv = &lpay[lp..lp + lv_total];
-                    if jsonb_contains_bytes(lv, rv)? {
+                    if read_header(lv)?.0 == rv_type && jsonb_contains_bytes(lv, rv)? {
                         found = true;
                         break;
                     }
@@ -741,6 +744,7 @@ pub fn jsonb_contains_bytes(lhs: &[u8], rhs: &[u8]) -> Result<bool> {
             }
             Ok(true)
         }
+        (JsonbType::Array, JsonbType::Object) => Ok(false),
         (JsonbType::Array, _) => {
             let r_total = rps + rpl;
             let r_full = &rhs[..r_total];
@@ -1067,7 +1071,9 @@ fn jsonb_contains_bytes_with_work(
                     if bytes_equal_with_work(left_key, key, work)? {
                         let left_value =
                             &left_payload[left_value_start..left_value_start + left_value_total];
-                        if !jsonb_contains_bytes_with_work(left_value, right_value, work)? {
+                        if read_header(left_value)?.0 != read_header(right_value)?.0
+                            || !jsonb_contains_bytes_with_work(left_value, right_value, work)?
+                        {
                             return Ok(false);
                         }
                         found = true;
@@ -1088,13 +1094,16 @@ fn jsonb_contains_bytes_with_work(
                 work.tick()?;
                 let right_value_total = skip_value(&right_payload[right_pos..])?;
                 let right_value = &right_payload[right_pos..right_pos + right_value_total];
+                let right_value_type = read_header(right_value)?.0;
                 let mut left_pos = 0usize;
                 let mut found = false;
                 while left_pos < left_payload.len() {
                     work.tick()?;
                     let left_value_total = skip_value(&left_payload[left_pos..])?;
                     let left_value = &left_payload[left_pos..left_pos + left_value_total];
-                    if jsonb_contains_bytes_with_work(left_value, right_value, work)? {
+                    if read_header(left_value)?.0 == right_value_type
+                        && jsonb_contains_bytes_with_work(left_value, right_value, work)?
+                    {
                         found = true;
                         break;
                     }
@@ -1107,6 +1116,7 @@ fn jsonb_contains_bytes_with_work(
             }
             Ok(true)
         }
+        (JsonbType::Array, JsonbType::Object) => Ok(false),
         (JsonbType::Array, _) => {
             let right_total = right_payload_start + right_payload_len;
             let right_full = &right[..right_total];
@@ -2951,13 +2961,18 @@ fn navigate_mut_with_work<'a>(
 
 fn json_contains(left: &serde_json::Value, right: &serde_json::Value) -> bool {
     match (left, right) {
-        (serde_json::Value::Object(a), serde_json::Value::Object(b)) => b
-            .iter()
-            .all(|(k, v)| a.get(k).is_some_and(|av| json_contains(av, v))),
-        (serde_json::Value::Array(a), serde_json::Value::Array(b)) => {
-            b.iter().all(|bv| a.iter().any(|av| json_contains(av, bv)))
-        }
-        (serde_json::Value::Array(a), other) => a.iter().any(|av| json_contains(av, other)),
+        (serde_json::Value::Object(a), serde_json::Value::Object(b)) => b.iter().all(|(k, v)| {
+            a.get(k).is_some_and(|av| {
+                std::mem::discriminant(av) == std::mem::discriminant(v) && json_contains(av, v)
+            })
+        }),
+        (serde_json::Value::Array(a), serde_json::Value::Array(b)) => b.iter().all(|bv| {
+            a.iter().any(|av| {
+                std::mem::discriminant(av) == std::mem::discriminant(bv) && json_contains(av, bv)
+            })
+        }),
+        (serde_json::Value::Array(_), serde_json::Value::Object(_)) => false,
+        (serde_json::Value::Array(a), other) => a.contains(other),
         (a, b) => a == b,
     }
 }
@@ -3544,7 +3559,9 @@ fn json_contains_with_work(
                 let Some(left_value) = left.get(key) else {
                     return Ok(false);
                 };
-                if !json_contains_with_work(left_value, right_value, work)? {
+                if std::mem::discriminant(left_value) != std::mem::discriminant(right_value)
+                    || !json_contains_with_work(left_value, right_value, work)?
+                {
                     return Ok(false);
                 }
             }
@@ -3556,7 +3573,9 @@ fn json_contains_with_work(
                 let mut found = false;
                 for left_value in left {
                     work.tick()?;
-                    if json_contains_with_work(left_value, right_value, work)? {
+                    if std::mem::discriminant(left_value) == std::mem::discriminant(right_value)
+                        && json_contains_with_work(left_value, right_value, work)?
+                    {
                         found = true;
                         break;
                     }
@@ -3567,10 +3586,13 @@ fn json_contains_with_work(
             }
             Ok(true)
         }
+        (serde_json::Value::Array(_), serde_json::Value::Object(_)) => Ok(false),
         (serde_json::Value::Array(left), right) => {
             for left_value in left {
                 work.tick()?;
-                if json_contains_with_work(left_value, right, work)? {
+                if std::mem::discriminant(left_value) == std::mem::discriminant(right)
+                    && json_contains_with_work(left_value, right, work)?
+                {
                     return Ok(true);
                 }
             }

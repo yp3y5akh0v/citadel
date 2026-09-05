@@ -3345,14 +3345,13 @@ impl MemoryEngine {
             predicates.push(format!("kind IN ({})", placeholders.join(", ")));
         }
         params.push(Value::Timestamp(now_micros()));
+        let ttl_param = params.len();
         predicates.push(format!(
             "(expires_at IS NULL OR expires_at > ${})",
-            params.len()
+            ttl_param
         ));
         if !q.include_superseded {
-            predicates.push(
-                "id NOT IN (SELECT dst_id FROM memory_edges WHERE kind = 'supersedes')".into(),
-            );
+            predicates.push(live_supersession_exclusion(&h.table, 2, ttl_param));
         }
         let qr = conn.query_params(
             &format!(
@@ -6978,14 +6977,7 @@ impl MemoryEngine {
             ttl_param
         ));
         if !q.include_superseded {
-            where_parts.push(format!(
-                "id NOT IN (SELECT e.dst_id FROM memory_edges e \
-                 JOIN {table} src ON src.id = e.src_id \
-                 JOIN {table} dst ON dst.id = e.dst_id \
-                 WHERE e.kind = 'supersedes' AND src.region_id = $2 AND dst.region_id = $2 \
-                 AND (src.expires_at IS NULL OR src.expires_at > ${ttl_param}) \
-                 AND (dst.expires_at IS NULL OR dst.expires_at > ${ttl_param}))"
-            ));
+            where_parts.push(live_supersession_exclusion(&table, 2, ttl_param));
         }
 
         // Over-fetch trades query latency for better ranking of keyword/recency
@@ -11019,15 +11011,34 @@ fn assign_bm25_ranks(
     Ok(())
 }
 
+fn live_supersession_exclusion(table: &str, region_param: usize, ttl_param: usize) -> String {
+    format!(
+        "id NOT IN (SELECT e.dst_id FROM memory_edges e \
+         JOIN {table} src ON src.id = e.src_id \
+         JOIN {table} dst ON dst.id = e.dst_id \
+         WHERE e.kind = 'supersedes' AND src.region_id = ${region_param} \
+         AND dst.region_id = ${region_param} \
+         AND (src.expires_at IS NULL OR src.expires_at > ${ttl_param}) \
+         AND (dst.expires_at IS NULL OR dst.expires_at > ${ttl_param}))"
+    )
+}
+
 /// JSONB `@>` containment: every member of `needle` is present in `haystack`.
 fn json_contains(haystack: &serde_json::Value, needle: &serde_json::Value) -> bool {
     use serde_json::Value as J;
     match (haystack, needle) {
-        (J::Object(h), J::Object(n)) => n
-            .iter()
-            .all(|(k, nv)| h.get(k).is_some_and(|hv| json_contains(hv, nv))),
-        (J::Array(h), J::Array(n)) => n.iter().all(|ne| h.iter().any(|he| json_contains(he, ne))),
-        (J::Array(h), ne) => h.iter().any(|he| json_contains(he, ne)),
+        (J::Object(h), J::Object(n)) => n.iter().all(|(k, nv)| {
+            h.get(k).is_some_and(|hv| {
+                std::mem::discriminant(hv) == std::mem::discriminant(nv) && json_contains(hv, nv)
+            })
+        }),
+        (J::Array(h), J::Array(n)) => n.iter().all(|ne| {
+            h.iter().any(|he| match (he, ne) {
+                (J::Object(_), J::Object(_)) | (J::Array(_), J::Array(_)) => json_contains(he, ne),
+                _ => he == ne,
+            })
+        }),
+        (J::Array(h), ne) if !ne.is_object() => h.contains(ne),
         (a, b) => a == b,
     }
 }
