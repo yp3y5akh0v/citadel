@@ -84,6 +84,7 @@ struct CompiledFastPath {
     num_pk_cols: usize,
     num_columns: usize,
     single_int_pk: bool,
+    strict: bool,
     targets: Vec<CompiledTarget>,
     scan_plan: crate::planner::ScanPlan,
     pk_idx_cache: Vec<usize>,
@@ -121,6 +122,7 @@ struct GenColPatch {
     phys_idx: usize,
     expr: Expr,
     col: ColumnDef,
+    strict: bool,
     fast_eval: FastGenEval,
 }
 
@@ -474,6 +476,7 @@ fn compute_gen_col_targets(
             phys_idx,
             expr,
             col: (*c).clone(),
+            strict: table_schema.is_strict(),
             fast_eval,
         });
     }
@@ -562,19 +565,14 @@ fn pk_range_patch_safe(set_cols: &[ColumnDef], gen_cols: &[ColumnDef]) -> bool {
         .all(|c| !c.nullable && is_fixed_width_type(c.data_type))
 }
 
-fn coerce_gen_value(val: Value, col: &ColumnDef) -> Result<Value> {
+fn coerce_update_value(val: Value, col: &ColumnDef, strict: bool) -> Result<Value> {
     if val.is_null() {
         if !col.nullable {
             return Err(SqlError::NotNullViolation(col.name.clone()));
         }
         Ok(Value::Null)
     } else {
-        let got_type = val.data_type();
-        val.coerce_into(col.data_type)
-            .ok_or_else(|| SqlError::TypeMismatch {
-                expected: col.data_type.to_string(),
-                got: got_type.to_string(),
-            })
+        coerce_for_column(val, col, strict)
     }
 }
 
@@ -593,7 +591,7 @@ fn apply_gen_col_patches_slice(
     decode_cols_into(value, gen_extra_cols, partial_row)?;
     for gp in gen_targets {
         let raw = eval_fast_gen_with_cancel(&gp.fast_eval, &gp.expr, partial_row, col_map, cancel)?;
-        let coerced = coerce_gen_value(raw, &gp.col)?;
+        let coerced = coerce_update_value(raw, &gp.col, gp.strict)?;
         partial_row[gp.schema_idx] = coerced.clone();
         if !patch_column_in_place(value, gp.phys_idx, &coerced)? {
             patch_row_column(value, gp.phys_idx, &coerced, patch_buf)?;
@@ -618,7 +616,7 @@ fn apply_gen_col_patches_vec(
     decode_cols_into(value, gen_extra_cols, partial_row)?;
     for gp in gen_targets {
         let raw = eval_fast_gen_with_cancel(&gp.fast_eval, &gp.expr, partial_row, col_map, cancel)?;
-        let coerced = coerce_gen_value(raw, &gp.col)?;
+        let coerced = coerce_update_value(raw, &gp.col, gp.strict)?;
         partial_row[gp.schema_idx] = coerced.clone();
         if !patch_column_in_place(value, gp.phys_idx, &coerced)? {
             patch_row_column(value, gp.phys_idx, &coerced, patch_buf)?;
@@ -1187,6 +1185,7 @@ fn compile_update_impl(schema: &SchemaManager, stmt: &UpdateStmt) -> Result<Comp
                     num_pk_cols,
                     num_columns: table_schema.columns.len(),
                     single_int_pk,
+                    strict: table_schema.is_strict(),
                     targets,
                     scan_plan: plan,
                     pk_idx_cache: pk_indices.to_vec(),
@@ -1236,6 +1235,7 @@ fn exec_update_compiled(
     }
 
     let fast = compiled.fast.as_ref().unwrap();
+    let strict = fast.strict;
     let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
     let cancel = wtx.cancel_token().cloned();
     let cancel = cancel.as_ref();
@@ -1380,13 +1380,7 @@ fn exec_update_compiled(
                         }
                         Value::Null
                     } else {
-                        let got_type = new_val.data_type();
-                        new_val.coerce_into(target.col.data_type).ok_or_else(|| {
-                            SqlError::TypeMismatch {
-                                expected: target.col.data_type.to_string(),
-                                got: got_type.to_string(),
-                            }
-                        })?
+                        coerce_for_column(new_val, &target.col, strict)?
                     };
                     if !patch_at_offset(value, bufs.offsets[i], &coerced)?
                         && !patch_column_in_place(value, target.phys_idx, &coerced)?
@@ -1693,13 +1687,7 @@ pub(super) fn exec_update(
                             }
                             Value::Null
                         } else {
-                            let got_type = new_val.data_type();
-                            new_val.coerce_into(target.col.data_type).ok_or_else(|| {
-                                SqlError::TypeMismatch {
-                                    expected: target.col.data_type.to_string(),
-                                    got: got_type.to_string(),
-                                }
-                            })?
+                            coerce_for_column(new_val, &target.col, strict)?
                         };
                         if !patch_column_in_place(value, target.phys_idx, &coerced)? {
                             patch_row_column(value, target.phys_idx, &coerced, &mut patch_buf)?;
@@ -1816,13 +1804,7 @@ pub(super) fn exec_update(
                     }
                     Value::Null
                 } else {
-                    let got_type = new_val.data_type();
-                    new_val.coerce_into(target.col.data_type).ok_or_else(|| {
-                        SqlError::TypeMismatch {
-                            expected: target.col.data_type.to_string(),
-                            got: got_type.to_string(),
-                        }
-                    })?
+                    coerce_for_column(new_val, &target.col, strict)?
                 };
                 if !patch_column_in_place(raw_value, target.phys_idx, &coerced)? {
                     patch_row_column(raw_value, target.phys_idx, &coerced, &mut patch_buf)?;
@@ -1936,12 +1918,7 @@ pub(super) fn exec_update(
                 }
                 Value::Null
             } else {
-                let got_type = val.data_type();
-                val.coerce_into(col.data_type)
-                    .ok_or_else(|| SqlError::TypeMismatch {
-                        expected: col.data_type.to_string(),
-                        got: got_type.to_string(),
-                    })?
+                coerce_for_column(val, col, strict)?
             };
         }
 
@@ -2921,6 +2898,7 @@ fn exec_update_in_txn_compiled(
         Some(f) => f,
         None => return exec_update_in_txn(wtx, schema, stmt),
     };
+    let strict = fast.strict;
     let cancel = wtx.cancel_token().cloned();
     let cancel = cancel.as_ref();
 
@@ -3038,7 +3016,7 @@ fn exec_update_in_txn_compiled(
                 decode_cols_into(value, rhs_extra_cols, partial_row)?;
                 for target in targets {
                     let new_val = compiled_target_eval(target, partial_row, col_map, cancel)?;
-                    let coerced = coerce_gen_value(new_val, &target.col)?;
+                    let coerced = coerce_update_value(new_val, &target.col, strict)?;
                     if !patch_column_in_place(value, target.phys_idx, &coerced)? {
                         patch_row_column(value, target.phys_idx, &coerced, patch_buf)?;
                         value[..patch_buf.len()].copy_from_slice(patch_buf);
@@ -3091,7 +3069,7 @@ fn exec_update_in_txn_compiled(
         }
         for target in targets {
             let new_val = compiled_target_eval(target, partial_row, col_map, cancel)?;
-            let coerced = coerce_gen_value(new_val, &target.col)?;
+            let coerced = coerce_update_value(new_val, &target.col, strict)?;
             if !patch_column_in_place(&mut raw_value, target.phys_idx, &coerced)? {
                 patch_row_column(&raw_value, target.phys_idx, &coerced, patch_buf)?;
                 std::mem::swap(&mut raw_value, patch_buf);
@@ -3190,7 +3168,7 @@ fn exec_update_in_txn_compiled(
         }
         for target in targets {
             let new_val = compiled_target_eval(target, partial_row, col_map, cancel)?;
-            let coerced = coerce_gen_value(new_val, &target.col)?;
+            let coerced = coerce_update_value(new_val, &target.col, strict)?;
             if !patch_column_in_place(raw_value, target.phys_idx, &coerced)? {
                 patch_row_column(raw_value, target.phys_idx, &coerced, patch_buf)?;
                 std::mem::swap(raw_value, patch_buf);
@@ -3260,7 +3238,7 @@ fn exec_pk_lookup_update(
     decode_cols_into(&raw_value, &fast.rhs_extra_cols, partial_row)?;
     for target in targets {
         let new_val = compiled_target_eval(target, partial_row, col_map, cancel)?;
-        let coerced = coerce_gen_value(new_val, &target.col)?;
+        let coerced = coerce_update_value(new_val, &target.col, fast.strict)?;
         if !patch_column_in_place(&mut raw_value, target.phys_idx, &coerced)? {
             patch_row_column(&raw_value, target.phys_idx, &coerced, patch_buf)?;
             std::mem::swap(&mut raw_value, patch_buf);
@@ -3345,6 +3323,7 @@ fn try_fast_update_in_txn(
     table_schema: &TableSchema,
     col_map: &ColumnMap,
 ) -> Result<Option<ExecutionResult>> {
+    let strict = table_schema.is_strict();
     let cancel = wtx.cancel_token().cloned();
     let cancel = cancel.as_ref();
     let lower_name = stmt.table.to_ascii_lowercase();
@@ -3483,7 +3462,7 @@ fn try_fast_update_in_txn(
                         &target.expr,
                         &EvalCtx::new(col_map, &partial_row).with_cancel(cancel),
                     )?;
-                    let coerced = coerce_gen_value(new_val, &target.col)?;
+                    let coerced = coerce_update_value(new_val, &target.col, strict)?;
                     if !patch_column_in_place(value, target.phys_idx, &coerced)? {
                         patch_row_column(value, target.phys_idx, &coerced, &mut patch_buf)?;
                         value[..patch_buf.len()].copy_from_slice(&patch_buf);
@@ -3585,7 +3564,7 @@ fn try_fast_update_in_txn(
                 &target.expr,
                 &EvalCtx::new(col_map, &partial_row).with_cancel(cancel),
             )?;
-            let coerced = coerce_gen_value(new_val, &target.col)?;
+            let coerced = coerce_update_value(new_val, &target.col, strict)?;
             if !patch_column_in_place(raw_value, target.phys_idx, &coerced)? {
                 patch_row_column(raw_value, target.phys_idx, &coerced, &mut patch_buf)?;
                 std::mem::swap(raw_value, &mut patch_buf);
@@ -3756,12 +3735,7 @@ pub(super) fn exec_update_in_txn(
                 }
                 Value::Null
             } else {
-                let got_type = val.data_type();
-                val.coerce_into(col.data_type)
-                    .ok_or_else(|| SqlError::TypeMismatch {
-                        expected: col.data_type.to_string(),
-                        got: got_type.to_string(),
-                    })?
+                coerce_for_column(val, col, strict)?
             };
         }
 

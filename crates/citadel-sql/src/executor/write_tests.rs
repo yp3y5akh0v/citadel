@@ -102,23 +102,32 @@ fn pk_range_patch_safe_nullable_column_makes_unsafe() {
 }
 
 #[test]
-fn coerce_gen_value_null_into_nullable_column_ok() {
+fn coerce_update_value_null_into_nullable_column_ok() {
     let c = col("v", DataType::Integer, true);
-    let v = coerce_gen_value(Value::Null, &c).unwrap();
-    assert!(matches!(v, Value::Null));
+    for strict in [false, true] {
+        let v = coerce_update_value(Value::Null, &c, strict).unwrap();
+        assert!(matches!(v, Value::Null));
+    }
 }
 
 #[test]
-fn coerce_gen_value_null_into_not_null_column_errors() {
+fn coerce_update_value_null_into_not_null_column_errors() {
     let c = col("v", DataType::Integer, false);
-    assert!(coerce_gen_value(Value::Null, &c).is_err());
+    for strict in [false, true] {
+        assert!(matches!(
+            coerce_update_value(Value::Null, &c, strict),
+            Err(SqlError::NotNullViolation(_))
+        ));
+    }
 }
 
 #[test]
-fn coerce_gen_value_int_to_real_succeeds() {
+fn coerce_update_value_int_to_real_succeeds() {
     let c = col("v", DataType::Real, false);
-    let v = coerce_gen_value(i(7), &c).unwrap();
-    assert!(matches!(v, Value::Real(_)));
+    for strict in [false, true] {
+        let v = coerce_update_value(i(7), &c, strict).unwrap();
+        assert!(matches!(v, Value::Real(7.0)));
+    }
 }
 
 #[test]

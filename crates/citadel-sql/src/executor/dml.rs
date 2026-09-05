@@ -1778,6 +1778,7 @@ fn exec_insert_in_txn_impl(
     let table_schema = schema
         .get(&stmt.table)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
+    let strict = table_schema.is_strict();
     if table_schema.has_ann_index() {
         super::ann_persist::purge_segment(wtx, &table_schema.name)?;
     }
@@ -2023,13 +2024,11 @@ fn exec_insert_in_txn_impl(
                             } else if v.data_type() == *target {
                                 v.clone()
                             } else {
-                                let got = v.data_type();
-                                v.clone().coerce_into(*target).ok_or_else(|| {
-                                    SqlError::TypeMismatch {
-                                        expected: target.to_string(),
-                                        got: got.to_string(),
-                                    }
-                                })?
+                                coerce_for_column(
+                                    v.clone(),
+                                    &table_schema.columns[*col_idx],
+                                    strict,
+                                )?
                             };
                         }
                         BindAction::Literal { value, col_idx } => {
@@ -2057,16 +2056,7 @@ fn exec_insert_in_txn_impl(
                     };
                     let col_idx = bufs.col_indices[i];
                     let col = &table_schema.columns[col_idx];
-                    let got_type = val.data_type();
-                    bufs.row[col_idx] = if val.is_null() {
-                        Value::Null
-                    } else {
-                        val.coerce_into(col.data_type)
-                            .ok_or_else(|| SqlError::TypeMismatch {
-                                expected: col.data_type.to_string(),
-                                got: got_type.to_string(),
-                            })?
-                    };
+                    bufs.row[col_idx] = coerce_for_column(val, col, strict)?;
                 }
             }
         } else if let Some(sel) = sel_rows {
@@ -2074,17 +2064,7 @@ fn exec_insert_in_txn_impl(
             for (i, val) in sel_row.iter().enumerate() {
                 let col_idx = bufs.col_indices[i];
                 let col = &table_schema.columns[col_idx];
-                let got_type = val.data_type();
-                bufs.row[col_idx] = if val.is_null() {
-                    Value::Null
-                } else {
-                    val.clone().coerce_into(col.data_type).ok_or_else(|| {
-                        SqlError::TypeMismatch {
-                            expected: col.data_type.to_string(),
-                            got: got_type.to_string(),
-                        }
-                    })?
-                };
+                bufs.row[col_idx] = coerce_for_column(val.clone(), col, strict)?;
             }
         }
 
@@ -2093,13 +2073,7 @@ fn exec_insert_in_txn_impl(
                 let val = eval_const_expr_with_cancel(def_expr, cancel.as_ref())?;
                 let col = &table_schema.columns[pos];
                 if !val.is_null() {
-                    let got_type = val.data_type();
-                    bufs.row[pos] =
-                        val.coerce_into(col.data_type)
-                            .ok_or_else(|| SqlError::TypeMismatch {
-                                expected: col.data_type.to_string(),
-                                got: got_type.to_string(),
-                            })?;
+                    bufs.row[pos] = coerce_for_column(val, col, strict)?;
                 }
             }
         }
@@ -2120,16 +2094,7 @@ fn exec_insert_in_txn_impl(
                         cancel.as_ref(),
                     )?;
                     let col = &table_schema.columns[pos];
-                    bufs.row[pos] = if val.is_null() {
-                        Value::Null
-                    } else {
-                        let got_type = val.data_type();
-                        val.coerce_into(col.data_type)
-                            .ok_or_else(|| SqlError::TypeMismatch {
-                                expected: col.data_type.to_string(),
-                                got: got_type.to_string(),
-                            })?
-                    };
+                    bufs.row[pos] = coerce_for_column(val, col, strict)?;
                 }
             } else {
                 for (pos, gen_expr, fast) in &generated_cols_uncached {
@@ -2141,16 +2106,7 @@ fn exec_insert_in_txn_impl(
                         cancel.as_ref(),
                     )?;
                     let col = &table_schema.columns[*pos];
-                    bufs.row[*pos] = if val.is_null() {
-                        Value::Null
-                    } else {
-                        let got_type = val.data_type();
-                        val.coerce_into(col.data_type)
-                            .ok_or_else(|| SqlError::TypeMismatch {
-                                expected: col.data_type.to_string(),
-                                got: got_type.to_string(),
-                            })?
-                    };
+                    bufs.row[*pos] = coerce_for_column(val, col, strict)?;
                 }
             }
         }
@@ -3229,16 +3185,7 @@ fn apply_do_update_fused(
                         .with_cancel(cancel);
                     let val = eval_expr(expr, &ctx)?;
                     let col = &table_schema.columns[*col_idx];
-                    new_row[*col_idx] = if val.is_null() {
-                        Value::Null
-                    } else {
-                        let got = val.data_type();
-                        val.coerce_into(col.data_type)
-                            .ok_or_else(|| SqlError::TypeMismatch {
-                                expected: col.data_type.to_string(),
-                                got: got.to_string(),
-                            })?
-                    };
+                    new_row[*col_idx] = coerce_for_column(val, col, table_schema.is_strict())?;
                 }
 
                 for (assigned_idx, _) in assignments {
@@ -3391,16 +3338,7 @@ fn apply_do_update_with_old_row(
             EvalCtx::with_excluded(col_map, old_row, col_map, proposed_row).with_cancel(cancel);
         let val = eval_expr(expr, &ctx)?;
         let col = &table_schema.columns[*col_idx];
-        new_row[*col_idx] = if val.is_null() {
-            Value::Null
-        } else {
-            let got = val.data_type();
-            val.coerce_into(col.data_type)
-                .ok_or_else(|| SqlError::TypeMismatch {
-                    expected: col.data_type.to_string(),
-                    got: got.to_string(),
-                })?
-        };
+        new_row[*col_idx] = coerce_for_column(val, col, table_schema.is_strict())?;
     }
 
     for col in &table_schema.columns {
@@ -3419,12 +3357,7 @@ fn apply_do_update_with_old_row(
                 }
                 Value::Null
             } else {
-                let got = val.data_type();
-                val.coerce_into(col.data_type)
-                    .ok_or_else(|| SqlError::TypeMismatch {
-                        expected: col.data_type.to_string(),
-                        got: got.to_string(),
-                    })?
+                coerce_for_column(val, col, table_schema.is_strict())?
             };
         }
     }
@@ -3734,8 +3667,7 @@ fn compile_on_conflict(oc: &OnConflictClause, ts: &TableSchema) -> Result<Compil
     }
 }
 
-/// Caller MUST check `cache.is_trivial_fast` first. `Ok(None)` = a NULL
-/// param changes the row's cell layout; the caller runs the cached lane.
+/// Integer-only template; other values use the validated cached lane.
 fn exec_insert_trivial_fast(
     wtx: &mut WriteTxn<'_>,
     table_lower: &str,
@@ -3750,8 +3682,7 @@ fn exec_insert_trivial_fast(
 
     match &params[prog.pk_param as usize] {
         Value::Integer(v) => crate::encoding::encode_int_key_into(*v, &mut bufs.key_buf),
-        Value::Null => return Ok(None),
-        _ => return Err(SqlError::InvalidValue("non-integer PK in fast path".into())),
+        _ => return Ok(None),
     }
 
     bufs.value_buf.clear();
@@ -3764,13 +3695,7 @@ fn exec_insert_trivial_fast(
                     let off = *off as usize;
                     bufs.value_buf[off..off + 8].copy_from_slice(&v.to_le_bytes());
                 }
-                Value::Null => return Ok(None),
-                other => {
-                    return Err(SqlError::TypeMismatch {
-                        expected: "Integer".into(),
-                        got: other.data_type().to_string(),
-                    });
-                }
+                _ => return Ok(None),
             },
             WriteOp::LiteralI64 { value, off } => {
                 let off = *off as usize;
@@ -3871,7 +3796,7 @@ fn exec_insert_trivial_fast(
 fn build_bind_plan(
     stmt: &InsertStmt,
     col_indices: &[usize],
-    col_data_types: &[DataType],
+    table_schema: &TableSchema,
 ) -> Option<Vec<BindAction>> {
     let rows = match &stmt.source {
         InsertSource::Values(rows) => rows,
@@ -3887,7 +3812,8 @@ fn build_bind_plan(
     let mut plan = Vec::with_capacity(value_row.len());
     for (i, expr) in value_row.iter().enumerate() {
         let col_idx = col_indices[i];
-        let target = col_data_types[col_idx];
+        let col = &table_schema.columns[col_idx];
+        let target = col.data_type;
         match expr {
             Expr::Parameter(n) => {
                 if *n == 0 {
@@ -3899,10 +3825,13 @@ fn build_bind_plan(
                     target,
                 });
             }
-            Expr::Literal(v) => plan.push(BindAction::Literal {
-                value: v.clone(),
-                col_idx,
-            }),
+            Expr::Literal(v) => {
+                if v.is_null() && !col.nullable {
+                    return None;
+                }
+                let value = coerce_for_column(v.clone(), col, table_schema.is_strict()).ok()?;
+                plan.push(BindAction::Literal { value, col_idx });
+            }
             _ => return None,
         }
     }
@@ -3960,7 +3889,6 @@ impl CompiledInsert {
             let encoding_positions: Vec<u16> = ts.encoding_positions().to_vec();
             let dropped_non_pk_slots: Vec<u16> = ts.dropped_non_pk_slots().to_vec();
             let phys_count = ts.physical_non_pk_count();
-            let col_data_types: Vec<DataType> = ts.columns.iter().map(|c| c.data_type).collect();
             let single_int_pk =
                 pk_indices.len() == 1 && ts.columns[pk_indices[0]].data_type == DataType::Integer;
             let not_null_indices: Vec<u16> = ts
@@ -3969,7 +3897,7 @@ impl CompiledInsert {
                 .filter(|c| !c.nullable)
                 .map(|c| c.position)
                 .collect();
-            let bind_plan = build_bind_plan(stmt, &col_indices, &col_data_types);
+            let bind_plan = build_bind_plan(stmt, &col_indices, ts);
             let any_defaults_flag = ts.columns.iter().any(|c| c.default_expr.is_some());
             let row_fully_overwritten = if any_defaults_flag {
                 false

@@ -43,6 +43,62 @@ fn equal_numeric_zeros_have_the_same_hash() {
 }
 
 #[test]
+fn strict_real_to_integer_checks_the_exclusive_upper_bound() {
+    let upper = -(i64::MIN as f64);
+    for real in [
+        upper,
+        -upper - 2048.0,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NAN,
+        1.5,
+    ] {
+        assert!(
+            Value::Real(real).strict_coerce(DataType::Integer).is_none(),
+            "{real}"
+        );
+    }
+    for (real, integer) in [
+        (i64::MIN as f64, i64::MIN),
+        (upper - 1024.0, i64::MAX - 1023),
+        (-0.0, 0),
+        (42.0, 42),
+    ] {
+        assert_eq!(
+            Value::Real(real).strict_coerce(DataType::Integer),
+            Some(Value::Integer(integer))
+        );
+    }
+}
+
+#[test]
+fn strict_integer_to_real_checks_significand_precision() {
+    for integer in [i64::MIN, i64::MAX, i64::MAX - 1023, i64::MIN + 1] {
+        let real = integer as f64;
+        let expected = ((real as i128) == i128::from(integer)).then_some(Value::Real(real));
+        assert_eq!(
+            Value::Integer(integer).strict_coerce(DataType::Real),
+            expected,
+            "{integer}"
+        );
+    }
+    for exponent in 0..=62 {
+        for sign in [-1, 1] {
+            for offset in -3..=3 {
+                let integer = sign * (1i64 << exponent) + offset;
+                let real = integer as f64;
+                let expected = ((real as i128) == i128::from(integer)).then_some(Value::Real(real));
+                assert_eq!(
+                    Value::Integer(integer).strict_coerce(DataType::Real),
+                    expected,
+                    "{integer}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn value_display() {
     assert_eq!(format!("{}", Value::Null), "NULL");
     assert_eq!(format!("{}", Value::Integer(42)), "42");
