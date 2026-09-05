@@ -573,7 +573,7 @@ fn try_pk_range_scan(
         .iter()
         .filter(|(op, _)| matches!(op, BinOp::GtEq | BinOp::Gt))
         .map(|(_, v)| encode_composite_key(std::slice::from_ref(v)))
-        .min_by(|a, b| a.cmp(b))
+        .max()
         .unwrap_or_default();
     Some(ScanPlan::PkRangeScan {
         start_key,
