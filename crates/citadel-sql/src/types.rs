@@ -302,16 +302,21 @@ impl Value {
         }
         match (self, target) {
             (Value::Integer(i), DataType::Real) => {
-                if i.unsigned_abs() <= (1u64 << 53) {
+                let magnitude = i.unsigned_abs();
+                let significant_bits = u64::BITS - magnitude.leading_zeros();
+                if significant_bits.saturating_sub(f64::MANTISSA_DIGITS)
+                    <= magnitude.trailing_zeros()
+                {
                     Some(Value::Real(*i as f64))
                 } else {
                     None
                 }
             }
             (Value::Real(r), DataType::Integer) => {
+                let upper_exclusive = -(i64::MIN as f64);
                 if r.is_finite()
                     && r.fract() == 0.0
-                    && (i64::MIN as f64..=i64::MAX as f64).contains(r)
+                    && (i64::MIN as f64..upper_exclusive).contains(r)
                 {
                     Some(Value::Integer(*r as i64))
                 } else {

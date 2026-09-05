@@ -420,14 +420,19 @@ pub fn drain_deferred_fk_checks(wtx: &mut citadel_txn::write_txn::WriteTxn<'_>) 
 
 #[inline]
 pub(super) fn coerce_for_column(value: Value, col: &ColumnDef, strict: bool) -> Result<Value> {
+    coerce_for_type(value, col.data_type, strict)
+}
+
+#[inline]
+fn coerce_for_type(value: Value, data_type: DataType, strict: bool) -> Result<Value> {
     let got = value.data_type();
     let coerced = if strict {
-        value.strict_coerce(col.data_type)
+        value.strict_coerce(data_type)
     } else {
-        value.coerce_into(col.data_type)
+        value.coerce_into(data_type)
     };
     coerced.ok_or_else(|| SqlError::TypeMismatch {
-        expected: col.data_type.to_string(),
+        expected: data_type.to_string(),
         got: got.to_string(),
     })
 }
@@ -610,6 +615,7 @@ pub(super) fn eval_fast_gen_checked_with_cancel(
 }
 
 pub(super) struct PartialDecodeCtx {
+    strict: bool,
     pk_positions: Vec<(usize, usize)>,
     nonpk_targets: Vec<usize>,
     nonpk_schema: Vec<usize>,
@@ -760,6 +766,7 @@ impl PartialDecodeCtx {
         reset_cols.dedup();
 
         Ok(Self {
+            strict: schema.is_strict(),
             pk_positions,
             nonpk_targets,
             nonpk_schema,
@@ -791,11 +798,7 @@ impl PartialDecodeCtx {
                 }
                 Value::Null
             } else {
-                let got = val.data_type();
-                val.coerce_into(*dt).ok_or_else(|| SqlError::TypeMismatch {
-                    expected: dt.to_string(),
-                    got: got.to_string(),
-                })?
+                coerce_for_type(val, *dt, self.strict)?
             };
         }
         Ok(())
@@ -1086,12 +1089,7 @@ pub(crate) fn materialize_virtual_with_cancel(
             row[pos] = if val.is_null() {
                 Value::Null
             } else {
-                let got_type = val.data_type();
-                val.coerce_into(col.data_type)
-                    .ok_or_else(|| SqlError::TypeMismatch {
-                        expected: col.data_type.to_string(),
-                        got: got_type.to_string(),
-                    })?
+                coerce_for_column(val, col, schema.is_strict())?
             };
         }
     }
