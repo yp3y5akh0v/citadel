@@ -231,6 +231,24 @@ pub(super) fn create_fk_auto_indices(
     Ok(table_schema)
 }
 
+fn resolve_primary_key_columns(columns: &[ColumnDef], names: &[String]) -> Result<Vec<u16>> {
+    let mut seen = rustc_hash::FxHashSet::default();
+    names
+        .iter()
+        .map(|name| {
+            let lower = name.to_ascii_lowercase();
+            let index = columns
+                .iter()
+                .position(|column| column.name == lower)
+                .ok_or_else(|| SqlError::ColumnNotFound(name.clone()))?;
+            if !seen.insert(index) {
+                return Err(SqlError::DuplicateColumn(name.clone()));
+            }
+            Ok(index as u16)
+        })
+        .collect()
+}
+
 pub(super) fn exec_create_table(
     db: &Database,
     schema: &mut SchemaManager,
@@ -285,18 +303,7 @@ pub(super) fn exec_create_table(
 
     validate_no_chained_generated(&columns)?;
 
-    let primary_key_columns: Vec<u16> = stmt
-        .primary_key
-        .iter()
-        .map(|pk_name| {
-            let lower = pk_name.to_ascii_lowercase();
-            columns
-                .iter()
-                .position(|c| c.name == lower)
-                .map(|i| i as u16)
-                .ok_or_else(|| SqlError::ColumnNotFound(pk_name.clone()))
-        })
-        .collect::<Result<_>>()?;
+    let primary_key_columns = resolve_primary_key_columns(&columns, &stmt.primary_key)?;
 
     let check_constraints: Vec<TableCheckDef> = stmt
         .check_constraints
@@ -476,18 +483,7 @@ pub(super) fn exec_create_table_in_txn(
 
     validate_no_chained_generated(&columns)?;
 
-    let primary_key_columns: Vec<u16> = stmt
-        .primary_key
-        .iter()
-        .map(|pk_name| {
-            let lower = pk_name.to_ascii_lowercase();
-            columns
-                .iter()
-                .position(|c| c.name == lower)
-                .map(|i| i as u16)
-                .ok_or_else(|| SqlError::ColumnNotFound(pk_name.clone()))
-        })
-        .collect::<Result<_>>()?;
+    let primary_key_columns = resolve_primary_key_columns(&columns, &stmt.primary_key)?;
 
     let check_constraints: Vec<TableCheckDef> = stmt
         .check_constraints
