@@ -561,7 +561,7 @@ impl AnnTopKPlan {
                 .search_filtered_default_ef(&self.query_vec, target, filter)
                 .map_err(|e| SqlError::InvalidValue(format!("ANN search failed: {e}")))?;
             check_cancel(cancel)?;
-            let mut survivors: Vec<RankedRow> = Vec::with_capacity(want);
+            let mut survivors: Vec<RankedRow> = Vec::with_capacity(want.min(hits.len()));
             for (hit_idx, (id, dist)) in hits.iter().enumerate() {
                 check_cancel_at(cancel, hit_idx)?;
                 encode_int_key_into(*id as i64, &mut key_buf);

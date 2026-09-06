@@ -15,6 +15,7 @@ pub(crate) mod matviews;
 mod result_cache;
 mod scan;
 mod select;
+mod topk;
 pub(crate) mod triggers;
 mod view;
 mod window;
