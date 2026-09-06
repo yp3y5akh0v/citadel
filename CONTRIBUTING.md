@@ -51,6 +51,10 @@ cargo test --workspace --locked --test shots --test pg_jsonb_jsonpath
 cargo test --workspace --locked --doc
 ```
 
+The native CI test matrix uses `CARGO_PROFILE_TEST_DEBUG=line-tables-only`.
+This retains source-file/line backtraces without debugger variable or parameter
+information. Local test builds retain full debug information.
+
 Nextest runs ordinary integration tests concurrently. Library and binary tests,
 Studio rendering, the custom JSONPath corpus harness and doctests run with Cargo.
 Run all four commands for full native coverage. The Nextest configuration uses
