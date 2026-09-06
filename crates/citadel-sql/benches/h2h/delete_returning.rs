@@ -1,5 +1,5 @@
 use citadel_sql::{Connection, Value};
-use criterion::{BenchmarkId, Criterion};
+use criterion::{black_box, BenchmarkId, Criterion};
 
 use super::common::*;
 
@@ -36,6 +36,20 @@ pub fn bench(c: &mut Criterion) {
         .prepare("DELETE FROM t WHERE id = ?1 RETURNING id, val")
         .unwrap();
 
+    cs_ins.execute(&[Value::Integer(-1)]).unwrap();
+    ss_ins.execute([-1i64]).unwrap();
+    assert_eq!(
+        cs_del.query_collect(&[Value::Integer(-1)]).unwrap().rows,
+        vec![vec![Value::Integer(-1), Value::Text("v".into())]]
+    );
+    assert_eq!(
+        sqlite_collect_params(&mut ss_del, [-1i64]),
+        vec![vec![
+            rusqlite::types::Value::Integer(-1),
+            rusqlite::types::Value::Text("v".into()),
+        ]]
+    );
+
     g.bench_function(BenchmarkId::new("citadel", ""), |b| {
         b.iter(|| {
             cc.execute("BEGIN").unwrap();
@@ -43,9 +57,11 @@ pub fn bench(c: &mut Criterion) {
                 cs_ins.execute(&[Value::Integer(c_offset + j)]).unwrap();
             }
             for j in 0..100i64 {
-                let _ = cs_del
-                    .query_collect(&[Value::Integer(c_offset + j)])
-                    .unwrap();
+                black_box(
+                    cs_del
+                        .query_collect(&[Value::Integer(c_offset + j)])
+                        .unwrap(),
+                );
             }
             cc.execute("COMMIT").unwrap();
             c_offset += 100;
@@ -58,8 +74,10 @@ pub fn bench(c: &mut Criterion) {
                 ss_ins.execute(rusqlite::params![s_offset + j]).unwrap();
             }
             for j in 0..100i64 {
-                let mut rows = ss_del.query(rusqlite::params![s_offset + j]).unwrap();
-                while rows.next().unwrap().is_some() {}
+                black_box(sqlite_collect_params(
+                    &mut ss_del,
+                    rusqlite::params![s_offset + j],
+                ));
             }
             sc.execute_batch("COMMIT").unwrap();
             s_offset += 100;

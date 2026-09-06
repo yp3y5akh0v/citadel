@@ -1,4 +1,4 @@
-use citadel_sql::Connection;
+use citadel_sql::{Connection, Value};
 use criterion::{BenchmarkId, Criterion};
 
 use super::common::*;
@@ -45,18 +45,35 @@ pub fn bench(c: &mut Criterion) {
     let cs = cc.prepare("SELECT id, s FROM t WHERE s > $1").unwrap();
     let mut ss = sc.prepare("SELECT id, s FROM t WHERE s > ?1").unwrap();
 
+    let mut citadel_rows: Vec<_> = cs
+        .query_collect(&[Value::Integer(50)])
+        .unwrap()
+        .rows
+        .into_iter()
+        .map(|row| match row.as_slice() {
+            [Value::Integer(id), Value::Integer(s)] => (*id, *s),
+            _ => panic!("unexpected Citadel generated-column row: {row:?}"),
+        })
+        .collect();
+    let mut sqlite_rows: Vec<_> = sqlite_collect_params(&mut ss, rusqlite::params![50])
+        .into_iter()
+        .map(|row| match row.as_slice() {
+            [rusqlite::types::Value::Integer(id), rusqlite::types::Value::Integer(s)] => (*id, *s),
+            _ => panic!("unexpected SQLite generated-column row: {row:?}"),
+        })
+        .collect();
+    citadel_rows.sort_unstable();
+    sqlite_rows.sort_unstable();
+    // s = 3 * id, so s > 50 selects exactly the 83 ids from 17 through 99.
+    let expected: Vec<_> = (17..100).map(|id| (id, id * 3)).collect();
+    assert_eq!(citadel_rows, expected);
+    assert_eq!(sqlite_rows, citadel_rows);
+
     g.bench_function(BenchmarkId::new("citadel", ""), |b| {
-        b.iter(|| {
-            let _ = cs
-                .query_collect(&[citadel_sql::Value::Integer(50)])
-                .unwrap();
-        });
+        b.iter(|| cs.query_collect(&[Value::Integer(50)]).unwrap());
     });
     g.bench_function(BenchmarkId::new("sqlite", ""), |b| {
-        b.iter(|| {
-            let mut rows = ss.query(rusqlite::params![50]).unwrap();
-            while rows.next().unwrap().is_some() {}
-        });
+        b.iter(|| sqlite_collect_params(&mut ss, rusqlite::params![50]));
     });
     g.finish();
 }
