@@ -1,6 +1,126 @@
 use super::*;
 use crate::types::DataType;
 
+const TEXT_SEARCH_CONSTRUCTORS: [&str; 5] = [
+    "to_tsvector",
+    "to_tsquery",
+    "plainto_tsquery",
+    "phraseto_tsquery",
+    "websearch_to_tsquery",
+];
+
+#[test]
+fn literal_jsonpath_analysis_only_unwraps_text_preserving_operations() {
+    for sql in ["'$.x'", "CAST('$.x' AS TEXT)", "('$.x' COLLATE BINARY)"] {
+        let expr = crate::parser::parse_sql_expr(sql).unwrap();
+        assert_eq!(literal_jsonpath_text(&expr), Some("$.x"), "{sql}");
+    }
+    let expr = crate::parser::parse_sql_expr("CAST(CAST('$.x' AS TSQUERY) AS TEXT)").unwrap();
+    assert_eq!(literal_jsonpath_text(&expr), None);
+}
+
+#[test]
+fn text_search_constructor_types_and_default_configuration_match_evaluation() {
+    let columns = ColumnMap::new(&[]);
+    let context = EvalCtx::new(&columns, &[]);
+    for name in TEXT_SEARCH_CONSTRUCTORS {
+        let implicit = crate::parser::parse_sql_expr(&format!("{name}('running')")).unwrap();
+        let english =
+            crate::parser::parse_sql_expr(&format!("{name}('english', 'running')")).unwrap();
+        let simple =
+            crate::parser::parse_sql_expr(&format!("{name}('simple', 'running')")).unwrap();
+        let implicit_value = eval_expr(&implicit, &context).unwrap();
+        assert_eq!(
+            intrinsic_result_type(&implicit),
+            Some(implicit_value.data_type())
+        );
+        assert_eq!(
+            implicit_value,
+            eval_expr(&english, &context).unwrap(),
+            "{name}"
+        );
+        assert_ne!(
+            implicit_value,
+            eval_expr(&simple, &context).unwrap(),
+            "{name}"
+        );
+        let expected = if name == "to_tsvector" {
+            DataType::TsVector
+        } else {
+            DataType::TsQuery
+        };
+        assert_eq!(implicit_value.data_type(), expected, "{name}");
+    }
+}
+
+#[test]
+fn text_search_constructor_arity_is_checked_before_null_propagation() {
+    let columns = ColumnMap::new(&[]);
+    let context = EvalCtx::new(&columns, &[]);
+    for name in TEXT_SEARCH_CONSTRUCTORS {
+        for args in ["", "NULL, 'english', 'rust'", "'simple', NULL, 'rust'"] {
+            let expr = crate::parser::parse_sql_expr(&format!("{name}({args})")).unwrap();
+            assert!(
+                matches!(eval_expr(&expr, &context), Err(SqlError::InvalidValue(message))
+                    if message == format!("{name} requires 1 or 2 arguments")),
+                "{name}({args})"
+            );
+        }
+        for args in ["NULL", "NULL, 'rust'", "'english', NULL"] {
+            let expr = crate::parser::parse_sql_expr(&format!("{name}({args})")).unwrap();
+            assert_eq!(
+                eval_expr(&expr, &context).unwrap(),
+                Value::Null,
+                "{name}({args})"
+            );
+        }
+    }
+}
+
+#[test]
+fn text_search_constructors_reject_invalid_config_and_argument_types() {
+    let columns = ColumnMap::new(&[]);
+    let context = EvalCtx::new(&columns, &[]);
+    for name in TEXT_SEARCH_CONSTRUCTORS {
+        for args in ["1", "1, 'rust'", "'english', 1"] {
+            let expr = crate::parser::parse_sql_expr(&format!("{name}({args})")).unwrap();
+            assert!(
+                matches!(
+                    eval_expr(&expr, &context),
+                    Err(SqlError::TypeMismatch { .. })
+                ),
+                "{name}({args})"
+            );
+        }
+        let expr =
+            crate::parser::parse_sql_expr(&format!("{name}('not_a_config', 'rust')")).unwrap();
+        assert!(
+            matches!(eval_expr(&expr, &context), Err(SqlError::Unsupported(message))
+                if message == "unknown text search configuration: not_a_config"),
+            "{name}"
+        );
+        let expr = crate::parser::parse_sql_expr(&format!("{name}(NULL, 1 / 0)")).unwrap();
+        assert!(
+            matches!(eval_expr(&expr, &context), Err(SqlError::DivisionByZero)),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn text_search_constructors_forward_cancellation() {
+    let cancel = citadel::CancelToken::new();
+    cancel.cancel();
+    for name in TEXT_SEARCH_CONSTRUCTORS {
+        let constructor = text_search::Constructor::from_name(&name.to_ascii_uppercase()).unwrap();
+        let result = constructor.evaluate(&[Value::Text("rust database".into())], Some(&cancel));
+        assert!(
+            matches!(result, Err(SqlError::Storage(citadel::Error::Interrupted))),
+            "{name}: {result:?}"
+        );
+    }
+}
+
 fn col(name: &str, dt: DataType, nullable: bool, pos: u16) -> ColumnDef {
     ColumnDef {
         name: name.into(),

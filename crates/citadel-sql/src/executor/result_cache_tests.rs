@@ -138,6 +138,60 @@ fn jsonpath_cacheability_is_path_aware() {
 }
 
 #[test]
+fn text_search_overloads_are_cacheable_without_treating_queries_as_json_paths() {
+    let s = schema_with_t();
+    for constructor in [
+        "TO_TSQUERY",
+        "PLAINTO_TSQUERY",
+        "PHRASETO_TSQUERY",
+        "WEBSEARCH_TO_TSQUERY",
+    ] {
+        for sql in [
+            format!("SELECT id FROM t WHERE v @@ {constructor}($1)"),
+            format!("SELECT {constructor}('rust') @@ TO_TSVECTOR('rust')"),
+            format!("SELECT id FROM t WHERE v @@ {constructor}('english', $1)"),
+        ] {
+            assert!(cacheable(&s, &sql), "{sql}");
+        }
+    }
+    for sql in [
+        "SELECT id, TS_RANK(v, TO_TSQUERY('rust & database')) AS r FROM t \
+         WHERE v @@ TO_TSQUERY('rust & database') ORDER BY r DESC LIMIT 10",
+        "SELECT id FROM t WHERE TO_TSVECTOR('rust database') @@ $1",
+        "SELECT id FROM t WHERE 'rust database' @@ $1",
+        "SELECT id FROM t WHERE CAST(v AS TEXT) @@ $1",
+        "SELECT id FROM t WHERE CAST(v AS TSVECTOR) @@ $1",
+        "SELECT id FROM t WHERE v @@ CAST($1 AS TSQUERY)",
+        "SELECT id FROM t WHERE v @@ (TO_TSQUERY($1) COLLATE BINARY)",
+        "SELECT id FROM t WHERE (CAST(v AS TEXT) COLLATE BINARY) @@ $1",
+    ] {
+        assert!(cacheable(&s, sql), "{sql}");
+    }
+}
+
+#[test]
+fn text_search_type_proofs_preserve_jsonpath_and_child_volatility_guards() {
+    let s = schema_with_t();
+    for sql in [
+        "SELECT id FROM t WHERE v @@ $1",
+        "SELECT id FROM t WHERE CAST(v AS JSONB) @@ $1",
+        "SELECT id FROM t WHERE (CAST(v AS JSONB) COLLATE BINARY) @@ $1",
+        "SELECT id FROM t WHERE v @@ CAST(TO_TSQUERY('rust') AS TEXT)",
+        "SELECT id FROM t WHERE CAST(v AS JSONB) @@ CAST(TO_TSQUERY('rust') AS TEXT)",
+        "SELECT id FROM t WHERE CAST(v AS JSONB) @? CAST(TO_TSQUERY('rust') AS TEXT)",
+        r#"SELECT id FROM t WHERE CAST(v AS JSONB) @@ '$.time_tz().string() == "17:04:56+10:00"'"#,
+        "SELECT id FROM t WHERE v @@ TO_TSQUERY(CAST(RANDOM() AS TEXT))",
+        "SELECT id FROM t WHERE TO_TSVECTOR(CAST(NOW() AS TEXT)) @@ $1",
+        "SELECT id FROM t WHERE v @@ TO_TSQUERY(CAST(\
+         JSONB_PATH_QUERY_FIRST_TZ(CAST(v AS JSONB), '$.time().string()') AS TEXT))",
+        "SELECT id FROM t WHERE v @@ CAST(\
+         JSONB_PATH_QUERY_FIRST_TZ(CAST(v AS JSONB), '$.time().string()') AS TSQUERY)",
+    ] {
+        assert!(!cacheable(&s, sql), "{sql}");
+    }
+}
+
+#[test]
 fn params_match_is_bit_exact() {
     assert!(params_match(
         &[Value::Real(1.5), Value::Integer(2)],

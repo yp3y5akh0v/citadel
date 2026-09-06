@@ -1211,7 +1211,7 @@ fn eval_match(ast: &TsQueryAst, entries: &[(Vec<u8>, Vec<u16>)], overflowed: boo
             lexeme,
             weight_mask,
             prefix,
-        } => Ok(!collect_lex_positions(entries, lexeme, *weight_mask, *prefix).is_empty()),
+        } => lexeme_matches(entries, lexeme, *weight_mask, *prefix, None, &mut 0),
         TsQueryAst::And(l, r) => {
             Ok(eval_match(l, entries, overflowed)? && eval_match(r, entries, overflowed)?)
         }
@@ -1250,15 +1250,7 @@ fn eval_match_with_cancel(
             lexeme,
             weight_mask,
             prefix,
-        } => Ok(!collect_lex_positions_with_cancel(
-            entries,
-            lexeme,
-            *weight_mask,
-            *prefix,
-            cancel,
-            work,
-        )?
-        .is_empty()),
+        } => lexeme_matches(entries, lexeme, *weight_mask, *prefix, cancel, work),
         TsQueryAst::And(left, right) => {
             if !eval_match_with_cancel(left, entries, overflowed, cancel, work)? {
                 return Ok(false);
@@ -1464,6 +1456,48 @@ fn positions_pairing_right_with_cancel(
     Ok(out)
 }
 
+fn position_has_weight(packed: u16, weight_mask: u8) -> bool {
+    weight_mask == 0 || (1 << (packed >> 14)) & weight_mask != 0
+}
+
+fn lexeme_matches(
+    entries: &[(Vec<u8>, Vec<u16>)],
+    query_lex: &[u8],
+    weight_mask: u8,
+    prefix: bool,
+    cancel: Option<&citadel::CancelToken>,
+    work: &mut usize,
+) -> Result<bool> {
+    let candidates = if prefix {
+        let start = entries.partition_point(|(lexeme, _)| lexeme.as_slice() < query_lex);
+        &entries[start..]
+    } else {
+        match entries.binary_search_by(|(lexeme, _)| lexeme.as_slice().cmp(query_lex)) {
+            Ok(index) => &entries[index..index + 1],
+            Err(_) => return Ok(false),
+        }
+    };
+    for (lexeme, positions) in candidates {
+        check_cancel_at(cancel, *work)?;
+        *work += 1;
+        if prefix && !lexeme.starts_with(query_lex) {
+            break;
+        }
+        // STRIP removes positions and weights, not lexeme membership.
+        if weight_mask == 0 || positions.is_empty() {
+            return Ok(true);
+        }
+        for &position in positions {
+            check_cancel_at(cancel, *work)?;
+            *work += 1;
+            if position_has_weight(position, weight_mask) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 fn collect_lex_positions(
     entries: &[(Vec<u8>, Vec<u16>)],
     query_lex: &[u8],
@@ -1471,21 +1505,10 @@ fn collect_lex_positions(
     prefix: bool,
 ) -> Vec<u16> {
     let mut out: Vec<u16> = Vec::new();
-    let weight_to_bit = |w: Weight| -> u8 {
-        match w {
-            Weight::A => 0b1000,
-            Weight::B => 0b0100,
-            Weight::C => 0b0010,
-            Weight::D => 0b0001,
-        }
-    };
     let collect_from = |positions: &[u16], out: &mut Vec<u16>| {
         for &p in positions {
-            if weight_mask != 0 {
-                let (_pos, w) = unpack_position(p);
-                if weight_to_bit(w) & weight_mask == 0 {
-                    continue;
-                }
+            if !position_has_weight(p, weight_mask) {
+                continue;
             }
             out.push(p);
         }
@@ -2338,17 +2361,8 @@ fn collect_positions_with_cancel(
     for &packed in positions {
         check_cancel_at(cancel, *work)?;
         *work += 1;
-        if weight_mask != 0 {
-            let (_, weight) = unpack_position(packed);
-            let weight_bit = match weight {
-                Weight::A => 0b1000,
-                Weight::B => 0b0100,
-                Weight::C => 0b0010,
-                Weight::D => 0b0001,
-            };
-            if weight_bit & weight_mask == 0 {
-                continue;
-            }
+        if !position_has_weight(packed, weight_mask) {
+            continue;
         }
         out.push(packed);
     }

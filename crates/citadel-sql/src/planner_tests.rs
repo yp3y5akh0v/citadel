@@ -2,6 +2,40 @@ use super::*;
 use crate::types::{Collation, ColumnDef, DataType, IndexKind};
 
 #[test]
+fn literal_resolution_does_not_evaluate_volatile_or_contextual_expressions() {
+    for expression in [
+        "RANDOM()",
+        "ABS(RANDOM())",
+        "CAST(NOW() AS TEXT)",
+        "TO_TSQUERY(CASE WHEN RANDOM() > 0 THEN 'cat' ELSE 'dog' END)",
+        "JSONB_PATH_QUERY_FIRST_TZ('{}'::JSONB, '$.a')",
+        "DATE(CAST('now' AS TEXT))",
+    ] {
+        let expression = crate::parser::parse_sql_expr(expression).unwrap();
+        assert!(resolve_literal(&expression).is_none(), "{expression:?}");
+    }
+    let query = crate::parser::parse_sql_expr("TO_TSQUERY('cat')").unwrap();
+    assert!(matches!(resolve_literal(&query), Some(Value::TsQuery(_))));
+    for expression in [
+        "CAST(1 + 2 AS INTEGER)",
+        "CAST(CASE WHEN 1 < 2 THEN 3 ELSE 4 END AS INTEGER)",
+        "CAST(COALESCE(NULL, 3) AS INTEGER)",
+    ] {
+        let expression = crate::parser::parse_sql_expr(expression).unwrap();
+        assert_eq!(resolve_literal(&expression), Some(Value::Integer(3)));
+    }
+    let quantified_path = Expr::Quantified {
+        left: Box::new(Expr::Literal(Value::Json("{}".into()))),
+        op: BinOp::JsonPathMatch,
+        quantifier: crate::parser::Quantifier::Any,
+        right: crate::parser::QuantifiedRhs::Array(Box::new(Expr::Literal(Value::Array(
+            vec![Value::Text("$.time_tz()".into())].into(),
+        )))),
+    };
+    assert!(!crate::eval::is_statement_constant(&quantified_path));
+}
+
+#[test]
 fn typed_key_bounds_preserve_numeric_comparison_sets() {
     use std::cmp::Ordering;
 
