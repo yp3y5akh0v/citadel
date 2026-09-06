@@ -1263,7 +1263,7 @@ fn visit_exprs_select(sel: &SelectStmt, visitor: &mut impl FnMut(&Expr)) {
     }
 }
 
-fn visit_expr(expr: &Expr, visitor: &mut impl FnMut(&Expr)) {
+pub(crate) fn visit_expr(expr: &Expr, visitor: &mut impl FnMut(&Expr)) {
     visitor(expr);
     match expr {
         Expr::BinaryOp { left, right, .. } => {
@@ -3434,6 +3434,15 @@ fn convert_expr(expr: &sp::Expr) -> Result<Expr> {
                 sp::UnaryOperator::Not => UnaryOp::Not,
                 _ => return Err(SqlError::Unsupported(format!("unary op: {op}"))),
             };
+            if *op == sp::UnaryOperator::Minus {
+                if let sp::Expr::Value(value) = expr.as_ref() {
+                    if let sp::Value::Number(number, _) = &value.value {
+                        if number.parse::<u64>() == Ok(i64::MAX as u64 + 1) {
+                            return Ok(Expr::Literal(Value::Integer(i64::MIN)));
+                        }
+                    }
+                }
+            }
             Ok(Expr::UnaryOp {
                 op: unary_op,
                 expr: Box::new(convert_expr(expr)?),

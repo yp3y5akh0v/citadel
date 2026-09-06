@@ -184,3 +184,36 @@ fn ann_limit_and_offset_above_u32_preserve_query_results() {
         }
     }
 }
+
+#[wasm_bindgen_test]
+fn window_offsets_and_bucket_counts_do_not_narrow_to_u32() {
+    let db = CitadelDb::create("pass").unwrap();
+    db.execute_batch(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY);
+         INSERT INTO t VALUES (1), (2), (3)",
+    )
+    .unwrap();
+    for count in [4_294_967_296_i64, 4_294_967_297, i64::MAX] {
+        assert_query_ids(
+            &db,
+            &format!("SELECT NTILE({count}) OVER (ORDER BY id) FROM t ORDER BY id"),
+            &[1, 2, 3],
+        );
+        for function in ["LAG", "LEAD"] {
+            for offset in [count, -count, i64::MIN] {
+                assert_query_ids(
+                    &db,
+                    &format!("SELECT {function}(id, {offset}, id + 10) OVER (ORDER BY id) FROM t ORDER BY id"),
+                    &[11, 12, 13],
+                );
+            }
+        }
+        for bound in ["PRECEDING", "FOLLOWING"] {
+            assert_query_ids(
+                &db,
+                &format!("SELECT COUNT(*) OVER (ORDER BY id ROWS BETWEEN {count} {bound} AND {count} {bound}) FROM t ORDER BY id"),
+                &[0, 0, 0],
+            );
+        }
+    }
+}

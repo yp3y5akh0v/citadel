@@ -198,8 +198,10 @@ fn rows_frame_indices_unbounded_both_sides() {
         start: WindowFrameBound::UnboundedPreceding,
         end: WindowFrameBound::UnboundedFollowing,
     };
-    let (s, e) = rows_frame_indices(&frame, 2, 5).unwrap();
-    assert_eq!((s, e), (0, 4));
+    assert_eq!(
+        ResolvedFrame::new(&frame, None).unwrap().indices(2, 5, &[]),
+        0..5
+    );
 }
 
 #[test]
@@ -209,8 +211,10 @@ fn rows_frame_indices_current_row_only() {
         start: WindowFrameBound::CurrentRow,
         end: WindowFrameBound::CurrentRow,
     };
-    let (s, e) = rows_frame_indices(&frame, 2, 5).unwrap();
-    assert_eq!((s, e), (2, 2));
+    assert_eq!(
+        ResolvedFrame::new(&frame, None).unwrap().indices(2, 5, &[]),
+        2..3
+    );
 }
 
 #[test]
@@ -220,8 +224,10 @@ fn rows_frame_indices_preceding_following() {
         start: WindowFrameBound::Preceding(Box::new(Expr::Literal(i(1)))),
         end: WindowFrameBound::Following(Box::new(Expr::Literal(i(1)))),
     };
-    let (s, e) = rows_frame_indices(&frame, 2, 5).unwrap();
-    assert_eq!((s, e), (1, 3));
+    assert_eq!(
+        ResolvedFrame::new(&frame, None).unwrap().indices(2, 5, &[]),
+        1..4
+    );
 }
 
 #[test]
@@ -231,19 +237,103 @@ fn rows_frame_indices_preceding_clamps_to_zero() {
         start: WindowFrameBound::Preceding(Box::new(Expr::Literal(i(10)))),
         end: WindowFrameBound::CurrentRow,
     };
-    let (s, e) = rows_frame_indices(&frame, 2, 5).unwrap();
-    assert_eq!((s, e), (0, 2));
+    assert_eq!(
+        ResolvedFrame::new(&frame, None).unwrap().indices(2, 5, &[]),
+        0..3
+    );
 }
 
 #[test]
-fn rows_frame_indices_following_clamps_to_n_minus_1() {
+fn rows_frame_indices_following_clamps_to_partition_end() {
     let frame = WindowFrame {
         units: WindowFrameUnits::Rows,
         start: WindowFrameBound::CurrentRow,
         end: WindowFrameBound::Following(Box::new(Expr::Literal(i(10)))),
     };
-    let (s, e) = rows_frame_indices(&frame, 2, 5).unwrap();
-    assert_eq!((s, e), (2, 4));
+    assert_eq!(
+        ResolvedFrame::new(&frame, None).unwrap().indices(2, 5, &[]),
+        2..5
+    );
+}
+
+#[test]
+fn rows_frame_ranges_match_membership_at_every_partition_boundary() {
+    for n in 0..8 {
+        for start in [
+            -i128::from(i64::MAX),
+            -9,
+            -2,
+            -1,
+            0,
+            1,
+            2,
+            9,
+            i128::from(i64::MAX),
+        ] {
+            for end in [
+                -i128::from(i64::MAX),
+                -9,
+                -2,
+                -1,
+                0,
+                1,
+                2,
+                9,
+                i128::from(i64::MAX),
+            ] {
+                let frame = ResolvedFrame::Rows {
+                    start: Some(start),
+                    end: Some(end),
+                    sliding: false,
+                };
+                for pos in 0..n.max(1) {
+                    let expected: Vec<_> = (0..n)
+                        .filter(|&row| {
+                            (pos as i128 + start..=pos as i128 + end).contains(&(row as i128))
+                        })
+                        .collect();
+                    let range = frame.indices(pos, n, &[]);
+                    assert!(range.start <= range.end && range.end <= n);
+                    assert_eq!(
+                        range.collect::<Vec<_>>(),
+                        expected,
+                        "n={n}, pos={pos}, start={start}, end={end}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn rows_frame_bounds_remain_valid_near_usize_max() {
+    let frame = ResolvedFrame::Rows {
+        start: Some(1),
+        end: Some(i128::from(i64::MAX)),
+        sliding: false,
+    };
+    assert_eq!(
+        frame.indices(usize::MAX - 1, usize::MAX, &[]),
+        usize::MAX..usize::MAX
+    );
+}
+
+#[test]
+fn window_frame_rejects_row_dependencies_in_unevaluated_branches() {
+    for sql in [
+        "CASE WHEN TRUE THEN 1 ELSE x END",
+        "COALESCE(1, SUM(1))",
+        "CASE x WHEN 0 THEN 1 ELSE 1 END",
+    ] {
+        let frame = WindowFrame {
+            units: WindowFrameUnits::Rows,
+            start: WindowFrameBound::Preceding(Box::new(
+                crate::parser::parse_sql_expr(sql).unwrap(),
+            )),
+            end: WindowFrameBound::CurrentRow,
+        };
+        assert!(ResolvedFrame::new(&frame, None).is_err(), "{sql}");
+    }
 }
 
 #[test]

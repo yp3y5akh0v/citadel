@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::ops::Range;
 
 use crate::error::{Result, SqlError};
 use crate::eval::{collation_of, eval_expr, operand_collation, ColumnMap, EvalCtx};
@@ -172,39 +173,164 @@ pub(super) fn resolve_frame(spec: &WindowSpec) -> WindowFrame {
     }
 }
 
-/// Convert frame bounds to (start_idx, end_idx) for ROWS frames.
-pub(super) fn rows_frame_indices(
-    frame: &WindowFrame,
-    i: usize,
-    n: usize,
-) -> Result<(usize, usize)> {
-    let start = match &frame.start {
-        WindowFrameBound::UnboundedPreceding => 0,
-        WindowFrameBound::Preceding(e) => {
-            let k = eval_const_int(e)? as usize;
-            i.saturating_sub(k)
+enum ResolvedFrame {
+    Rows {
+        start: Option<i128>,
+        end: Option<i128>,
+        sliding: bool,
+    },
+    Range {
+        unbounded_start: bool,
+        unbounded_end: bool,
+    },
+    Ignored,
+}
+
+impl ResolvedFrame {
+    fn validate_categories(frame: &WindowFrame) -> Result<()> {
+        let category = |bound: &WindowFrameBound| match bound {
+            WindowFrameBound::UnboundedPreceding => 0,
+            WindowFrameBound::Preceding(_) => 1,
+            WindowFrameBound::CurrentRow => 2,
+            WindowFrameBound::Following(_) => 3,
+            WindowFrameBound::UnboundedFollowing => 4,
+        };
+        if matches!(frame.start, WindowFrameBound::UnboundedFollowing)
+            || matches!(frame.end, WindowFrameBound::UnboundedPreceding)
+            || category(&frame.start) > category(&frame.end)
+        {
+            return Err(SqlError::InvalidValue("invalid window frame bounds".into()));
         }
-        WindowFrameBound::CurrentRow => i,
-        WindowFrameBound::Following(e) => {
-            let k = eval_const_int(e)? as usize;
-            (i + k).min(n - 1)
+        Ok(())
+    }
+
+    fn new(frame: &WindowFrame, cancel: Option<&citadel::CancelToken>) -> Result<Self> {
+        Self::validate_categories(frame)?;
+        match frame.units {
+            WindowFrameUnits::Rows => {
+                let offset = |bound: &WindowFrameBound| -> Result<Option<i128>> {
+                    match bound {
+                        WindowFrameBound::UnboundedPreceding
+                        | WindowFrameBound::UnboundedFollowing => Ok(None),
+                        WindowFrameBound::CurrentRow => Ok(Some(0)),
+                        WindowFrameBound::Preceding(expr) | WindowFrameBound::Following(expr) => {
+                            let mut row_dependent = false;
+                            visit_expr(expr, &mut |node| {
+                                row_dependent |= match node {
+                                    Expr::Column(_)
+                                    | Expr::QualifiedColumn { .. }
+                                    | Expr::CountStar
+                                    | Expr::WindowFunction { .. }
+                                    | Expr::ScalarSubquery(_)
+                                    | Expr::InSubquery { .. }
+                                    | Expr::Exists { .. }
+                                    | Expr::Quantified {
+                                        right: QuantifiedRhs::Subquery(_),
+                                        ..
+                                    } => true,
+                                    Expr::Function { name, args, .. } => {
+                                        super::aggregate::is_aggregate_function(name, args.len())
+                                    }
+                                    _ => false,
+                                };
+                            });
+                            if row_dependent {
+                                return Err(SqlError::InvalidValue(
+                                    "ROWS frame offset must not depend on rows or aggregates"
+                                        .into(),
+                                ));
+                            }
+                            let value = eval_const_expr_with_cancel(expr, cancel)?;
+                            let Value::Integer(count) = value else {
+                                return Err(SqlError::InvalidValue(
+                                    "ROWS frame offset must be a nonnegative integer".into(),
+                                ));
+                            };
+                            if count < 0 {
+                                return Err(SqlError::InvalidValue(
+                                    "ROWS frame offset must be a nonnegative integer".into(),
+                                ));
+                            }
+                            Ok(Some(if matches!(bound, WindowFrameBound::Preceding(_)) {
+                                -i128::from(count)
+                            } else {
+                                i128::from(count)
+                            }))
+                        }
+                    }
+                };
+                Ok(Self::Rows {
+                    start: offset(&frame.start)?,
+                    end: offset(&frame.end)?,
+                    sliding: matches!(
+                        frame.start,
+                        WindowFrameBound::UnboundedPreceding | WindowFrameBound::Preceding(_)
+                    ) && matches!(
+                        frame.end,
+                        WindowFrameBound::CurrentRow | WindowFrameBound::Following(_)
+                    ),
+                })
+            }
+            WindowFrameUnits::Range => {
+                if matches!(
+                    frame.start,
+                    WindowFrameBound::Preceding(_) | WindowFrameBound::Following(_)
+                ) || matches!(
+                    frame.end,
+                    WindowFrameBound::Preceding(_) | WindowFrameBound::Following(_)
+                ) {
+                    return Err(SqlError::Unsupported("RANGE with numeric offset".into()));
+                }
+                Ok(Self::Range {
+                    unbounded_start: matches!(frame.start, WindowFrameBound::UnboundedPreceding),
+                    unbounded_end: matches!(frame.end, WindowFrameBound::UnboundedFollowing),
+                })
+            }
+            WindowFrameUnits::Groups => Err(SqlError::Unsupported("GROUPS window frame".into())),
         }
-        WindowFrameBound::UnboundedFollowing => n - 1,
-    };
-    let end = match &frame.end {
-        WindowFrameBound::UnboundedPreceding => 0,
-        WindowFrameBound::Preceding(e) => {
-            let k = eval_const_int(e)? as usize;
-            i.saturating_sub(k)
+    }
+
+    fn uses_peers(&self) -> bool {
+        matches!(self, Self::Range { unbounded_start, unbounded_end } if !unbounded_start || !unbounded_end)
+    }
+
+    fn supports_sliding(&self) -> bool {
+        matches!(self, Self::Rows { sliding: true, .. })
+    }
+
+    /// Half-open bounds preserve empty frames at either partition boundary.
+    fn indices(&self, i: usize, n: usize, peer_bounds: &[(usize, usize)]) -> Range<usize> {
+        if n == 0 {
+            return 0..0;
         }
-        WindowFrameBound::CurrentRow => i,
-        WindowFrameBound::Following(e) => {
-            let k = eval_const_int(e)? as usize;
-            (i + k).min(n - 1)
-        }
-        WindowFrameBound::UnboundedFollowing => n - 1,
-    };
-    Ok((start, end.min(n - 1)))
+        let (start, end) = match self {
+            Self::Rows { start, end, .. } => {
+                let limit = n as i128;
+                let start = start.map_or(0, |offset| (i as i128 + offset).clamp(0, limit) as usize);
+                let end = end.map_or(n, |offset| {
+                    (i as i128 + offset + 1).clamp(0, limit) as usize
+                });
+                (start, end)
+            }
+            Self::Range {
+                unbounded_start,
+                unbounded_end,
+            } => (
+                if *unbounded_start {
+                    0
+                } else {
+                    peer_bounds[i].0
+                },
+                if *unbounded_end {
+                    n
+                } else {
+                    peer_bounds[i].1 + 1
+                },
+            ),
+            Self::Ignored => unreachable!("this function does not consume its frame"),
+        };
+        start..end.max(start)
+    }
 }
 
 /// For RANGE frames, index every peer group once. `part_indices` are already in
@@ -270,33 +396,6 @@ fn collated_keys_equal(left: &[Value], right: &[Value], collations: &[Collation]
         })
 }
 
-/// Resolve frame indices for a given row position within a partition.
-fn frame_indices(
-    frame: &WindowFrame,
-    i: usize,
-    n: usize,
-    peer_bounds: &[(usize, usize)],
-) -> Result<(usize, usize)> {
-    match frame.units {
-        WindowFrameUnits::Rows => rows_frame_indices(frame, i, n),
-        WindowFrameUnits::Range => {
-            // For RANGE, only UNBOUNDED and CURRENT ROW are supported
-            let start = match &frame.start {
-                WindowFrameBound::UnboundedPreceding => 0,
-                WindowFrameBound::CurrentRow => peer_bounds[i].0,
-                _ => return Err(SqlError::Unsupported("RANGE with numeric offset".into())),
-            };
-            let end = match &frame.end {
-                WindowFrameBound::UnboundedFollowing => n - 1,
-                WindowFrameBound::CurrentRow => peer_bounds[i].1,
-                _ => return Err(SqlError::Unsupported("RANGE with numeric offset".into())),
-            };
-            Ok((start, end))
-        }
-        WindowFrameUnits::Groups => Err(SqlError::Unsupported("GROUPS window frame".into())),
-    }
-}
-
 /// Monotonic deque for sliding MIN/MAX.
 pub(super) struct MonoDeque {
     deque: VecDeque<(usize, Value)>,
@@ -353,9 +452,9 @@ impl MonoDeque {
 
 /// Removable accumulator for sliding SUM/COUNT/AVG.
 pub(super) struct SlidingSum {
-    int_sum: i64,
+    int_sum: i128,
     real_sum: f64,
-    has_real: bool,
+    real_count: i64,
     count: i64,
 }
 
@@ -364,59 +463,68 @@ impl SlidingSum {
         Self {
             int_sum: 0,
             real_sum: 0.0,
-            has_real: false,
+            real_count: 0,
             count: 0,
         }
     }
 
-    pub(super) fn add(&mut self, val: &Value) {
+    pub(super) fn add(&mut self, val: &Value) -> Result<()> {
         match val {
             Value::Integer(i) => {
-                self.int_sum += i;
+                self.int_sum += i128::from(*i);
                 self.count += 1;
             }
             Value::Real(r) => {
                 self.real_sum += r;
-                self.has_real = true;
+                self.real_count += 1;
                 self.count += 1;
             }
-            _ => {}
+            Value::Null => {}
+            other => {
+                return Err(SqlError::TypeMismatch {
+                    expected: "numeric".into(),
+                    got: other.data_type().to_string(),
+                })
+            }
         }
+        Ok(())
     }
 
     pub(super) fn remove(&mut self, val: &Value) {
         match val {
             Value::Integer(i) => {
-                self.int_sum -= i;
+                self.int_sum -= i128::from(*i);
                 self.count -= 1;
             }
             Value::Real(r) => {
                 self.real_sum -= r;
+                self.real_count -= 1;
+                if self.real_count == 0 {
+                    self.real_sum = 0.0;
+                }
                 self.count -= 1;
             }
             _ => {}
         }
     }
 
-    pub(super) fn result_sum(&self) -> Value {
-        if self.count == 0 && !self.has_real {
-            Value::Null
-        } else if self.has_real {
-            Value::Real(self.real_sum + self.int_sum as f64)
+    pub(super) fn result_sum(&self) -> Result<Value> {
+        if self.count == 0 {
+            Ok(Value::Null)
+        } else if self.real_count > 0 {
+            Ok(Value::Real(self.real_sum + self.int_sum as f64))
         } else {
-            Value::Integer(self.int_sum)
+            i64::try_from(self.int_sum)
+                .map(Value::Integer)
+                .map_err(|_| SqlError::IntegerOverflow)
         }
-    }
-
-    pub(super) fn result_count(&self) -> Value {
-        Value::Integer(self.count)
     }
 
     pub(super) fn result_avg(&self) -> Value {
         if self.count == 0 {
             Value::Null
         } else {
-            let total = if self.has_real {
+            let total = if self.real_count > 0 {
                 self.real_sum + self.int_sum as f64
             } else {
                 self.int_sum as f64
@@ -424,6 +532,74 @@ impl SlidingSum {
             Value::Real(total / self.count as f64)
         }
     }
+}
+
+enum WindowAccumulator {
+    Count { count: i64, star: bool },
+    Sum(SlidingSum),
+    Avg(SlidingSum),
+}
+
+impl WindowAccumulator {
+    fn new(name: &str, arg_count: usize) -> Self {
+        match name {
+            "COUNT" => Self::Count {
+                count: 0,
+                star: arg_count == 0,
+            },
+            "SUM" => Self::Sum(SlidingSum::new()),
+            "AVG" => Self::Avg(SlidingSum::new()),
+            _ => unreachable!(),
+        }
+    }
+
+    fn add(&mut self, args: &[Value]) -> Result<()> {
+        match self {
+            Self::Count { count, star } => {
+                *count += i64::from(*star || !args[0].is_null());
+                Ok(())
+            }
+            Self::Sum(sum) | Self::Avg(sum) => sum.add(&args[0]),
+        }
+    }
+
+    fn remove(&mut self, args: &[Value]) {
+        match self {
+            Self::Count { count, star } => *count -= i64::from(*star || !args[0].is_null()),
+            Self::Sum(sum) | Self::Avg(sum) => sum.remove(&args[0]),
+        }
+    }
+
+    fn result(&self) -> Result<Value> {
+        match self {
+            Self::Count { count, .. } => Ok(Value::Integer(*count)),
+            Self::Sum(sum) => sum.result_sum(),
+            Self::Avg(sum) => Ok(sum.result_avg()),
+        }
+    }
+}
+
+fn validate_window_args(name: &str, count: usize) -> Result<()> {
+    let valid = match name {
+        "ROW_NUMBER" | "RANK" | "DENSE_RANK" => count == 0,
+        "NTILE" | "FIRST_VALUE" | "LAST_VALUE" | "SUM" | "AVG" | "MIN" | "MAX" => count == 1,
+        "LAG" | "LEAD" => (1..=3).contains(&count),
+        "COUNT" => count <= 1,
+        other => return Err(SqlError::Unsupported(format!("window function: {other}"))),
+    };
+    if !valid {
+        return Err(SqlError::Parse(format!(
+            "invalid number of arguments for {name}"
+        )));
+    }
+    Ok(())
+}
+
+fn uses_window_frame(name: &str) -> bool {
+    matches!(
+        name,
+        "FIRST_VALUE" | "LAST_VALUE" | "SUM" | "COUNT" | "AVG" | "MIN" | "MAX"
+    )
 }
 
 pub(super) fn eval_window_select(
@@ -437,24 +613,6 @@ pub(super) fn eval_window_select(
         cancel,
         ..
     } = ctx;
-    if rows.is_empty() {
-        let col_names = stmt
-            .columns
-            .iter()
-            .map(|c| match c {
-                SelectColumn::AllColumns => "*".into(),
-                SelectColumn::AllFromOld => "old.*".into(),
-                SelectColumn::AllFromNew => "new.*".into(),
-                SelectColumn::Expr { alias: Some(a), .. } => a.clone(),
-                SelectColumn::Expr { expr, .. } => expr_display_name(expr),
-            })
-            .collect();
-        return Ok(ExecutionResult::Query(QueryResult {
-            columns: col_names,
-            rows: vec![],
-        }));
-    }
-
     let mut slot_counter = 0usize;
     let mut all_extracted: Vec<(String, String, Vec<Expr>, WindowSpec)> = Vec::new();
     let mut rewritten_columns: Vec<SelectColumn> = Vec::new();
@@ -476,6 +634,39 @@ pub(super) fn eval_window_select(
 
     if all_extracted.is_empty() {
         return super::process_select(rows, ctx.predicate_applied(false));
+    }
+
+    let frames = all_extracted
+        .iter()
+        .map(|(_, name, args, spec)| {
+            check_cancel(cancel)?;
+            let upper_name = name.to_ascii_uppercase();
+            validate_window_args(&upper_name, args.len())?;
+            let frame = resolve_frame(spec);
+            if !uses_window_frame(&upper_name) && matches!(frame.units, WindowFrameUnits::Range) {
+                ResolvedFrame::validate_categories(&frame)?;
+                Ok(ResolvedFrame::Ignored)
+            } else {
+                ResolvedFrame::new(&frame, cancel)
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if rows.is_empty() {
+        let col_names = stmt
+            .columns
+            .iter()
+            .map(|c| match c {
+                SelectColumn::AllColumns => "*".into(),
+                SelectColumn::AllFromOld => "old.*".into(),
+                SelectColumn::AllFromNew => "new.*".into(),
+                SelectColumn::Expr { alias: Some(a), .. } => a.clone(),
+                SelectColumn::Expr { expr, .. } => expr_display_name(expr),
+            })
+            .collect();
+        return Ok(ExecutionResult::Query(QueryResult {
+            columns: col_names,
+            rows: vec![],
+        }));
     }
 
     let col_map = ColumnMap::new(columns);
@@ -570,21 +761,15 @@ pub(super) fn eval_window_select(
         }
         partitions.push((part_start, n));
 
-        let frame = resolve_frame(spec);
+        let frame = &frames[win_idx];
         let upper_name = fn_name.to_ascii_uppercase();
 
         for (partition_idx, &(ps, pe)) in partitions.iter().enumerate() {
             check_cancel_at(cancel, partition_idx)?;
             let part_len = pe - ps;
             let part_indices = &indices[ps..pe];
-            let uses_frame = matches!(
-                upper_name.as_str(),
-                "FIRST_VALUE" | "LAST_VALUE" | "SUM" | "COUNT" | "AVG" | "MIN" | "MAX"
-            );
-            let range_uses_peers = uses_frame
-                && matches!(frame.units, WindowFrameUnits::Range)
-                && (matches!(frame.start, WindowFrameBound::CurrentRow)
-                    || matches!(frame.end, WindowFrameBound::CurrentRow));
+            let uses_frame = uses_window_frame(&upper_name);
+            let range_uses_peers = uses_frame && frame.uses_peers();
             let peer_bounds = if range_uses_peers {
                 peer_group_bounds(part_indices, &keys, part_count, order_collations, cancel)?
             } else {
@@ -635,16 +820,23 @@ pub(super) fn eval_window_select(
                     }
                 }
                 "NTILE" => {
-                    let ntile_n = if arg_values[win_idx][0].is_empty() {
-                        return Err(SqlError::Parse("NTILE requires one argument".into()));
-                    } else {
-                        match &arg_values[win_idx][part_indices[0]][0] {
-                            Value::Integer(n) if *n > 0 => *n as usize,
-                            _ => {
-                                return Err(SqlError::InvalidValue(
-                                    "NTILE argument must be a positive integer".into(),
-                                ))
-                            }
+                    let mut first = 0;
+                    while first < part_len && arg_values[win_idx][part_indices[first]][0].is_null()
+                    {
+                        check_cancel_at(cancel, first)?;
+                        first += 1;
+                    }
+                    if first == part_len {
+                        continue;
+                    }
+                    let ntile_n = match &arg_values[win_idx][part_indices[first]][0] {
+                        Value::Integer(n) if *n > 0 => {
+                            (i128::from(*n).min(part_len as i128)) as usize
+                        }
+                        _ => {
+                            return Err(SqlError::InvalidValue(
+                                "NTILE argument must be a positive integer".into(),
+                            ))
                         }
                     };
                     let base = part_len / ntile_n;
@@ -658,7 +850,7 @@ pub(super) fn eval_window_select(
                             base
                         }
                     };
-                    for (pos, &orig_idx) in part_indices.iter().enumerate() {
+                    for (pos, &orig_idx) in part_indices.iter().enumerate().skip(first) {
                         check_cancel_at(cancel, pos)?;
                         row_results[orig_idx][win_idx] = Value::Integer(bucket as i64);
                         count_in_bucket += 1;
@@ -669,36 +861,26 @@ pub(super) fn eval_window_select(
                     }
                 }
                 "LAG" | "LEAD" => {
-                    let offset = if arg_values[win_idx][0].len() >= 2 {
-                        match &arg_values[win_idx][0][1] {
-                            Value::Integer(n) => *n as usize,
-                            _ => 1,
-                        }
-                    } else {
-                        1
-                    };
-                    let default_val = if arg_values[win_idx][0].len() >= 3 {
-                        arg_values[win_idx][0][2].clone()
-                    } else {
-                        Value::Null
-                    };
                     let is_lag = upper_name == "LAG";
                     for (pos, &orig_idx) in part_indices.iter().enumerate() {
                         check_cancel_at(cancel, pos)?;
-                        let target_pos = if is_lag {
-                            if pos >= offset {
-                                Some(pos - offset)
-                            } else {
-                                None
+                        let row_args = &arg_values[win_idx][orig_idx];
+                        let offset = match row_args.get(1) {
+                            None => 1,
+                            Some(Value::Integer(offset)) => i128::from(*offset),
+                            Some(Value::Null) => continue,
+                            Some(other) => {
+                                return Err(SqlError::TypeMismatch {
+                                    expected: "INTEGER".into(),
+                                    got: other.data_type().to_string(),
+                                })
                             }
-                        } else if pos + offset < part_len {
-                            Some(pos + offset)
-                        } else {
-                            None
                         };
-                        let val = match target_pos {
-                            Some(tp) => arg_values[win_idx][part_indices[tp]][0].clone(),
-                            None => default_val.clone(),
+                        let target = pos as i128 + if is_lag { -offset } else { offset };
+                        let val = if (0..part_len as i128).contains(&target) {
+                            arg_values[win_idx][part_indices[target as usize]][0].clone()
+                        } else {
+                            row_args.get(2).cloned().unwrap_or(Value::Null)
                         };
                         row_results[orig_idx][win_idx] = val;
                     }
@@ -706,89 +888,55 @@ pub(super) fn eval_window_select(
                 "FIRST_VALUE" => {
                     for (pos, &orig_idx) in part_indices.iter().enumerate() {
                         check_cancel_at(cancel, pos)?;
-                        let (fs, _) = frame_indices(&frame, pos, part_len, &peer_bounds)?;
-                        let source_idx = part_indices[fs];
-                        row_results[orig_idx][win_idx] = arg_values[win_idx][source_idx][0].clone();
+                        let range = frame.indices(pos, part_len, &peer_bounds);
+                        if let Some(&source_idx) = part_indices[range].first() {
+                            row_results[orig_idx][win_idx] =
+                                arg_values[win_idx][source_idx][0].clone();
+                        }
                     }
                 }
                 "LAST_VALUE" => {
                     for (pos, &orig_idx) in part_indices.iter().enumerate() {
                         check_cancel_at(cancel, pos)?;
-                        let (_, fe) = frame_indices(&frame, pos, part_len, &peer_bounds)?;
-                        let source_idx = part_indices[fe];
-                        row_results[orig_idx][win_idx] = arg_values[win_idx][source_idx][0].clone();
+                        let range = frame.indices(pos, part_len, &peer_bounds);
+                        if let Some(&source_idx) = part_indices[range].last() {
+                            row_results[orig_idx][win_idx] =
+                                arg_values[win_idx][source_idx][0].clone();
+                        }
                     }
                 }
                 "SUM" | "COUNT" | "AVG" => {
-                    let is_count_star = upper_name == "COUNT" && arg_values[win_idx][0].is_empty();
-                    if matches!(frame.units, WindowFrameUnits::Rows)
-                        && matches!(
-                            frame.start,
-                            WindowFrameBound::UnboundedPreceding | WindowFrameBound::Preceding(_)
-                        )
-                        && matches!(
-                            frame.end,
-                            WindowFrameBound::CurrentRow | WindowFrameBound::Following(_)
-                        )
-                    {
-                        // Sliding accumulator
-                        let mut acc = SlidingSum::new();
-                        let mut prev_start = 0usize;
+                    if frame.supports_sliding() {
+                        let mut acc = WindowAccumulator::new(&upper_name, args.len());
+                        let mut previous = 0..0;
                         for (pos, &orig_idx) in part_indices.iter().enumerate() {
                             check_cancel_at(cancel, pos)?;
-                            let (fs, fe) = rows_frame_indices(&frame, pos, part_len)?;
-                            // Remove expired rows
-                            while prev_start < fs {
-                                check_cancel_at(cancel, prev_start)?;
-                                if is_count_star {
-                                    acc.count -= 1;
-                                } else {
-                                    acc.remove(&arg_values[win_idx][part_indices[prev_start]][0]);
-                                }
-                                prev_start += 1;
+                            let current = frame.indices(pos, part_len, &peer_bounds);
+                            for (work, remove_pos) in
+                                (previous.start..current.start.min(previous.end)).enumerate()
+                            {
+                                check_cancel_at(cancel, work)?;
+                                acc.remove(&arg_values[win_idx][part_indices[remove_pos]]);
                             }
-                            // Add new rows (from previous end+1 to current end)
-                            let add_from = if pos == 0 {
-                                fs
-                            } else {
-                                let (_, prev_fe) = rows_frame_indices(&frame, pos - 1, part_len)?;
-                                prev_fe + 1
-                            };
-                            for (add_iteration, add_pos) in (add_from..=fe).enumerate() {
-                                check_cancel_at(cancel, add_iteration)?;
-                                if is_count_star {
-                                    acc.count += 1;
-                                } else {
-                                    acc.add(&arg_values[win_idx][part_indices[add_pos]][0]);
-                                }
+                            for (work, add_pos) in
+                                (previous.end.max(current.start)..current.end).enumerate()
+                            {
+                                check_cancel_at(cancel, work)?;
+                                acc.add(&arg_values[win_idx][part_indices[add_pos]])?;
                             }
-                            row_results[orig_idx][win_idx] = match upper_name.as_str() {
-                                "SUM" => acc.result_sum(),
-                                "COUNT" => acc.result_count(),
-                                "AVG" => acc.result_avg(),
-                                _ => unreachable!(),
-                            };
+                            row_results[orig_idx][win_idx] = acc.result()?;
+                            previous = current;
                         }
                     } else {
-                        // Fallback: recompute per row
                         for (pos, &orig_idx) in part_indices.iter().enumerate() {
                             check_cancel_at(cancel, pos)?;
-                            let (fs, fe) = frame_indices(&frame, pos, part_len, &peer_bounds)?;
-                            let mut acc = SlidingSum::new();
-                            for (frame_iteration, fpos) in (fs..=fe).enumerate() {
+                            let range = frame.indices(pos, part_len, &peer_bounds);
+                            let mut acc = WindowAccumulator::new(&upper_name, args.len());
+                            for (frame_iteration, fpos) in range.enumerate() {
                                 check_cancel_at(cancel, frame_iteration)?;
-                                if is_count_star {
-                                    acc.count += 1;
-                                } else {
-                                    acc.add(&arg_values[win_idx][part_indices[fpos]][0]);
-                                }
+                                acc.add(&arg_values[win_idx][part_indices[fpos]])?;
                             }
-                            row_results[orig_idx][win_idx] = match upper_name.as_str() {
-                                "SUM" => acc.result_sum(),
-                                "COUNT" => acc.result_count(),
-                                "AVG" => acc.result_avg(),
-                                _ => unreachable!(),
-                            };
+                            row_results[orig_idx][win_idx] = acc.result()?;
                         }
                     }
                 }
@@ -798,40 +946,31 @@ pub(super) fn eval_window_select(
                         .first()
                         .and_then(|arg| operand_collation(arg, &col_map))
                         .unwrap_or_default();
-                    if matches!(frame.units, WindowFrameUnits::Rows)
-                        && matches!(
-                            frame.start,
-                            WindowFrameBound::UnboundedPreceding | WindowFrameBound::Preceding(_)
-                        )
-                        && matches!(
-                            frame.end,
-                            WindowFrameBound::CurrentRow | WindowFrameBound::Following(_)
-                        )
-                    {
+                    if frame.supports_sliding() {
                         let mut deque = MonoDeque::new(is_min, value_collation);
-                        let mut prev_end: Option<usize> = None;
+                        let mut prev_end = 0;
                         for (pos, &orig_idx) in part_indices.iter().enumerate() {
                             check_cancel_at(cancel, pos)?;
-                            let (fs, fe) = rows_frame_indices(&frame, pos, part_len)?;
-                            let add_from = prev_end.map(|pe| pe + 1).unwrap_or(fs);
-                            for (add_iteration, add_pos) in (add_from..=fe).enumerate() {
+                            let range = frame.indices(pos, part_len, &peer_bounds);
+                            for (add_iteration, add_pos) in
+                                (prev_end.max(range.start)..range.end).enumerate()
+                            {
                                 check_cancel_at(cancel, add_iteration)?;
                                 deque.push(
                                     add_pos,
                                     arg_values[win_idx][part_indices[add_pos]][0].clone(),
                                 );
                             }
-                            deque.pop_expired(fs);
+                            deque.pop_expired(range.start);
                             row_results[orig_idx][win_idx] = deque.current();
-                            prev_end = Some(fe);
+                            prev_end = range.end;
                         }
                     } else {
-                        // Fallback
                         for (pos, &orig_idx) in part_indices.iter().enumerate() {
                             check_cancel_at(cancel, pos)?;
-                            let (fs, fe) = frame_indices(&frame, pos, part_len, &peer_bounds)?;
+                            let range = frame.indices(pos, part_len, &peer_bounds);
                             let mut result = Value::Null;
-                            for (frame_iteration, fpos) in (fs..=fe).enumerate() {
+                            for (frame_iteration, fpos) in range.enumerate() {
                                 check_cancel_at(cancel, frame_iteration)?;
                                 let v = &arg_values[win_idx][part_indices[fpos]][0];
                                 if !v.is_null() {
