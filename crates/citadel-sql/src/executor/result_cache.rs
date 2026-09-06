@@ -400,7 +400,7 @@ fn cacheable_expr(ctx: &mut WalkCtx<'_>, expr: &Expr) -> bool {
             if matches!(
                 op,
                 BinOp::VectorL2 | BinOp::VectorInner | BinOp::VectorCosine
-            ) || crate::eval::is_session_dependent_jsonpath_op(op, right)
+            ) || crate::eval::is_session_dependent_jsonpath_op(op, left, right)
             {
                 return false;
             }

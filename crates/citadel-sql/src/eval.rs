@@ -6,6 +6,8 @@ use crate::error::{Result, SqlError};
 use crate::parser::{BinOp, Expr, QuantifiedRhs, UnaryOp};
 use crate::types::{ColumnDef, CompactString, DataType, Value};
 
+mod text_search;
+
 #[derive(Debug)]
 pub struct ColumnMap {
     exact: FxHashMap<String, ShortMatch>,
@@ -2117,8 +2119,11 @@ pub(crate) fn is_volatile_function_expr(name_upper: &str, args: &[Expr]) -> bool
 fn literal_jsonpath_text(expr: &Expr) -> Option<&str> {
     match expr {
         Expr::Literal(Value::Text(path)) => Some(path),
-        // These wrappers do not make a literal path dynamic.
-        Expr::Cast { expr, .. } | Expr::Collate { expr, .. } => literal_jsonpath_text(expr),
+        Expr::Cast {
+            expr,
+            data_type: DataType::Text,
+        }
+        | Expr::Collate { expr, .. } => literal_jsonpath_text(expr),
         _ => None,
     }
 }
@@ -2165,12 +2170,110 @@ pub(crate) fn is_session_dependent_jsonpath_function(name_upper: &str, args: &[E
     ) && jsonpath_argument_depends_on_session_context(args.get(1))
 }
 
-/// Whether a SQL/JSON path operator can depend on session context.
-pub(crate) fn is_session_dependent_jsonpath_op(op: &BinOp, path: &Expr) -> bool {
+/// A successful non-NULL result type, when it is fixed without schema binding.
+fn intrinsic_result_type(expr: &Expr) -> Option<DataType> {
+    match expr {
+        Expr::Literal(value) => Some(value.data_type()),
+        Expr::Cast { data_type, .. } => Some(*data_type),
+        Expr::Collate { expr, .. } => intrinsic_result_type(expr),
+        Expr::Function { name, .. } => {
+            text_search::Constructor::from_name(name).map(|constructor| constructor.result_type())
+        }
+        _ => None,
+    }
+}
+
+/// Whether an expression can be evaluated once for a statement without a row.
+/// Parameters are fixed for the statement; contextual functions and expression
+/// forms without a conservative proof must stay in the ordinary evaluator.
+pub(crate) fn is_statement_constant(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(_) | Expr::Parameter(_) | Expr::TypedNullRecord(_) => true,
+        Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. }
+        | Expr::UnaryOp { expr, .. }
+        | Expr::IsNull(expr)
+        | Expr::IsNotNull(expr)
+        | Expr::InSet { expr, .. } => is_statement_constant(expr),
+        Expr::BinaryOp { left, op, right } => {
+            !is_session_dependent_jsonpath_op(op, left, right)
+                && is_statement_constant(left)
+                && is_statement_constant(right)
+        }
+        Expr::IsDistinctFrom { left, right, .. } => {
+            is_statement_constant(left) && is_statement_constant(right)
+        }
+        Expr::Function { name, args, .. } => {
+            let upper = name.to_ascii_uppercase();
+            !is_volatile_function_expr(&upper, args)
+                && !is_session_dependent_jsonpath_function(&upper, args)
+                && (!matches!(upper.as_str(), "DATE" | "TIME" | "DATETIME")
+                    || matches!(args.first(), Some(Expr::Literal(_))))
+                && args.iter().all(is_statement_constant)
+        }
+        Expr::Coalesce(args) | Expr::ArrayLiteral(args) => args.iter().all(is_statement_constant),
+        Expr::InList { expr, list, .. } => {
+            is_statement_constant(expr) && list.iter().all(is_statement_constant)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            is_statement_constant(expr) && is_statement_constant(low) && is_statement_constant(high)
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            is_statement_constant(expr)
+                && is_statement_constant(pattern)
+                && escape.as_deref().is_none_or(is_statement_constant)
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+        } => {
+            operand.as_deref().is_none_or(is_statement_constant)
+                && conditions.iter().all(|(condition, result)| {
+                    is_statement_constant(condition) && is_statement_constant(result)
+                })
+                && else_result.as_deref().is_none_or(is_statement_constant)
+        }
+        Expr::Quantified {
+            left,
+            op,
+            right: QuantifiedRhs::Array(right),
+            ..
+        } => {
+            // The operator sees each array element, not the ARRAY value, so
+            // the array's type cannot prove an overloaded operator safe.
+            matches!(
+                op,
+                BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq
+            ) && is_statement_constant(left)
+                && is_statement_constant(right)
+        }
+        _ => false,
+    }
+}
+
+/// Operator-local dependency; callers must also check both child expressions.
+pub(crate) fn is_session_dependent_jsonpath_op(op: &BinOp, left: &Expr, right: &Expr) -> bool {
     match op {
         BinOp::JsonPathExistsTz | BinOp::JsonPathMatchTz => true,
+        BinOp::JsonPathMatch
+            if intrinsic_result_type(left)
+                .is_some_and(|ty| !matches!(ty, DataType::Json | DataType::Jsonb))
+                || intrinsic_result_type(right).is_some_and(|ty| ty != DataType::Text) =>
+        {
+            // Only JSON/JSONB @@ TEXT dispatches to JSONPath; other pairs use
+            // full-text matching, propagate NULL, or return a type error.
+            false
+        }
         BinOp::JsonPathExists | BinOp::JsonPathMatch => {
-            jsonpath_argument_depends_on_session_context(Some(path))
+            jsonpath_argument_depends_on_session_context(Some(right))
         }
         _ => false,
     }
@@ -3367,11 +3470,6 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
             }
             crate::json::op_has_all_keys_with_cancel(&evaluated[0], &evaluated[1], ctx.cancel)
         }
-        "TO_TSVECTOR" => fts_to_tsvector(&evaluated, ctx.cancel),
-        "TO_TSQUERY" => fts_to_tsquery(&evaluated, ctx.cancel),
-        "PLAINTO_TSQUERY" => fts_plainto_tsquery(&evaluated, ctx.cancel),
-        "PHRASETO_TSQUERY" => fts_phraseto_tsquery(&evaluated, ctx.cancel),
-        "WEBSEARCH_TO_TSQUERY" => fts_websearch_to_tsquery(&evaluated, ctx.cancel),
         "TS_RANK" => fts_ts_rank(&evaluated, false, ctx.cancel),
         "TS_RANK_CD" => fts_ts_rank(&evaluated, true, ctx.cancel),
         "TS_HEADLINE" => fts_ts_headline(&evaluated, ctx.cancel),
@@ -3379,99 +3477,11 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
         "NUMNODE" => fts_numnode(&evaluated, ctx.cancel),
         "SETWEIGHT" => fts_setweight(&evaluated, ctx.cancel),
         "STRIP" => fts_strip(&evaluated, ctx.cancel),
-        _ => Err(SqlError::Unsupported(format!("scalar function: {name}"))),
+        _ => match text_search::Constructor::from_name(name) {
+            Some(constructor) => constructor.evaluate(&evaluated, ctx.cancel),
+            None => Err(SqlError::Unsupported(format!("scalar function: {name}"))),
+        },
     }
-}
-
-fn fts_resolve_config_and_text<'a>(
-    args: &'a [Value],
-    fname: &str,
-) -> Result<(crate::fts::TokenizerKind, &'a str)> {
-    if args.is_empty() || args.len() > 2 {
-        return Err(SqlError::InvalidValue(format!(
-            "{fname} requires 1 or 2 arguments"
-        )));
-    }
-    let (config_name, text) = if args.len() == 2 {
-        let cfg = match &args[0] {
-            Value::Text(s) => Some(s.as_str()),
-            v => {
-                return Err(SqlError::TypeMismatch {
-                    expected: "TEXT (config)".into(),
-                    got: v.data_type().to_string(),
-                })
-            }
-        };
-        let txt = match &args[1] {
-            Value::Text(s) => s.as_str(),
-            v => {
-                return Err(SqlError::TypeMismatch {
-                    expected: "TEXT".into(),
-                    got: v.data_type().to_string(),
-                })
-            }
-        };
-        (cfg, txt)
-    } else {
-        let txt = match &args[0] {
-            Value::Text(s) => s.as_str(),
-            v => {
-                return Err(SqlError::TypeMismatch {
-                    expected: "TEXT".into(),
-                    got: v.data_type().to_string(),
-                })
-            }
-        };
-        (None, txt)
-    };
-    let kind = match config_name {
-        Some(name) => crate::fts::TokenizerKind::from_name(name)?,
-        None => crate::fts::TokenizerKind::English,
-    };
-    Ok((kind, text))
-}
-
-fn fts_to_tsvector(args: &[Value], cancel: Option<&citadel::CancelToken>) -> Result<Value> {
-    if args.iter().any(|v| v.is_null()) {
-        return Ok(Value::Null);
-    }
-    let (kind, text) = fts_resolve_config_and_text(args, "to_tsvector")?;
-    crate::fts::fn_to_tsvector_with_cancel(kind, text, cancel)
-}
-
-fn fts_to_tsquery(args: &[Value], cancel: Option<&citadel::CancelToken>) -> Result<Value> {
-    if args.iter().any(|v| v.is_null()) {
-        return Ok(Value::Null);
-    }
-    let (kind, text) = fts_resolve_config_and_text(args, "to_tsquery")?;
-    crate::fts::fn_to_tsquery_with_cancel(kind, text, cancel)
-}
-
-fn fts_plainto_tsquery(args: &[Value], cancel: Option<&citadel::CancelToken>) -> Result<Value> {
-    if args.iter().any(|v| v.is_null()) {
-        return Ok(Value::Null);
-    }
-    let (kind, text) = fts_resolve_config_and_text(args, "plainto_tsquery")?;
-    crate::fts::fn_plainto_tsquery_with_cancel(kind, text, cancel)
-}
-
-fn fts_phraseto_tsquery(args: &[Value], cancel: Option<&citadel::CancelToken>) -> Result<Value> {
-    if args.iter().any(|v| v.is_null()) {
-        return Ok(Value::Null);
-    }
-    let (kind, text) = fts_resolve_config_and_text(args, "phraseto_tsquery")?;
-    crate::fts::fn_phraseto_tsquery_with_cancel(kind, text, cancel)
-}
-
-fn fts_websearch_to_tsquery(
-    args: &[Value],
-    cancel: Option<&citadel::CancelToken>,
-) -> Result<Value> {
-    if args.iter().any(|v| v.is_null()) {
-        return Ok(Value::Null);
-    }
-    let (kind, text) = fts_resolve_config_and_text(args, "websearch_to_tsquery")?;
-    crate::fts::fn_websearch_to_tsquery_with_cancel(kind, text, cancel)
 }
 
 fn fts_ts_rank(

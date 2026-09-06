@@ -235,7 +235,7 @@ fn resolve_literal(expr: &Expr) -> Option<Value> {
     match expr {
         Expr::Literal(v) => Some(v.clone()),
         Expr::Parameter(n) => crate::eval::resolve_scoped_param(*n).ok(),
-        Expr::Function { .. } | Expr::Cast { .. } => {
+        Expr::Function { .. } | Expr::Cast { .. } if crate::eval::is_statement_constant(expr) => {
             let col_map = crate::eval::ColumnMap::new(&[]);
             let ctx = crate::eval::EvalCtx::new(&col_map, &[]);
             crate::eval::eval_expr(expr, &ctx).ok()

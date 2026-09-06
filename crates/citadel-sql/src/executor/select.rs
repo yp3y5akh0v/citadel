@@ -647,16 +647,18 @@ fn weight_default_score(packed: u16) -> f64 {
 
 fn ts_rank_from_index_positions(
     positions_per_lex: &[&[u16]],
+    rank_probe_indices: &[usize],
     cancel: Option<&CancelToken>,
     work: &mut usize,
 ) -> Result<f64> {
     let mut score = 0.0_f64;
-    for positions in positions_per_lex {
+    for &probe_index in rank_probe_indices {
+        let positions = positions_per_lex[probe_index];
         if positions.is_empty() {
             continue;
         }
         let mut weight_sum = 0.0;
-        for &position in *positions {
+        for &position in positions {
             check_cancel_at(cancel, *work)?;
             *work += 1;
             weight_sum += weight_default_score(position);
@@ -665,6 +667,40 @@ fn ts_rank_from_index_positions(
         score += weight_sum * (1.0 + tf);
     }
     Ok(score)
+}
+
+// The posting lists can reproduce an unweighted conjunction's rank only when
+// they contain every ranking term. Preserve AST order and repeated terms: both
+// affect scalar TS_RANK's accumulation, even though the WHERE probes are unique.
+fn ts_rank_probe_indices(
+    ast: &crate::fts::TsQueryAst,
+    probe_entries: &[Vec<u8>],
+    cancel: Option<&CancelToken>,
+) -> Result<Option<Vec<usize>>> {
+    use crate::fts::TsQueryAst;
+    let mut pending = vec![ast];
+    let mut indices = Vec::new();
+    let mut work = 0;
+    while let Some(node) = pending.pop() {
+        check_cancel_at(cancel, work)?;
+        work += 1;
+        match node {
+            TsQueryAst::Lexeme {
+                lexeme,
+                prefix: false,
+                weight_mask: 0,
+            } => match probe_entries.binary_search(lexeme) {
+                Ok(index) => indices.push(index),
+                Err(_) => return Ok(None),
+            },
+            TsQueryAst::And(left, right) => {
+                pending.push(right);
+                pending.push(left);
+            }
+            _ => return Ok(None),
+        }
+    }
+    Ok(Some(indices))
 }
 
 fn try_inverted_ts_rank_topk_with_read(
@@ -705,6 +741,11 @@ fn try_inverted_ts_rank_topk_with_read(
         ),
         _ => return Ok(None),
     };
+    // TEXT FTS indexes tokenize their source, but scalar TS_RANK requires a
+    // TSVECTOR. Do not turn its type error into an index-only numeric result.
+    if table_schema.columns[fts_col_idx].data_type != DataType::TsVector {
+        return Ok(None);
+    }
     let fts_col_name = table_schema.columns[fts_col_idx].name.to_ascii_lowercase();
 
     let pk_col_indices: Vec<usize> = table_schema
@@ -717,12 +758,11 @@ fn try_inverted_ts_rank_topk_with_read(
         TsRank,
     }
     let mut out_cols: Vec<OutCol> = Vec::with_capacity(stmt.columns.len());
-    let mut out_col_names: Vec<String> = Vec::with_capacity(stmt.columns.len());
-    let mut rank_alias: Option<String> = None;
-    let mut saw_rank = false;
+    let mut rank_output = None;
+    let mut rank_probe_indices = Vec::new();
     for sc in &stmt.columns {
-        let (expr, alias) = match sc {
-            SelectColumn::Expr { expr, alias } => (expr, alias.clone()),
+        let expr = match sc {
+            SelectColumn::Expr { expr, .. } => expr,
             _ => return Ok(None),
         };
         match expr {
@@ -736,11 +776,13 @@ fn try_inverted_ts_rank_topk_with_read(
                     return Ok(None);
                 }
                 out_cols.push(OutCol::Pk);
-                out_col_names.push(alias.unwrap_or_else(|| n.clone()));
             }
             Expr::Function { name, args, .. }
                 if name.eq_ignore_ascii_case("ts_rank") && args.len() == 2 =>
             {
+                if rank_output.is_some() || !crate::eval::is_statement_constant(&args[1]) {
+                    return Ok(None);
+                }
                 let arg_col = match &args[0] {
                     Expr::Column(c) => c.to_ascii_lowercase(),
                     Expr::QualifiedColumn { column, .. } => column.to_ascii_lowercase(),
@@ -750,38 +792,47 @@ fn try_inverted_ts_rank_topk_with_read(
                     return Ok(None);
                 }
                 let col_map = crate::eval::ColumnMap::new(&[]);
-                let ctx = crate::eval::EvalCtx::new(&col_map, &[]);
+                let ctx = crate::eval::EvalCtx::new(&col_map, &[]).with_cancel(cancel);
                 let q = match crate::eval::eval_expr(&args[1], &ctx) {
                     Ok(Value::TsQuery(b)) => b,
                     _ => return Ok(None),
                 };
-                let _ = q;
+                let ast = match crate::fts::TsQueryAst::decode_with_cancel(&q, cancel) {
+                    Ok(ast) => ast,
+                    Err(error @ SqlError::Storage(citadel::Error::Interrupted)) => {
+                        return Err(error)
+                    }
+                    // Let ordinary projection preserve lazy errors on empty
+                    // results rather than reject a query before scanning.
+                    Err(_) => return Ok(None),
+                };
+                rank_probe_indices = match ts_rank_probe_indices(&ast, &probe_entries, cancel)? {
+                    Some(indices) => indices,
+                    None => return Ok(None),
+                };
+                rank_output = Some(out_cols.len());
                 out_cols.push(OutCol::TsRank);
-                let name = alias.clone().unwrap_or_else(|| "ts_rank".to_string());
-                rank_alias = Some(name.clone());
-                out_col_names.push(name);
-                saw_rank = true;
             }
             _ => return Ok(None),
         }
     }
-    if !saw_rank {
+    let Some(rank_output) = rank_output else {
         return Ok(None);
-    }
+    };
 
-    let rank_alias = rank_alias.unwrap();
     if stmt.order_by.len() != 1 {
         return Ok(None);
     }
     let order = &stmt.order_by[0];
-    let order_name = match &order.expr {
-        Expr::Column(n) => n.to_ascii_lowercase(),
-        Expr::QualifiedColumn { column, .. } => column.to_ascii_lowercase(),
-        _ => return Ok(None),
-    };
-    if order_name != rank_alias.to_ascii_lowercase() {
+    let output_columns = build_output_columns(&stmt.columns, &table_schema.columns);
+    let output_map = ColumnMap::new(&output_columns);
+    if order_by_output_position(order, &output_map)? != Some(rank_output) {
         return Ok(None);
     }
+    let out_col_names: Vec<_> = output_columns
+        .into_iter()
+        .map(|column| column.name)
+        .collect();
     let limit = match stmt.limit.as_ref() {
         Some(expr) => eval_const_int(expr)?.max(0) as usize,
         None => return Ok(None),
@@ -850,25 +901,17 @@ fn try_inverted_ts_rank_topk_with_read(
         probes.push(p);
     }
 
-    fn score_to_key(s: f64) -> i64 {
-        let bits = s.to_bits() as i64;
-        if bits < 0 {
-            !bits
-        } else {
-            bits ^ i64::MIN
-        }
-    }
     use std::cmp::Reverse;
     use std::collections::BinaryHeap;
-    let mut heap: BinaryHeap<Reverse<(i64, i64)>> = BinaryHeap::with_capacity(limit + 1);
-
     let driver_idx = probes
         .iter()
         .enumerate()
         .min_by_key(|(_, p)| p.pks.len())
         .map(|(i, _)| i)
         .unwrap();
-    let driver = probes.swap_remove(driver_idx);
+    let driver = &probes[driver_idx];
+    let limit = limit.min(driver.pks.len());
+    let mut heap: BinaryHeap<Reverse<(u64, Reverse<i64>)>> = BinaryHeap::with_capacity(limit);
     let mut indices = vec![0usize; probes.len()];
     let mut positions_per_lex: Vec<&[u16]> = vec![&[]; probe_entries.len()];
     let mut rank_work = 0usize;
@@ -876,7 +919,11 @@ fn try_inverted_ts_rank_topk_with_read(
     'outer: for di in 0..driver.pks.len() {
         check_cancel_at(cancel, di)?;
         let pk = driver.pks[di];
+        indices[driver_idx] = di;
         for (pi, probe) in probes.iter().enumerate() {
+            if pi == driver_idx {
+                continue;
+            }
             while indices[pi] < probe.pks.len() && probe.pks[indices[pi]] < pk {
                 indices[pi] += 1;
             }
@@ -884,42 +931,47 @@ fn try_inverted_ts_rank_topk_with_read(
                 continue 'outer;
             }
         }
-        let dr_s = driver.offs[di] as usize;
-        let dr_e = driver.offs[di + 1] as usize;
-        positions_per_lex[0] = &driver.data[dr_s..dr_e];
         for (pi, probe) in probes.iter().enumerate() {
             let idx = indices[pi];
             let s = probe.offs[idx] as usize;
             let e = probe.offs[idx + 1] as usize;
-            positions_per_lex[pi + 1] = &probe.data[s..e];
+            positions_per_lex[pi] = &probe.data[s..e];
         }
-        let score = ts_rank_from_index_positions(&positions_per_lex, cancel, &mut rank_work)?;
-        let key = score_to_key(score);
+        let score = ts_rank_from_index_positions(
+            &positions_per_lex,
+            &rank_probe_indices,
+            cancel,
+            &mut rank_work,
+        )?;
+        // Scores here are finite and nonnegative, so their unsigned IEEE bits
+        // have numeric order. Larger keys always mean better requested rank.
+        let key = if order.descending {
+            score.to_bits()
+        } else {
+            !score.to_bits()
+        };
+        let candidate = (key, Reverse(pk));
         if heap.len() < limit {
-            heap.push(Reverse((key, pk)));
-        } else if let Some(Reverse((min_key, _))) = heap.peek() {
-            if key > *min_key {
+            heap.push(Reverse(candidate));
+        } else if let Some(Reverse(worst)) = heap.peek() {
+            if candidate > *worst {
                 heap.pop();
-                heap.push(Reverse((key, pk)));
+                heap.push(Reverse(candidate));
             }
         }
     }
 
-    fn key_to_score(k: i64) -> f64 {
-        let bits = if k < 0 { !k } else { k ^ i64::MIN };
-        f64::from_bits(bits as u64)
-    }
-    let heap_rows: Vec<(i64, i64)> = heap.into_iter().map(|r| r.0).collect();
+    let heap_rows: Vec<(u64, Reverse<i64>)> = heap.into_iter().map(|r| r.0).collect();
     let mut sorted_indices: Vec<usize> = (0..heap_rows.len()).collect();
     sort_indices_by(&mut sorted_indices, cancel, |a, b| {
-        heap_rows[b].0.cmp(&heap_rows[a].0)
+        heap_rows[b].cmp(&heap_rows[a])
     })?;
 
     let mut rows: Vec<Vec<Value>> = Vec::with_capacity(sorted_indices.len());
     for (row_idx, source_idx) in sorted_indices.into_iter().enumerate() {
         check_cancel_at(cancel, row_idx)?;
-        let (key, pk) = heap_rows[source_idx];
-        let score = key_to_score(key);
+        let (key, Reverse(pk)) = heap_rows[source_idx];
+        let score = f64::from_bits(if order.descending { key } else { !key });
         let mut row = Vec::with_capacity(out_cols.len());
         for col in &out_cols {
             match col {

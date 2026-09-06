@@ -1882,8 +1882,8 @@ fn find_non_immutable_expr(expr: &Expr) -> Option<NonImmutableExpr> {
                     violation = Some(NonImmutableExpr::SessionDependentJsonPath);
                 }
             }
-            Expr::BinaryOp { op, right, .. }
-                if crate::eval::is_session_dependent_jsonpath_op(op, right) =>
+            Expr::BinaryOp { op, left, right }
+                if crate::eval::is_session_dependent_jsonpath_op(op, left, right) =>
             {
                 violation = Some(NonImmutableExpr::SessionDependentJsonPath);
             }
@@ -1914,8 +1914,8 @@ pub(crate) fn expr_uses_session_dependent_jsonpath(expr: &Expr) -> bool {
                     args,
                 );
             }
-            Expr::BinaryOp { op, right, .. } => {
-                dependent = crate::eval::is_session_dependent_jsonpath_op(op, right);
+            Expr::BinaryOp { op, left, right } => {
+                dependent = crate::eval::is_session_dependent_jsonpath_op(op, left, right);
             }
             _ => {}
         }
