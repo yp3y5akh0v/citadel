@@ -1493,6 +1493,26 @@ pub(super) fn collect_keyed_rows_write(
     }
 }
 
+pub(super) enum FastPredicate {
+    Simple(SimplePredicate),
+    Between(BetweenPredicate),
+}
+
+impl FastPredicate {
+    pub(super) fn try_new(expr: &Expr, schema: &TableSchema) -> Option<Self> {
+        try_simple_predicate(expr, schema)
+            .map(Self::Simple)
+            .or_else(|| try_between_predicate(expr, schema).map(Self::Between))
+    }
+
+    pub(super) fn matches_raw(&self, key: &[u8], value: &[u8]) -> Result<bool> {
+        match self {
+            Self::Simple(predicate) => predicate.matches_raw(key, value),
+            Self::Between(predicate) => predicate.matches_raw(key, value),
+        }
+    }
+}
+
 pub(super) struct SimplePredicate {
     is_pk: bool,
     pk_pos: usize,
@@ -1646,10 +1666,12 @@ pub(super) fn try_between_predicate(expr: &Expr, schema: &TableSchema) -> Option
     } else {
         let nonpk_order = non_pk.iter().position(|&i| i == col_idx)?;
         let nonpk_idx = schema.encoding_positions()[nonpk_order] as usize;
-        let default_val = schema.columns[col_idx]
-            .default_expr
-            .as_ref()
-            .and_then(|expr| eval_const_expr(expr).ok());
+        let default_expr = schema.columns[col_idx].default_expr.as_ref();
+        if default_expr.is_some_and(|expr| crate::parser::volatile_function_in_expr(expr).is_some())
+        {
+            return None;
+        }
+        let default_val = default_expr.map(eval_const_expr).transpose().ok()?;
         Some(BetweenPredicate {
             is_pk: false,
             pk_pos: 0,
@@ -1731,10 +1753,12 @@ pub(super) fn try_simple_predicate(expr: &Expr, schema: &TableSchema) -> Option<
     } else {
         let nonpk_order = non_pk.iter().position(|&i| i == col_idx)?;
         let nonpk_idx = schema.encoding_positions()[nonpk_order] as usize;
-        let default_val = schema.columns[col_idx]
-            .default_expr
-            .as_ref()
-            .and_then(|expr| eval_const_expr(expr).ok());
+        let default_expr = schema.columns[col_idx].default_expr.as_ref();
+        if default_expr.is_some_and(|expr| crate::parser::volatile_function_in_expr(expr).is_some())
+        {
+            return None;
+        }
+        let default_val = default_expr.map(eval_const_expr).transpose().ok()?;
         Some(SimplePredicate {
             is_pk: false,
             pk_pos: 0,

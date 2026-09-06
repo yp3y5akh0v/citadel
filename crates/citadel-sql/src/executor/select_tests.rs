@@ -667,7 +667,7 @@ mod post_scan_cancellation {
     #[test]
     fn fused_topk_winner_sort_stops_after_comparisons_have_started() {
         use crate::encoding::{encode_composite_key, encode_row};
-        use crate::executor::select::{
+        use crate::executor::topk::{
             arm_topk_sort_cancel, take_topk_sort_comparisons, TopKScanPlan,
         };
         use crate::parser::OrderByItem;
