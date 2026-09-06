@@ -1,23 +1,23 @@
 # citadel-mem benchmarks
 
-Results and a reproducible evaluation harness for citadel-mem on two long-term
-memory benchmarks: LoCoMo (below) and LongMemEval_S (full-haystack, in its own section
-further down). citadel-mem is an embedded memory engine that is encrypted at rest and
-forgets by destroying keys; the LoCoMo numbers run on encrypted regions (each
-conversation is a per-atom-sealed region), so every LoCoMo figure is on the encrypted
-storage path. Each number is regenerated from a SHA-256-pinned dataset with one
-command, and each run writes a report locally recording the reader and judge models, the
-prompts, a per-question audit, and the run's limitations.
+Historical results and an evaluation harness for citadel-mem on two long-term
+memory benchmarks: LoCoMo and LongMemEval_S (full-haystack). These scores describe
+the recorded configurations below; neither benchmark has been rerun for Citadel 2.3.
+The reported configurations used encrypted regions. The harness uses SHA-256-pinned
+datasets and writes local reports recording the reader and judge models, prompts,
+per-question audit, and limitations.
 
 ## Full 10-conversation LoCoMo (encrypted, reader and judge `gpt-4o-mini`)
 
-Reference configuration (citadel defaults): encrypted regions, `e5-large` (v1) embedder +
+Recorded LoCoMo configuration: encrypted regions, `e5-large` (v1) embedder +
 `ms-marco-minilm` cross-encoder reranker, top-50 retrieval presented session-grouped
 (each session block sits at the rank of its best hit, turns inside it in conversation
-order), temperature 0, raw-turn plus photo-caption ingestion with
+order), temperature 0, raw turns enriched with supplied photo captions and image-search text, with
 each session's date prefixed into the indexed turn text (`[date] speaker: text`). Scored
 categories are multi-hop, temporal, open-domain, and single-hop; the adversarial
-(unanswerable) category is reported separately as an abstention metric.
+(unanswerable) category is reported separately as an abstention metric. The reader
+and judge prompts are implemented in this harness; the correctness judge adapts
+the Mem0 rubric.
 
 Three independent full runs (n=1540 scored questions each), measured 2026-08-18; the
 Mean +/- SD column is the sample mean and standard deviation across the three. The Run
@@ -48,8 +48,8 @@ retrieval bit-identical to these runs (the same ordered top-50 for all 1,986 que
 the shift is hosted reader/judge variance - cross-date verdict-flip rates equal the
 within-date rates.
 
-**Embedder.** The default is `e5-large` (v1). Retrieval is reader-bound, so the embedder is a
-within-noise choice; on this benchmark `e5-large` matches or slightly beats the alternatives
+**Embedder.** The evaluated runs used `e5-large` (v1). Retrieval was reader-bound, so the
+embedder was a within-noise choice; `e5-large` matched or slightly beat the alternatives
 (85.7% vs 85.5% for `bge-large` over 3 runs each on an earlier reader configuration,
 same reranker + fusion; the embedder ranking is unchanged). Deterministic
 retrieval recall (recall@50, hybrid fusion, no reranker) across the encoders we evaluated:
@@ -68,16 +68,12 @@ The top encoders sit within ~1 point on raw recall; the cross-encoder reranker (
 below) then lifts the final recall@50 to 94.5%. `bge-large` and the others remain selectable
 `--embedder` options.
 
-Encryption adds no retrieval-layer overhead. Recall over an encrypted region decrypts
-the region into an ephemeral in-memory nearest-neighbor index whose plaintext vectors
-are zeroized when it is dropped, so the retrieval ceiling and end-to-end accuracy are
-identical to a plaintext store.
+## Historical comparison with 2025 paper results
 
-## How 87.2% compares (2025 paper protocol)
-
-Both reader and judge are `gpt-4o-mini`, matching the 2025 Mem0 paper results listed
-below. This table is a comparison to that fixed paper protocol, not to newer vendor
-pipelines that use different readers and memory construction:
+The Citadel runs used `gpt-4o-mini` for both reader and judge, matching the models
+reported in the 2025 Mem0 paper. Citadel used the harness's own prompts and memory
+construction; matching models does not establish a matched evaluation protocol.
+The paper's results were not reproduced with this harness:
 
 | System | Overall (scored) | Source |
 |---|---|---|
@@ -89,17 +85,13 @@ pipelines that use different readers and memory construction:
 | LangMem | 58.1% | arXiv 2504.19413 |
 | OpenAI memory | 52.9% | arXiv 2504.19413 |
 
-The 87.2% mean is 19 to 34 points higher than these reported memory systems, and 14 points
-above the full-context, no-retrieval baseline. Their scores are taken from the Mem0 paper
-(Chhikara et al., 2025). Newer vendor results are excluded from this table because their
-reader and memory-building protocols differ and they are not reproduced here.
+The external scores, including the full-context baseline, come from the Mem0 paper
+(Chhikara et al., 2025). They provide historical context; the table does not measure
+a paired advantage under a shared protocol. Newer vendor results are not included.
 
-This number uses a zero-LLM memory path: raw turns in, vector + BM25 + cross-encoder
-out, with no LLM touching the memory at ingest or retrieval, so ingestion costs no
-tokens, recall is deterministic, and no conversation content is sent to a model
-to build or search the store. The other systems run an LLM
-over the conversation to build memory (fact extraction, temporal knowledge graphs, or
-context curation).
+These runs used raw turns enriched with supplied photo captions and image-search
+text, local embedding and reranking, and no LLM calls during memory ingest or
+retrieval. Reader and judge calls generated and scored answers separately.
 
 77% of scored misses have the gold already in the prompt and the reader still missed it
 (Self-audit below), so reader quality dominates the remaining error.
@@ -108,7 +100,7 @@ context curation).
 
 [LongMemEval](https://arxiv.org/abs/2410.10813) tests long-term memory over many chat sessions
 across six question types. `longmemeval_s` is the full-haystack split: ~40-50 sessions per
-question (~115k tokens), so retrieval runs against distractors. Config: 500 questions, encrypted
+question (~115k tokens), so retrieval runs against distractors. Recorded configuration: 500 questions, encrypted
 regions, `e5-large` embedder + `ms-marco-minilm` reranker, gpt-4o reader, official CoT prompt
 (session-grouped history), official `gpt-4o-2024-08-06` judge.
 
@@ -120,7 +112,7 @@ regions, `e5-large` embedder + `ms-marco-minilm` reranker, gpt-4o reader, offici
 
 Per-type: single-session-assistant 100.0%, single-session-user 98.6%, knowledge-update 92.3%,
 temporal-reasoning 84.2%, multi-session 75.9%, single-session-preference 70.0%.
-Single-run numbers; run-to-run reader/judge variance is about +/-2 points.
+Single-run results.
 
 Reproduce: see [RUNBOOK.md](RUNBOOK.md).
 
@@ -165,7 +157,7 @@ dataset:           locomo10.json
 dataset_sha256:    79fa87e90f04081343b8c8debecb80a9a6842b76a7aa537dc9fdf651ea698ff4
 ```
 
-These are the defaults used for the full runs above.
+This is the configuration recorded for the LoCoMo full runs above.
 
 ## How the harness stays reproducible
 
@@ -239,14 +231,12 @@ date-prefixed (`[date] speaker: text ...`), overall evidence recall is:
 | C: + linear fusion (BM25 keyword) | 81.6/69.1 | 90.6/79.8 | 92.8/83.3 |
 | D: + cross-encoder reranker | 84.2/71.8 | 92.1/81.5 | 94.5/85.2 |
 
-A and B are identical to the decimal at every cutoff: nearest-neighbor recall over
-the decrypted-into-memory index of an encrypted region loses nothing against
-brute-force cosine over the same embeddings, so the retrieval ceiling is identical
-to a plaintext store. (An earlier revision reported A = 67.9% as the "embedder
+In this historical diagnostic, A and B agree at the reported precision for the
+same embeddings. (An earlier revision reported A = 67.9% as the "embedder
 ceiling"; that diagnostic embedded the raw turn text while the index held
 speaker-and-caption-enriched text - an instrumentation artifact, not a ceiling.)
 Fusion and the reranker add recall on top of the exact vector layer because they
-merge non-vector signals. In the shipped fusion-plus-reranker stack at k=50,
+merge non-vector signals. In the evaluated fusion-plus-reranker configuration at k=50,
 269/282 (95.4%) multi-hop questions surface at least one annotated gold turn and
 172/282 (61.0%) surface every annotated gold turn. Full-set coverage is a
 retrieval diagnostic; by itself, it does not identify which strategy would close
@@ -269,9 +259,10 @@ retrieval contributes none.
 
 ## Limitations
 
-- The metric is an LLM-judge protocol, not the LoCoMo paper's token-F1, so a number is
-  comparable only to runs using the same judge model.
-- Ingestion is raw conversation turns plus each shared photo's caption, not LLM-extracted
+- The metric uses the harness's LLM-judge protocol, not the LoCoMo paper's token-F1.
+  Comparisons depend on the reader and judge models, prompts, input construction,
+  and evaluation setup; matching the judge model alone is insufficient.
+- Ingestion uses raw conversation turns, supplied photo captions and image-search text, not LLM-extracted
   facts. Accuracy is therefore not directly comparable with fact-extraction systems.
 - On this benchmark the recency and importance fusion weights contribute no rank signal
   (all sessions are equally old versus the wall clock, and raw turns carry no importance),
@@ -280,7 +271,7 @@ retrieval contributes none.
   below 100%. The retrieval ceiling and per-question audit are in each run's local report.
 - conv-26 is the development split on which the configuration (top-50, session-grouped
   order, no neighbor expansion, date-prefixed indexing) was selected; the full-run
-  figures are the reportable ones. The retrieval defaults (fusion ratio, RRF k, rerank pool)
+  figures are the reportable ones. The evaluated retrieval settings (fusion ratio, RRF k, rerank pool)
   were likewise selected on the token-free diagnostic and the same dev split.
 - Top-50 retrieval trades abstention for accuracy: with more retrieved content the
   reader answers more unanswerable questions (abstention 65.9%).

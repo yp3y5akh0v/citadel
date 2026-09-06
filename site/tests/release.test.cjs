@@ -175,12 +175,22 @@ for (const [tag, studio] of [['v2.1.0', false], ['v2.2.0', true]]) {
   test(`Zola renders ${tag} using only available release download URLs`, () => {
     const directory = mkdtempSync(join(tmpdir(), 'citadel-site-release-test-'));
     try {
-      cpSync(join(__dirname, '..'), directory, {
-        recursive: true, filter: path => !['public', 'data', 'wasm'].includes(basename(path)),
+      const source = resolve(__dirname, '..');
+      cpSync(source, directory, {
+        recursive: true,
+        filter: path => !['public', 'wasm'].includes(basename(path))
+          && path !== join(source, 'data', 'release.json'),
       });
       const f = fixture(tag, studio);
       writeManifest(f.manifest(), join(directory, 'data'));
       execFileSync('zola', ['--root', directory, 'build'], { encoding: 'utf8', timeout: 30_000 });
+      const homepage = readFileSync(join(directory, 'public/index.html'), 'utf8');
+      const benchmarkScripts = [...homepage.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/g)]
+        .filter(match => /\bid=(?:"sqlBenchmarks"|sqlBenchmarks)(?=\s|$)/.test(match[1]));
+      assert.equal(benchmarkScripts.length, 1);
+      assert.match(benchmarkScripts[0][1], /\btype=(?:"application\/json"|application\/json)(?=\s|$)/);
+      assert.deepEqual(JSON.parse(benchmarkScripts[0][2]),
+        JSON.parse(readFileSync(join(source, 'data/sql-benchmarks.json'), 'utf8')));
       const html = readFileSync(join(directory, 'public/download/index.html'), 'utf8');
       const links = [...html.matchAll(/\bhref=(?:"([^"]*)"|([^\s>]+))/g)]
         .map(match => match[1] ?? match[2])

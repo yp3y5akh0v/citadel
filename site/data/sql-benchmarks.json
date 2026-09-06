@@ -1,0 +1,127 @@
+{
+  "schema_version": 1,
+  "measured_on": "2026-09-06",
+  "environment": {
+    "cpu": "Intel Core i9-12900HX",
+    "os": "Windows 11 Pro (10.0.26200)",
+    "rustc": "1.98.0",
+    "sqlite": "3.51.3",
+    "logical_processor": 0
+  },
+  "measurement": {
+    "passes": 2,
+    "samples_per_pass": 100,
+    "warmup_seconds": 3,
+    "measurement_target_seconds": 5,
+    "statistic": "Median of the two per-pass sample medians, in nanoseconds.",
+    "scope": "Combined measurements from the listed source revisions; not a full-suite timing run at one revision."
+  },
+  "configuration": {
+    "citadel": {
+      "sync": "Off",
+      "page_size": 8208,
+      "cached_body_bytes": 8160,
+      "cache_pages": 4096
+    },
+    "sqlite": {
+      "journal_mode": "MEMORY",
+      "synchronous": "OFF",
+      "page_size": 8192,
+      "cache_pages": 4096
+    }
+  },
+  "sources": {
+    "baseline": {
+      "revision": "4a5ac2833334ef8d491999d6f79f4cfab00da512",
+      "executable_sha256": "dab71c5bb155795912d244a7b370bb468f7070565092fc99bb16df2fbfac73a8"
+    },
+    "post_fix_fts": {
+      "revision": "b9f3b53c4ae4bfbd4e9010f5585f4a8129ba3ec7",
+      "executable_sha256": "baf3fca4ec7d0be218fbeccaff8a5bed98a5530f4df82a37ff0429970f4cecf0"
+    },
+    "post_fix_window": {
+      "revision": "20fa38e1327a05d8811fb98d50f1bf5c9d201e65",
+      "executable_sha256": "70c8c7aaf1102aa1fde99c04d9082f123173a231d27e23829debae8af5ebfbb5"
+    },
+    "post_fix_update": {
+      "revision": "099d091735f16a45e790b3ef5bd47c5d6187dba4",
+      "executable_sha256": "b043c642746fccd1e7ee9974d66628f50ecb7b13b50ab65d27fb88545151eefd"
+    }
+  },
+  "execution": [
+    {"name":"join_param","source":"baseline","samples_ns":{"citadel":[2151.764692805227,2230.967426882061],"sqlite":[43256.15897408439,43814.19642857143]}},
+    {"name":"fts_rank_first_execution","source":"post_fix_fts","samples_ns":{"citadel":[5193260,5335035],"sqlite":[49434925,50480950]}},
+    {"name":"insert_returning","source":"baseline","samples_ns":{"citadel":[68037.64730639731,66141.39784946237],"sqlite":[286598.28814338235,278983.3143939394]}},
+    {"name":"upsert_returning","source":"post_fix_update","samples_ns":{"citadel":[102662.78556701032,106024.9540229885],"sqlite":[297053.19220430107,297974.5757385292]}},
+    {"name":"update_returning","source":"post_fix_update","samples_ns":{"citadel":[78736.75213675213,78634.97825359652],"sqlite":[204837.9513633014,204698.7400318979]}},
+    {"name":"sort_paginate_pk","source":"baseline","samples_ns":{"citadel":[7651.516076094576,7901.407324702001],"sqlite":[19202.892764015647,19663.836361180525]}},
+    {"name":"delete_returning","source":"baseline","samples_ns":{"citadel":[88535.14576141158,86756.5404040404],"sqlite":[222442.53101736974,214944.375]}},
+    {"name":"fts_phrase","source":"post_fix_fts","samples_ns":{"citadel":[4383587.5,4470737.5],"sqlite":[10756870,11147750]}},
+    {"name":"fts_match","source":"post_fix_fts","samples_ns":{"citadel":[3674350,3740692.8571428573],"sqlite":[9116525,9148400]}},
+    {"name":"json_extract","source":"baseline","samples_ns":{"citadel":[17257050,17236083.333333336],"sqlite":[38599700,37961125]}},
+    {"name":"scan","source":"baseline","samples_ns":{"citadel":[5994656.25,6284794.444444444],"sqlite":[12296460,12486440]}},
+    {"name":"window_rank","source":"post_fix_window","samples_ns":{"citadel":[65883700,65639850],"sqlite":[125871300,127403000]}},
+    {"name":"window_agg","source":"post_fix_window","samples_ns":{"citadel":[41592425,41360550],"sqlite":[75633650,75279750]}},
+    {"name":"wide_proj_full","source":"baseline","samples_ns":{"citadel":[5364980,5411888.888888889],"sqlite":[9435291.666666668,9528091.666666668]}},
+    {"name":"insert_gen_stored","source":"baseline","samples_ns":{"citadel":[33878.97316821465,32757.338989460528],"sqlite":[53997.87393162394,52758.389241996236]}},
+    {"name":"insert_gen_virtual","source":"baseline","samples_ns":{"citadel":[33770.5211248533,33022.670454545456],"sqlite":[53597.11399711399,52710.36437246964]}},
+    {"name":"truncate","source":"baseline","samples_ns":{"citadel":[52396.10119047619,50609.85377358491],"sqlite":[78206.07076585694,76908.50048923679]}},
+    {"name":"insert","source":"baseline","samples_ns":{"citadel":[33007.903940178316,33148.344696969696],"sqlite":[49196.59987448449,49803.99499880924]}},
+    {"name":"upsert_all_new","source":"baseline","samples_ns":{"citadel":[33387.668831168834,32393.581486611263],"sqlite":[49805.07343395002,48356.90230167842]}},
+    {"name":"covered_count","source":"baseline","samples_ns":{"citadel":[302257.51488095237,309876.2060463122],"sqlite":[447778.3914412947,456148.354978355]}},
+    {"name":"upsert_dedup","source":"baseline","samples_ns":{"citadel":[28290.24865591398,27696.122685185186],"sqlite":[41397.86206896552,39955.13333333333]}},
+    {"name":"wide_proj_3col","source":"baseline","samples_ns":{"citadel":[1121265.7843137253,1135608.8739290086],"sqlite":[1507740.042223786,1525906.0960591133]}},
+    {"name":"delete","source":"baseline","samples_ns":{"citadel":[71910.18398268399,71427.87059878897],"sqlite":[95560.71022727274,94217.78200961136]}},
+    {"name":"wide_proj_pk","source":"baseline","samples_ns":{"citadel":[455357.9444444445,429776.59090909094],"sqlite":[569738.0361445784,577927.2417153995]}},
+    {"name":"wide_proj_2col","source":"baseline","samples_ns":{"citadel":[615600.3909026297,620331.0697115385],"sqlite":[780901.0704727921,801839.1090678503]}},
+    {"name":"savepoint_create","source":"baseline","samples_ns":{"citadel":[767.1747422950519,735.594731919899],"sqlite":[865.0630773530422,836.1913957248069]}},
+    {"name":"savepoint_nested","source":"baseline","samples_ns":{"citadel":[261915.50849780702,255392.94016768294],"sqlite":[276628.9425202653,269573.47222222225]}},
+    {"name":"savepoint_rollback","source":"baseline","samples_ns":{"citadel":[2565947.5,2597365],"sqlite":[2692600,2621594.736842105]}},
+    {"name":"upsert_counter","source":"post_fix_update","samples_ns":{"citadel":[71928.1693655723,72260.01828896566],"sqlite":[71270.38276069921,72145.1441102757]}},
+    {"name":"covered_range","source":"baseline","samples_ns":{"citadel":[93696.17535574472,94858.27003185495],"sqlite":[92307.62987012987,94840.80454047595]}},
+    {"name":"with_dml","source":"baseline","samples_ns":{"citadel":[124635.5417837976,121409.48472259447],"sqlite":[118373.10659335976,113587.35406743252]}},
+    {"name":"upsert_mixed","source":"post_fix_update","samples_ns":{"citadel":[56416.21212121212,58235.32948532949],"sqlite":[50549.28310997241,52713.93996523272]}},
+    {"name":"fk_cascade","source":"baseline","samples_ns":{"citadel":[132423.65562678064,127793.70554765292],"sqlite":[115624.22514619883,111825.85858585857]}},
+    {"name":"update","source":"post_fix_update","samples_ns":{"citadel":[49015.12782749896,49622.43583495777],"sqlite":[39167.07427536232,40195.67179487179]}},
+    {"name":"update_gen_propagate","source":"post_fix_update","samples_ns":{"citadel":[77587.14447317389,77560.48598312154],"sqlite":[61581.35703648548,61617.99884659746]}},
+    {"name":"fk_cascade_delete_only","source":"baseline","samples_ns":{"citadel":[64863.569078947374,63099.12314388121],"sqlite":[51276.037376048815,49179.29371231697]}},
+    {"name":"insert_select","source":"baseline","samples_ns":{"citadel":[367178.1061850027,360671.3625672043],"sqlite":[200757.50862068965,196218.88257575757]}}
+  ],
+  "cached": [
+    {"name":"correlated_in","source":"baseline","samples_ns":{"citadel":[221.9593926794356,224.1615722865723],"sqlite":[2388099750,2336807400]}},
+    {"name":"fts_rank","source":"post_fix_fts","samples_ns":{"citadel":[404.4123915952117,419.5320989466301],"sqlite":[48892500,50464100]}},
+    {"name":"correlated_exists","source":"baseline","samples_ns":{"citadel":[221.22953576103805,219.74760614609102],"sqlite":[8399850,8218133.333333334]}},
+    {"name":"jsonb_contains","source":"baseline","samples_ns":{"citadel":[1533.0825914512357,1475.1635644875041],"sqlite":[31627800,31200675]}},
+    {"name":"sort_nocase","source":"baseline","samples_ns":{"citadel":[362.17067835518003,366.19561201369277],"sqlite":[3980403.846153846,4084203.846153846]}},
+    {"name":"cte","source":"baseline","samples_ns":{"citadel":[1212.870608798789,1191.3611570247933],"sqlite":[7484242.857142857,7327535.714285715]}},
+    {"name":"sort","source":"baseline","samples_ns":{"citadel":[543.9432315222393,559.0786810288167],"sqlite":[3231890.625,3313528.125]}},
+    {"name":"group_by","source":"baseline","samples_ns":{"citadel":[2156.061828409175,2161.4037806011775],"sqlite":[12488300,12406550]}},
+    {"name":"sum","source":"baseline","samples_ns":{"citadel":[684.2078207491595,683.7326914259513],"sqlite":[2336972.7272727275,2356002.2727272725]}},
+    {"name":"distinct","source":"baseline","samples_ns":{"citadel":[1523.3453706894352,1501.6680523746872],"sqlite":[4915286.363636363,4747531.818181818]}},
+    {"name":"full_outer_join","source":"baseline","samples_ns":{"citadel":[20978.548970178817,20444.106427648578],"sqlite":[25344075,24490675]}},
+    {"name":"correlated_scalar","source":"baseline","samples_ns":{"citadel":[19747.833993298813,19287.939248251747],"sqlite":[22847566.666666664,22290883.333333336]}},
+    {"name":"recursive_cte","source":"baseline","samples_ns":{"citadel":[234.4306378388479,223.0784286370798],"sqlite":[153252.09882583172,147542.9559507873]}},
+    {"name":"partial_index_point","source":"baseline","samples_ns":{"citadel":[220.26328643361046,216.55427391937835],"sqlite":[17152.00048059594,16716.695746095047]}},
+    {"name":"view_filter","source":"baseline","samples_ns":{"citadel":[31476.812265267276,30969.965277777777],"sqlite":[2235223.913043478,2196354.347826087]}},
+    {"name":"filter","source":"baseline","samples_ns":{"citadel":[30625.65133037694,31657.869249394673],"sqlite":[2186623.9130434785,2231647.7272727275]}},
+    {"name":"point","source":"baseline","samples_ns":{"citadel":[242.8193429123603,252.90157192782544],"sqlite":[16571.115930074768,17270.884686688914]}},
+    {"name":"view_point","source":"baseline","samples_ns":{"citadel":[256.79953976260225,250.68321374870754],"sqlite":[17270.88489958747,16899.506370845585]}},
+    {"name":"count","source":"baseline","samples_ns":{"citadel":[637.1619615588171,673.7049298096854],"sqlite":[26480.118601747818,27296.3769640853]}},
+    {"name":"select_gen_virtual","source":"baseline","samples_ns":{"citadel":[1873.233328593772,1788.030415718758],"sqlite":[27077.938446688448,26220.299053867733]}},
+    {"name":"join","source":"baseline","samples_ns":{"citadel":[20619.18458478742,21310.94030017921],"sqlite":[125381.74816280385,127782.31699594732]}},
+    {"name":"union","source":"baseline","samples_ns":{"citadel":[41887.099549415725,41005.88541666667],"sqlite":[201452.6984126984,193044.93600071606]}}
+  ],
+  "only": [
+    {"name":"json_table","source":"baseline","samples_ns":{"citadel":[6106911.111111111,6068700]}},
+    {"name":"lateral","source":"baseline","samples_ns":{"citadel":[2185.2688847518866,2164.6022208166423]}},
+    {"name":"date_sort","source":"baseline","samples_ns":{"citadel":[1497.349505279787,1477.2700951111747]}},
+    {"name":"date_extract","source":"baseline","samples_ns":{"citadel":[682.4888429904474,683.4188600715813]}},
+    {"name":"date_groupby","source":"baseline","samples_ns":{"citadel":[478.07634124181516,460.17703372299997]}},
+    {"name":"date_arith","source":"baseline","samples_ns":{"citadel":[227.2637289523517,217.52870499307028]}},
+    {"name":"date_range_scan","source":"baseline","samples_ns":{"citadel":[220.8971296431223,216.04814978391678]}}
+  ],
+  "index": [
+    {"name":"json_gin","source":"baseline","samples_ns":{"gin_index":[4551.857606486667,4523.913109751331],"seq_scan":[6444431.25,6374531.25]}},
+    {"name":"fts_index","source":"post_fix_fts","samples_ns":{"fts_index":[3817834.615384615,3884388.461538462],"seq_scan":[1643299400,1668419250]}}
+  ]
+}

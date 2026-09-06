@@ -3,10 +3,10 @@ name: Website checks
 on:
   pull_request:
     branches: [master]
-    paths: ['site/**', '.github/workflows/site.yml', '.github/workflows/deploy-site.yml']
+    paths: ['README.md', 'site/**', '.github/workflows/site.yml', '.github/workflows/deploy-site.yml']
   push:
     branches: [master]
-    paths: ['site/**', '.github/workflows/site.yml', '.github/workflows/deploy-site.yml']
+    paths: ['README.md', 'site/**', '.github/workflows/site.yml', '.github/workflows/deploy-site.yml']
 
 permissions:
   contents: read
