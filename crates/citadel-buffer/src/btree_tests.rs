@@ -63,6 +63,293 @@ fn insert_update_existing() {
 }
 
 #[test]
+fn insert_same_width_replacement_preserves_leaf_layout() {
+    let (mut pages, mut alloc, mut tree) = new_tree();
+    for i in 0..16u8 {
+        let key = format!("k{i:02}");
+        tree.insert(
+            &mut pages,
+            &mut alloc,
+            TxnId(1),
+            key.as_bytes(),
+            ValueType::Inline,
+            &[i; 32],
+        )
+        .unwrap();
+    }
+    assert_eq!(tree.depth, 1);
+    let root = tree.root;
+    let page = &pages[&root];
+    let cell_area_start = page.cell_area_start();
+    let free_space = page.free_space();
+    let offsets: Vec<u16> = (0..page.num_cells()).map(|i| page.cell_offset(i)).collect();
+
+    for byte in 0..64u8 {
+        assert!(!tree
+            .insert(
+                &mut pages,
+                &mut alloc,
+                TxnId(1),
+                b"k07",
+                ValueType::Inline,
+                &[byte; 32],
+            )
+            .unwrap());
+        let page = &pages[&root];
+        assert_eq!(tree.root, root);
+        assert_eq!(tree.entry_count, 16);
+        assert_eq!(page.num_cells(), 16);
+        // Delete/reinsert preserves total free space but moves the cell and
+        // consumes contiguous space. Check both to detect fragmentation.
+        assert_eq!(page.cell_area_start(), cell_area_start);
+        assert_eq!(page.free_space(), free_space);
+        for (i, &offset) in offsets.iter().enumerate() {
+            assert_eq!(page.cell_offset(i as u16), offset);
+        }
+    }
+    for i in 0..16u8 {
+        let key = format!("k{i:02}");
+        let byte = if i == 7 { 63 } else { i };
+        assert_eq!(
+            tree.search(&pages, key.as_bytes()).unwrap(),
+            Some((ValueType::Inline, vec![byte; 32]))
+        );
+    }
+}
+
+#[test]
+fn insert_existing_growth_splits_full_leaf_and_shrink_preserves_keys() {
+    let (mut pages, mut alloc, mut tree) = new_tree();
+    // 60 cells of 130 bytes plus their pointers nearly fill one leaf.
+    for i in 0..60u32 {
+        let key = format!("k{i:02}");
+        tree.insert(
+            &mut pages,
+            &mut alloc,
+            TxnId(1),
+            key.as_bytes(),
+            ValueType::Inline,
+            &[b'a'; 120],
+        )
+        .unwrap();
+    }
+    assert_eq!(tree.depth, 1);
+    assert!(!tree
+        .insert(
+            &mut pages,
+            &mut alloc,
+            TxnId(2),
+            b"k05",
+            ValueType::Inline,
+            &[b'B'; 700],
+        )
+        .unwrap());
+    assert!(tree.depth > 1);
+    assert_eq!(tree.entry_count, 60);
+
+    for replacement in [vec![b'B'; 700], Vec::new(), vec![b'C'; 17]] {
+        assert!(!tree
+            .insert(
+                &mut pages,
+                &mut alloc,
+                TxnId(2),
+                b"k05",
+                ValueType::Inline,
+                &replacement,
+            )
+            .unwrap());
+        assert_eq!(tree.entry_count, 60);
+        for i in 0..60u32 {
+            let key = format!("k{i:02}");
+            let expected = if i == 5 {
+                replacement.clone()
+            } else {
+                vec![b'a'; 120]
+            };
+            assert_eq!(
+                tree.search(&pages, key.as_bytes()).unwrap(),
+                Some((ValueType::Inline, expected))
+            );
+        }
+    }
+    assert!(tree
+        .insert(
+            &mut pages,
+            &mut alloc,
+            TxnId(2),
+            b"k60",
+            ValueType::Inline,
+            b"new",
+        )
+        .unwrap());
+    assert_eq!(tree.entry_count, 61);
+}
+
+#[test]
+fn insert_existing_tombstone_preserves_physical_count_and_updates_tag() {
+    let (mut pages, mut alloc, mut tree) = new_tree();
+    assert!(tree
+        .insert(
+            &mut pages,
+            &mut alloc,
+            TxnId(1),
+            b"key",
+            ValueType::Tombstone,
+            b"",
+        )
+        .unwrap());
+    for (val_type, value) in [
+        (ValueType::Inline, b"".as_slice()),
+        (ValueType::Tombstone, b"".as_slice()),
+        (ValueType::Inline, b"restored".as_slice()),
+        (ValueType::Tombstone, b"".as_slice()),
+    ] {
+        assert!(!tree
+            .insert(&mut pages, &mut alloc, TxnId(1), b"key", val_type, value)
+            .unwrap());
+        assert_eq!(tree.entry_count, 1);
+        assert_eq!(pages[&tree.root].num_cells(), 1);
+        assert_eq!(
+            tree.search(&pages, b"key").unwrap(),
+            Some((val_type, value.to_vec()))
+        );
+    }
+}
+
+#[test]
+fn insert_existing_equal_width_type_changes_report_old_overflow_head() {
+    let (mut pages, mut alloc, mut tree) = new_tree();
+    tree.insert(
+        &mut pages,
+        &mut alloc,
+        TxnId(1),
+        b"key",
+        ValueType::Inline,
+        b"12345678",
+    )
+    .unwrap();
+    let first_ref = leaf_node::OverflowRef {
+        first_page: PageId(4242),
+        total_len: 5000,
+    }
+    .to_bytes();
+    let second_ref = leaf_node::OverflowRef {
+        first_page: PageId(4343),
+        total_len: 6000,
+    }
+    .to_bytes();
+    let page = &pages[&tree.root];
+    let cell_offset = page.cell_offset(0);
+    let cell_area_start = page.cell_area_start();
+    for (val_type, value, old_head) in [
+        (ValueType::Overflow, first_ref.as_slice(), None),
+        (
+            ValueType::Overflow,
+            second_ref.as_slice(),
+            Some(PageId(4242)),
+        ),
+        (
+            ValueType::Inline,
+            b"87654321".as_slice(),
+            Some(PageId(4343)),
+        ),
+    ] {
+        let (path, leaf_id) = tree.walk_to_leaf(&pages, b"key").unwrap();
+        let result = tree
+            .insert_at_leaf(
+                &mut pages,
+                &mut alloc,
+                TxnId(1),
+                b"key",
+                val_type,
+                value,
+                path,
+                leaf_id,
+            )
+            .unwrap();
+        assert_eq!(result, (false, old_head));
+        assert_eq!(tree.entry_count, 1);
+        assert_eq!(pages[&tree.root].cell_offset(0), cell_offset);
+        assert_eq!(pages[&tree.root].cell_area_start(), cell_area_start);
+        assert_eq!(
+            tree.search(&pages, b"key").unwrap(),
+            Some((val_type, value.to_vec()))
+        );
+    }
+}
+
+#[test]
+fn insert_existing_cow_preserves_snapshot_and_remaps_append_cache() {
+    let (mut pages, mut alloc, mut tree) = new_tree();
+    for i in 0..100u32 {
+        let key = format!("k{i:03}");
+        tree.insert(
+            &mut pages,
+            &mut alloc,
+            TxnId(1),
+            key.as_bytes(),
+            ValueType::Inline,
+            &[b'a'; 120],
+        )
+        .unwrap();
+    }
+    assert!(tree.depth > 1);
+    assert!(tree.last_insert.is_some());
+    let snapshot = tree.clone();
+    let (path, leaf_id) = tree.walk_to_leaf(&pages, b"k000").unwrap();
+    assert_eq!(
+        tree.insert_at_leaf(
+            &mut pages,
+            &mut alloc,
+            TxnId(2),
+            b"k000",
+            ValueType::Inline,
+            &[b'B'; 120],
+            path,
+            leaf_id,
+        )
+        .unwrap(),
+        (false, None)
+    );
+    assert_ne!(tree.root, snapshot.root);
+    assert!(tree.lil_would_hit(&pages, b"k100"));
+    assert_eq!(
+        tree.try_lil_insert(
+            &mut pages,
+            &mut alloc,
+            TxnId(2),
+            b"k100",
+            ValueType::Inline,
+            &[b'c'; 120],
+        )
+        .unwrap(),
+        Some(true)
+    );
+    tree.debug_assert_lil_disjoint();
+    assert_eq!(tree.entry_count, 101);
+    assert_eq!(snapshot.entry_count, 100);
+    for i in 0..100u32 {
+        let key = format!("k{i:03}");
+        assert_eq!(
+            snapshot.search(&pages, key.as_bytes()).unwrap(),
+            Some((ValueType::Inline, vec![b'a'; 120]))
+        );
+        assert_eq!(
+            tree.search(&pages, key.as_bytes()).unwrap(),
+            Some((
+                ValueType::Inline,
+                vec![if i == 0 { b'B' } else { b'a' }; 120]
+            ))
+        );
+    }
+    assert_eq!(snapshot.search(&pages, b"k100").unwrap(), None);
+    assert_eq!(
+        tree.search(&pages, b"k100").unwrap(),
+        Some((ValueType::Inline, vec![b'c'; 120]))
+    );
+}
+
+#[test]
 fn insert_multiple_sorted() {
     let (mut pages, mut alloc, mut tree) = new_tree();
     let keys = [b"dog", b"ant", b"cat", b"fox", b"bat", b"eel"];

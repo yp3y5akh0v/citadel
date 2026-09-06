@@ -388,7 +388,7 @@ impl BTree {
         path: Vec<(PageId, usize)>,
         leaf_id: PageId,
     ) -> Result<(bool, Option<PageId>)> {
-        let (key_exists, replaced_overflow) = {
+        let (existing_idx, replaced_overflow) = {
             let page = pages.get(&leaf_id).unwrap();
             match leaf_node::search(page, key) {
                 Ok(idx) => {
@@ -398,17 +398,23 @@ impl BTree {
                     } else {
                         None
                     };
-                    (true, head)
+                    (Some(idx), head)
                 }
-                Err(_) => (false, None),
+                Err(_) => (None, None),
             }
         };
+        let key_exists = existing_idx.is_some();
 
         let new_leaf_id = cow_page(pages, alloc, leaf_id, txn_id);
 
         let leaf_ok = {
             let page = pages.get_mut(&new_leaf_id).unwrap();
-            leaf_node::insert_direct(page, key, val_type, value)
+            // CoW preserves cell indices. Reuse the known match so equal-width
+            // replacements do not fragment the leaf by deleting/reinserting.
+            match existing_idx {
+                Some(idx) => leaf_node::replace_at(page, idx, key, val_type, value),
+                None => leaf_node::insert_direct(page, key, val_type, value),
+            }
         };
 
         if leaf_ok {
