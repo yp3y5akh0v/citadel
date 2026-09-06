@@ -1573,7 +1573,7 @@ pub(super) fn apply_set_operation(
     }
 
     if let Some(ref offset_expr) = comp.offset {
-        let offset = eval_const_int(offset_expr)?.max(0) as usize;
+        let offset = eval_row_count(offset_expr)?;
         if offset < rows.len() {
             rows = rows.split_off(offset);
         } else {
@@ -1582,7 +1582,7 @@ pub(super) fn apply_set_operation(
     }
 
     if let Some(ref limit_expr) = comp.limit {
-        let limit = eval_const_int(limit_expr)?.max(0) as usize;
+        let limit = eval_row_count(limit_expr)?;
         rows.truncate(limit);
     }
 

@@ -289,14 +289,13 @@ impl TopKScanPlan {
             SortTarget::Column(enc_pos_arr[nonpk_order] as usize)
         };
 
-        let limit = eval_const_int(stmt.limit.as_ref().unwrap())?.max(0) as usize;
+        let limit = eval_row_count(stmt.limit.as_ref().unwrap())?;
         let offset = stmt
             .offset
             .as_ref()
-            .map(eval_const_int)
+            .map(eval_row_count)
             .transpose()?
-            .unwrap_or(0)
-            .max(0) as usize;
+            .unwrap_or(0);
         let keep = if limit == 0 {
             0
         } else {
@@ -471,7 +470,7 @@ fn finish_topk(
     cancel: Option<&CancelToken>,
 ) -> Result<ExecutionResult> {
     if let Some(ref offset_expr) = stmt.offset {
-        let offset = eval_const_int(offset_expr)?.max(0) as usize;
+        let offset = eval_row_count(offset_expr)?;
         if offset < rows.len() {
             rows = rows.split_off(offset);
         } else {
@@ -479,7 +478,7 @@ fn finish_topk(
         }
     }
     if let Some(ref limit_expr) = stmt.limit {
-        let limit = eval_const_int(limit_expr)?.max(0) as usize;
+        let limit = eval_row_count(limit_expr)?;
         rows.truncate(limit);
     }
 
