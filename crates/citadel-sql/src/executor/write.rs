@@ -86,10 +86,8 @@ struct CompiledFastPath {
     single_int_pk: bool,
     strict: bool,
     targets: Vec<CompiledTarget>,
-    scan_plan: crate::planner::ScanPlan,
     pk_idx_cache: Vec<usize>,
     col_map: ColumnMap,
-    range_bounds_i64: Option<Vec<(BinOp, i64)>>,
     gen_targets: Vec<GenColPatch>,
     gen_extra_cols: Vec<(usize, usize)>,
     rhs_extra_cols: Vec<(usize, usize)>,
@@ -245,6 +243,26 @@ fn resolve_int_param(n: usize) -> Option<i64> {
     match crate::eval::resolve_scoped_param(n).ok()? {
         Value::Integer(v) => Some(v),
         _ => None,
+    }
+}
+
+fn compiled_target_patch_safe(target: &CompiledTarget) -> bool {
+    if target.col.default_expr.is_some() {
+        return false;
+    }
+    if !target.col.nullable {
+        return is_fixed_width_type(target.col.data_type);
+    }
+    if target.col.data_type != DataType::Integer {
+        return false;
+    }
+    // Integer self-arithmetic preserves both the payload width and NULL bitmap.
+    match target.fast_eval {
+        FastEval::IntAdd(_) | FastEval::IntSub(_) | FastEval::IntMul(_) => true,
+        FastEval::IntAddParam(p) | FastEval::IntSubParam(p) | FastEval::IntMulParam(p) => {
+            resolve_int_param(p).is_some()
+        }
+        FastEval::None | FastEval::IntSet(_) | FastEval::IntSetParam(_) => false,
     }
 }
 
@@ -1129,34 +1147,9 @@ fn compile_update_impl(schema: &SchemaManager, stmt: &UpdateStmt) -> Result<Comp
             });
         }
 
-        let plan = crate::planner::plan_select(table_schema, &stmt.where_clause);
         let single_int_pk = num_pk_cols == 1
             && table_schema.columns[table_schema.primary_key_columns[0] as usize].data_type
                 == DataType::Integer;
-
-        let range_bounds_i64 = if single_int_pk {
-            if let crate::planner::ScanPlan::PkRangeScan {
-                ref range_conds, ..
-            } = plan
-            {
-                let bounds: Vec<(BinOp, i64)> = range_conds
-                    .iter()
-                    .filter_map(|(op, val)| match val {
-                        Value::Integer(i) => Some((*op, *i)),
-                        _ => None,
-                    })
-                    .collect();
-                if bounds.len() == range_conds.len() {
-                    Some(bounds)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
 
         let set_target_indices: Vec<usize> = targets.iter().map(|t| t.schema_idx).collect();
         let gen = compute_gen_col_targets(table_schema, &set_target_indices, pk_indices);
@@ -1187,10 +1180,8 @@ fn compile_update_impl(schema: &SchemaManager, stmt: &UpdateStmt) -> Result<Comp
                     single_int_pk,
                     strict: table_schema.is_strict(),
                     targets,
-                    scan_plan: plan,
                     pk_idx_cache: pk_indices.to_vec(),
                     col_map: ColumnMap::new(&table_schema.columns),
-                    range_bounds_i64,
                     gen_targets,
                     gen_extra_cols,
                     rhs_extra_cols,
@@ -1221,12 +1212,8 @@ fn exec_update_compiled(
     compiled: &CompiledUpdate,
     bufs: &mut UpdateBufs,
 ) -> Result<ExecutionResult> {
-    if compiled.is_view {
-        // exec_update handles INSTEAD OF view dispatch (or returns
-        // CannotModifyView).
-        return exec_update(db, schema, stmt);
-    }
-    if compiled.has_correlated_where
+    if compiled.is_view
+        || compiled.has_correlated_where
         || compiled.has_subquery
         || !compiled.can_fast_path
         || stmt.returning.is_some()
@@ -1234,187 +1221,119 @@ fn exec_update_compiled(
         return exec_update(db, schema, stmt);
     }
 
-    let fast = compiled.fast.as_ref().unwrap();
-    let strict = fast.strict;
     let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
+    schema.mark_dml(&compiled.table_name_lower);
+    let result = exec_update_in_txn_compiled(&mut wtx, schema, stmt, compiled, bufs)?;
+    super::helpers::drain_deferred_fk_checks(&mut wtx)?;
+    super::commit_with_ann_publication(wtx, schema)?;
+    Ok(result)
+}
+
+fn exec_compiled_range_update(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    table: &str,
+    fast: &CompiledFastPath,
+    start_key: &[u8],
+    range_conds: &[(BinOp, Value)],
+    bufs: &mut UpdateBufs,
+) -> Result<ExecutionResult> {
     let cancel = wtx.cancel_token().cloned();
     let cancel = cancel.as_ref();
-    // No segment purge: this lane compiles only for index-free tables, so an
-    // ANN segment cannot exist.
-    schema.mark_dml(&compiled.table_name_lower);
-
-    // The range lane patches in place through a fixed-length buffer, so it is
-    // legal only when no target can change the row width; a growing value
-    // takes the delete+reinsert lane below.
-    let patch_safe = fast
-        .targets
-        .iter()
-        .all(|t| !t.col.nullable && is_fixed_width_type(t.col.data_type))
-        && fast
-            .gen_targets
+    let range_bounds_i64: Option<Vec<(BinOp, i64)>> = if fast.single_int_pk {
+        range_conds
             .iter()
-            .all(|g| !g.col.nullable && is_fixed_width_type(g.col.data_type));
+            .map(|(op, value)| match value {
+                Value::Integer(value) => Some((*op, *value)),
+                _ => None,
+            })
+            .collect()
+    } else {
+        None
+    };
+    bufs.offsets.clear();
+    bufs.offsets.resize(fast.targets.len(), usize::MAX);
 
-    if let (
-        true,
-        crate::planner::ScanPlan::PkRangeScan {
-            start_key,
-            range_conds,
-            full_cover: true,
-            ..
-        },
-    ) = (patch_safe, &fast.scan_plan)
-    {
-        bufs.partial_row.clear();
-        bufs.partial_row.resize(fast.num_columns, Value::Null);
-        bufs.offsets.clear();
-        bufs.offsets.resize(fast.targets.len(), usize::MAX);
-
-        let count = wtx.table_update_range(
-            compiled.table_name_lower.as_bytes(),
-            start_key,
-            |key, value| {
-                if let Some(ref bounds) = fast.range_bounds_i64 {
-                    let pk = decode_pk_integer(key)?;
-                    for &(op, bound) in bounds {
-                        match op {
-                            BinOp::Lt if pk >= bound => return Ok(None),
-                            BinOp::LtEq if pk > bound => return Ok(None),
-                            BinOp::Gt if pk <= bound => return Ok(Some(false)),
-                            BinOp::GtEq if pk < bound => return Ok(Some(false)),
-                            _ => {}
-                        }
-                    }
-                    bufs.partial_row[fast.pk_idx_cache[0]] = Value::Integer(pk);
-                } else if fast.single_int_pk {
-                    let pk = decode_pk_integer(key)?;
-                    let pk_val = Value::Integer(pk);
-                    for (op, bound) in range_conds {
-                        match op {
-                            BinOp::Lt if &pk_val >= bound => return Ok(None),
-                            BinOp::LtEq if &pk_val > bound => return Ok(None),
-                            BinOp::Gt if &pk_val <= bound => return Ok(Some(false)),
-                            BinOp::GtEq if &pk_val < bound => return Ok(Some(false)),
-                            _ => {}
-                        }
-                    }
-                    bufs.partial_row[fast.pk_idx_cache[0]] = pk_val;
-                } else {
-                    let pk_vals = decode_composite_key(key, fast.num_pk_cols)?;
-                    for (op, bound) in range_conds {
-                        match op {
-                            BinOp::Lt if &pk_vals[0] >= bound => return Ok(None),
-                            BinOp::LtEq if &pk_vals[0] > bound => return Ok(None),
-                            BinOp::Gt if &pk_vals[0] <= bound => return Ok(Some(false)),
-                            BinOp::GtEq if &pk_vals[0] < bound => return Ok(Some(false)),
-                            _ => {}
-                        }
-                    }
-                    for (i, &pi) in fast.pk_idx_cache.iter().enumerate() {
-                        bufs.partial_row[pi] = pk_vals[i].clone();
+    let count =
+        wtx.table_update_range::<_, SqlError>(table.as_bytes(), start_key, |key, value| {
+            if let Some(ref bounds) = range_bounds_i64 {
+                let pk = decode_pk_integer(key)?;
+                for &(op, bound) in bounds {
+                    match op {
+                        BinOp::Lt if pk >= bound => return Ok(None),
+                        BinOp::LtEq if pk > bound => return Ok(None),
+                        BinOp::Gt if pk <= bound => return Ok(Some(false)),
+                        BinOp::GtEq if pk < bound => return Ok(Some(false)),
+                        _ => {}
                     }
                 }
-                for (i, target) in fast.targets.iter().enumerate() {
-                    let (raw, off) = decode_column_with_offset(value, target.phys_idx)?;
-                    bufs.partial_row[target.schema_idx] = raw.to_value();
-                    bufs.offsets[i] = off;
-                }
-                decode_cols_into(value, &fast.rhs_extra_cols, &mut bufs.partial_row)?;
-                for (i, target) in fast.targets.iter().enumerate() {
-                    let generic_eval = || {
-                        eval_expr(
-                            &target.expr,
-                            &EvalCtx::new(&fast.col_map, &bufs.partial_row).with_cancel(cancel),
-                        )
-                    };
-                    let new_val = match target.fast_eval {
-                        FastEval::IntAdd(n) => {
-                            if let Value::Integer(v) = bufs.partial_row[target.schema_idx] {
-                                Value::Integer(v.wrapping_add(n))
-                            } else {
-                                generic_eval()?
-                            }
-                        }
-                        FastEval::IntSub(n) => {
-                            if let Value::Integer(v) = bufs.partial_row[target.schema_idx] {
-                                Value::Integer(v.wrapping_sub(n))
-                            } else {
-                                generic_eval()?
-                            }
-                        }
-                        FastEval::IntMul(n) => {
-                            if let Value::Integer(v) = bufs.partial_row[target.schema_idx] {
-                                Value::Integer(v.wrapping_mul(n))
-                            } else {
-                                generic_eval()?
-                            }
-                        }
-                        FastEval::IntSet(n) => Value::Integer(n),
-                        FastEval::IntAddParam(p) => {
-                            match (resolve_int_param(p), &bufs.partial_row[target.schema_idx]) {
-                                (Some(n), Value::Integer(v)) => Value::Integer(v.wrapping_add(n)),
-                                _ => generic_eval()?,
-                            }
-                        }
-                        FastEval::IntSubParam(p) => {
-                            match (resolve_int_param(p), &bufs.partial_row[target.schema_idx]) {
-                                (Some(n), Value::Integer(v)) => Value::Integer(v.wrapping_sub(n)),
-                                _ => generic_eval()?,
-                            }
-                        }
-                        FastEval::IntMulParam(p) => {
-                            match (resolve_int_param(p), &bufs.partial_row[target.schema_idx]) {
-                                (Some(n), Value::Integer(v)) => Value::Integer(v.wrapping_mul(n)),
-                                _ => generic_eval()?,
-                            }
-                        }
-                        FastEval::IntSetParam(p) => match resolve_int_param(p) {
-                            Some(n) => Value::Integer(n),
-                            None => generic_eval()?,
-                        },
-                        FastEval::None => generic_eval()?,
-                    };
-                    let coerced = if new_val.is_null() {
-                        if !target.col.nullable {
-                            return Err(SqlError::NotNullViolation(target.col.name.clone()));
-                        }
-                        Value::Null
-                    } else {
-                        coerce_for_column(new_val, &target.col, strict)?
-                    };
-                    if !patch_at_offset(value, bufs.offsets[i], &coerced)?
-                        && !patch_column_in_place(value, target.phys_idx, &coerced)?
-                    {
-                        patch_row_column(value, target.phys_idx, &coerced, &mut bufs.patch_buf)?;
-                        value[..bufs.patch_buf.len()].copy_from_slice(&bufs.patch_buf);
-                        for off in bufs.offsets.iter_mut().skip(i + 1) {
-                            *off = usize::MAX;
-                        }
-                    }
-                    if fast.targets.len() == 1 {
-                        bufs.partial_row[target.schema_idx] = coerced;
+                bufs.partial_row[fast.pk_idx_cache[0]] = Value::Integer(pk);
+            } else if fast.single_int_pk {
+                let pk = decode_pk_integer(key)?;
+                let pk_val = Value::Integer(pk);
+                for (op, bound) in range_conds {
+                    match op {
+                        BinOp::Lt if &pk_val >= bound => return Ok(None),
+                        BinOp::LtEq if &pk_val > bound => return Ok(None),
+                        BinOp::Gt if &pk_val <= bound => return Ok(Some(false)),
+                        BinOp::GtEq if &pk_val < bound => return Ok(Some(false)),
+                        _ => {}
                     }
                 }
-                apply_gen_col_patches_slice(
-                    value,
-                    &mut bufs.partial_row,
-                    &fast.gen_targets,
-                    &fast.gen_extra_cols,
-                    &fast.col_map,
-                    cancel,
-                    &mut bufs.patch_buf,
-                )?;
-                Ok(Some(true))
-            },
-        )?;
+                bufs.partial_row[fast.pk_idx_cache[0]] = pk_val;
+            } else {
+                let pk_vals = decode_composite_key(key, fast.num_pk_cols)?;
+                for (op, bound) in range_conds {
+                    match op {
+                        BinOp::Lt if &pk_vals[0] >= bound => return Ok(None),
+                        BinOp::LtEq if &pk_vals[0] > bound => return Ok(None),
+                        BinOp::Gt if &pk_vals[0] <= bound => return Ok(Some(false)),
+                        BinOp::GtEq if &pk_vals[0] < bound => return Ok(Some(false)),
+                        _ => {}
+                    }
+                }
+                for (i, &pi) in fast.pk_idx_cache.iter().enumerate() {
+                    bufs.partial_row[pi] = pk_vals[i].clone();
+                }
+            }
+            for (i, target) in fast.targets.iter().enumerate() {
+                let (raw, off) = decode_column_with_offset(value, target.phys_idx)?;
+                bufs.partial_row[target.schema_idx] = raw.to_value();
+                bufs.offsets[i] = off;
+            }
+            decode_cols_into(value, &fast.rhs_extra_cols, &mut bufs.partial_row)?;
+            for (i, target) in fast.targets.iter().enumerate() {
+                let new_val =
+                    compiled_target_eval(target, &bufs.partial_row, &fast.col_map, cancel)?;
+                let coerced = coerce_update_value(new_val, &target.col, fast.strict)?;
+                if coerced.is_null() && bufs.partial_row[target.schema_idx].is_null() {
+                    continue;
+                }
+                if !patch_at_offset(value, bufs.offsets[i], &coerced)?
+                    && !patch_column_in_place(value, target.phys_idx, &coerced)?
+                {
+                    patch_row_column(value, target.phys_idx, &coerced, &mut bufs.patch_buf)?;
+                    value[..bufs.patch_buf.len()].copy_from_slice(&bufs.patch_buf);
+                    for off in bufs.offsets.iter_mut().skip(i + 1) {
+                        *off = usize::MAX;
+                    }
+                }
+                if fast.targets.len() == 1 {
+                    bufs.partial_row[target.schema_idx] = coerced;
+                }
+            }
+            apply_gen_col_patches_slice(
+                value,
+                &mut bufs.partial_row,
+                &fast.gen_targets,
+                &fast.gen_extra_cols,
+                &fast.col_map,
+                cancel,
+                &mut bufs.patch_buf,
+            )?;
+            Ok(Some(true))
+        })?;
 
-        super::helpers::drain_deferred_fk_checks(&mut wtx)?;
-        super::commit_with_ann_publication(wtx, schema)?;
-        return Ok(ExecutionResult::RowsAffected(count));
-    }
-
-    drop(wtx);
-    exec_update(db, schema, stmt)
+    Ok(ExecutionResult::RowsAffected(count))
 }
 
 pub(super) fn exec_update(
@@ -2898,7 +2817,6 @@ fn exec_update_in_txn_compiled(
         Some(f) => f,
         None => return exec_update_in_txn(wtx, schema, stmt),
     };
-    let strict = fast.strict;
     let cancel = wtx.cancel_token().cloned();
     let cancel = cancel.as_ref();
 
@@ -2920,9 +2838,6 @@ fn exec_update_in_txn_compiled(
     let pk_idx_cache = &fast.pk_idx_cache;
     let col_map = &fast.col_map;
     let targets = &fast.targets;
-    let gen_targets = &fast.gen_targets;
-    let gen_extra_cols = &fast.gen_extra_cols;
-    let rhs_extra_cols = &fast.rhs_extra_cols;
 
     bufs.partial_row.clear();
     bufs.partial_row.resize(fast.num_columns, Value::Null);
@@ -2956,10 +2871,9 @@ fn exec_update_in_txn_compiled(
 
     let plan = crate::planner::plan_select(table_schema, &stmt.where_clause);
 
-    let set_cols_safe = targets
-        .iter()
-        .all(|t| !t.col.nullable && is_fixed_width_type(t.col.data_type));
-    let gen_cols_safe = gen_targets
+    let set_cols_safe = targets.iter().all(compiled_target_patch_safe);
+    let gen_cols_safe = fast
+        .gen_targets
         .iter()
         .all(|g| !g.col.nullable && is_fixed_width_type(g.col.data_type));
     let patch_safe = set_cols_safe && gen_cols_safe;
@@ -2974,70 +2888,14 @@ fn exec_update_in_txn_compiled(
         },
     ) = (patch_safe, &plan)
     {
-        let range_conds = range_conds.clone();
-        let partial_row = &mut bufs.partial_row;
-        let patch_buf = &mut bufs.patch_buf;
-
-        let count = wtx.table_update_range::<_, SqlError>(
-            compiled.table_name_lower.as_bytes(),
+        return exec_compiled_range_update(
+            wtx,
+            &compiled.table_name_lower,
+            fast,
             start_key,
-            |key, value| {
-                if single_int_pk {
-                    let pk_int = Value::Integer(decode_pk_integer(key)?);
-                    for (op, bound) in &range_conds {
-                        match op {
-                            BinOp::Lt if &pk_int >= bound => return Ok(None),
-                            BinOp::LtEq if &pk_int > bound => return Ok(None),
-                            BinOp::Gt if &pk_int <= bound => return Ok(Some(false)),
-                            BinOp::GtEq if &pk_int < bound => return Ok(Some(false)),
-                            _ => {}
-                        }
-                    }
-                    partial_row[pk_idx_cache[0]] = pk_int;
-                } else {
-                    let pk_vals = decode_composite_key(key, num_pk_cols)?;
-                    for (op, bound) in &range_conds {
-                        match op {
-                            BinOp::Lt if &pk_vals[0] >= bound => return Ok(None),
-                            BinOp::LtEq if &pk_vals[0] > bound => return Ok(None),
-                            BinOp::Gt if &pk_vals[0] <= bound => return Ok(Some(false)),
-                            BinOp::GtEq if &pk_vals[0] < bound => return Ok(Some(false)),
-                            _ => {}
-                        }
-                    }
-                    for (i, &pi) in pk_idx_cache.iter().enumerate() {
-                        partial_row[pi] = pk_vals[i].clone();
-                    }
-                }
-                for target in targets {
-                    partial_row[target.schema_idx] =
-                        decode_column_raw(value, target.phys_idx)?.to_value();
-                }
-                decode_cols_into(value, rhs_extra_cols, partial_row)?;
-                for target in targets {
-                    let new_val = compiled_target_eval(target, partial_row, col_map, cancel)?;
-                    let coerced = coerce_update_value(new_val, &target.col, strict)?;
-                    if !patch_column_in_place(value, target.phys_idx, &coerced)? {
-                        patch_row_column(value, target.phys_idx, &coerced, patch_buf)?;
-                        value[..patch_buf.len()].copy_from_slice(patch_buf);
-                    }
-                    if targets.len() == 1 {
-                        partial_row[target.schema_idx] = coerced;
-                    }
-                }
-                apply_gen_col_patches_slice(
-                    value,
-                    partial_row,
-                    gen_targets,
-                    gen_extra_cols,
-                    col_map,
-                    cancel,
-                    patch_buf,
-                )?;
-                Ok(Some(true))
-            },
-        )?;
-        return Ok(ExecutionResult::RowsAffected(count));
+            range_conds,
+            bufs,
+        );
     }
 
     if let crate::planner::ScanPlan::PkLookup {
@@ -3063,30 +2921,7 @@ fn exec_update_in_txn_compiled(
                 partial_row[pi] = pk_vals[i].clone();
             }
         }
-        for target in targets {
-            partial_row[target.schema_idx] =
-                decode_column_raw(&raw_value, target.phys_idx)?.to_value();
-        }
-        for target in targets {
-            let new_val = compiled_target_eval(target, partial_row, col_map, cancel)?;
-            let coerced = coerce_update_value(new_val, &target.col, strict)?;
-            if !patch_column_in_place(&mut raw_value, target.phys_idx, &coerced)? {
-                patch_row_column(&raw_value, target.phys_idx, &coerced, patch_buf)?;
-                std::mem::swap(&mut raw_value, patch_buf);
-            }
-            if targets.len() == 1 {
-                partial_row[target.schema_idx] = coerced;
-            }
-        }
-        apply_gen_col_patches_vec(
-            &mut raw_value,
-            partial_row,
-            gen_targets,
-            gen_extra_cols,
-            col_map,
-            cancel,
-            patch_buf,
-        )?;
+        patch_compiled_update_value(&mut raw_value, fast, partial_row, cancel, patch_buf)?;
         wtx.table_insert(compiled.table_name_lower.as_bytes(), &key, &raw_value)
             .map_err(SqlError::Storage)?;
         return Ok(ExecutionResult::RowsAffected(1));
@@ -3162,30 +2997,7 @@ fn exec_update_in_txn_compiled(
                 partial_row[pi] = pk_vals[i].clone();
             }
         }
-        for target in targets {
-            partial_row[target.schema_idx] =
-                decode_column_raw(raw_value, target.phys_idx)?.to_value();
-        }
-        for target in targets {
-            let new_val = compiled_target_eval(target, partial_row, col_map, cancel)?;
-            let coerced = coerce_update_value(new_val, &target.col, strict)?;
-            if !patch_column_in_place(raw_value, target.phys_idx, &coerced)? {
-                patch_row_column(raw_value, target.phys_idx, &coerced, patch_buf)?;
-                std::mem::swap(raw_value, patch_buf);
-            }
-            if targets.len() == 1 {
-                partial_row[target.schema_idx] = coerced;
-            }
-        }
-        apply_gen_col_patches_vec(
-            raw_value,
-            partial_row,
-            gen_targets,
-            gen_extra_cols,
-            col_map,
-            cancel,
-            patch_buf,
-        )?;
+        patch_compiled_update_value(raw_value, fast, partial_row, cancel, patch_buf)?;
         bufs.patched
             .push((std::mem::take(key), std::mem::take(raw_value)));
     }
@@ -3211,8 +3023,6 @@ fn exec_pk_lookup_update(
     cancel: Option<&citadel::CancelToken>,
     bufs: &mut UpdateBufs,
 ) -> Result<ExecutionResult> {
-    let targets = &fast.targets;
-    let col_map = &fast.col_map;
     let key = encode_composite_key(std::slice::from_ref(pk_value));
     let mut raw_value = match wtx
         .table_get(table_name_lower.as_bytes(), &key)
@@ -3232,30 +3042,7 @@ fn exec_pk_lookup_update(
     let partial_row = &mut bufs.partial_row;
     let patch_buf = &mut bufs.patch_buf;
     partial_row[fast.pk_idx_cache[0]] = pk_value.clone();
-    for target in targets {
-        partial_row[target.schema_idx] = decode_column_raw(&raw_value, target.phys_idx)?.to_value();
-    }
-    decode_cols_into(&raw_value, &fast.rhs_extra_cols, partial_row)?;
-    for target in targets {
-        let new_val = compiled_target_eval(target, partial_row, col_map, cancel)?;
-        let coerced = coerce_update_value(new_val, &target.col, fast.strict)?;
-        if !patch_column_in_place(&mut raw_value, target.phys_idx, &coerced)? {
-            patch_row_column(&raw_value, target.phys_idx, &coerced, patch_buf)?;
-            std::mem::swap(&mut raw_value, patch_buf);
-        }
-        if targets.len() == 1 {
-            partial_row[target.schema_idx] = coerced;
-        }
-    }
-    apply_gen_col_patches_vec(
-        &mut raw_value,
-        partial_row,
-        &fast.gen_targets,
-        &fast.gen_extra_cols,
-        col_map,
-        cancel,
-        patch_buf,
-    )?;
+    patch_compiled_update_value(&mut raw_value, fast, partial_row, cancel, patch_buf)?;
     wtx.table_insert(table_name_lower.as_bytes(), &key, &raw_value)
         .map_err(SqlError::Storage)?;
     if let Some(rf) = ret_fast {
@@ -3268,6 +3055,41 @@ fn exec_pk_lookup_update(
         }));
     }
     Ok(ExecutionResult::RowsAffected(1))
+}
+
+fn patch_compiled_update_value(
+    raw_value: &mut Vec<u8>,
+    fast: &CompiledFastPath,
+    partial_row: &mut [Value],
+    cancel: Option<&citadel::CancelToken>,
+    patch_buf: &mut Vec<u8>,
+) -> Result<()> {
+    let targets = &fast.targets;
+    let col_map = &fast.col_map;
+    for target in targets {
+        partial_row[target.schema_idx] = decode_column_raw(raw_value, target.phys_idx)?.to_value();
+    }
+    decode_cols_into(raw_value, &fast.rhs_extra_cols, partial_row)?;
+    for target in targets {
+        let new_val = compiled_target_eval(target, partial_row, col_map, cancel)?;
+        let coerced = coerce_update_value(new_val, &target.col, fast.strict)?;
+        if !patch_column_in_place(raw_value, target.phys_idx, &coerced)? {
+            patch_row_column(raw_value, target.phys_idx, &coerced, patch_buf)?;
+            std::mem::swap(raw_value, patch_buf);
+        }
+        if targets.len() == 1 {
+            partial_row[target.schema_idx] = coerced;
+        }
+    }
+    apply_gen_col_patches_vec(
+        raw_value,
+        partial_row,
+        &fast.gen_targets,
+        &fast.gen_extra_cols,
+        col_map,
+        cancel,
+        patch_buf,
+    )
 }
 
 fn compiled_target_eval(
@@ -3284,28 +3106,46 @@ fn compiled_target_eval(
     };
     match target.fast_eval {
         FastEval::IntAdd(n) => match partial_row[target.schema_idx] {
-            Value::Integer(v) => Ok(Value::Integer(v.wrapping_add(n))),
+            Value::Integer(v) => v
+                .checked_add(n)
+                .map(Value::Integer)
+                .ok_or(SqlError::IntegerOverflow),
             _ => generic(),
         },
         FastEval::IntSub(n) => match partial_row[target.schema_idx] {
-            Value::Integer(v) => Ok(Value::Integer(v.wrapping_sub(n))),
+            Value::Integer(v) => v
+                .checked_sub(n)
+                .map(Value::Integer)
+                .ok_or(SqlError::IntegerOverflow),
             _ => generic(),
         },
         FastEval::IntMul(n) => match partial_row[target.schema_idx] {
-            Value::Integer(v) => Ok(Value::Integer(v.wrapping_mul(n))),
+            Value::Integer(v) => v
+                .checked_mul(n)
+                .map(Value::Integer)
+                .ok_or(SqlError::IntegerOverflow),
             _ => generic(),
         },
         FastEval::IntSet(n) => Ok(Value::Integer(n)),
         FastEval::IntAddParam(p) => match (resolve_int_param(p), &partial_row[target.schema_idx]) {
-            (Some(n), Value::Integer(v)) => Ok(Value::Integer(v.wrapping_add(n))),
+            (Some(n), Value::Integer(v)) => v
+                .checked_add(n)
+                .map(Value::Integer)
+                .ok_or(SqlError::IntegerOverflow),
             _ => generic(),
         },
         FastEval::IntSubParam(p) => match (resolve_int_param(p), &partial_row[target.schema_idx]) {
-            (Some(n), Value::Integer(v)) => Ok(Value::Integer(v.wrapping_sub(n))),
+            (Some(n), Value::Integer(v)) => v
+                .checked_sub(n)
+                .map(Value::Integer)
+                .ok_or(SqlError::IntegerOverflow),
             _ => generic(),
         },
         FastEval::IntMulParam(p) => match (resolve_int_param(p), &partial_row[target.schema_idx]) {
-            (Some(n), Value::Integer(v)) => Ok(Value::Integer(v.wrapping_mul(n))),
+            (Some(n), Value::Integer(v)) => v
+                .checked_mul(n)
+                .map(Value::Integer)
+                .ok_or(SqlError::IntegerOverflow),
             _ => generic(),
         },
         FastEval::IntSetParam(p) => match resolve_int_param(p) {
