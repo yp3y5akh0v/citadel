@@ -1397,3 +1397,137 @@ fn compute_scan_limit_allows_pk_asc_order() {
     s.order_by[0].descending = true;
     assert_eq!(compute_scan_limit(&s, &scan_limit_schema()), None);
 }
+
+#[test]
+fn raw_aggregate_feed_rejects_truncated_headers_before_using_defaults() {
+    let targets = [RawAggTarget::NonPk(0)];
+    let defaults = [Some(i(7))];
+    let feed = RawFeed {
+        raw_targets: &targets,
+        num_pk_cols: 1,
+        nonpk_agg_defaults: &defaults,
+    };
+    for bytes in [&[][..], &[0], &[1, 0], &[1, 0x80]] {
+        let mut states = [AggState::new(&StreamAgg::Sum(1))];
+        let mut error = None;
+        assert!(!feed.feed(&[], bytes, &mut states, &mut error));
+        assert!(error.is_some(), "{bytes:?}");
+    }
+}
+
+#[test]
+fn numeric_aggregate_states_match_generic_families_and_accumulation() {
+    let interval = |months, days, micros| Value::Interval {
+        months,
+        days,
+        micros,
+    };
+    let fixtures = [
+        vec![],
+        vec![Value::Null, Value::Null],
+        vec![Value::Null, i(1), Value::Null, Value::Real(2.5)],
+        vec![Value::Null, Value::Real(2.5), i(-1)],
+        vec![
+            Value::Real(9007199254740992.0),
+            i(1),
+            Value::Real(-9007199254740992.0),
+        ],
+        vec![
+            Value::Null,
+            interval(1, 2, 3),
+            Value::Null,
+            interval(2, 4, 6),
+        ],
+        vec![interval(i32::MAX, i32::MAX, i64::MAX), interval(1, 1, 1)],
+        vec![interval(i32::MIN, i32::MIN, i64::MIN), interval(-1, -1, -1)],
+        vec![Value::Null, i(1), Value::Null, interval(0, 1, 0)],
+        vec![Value::Null, Value::Real(1.5), interval(0, 1, 0)],
+        vec![Value::Null, interval(0, 1, 0), Value::Null, i(1)],
+        vec![Value::Null, interval(0, 1, 0), Value::Real(1.5)],
+    ];
+    let columns = cols(&[("v", DataType::Integer)]);
+    let column_map = ColumnMap::new(&columns);
+    for values in fixtures {
+        let rows: Vec<_> = values.iter().map(|value| vec![value.clone()]).collect();
+        let row_refs: Vec<_> = rows.iter().collect();
+        for (name, op) in [("SUM", StreamAgg::Sum(0)), ("AVG", StreamAgg::Avg(0))] {
+            let expr = Expr::Function {
+                name: name.into(),
+                args: vec![Expr::Column("v".into())],
+                distinct: false,
+            };
+            let expected = eval_aggregate_expr(&expr, &column_map, &row_refs);
+            for representation in 0..4 {
+                let mut state = AggState::new(&op);
+                let mut accepted = 0;
+                let outcome = values.iter().enumerate().try_for_each(|(index, value)| {
+                    let raw = match representation {
+                        0 => false,
+                        1 => true,
+                        2 => index % 2 == 0,
+                        _ => index % 2 != 0,
+                    };
+                    if raw {
+                        let encoded = crate::encoding::encode_row(std::slice::from_ref(value));
+                        state.feed_raw(&decode_stored_column_raw(&encoded, 0)?.unwrap())?;
+                    } else {
+                        state.feed_val(value)?;
+                    }
+                    accepted += 1;
+                    Ok::<(), SqlError>(())
+                });
+                match (outcome, &expected) {
+                    (Ok(()), Ok(expected)) => {
+                        assert_eq!(state.finish(), *expected, "{name} {values:?}")
+                    }
+                    (Err(actual), Err(expected)) => {
+                        assert_eq!(
+                            actual.to_string(),
+                            expected.to_string(),
+                            "{name} {values:?}"
+                        );
+                        let prefix =
+                            eval_aggregate_expr(&expr, &column_map, &row_refs[..accepted]).unwrap();
+                        assert_eq!(state.finish(), prefix, "failed feed changed {name} state");
+                    }
+                    (actual, expected) => {
+                        panic!("{name} {values:?}: actual={actual:?}, expected={expected:?}")
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn numeric_aggregate_states_report_the_first_non_null_family_for_bad_types() {
+    for (prefix, expected_family) in [
+        (Value::Null, "numeric"),
+        (i(1), "numeric"),
+        (
+            Value::Interval {
+                months: 0,
+                days: 1,
+                micros: 0,
+            },
+            "INTERVAL",
+        ),
+    ] {
+        for op in [StreamAgg::Sum(0), StreamAgg::Avg(0)] {
+            for raw in [false, true] {
+                let mut state = AggState::new(&op);
+                state.feed_val(&Value::Null).unwrap();
+                state.feed_val(&prefix).unwrap();
+                let error = if raw {
+                    state.feed_raw(&RawColumn::Text("not numeric"))
+                } else {
+                    state.feed_val(&Value::Text("not numeric".into()))
+                }
+                .unwrap_err();
+                assert!(
+                    matches!(error, SqlError::TypeMismatch { ref expected, .. } if expected == expected_family)
+                );
+            }
+        }
+    }
+}

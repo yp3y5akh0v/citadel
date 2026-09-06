@@ -2,11 +2,14 @@ use citadel::Database;
 use citadel_txn::read_txn::ReadTxn;
 
 use crate::encoding::{
-    decode_composite_key, decode_key_value, decode_stored_column_raw, encode_composite_key,
-    RawColumn,
+    decode_columns, decode_composite_key, decode_key_value, decode_stored_column_raw,
+    encode_composite_key, RawColumn,
 };
 use crate::error::{Result, SqlError};
-use crate::eval::{eval_expr, is_truthy, referenced_columns, ColumnMap, CompiledExpr, EvalCtx};
+use crate::eval::{
+    eval_binary_op_public, eval_expr, is_truthy, referenced_columns, ColumnMap, CompiledExpr,
+    EvalCtx,
+};
 use crate::parser::*;
 use crate::planner::{self, ScanPlan};
 use crate::types::*;
@@ -1519,34 +1522,50 @@ pub(super) struct SimplePredicate {
     nonpk_idx: usize,
     op: BinOp,
     literal: Value,
+    arithmetic: Option<Box<ArithmeticTransform>>,
     num_pk_cols: usize,
     default_val: Option<Value>,
+}
+
+struct ArithmeticTransform {
+    op: BinOp,
+    offset: Value,
+    comparison_reversed: bool,
 }
 
 impl SimplePredicate {
     pub(super) fn matches_raw(&self, key: &[u8], value: &[u8]) -> Result<bool> {
         if self.is_pk {
             if self.num_pk_cols == 1 {
-                return Ok(raw_matches_op_value(
-                    &decode_key_value(key)?.0,
-                    self.op,
-                    &self.literal,
-                ));
+                return self.matches_value(&decode_key_value(key)?.0);
             }
             let pk = decode_composite_key(key, self.num_pk_cols)?;
-            return Ok(raw_matches_op_value(
-                &pk[self.pk_pos],
-                self.op,
-                &self.literal,
-            ));
+            return self.matches_value(&pk[self.pk_pos]);
         }
-        Ok(match decode_stored_column_raw(value, self.nonpk_idx)? {
-            Some(raw) => raw_matches_op(&raw, self.op, &self.literal),
-            None => self
-                .default_val
-                .as_ref()
-                .is_some_and(|default| raw_matches_op_value(default, self.op, &self.literal)),
-        })
+        match decode_stored_column_raw(value, self.nonpk_idx)? {
+            Some(raw) if self.arithmetic.is_none() => {
+                Ok(raw_matches_op(&raw, self.op, &self.literal))
+            }
+            Some(RawColumn::Array(_) | RawColumn::Vector(_)) => {
+                let decoded = decode_columns(value, &[self.nonpk_idx])?;
+                self.matches_value(&decoded[0])
+            }
+            Some(raw) => self.matches_value(&raw.to_value()),
+            None => self.matches_value(self.default_val.as_ref().unwrap_or(&Value::Null)),
+        }
+    }
+
+    fn matches_value(&self, value: &Value) -> Result<bool> {
+        let Some(arithmetic) = self.arithmetic.as_deref() else {
+            return Ok(raw_matches_op_value(value, self.op, &self.literal));
+        };
+        let computed = eval_binary_op_public(value, arithmetic.op, &arithmetic.offset)?;
+        let result = if arithmetic.comparison_reversed {
+            eval_binary_op_public(&self.literal, self.op, &computed)?
+        } else {
+            eval_binary_op_public(&computed, self.op, &self.literal)?
+        };
+        Ok(is_truthy(&result))
     }
 }
 
@@ -1686,16 +1705,10 @@ pub(super) fn try_between_predicate(expr: &Expr, schema: &TableSchema) -> Option
 }
 
 pub(super) fn try_simple_predicate(expr: &Expr, schema: &TableSchema) -> Option<SimplePredicate> {
-    // Fold `col ± lit <cmp> lit` into `col <cmp> (lit ∓ lit)` to avoid per-row arithmetic.
-    let folded = fold_temporal_offset(expr);
-    let expr_ref = folded.as_ref().unwrap_or(expr);
-
-    let (col_name, op, literal) = match expr_ref {
+    let (operand, mut op, literal, reversed) = match expr {
         Expr::BinaryOp { left, op, right } => match (left.as_ref(), right.as_ref()) {
-            (Expr::Column(name), Expr::Literal(lit)) => (name.as_str(), *op, lit.clone()),
-            (Expr::Literal(lit), Expr::Column(name)) => {
-                (name.as_str(), flip_cmp_op(*op)?, lit.clone())
-            }
+            (operand, Expr::Literal(lit)) => (operand, *op, lit.clone(), false),
+            (Expr::Literal(lit), operand) => (operand, *op, lit.clone(), true),
             _ => return None,
         },
         _ => return None,
@@ -1708,6 +1721,25 @@ pub(super) fn try_simple_predicate(expr: &Expr, schema: &TableSchema) -> Option<
         return None;
     }
 
+    let (col_name, arithmetic) = match operand {
+        Expr::Column(name) => (name.as_str(), None),
+        Expr::BinaryOp { left, op, right } if matches!(op, BinOp::Add | BinOp::Sub) => {
+            let (Expr::Column(name), Expr::Literal(offset)) = (left.as_ref(), right.as_ref())
+            else {
+                return None;
+            };
+            (
+                name.as_str(),
+                Some(Box::new(ArithmeticTransform {
+                    op: *op,
+                    offset: offset.clone(),
+                    comparison_reversed: reversed,
+                })),
+            )
+        }
+        _ => return None,
+    };
+
     let col_idx = schema.column_index(col_name)?;
     if matches!(
         schema.columns[col_idx].generated_kind,
@@ -1719,21 +1751,37 @@ pub(super) fn try_simple_predicate(expr: &Expr, schema: &TableSchema) -> Option<
         return None;
     }
 
-    // Coerce a TEXT/INTEGER literal to the column's temporal type for same-typed compare.
     let col_type = schema.columns[col_idx].data_type;
-    let literal = if matches!(
-        col_type,
-        DataType::Date | DataType::Time | DataType::Timestamp | DataType::Interval
-    ) && matches!(literal, Value::Text(_) | Value::Integer(_))
-    {
-        literal.coerce_into(col_type)?
+    let literal = if arithmetic.is_some() {
+        if !matches!(
+            col_type,
+            DataType::Integer
+                | DataType::Real
+                | DataType::Date
+                | DataType::Time
+                | DataType::Timestamp
+        ) {
+            return None;
+        }
+        literal
     } else {
+        if reversed {
+            op = flip_cmp_op(op)?;
+        }
+        let literal = if matches!(
+            col_type,
+            DataType::Date | DataType::Time | DataType::Timestamp | DataType::Interval
+        ) && matches!(literal, Value::Text(_) | Value::Integer(_))
+        {
+            literal.coerce_into(col_type)?
+        } else {
+            literal
+        };
+        if !raw_comparison_supported(col_type, &literal) {
+            return None;
+        }
         literal
     };
-    if !raw_comparison_supported(col_type, &literal) {
-        return None;
-    }
-    let literal = &literal;
     let non_pk = schema.non_pk_indices();
 
     if let Some(pk_pos) = schema
@@ -1746,7 +1794,8 @@ pub(super) fn try_simple_predicate(expr: &Expr, schema: &TableSchema) -> Option<
             pk_pos,
             nonpk_idx: 0,
             op,
-            literal: literal.clone(),
+            literal,
+            arithmetic,
             num_pk_cols: schema.primary_key_columns.len(),
             default_val: None,
         })
@@ -1759,12 +1808,29 @@ pub(super) fn try_simple_predicate(expr: &Expr, schema: &TableSchema) -> Option<
             return None;
         }
         let default_val = default_expr.map(eval_const_expr).transpose().ok()?;
+        if arithmetic.is_some()
+            && default_val.as_ref().is_some_and(|value| {
+                !matches!(
+                    value,
+                    Value::Null
+                        | Value::Integer(_)
+                        | Value::Real(_)
+                        | Value::Date(_)
+                        | Value::Time(_)
+                        | Value::Timestamp(_)
+                        | Value::Interval { .. }
+                )
+            })
+        {
+            return None;
+        }
         Some(SimplePredicate {
             is_pk: false,
             pk_pos: 0,
             nonpk_idx,
             op,
-            literal: literal.clone(),
+            literal,
+            arithmetic,
             num_pk_cols: schema.primary_key_columns.len(),
             default_val,
         })
@@ -1824,68 +1890,6 @@ pub(super) fn try_jsonb_contains_predicate(
         _ => return None,
     };
     Some(JsonbContainsPredicate { nonpk_idx, literal })
-}
-
-/// Fold `col ± lit <cmp> lit` → `col <cmp> (lit ∓ lit)` at plan time. Returns `None`
-/// if the pattern doesn't match.
-pub(super) fn fold_temporal_offset(expr: &Expr) -> Option<Expr> {
-    let (left, op, right) = match expr {
-        Expr::BinaryOp { left, op, right } => (left, *op, right),
-        _ => return None,
-    };
-    if !matches!(
-        op,
-        BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq
-    ) {
-        return None;
-    }
-
-    // col +/- lit_offset <op> literal_rhs
-    let try_fold = |l: &Expr, r: &Expr, flip: bool| -> Option<Expr> {
-        let Expr::BinaryOp {
-            left: inner_l,
-            op: inner_op,
-            right: inner_r,
-        } = l
-        else {
-            return None;
-        };
-        if !matches!(inner_op, BinOp::Add | BinOp::Sub) {
-            return None;
-        }
-        let col = inner_l.as_ref();
-        let offset = inner_r.as_ref();
-        let (col_name, offset_lit, rhs_lit) = match (col, offset, r) {
-            (Expr::Column(name), Expr::Literal(off), Expr::Literal(rhs)) => (name, off, rhs),
-            _ => return None,
-        };
-        // Compute `rhs_lit <inverse> offset_lit` at plan time.
-        let new_literal = match inner_op {
-            BinOp::Add => {
-                crate::eval::eval_binary_op_public(rhs_lit, BinOp::Sub, offset_lit).ok()?
-            }
-            BinOp::Sub => {
-                crate::eval::eval_binary_op_public(rhs_lit, BinOp::Add, offset_lit).ok()?
-            }
-            _ => return None,
-        };
-        let final_op = if flip { flip_cmp_op(op)? } else { op };
-        Some(Expr::BinaryOp {
-            left: Box::new(Expr::Column(col_name.clone())),
-            op: final_op,
-            right: Box::new(Expr::Literal(new_literal)),
-        })
-    };
-
-    // Pattern: (col <op_inner> lit) <cmp> lit
-    if let Some(folded) = try_fold(left, right, false) {
-        return Some(folded);
-    }
-    // Pattern: lit <cmp> (col <op_inner> lit) — flip the comparison operator.
-    if let Some(folded) = try_fold(right, left, true) {
-        return Some(folded);
-    }
-    None
 }
 
 pub(super) fn flip_cmp_op(op: BinOp) -> Option<BinOp> {

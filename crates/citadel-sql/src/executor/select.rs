@@ -6,7 +6,7 @@ use rustc_hash::FxHashMap;
 
 use crate::encoding::{
     decode_column_raw, decode_column_with_offset, decode_composite_key, decode_pk_integer,
-    row_non_pk_count, RawColumn,
+    decode_stored_column_raw, RawColumn,
 };
 use crate::error::{Result, SqlError};
 use crate::eval::{eval_expr, is_truthy, referenced_columns, ColumnMap, EvalCtx};
@@ -1664,6 +1664,27 @@ pub(super) enum AggState {
     },
 }
 
+fn numeric_aggregate_type_error(is_interval: bool, got: String) -> SqlError {
+    SqlError::TypeMismatch {
+        expected: if is_interval { "INTERVAL" } else { "numeric" }.into(),
+        got,
+    }
+}
+
+fn check_numeric_aggregate_family(
+    raw: &RawColumn,
+    has_values: bool,
+    is_interval: bool,
+) -> Result<()> {
+    let got = match raw {
+        RawColumn::Integer(_) if is_interval => "INTEGER",
+        RawColumn::Real(_) if is_interval => "REAL",
+        RawColumn::Interval { .. } if has_values && !is_interval => "INTERVAL",
+        _ => return Ok(()),
+    };
+    Err(numeric_aggregate_type_error(is_interval, got.into()))
+}
+
 impl AggState {
     pub(super) fn new(op: &StreamAgg) -> Self {
         match op {
@@ -1803,79 +1824,29 @@ impl AggState {
                     *c += 1;
                 }
             }
-            AggState::Sum {
-                int_sum,
-                real_sum,
-                has_real,
-                all_null,
-                interval_months,
-                interval_days,
-                interval_micros,
-                is_interval,
-            } => match val {
-                Value::Integer(i) => {
-                    *int_sum += i;
-                    *all_null = false;
-                }
-                Value::Real(r) => {
-                    *real_sum += r;
-                    *has_real = true;
-                    *all_null = false;
-                }
-                Value::Interval {
-                    months,
-                    days,
-                    micros,
-                } => {
-                    *interval_months = interval_months.saturating_add(*months);
-                    *interval_days = interval_days.saturating_add(*days);
-                    *interval_micros = interval_micros.saturating_add(*micros);
-                    *all_null = false;
-                    *is_interval = true;
-                }
-                Value::Null => {}
-                _ => {
-                    return Err(SqlError::TypeMismatch {
-                        expected: "numeric or INTERVAL".into(),
-                        got: val.data_type().to_string(),
-                    })
-                }
-            },
-            AggState::Avg {
-                sum,
-                count,
-                interval_months,
-                interval_days,
-                interval_micros,
-                is_interval,
-            } => match val {
-                Value::Integer(i) => {
-                    *sum += *i as f64;
-                    *count += 1;
-                }
-                Value::Real(r) => {
-                    *sum += r;
-                    *count += 1;
-                }
-                Value::Interval {
-                    months,
-                    days,
-                    micros,
-                } => {
-                    *interval_months += *months as i64;
-                    *interval_days += *days as i64;
-                    *interval_micros += *micros as i128;
-                    *count += 1;
-                    *is_interval = true;
-                }
-                Value::Null => {}
-                _ => {
-                    return Err(SqlError::TypeMismatch {
-                        expected: "numeric or INTERVAL".into(),
-                        got: val.data_type().to_string(),
-                    })
-                }
-            },
+            AggState::Sum { is_interval, .. } | AggState::Avg { is_interval, .. } => {
+                let raw = match val {
+                    Value::Integer(value) => RawColumn::Integer(*value),
+                    Value::Real(value) => RawColumn::Real(*value),
+                    Value::Interval {
+                        months,
+                        days,
+                        micros,
+                    } => RawColumn::Interval {
+                        months: *months,
+                        days: *days,
+                        micros: *micros,
+                    },
+                    Value::Null => RawColumn::Null,
+                    _ => {
+                        return Err(numeric_aggregate_type_error(
+                            *is_interval,
+                            val.data_type().to_string(),
+                        ));
+                    }
+                };
+                self.feed_raw(&raw)?;
+            }
             AggState::Min {
                 current: cur,
                 collation,
@@ -1933,35 +1904,38 @@ impl AggState {
                 interval_days,
                 interval_micros,
                 is_interval,
-            } => match raw {
-                RawColumn::Integer(i) => {
-                    *int_sum += i;
-                    *all_null = false;
+            } => {
+                check_numeric_aggregate_family(raw, !*all_null, *is_interval)?;
+                match raw {
+                    RawColumn::Integer(i) => {
+                        *int_sum += i;
+                        *all_null = false;
+                    }
+                    RawColumn::Real(r) => {
+                        *real_sum += r;
+                        *has_real = true;
+                        *all_null = false;
+                    }
+                    RawColumn::Interval {
+                        months,
+                        days,
+                        micros,
+                    } => {
+                        *interval_months = interval_months.saturating_add(*months);
+                        *interval_days = interval_days.saturating_add(*days);
+                        *interval_micros = interval_micros.saturating_add(*micros);
+                        *all_null = false;
+                        *is_interval = true;
+                    }
+                    RawColumn::Null => {}
+                    _ => {
+                        return Err(numeric_aggregate_type_error(
+                            *is_interval,
+                            "non-numeric".into(),
+                        ));
+                    }
                 }
-                RawColumn::Real(r) => {
-                    *real_sum += r;
-                    *has_real = true;
-                    *all_null = false;
-                }
-                RawColumn::Interval {
-                    months,
-                    days,
-                    micros,
-                } => {
-                    *interval_months = interval_months.saturating_add(*months);
-                    *interval_days = interval_days.saturating_add(*days);
-                    *interval_micros = interval_micros.saturating_add(*micros);
-                    *all_null = false;
-                    *is_interval = true;
-                }
-                RawColumn::Null => {}
-                _ => {
-                    return Err(SqlError::TypeMismatch {
-                        expected: "numeric or INTERVAL".into(),
-                        got: "non-numeric".into(),
-                    })
-                }
-            },
+            }
             AggState::Avg {
                 sum,
                 count,
@@ -1969,34 +1943,37 @@ impl AggState {
                 interval_days,
                 interval_micros,
                 is_interval,
-            } => match raw {
-                RawColumn::Integer(i) => {
-                    *sum += *i as f64;
-                    *count += 1;
+            } => {
+                check_numeric_aggregate_family(raw, *count != 0, *is_interval)?;
+                match raw {
+                    RawColumn::Integer(i) => {
+                        *sum += *i as f64;
+                        *count += 1;
+                    }
+                    RawColumn::Real(r) => {
+                        *sum += r;
+                        *count += 1;
+                    }
+                    RawColumn::Interval {
+                        months,
+                        days,
+                        micros,
+                    } => {
+                        *interval_months += *months as i64;
+                        *interval_days += *days as i64;
+                        *interval_micros += *micros as i128;
+                        *count += 1;
+                        *is_interval = true;
+                    }
+                    RawColumn::Null => {}
+                    _ => {
+                        return Err(numeric_aggregate_type_error(
+                            *is_interval,
+                            "non-numeric".into(),
+                        ));
+                    }
                 }
-                RawColumn::Real(r) => {
-                    *sum += r;
-                    *count += 1;
-                }
-                RawColumn::Interval {
-                    months,
-                    days,
-                    micros,
-                } => {
-                    *interval_months += *months as i64;
-                    *interval_days += *days as i64;
-                    *interval_micros += *micros as i128;
-                    *count += 1;
-                    *is_interval = true;
-                }
-                RawColumn::Null => {}
-                _ => {
-                    return Err(SqlError::TypeMismatch {
-                        expected: "numeric or INTERVAL".into(),
-                        got: "non-numeric".into(),
-                    })
-                }
-            },
+            }
             AggState::Min {
                 current: cur,
                 collation,
@@ -2159,9 +2136,9 @@ impl RawFeed<'_> {
                         }
                     }
                 }
-                RawAggTarget::NonPk(idx) => {
-                    let stored = row_non_pk_count(value);
-                    if *idx >= stored {
+                RawAggTarget::NonPk(idx) => match decode_stored_column_raw(value, *idx) {
+                    Ok(Some(raw)) => raw,
+                    Ok(None) => {
                         if let Some(ref default) = self.nonpk_agg_defaults[i] {
                             if let Err(e) = states[i].feed_val(default) {
                                 *scan_err = Some(e);
@@ -2173,14 +2150,11 @@ impl RawFeed<'_> {
                         }
                         continue;
                     }
-                    match decode_column_raw(value, *idx) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            *scan_err = Some(e);
-                            return false;
-                        }
+                    Err(e) => {
+                        *scan_err = Some(e);
+                        return false;
                     }
-                }
+                },
             };
             if let Err(e) = states[i].feed_raw(&raw) {
                 *scan_err = Some(e);
@@ -2596,9 +2570,11 @@ pub(super) enum GroupByOutputCol {
 
 pub(super) struct StreamGroupByPlan {
     group_target: RawAggTarget,
+    group_default: Option<i64>,
     num_pk_cols: usize,
     agg_ops: Vec<StreamAgg>,
     raw_targets: Vec<RawAggTarget>,
+    nonpk_agg_defaults: Vec<Option<Value>>,
     output: Vec<(GroupByOutputCol, String)>,
     where_pred: Option<SimplePredicate>,
 }
@@ -2649,6 +2625,13 @@ impl StreamGroupByPlan {
 
         let non_pk = schema.non_pk_indices();
         let enc_pos = schema.encoding_positions();
+        let nonpk_default = |col_idx: usize| -> Option<Option<Value>> {
+            let expr = schema.columns[col_idx].default_expr.as_ref();
+            if expr.is_some_and(|expr| volatile_function_in_expr(expr).is_some()) {
+                return None;
+            }
+            expr.map(eval_const_expr).transpose().ok()
+        };
         let group_target = if let Some(pk_pos) = schema
             .primary_key_columns
             .iter()
@@ -2659,9 +2642,19 @@ impl StreamGroupByPlan {
             let nonpk_order = non_pk.iter().position(|&i| i == group_col_idx).unwrap();
             RawAggTarget::NonPk(enc_pos[nonpk_order] as usize)
         };
+        let group_default = if matches!(group_target, RawAggTarget::NonPk(_)) {
+            match nonpk_default(group_col_idx) {
+                Some(Some(Value::Integer(value))) => Some(value),
+                Some(None) | Some(Some(Value::Null)) => None,
+                _ => return Ok(None),
+            }
+        } else {
+            None
+        };
 
         let mut agg_ops = Vec::new();
         let mut raw_targets = Vec::new();
+        let mut nonpk_agg_defaults = Vec::new();
         let mut output = Vec::new();
 
         for sel_col in &stmt.columns {
@@ -2686,6 +2679,7 @@ impl StreamGroupByPlan {
                     let agg_idx = agg_ops.len();
                     agg_ops.push(StreamAgg::CountStar);
                     raw_targets.push(RawAggTarget::CountStar);
+                    nonpk_agg_defaults.push(None);
                     output.push((GroupByOutputCol::Agg(agg_idx), name));
                 }
                 Expr::Function {
@@ -2717,6 +2711,18 @@ impl StreamGroupByPlan {
                         let nonpk_order = non_pk.iter().position(|&i| i == col_idx).unwrap();
                         RawAggTarget::NonPk(enc_pos[nonpk_order] as usize)
                     };
+                    let default = match &target {
+                        RawAggTarget::Pk(_)
+                            if schema.columns[col_idx].data_type != DataType::Integer =>
+                        {
+                            return Ok(None);
+                        }
+                        RawAggTarget::NonPk(_) => match nonpk_default(col_idx) {
+                            Some(default) => default,
+                            None => return Ok(None),
+                        },
+                        _ => None,
+                    };
                     let agg_idx = agg_ops.len();
                     match func.as_str() {
                         "COUNT" => agg_ops.push(StreamAgg::Count(col_idx)),
@@ -2731,6 +2737,7 @@ impl StreamGroupByPlan {
                         _ => return Ok(None),
                     }
                     raw_targets.push(target);
+                    nonpk_agg_defaults.push(default);
                     output.push((GroupByOutputCol::Agg(agg_idx), name));
                 }
                 _ => return Ok(None),
@@ -2739,9 +2746,11 @@ impl StreamGroupByPlan {
 
         Ok(Some(Self {
             group_target,
+            group_default,
             num_pk_cols: schema.primary_key_columns.len(),
             agg_ops,
             raw_targets,
+            nonpk_agg_defaults,
             output,
             where_pred,
         }))
@@ -2758,6 +2767,11 @@ impl StreamGroupByPlan {
         let mut groups: FxHashMap<i64, Vec<AggState>> = FxHashMap::default();
         let mut null_group: Option<Vec<AggState>> = None;
         let mut scan_err: Option<SqlError> = None;
+        let raw_feed = RawFeed {
+            raw_targets: &self.raw_targets,
+            num_pk_cols: self.num_pk_cols,
+            nonpk_agg_defaults: &self.nonpk_agg_defaults,
+        };
 
         scan(&mut |key, value| {
             if let Some(ref pred) = self.where_pred {
@@ -2800,9 +2814,10 @@ impl StreamGroupByPlan {
                         }
                     }
                 }
-                RawAggTarget::NonPk(idx) => match decode_column_raw(value, *idx) {
-                    Ok(RawColumn::Integer(i)) => Some(i),
-                    Ok(RawColumn::Null) => None,
+                RawAggTarget::NonPk(idx) => match decode_stored_column_raw(value, *idx) {
+                    Ok(Some(RawColumn::Integer(i))) => Some(i),
+                    Ok(Some(RawColumn::Null)) => None,
+                    Ok(None) => self.group_default,
                     Ok(_) => {
                         scan_err = Some(SqlError::InvalidValue("GROUP BY key not integer".into()));
                         return false;
@@ -2823,56 +2838,7 @@ impl StreamGroupByPlan {
                     .get_or_insert_with(|| self.agg_ops.iter().map(AggState::new).collect()),
             };
 
-            for (i, target) in self.raw_targets.iter().enumerate() {
-                let raw = match target {
-                    RawAggTarget::CountStar => {
-                        if let Err(e) = states[i].feed_raw(&RawColumn::Null) {
-                            scan_err = Some(e);
-                            return false;
-                        }
-                        continue;
-                    }
-                    RawAggTarget::Pk(pk_pos) => {
-                        if self.num_pk_cols == 1 && *pk_pos == 0 {
-                            match decode_pk_integer(key) {
-                                Ok(v) => RawColumn::Integer(v),
-                                Err(e) => {
-                                    scan_err = Some(e);
-                                    return false;
-                                }
-                            }
-                        } else {
-                            match decode_composite_key(key, self.num_pk_cols) {
-                                Ok(pk) => match &pk[*pk_pos] {
-                                    Value::Integer(i) => RawColumn::Integer(*i),
-                                    _ => {
-                                        scan_err = Some(SqlError::InvalidValue(
-                                            "agg column not integer".into(),
-                                        ));
-                                        return false;
-                                    }
-                                },
-                                Err(e) => {
-                                    scan_err = Some(e);
-                                    return false;
-                                }
-                            }
-                        }
-                    }
-                    RawAggTarget::NonPk(idx) => match decode_column_raw(value, *idx) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            scan_err = Some(e);
-                            return false;
-                        }
-                    },
-                };
-                if let Err(e) = states[i].feed_raw(&raw) {
-                    scan_err = Some(e);
-                    return false;
-                }
-            }
-            true
+            raw_feed.feed(key, value, states, &mut scan_err)
         })
         .map_err(SqlError::Storage)?;
 

@@ -821,10 +821,427 @@ fn try_between_predicate_unknown_column_returns_none() {
     assert!(try_between_predicate(&expr, &ts).is_none());
 }
 
+fn arithmetic_predicate_expr(
+    operand: Expr,
+    arithmetic: BinOp,
+    offset: Value,
+    comparison: BinOp,
+    literal: Value,
+    reversed: bool,
+) -> Expr {
+    let mut left = Expr::BinaryOp {
+        left: Box::new(operand),
+        op: arithmetic,
+        right: Box::new(Expr::Literal(offset)),
+    };
+    let mut right = Expr::Literal(literal);
+    if reversed {
+        std::mem::swap(&mut left, &mut right);
+    }
+    Expr::BinaryOp {
+        left: Box::new(left),
+        op: comparison,
+        right: Box::new(right),
+    }
+}
+
+fn assert_arithmetic_predicate_matches_eval(
+    table: &TableSchema,
+    key: &[u8],
+    encoded: &[u8],
+    value: &Value,
+    expr: &Expr,
+) {
+    let eval_columns = columns(&[(
+        "v",
+        table.columns[table.column_index("v").unwrap()].data_type,
+    )]);
+    let col_map = ColumnMap::new(&eval_columns);
+    let row = [value.clone()];
+    let expected = eval_expr(expr, &EvalCtx::new(&col_map, &row)).map(|value| is_truthy(&value));
+    let predicate = try_simple_predicate(expr, table).expect("scalar arithmetic predicate");
+    assert!(predicate.arithmetic.is_some());
+    let actual = predicate.matches_raw(key, encoded);
+    match (actual, expected) {
+        (Ok(actual), Ok(expected)) => assert_eq!(actual, expected, "{value:?}, {expr:?}"),
+        (Err(actual), Err(expected)) => {
+            assert_eq!(
+                actual.to_string(),
+                expected.to_string(),
+                "{value:?}, {expr:?}"
+            );
+        }
+        (actual, expected) => {
+            panic!("{value:?}, {expr:?}: actual={actual:?}, expected={expected:?}")
+        }
+    }
+}
+
 #[test]
-fn fold_temporal_offset_non_temporal_returns_none() {
-    let expr = Expr::Literal(i(1));
-    assert!(fold_temporal_offset(&expr).is_none());
+fn arithmetic_predicates_match_scalar_evaluation_for_every_comparison() {
+    use crate::datetime::{parse_date, parse_time, parse_timestamp};
+
+    let month = Value::Interval {
+        months: 1,
+        days: 0,
+        micros: 0,
+    };
+    let timestamp = |text| Value::Timestamp(parse_timestamp(text).unwrap());
+    let fixtures = [
+        (DataType::Integer, i(i64::MAX), i(1), i(0)),
+        (DataType::Integer, i(i64::MIN), i(1), i(0)),
+        (DataType::Integer, i(-7), i(3), i(-4)),
+        (DataType::Integer, i(i64::MAX), i(1), Value::Null),
+        (DataType::Integer, i(5), Value::Real(0.5), Value::Real(5.5)),
+        (DataType::Integer, Value::Null, i(1), i(0)),
+        (DataType::Integer, i(1), Value::Null, i(0)),
+        (
+            DataType::Real,
+            Value::Real(9007199254740992.0),
+            Value::Real(1.0),
+            Value::Real(9007199254740992.0),
+        ),
+        (DataType::Real, Value::Real(-0.0), Value::Real(0.0), i(0)),
+        (DataType::Real, Value::Real(f64::NAN), i(1), i(0)),
+        (
+            DataType::Real,
+            Value::Real(f64::INFINITY),
+            Value::Real(f64::INFINITY),
+            i(0),
+        ),
+        (
+            DataType::Timestamp,
+            timestamp("2023-01-31 12:00:00"),
+            month.clone(),
+            timestamp("2023-02-28 12:00:00"),
+        ),
+        (
+            DataType::Timestamp,
+            timestamp("2024-01-31 12:00:00"),
+            month.clone(),
+            timestamp("2024-02-29 12:00:00"),
+        ),
+        (
+            DataType::Timestamp,
+            timestamp("2023-01-31 12:00:00"),
+            timestamp("2023-01-01 12:00:00"),
+            month,
+        ),
+        (
+            DataType::Time,
+            Value::Time(parse_time("23:30:00").unwrap()),
+            Value::Interval {
+                months: 0,
+                days: 0,
+                micros: 3_600_000_000,
+            },
+            Value::Time(parse_time("01:00:00").unwrap()),
+        ),
+        (
+            DataType::Date,
+            Value::Date(parse_date("2023-01-01").unwrap()),
+            Value::Interval {
+                months: 0,
+                days: 1,
+                micros: 0,
+            },
+            timestamp("2023-01-02 00:00:00"),
+        ),
+    ];
+    for (data_type, value, offset, literal) in fixtures {
+        let nonpk = schema(
+            "t",
+            columns(&[("id", DataType::Integer), ("v", data_type)]),
+            vec![0],
+        );
+        let pk = schema("t", columns(&[("v", data_type)]), vec![0]);
+        let compound = schema(
+            "t",
+            columns(&[("tenant", DataType::Integer), ("v", data_type)]),
+            vec![0, 1],
+        );
+        let encoded = crate::encoding::encode_row(std::slice::from_ref(&value));
+        let key = encode_composite_key(std::slice::from_ref(&value));
+        let compound_key = encode_composite_key(&[i(42), value.clone()]);
+        for arithmetic in [BinOp::Add, BinOp::Sub] {
+            for comparison in [
+                BinOp::Eq,
+                BinOp::NotEq,
+                BinOp::Lt,
+                BinOp::LtEq,
+                BinOp::Gt,
+                BinOp::GtEq,
+            ] {
+                for reversed in [false, true] {
+                    let expr = arithmetic_predicate_expr(
+                        Expr::Column("v".into()),
+                        arithmetic,
+                        offset.clone(),
+                        comparison,
+                        literal.clone(),
+                        reversed,
+                    );
+                    for (table, key, row) in [
+                        (&nonpk, &[][..], encoded.as_slice()),
+                        (&pk, key.as_slice(), &[][..]),
+                        (&compound, compound_key.as_slice(), &[][..]),
+                    ] {
+                        assert_arithmetic_predicate_matches_eval(table, key, row, &value, &expr);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn arithmetic_predicates_preserve_missing_defaults_and_explicit_nulls() {
+    let default = Value::Real(9007199254740992.0);
+    let mut cols = columns(&[
+        ("id", DataType::Integer),
+        ("padding", DataType::Text),
+        ("v", DataType::Real),
+    ]);
+    cols[2].default_expr = Some(Expr::Literal(default.clone()));
+    let table = schema("t", cols, vec![0]);
+    let expr = arithmetic_predicate_expr(
+        Expr::Column("v".into()),
+        BinOp::Add,
+        Value::Real(1.0),
+        BinOp::Eq,
+        default.clone(),
+        false,
+    );
+    for v2 in [false, true] {
+        for (stored, expected) in [
+            (vec![Value::Text("padding".into())], default.clone()),
+            (
+                vec![Value::Text("padding".into()), Value::Null],
+                Value::Null,
+            ),
+            (
+                vec![Value::Text("padding".into()), Value::Real(0.0)],
+                Value::Real(0.0),
+            ),
+        ] {
+            let encoded = typed_predicate_row(&stored, v2);
+            assert_arithmetic_predicate_matches_eval(&table, &[], &encoded, &expected, &expr);
+        }
+    }
+}
+
+#[test]
+fn arithmetic_predicates_decline_unsupported_operands_and_unsafe_columns() {
+    let make_expr =
+        |operand| arithmetic_predicate_expr(operand, BinOp::Add, i(1), BinOp::Gt, i(0), false);
+    let table = schema(
+        "t",
+        columns(&[("id", DataType::Integer), ("v", DataType::Integer)]),
+        vec![0],
+    );
+    for operand in [
+        Expr::Parameter(1),
+        Expr::Collate {
+            expr: Box::new(Expr::Column("v".into())),
+            collation: Collation::Binary,
+        },
+        Expr::BinaryOp {
+            left: Box::new(Expr::Column("v".into())),
+            op: BinOp::Add,
+            right: Box::new(Expr::Literal(i(1))),
+        },
+        Expr::Function {
+            name: "ABS".into(),
+            args: vec![Expr::Column("v".into())],
+            distinct: false,
+        },
+    ] {
+        assert!(try_simple_predicate(&make_expr(operand), &table).is_none());
+    }
+    assert!(try_simple_predicate(&Expr::Literal(i(1)), &table).is_none());
+
+    let mut variants = Vec::new();
+    let mut cols = table.columns.clone();
+    cols[1].collation = Collation::NoCase;
+    variants.push(cols);
+    let mut cols = table.columns.clone();
+    cols[1].generated_kind = Some(GeneratedKind::Virtual);
+    variants.push(cols);
+    let mut cols = table.columns.clone();
+    cols[1].default_expr = Some(Expr::Function {
+        name: "RANDOM".into(),
+        args: Vec::new(),
+        distinct: false,
+    });
+    variants.push(cols);
+    let mut cols = table.columns.clone();
+    cols[1].default_expr = Some(Expr::BinaryOp {
+        left: Box::new(Expr::Literal(i(1))),
+        op: BinOp::Div,
+        right: Box::new(Expr::Literal(i(0))),
+    });
+    variants.push(cols);
+    let mut cols = table.columns.clone();
+    cols[1].data_type = DataType::Text;
+    variants.push(cols);
+    for cols in variants {
+        let table = schema("t", cols, vec![0]);
+        assert!(try_simple_predicate(&make_expr(Expr::Column("v".into())), &table).is_none());
+    }
+}
+
+#[test]
+fn arithmetic_predicates_preserve_array_and_vector_decode_errors() {
+    let table = schema(
+        "t",
+        columns(&[
+            ("id", DataType::Integer),
+            ("padding", DataType::Text),
+            ("v", DataType::Real),
+        ]),
+        vec![0],
+    );
+    let expr = arithmetic_predicate_expr(
+        Expr::Column("v".into()),
+        BinOp::Add,
+        i(1),
+        BinOp::Gt,
+        i(0),
+        false,
+    );
+    let predicate = try_simple_predicate(&expr, &table).unwrap();
+    for value in [
+        Value::Array(vec![i(1)].into()),
+        Value::Vector(vec![1.0].into()),
+    ] {
+        for v2 in [false, true] {
+            let mut encoded =
+                crate::encoding::encode_row(&[Value::Text("padding".into()), value.clone()]);
+            if !v2 {
+                encoded[1] &= 0x7f;
+            }
+            let decoded = decode_columns(&encoded, &[1]).unwrap();
+            assert_eq!(decoded, vec![value.clone()]);
+            assert_arithmetic_predicate_matches_eval(&table, &[], &encoded, &value, &expr);
+            assert!(matches!(
+                predicate.matches_raw(&[], &encoded),
+                Err(SqlError::TypeMismatch { .. })
+            ));
+
+            let body_len = match decode_stored_column_raw(&encoded, 1).unwrap().unwrap() {
+                RawColumn::Array(body) | RawColumn::Vector(body) => body.len(),
+                _ => unreachable!(),
+            };
+            let body_start = encoded.len() - body_len;
+            encoded[body_start] = 2;
+            let expected = decode_columns(&encoded, &[1]).unwrap_err();
+            assert!(matches!(expected, SqlError::InvalidValue(_)));
+            let actual = predicate.matches_raw(&[], &encoded).unwrap_err();
+            assert!(matches!(actual, SqlError::InvalidValue(_)));
+            assert_eq!(actual.to_string(), expected.to_string());
+        }
+    }
+}
+
+#[test]
+fn arithmetic_predicates_admit_only_scalar_defaults() {
+    let arithmetic = arithmetic_predicate_expr(
+        Expr::Column("v".into()),
+        BinOp::Add,
+        i(1),
+        BinOp::Gt,
+        i(0),
+        false,
+    );
+    let direct = Expr::BinaryOp {
+        left: Box::new(Expr::Column("v".into())),
+        op: BinOp::Gt,
+        right: Box::new(Expr::Literal(i(0))),
+    };
+    for (default, admitted) in [
+        (Value::Null, true),
+        (i(1), true),
+        (Value::Real(1.0), true),
+        (Value::Date(0), true),
+        (Value::Time(0), true),
+        (Value::Timestamp(0), true),
+        (
+            Value::Interval {
+                months: 0,
+                days: 1,
+                micros: 0,
+            },
+            true,
+        ),
+        (Value::Json("{}".into()), false),
+        (crate::json::text_to_jsonb("{}").unwrap(), false),
+        (Value::Text("1".into()), false),
+        (Value::Boolean(true), false),
+        (Value::Blob(vec![1]), false),
+        (Value::Array(vec![i(1)].into()), false),
+        (Value::Vector(vec![1.0].into()), false),
+    ] {
+        let mut cols = columns(&[("id", DataType::Integer), ("v", DataType::Integer)]);
+        cols[1].default_expr = Some(Expr::Literal(default.clone()));
+        let table = schema("t", cols, vec![0]);
+        assert_eq!(
+            try_simple_predicate(&arithmetic, &table).is_some(),
+            admitted,
+            "{default:?}"
+        );
+        assert!(
+            try_simple_predicate(&direct, &table).is_some(),
+            "{default:?}"
+        );
+    }
+}
+
+#[test]
+fn nonscalar_arithmetic_defaults_keep_cancellable_generic_evaluation() {
+    for default in [
+        Value::Json("{\"key\":1}".into()),
+        crate::json::text_to_jsonb("{\"key\":1}").unwrap(),
+    ] {
+        let mut cols = columns(&[("id", DataType::Integer), ("v", DataType::Integer)]);
+        cols[1].default_expr = Some(Expr::Literal(default));
+        let table = schema("t", cols, vec![0]);
+        let expr = arithmetic_predicate_expr(
+            Expr::Column("v".into()),
+            BinOp::Sub,
+            Value::Text("key".into()),
+            BinOp::Eq,
+            crate::json::text_to_jsonb("{}").unwrap(),
+            false,
+        );
+        let simple = try_simple_predicate(&expr, &table);
+        assert!(simple.is_none());
+        let col_map = ColumnMap::new(&table.columns);
+        let compiled = CompiledExpr::compile(&expr, &col_map);
+        let token = citadel::CancelToken::new();
+        let partial = PartialDecodeCtx::new_with_cancel(&table, &[1], Some(&token)).unwrap();
+        let key = encode_composite_key(&[i(1)]);
+        let encoded = crate::encoding::encode_row(&[]);
+        let _cancel = crate::json::cancel_json_after(token.clone(), 1);
+        token.check().unwrap();
+        let error = scan_step(
+            &table,
+            &key,
+            &encoded,
+            Some(&compiled),
+            simple.as_ref(),
+            None,
+            None,
+            Some(&col_map),
+            Some(&partial),
+            Some(&token),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            SqlError::Storage(citadel_core::Error::Interrupted)
+        ));
+        assert!(token.check().is_err());
+    }
 }
 
 #[test]
