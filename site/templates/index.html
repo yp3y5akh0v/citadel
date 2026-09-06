@@ -5,6 +5,7 @@
 
 {% block content %}
 {% set base = config.base_url %}
+{% set sql_benchmarks = load_data(path="data/sql-benchmarks.json") %}
 
 <section class="hero shell">
   <div class="hero-inner">
@@ -63,10 +64,10 @@
   <div class="proof">
     <div class="proof-label">// proven in</div>
     <div class="proof-items">
-      <span><b>{{ config.extra.locomo }}%</b> LoCoMo score</span>
-      <span><b>{{ config.extra.locomo_ceiling }}%</b> recall ceiling</span>
+      <span><b>{{ config.extra.locomo }}%</b> historical LoCoMo score</span>
+      <span><b>{{ config.extra.locomo_ceiling }}%</b> historical recall@50</span>
       <span><b>Thousands</b> of tests, {{ config.extra.crates }} crates</span>
-      <span><b>{{ config.extra.benchmarks }}/{{ config.extra.benchmarks }}</b> faster vs SQLite</span>
+      <span><b>{{ config.extra.benchmarks }}</b> SQL comparisons vs SQLite</span>
     </div>
   </div>
 </div>
@@ -102,7 +103,7 @@
         <li><code>VECTOR(N)</code> type with a <a class="ilink" href="https://github.com/yp3y5akh0v/prism" target="_blank" rel="noopener">PRISM</a>-backed filtered ANN index</li>
         <li>Hybrid recall: vector ANN + BM25 keyword + recency + optional cross-encoder reranker</li>
         <li>Cryptographic forgetting: erase an atom or region by destroying its key</li>
-        <li>{{ config.extra.mcp_tools }}-tool MCP server; {{ config.extra.locomo }}% on LoCoMo and {{ config.extra.longmemeval }}% on LongMemEval-S (gpt-4o)</li>
+        <li>{{ config.extra.mcp_tools }}-tool MCP server; historical scores of {{ config.extra.locomo }}% on LoCoMo and {{ config.extra.longmemeval }}% on LongMemEval-S (gpt-4o)</li>
       </ul>
     </div>
     <div class="pillar">
@@ -385,10 +386,10 @@
       <div class="bench-kpis cols-2" style="margin-bottom:0">
         <div class="kpi"><div class="val"><em>{{ config.extra.locomo }}</em>%</div><div class="lab">LoCoMo (gpt-4o-mini)</div></div>
         <div class="kpi"><div class="val"><em>{{ config.extra.longmemeval }}</em>%</div><div class="lab">LongMemEval-S (gpt-4o)</div></div>
-        <div class="kpi"><div class="val"><em>{{ config.extra.locomo_ceiling }}</em>%</div><div class="lab">LoCoMo retrieval ceiling</div></div>
+        <div class="kpi"><div class="val"><em>{{ config.extra.locomo_ceiling }}</em>%</div><div class="lab">Historical LoCoMo recall@50</div></div>
         <div class="kpi"><div class="val"><em>8</em></div><div class="lab">typed edge kinds</div></div>
       </div>
-      <p class="bench-note">Two long-term-memory benchmarks, each on its official prompt and judge. LoCoMo: encrypted regions, gpt-4o-mini reader and judge, zero LLM at ingest or retrieval. LongMemEval-S (full-haystack, ~40-50 sessions/question): {{ config.extra.longmemeval }}% with a gpt-4o reader and the official gpt-4o judge. Protocol and full numbers in <code>citadeldb-membench</code>.</p>
+      <p class="bench-note">Historical results on encrypted regions. LoCoMo uses the harness's prompts with a gpt-4o-mini reader and judge. LongMemEval-S uses the official CoT reader prompt and judge protocol with gpt-4o. <a href="{{ config.extra.github }}/blob/HEAD/crates/citadel-membench/RESULTS.md">Recorded configurations and limitations</a>.</p>
     </div>
   </div>
 </section>
@@ -453,15 +454,15 @@
 <section class="block shell" id="benchmarks">
   <div class="sec-head">
     <div class="eyebrow">Benchmarks</div>
-    <h2>Faster on all {{ config.extra.benchmarks }} head-to-head benchmarks.</h2>
-    <p>Recorded single-threaded results with durability off, measuring engine overhead. Most cases use 100K rows of <code class="mono" style="color:var(--accent)">(id INTEGER PK, name TEXT, age INTEGER)</code>; cache budgets are equal (~32 MB). Ratios are SQLite / Citadel time, using two-run medians. Execution cases recompute results; memoized cases repeat identical reads against unchanged data. See the <a href="{{ config.extra.github }}#speed-benchmarks">full methodology</a>.</p>
+    <h2>{{ config.extra.benchmarks }} SQL comparisons with SQLite.</h2>
+    <p>Single-threaded measurements with durability off and both caches configured for 4,096 pages (about 32 MiB). Ratios are SQLite time / Citadel time: above 1 means Citadel is faster, below 1 means Citadel is slower. Execution and cached repeat reads are reported separately. Measurements from September 6, 2026 combine the source revisions listed in the <a href="{{ config.extra.github }}#speed-benchmarks">methodology</a>; they are not a full-suite timing run at one revision.</p>
   </div>
 
   <div class="bench-kpis">
-    <div class="kpi"><div class="val"><em>1,549&times;</em></div><div class="lab">correlated_scalar</div></div>
-    <div class="kpi"><div class="val"><em>22&times;</em></div><div class="lab">join_param</div></div>
-    <div class="kpi"><div class="val"><em>19.2M&times;</em></div><div class="lab">correlated_in (memoized)</div></div>
-    <div class="kpi"><div class="val"><em>1.01&times;</em></div><div class="lab">slowest (still faster)</div></div>
+    <div class="kpi"><div class="val"><em>{{ sql_benchmarks.execution | length }}</em></div><div class="lab">execution comparisons</div></div>
+    <div class="kpi"><div class="val"><em>{{ sql_benchmarks.cached | length }}</em></div><div class="lab">cached-read comparisons</div></div>
+    <div class="kpi"><div class="val"><em>{{ sql_benchmarks.measurement.passes }}</em></div><div class="lab">passes per measurement</div></div>
+    <div class="kpi"><div class="val"><em>{{ sql_benchmarks.measurement.samples_per_pass }}</em></div><div class="lab">samples per pass</div></div>
   </div>
 
   <h3 class="bench-sub">Execution speed</h3>
@@ -475,7 +476,8 @@
     </div>
   </div>
 
-  <h3 class="bench-sub">Memoized repeat-reads</h3>
+  <h3 class="bench-sub">Cached repeat reads</h3>
+  <p class="bench-note">Identical reads reuse Citadel's cached results or projected UNION ALL branches while SQLite executes again. These are not first-execution timings.</p>
   <div class="bench-table" id="memoTable">
     <div class="row h">
       <div>Benchmark</div>
@@ -485,7 +487,7 @@
       <div>Ratio</div>
     </div>
   </div>
-  <div class="bench-note">SQLite: <code>journal_mode=OFF, synchronous=OFF, cache_size=8192</code>. Citadel: <code>SyncMode::Off, cache_size=4096</code>. Reproduce: <code>cargo bench -p citadeldb-sql --bench h2h_bench</code>.</div>
+  <div class="bench-note">SQLite: <code>page_size=8192, journal_mode=MEMORY, synchronous=OFF, cache_size=4096</code>. Citadel: <code>SyncMode::Off, cache_size=4096</code>. Reproduce: <code>cargo bench --locked -p citadeldb-sql --bench h2h_bench</code>.</div>
 </section>
 
 <section class="block shell" id="arch">
@@ -849,5 +851,6 @@
 {% endblock %}
 
 {% block scripts %}
+<script type="application/json" id="sqlBenchmarks">{{ load_data(path="data/sql-benchmarks.json", format="plain") | safe }}</script>
 <script src="{{ get_url(path='js/home.js') }}"></script>
 {% endblock %}

@@ -23,7 +23,7 @@ published = 16
 locomo = "87.2"
 locomo_ceiling = "94.5"
 longmemeval = "86.2"
-benchmarks = 58
+benchmarks = 59
 mcp_tools = 15
 
 adapters = [

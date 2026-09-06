@@ -133,7 +133,7 @@
     <div class="explainer">
       <div class="num">03 / the benchmark numbers</div>
       <h4>Reproduce with one command.</h4>
-      <p><code>cargo bench -p citadeldb-sql --bench h2h_bench</code> runs the {{ config.extra.benchmarks }} head-to-head benchmarks against unencrypted SQLite at equal cache budgets.</p>
+      <p><code>cargo bench --locked -p citadeldb-sql --bench h2h_bench</code> runs the {{ config.extra.benchmarks }} head-to-head benchmarks against unencrypted SQLite, with both caches configured for 4,096 pages (about 32 MiB).</p>
     </div>
   </div>
 </div>

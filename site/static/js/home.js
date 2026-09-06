@@ -245,93 +245,49 @@ cleanup:
 })();
 
 (() => {
-  const BENCH_EXEC = [
-    ['correlated_scalar', '12.8 µs', '19.8 ms', 1549],
-    ['full_outer_join', '14.1 µs', '21.8 ms', 1540],
-    ['view_filter', '21.6 µs', '1.83 ms', 85],
-    ['filter', '23.2 µs', '1.84 ms', 80],
-    ['join_param', '1.55 µs', '34.8 µs', 22],
-    ['join', '14.2 µs', '97.7 µs', 6.89],
-    ['union', '28.0 µs', '150 µs', 5.35],
-    ['delete_returning', '48.8 µs', '171 µs', 3.50],
-    ['update_returning', '46.6 µs', '150 µs', 3.23],
-    ['insert_returning', '61.1 µs', '174 µs', 2.84],
-    ['truncate', '20.8 µs', '58.7 µs', 2.83],
-    ['fts_match', '2.91 ms', '8.03 ms', 2.76],
-    ['json_extract', '12.2 ms', '32.7 ms', 2.68],
-    ['sort_paginate_pk', '5.62 µs', '14.7 µs', 2.61],
-    ['upsert_returning', '67.2 µs', '175 µs', 2.61],
-    ['window_agg', '29.5 ms', '76.5 ms', 2.59],
-    ['upsert_dedup', '13.0 µs', '32.8 µs', 2.52],
-    ['fts_phrase', '4.19 ms', '9.73 ms', 2.32],
-    ['savepoint_create', '349 ns', '748 ns', 2.14],
-    ['window_rank', '63.4 ms', '130 ms', 2.05],
-    ['insert_select', '543 µs', '1.10 ms', 2.03],
-    ['delete', '35.0 µs', '69.9 µs', 2.00],
-    ['scan', '4.97 ms', '9.54 ms', 1.92],
-    ['savepoint_rollback', '1.28 ms', '2.28 ms', 1.78],
-    ['wide_proj_2col', '501 µs', '842 µs', 1.68],
-    ['upsert_mixed', '35.5 µs', '59.1 µs', 1.66],
-    ['savepoint_nested', '197 µs', '326 µs', 1.66],
-    ['wide_proj_full', '4.59 ms', '7.53 ms', 1.64],
-    ['update', '17.9 µs', '28.3 µs', 1.58],
-    ['wide_proj_pk', '319 µs', '480 µs', 1.51],
-    ['upsert_counter', '35.8 µs', '53.7 µs', 1.50],
-    ['insert', '35.4 µs', '51.9 µs', 1.47],
-    ['upsert_all_new', '35.6 µs', '51.4 µs', 1.44],
-    ['covered_count', '257 µs', '359 µs', 1.40],
-    ['with_dml', '80.5 µs', '107 µs', 1.34],
-    ['fk_cascade_delete_only', '63.5 µs', '80.7 µs', 1.27],
-    ['insert_gen_virtual', '48.5 µs', '55.0 µs', 1.13],
-    ['wide_proj_3col', '1.11 ms', '1.23 ms', 1.11],
-    ['covered_range', '68.2 µs', '74.8 µs', 1.10],
-    ['insert_gen_stored', '51.3 µs', '56.2 µs', 1.10],
-    ['fk_cascade', '80.7 µs', '87.3 µs', 1.08],
-    ['update_gen_propagate', '44.6 µs', '45.2 µs', 1.01],
-  ];
-  const BENCH_MEMO = [
-    ['correlated_in', '103 ns', '1.97 s', 19208388],
-    ['fts_rank', '219 ns', '42.5 ms', 194338],
-    ['correlated_exists', '102 ns', '6.89 ms', 67712],
-    ['jsonb_contains', '1.09 µs', '27.7 ms', 25273],
-    ['sort_nocase', '213 ns', '3.31 ms', 15532],
-    ['cte', '668 ns', '6.13 ms', 9179],
-    ['sort', '312 ns', '2.76 ms', 8853],
-    ['group_by', '1.27 µs', '10.7 ms', 8411],
-    ['sum', '468 ns', '1.97 ms', 4214],
-    ['distinct', '1.11 µs', '4.08 ms', 3675],
-    ['recursive_cte', '105 ns', '122 µs', 1165],
-    ['partial_index_point', '103 ns', '12.6 µs', 122],
-    ['view_point', '121 ns', '12.7 µs', 105],
-    ['point', '121 ns', '12.5 µs', 104],
-    ['count', '457 ns', '21.6 µs', 47],
-    ['select_gen_virtual', '1.05 µs', '18.1 µs', 17],
-  ];
-  const fmtRatio = (r) => {
-    if (r >= 1000) return r.toLocaleString('en-US') + '×';
-    return r.toFixed(r < 10 ? 2 : 0) + '×';
+  const source = document.getElementById('sqlBenchmarks');
+  if (!source) return;
+  const benchmarks = JSON.parse(source.textContent);
+  const median = (samples) => (samples[0] + samples[1]) / 2;
+  const fmtNumber = (value) => Number(value.toPrecision(3)).toLocaleString('en-US', {
+    useGrouping: false, maximumSignificantDigits: 3,
+  });
+  const fmtRatio = (ratio) => fmtNumber(ratio) + '×';
+  const fmtTime = (ns) => {
+    const [scale, unit] = [[1e9, 's'], [1e6, 'ms'], [1e3, 'us'], [1, 'ns']]
+      .find(([scale]) => ns >= scale || scale === 1);
+    return fmtNumber(ns / scale) + ' ' + unit;
   };
   const renderBench = (id, data) => {
     const table = document.getElementById(id);
     if (!table) return;
-    const maxLog = Math.log10(data[0][3]);
+    const rows = data.map(({ name, samples_ns }) => {
+      const citadel = median(samples_ns.citadel);
+      const sqlite = median(samples_ns.sqlite);
+      return { name, citadel, sqlite, ratio: sqlite / citadel };
+    });
+    const maxLog = Math.max(0, ...rows.map(({ ratio }) => Math.log10(ratio)));
     const frag = document.createDocumentFragment();
-    data.forEach(([name, c, s, r]) => {
-      const w = Math.max(6, (Math.log10(r) / maxLog) * 100);
+    rows.forEach(({ name, citadel, sqlite, ratio }) => {
+      const faster = ratio > 1;
+      const width = faster ? Math.min(100, Math.max(6, Math.log10(ratio) / maxLog * 100)) : 0;
+      const comparison = faster
+        ? `<div class="bar"><i style="width:${width.toFixed(1)}%"></i></div>`
+        : `<span class="relative-neutral">${ratio < 1 ? 'SQLite ' + fmtRatio(1 / ratio) + ' faster' : 'Equal measured time'}</span>`;
       const row = document.createElement('div');
       row.className = 'row';
       row.innerHTML = `
         <div class="name mono">${name}</div>
-        <div class="bar-wrap"><div class="bar"><i style="width:${w.toFixed(1)}%"></i></div></div>
-        <div class="num">${c}</div>
-        <div class="num">${s}</div>
-        <div class="ratio">${fmtRatio(r)}</div>`;
+        <div class="bar-wrap">${comparison}</div>
+        <div class="num">${fmtTime(citadel)}</div>
+        <div class="num">${fmtTime(sqlite)}</div>
+        <div class="ratio${faster ? '' : ' ratio-neutral'}">${fmtRatio(ratio)}</div>`;
       frag.appendChild(row);
     });
     table.appendChild(frag);
   };
-  renderBench('benchTable', BENCH_EXEC);
-  renderBench('memoTable', BENCH_MEMO);
+  renderBench('benchTable', benchmarks.execution);
+  renderBench('memoTable', benchmarks.cached);
 })();
 
 (() => {

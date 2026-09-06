@@ -13,8 +13,8 @@ pip install citadeldb
 Requires Python 3.10 or later. The only runtime dependency is NumPy; embeddings are
 bring-your-own. `CandleEmbedder` and `CrossEncoder` are not included in the default wheel.
 
-This guide covers the 2.2 source APIs. Until 2.2 is published, activate a virtual
-environment and build from this repository's root with Rust installed:
+To build from source, activate a virtual environment and run these commands from
+the repository root with Rust installed:
 
 ```console
 pip install maturin
@@ -65,7 +65,7 @@ The model is downloaded on first construction and runs locally. Keep the model
 revision and encoding settings unchanged when reopening a region. This wrapper checks
 cancellation between batches, not during a batch's model inference.
 
-CitadelDB 2.2 requires `dim`, `metric`, `model_id`, and
+Custom embedders require `dim`, `metric`, `model_id`, and
 `embed_with_cancel(texts, cancel_token)`. Return one `dim`-wide vector per input and
 accept `None` as the token. Asymmetric models should also implement
 `embed_queries_with_cancel` for query-specific encoding. `MockEmbedder` is only a
