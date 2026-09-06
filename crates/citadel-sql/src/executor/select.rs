@@ -834,7 +834,7 @@ fn try_inverted_ts_rank_topk_with_read(
         .map(|column| column.name)
         .collect();
     let limit = match stmt.limit.as_ref() {
-        Some(expr) => eval_const_int(expr)?.max(0) as usize,
+        Some(expr) => eval_row_count(expr)?,
         None => return Ok(None),
     };
     if limit == 0 || stmt.offset.is_some() {
@@ -1589,13 +1589,12 @@ pub(super) fn compute_scan_limit(stmt: &SelectStmt, table_schema: &TableSchema) 
         return None;
     }
     let limit = stmt.limit.as_ref()?;
-    let limit_val = eval_const_int(limit).ok()?.max(0) as usize;
+    let limit_val = eval_row_count(limit).ok()?;
     let offset_val = stmt
         .offset
         .as_ref()
-        .and_then(|e| eval_const_int(e).ok())
-        .unwrap_or(0)
-        .max(0) as usize;
+        .and_then(|e| eval_row_count(e).ok())
+        .unwrap_or(0);
     Some(limit_val.saturating_add(offset_val))
 }
 
@@ -1657,7 +1656,7 @@ pub(super) fn try_count_star_shortcut(
 
 fn apply_offset_limit(rows: &mut Vec<Vec<Value>>, stmt: &SelectStmt) -> Result<()> {
     if let Some(offset_expr) = &stmt.offset {
-        let offset = eval_const_int(offset_expr)?.max(0) as usize;
+        let offset = eval_row_count(offset_expr)?;
         if offset < rows.len() {
             *rows = rows.split_off(offset);
         } else {
@@ -1665,7 +1664,7 @@ fn apply_offset_limit(rows: &mut Vec<Vec<Value>>, stmt: &SelectStmt) -> Result<(
         }
     }
     if let Some(limit_expr) = &stmt.limit {
-        rows.truncate(eval_const_int(limit_expr)?.max(0) as usize);
+        rows.truncate(eval_row_count(limit_expr)?);
     }
     Ok(())
 }
@@ -3075,7 +3074,7 @@ fn try_streaming_distinct_with_read(
     }
 
     if let Some(ref offset_expr) = stmt.offset {
-        let offset = eval_const_int(offset_expr)?.max(0) as usize;
+        let offset = eval_row_count(offset_expr)?;
         if offset < rows.len() {
             rows = rows.split_off(offset);
         } else {
@@ -3083,7 +3082,7 @@ fn try_streaming_distinct_with_read(
         }
     }
     if let Some(ref limit_expr) = stmt.limit {
-        let limit = eval_const_int(limit_expr)?.max(0) as usize;
+        let limit = eval_row_count(limit_expr)?;
         rows.truncate(limit);
     }
 
@@ -3706,7 +3705,7 @@ fn try_lateral_decorrelated(
     }
 
     let limit_n = match &sel.limit {
-        Some(Expr::Literal(Value::Integer(n))) if *n >= 0 => Some(*n as usize),
+        Some(Expr::Literal(Value::Integer(n))) if *n >= 0 => Some(nonnegative_row_count(*n)),
         Some(_) => return Ok(None),
         None => None,
     };
@@ -4363,7 +4362,7 @@ pub(super) fn process_select(
         }
 
         if let Some(ref offset_expr) = stmt.offset {
-            let offset = eval_const_int(offset_expr)?.max(0) as usize;
+            let offset = eval_row_count(offset_expr)?;
             if offset < projected.len() {
                 projected = projected.split_off(offset);
             } else {
@@ -4372,7 +4371,7 @@ pub(super) fn process_select(
         }
 
         if let Some(ref limit_expr) = stmt.limit {
-            let limit = eval_const_int(limit_expr)?.max(0) as usize;
+            let limit = eval_row_count(limit_expr)?;
             projected.truncate(limit);
         }
 
@@ -4401,14 +4400,13 @@ pub(super) fn process_select(
         let collations = projection_sort_collations(&stmt.order_by, columns, &output_columns)?;
 
         if let Some(ref limit_expr) = stmt.limit {
-            let limit = eval_const_int(limit_expr)?.max(0) as usize;
+            let limit = eval_row_count(limit_expr)?;
             let offset = stmt
                 .offset
                 .as_ref()
-                .map(eval_const_int)
+                .map(eval_row_count)
                 .transpose()?
-                .unwrap_or(0)
-                .max(0) as usize;
+                .unwrap_or(0);
             let keep = limit.saturating_add(offset);
             if keep == 0 {
                 projected.clear();
@@ -4442,7 +4440,7 @@ pub(super) fn process_select(
         }
 
         if let Some(ref offset_expr) = stmt.offset {
-            let offset = eval_const_int(offset_expr)?.max(0) as usize;
+            let offset = eval_row_count(offset_expr)?;
             if offset < projected.len() {
                 projected = projected.split_off(offset);
             } else {
@@ -4450,7 +4448,7 @@ pub(super) fn process_select(
             }
         }
         if let Some(ref limit_expr) = stmt.limit {
-            projected.truncate(eval_const_int(limit_expr)?.max(0) as usize);
+            projected.truncate(eval_row_count(limit_expr)?);
         }
         ctx.check()?;
         return Ok(ExecutionResult::Query(QueryResult {
@@ -4461,9 +4459,9 @@ pub(super) fn process_select(
 
     if !stmt.order_by.is_empty() {
         if let Some(ref limit_expr) = stmt.limit {
-            let limit = eval_const_int(limit_expr)?.max(0) as usize;
+            let limit = eval_row_count(limit_expr)?;
             let offset = match stmt.offset {
-                Some(ref e) => eval_const_int(e)?.max(0) as usize,
+                Some(ref e) => eval_row_count(e)?,
                 None => 0,
             };
             let keep = limit.saturating_add(offset);
@@ -4481,7 +4479,7 @@ pub(super) fn process_select(
     }
 
     if let Some(ref offset_expr) = stmt.offset {
-        let offset = eval_const_int(offset_expr)?.max(0) as usize;
+        let offset = eval_row_count(offset_expr)?;
         if offset < rows.len() {
             rows = rows.split_off(offset);
         } else {
@@ -4490,7 +4488,7 @@ pub(super) fn process_select(
     }
 
     if let Some(ref limit_expr) = stmt.limit {
-        let limit = eval_const_int(limit_expr)?.max(0) as usize;
+        let limit = eval_row_count(limit_expr)?;
         rows.truncate(limit);
     }
 

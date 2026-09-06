@@ -1033,6 +1033,62 @@ fn compute_scan_limit_with_offset_adds() {
 }
 
 #[test]
+fn compute_scan_limit_saturates_large_counts_and_their_sum() {
+    for (limit, offset) in [
+        (i64::from(u32::MAX) + 1, 0),
+        (i64::from(u32::MAX) + 2, 3),
+        (3, i64::from(u32::MAX) + 1),
+        (i64::MAX, i64::MAX),
+        (-1, 3),
+    ] {
+        let mut s = empty_select("t");
+        s.limit = Some(Expr::Literal(i(limit)));
+        s.offset = Some(Expr::Literal(i(offset)));
+        let expected =
+            (limit.max(0) as u128 + offset.max(0) as u128).min(usize::MAX as u128) as usize;
+        assert_eq!(
+            compute_scan_limit(&s, &scan_limit_schema()),
+            Some(expected),
+            "LIMIT {limit} OFFSET {offset}"
+        );
+    }
+}
+
+#[test]
+fn apply_offset_limit_keeps_large_limits_and_exhausts_large_offsets() {
+    let original = vec![vec![i(1)], vec![i(2)], vec![i(3)]];
+    for count in [i64::from(u32::MAX) + 1, i64::from(u32::MAX) + 2, i64::MAX] {
+        let mut s = empty_select("t");
+        s.limit = Some(Expr::Literal(i(count)));
+        let mut rows = original.clone();
+        apply_offset_limit(&mut rows, &s).unwrap();
+        assert_eq!(rows, original, "LIMIT {count}");
+
+        s.offset = Some(Expr::Literal(i(count)));
+        apply_offset_limit(&mut rows, &s).unwrap();
+        assert!(rows.is_empty(), "OFFSET {count}");
+    }
+    let mut s = empty_select("t");
+    s.offset = Some(Expr::Literal(i(-1)));
+    let mut rows = original.clone();
+    apply_offset_limit(&mut rows, &s).unwrap();
+    assert_eq!(rows, original);
+    s.limit = Some(Expr::Literal(i(-1)));
+    apply_offset_limit(&mut rows, &s).unwrap();
+    assert!(rows.is_empty());
+}
+
+#[test]
+fn scan_limit_prediction_leaves_expression_errors_to_execution() {
+    let mut s = empty_select("t");
+    s.offset = Some(Expr::Literal(Value::Text("bad".into())));
+    assert_eq!(compute_scan_limit(&s, &scan_limit_schema()), None);
+    s.limit = Some(Expr::Literal(i(3)));
+    assert_eq!(compute_scan_limit(&s, &scan_limit_schema()), Some(3));
+    assert!(apply_offset_limit(&mut vec![vec![i(1)]], &s).is_err());
+}
+
+#[test]
 fn compute_scan_limit_none_with_order_by() {
     use crate::parser::OrderByItem;
     let mut s = empty_select("t");

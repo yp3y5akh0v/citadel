@@ -1119,6 +1119,15 @@ pub(super) fn eval_const_int(expr: &Expr) -> Result<i64> {
     }
 }
 
+/// LIMIT/OFFSET clamp negative counts to zero and saturate on narrower targets.
+pub(super) fn nonnegative_row_count(value: i64) -> usize {
+    usize::try_from(value.max(0)).unwrap_or(usize::MAX)
+}
+
+pub(super) fn eval_row_count(expr: &Expr) -> Result<usize> {
+    eval_const_int(expr).map(nonnegative_row_count)
+}
+
 pub(super) fn sort_rows(
     rows: &mut [Vec<Value>],
     order_by: &[OrderByItem],

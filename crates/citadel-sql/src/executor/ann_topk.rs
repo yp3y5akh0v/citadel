@@ -28,7 +28,7 @@ use crate::types::*;
 use super::aggregate::is_aggregate_expr;
 use super::ann_persist;
 use super::helpers::{
-    check_cancel, check_cancel_at, decode_full_row_with_cancel, eval_const_expr, eval_const_int,
+    check_cancel, check_cancel_at, decode_full_row_with_cancel, eval_const_expr, eval_row_count,
     project_rows, project_rows_with_cancel, sort_vec_by,
 };
 use super::window::has_any_window_function;
@@ -409,14 +409,13 @@ impl AnnTopKPlan {
             })
             .collect();
 
-        let k_limit = eval_const_int(stmt.limit.as_ref().unwrap())?.max(0) as usize;
+        let k_limit = eval_row_count(stmt.limit.as_ref().unwrap())?;
         let offset = stmt
             .offset
             .as_ref()
-            .map(eval_const_int)
+            .map(eval_row_count)
             .transpose()?
-            .unwrap_or(0)
-            .max(0) as usize;
+            .unwrap_or(0);
         if k_limit == 0 {
             return Ok(None);
         }
@@ -1253,17 +1252,16 @@ impl VectorTopKPlan {
             return Ok(None);
         }
 
-        let k = eval_const_int(stmt.limit.as_ref().unwrap())?.max(0) as usize;
+        let k = eval_row_count(stmt.limit.as_ref().unwrap())?;
         if k == 0 {
             return Ok(None);
         }
         let offset = stmt
             .offset
             .as_ref()
-            .map(eval_const_int)
+            .map(eval_row_count)
             .transpose()?
-            .unwrap_or(0)
-            .max(0) as usize;
+            .unwrap_or(0);
 
         Ok(Some(Self {
             order_expr: ob.expr.clone(),

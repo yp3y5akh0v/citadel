@@ -295,6 +295,48 @@ fn eval_const_int_from_arithmetic() {
 }
 
 #[test]
+fn nonnegative_row_counts_saturate_at_the_target_width() {
+    for value in [
+        i64::MIN,
+        -1,
+        0,
+        1,
+        i64::from(u32::MAX),
+        i64::from(u32::MAX) + 1,
+        i64::from(u32::MAX) + 2,
+        i64::MAX,
+    ] {
+        let expected = (value.max(0) as u128).min(usize::MAX as u128) as usize;
+        assert_eq!(nonnegative_row_count(value), expected, "{value}");
+        assert_eq!(
+            eval_row_count(&Expr::Literal(i(value))).unwrap(),
+            expected,
+            "{value}"
+        );
+    }
+}
+
+#[test]
+fn eval_row_count_preserves_integer_expression_semantics() {
+    let expression = Expr::BinaryOp {
+        left: Box::new(Expr::Literal(i(i64::from(u32::MAX)))),
+        op: BinOp::Add,
+        right: Box::new(Expr::Literal(i(2))),
+    };
+    assert_eq!(
+        eval_row_count(&expression).unwrap(),
+        nonnegative_row_count(i64::from(u32::MAX) + 2)
+    );
+    for value in [Value::Null, Value::Real(1.0), Value::Text("1".into())] {
+        let expression = Expr::Literal(value);
+        assert_eq!(
+            eval_row_count(&expression).unwrap_err().to_string(),
+            eval_const_int(&expression).unwrap_err().to_string()
+        );
+    }
+}
+
+#[test]
 fn eval_const_expr_basic() {
     let e = Expr::Literal(i(99));
     assert_eq!(eval_const_expr(&e).unwrap(), i(99));
