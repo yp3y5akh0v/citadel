@@ -1,6 +1,33 @@
 use super::*;
 
 #[test]
+fn minimum_integer_literal_stays_integer() {
+    for sql in ["-9223372036854775808", "-09223372036854775808"] {
+        assert!(
+            matches!(
+                parse_sql_expr(sql).unwrap(),
+                Expr::Literal(Value::Integer(i64::MIN))
+            ),
+            "{sql}"
+        );
+    }
+    assert!(matches!(
+        parse_sql_expr("9223372036854775807").unwrap(),
+        Expr::Literal(Value::Integer(i64::MAX))
+    ));
+    assert!(matches!(
+        parse_sql_expr("9223372036854775808").unwrap(),
+        Expr::Literal(Value::Real(_))
+    ));
+    for sql in ["-9223372036854775809", "-9223372036854775808.0"] {
+        assert!(
+            matches!(parse_sql_expr(sql).unwrap(), Expr::UnaryOp { expr, .. } if matches!(*expr, Expr::Literal(Value::Real(_)))),
+            "{sql}"
+        );
+    }
+}
+
+#[test]
 fn parse_create_table() {
     let stmt =
         parse_sql("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER)")

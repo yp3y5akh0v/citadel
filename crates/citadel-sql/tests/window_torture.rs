@@ -66,6 +66,90 @@ fn error_ntile_zero() {
 }
 
 #[test]
+fn ntile_large_and_null_buckets() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    setup_employees(&conn);
+
+    for buckets in [Value::Integer(1_i64 << 32), Value::Integer(i64::MAX)] {
+        let qr = conn
+            .query_params(
+                "SELECT id, NTILE($1) OVER (ORDER BY id DESC) FROM employees ORDER BY id",
+                std::slice::from_ref(&buckets),
+            )
+            .unwrap();
+        assert_eq!(qr.rows.len(), 5);
+        for (i, row) in qr.rows.iter().enumerate() {
+            assert_eq!(row[1], Value::Integer(5 - i as i64), "{buckets:?}");
+        }
+    }
+
+    let qr = conn
+        .query("SELECT NTILE(NULL) OVER (PARTITION BY dept ORDER BY id) FROM employees")
+        .unwrap();
+    assert_eq!(qr.rows, vec![vec![Value::Null]; 5]);
+
+    let qr = conn
+        .query(
+            "SELECT NTILE(CASE WHEN id = 1 THEN NULL WHEN id = 2 THEN 2 \
+             WHEN id = 3 THEN NULL ELSE 99 END) OVER (ORDER BY id) FROM employees ORDER BY id",
+        )
+        .unwrap();
+    assert_eq!(
+        qr.rows,
+        vec![
+            vec![Value::Null],
+            vec![Value::Integer(1)],
+            vec![Value::Integer(1)],
+            vec![Value::Integer(1)],
+            vec![Value::Integer(2)],
+        ]
+    );
+}
+
+#[test]
+fn ntile_uses_first_sorted_row_of_each_partition() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute(
+        "CREATE TABLE tiles (id INTEGER PRIMARY KEY, grp TEXT, position INTEGER, buckets INTEGER)",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO tiles VALUES (1, 'a', 30, 99), (2, 'b', 20, 99), \
+         (3, 'a', 10, 2), (4, 'b', 10, 3), (5, 'a', 20, 99), (6, 'b', 30, 99)",
+    )
+    .unwrap();
+
+    let qr = conn
+        .query(
+            "SELECT id, NTILE(buckets) OVER (PARTITION BY grp ORDER BY position) \
+             FROM tiles ORDER BY id",
+        )
+        .unwrap();
+    let expected = [2, 2, 1, 1, 1, 3];
+    assert_eq!(qr.rows.len(), expected.len());
+    for (row, tile) in qr.rows.iter().zip(expected) {
+        assert_eq!(row[1], Value::Integer(tile), "row {row:?}");
+    }
+}
+
+#[test]
+fn ntile_rejects_invalid_buckets_and_arity() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    setup_employees(&conn);
+
+    for args in ["-1", "1.5", "'invalid'", "", "1, 2"] {
+        let sql = format!("SELECT NTILE({args}) OVER (ORDER BY id) FROM employees");
+        assert!(conn.query(&sql).is_err(), "expected error for {sql}");
+    }
+}
+
+#[test]
 fn window_empty_table() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
@@ -177,6 +261,105 @@ fn lead_beyond_partition() {
         .unwrap();
     for row in &qr.rows {
         assert_eq!(row[1], Value::Integer(-1)); // all default
+    }
+}
+
+#[test]
+fn lag_lead_use_current_row_offsets_and_defaults() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute(
+        "CREATE TABLE offsets (id INTEGER PRIMARY KEY, position INTEGER, val INTEGER, step INTEGER)",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO offsets VALUES (1, 40, 40, 1), (2, 10, 10, -1), \
+         (3, 30, NULL, 0), (4, 20, 20, 2), (5, 50, 50, NULL), (6, 60, 60, -1)",
+    )
+    .unwrap();
+
+    let qr = conn
+        .query(
+            "SELECT id, LAG(val, step, id + 100) OVER (ORDER BY position), \
+             LEAD(val, step, id + 100) OVER (ORDER BY position) \
+             FROM offsets ORDER BY id",
+        )
+        .unwrap();
+    assert_eq!(
+        qr.rows,
+        vec![
+            vec![Value::Integer(1), Value::Null, Value::Integer(50)],
+            vec![Value::Integer(2), Value::Integer(20), Value::Integer(102)],
+            vec![Value::Integer(3), Value::Null, Value::Null],
+            vec![Value::Integer(4), Value::Integer(104), Value::Integer(40)],
+            vec![Value::Integer(5), Value::Null, Value::Null],
+            vec![Value::Integer(6), Value::Integer(106), Value::Integer(50)],
+        ]
+    );
+
+    for function in ["LAG", "LEAD"] {
+        let sql = format!(
+            "SELECT id, {function}(val, 100, id + 100) OVER (ORDER BY position) \
+             FROM offsets ORDER BY id"
+        );
+        let qr = conn.query(&sql).unwrap();
+        for (i, row) in qr.rows.iter().enumerate() {
+            assert_eq!(row[1], Value::Integer(i as i64 + 101), "{function}");
+        }
+    }
+}
+
+#[test]
+fn lag_lead_extreme_offsets_return_current_row_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    setup_employees(&conn);
+
+    for function in ["LAG", "LEAD"] {
+        for offset in [i64::MIN, i64::MAX] {
+            let sql = format!(
+                "SELECT id, {function}(salary, $1, id + 100) \
+                 OVER (PARTITION BY dept ORDER BY salary DESC, id) FROM employees ORDER BY id"
+            );
+            let qr = conn.query_params(&sql, &[Value::Integer(offset)]).unwrap();
+            assert_eq!(qr.rows.len(), 5);
+            for (i, row) in qr.rows.iter().enumerate() {
+                assert_eq!(
+                    row[1],
+                    Value::Integer(i as i64 + 101),
+                    "{function} offset {offset}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn lag_lead_optional_arguments_and_validation() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    setup_employees(&conn);
+
+    for function in ["LAG", "LEAD"] {
+        let sql = format!(
+            "SELECT {function}(salary) OVER (ORDER BY id), \
+             {function}(salary, 1) OVER (ORDER BY id), \
+             {function}(salary, 1, NULL) OVER (ORDER BY id) FROM employees ORDER BY id"
+        );
+        let qr = conn.query(&sql).unwrap();
+        assert_eq!(qr.rows.len(), 5);
+        for row in qr.rows {
+            assert_eq!(row[0], row[1], "{function}");
+            assert_eq!(row[0], row[2], "{function}");
+        }
+
+        for args in ["", "salary, 1, 0, 0", "salary, 1.5", "salary, 'invalid'"] {
+            let sql = format!("SELECT {function}({args}) OVER (ORDER BY id) FROM employees");
+            assert!(conn.query(&sql).is_err(), "expected error for {sql}");
+        }
     }
 }
 
@@ -405,4 +588,383 @@ fn unbounded_frame() {
     assert_eq!(qr.rows[2][1], Value::Integer(150)); // Carol sales
     assert_eq!(qr.rows[3][1], Value::Integer(150)); // Dave sales
     assert_eq!(qr.rows[4][1], Value::Integer(290)); // Eve eng
+}
+
+#[test]
+fn rows_frames_preserve_empty_boundaries() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute(
+        "CREATE TABLE frames (id INTEGER PRIMARY KEY, grp TEXT, val INTEGER, amount REAL, label TEXT)",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO frames VALUES (1, 'a', 10, 10.5, 'first'), (2, 'a', NULL, NULL, NULL), \
+         (3, 'a', 30, 30.5, 'last'), (4, 'b', 40, 40.5, 'only')",
+    )
+    .unwrap();
+
+    let functions = [
+        "COUNT(*)",
+        "COUNT(label)",
+        "SUM(val)",
+        "SUM(amount)",
+        "AVG(val)",
+        "MIN(val)",
+        "MAX(val)",
+        "FIRST_VALUE(label)",
+        "LAST_VALUE(label)",
+    ];
+    let empty = vec![
+        Value::Integer(0),
+        Value::Integer(0),
+        Value::Null,
+        Value::Null,
+        Value::Null,
+        Value::Null,
+        Value::Null,
+        Value::Null,
+        Value::Null,
+    ];
+    let singleton_results = [
+        vec![
+            Value::Integer(1),
+            Value::Integer(1),
+            Value::Integer(10),
+            Value::Real(10.5),
+            Value::Real(10.0),
+            Value::Integer(10),
+            Value::Integer(10),
+            Value::Text("first".into()),
+            Value::Text("first".into()),
+        ],
+        vec![
+            Value::Integer(1),
+            Value::Integer(0),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+        ],
+        vec![
+            Value::Integer(1),
+            Value::Integer(1),
+            Value::Integer(30),
+            Value::Real(30.5),
+            Value::Real(30.0),
+            Value::Integer(30),
+            Value::Integer(30),
+            Value::Text("last".into()),
+            Value::Text("last".into()),
+        ],
+    ];
+    for (frame, sources) in [
+        (
+            "1 PRECEDING AND 1 PRECEDING",
+            [None, Some(0), Some(1), None],
+        ),
+        (
+            "1 FOLLOWING AND 1 FOLLOWING",
+            [Some(1), Some(2), None, None],
+        ),
+        ("2 FOLLOWING AND 1 FOLLOWING", [None; 4]),
+        ("1 PRECEDING AND 2 PRECEDING", [None; 4]),
+        (
+            "9223372036854775807 FOLLOWING AND 9223372036854775807 FOLLOWING",
+            [None; 4],
+        ),
+        (
+            "9223372036854775807 PRECEDING AND 9223372036854775807 PRECEDING",
+            [None; 4],
+        ),
+    ] {
+        let projection = functions
+            .iter()
+            .map(|function| {
+                format!("{function} OVER (PARTITION BY grp ORDER BY id ROWS BETWEEN {frame})")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let qr = conn
+            .query(&format!("SELECT {projection} FROM frames ORDER BY id"))
+            .unwrap();
+        assert_eq!(qr.rows.len(), sources.len(), "{frame}");
+        for (i, (row, source)) in qr.rows.iter().zip(sources).enumerate() {
+            let expected = source
+                .map(|index| &singleton_results[index])
+                .unwrap_or(&empty);
+            assert_eq!(row, expected, "{frame}, row {}", i + 1);
+        }
+    }
+}
+
+#[test]
+fn sliding_count_text_and_sum_after_real_expires() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE sliding (id INTEGER PRIMARY KEY, val REAL, label TEXT)")
+        .unwrap();
+    conn.execute(
+        "INSERT INTO sliding VALUES (1, 1.5, 'first'), (2, NULL, 'second'), (3, NULL, NULL)",
+    )
+    .unwrap();
+
+    let qr = conn
+        .query(
+            "SELECT COUNT(label) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW), \
+             SUM(val) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW), \
+             AVG(val) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) \
+             FROM sliding ORDER BY id",
+        )
+        .unwrap();
+    assert_eq!(
+        qr.rows,
+        vec![
+            vec![Value::Integer(1), Value::Real(1.5), Value::Real(1.5)],
+            vec![Value::Integer(2), Value::Real(1.5), Value::Real(1.5)],
+            vec![Value::Integer(1), Value::Null, Value::Null],
+        ]
+    );
+}
+
+#[test]
+fn rows_frames_reject_invalid_offsets_and_bound_categories() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    setup_employees(&conn);
+
+    for offset in ["-1", "NULL", "1.5", "'invalid'"] {
+        for frame in [
+            format!("{offset} PRECEDING AND CURRENT ROW"),
+            format!("CURRENT ROW AND {offset} FOLLOWING"),
+        ] {
+            let sql = format!(
+                "SELECT SUM(salary) OVER (ORDER BY id ROWS BETWEEN {frame}) FROM employees"
+            );
+            assert!(conn.query(&sql).is_err(), "expected error for {sql}");
+        }
+    }
+    for frame in [
+        "UNBOUNDED FOLLOWING AND UNBOUNDED FOLLOWING",
+        "UNBOUNDED PRECEDING AND UNBOUNDED PRECEDING",
+        "CURRENT ROW AND 1 PRECEDING",
+        "1 FOLLOWING AND CURRENT ROW",
+        "1 FOLLOWING AND 1 PRECEDING",
+    ] {
+        let sql =
+            format!("SELECT SUM(salary) OVER (ORDER BY id ROWS BETWEEN {frame}) FROM employees");
+        assert!(conn.query(&sql).is_err(), "expected error for {sql}");
+    }
+}
+
+#[test]
+fn window_integer_sum_overflow_does_not_overflow_avg() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE large_values (id INTEGER PRIMARY KEY, val INTEGER)")
+        .unwrap();
+
+    for value in [1_i64 << 62, -(1_i64 << 62)] {
+        conn.execute("DELETE FROM large_values").unwrap();
+        conn.execute_params(
+            "INSERT INTO large_values VALUES (1, $1), (2, $1), (3, $1)",
+            &[Value::Integer(value)],
+        )
+        .unwrap();
+        for frame in [
+            "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW",
+            "ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING",
+            "RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING",
+        ] {
+            let sql = format!("SELECT SUM(val) OVER (ORDER BY id {frame}) FROM large_values");
+            let err = conn.query(&sql).unwrap_err();
+            assert!(err.to_string().contains("overflow"), "{sql}: {err}");
+
+            let sql =
+                format!("SELECT AVG(val) OVER (ORDER BY id {frame}) FROM large_values ORDER BY id");
+            let qr = conn.query(&sql).unwrap();
+            assert_eq!(qr.rows, vec![vec![Value::Real(value as f64)]; 3], "{sql}");
+        }
+    }
+}
+
+#[test]
+fn numeric_range_is_ignored_only_by_non_frame_functions() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    setup_employees(&conn);
+    let frame = "RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING";
+
+    for function in [
+        "LAG(salary)",
+        "LEAD(salary)",
+        "ROW_NUMBER()",
+        "RANK()",
+        "DENSE_RANK()",
+        "NTILE(2)",
+    ] {
+        let query = |frame: &str| {
+            format!("SELECT {function} OVER (ORDER BY salary {frame}) FROM employees ORDER BY id")
+        };
+        assert_eq!(
+            conn.query(&query(frame)).unwrap().rows,
+            conn.query(&query("")).unwrap().rows,
+            "{function}"
+        );
+    }
+    for function in [
+        "COUNT(*)",
+        "SUM(salary)",
+        "AVG(salary)",
+        "MIN(salary)",
+        "MAX(salary)",
+        "FIRST_VALUE(salary)",
+        "LAST_VALUE(salary)",
+    ] {
+        let sql = format!("SELECT {function} OVER (ORDER BY salary {frame}) FROM employees");
+        let err = conn.query(&sql).unwrap_err();
+        assert!(
+            matches!(err, citadel_sql::SqlError::Unsupported(_)),
+            "{sql}: {err}"
+        );
+    }
+}
+
+#[test]
+fn suffix_real_aggregates_and_large_integer_counts() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE magnitudes (id INTEGER PRIMARY KEY, val REAL, big INTEGER)")
+        .unwrap();
+    conn.execute_params(
+        "INSERT INTO magnitudes VALUES (1, $1, $2), (2, 1.0, $2)",
+        &[Value::Real(1e20), Value::Integer(i64::MAX)],
+    )
+    .unwrap();
+
+    let qr = conn
+        .query(
+            "SELECT SUM(val) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING), \
+             AVG(val) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) \
+             FROM magnitudes ORDER BY id",
+        )
+        .unwrap();
+    assert_eq!(
+        qr.rows,
+        vec![
+            vec![Value::Real(1e20), Value::Real(5e19)],
+            vec![Value::Real(1.0), Value::Real(1.0)],
+        ]
+    );
+    for (frame, counts) in [
+        ("ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING", [2, 1]),
+        ("ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW", [1, 2]),
+        (
+            "RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING",
+            [2, 2],
+        ),
+    ] {
+        let sql =
+            format!("SELECT COUNT(big) OVER (ORDER BY id {frame}) FROM magnitudes ORDER BY id");
+        let expected: Vec<_> = counts
+            .into_iter()
+            .map(|count| vec![Value::Integer(count)])
+            .collect();
+        assert_eq!(conn.query(&sql).unwrap().rows, expected, "{frame}");
+    }
+}
+
+#[test]
+fn empty_input_still_validates_window_frames_and_arity() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE empty_frames (id INTEGER PRIMARY KEY, val INTEGER)")
+        .unwrap();
+
+    for function in ["SUM(val)", "ROW_NUMBER()"] {
+        for frame in [
+            "-1 PRECEDING AND CURRENT ROW",
+            "NULL PRECEDING AND CURRENT ROW",
+            "1.5 PRECEDING AND CURRENT ROW",
+            "CURRENT ROW AND 1 PRECEDING",
+            "1 FOLLOWING AND CURRENT ROW",
+            "UNBOUNDED FOLLOWING AND UNBOUNDED FOLLOWING",
+            "UNBOUNDED PRECEDING AND UNBOUNDED PRECEDING",
+        ] {
+            let sql = format!(
+                "SELECT {function} OVER (ORDER BY id ROWS BETWEEN {frame}) FROM empty_frames"
+            );
+            assert!(conn.query(&sql).is_err(), "expected error for {sql}");
+        }
+    }
+    for function in [
+        "LAG()",
+        "LEAD()",
+        "LAG(val, 1, 0, 0)",
+        "LEAD(val, 1, 0, 0)",
+        "NTILE()",
+        "NTILE(1, 2)",
+        "ROW_NUMBER(1)",
+        "RANK(1)",
+        "DENSE_RANK(1)",
+        "COUNT(val, val)",
+        "SUM()",
+        "AVG()",
+        "MIN()",
+        "MAX()",
+        "FIRST_VALUE()",
+        "LAST_VALUE()",
+    ] {
+        let sql = format!("SELECT {function} OVER (ORDER BY id) FROM empty_frames");
+        assert!(conn.query(&sql).is_err(), "expected error for {sql}");
+    }
+}
+
+#[test]
+fn rows_frame_offsets_accept_bound_parameters() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    setup_employees(&conn);
+
+    for (frame, offset, counts) in [
+        ("$1 PRECEDING AND CURRENT ROW", 1, [1, 2, 2, 2, 2]),
+        ("$1 PRECEDING AND CURRENT ROW", i64::MAX, [1, 2, 3, 4, 5]),
+        ("CURRENT ROW AND $1 FOLLOWING", 1, [2, 2, 2, 2, 1]),
+        ("CURRENT ROW AND $1 FOLLOWING", i64::MAX, [5, 4, 3, 2, 1]),
+    ] {
+        let sql = format!(
+            "SELECT COUNT(*) OVER (ORDER BY id ROWS BETWEEN {frame}) FROM employees ORDER BY id"
+        );
+        let qr = conn.query_params(&sql, &[Value::Integer(offset)]).unwrap();
+        let expected: Vec<_> = counts
+            .into_iter()
+            .map(|count| vec![Value::Integer(count)])
+            .collect();
+        assert_eq!(qr.rows, expected, "{frame}, offset {offset}");
+    }
+    for frame in [
+        "$1 PRECEDING AND CURRENT ROW",
+        "CURRENT ROW AND $1 FOLLOWING",
+    ] {
+        for offset in [Value::Null, Value::Integer(-1), Value::Real(1.5)] {
+            let sql =
+                format!("SELECT COUNT(*) OVER (ORDER BY id ROWS BETWEEN {frame}) FROM employees");
+            assert!(
+                conn.query_params(&sql, std::slice::from_ref(&offset))
+                    .is_err(),
+                "expected error for {sql}, offset {offset:?}"
+            );
+        }
+    }
 }
