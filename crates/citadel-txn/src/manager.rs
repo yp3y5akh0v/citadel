@@ -13,7 +13,7 @@ use std::sync::{Arc, OnceLock};
 use citadel_buffer::allocator::PageAllocator;
 use citadel_buffer::btree::BTree;
 use citadel_buffer::pool::BufferPool;
-use citadel_core::types::{PageId, TxnId};
+use citadel_core::types::{PageId, PageType, TxnId};
 use citadel_core::{
     CancelToken, Error, Result, BODY_SIZE, DEK_SIZE, GOD_BIT_ACTIVE_SLOT, GOD_BIT_RECOVERY,
     MAC_KEY_SIZE, PAGE_SIZE, SLOT_ENTRY_STALE, SLOT_NAMED_MAX_ENTRIES_V1,
@@ -33,6 +33,8 @@ use crate::read_txn::ReadTxn;
 use crate::write_txn::WriteTxn;
 
 static NEXT_MANAGER_ID: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) const SCAN_CACHE_BATCH_SIZE: usize = 32;
 
 type NamedTableHashCollisions = FxHashMap<u32, (Vec<u8>, Vec<u8>)>;
 
@@ -741,6 +743,10 @@ impl TxnManager {
             return Ok(arc);
         }
 
+        self.read_page_into_pool(page_id)
+    }
+
+    fn read_page_into_pool(&self, page_id: PageId) -> Result<Arc<Page>> {
         let offset = page_offset(page_id);
         let page = citadel_buffer::pool::read_and_decrypt(
             &*self.io,
@@ -755,6 +761,54 @@ impl TxnManager {
         self.pool.lock().insert_if_absent(page_id, Arc::clone(&arc));
 
         Ok(arc)
+    }
+
+    /// Pin a bounded run of cached leaves in traversal order. Missing pages
+    /// are read only on demand; prefetched headers are checked on consumption.
+    pub(crate) fn fetch_scan_page(
+        &self,
+        page_id: PageId,
+        high_water_mark: u32,
+        pending: &[PageId],
+        cached_leaves: &mut Vec<(PageId, Arc<Page>)>,
+    ) -> Result<Arc<Page>> {
+        if page_id.as_u32() >= high_water_mark {
+            return Err(Error::PageOutOfBounds(page_id));
+        }
+        debug_assert!(cached_leaves.is_empty());
+        let cached = {
+            let mut pool = self.pool.lock();
+            let page = pool.get_cached(page_id);
+            if let Some(page) = &page {
+                if page.page_id() != page_id {
+                    return Err(Error::DatabaseCorrupted);
+                }
+                if page.page_type() == Some(PageType::Leaf) {
+                    for &id in pending.iter().rev().take(SCAN_CACHE_BATCH_SIZE - 1) {
+                        if id.as_u32() >= high_water_mark {
+                            break;
+                        }
+                        let Some(leaf) = pool.get_cached(id) else {
+                            break;
+                        };
+                        if leaf.page_type() != Some(PageType::Leaf) {
+                            break;
+                        }
+                        cached_leaves.push((id, leaf));
+                    }
+                    cached_leaves.reverse();
+                }
+            }
+            page
+        };
+        let page = match cached {
+            Some(page) => page,
+            None => self.read_page_into_pool(page_id)?,
+        };
+        if page.page_id() != page_id {
+            return Err(Error::DatabaseCorrupted);
+        }
+        Ok(page)
     }
 
     pub(crate) fn fetch_reachable_page(

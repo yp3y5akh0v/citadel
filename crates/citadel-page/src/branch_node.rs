@@ -7,8 +7,6 @@
 //! - cell[i].child handles keys where key[i-1] <= k < key[i] (key[-1] = -∞)
 //! - right_child handles keys where key[n-1] <= k
 
-use std::collections::HashSet;
-
 use crate::page::{checked_cell_offsets, validate_cell_layout, CellDecodeError, CellSpan, Page};
 use citadel_core::types::{PageId, PageType};
 use citadel_core::BODY_SIZE;
@@ -49,7 +47,7 @@ pub fn read_cells_checked(page: &Page) -> Result<Vec<BranchCell<'_>>, CellDecode
     let offsets = checked_cell_offsets(page)?;
     let mut cells = Vec::with_capacity(offsets.len());
     let mut spans = Vec::with_capacity(offsets.len());
-    for (index, offset) in offsets.into_iter().enumerate() {
+    for (index, offset) in offsets.enumerate() {
         let fixed_end = offset.checked_add(BRANCH_CELL_FIXED).ok_or_else(|| {
             CellDecodeError::new(format!("branch cell {index} header length overflows"))
         })?;
@@ -97,7 +95,7 @@ pub fn read_cells_checked(page: &Page) -> Result<Vec<BranchCell<'_>>, CellDecode
     }
 
     let own_page = page.page_id();
-    let mut children = HashSet::with_capacity(cells.len() + 1);
+    let mut children = Vec::with_capacity(cells.len() + 1);
     for (index, child) in cells
         .iter()
         .map(|cell| cell.child)
@@ -114,11 +112,14 @@ pub fn read_cells_checked(page: &Page) -> Result<Vec<BranchCell<'_>>, CellDecode
                 "branch child {index} points back to page {own_page}"
             )));
         }
-        if !children.insert(child) {
-            return Err(CellDecodeError::new(format!(
-                "branch child {index} duplicates page {child}"
-            )));
-        }
+        children.push(child);
+    }
+    children.sort_unstable();
+    if let Some(pair) = children.windows(2).find(|pair| pair[0] == pair[1]) {
+        let child = pair[0];
+        return Err(CellDecodeError::new(format!(
+            "branch child duplicates page {child}"
+        )));
     }
 
     Ok(cells)

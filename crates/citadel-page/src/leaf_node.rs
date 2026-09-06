@@ -67,7 +67,7 @@ pub fn read_cells_checked(page: &Page) -> Result<Vec<LeafCell<'_>>, CellDecodeEr
     let offsets = checked_cell_offsets(page)?;
     let mut cells = Vec::with_capacity(offsets.len());
     let mut spans = Vec::with_capacity(offsets.len());
-    for (index, offset) in offsets.into_iter().enumerate() {
+    for (index, offset) in offsets.enumerate() {
         let fixed_end = offset.checked_add(6).ok_or_else(|| {
             CellDecodeError::new(format!("leaf cell {index} header length overflows"))
         })?;

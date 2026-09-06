@@ -42,6 +42,130 @@ impl PageLoader for ReadPages<'_> {
     }
 }
 
+/// A streaming scan borrows existing snapshot pages without growing that cache.
+/// Overflow walks need only their current page after copying its payload.
+struct StreamingReadPages<'a> {
+    cache: &'a FxHashMap<PageId, Arc<Page>>,
+    manager: &'a TxnManager,
+    high_water_mark: u32,
+    current: Option<Arc<Page>>,
+    cached_leaves: Vec<(PageId, Arc<Page>)>,
+}
+
+impl StreamingReadPages<'_> {
+    fn load(&self, id: PageId) -> Result<Arc<Page>> {
+        match self.cache.get(&id) {
+            Some(page) => Ok(Arc::clone(page)),
+            None => self.manager.fetch_reachable_page(id, self.high_water_mark),
+        }
+    }
+
+    fn load_scan_page(&mut self, id: PageId, pending: &[PageId]) -> Result<Arc<Page>> {
+        let cached = if self
+            .cached_leaves
+            .last()
+            .is_some_and(|(next, _)| *next == id)
+        {
+            self.cached_leaves.pop().map(|(_, page)| page)
+        } else {
+            self.cached_leaves.clear();
+            None
+        };
+        if let Some(page) = self.cache.get(&id) {
+            return Ok(Arc::clone(page));
+        }
+        if let Some(page) = cached {
+            if page.page_id() != id {
+                return Err(Error::DatabaseCorrupted);
+            }
+            return Ok(page);
+        }
+        self.manager
+            .fetch_scan_page(id, self.high_water_mark, pending, &mut self.cached_leaves)
+    }
+}
+
+impl PageMap for StreamingReadPages<'_> {
+    fn get_page(&self, id: &PageId) -> Option<&Page> {
+        self.cache
+            .get(id)
+            .or_else(|| self.current.as_ref().filter(|page| page.page_id() == *id))
+            .map(AsRef::as_ref)
+    }
+}
+
+impl PageLoader for StreamingReadPages<'_> {
+    fn ensure_loaded(&mut self, id: PageId) -> Result<()> {
+        if self.get_page(&id).is_none() {
+            self.current = Some(self.load(id)?);
+        }
+        Ok(())
+    }
+}
+
+/// Sparse bit words track visited page IDs without allocating for gaps.
+#[derive(Default)]
+struct VisitedPages {
+    words: FxHashMap<u32, u64>,
+}
+
+impl VisitedPages {
+    fn insert(&mut self, id: PageId) -> bool {
+        let mask = 1u64 << (id.0 % u64::BITS);
+        let word = self.words.entry(id.0 / u64::BITS).or_default();
+        let fresh = *word & mask == 0;
+        *word |= mask;
+        fresh
+    }
+}
+
+/// Depth-first, left-to-right traversal retains only pending child IDs. The
+/// visited set rejects cross-page cycles and shared children without pinning
+/// decrypted pages or relying on a possibly corrupt advertised tree depth.
+struct LeafTraversal {
+    pending: Vec<PageId>,
+    visited: VisitedPages,
+}
+
+impl LeafTraversal {
+    fn new(root: PageId) -> Self {
+        Self {
+            pending: vec![root],
+            visited: VisitedPages::default(),
+        }
+    }
+
+    fn next_leaf(
+        &mut self,
+        cancel: Option<&CancelToken>,
+        mut load: impl FnMut(PageId, &[PageId]) -> Result<Arc<Page>>,
+    ) -> Result<Option<Arc<Page>>> {
+        loop {
+            if let Some(token) = cancel {
+                token.check()?;
+            }
+            let Some(id) = self.pending.pop() else {
+                return Ok(None);
+            };
+            if !self.visited.insert(id) {
+                return Err(Error::DatabaseCorrupted);
+            }
+            let page = load(id, &self.pending)?;
+            match page.page_type() {
+                Some(PageType::Leaf) => return Ok(Some(page)),
+                Some(PageType::Branch) => {
+                    let cells = branch_node::read_cells_checked(&page)
+                        .map_err(|_| Error::DatabaseCorrupted)?;
+                    self.pending.push(page.right_child());
+                    self.pending
+                        .extend(cells.iter().rev().map(|cell| cell.child));
+                }
+                _ => return Err(Error::InvalidPageType(page.page_type_raw(), id)),
+            }
+        }
+    }
+}
+
 /// Counts rows a scan saw and adds them to the manager when the scan ends.
 ///
 /// A guard rather than a line before each `return`: a scan ends exhausted,
@@ -78,11 +202,53 @@ impl Drop for ScanCount<'_> {
     }
 }
 
-/// Cell iteration over a leaf slice (materializing overflow through `view`).
-/// Callback returns `false` to stop.
+/// Cell iteration over one leaf (materializing overflow through `view`).
+/// Returns `false` when the callback stops the scan.
 ///
 /// Checked once per leaf, not per cell: a leaf bounds the work between checks,
 /// and an atomic load per cell would show up in the scan benchmarks.
+fn scan_leaf<F>(
+    view: &mut impl PageLoader,
+    page: &Page,
+    cancel: Option<&CancelToken>,
+    budget: Option<&ReadBudget>,
+    count: &mut ScanCount<'_>,
+    f: &mut F,
+) -> Result<bool>
+where
+    F: FnMut(&[u8], &[u8]) -> bool,
+{
+    if let Some(c) = cancel {
+        c.check()?;
+    }
+    let n = page.num_cells();
+    for i in 0..n {
+        count.rows += 1;
+        let cell = leaf_node::read_cell(page, i);
+        match cell.val_type {
+            ValueType::Tombstone => continue,
+            ValueType::Inline => {
+                if let Some(budget) = budget {
+                    budget.try_charge(cell.value.len())?;
+                }
+                if !f(cell.key, cell.value) {
+                    return Ok(false);
+                }
+            }
+            ValueType::Overflow => {
+                let oref = OverflowRef::from_bytes(cell.value);
+                let key_owned = cell.key.to_vec();
+                let materialized =
+                    overflow_io::read_chain_value_with_budget(view, &oref, cancel, budget)?;
+                if !f(&key_owned, &materialized) {
+                    return Ok(false);
+                }
+            }
+        }
+    }
+    Ok(true)
+}
+
 fn scan_leaf_cells<F>(
     view: &mut ReadPages<'_>,
     leaves: &[Arc<Page>],
@@ -95,33 +261,8 @@ where
     F: FnMut(&[u8], &[u8]) -> bool,
 {
     for page in leaves {
-        if let Some(c) = cancel {
-            c.check()?;
-        }
-        let n = page.num_cells();
-        for i in 0..n {
-            count.rows += 1;
-            let cell = leaf_node::read_cell(page, i);
-            match cell.val_type {
-                ValueType::Tombstone => continue,
-                ValueType::Inline => {
-                    if let Some(budget) = budget {
-                        budget.try_charge(cell.value.len())?;
-                    }
-                    if !f(cell.key, cell.value) {
-                        return Ok(());
-                    }
-                }
-                ValueType::Overflow => {
-                    let oref = OverflowRef::from_bytes(cell.value);
-                    let key_owned = cell.key.to_vec();
-                    let materialized =
-                        overflow_io::read_chain_value_with_budget(view, &oref, cancel, budget)?;
-                    if !f(&key_owned, &materialized) {
-                        return Ok(());
-                    }
-                }
-            }
+        if !scan_leaf(view, page, cancel, budget, count, &mut f)? {
+            break;
         }
     }
     Ok(())
@@ -771,13 +912,25 @@ impl<'db> ReadTxn<'db> {
         Ok(crate::scan_iter::TableIter::new(adapter, cursor))
     }
 
-    /// Collect a table's leaf pages left-to-right (the DFS prelude of a full
-    /// scan), so a caller can cache them and skip this walk on repeated scans
-    /// at the same commit gen.
+    /// Explicitly collect a table's leaf pages left-to-right, so a caller can
+    /// cache them and skip this walk on repeated scans at the same commit gen.
     pub fn collect_table_leaves(&mut self, table: &[u8]) -> Result<LeafPages> {
         let desc = self.lookup_table(table)?;
         let mut leaves = Vec::new();
-        self.load_and_collect_leaves(desc.root_page, &mut leaves)?;
+        let mut traversal = LeafTraversal::new(desc.root_page);
+        let cache = &mut self.page_cache;
+        let manager = self.manager;
+        let high_water_mark = self.snapshot.high_water_mark;
+        while let Some(page) = traversal.next_leaf(self.cancel.as_ref(), |id, _| {
+            if let Some(page) = cache.get(&id) {
+                return Ok(Arc::clone(page));
+            }
+            let page = manager.fetch_reachable_page(id, high_water_mark)?;
+            cache.insert(id, Arc::clone(&page));
+            Ok(page)
+        })? {
+            leaves.push(page);
+        }
         Ok(leaves)
     }
 
@@ -823,53 +976,37 @@ impl<'db> ReadTxn<'db> {
         }
     }
 
-    /// Full table scan via direct leaf iteration. Callback returns `false` to
-    /// stop.
-    pub fn table_scan_raw<F>(&mut self, table: &[u8], f: F) -> Result<()>
+    /// Stream a table's leaves left-to-right without retaining newly read pages
+    /// in the transaction cache. Callback returns `false` to stop before loading
+    /// the remaining leaves.
+    pub fn table_scan_raw<F>(&mut self, table: &[u8], mut f: F) -> Result<()>
     where
         F: FnMut(&[u8], &[u8]) -> bool,
     {
-        let leaves = self.collect_table_leaves(table)?;
-        self.scan_leaves(&leaves, f)
-    }
-
-    /// DFS pass that loads each page into the cache and collects leaves in
-    /// left-to-right order.
-    fn load_and_collect_leaves(
-        &mut self,
-        page_id: PageId,
-        leaves: &mut Vec<Arc<Page>>,
-    ) -> Result<()> {
-        // Runs to completion before `table_scan_raw` emits a row, so skipping it
-        // leaves the whole descent of a large table uncancellable.
-        if let Some(t) = self.cancel.as_ref() {
-            t.check()?;
-        }
-        let page = if let Some(p) = self.page_cache.get(&page_id) {
-            Arc::clone(p)
-        } else {
-            let arc = self
-                .manager
-                .fetch_reachable_page(page_id, self.snapshot.high_water_mark)?;
-            self.page_cache.insert(page_id, Arc::clone(&arc));
-            arc
+        let desc = self.lookup_table(table)?;
+        let mut traversal = LeafTraversal::new(desc.root_page);
+        let measurements = self.captured_scan_measurements();
+        let mut count = ScanCount::with_measurements(self.manager, measurements);
+        let mut view = StreamingReadPages {
+            cache: &self.page_cache,
+            manager: self.manager,
+            high_water_mark: self.snapshot.high_water_mark,
+            current: None,
+            cached_leaves: Vec::with_capacity(crate::manager::SCAN_CACHE_BATCH_SIZE - 1),
         };
-        match page.page_type() {
-            Some(PageType::Leaf) => {
-                leaves.push(page);
+        while let Some(page) = traversal.next_leaf(self.cancel.as_ref(), |id, pending| {
+            view.load_scan_page(id, pending)
+        })? {
+            if !scan_leaf(
+                &mut view,
+                &page,
+                self.cancel.as_ref(),
+                self.read_budget.as_ref(),
+                &mut count,
+                &mut f,
+            )? {
+                break;
             }
-            Some(PageType::Branch) => {
-                let n = page.num_cells() as usize;
-                for i in 0..n {
-                    let child = branch_node::get_child(&page, i);
-                    self.load_and_collect_leaves(child, leaves)?;
-                }
-                let right = page.right_child();
-                if right.is_valid() {
-                    self.load_and_collect_leaves(right, leaves)?;
-                }
-            }
-            _ => return Err(Error::InvalidPageType(page.page_type_raw(), page_id)),
         }
         Ok(())
     }
@@ -1141,3 +1278,7 @@ impl<'db> crate::scan_iter::TxnScanAdapter for OwnedReadTxnAdapter<'db> {
 #[cfg(test)]
 #[path = "read_txn_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "read_txn_stream_tests.rs"]
+mod stream_tests;

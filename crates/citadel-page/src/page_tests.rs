@@ -111,3 +111,89 @@ fn from_bytes_preserves_data() {
     assert_eq!(page2.txn_id(), TxnId(3));
     assert!(page2.verify_checksum());
 }
+
+#[test]
+fn checked_offsets_of_an_empty_page_are_exhausted() {
+    let page = Page::new(PageId(1), PageType::Leaf, TxnId(1));
+    let mut offsets = checked_cell_offsets(&page).unwrap();
+    assert_eq!(offsets.len(), 0);
+    assert_eq!(offsets.size_hint(), (0, Some(0)));
+    assert_eq!(offsets.next(), None);
+    assert_eq!(offsets.next(), None);
+}
+
+#[test]
+fn checked_offsets_preserve_pointer_order_and_remaining_length() {
+    let mut page = Page::new(PageId(1), PageType::Leaf, TxnId(1));
+    let first = page.write_cell(b"first").unwrap();
+    let second = page.write_cell(b"second").unwrap();
+    let third = page.write_cell(b"third").unwrap();
+    page.set_cell_offset(0, third);
+    page.set_cell_offset(1, first);
+    page.set_cell_offset(2, second);
+
+    let mut offsets = checked_cell_offsets(&page).unwrap();
+    for (remaining, expected) in [(3, third), (2, first), (1, second)] {
+        assert_eq!(offsets.len(), remaining);
+        assert_eq!(offsets.size_hint(), (remaining, Some(remaining)));
+        assert_eq!(offsets.next(), Some(expected as usize));
+    }
+    assert_eq!(offsets.len(), 0);
+    assert_eq!(offsets.next(), None);
+}
+
+#[test]
+fn checked_offsets_reject_invalid_pointer_metadata_without_panicking() {
+    let mut oversized = Page::new(PageId(1), PageType::Leaf, TxnId(1));
+    oversized.set_num_cells(u16::MAX);
+    let result = std::panic::catch_unwind(|| checked_cell_offsets(&oversized).map(Iterator::count));
+    assert!(result
+        .unwrap()
+        .unwrap_err()
+        .to_string()
+        .contains("pointer array"));
+
+    for cell_area_start in [PAGE_HEADER_SIZE + 1, BODY_SIZE + 1] {
+        let mut page = Page::new(PageId(1), PageType::Leaf, TxnId(1));
+        page.write_cell(b"cell").unwrap();
+        page.set_cell_area_start(cell_area_start as u16);
+        let result = std::panic::catch_unwind(|| checked_cell_offsets(&page).map(Iterator::count));
+        assert!(result
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .contains("cell area starts"));
+    }
+}
+
+#[test]
+fn checked_offsets_validate_late_pointers_before_returning_an_iterator() {
+    let mut valid = Page::new(PageId(1), PageType::Leaf, TxnId(1));
+    valid.write_cell(b"first").unwrap();
+    valid.write_cell(b"second").unwrap();
+    valid.write_cell(b"third").unwrap();
+    for bad_offset in [0, valid.cell_area_start() - 1, BODY_SIZE as u16, u16::MAX] {
+        let mut page = valid.clone();
+        page.set_cell_offset(2, bad_offset);
+        let error = checked_cell_offsets(&page)
+            .err()
+            .expect("invalid last pointer");
+        assert!(error.to_string().contains("cell 2 offset"));
+    }
+}
+
+#[test]
+fn checked_cell_readers_validate_all_pointers_before_decoding_cells() {
+    for page_type in [PageType::Leaf, PageType::Branch] {
+        let mut page = Page::new(PageId(1), page_type, TxnId(1));
+        page.write_cell(b"x").unwrap();
+        page.write_cell(b"y").unwrap();
+        page.set_cell_offset(1, BODY_SIZE as u16);
+        let error = match page_type {
+            PageType::Leaf => crate::leaf_node::read_cells_checked(&page).unwrap_err(),
+            PageType::Branch => crate::branch_node::read_cells_checked(&page).unwrap_err(),
+            _ => unreachable!(),
+        };
+        assert!(error.to_string().contains("cell 1 offset"));
+    }
+}
