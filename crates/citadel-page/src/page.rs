@@ -34,9 +34,10 @@ pub(crate) struct CellSpan {
     pub end: usize,
 }
 
-/// Read the cell-pointer array only after proving that it and the declared
-/// cell area fit inside the decrypted page body.
-pub(crate) fn checked_cell_offsets(page: &Page) -> Result<Vec<usize>, CellDecodeError> {
+/// Validate the entire cell-pointer array before exposing borrowed offsets.
+pub(crate) fn checked_cell_offsets(
+    page: &Page,
+) -> Result<impl ExactSizeIterator<Item = usize> + '_, CellDecodeError> {
     let count = page.num_cells() as usize;
     let pointer_bytes = count.checked_mul(2).ok_or_else(|| {
         CellDecodeError::new(format!(
@@ -61,16 +62,17 @@ pub(crate) fn checked_cell_offsets(page: &Page) -> Result<Vec<usize>, CellDecode
         )));
     }
 
-    let mut offsets = Vec::with_capacity(count);
-    for index in 0..count {
-        let pointer = PAGE_HEADER_SIZE + index * 2;
-        let offset = u16::from_le_bytes([page.data[pointer], page.data[pointer + 1]]) as usize;
+    let offsets = page.data[PAGE_HEADER_SIZE..pointer_end]
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pointer| u16::from_le_bytes(*pointer) as usize);
+    for (index, offset) in offsets.clone().enumerate() {
         if offset < cell_area_start || offset >= BODY_SIZE {
             return Err(CellDecodeError::new(format!(
                 "cell {index} offset {offset} lies outside cell area {cell_area_start}..{BODY_SIZE}"
             )));
         }
-        offsets.push(offset);
     }
     Ok(offsets)
 }

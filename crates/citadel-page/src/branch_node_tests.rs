@@ -81,6 +81,72 @@ fn checked_reader_rejects_unordered_keys_and_bad_children() {
 }
 
 #[test]
+fn checked_reader_preserves_separator_order_when_children_are_unsorted() {
+    let page = make_branch_page(
+        &[b"ant", b"cat", b"dog"],
+        &[PageId(9), PageId(2), PageId(5)],
+        PageId(1),
+    );
+    let cells = read_cells_checked(&page).unwrap();
+    let actual: Vec<_> = cells.iter().map(|cell| (cell.child, cell.key)).collect();
+    assert_eq!(
+        actual,
+        vec![
+            (PageId(9), b"ant".as_slice()),
+            (PageId(2), b"cat".as_slice()),
+            (PageId(5), b"dog".as_slice()),
+        ]
+    );
+}
+
+#[test]
+fn checked_reader_rejects_nonadjacent_duplicate_children() {
+    for (children, right) in [
+        ([PageId(7), PageId(2), PageId(7)], PageId(4)),
+        ([PageId(7), PageId(2), PageId(4)], PageId(7)),
+    ] {
+        let page = make_branch_page(&[b"ant", b"cat", b"dog"], &children, right);
+        assert!(read_cells_checked(&page)
+            .unwrap_err()
+            .to_string()
+            .contains(&format!("duplicates page {}", PageId(7))));
+    }
+}
+
+#[test]
+fn checked_reader_validates_cell_and_right_children() {
+    for (child, right, expected) in [
+        (PageId::INVALID, PageId(2), "child 0 is invalid"),
+        (PageId(1), PageId::INVALID, "child 1 is invalid"),
+        (PageId(0), PageId(2), "child 0 points back"),
+        (PageId(1), PageId(0), "child 1 points back"),
+    ] {
+        let page = make_branch_page(&[b"cat"], &[child], right);
+        assert!(read_cells_checked(&page)
+            .unwrap_err()
+            .to_string()
+            .contains(expected));
+    }
+}
+
+#[test]
+fn checked_reader_validates_the_only_child_of_an_empty_branch() {
+    let mut page = make_branch_page(&[], &[], PageId(0));
+    page.set_page_id(PageId(10));
+    assert!(read_cells_checked(&page).unwrap().is_empty());
+    for (right, expected) in [
+        (PageId::INVALID, "child 0 is invalid"),
+        (PageId(10), "child 0 points back"),
+    ] {
+        page.set_right_child(right);
+        assert!(read_cells_checked(&page)
+            .unwrap_err()
+            .to_string()
+            .contains(expected));
+    }
+}
+
+#[test]
 fn search_finds_correct_child() {
     let page = make_branch_page(
         &[b"cat", b"dog", b"fox"],
