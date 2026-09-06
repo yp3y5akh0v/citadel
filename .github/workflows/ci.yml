@@ -66,7 +66,6 @@ jobs:
       - run: cargo +1.95 check --workspace --locked
 
   test:
-    needs: [fmt, clippy]
     strategy:
       fail-fast: false
       matrix:
@@ -109,14 +108,34 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.name }}
-      - run: cargo test --workspace ${{ matrix.features }}
+      - name: Install Nextest
+        if: matrix.name != 'linux-fips'
+        uses: taiki-e/install-action@7b8d4719ee4aaa279bdf55df38dacb9ebfe12a6c # v2.87.6
+        with:
+          tool: cargo-nextest@0.9.143
+          checksum: true
+          fallback: none
+      - name: Test integrations
+        if: matrix.name != 'linux-fips'
+        run: cargo nextest run --workspace --locked ${{ matrix.features }} --profile ci -E 'kind(test) & not binary(=shots) & not binary(=pg_jsonb_jsonpath)'
+      - name: Test libraries and binaries
+        if: matrix.name != 'linux-fips'
+        run: cargo test --workspace --locked ${{ matrix.features }} --lib --bins
+      - name: Test Studio rendering and JSONPath corpus
+        if: matrix.name != 'linux-fips'
+        run: cargo test --workspace --locked ${{ matrix.features }} --test shots --test pg_jsonb_jsonpath
+      - name: Test documentation
+        if: matrix.name != 'linux-fips'
+        run: cargo test --workspace --locked ${{ matrix.features }} --doc
+      - name: Test FIPS integrations
+        if: matrix.name == 'linux-fips'
+        run: cargo test --workspace ${{ matrix.features }}
       - name: Test FIPS library configuration
         if: matrix.name == 'linux-fips'
         run: cargo test -p citadeldb --lib --features fips
 
   # Opt-in backends the default workspace test skips; also proves wasm cfg-away.
   ai-backends:
-    needs: [fmt, clippy]
     runs-on: ubuntu-latest
     name: llm + ai backends
     steps:
@@ -152,7 +171,6 @@ jobs:
         run: cargo check -p citadeldb-membench --features openai,candle-embed --bins
 
   wasm:
-    needs: [fmt, clippy]
     runs-on: ubuntu-latest
     name: wasm bindings
     steps:
@@ -178,7 +196,6 @@ jobs:
 
   # Build the wheel, run pytest, and type-check the stubs/facades.
   python:
-    needs: [fmt, clippy]
     runs-on: ubuntu-latest
     name: python bindings
     steps:

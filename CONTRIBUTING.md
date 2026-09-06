@@ -30,18 +30,38 @@ export PYO3_PYTHON=/usr/bin/python3             # sh
 
 ## What CI checks
 
-`fmt`, `clippy` and the MSRV check run on every pull request against `master`.
-The test job runs after `fmt` and `clippy` pass.
+`fmt`, `clippy`, the MSRV check and tests run independently on pull requests
+against `master` that trigger CI. All checks must pass before merging.
 
 ```
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo +1.95 check --workspace --locked
-cargo test --workspace          # CI runs this on Linux, Windows and macOS
+cargo test --workspace --locked
 ```
 
-Two further jobs cover ground the commands above skip. Run the parts that match
-what you touched:
+For faster native test execution, install [Nextest](https://nexte.st/docs/installation/)
+0.9.143 or newer. CI pins 0.9.143 and runs these commands on Linux, Windows and
+macOS:
+
+```
+cargo nextest run --workspace --locked --profile ci -E 'kind(test) & not binary(=shots) & not binary(=pg_jsonb_jsonpath)'
+cargo test --workspace --locked --lib --bins
+cargo test --workspace --locked --test shots --test pg_jsonb_jsonpath
+cargo test --workspace --locked --doc
+```
+
+Nextest runs ordinary integration tests concurrently. Library and binary tests,
+Studio rendering, the custom JSONPath corpus harness and doctests run with Cargo.
+Run all four commands for full native coverage. The Nextest configuration uses
+the available CPU count, no retries and a ten-minute per-test timeout. Output
+handles left open five seconds after a test exits cause a failure.
+
+Examples or benchmarks marked `test = true` need a Cargo execution step in CI;
+`kind(test)` selects integration targets only. Custom harnesses must either
+support Nextest or run in a separate Cargo step.
+
+Separate jobs cover AI/LLM backends, WASM and Python. Additional checks include:
 
 ```
 # citadel-ai backends, and the wasm build that proves they cfg away
@@ -66,7 +86,8 @@ Two more legs run only on Linux:
 
 ```
 cargo test --workspace --features citadeldb/io-uring
-cargo test --workspace -p citadeldb --test fips --features citadeldb/fips
+cargo test --workspace -p citadeldb --test fips --test cipher_selector_retirement --test key_backup --features citadeldb/fips
+cargo test -p citadeldb --lib --features fips
 ```
 
 From a non-Linux host, run the io-uring suite in its pinned container:
@@ -76,8 +97,8 @@ docker build -f Dockerfile.test -t citadeldb-test .
 docker run --rm --security-opt seccomp=unconfined citadeldb-test
 ```
 
-No CI job builds the benchmark binaries, so run this yourself if you touch
-`citadel-membench`:
+CI type-checks the feature-gated benchmark binaries. To also check linking when
+changing `citadel-membench`, run:
 
 ```
 cargo build -p citadeldb-membench --features openai,candle-embed --bins
@@ -93,7 +114,7 @@ cargo build -p citadeldb-membench --features openai,candle-embed --bins
   workspace members, so `-p` cannot select them.
 - The `locomo` and `longmemeval` binaries have `required-features`, so
   `--all-targets` skips them silently and they can break while everything is green.
-- On a pull request, changes touching only `**.md`, `site/**`, `scripts/**`,
+- On a pull request, changes touching only `**.md`, `site/**`,
   `LICENSE-*`, `server.json`, `.github/FUNDING.yml` or `.github/*.png` run no CI
   at all (`paths-ignore` in `.github/workflows/ci.yml`).
 - Tests needing a real embedder model do not run by default. The Rust ones are
