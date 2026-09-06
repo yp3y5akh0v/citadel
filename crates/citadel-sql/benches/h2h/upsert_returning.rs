@@ -1,5 +1,5 @@
 use citadel_sql::{Connection, Value};
-use criterion::{BenchmarkId, Criterion};
+use criterion::{black_box, BenchmarkId, Criterion};
 
 use super::common::*;
 
@@ -35,11 +35,23 @@ pub fn bench(c: &mut Criterion) {
         )
         .unwrap();
 
+    assert_eq!(
+        cs.query_collect(&[Value::Text("hot".into())]).unwrap().rows,
+        vec![vec![Value::Integer(1)]]
+    );
+    assert_eq!(
+        sqlite_collect_params(&mut ss, ["hot"]),
+        vec![vec![rusqlite::types::Value::Integer(1)]]
+    );
+    cc.execute("UPDATE ct SET c = 0 WHERE k = 'hot'").unwrap();
+    sc.execute("UPDATE ct SET c = 0 WHERE k = 'hot'", [])
+        .unwrap();
+
     g.bench_function(BenchmarkId::new("citadel", ""), |b| {
         b.iter(|| {
             cc.execute("BEGIN").unwrap();
             for _ in 0..100 {
-                let _ = cs.query_collect(&[Value::Text("hot".into())]).unwrap();
+                black_box(cs.query_collect(&[Value::Text("hot".into())]).unwrap());
             }
             cc.execute("COMMIT").unwrap();
         });
@@ -48,8 +60,7 @@ pub fn bench(c: &mut Criterion) {
         b.iter(|| {
             sc.execute_batch("BEGIN").unwrap();
             for _ in 0..100 {
-                let mut rows = ss.query(rusqlite::params!["hot"]).unwrap();
-                while rows.next().unwrap().is_some() {}
+                black_box(sqlite_collect_params(&mut ss, rusqlite::params!["hot"]));
             }
             sc.execute_batch("COMMIT").unwrap();
         });

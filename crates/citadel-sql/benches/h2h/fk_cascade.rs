@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use citadel_sql::{Connection, Value};
 use criterion::{BenchmarkId, Criterion};
@@ -32,6 +32,8 @@ pub fn bench(c: &mut Criterion) {
         [],
     )
     .unwrap();
+
+    validate_cascade(&cc, &sc);
 
     let cins_p = cc.prepare("INSERT INTO parent (id) VALUES ($1)").unwrap();
     let cins_c = cc
@@ -80,10 +82,7 @@ pub fn bench(c: &mut Criterion) {
     bench_delete_only(c);
 }
 
-/// Diagnostic bench: only times the cascading DELETE. The setup (BEGIN +
-/// 1 INSERT parent + 100 INSERTs child + COMMIT) is done before each timer
-/// start, so the holistic-bench's parsing/insert/commit overhead is
-/// excluded.
+/// Times cascading DELETE with one parent and 100 children for every iteration.
 fn bench_delete_only(c: &mut Criterion) {
     let mut g = c.benchmark_group("fk_cascade_delete_only");
 
@@ -114,58 +113,82 @@ fn bench_delete_only(c: &mut Criterion) {
         [],
     )
     .unwrap();
+    validate_cascade(&cc, &sc);
     let mut sins_p = sc.prepare("INSERT INTO parent (id) VALUES (?1)").unwrap();
     let mut sins_c = sc
         .prepare("INSERT INTO child (id, p) VALUES (?1, ?2)")
         .unwrap();
     let mut sdel = sc.prepare("DELETE FROM parent WHERE id = ?1").unwrap();
 
-    let mut c_off = 0i64;
-    let mut s_off = 0i64;
-
     g.bench_function(BenchmarkId::new("citadel", ""), |b| {
         b.iter_custom(|iters| {
+            let mut elapsed = Duration::ZERO;
             for _ in 0..iters {
                 cc.execute("BEGIN").unwrap();
-                cins_p.execute(&[Value::Integer(c_off)]).unwrap();
+                cins_p.execute(&[Value::Integer(0)]).unwrap();
                 for j in 0..CHILDREN {
                     cins_c
-                        .execute(&[Value::Integer(c_off * CHILDREN + j), Value::Integer(c_off)])
+                        .execute(&[Value::Integer(j), Value::Integer(0)])
                         .unwrap();
                 }
                 cc.execute("COMMIT").unwrap();
-                c_off += 1;
+                let start = Instant::now();
+                cdel.execute(&[Value::Integer(0)]).unwrap();
+                elapsed += start.elapsed();
             }
-            let start_off = c_off - iters as i64;
-            let start = Instant::now();
-            for k in 0..iters {
-                cdel.execute(&[Value::Integer(start_off + k as i64)])
-                    .unwrap();
-            }
-            start.elapsed()
+            elapsed
         });
     });
     g.bench_function(BenchmarkId::new("sqlite", ""), |b| {
         b.iter_custom(|iters| {
+            let mut elapsed = Duration::ZERO;
             for _ in 0..iters {
                 sc.execute_batch("BEGIN").unwrap();
-                sins_p.execute(rusqlite::params![s_off]).unwrap();
+                sins_p.execute(rusqlite::params![0]).unwrap();
                 for j in 0..CHILDREN {
-                    sins_c
-                        .execute(rusqlite::params![s_off * CHILDREN + j, s_off])
-                        .unwrap();
+                    sins_c.execute(rusqlite::params![j, 0]).unwrap();
                 }
                 sc.execute_batch("COMMIT").unwrap();
-                s_off += 1;
+                let start = Instant::now();
+                sdel.execute(rusqlite::params![0]).unwrap();
+                elapsed += start.elapsed();
             }
-            let start_off = s_off - iters as i64;
-            let start = Instant::now();
-            for k in 0..iters {
-                sdel.execute(rusqlite::params![start_off + k as i64])
-                    .unwrap();
-            }
-            start.elapsed()
+            elapsed
         });
     });
     g.finish();
+}
+
+fn validate_cascade(cc: &Connection<'_>, sc: &rusqlite::Connection) {
+    cc.execute("BEGIN").unwrap();
+    cc.execute("INSERT INTO parent VALUES (-1)").unwrap();
+    sc.execute_batch("BEGIN; INSERT INTO parent VALUES (-1)")
+        .unwrap();
+    for j in 0..CHILDREN {
+        cc.execute(&format!("INSERT INTO child VALUES ({j}, -1)"))
+            .unwrap();
+        sc.execute("INSERT INTO child VALUES (?1, -1)", [j])
+            .unwrap();
+    }
+    cc.execute("COMMIT").unwrap();
+    sc.execute_batch("COMMIT").unwrap();
+    assert_eq!(
+        cc.prepare("DELETE FROM parent WHERE id = -1")
+            .unwrap()
+            .execute(&[])
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        sc.execute("DELETE FROM parent WHERE id = -1", []).unwrap(),
+        1
+    );
+    for table in ["parent", "child"] {
+        let sql = format!("SELECT COUNT(*) FROM {table}");
+        assert_eq!(cc.query(&sql).unwrap().rows, vec![vec![Value::Integer(0)]]);
+        assert_eq!(
+            sc.query_row(&sql, [], |row| row.get::<_, i64>(0)).unwrap(),
+            0
+        );
+    }
 }

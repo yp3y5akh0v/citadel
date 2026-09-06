@@ -11,7 +11,6 @@ pub fn bench(c: &mut Criterion) {
     let cc = Connection::open(&cdb).unwrap();
     cc.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val TEXT)")
         .unwrap();
-    let mut c_off = 0i64;
 
     let sdir = tempfile::tempdir().unwrap();
     let sc = sqlite_db(sdir.path());
@@ -20,7 +19,6 @@ pub fn bench(c: &mut Criterion) {
         [],
     )
     .unwrap();
-    let mut s_off = 0i64;
 
     let c_pre = cc
         .prepare("INSERT INTO t (id, val) VALUES ($1, 'pre')")
@@ -36,42 +34,69 @@ pub fn bench(c: &mut Criterion) {
         .prepare("INSERT INTO t (id, val) VALUES (?1, 'post')")
         .unwrap();
     let mut s_del = sc.prepare("DELETE FROM t").unwrap();
+    let c_run = || {
+        cc.execute("BEGIN").unwrap();
+        for id in 0i64..1_000 {
+            c_pre.execute(&[Value::Integer(id)]).unwrap();
+        }
+        cc.execute("SAVEPOINT sp").unwrap();
+        for id in 1_000i64..11_000 {
+            c_post.execute(&[Value::Integer(id)]).unwrap();
+        }
+        cc.execute("ROLLBACK TO SAVEPOINT sp").unwrap();
+        cc.execute("COMMIT").unwrap();
+    };
+    let mut s_run = || {
+        sc.execute_batch("BEGIN").unwrap();
+        for id in 0i64..1_000 {
+            s_pre.execute(rusqlite::params![id]).unwrap();
+        }
+        sc.execute_batch("SAVEPOINT sp").unwrap();
+        for id in 1_000i64..11_000 {
+            s_post.execute(rusqlite::params![id]).unwrap();
+        }
+        sc.execute_batch("ROLLBACK TO SAVEPOINT sp").unwrap();
+        sc.execute_batch("COMMIT").unwrap();
+    };
+
+    for _ in 0..2 {
+        c_run();
+        assert_eq!(
+            cc.query("SELECT id, val FROM t ORDER BY id").unwrap().rows,
+            (0..1_000)
+                .map(|id| vec![Value::Integer(id), Value::Text("pre".into())])
+                .collect::<Vec<_>>()
+        );
+        c_del.execute(&[]).unwrap();
+        s_run();
+        let s_rows = sc
+            .prepare("SELECT id, val FROM t ORDER BY id")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            s_rows,
+            (0..1_000i64)
+                .map(|id| (id, "pre".to_owned()))
+                .collect::<Vec<_>>()
+        );
+        s_del.execute([]).unwrap();
+    }
+
     g.bench_function(BenchmarkId::new("citadel", ""), |b| {
         b.iter(|| {
-            cc.execute("BEGIN").unwrap();
-            for _ in 0..1_000 {
-                c_pre.execute(&[Value::Integer(c_off)]).unwrap();
-                c_off += 1;
-            }
-            cc.execute("SAVEPOINT sp").unwrap();
-            for _ in 0..10_000 {
-                c_post.execute(&[Value::Integer(c_off)]).unwrap();
-                c_off += 1;
-            }
-            cc.execute("ROLLBACK TO SAVEPOINT sp").unwrap();
-            c_off -= 10_000;
-            cc.execute("COMMIT").unwrap();
+            c_run();
             c_del.execute(&[]).unwrap();
-            c_off = 0;
         });
     });
     g.bench_function(BenchmarkId::new("sqlite", ""), |b| {
         b.iter(|| {
-            sc.execute_batch("BEGIN").unwrap();
-            for _ in 0..1_000 {
-                s_pre.execute(rusqlite::params![s_off]).unwrap();
-                s_off += 1;
-            }
-            sc.execute_batch("SAVEPOINT sp").unwrap();
-            for _ in 0..10_000 {
-                s_post.execute(rusqlite::params![s_off]).unwrap();
-                s_off += 1;
-            }
-            sc.execute_batch("ROLLBACK TO SAVEPOINT sp").unwrap();
-            s_off -= 10_000;
-            sc.execute_batch("COMMIT").unwrap();
+            s_run();
             s_del.execute([]).unwrap();
-            s_off = 0;
         });
     });
     g.finish();

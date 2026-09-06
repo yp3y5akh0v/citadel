@@ -1,5 +1,25 @@
 use citadel::{Argon2Profile, DatabaseBuilder, SyncMode};
 use citadel_sql::Connection;
+use criterion::Bencher;
+use std::time::{Duration, Instant};
+
+/// Measures the operation, excluding the fixture reset between iterations.
+pub fn iter_with_cleanup(
+    b: &mut Bencher<'_>,
+    mut operation: impl FnMut(),
+    mut cleanup: impl FnMut(),
+) {
+    b.iter_custom(|iterations| {
+        let mut elapsed = Duration::ZERO;
+        for _ in 0..iterations {
+            let start = Instant::now();
+            operation();
+            elapsed += start.elapsed();
+            cleanup();
+        }
+        elapsed
+    });
+}
 
 pub fn citadel_db(dir: &std::path::Path) -> citadel::Database {
     DatabaseBuilder::new(dir.join("bench.citadel"))
@@ -48,7 +68,7 @@ pub fn citadel_join_tables(conn: &Connection) {
 pub fn sqlite_db(dir: &std::path::Path) -> rusqlite::Connection {
     let conn = rusqlite::Connection::open(dir.join("bench.db")).unwrap();
     conn.execute_batch(
-        "PRAGMA page_size=8192; PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA cache_size=4096;",
+        "PRAGMA page_size=8192; PRAGMA journal_mode=MEMORY; PRAGMA synchronous=OFF; PRAGMA cache_size=4096;",
     )
     .unwrap();
     conn
@@ -101,14 +121,18 @@ pub fn sqlite_join_tables(conn: &rusqlite::Connection) {
 }
 
 pub fn sqlite_collect_stmt(stmt: &mut rusqlite::Statement<'_>) -> Vec<Vec<rusqlite::types::Value>> {
+    sqlite_collect_params(stmt, [])
+}
+
+pub fn sqlite_collect_params(
+    stmt: &mut rusqlite::Statement<'_>,
+    params: impl rusqlite::Params,
+) -> Vec<Vec<rusqlite::types::Value>> {
     let col_count = stmt.column_count();
-    stmt.query_map([], |row| {
+    stmt.query_map(params, |row| {
         let mut vals = Vec::with_capacity(col_count);
         for i in 0..col_count {
-            vals.push(
-                row.get::<_, rusqlite::types::Value>(i)
-                    .unwrap_or(rusqlite::types::Value::Null),
-            );
+            vals.push(row.get::<_, rusqlite::types::Value>(i)?);
         }
         Ok(vals)
     })

@@ -1,5 +1,5 @@
 use citadel_sql::{Connection, Value};
-use criterion::{BenchmarkId, Criterion};
+use criterion::{black_box, BenchmarkId, Criterion};
 
 use super::common::*;
 
@@ -39,13 +39,27 @@ pub fn bench(c: &mut Criterion) {
         .prepare("UPDATE t SET c = c + ?1 WHERE id = ?2 RETURNING c")
         .unwrap();
 
+    assert_eq!(
+        cs.query_collect(&[Value::Integer(1), Value::Integer(0)])
+            .unwrap()
+            .rows,
+        vec![vec![Value::Integer(1)]]
+    );
+    assert_eq!(
+        sqlite_collect_params(&mut ss, [1i64, 0]),
+        vec![vec![rusqlite::types::Value::Integer(1)]]
+    );
+    cc.execute("UPDATE t SET c = 0 WHERE id = 0").unwrap();
+    sc.execute("UPDATE t SET c = 0 WHERE id = 0", []).unwrap();
+
     g.bench_function(BenchmarkId::new("citadel", ""), |b| {
         b.iter(|| {
             cc.execute("BEGIN").unwrap();
             for j in 0..100i64 {
-                let _ = cs
-                    .query_collect(&[Value::Integer(1), Value::Integer(j)])
-                    .unwrap();
+                black_box(
+                    cs.query_collect(&[Value::Integer(1), Value::Integer(j)])
+                        .unwrap(),
+                );
             }
             cc.execute("COMMIT").unwrap();
         });
@@ -54,8 +68,7 @@ pub fn bench(c: &mut Criterion) {
         b.iter(|| {
             sc.execute_batch("BEGIN").unwrap();
             for j in 0..100i64 {
-                let mut rows = ss.query(rusqlite::params![1, j]).unwrap();
-                while rows.next().unwrap().is_some() {}
+                black_box(sqlite_collect_params(&mut ss, rusqlite::params![1, j]));
             }
             sc.execute_batch("COMMIT").unwrap();
         });
