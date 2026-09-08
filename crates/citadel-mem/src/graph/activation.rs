@@ -324,13 +324,13 @@ fn rank_turns(
 /// (its diffusion rank was below the cut, so the tail is its true
 /// position). Everything else keeps its order. If fewer unpinned entries
 /// exist than absent pinned ids, the view grows rather than dropping a
-/// pinned id.
+/// pinned id. Repeated pins are ignored; missing ids append in first-requested order.
 pub fn pin_into_view(ranked: &mut Vec<AtomId>, pinned: &[AtomId]) {
-    let have: FxHashSet<AtomId> = ranked.iter().copied().collect();
+    let mut seen: FxHashSet<AtomId> = ranked.iter().copied().collect();
     let missing: Vec<AtomId> = pinned
         .iter()
         .copied()
-        .filter(|id| !have.contains(id))
+        .filter(|id| seen.insert(*id))
         .collect();
     if missing.is_empty() {
         return;
@@ -972,8 +972,49 @@ mod tests {
     #[test]
     fn pin_present_is_a_no_op() {
         let mut ranked = vec![1, 2, 3];
-        pin_into_view(&mut ranked, &[3, 1]);
+        pin_into_view(&mut ranked, &[3, 1, 3, 1]);
         assert_eq!(ranked, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn pin_duplicate_absent_ids_evict_once() {
+        let mut ranked = vec![1, 2, 3, 4];
+        pin_into_view(&mut ranked, &[9, 9]);
+        assert_eq!(ranked, vec![1, 2, 3, 9]);
+    }
+
+    #[test]
+    fn pin_mixed_duplicates_preserve_rank_and_request_order() {
+        let mut ranked = vec![10, 20, 30, 40, 50];
+        pin_into_view(&mut ranked, &[40, 99, 99, 20, 88, 40, 88]);
+        assert_eq!(ranked, vec![10, 20, 40, 99, 88]);
+    }
+
+    #[test]
+    fn pin_duplicate_requests_grow_only_for_distinct_ids() {
+        let mut ranked = vec![1, 2];
+        pin_into_view(&mut ranked, &[2, 9, 9, 8, 8, 7]);
+        assert_eq!(ranked, vec![2, 9, 8, 7]);
+    }
+
+    #[test]
+    fn pin_empty_inputs() {
+        let mut ranked = Vec::new();
+        pin_into_view(&mut ranked, &[]);
+        assert!(ranked.is_empty());
+
+        pin_into_view(&mut ranked, &[9, 8, 9, 8]);
+        assert_eq!(ranked, vec![9, 8]);
+
+        pin_into_view(&mut ranked, &[]);
+        assert_eq!(ranked, vec![9, 8]);
+    }
+
+    #[test]
+    fn pin_preserves_existing_ranked_duplicates() {
+        let mut ranked = vec![1, 2, 1, 3];
+        pin_into_view(&mut ranked, &[1, 4, 4]);
+        assert_eq!(ranked, vec![1, 2, 1, 4]);
     }
 
     #[test]
