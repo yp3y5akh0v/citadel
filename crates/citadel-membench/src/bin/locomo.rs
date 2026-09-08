@@ -1,50 +1,20 @@
-//! Live LoCoMo runner. Requires a real OpenAI key and a local embedder
-//! (e5-large); gated behind `openai` + `candle-embed` so CI never compiles it.
-//!
-//! Usage:
-//!   OPENAI_API_KEY=...  CITADEL_EMBEDDER_DIR=/path/to/e5-large  \
-//!     cargo run -p citadeldb-membench --features openai,candle-embed \
-//!     --bin locomo -- path/to/locomo10.json
-//!
-//! Dataset path: argv[1] or CITADEL_LOCOMO_DATASET. Env knobs:
-//!   CITADEL_LOCOMO_READER_MODEL=m     answer model (default gpt-4o-mini)
-//!   CITADEL_LOCOMO_JUDGE_MODEL=m      scoring model (default gpt-4o-mini)
-//!   CITADEL_LOCOMO_TOP_K=n            memories per question (default 50)
-//!   CITADEL_LOCOMO_READER_ORDER       sessions|chrono|relevance (def sessions)
-//!   CITADEL_LOCOMO_NEIGHBOR_RADIUS=n  adjacent turns per hit (default 0)
-//!   CITADEL_LOCOMO_AGENTIC=1          agentic reader for aggregation Qs
-//!   CITADEL_LOCOMO_RERANK_STRATEGY    replace|rrf (default rrf)
-//!   CITADEL_LOCOMO_READER_CONCURRENCY reader calls in flight (default 3)
-//!   CITADEL_LOCOMO_JUDGE_CONCURRENCY  judge calls in flight (default 12, mini)
-//!   CITADEL_LOCOMO_CONCURRENCY=1      force TRUE serial (both caps -> 1)
-//!   CITADEL_LOCOMO_READER_TPM / _JUDGE_TPM  per-model token/min cap
-//!                             (30000 / 1000000)
-//!   CITADEL_MEMBENCH_RETRY_MAX_ELAPSED_SECS  per-call retry budget (def 240)
-//!   CITADEL_MEMBENCH_MAX_TOKENS      output-token cap override (shared)
-//!   CITADEL_LOCOMO_MAX_SAMPLES=N      cap to the first N conversations
-//!   CITADEL_LOCOMO_LIVE_TRACE=path    stream one JSON line per question
-//!   CITADEL_LOCOMO_AUDIT_PATH=path    per-question audit JSON at the end
-//!   CITADEL_LOCOMO_DB_PATH=path       persist + reuse the encrypted DB
-//!                             (validate before reuse; ENCRYPTED must match)
-//!   CITADEL_LOCOMO_DRY_RUN=1          load + print dataset stats, then exit
-//!   CITADEL_LOCOMO_RETRIEVAL_DIAG=1   token-free layered recall@k, then exit
-//!                             (needs embedder, no key; finds the lossy layer)
-//!   CITADEL_LOCOMO_PARAM_SWEEP=1      token-free fusion-ratio sweep and
-//!                             rerank strategies (RRF k / Replace), then exit
+//! LoCoMo scored evaluation and offline diagnostics. See `run.ps1` and
+//! `benchmarks::locomo::config` for validated modes and parameters.
 
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::io::Write;
 use std::sync::Arc;
 
-use citadel_llm::LLMClient;
 use citadel_mem::{
-    AtomHit, CandleEmbedder, CrossEncoder, Embedder, FusionWeights, MemoryEngine, RecallQuery,
-    RerankStrategy, Reranker,
+    AtomHit, CrossEncoder, Embedder, FusionWeights, MemoryEngine, RecallQuery, RerankStrategy,
+    Reranker,
 };
+use citadel_membench::benchmarks::locomo::config::{RunConfig, RunMode};
+use citadel_membench::core::retrieval::{baseline_recall, validate_embeddings};
 use citadel_membench::{
-    aggregate, ingest_sample, provenance, run_sample_observed, turn_content, BenchConfig, Category,
-    QuestionResult, ReaderOrder, Sample,
+    aggregate, ingest_sample, provenance, run_sample_observed, turn_content, Category,
+    QuestionResult, Sample,
 };
 use rustc_hash::FxHashMap;
 
@@ -60,163 +30,122 @@ fn main() -> Result<(), Box<dyn Error>> {
         .or_else(|| std::env::var("CITADEL_LOCOMO_DATASET").ok())
         .ok_or("dataset path required: argv[1] or CITADEL_LOCOMO_DATASET")?;
 
-    let config = bench_config_from_env();
+    let launch = RunConfig::from_env()?;
+    if launch.mode == RunMode::Scored {
+        citadel_membench::core::config::preflight_llm(
+            "CITADEL_LOCOMO_READER",
+            DEFAULT_READER_MODEL,
+        )?;
+        citadel_membench::core::config::preflight_llm("CITADEL_LOCOMO_JUDGE", DEFAULT_JUDGE_MODEL)?;
+    }
+    let config = launch.bench;
     let (mut samples, dataset_sha256) = citadel_membench::load_with_hash(&dataset_path)?;
 
-    if let Ok(raw) = std::env::var("CITADEL_LOCOMO_MAX_SAMPLES") {
-        let n: usize = raw
-            .parse()
-            .map_err(|_| "CITADEL_LOCOMO_MAX_SAMPLES must be a non-negative integer")?;
+    if let Some(n) = launch.max_samples {
         samples.truncate(n);
     }
-
+    if samples.is_empty() {
+        return Err("dataset contains no selected conversations".into());
+    }
     print_dataset_stats(&samples, &dataset_path, &dataset_sha256);
-
-    if std::env::var("CITADEL_LOCOMO_DRY_RUN").is_ok() {
-        eprintln!("dry run: dataset parsed OK, no LLM calls made.");
+    if launch.mode == RunMode::DryRun {
+        eprintln!("dry run: dataset parsed OK, no models loaded.");
         return Ok(());
     }
-
-    // CITADEL_LOCOMO_MOCK_EMBED uses a deterministic embedder: fine for the DB
-    // dump (embedder-independent), not for the diag or full run (need real
-    // embedder semantics).
-    let embedder: Arc<dyn Embedder> = if std::env::var("CITADEL_LOCOMO_MOCK_EMBED").is_ok() {
+    let scoring_clients = if launch.mode == RunMode::Scored {
+        let reader =
+            citadel_llm::factory::from_env("CITADEL_LOCOMO_READER", "openai", DEFAULT_READER_MODEL)
+                .map_err(|e| format!("reader LLM: {e}"))?;
+        let judge =
+            citadel_llm::factory::from_env("CITADEL_LOCOMO_JUDGE", "openai", DEFAULT_JUDGE_MODEL)
+                .map_err(|e| format!("judge LLM: {e}"))?;
+        Some((reader, judge))
+    } else {
+        None
+    };
+    let reranker = if matches!(launch.mode, RunMode::Dump | RunMode::Erasure) {
+        None
+    } else {
+        match std::env::var("CITADEL_RERANKER_DIR") {
+            Ok(dir) => Some(Arc::new(
+                CrossEncoder::ms_marco_minilm_l6(&dir)
+                    .map_err(|e| format!("reranker model: {e}"))?,
+            )),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(_) => return Err("CITADEL_RERANKER_DIR must be Unicode text".into()),
+        }
+    };
+    let embedder: Arc<dyn Embedder> = if launch.mode == RunMode::Dump {
         Arc::new(citadel_mem::MockEmbedder::new(384))
     } else {
         let model_dir =
             std::env::var("CITADEL_EMBEDDER_DIR").map_err(|_| "CITADEL_EMBEDDER_DIR not set")?;
-        // CITADEL_LOCOMO_EMBEDDER selects the model (default e5-large);
-        // dim/layers come from its config.json, and the choice is recorded in
-        // Provenance.
-        let ce = match std::env::var("CITADEL_LOCOMO_EMBEDDER")
-            .unwrap_or_default()
-            .as_str()
-        {
-            "bge-base" => CandleEmbedder::bge_base(&model_dir)?,
-            "bge-large" => CandleEmbedder::bge_large(&model_dir)?,
-            "e5-large" => CandleEmbedder::e5_large(&model_dir)?,
-            "e5-large-v2" => CandleEmbedder::e5_large_v2(&model_dir)?,
-            "granite-r2" => CandleEmbedder::granite_r2(&model_dir)?,
-            "arctic" => CandleEmbedder::arctic(&model_dir)?,
-            "modernbert-embed" => CandleEmbedder::modernbert_embed(&model_dir)?,
-            _ => CandleEmbedder::e5_large(&model_dir)?,
-        };
-        Arc::new(ce)
+        Arc::new(launch.embedder.load(&model_dir)?)
     };
 
-    // CITADEL_LOCOMO_ENCRYPTED seals atoms per-key (enables erasure).
-    // CITADEL_LOCOMO_DB_PATH persists + reuses the DB (ENCRYPTED must match).
-    let encrypted = citadel_membench::encrypted_regions()
-        || std::env::var("CITADEL_LOCOMO_ERASURE_DEMO").is_ok();
+    let encrypted = launch.encrypted;
     let bench_db = citadel_membench::open_bench_db("CITADEL_LOCOMO_DB_PATH", encrypted)?;
     let db = Arc::clone(&bench_db.db);
-    if bench_db.reuse {
-        eprintln!(
-            "db: reuse {} (encrypted_regions={encrypted}) - corpus validation required",
-            bench_db.path.display()
-        );
-    } else {
-        eprintln!(
-            "db: {} (encrypted_regions={encrypted})",
-            bench_db.path.display()
-        );
-    }
+    eprintln!(
+        "db: {} (reuse={}, encrypted_regions={encrypted})",
+        bench_db.path.display(),
+        bench_db.reuse
+    );
     let mut eng = MemoryEngine::open(db.clone())?;
-
-    // The token-free build-and-inspect modes rebuild a throwaway DB; reusing a
-    // persisted one would double-ingest. LoCoMo is seconds to rebuild, so
-    // require a fresh DB for them.
-    if bench_db.reuse
-        && (std::env::var("CITADEL_LOCOMO_DUMP_DB").is_ok()
-            || std::env::var("CITADEL_LOCOMO_RETRIEVAL_DIAG").is_ok()
-            || std::env::var("CITADEL_LOCOMO_PARAM_SWEEP").is_ok()
-            || std::env::var("CITADEL_LOCOMO_ERASURE_DEMO").is_ok())
-    {
-        return Err(
-            "CITADEL_LOCOMO_DB_PATH reuse supports only the scored run; unset it \
-                    (or point to a new path) for dump/diag/sweep/erasure modes"
-                .into(),
-        );
+    match launch.mode {
+        RunMode::Dump => return run_db_dump(&eng, &samples, embedder),
+        RunMode::RetrievalDiag => {
+            return run_retrieval_diag(
+                &mut eng,
+                &samples,
+                embedder,
+                launch.rerank_strategy,
+                config.top_k,
+                reranker,
+            );
+        }
+        RunMode::ParamSweep => {
+            return run_param_sweep(&mut eng, &samples, embedder, config.top_k, reranker)
+        }
+        RunMode::Erasure => return run_erasure_demo(&eng, db, &samples, embedder),
+        RunMode::Scored => {}
+        RunMode::DryRun => unreachable!("dry-run returned before database creation"),
     }
 
-    // Inspect what is actually stored: ingest one conversation, dump its atoms.
-    if std::env::var("CITADEL_LOCOMO_DUMP_DB").is_ok() {
-        return run_db_dump(&eng, &samples, embedder);
-    }
-
-    // Token-free: does top-k recall surface the gold evidence turns? No key.
-    if std::env::var("CITADEL_LOCOMO_RETRIEVAL_DIAG").is_ok() {
-        return run_retrieval_diag(&mut eng, &samples, embedder);
-    }
-
-    // Token-free: sweep fusion-weight ratios and rerank strategies. No key.
-    if std::env::var("CITADEL_LOCOMO_PARAM_SWEEP").is_ok() {
-        return run_param_sweep(&mut eng, &samples, embedder);
-    }
-
-    // Behind-the-scenes encryption + erasure verification (token-free, no key).
-    if std::env::var("CITADEL_LOCOMO_ERASURE_DEMO").is_ok() {
-        return run_erasure_demo(&eng, db, &samples, embedder);
-    }
-
-    // Optional cross-encoder reranker re-orders the candidate pool before the
-    // reader's top-k. CITADEL_LOCOMO_RERANK_STRATEGY=replace|rrf (default rrf
-    // blends cross-encoder + fusion).
-    let reranker_model = match std::env::var("CITADEL_RERANKER_DIR") {
-        Ok(rr_dir) => {
-            let ce = CrossEncoder::ms_marco_minilm_l6(&rr_dir)?;
+    let reranker_model = match reranker {
+        Some(ce) => {
             let model = ce.model_id().to_string();
-            let strategy = rerank_strategy_from_env();
-            eng.set_reranker(Arc::new(ce), strategy);
-            eprintln!("reranker: {model} (from {rr_dir}) strategy={strategy:?}");
+            let strategy = launch.rerank_strategy;
+            eng.set_reranker(ce, strategy);
+            eprintln!("reranker: {model} strategy={strategy:?}");
             format!("{model} ({strategy:?})")
         }
-        Err(_) => {
+        None => {
             eprintln!("reranker: none (set CITADEL_RERANKER_DIR to enable)");
             "none".to_string()
         }
     };
-
-    // Reader/judge selected via the shared citadel-llm backend factory:
-    // CITADEL_LOCOMO_READER_* / CITADEL_LOCOMO_JUDGE_* (default openai;
-    // OPENAI_API_KEY is read inside the factory).
-    let reader: Arc<dyn LLMClient> =
-        citadel_llm::factory::from_env("CITADEL_LOCOMO_READER", "openai", DEFAULT_READER_MODEL)
-            .map_err(|e| format!("reader LLM: {e}"))?;
+    let (reader, judge) = scoring_clients.ok_or("scored mode requires reader and judge clients")?;
     let reader_model = reader.model_id().to_string();
-
-    let judge_candidate: Arc<dyn LLMClient> =
-        citadel_llm::factory::from_env("CITADEL_LOCOMO_JUDGE", "openai", DEFAULT_JUDGE_MODEL)
-            .map_err(|e| format!("judge LLM: {e}"))?;
-    let judge_model = judge_candidate.model_id().to_string();
-    // Reuse the reader Arc when the judge resolves to the same model.
-    let judge: Arc<dyn LLMClient> = if judge_model == reader_model {
-        Arc::clone(&reader)
-    } else {
-        judge_candidate
-    };
+    let judge_model = judge.model_id().to_string();
     eprintln!("reader: {reader_model}  judge: {judge_model}");
 
-    // Per-model TPM pacing keeps submissions under the OpenAI limit so a burst
-    // can't trigger a 429 storm. Override via CITADEL_LOCOMO_READER_TPM /
-    // CITADEL_LOCOMO_JUDGE_TPM.
-    const DEFAULT_READER_TPM: u64 = 30_000;
-    const DEFAULT_JUDGE_TPM: u64 = 1_000_000;
-    let reader_tpm = std::env::var("CITADEL_LOCOMO_READER_TPM")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_READER_TPM);
-    let judge_tpm = std::env::var("CITADEL_LOCOMO_JUDGE_TPM")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_JUDGE_TPM);
-    let pacer = citadel_membench::Pacer::new(&reader_model, reader_tpm, &judge_model, judge_tpm);
+    let pacer = citadel_membench::Pacer::new(
+        &reader_model,
+        launch.reader_tpm,
+        &judge_model,
+        launch.judge_tpm,
+    );
 
     // CITADEL_LOCOMO_LIVE_TRACE=path writes one JSON line per question (a plain
     // File, so each writeln is a direct, tailable syscall).
     let mut live_trace = std::env::var("CITADEL_LOCOMO_LIVE_TRACE")
         .ok()
-        .map(std::fs::File::create)
+        .map(std::fs::File::create_new)
+        .transpose()?;
+    let mut audit_file = std::env::var("CITADEL_LOCOMO_AUDIT_PATH")
+        .ok()
+        .map(std::fs::File::create_new)
         .transpose()?;
     let total_q: usize = samples.iter().map(|s| s.qa.len()).sum();
     let mut prog = LiveProgress::new(total_q);
@@ -256,12 +185,10 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // Per-question audit trail (question, gold, predicted, verdict) for
     // spot-checking.
-    if let Ok(path) = std::env::var("CITADEL_LOCOMO_AUDIT_PATH") {
-        std::fs::write(&path, serde_json::to_string_pretty(&results)?)?;
-        eprintln!(
-            "per-question audit ({} questions) written to {path}",
-            results.len()
-        );
+    if let Some(mut audit) = audit_file.take() {
+        serde_json::to_writer_pretty(&mut audit, &results)?;
+        audit.flush()?;
+        eprintln!("per-question audit: {} questions", results.len());
     }
 
     println!("{}", serde_json::to_string_pretty(&report)?);
@@ -321,8 +248,10 @@ impl LiveProgress {
                 "gold": r.gold,
                 "predicted": r.predicted,
                 "reader_finish_reasons": r.reader_finish_reasons,
+                "reader_calls": r.reader_calls,
                 "judge": r.judge,
                 "retrieved": r.retrieved,
+                "retrieved_atom_ids": r.retrieved_atom_ids,
                 "gold_evidence": r.gold_evidence,
                 "gold_turn_texts": r.gold_turn_texts,
                 "gold_in_view": r.gold_in_view,
@@ -354,84 +283,33 @@ impl LiveProgress {
     }
 }
 
-/// Build the run config from env overrides over [`BenchConfig::default`]:
-/// CITADEL_LOCOMO_TOP_K, CITADEL_LOCOMO_READER_ORDER,
-/// CITADEL_LOCOMO_NEIGHBOR_RADIUS.
-fn bench_config_from_env() -> BenchConfig {
-    let d = BenchConfig::default();
-    let reader_order = match std::env::var("CITADEL_LOCOMO_READER_ORDER")
-        .unwrap_or_else(|_| "sessions".into())
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "chrono" => ReaderOrder::Chrono,
-        "relevance" => ReaderOrder::Relevance,
-        "sessions" => ReaderOrder::Sessions,
-        other => panic!(
-            "CITADEL_LOCOMO_READER_ORDER must be sessions, chrono, or relevance; got {other}"
-        ),
-    };
-    BenchConfig {
-        top_k: env_usize("CITADEL_LOCOMO_TOP_K", 1, d.top_k),
-        reader_order,
-        neighbor_radius: env_usize("CITADEL_LOCOMO_NEIGHBOR_RADIUS", 0, d.neighbor_radius),
-        agentic: std::env::var("CITADEL_LOCOMO_AGENTIC").is_ok(),
-        ..d
-    }
-}
-
-/// Read `key` as a `usize >= min`, else `default`.
-fn env_usize(key: &str, min: usize, default: usize) -> usize {
-    std::env::var(key)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .filter(|&n| n >= min)
-        .unwrap_or(default)
-}
-
-/// Parse `CITADEL_LOCOMO_RERANK_STRATEGY` (replace|rrf, default rrf) into a
-/// strategy.
-fn rerank_strategy_from_env() -> RerankStrategy {
-    match std::env::var("CITADEL_LOCOMO_RERANK_STRATEGY")
-        .unwrap_or_default()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "replace" => RerankStrategy::Replace,
-        _ => RerankStrategy::default(),
-    }
-}
-
 /// Token-free evidence recall@k per layer, to localize the lossy stage: A exact
-/// cosine (embedder ceiling), B semantic-only PRISM, C default fusion,
+/// cosine (exact ranking), B semantic-only PRISM, C default fusion,
 /// C-asof fusion graded at conversation end, D/D-asof + cross-encoder reranker.
-/// Each cell reports any-evidence and all-evidence recall (the multi-hop
-/// ceiling).
+/// Each cell reports any-evidence and all-evidence recall.
 fn run_retrieval_diag(
     eng: &mut MemoryEngine,
     samples: &[Sample],
     embedder: Arc<dyn Embedder>,
+    strategy: RerankStrategy,
+    top_k: usize,
+    reranker: Option<Arc<CrossEncoder>>,
 ) -> Result<(), Box<dyn Error>> {
-    const KS: [usize; 3] = [10, 30, 50];
-    const MAX_K: usize = 50;
+    let ks = [10.min(top_k), 30.min(top_k), top_k];
     // D rows are only populated when a reranker dir is set; names pin the
     // strategy.
-    let rr_dir = std::env::var("CITADEL_RERANKER_DIR").ok();
-    let (d_name, d_asof_name) = match &rr_dir {
-        Some(_) => {
-            let strategy = rerank_strategy_from_env();
-            (
-                format!("D: fusion + reranker {strategy:?} (the order the reader sees)"),
-                format!("D-asof: fusion as of conversation end + reranker {strategy:?}"),
-            )
-        }
+    let (d_name, d_asof_name) = match &reranker {
+        Some(_) => (
+            format!("D: fusion + reranker {strategy:?} (retrieval rank before reader ordering)"),
+            format!("D-asof: fusion as of conversation end + reranker {strategy:?}"),
+        ),
         None => (
             "D: (skipped; set CITADEL_RERANKER_DIR to measure)".to_string(),
             "D-asof: (skipped; set CITADEL_RERANKER_DIR to measure)".to_string(),
         ),
     };
     let mode_names = [
-        "A: exact-cosine over the indexed text (embedder ceiling)".to_string(),
+        "A: exact-cosine reference over the indexed text".to_string(),
         "B: semantic-only via recall (citadel-vector PRISM)".to_string(),
         "C: default fusion via recall (citadel-mem)".to_string(),
         "C-asof: default fusion as of conversation end".to_string(),
@@ -454,94 +332,90 @@ fn run_retrieval_diag(
         ingest_sample(eng, &s.sample_id, s)?;
         let as_of = s.as_of_micros();
 
-        // Embed each turn's indexed text once for the exact-cosine ceiling
+        // Embed each turn's indexed text once for the exact-cosine reference
         // (mode A).
         let turn_texts: Vec<String> = s.turns.iter().map(turn_content).collect();
         let turn_refs: Vec<&str> = turn_texts.iter().map(String::as_str).collect();
         let turn_embs = embedder.embed(&turn_refs)?;
+        validate_embeddings(&turn_embs, turn_refs.len(), embedder.dim())?;
         let turn_dia: Vec<&str> = s.turns.iter().map(|t| t.dia_id.as_str()).collect();
 
         // Embed every scored question once in a single batch (GPU-efficient) on
         // the query side (asymmetric models prefix here), then reuse the vector
         // across modes via by_embedding so no recall re-embeds the query.
-        let scored_qa: Vec<_> =
-            s.qa.iter()
-                .filter(|qa| qa.category != Category::Adversarial && !qa.evidence.is_empty())
-                .collect();
+        let scored_qa: Vec<_> = s.qa.iter().filter(|qa| qa.has_scored_evidence()).collect();
         let q_texts: Vec<&str> = scored_qa.iter().map(|qa| qa.question.as_str()).collect();
         let q_embs = embedder.embed_queries(&q_texts)?;
+        validate_embeddings(&q_embs, q_texts.len(), embedder.dim())?;
 
         for (qi, &qa) in scored_qa.iter().enumerate() {
             let label = qa.category.label();
             let q_emb = &q_embs[qi];
 
             // A: exact cosine over the same embeddings the index holds.
-            let mut scored: Vec<(f32, &str)> = turn_embs
+            let mut scored: Vec<(f64, &str)> = turn_embs
                 .iter()
                 .zip(&turn_dia)
                 .map(|(e, d)| (cosine(q_emb, e), *d))
                 .collect();
-            scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            scored.sort_by(|a, b| b.0.total_cmp(&a.0));
             let a_ranked: Vec<&str> = scored.iter().map(|(_, d)| *d).collect();
-            record(&mut acc[0], label, &a_ranked, &qa.evidence, KS);
+            record(&mut acc[0], label, &a_ranked, &qa.evidence, ks);
 
             // B: semantic-only recall (reuse the embedding; keyword inert
             // here).
             let b = eng.recall(
                 &s.sample_id,
-                RecallQuery::by_embedding(q_emb.clone(), MAX_K)
+                RecallQuery::by_embedding(q_emb.clone(), top_k)
                     .with_text(qa.question.as_str())
                     .with_weights(semantic_only),
             )?;
-            record(&mut acc[1], label, &hit_dia_ids(&b), &qa.evidence, KS);
+            record(&mut acc[1], label, &hit_dia_ids(&b), &qa.evidence, ks);
 
             // C: default fusion (reuse the embedding; text drives the keyword
             // signal).
             let c_query =
-                RecallQuery::by_embedding(q_emb.clone(), MAX_K).with_text(qa.question.as_str());
-            let c = eng.recall(&s.sample_id, c_query.clone())?;
-            record(&mut acc[2], label, &hit_dia_ids(&c), &qa.evidence, KS);
+                RecallQuery::by_embedding(q_emb.clone(), top_k).with_text(qa.question.as_str());
+            let c = baseline_recall(eng, &s.sample_id, c_query.clone())?;
+            record(&mut acc[2], label, &hit_dia_ids(&c), &qa.evidence, ks);
 
             // C-asof: identical query graded as of the conversation's end.
             if let Some(t) = as_of {
-                let ca = eng.recall(&s.sample_id, c_query.with_as_of(t))?;
-                record(&mut acc[3], label, &hit_dia_ids(&ca), &qa.evidence, KS);
+                let ca = baseline_recall(eng, &s.sample_id, c_query.with_as_of(t))?;
+                record(&mut acc[3], label, &hit_dia_ids(&ca), &qa.evidence, ks);
             }
         }
     }
 
     // Pass 2 (D rows): attach the reranker and re-recall, isolating rerank from
     // fusion.
-    if let Some(dir) = &rr_dir {
-        let ce = CrossEncoder::ms_marco_minilm_l6(dir)?;
-        eng.set_reranker(Arc::new(ce), rerank_strategy_from_env());
+    if let Some(ce) = &reranker {
+        eng.set_reranker(ce.clone(), strategy);
         for s in samples {
             let as_of = s.as_of_micros();
-            let scored_qa: Vec<_> =
-                s.qa.iter()
-                    .filter(|qa| qa.category != Category::Adversarial && !qa.evidence.is_empty())
-                    .collect();
+            let scored_qa: Vec<_> = s.qa.iter().filter(|qa| qa.has_scored_evidence()).collect();
             let q_texts: Vec<&str> = scored_qa.iter().map(|qa| qa.question.as_str()).collect();
             let q_embs = embedder.embed_queries(&q_texts)?;
+            validate_embeddings(&q_embs, q_texts.len(), embedder.dim())?;
             for (qi, &qa) in scored_qa.iter().enumerate() {
-                let d_query = RecallQuery::by_embedding(q_embs[qi].clone(), MAX_K)
+                let d_query = RecallQuery::by_embedding(q_embs[qi].clone(), top_k)
                     .with_text(qa.question.as_str());
-                let d = eng.recall(&s.sample_id, d_query.clone())?;
+                let d = baseline_recall(eng, &s.sample_id, d_query.clone())?;
                 record(
                     &mut acc[4],
                     qa.category.label(),
                     &hit_dia_ids(&d),
                     &qa.evidence,
-                    KS,
+                    ks,
                 );
                 if let Some(t) = as_of {
-                    let da = eng.recall(&s.sample_id, d_query.with_as_of(t))?;
+                    let da = baseline_recall(eng, &s.sample_id, d_query.with_as_of(t))?;
                     record(
                         &mut acc[5],
                         qa.category.label(),
                         &hit_dia_ids(&da),
                         &qa.evidence,
-                        KS,
+                        ks,
                     );
                 }
             }
@@ -549,25 +423,25 @@ fn run_retrieval_diag(
     }
     eprintln!(
         "\n=== layered retrieval diagnostic: evidence recall@{}/{}/{} as any%/all% ===",
-        KS[0], KS[1], KS[2]
+        ks[0], ks[1], ks[2]
     );
     for (mi, name) in mode_names.iter().enumerate() {
-        if mi >= 4 && rr_dir.is_none() {
+        if mi >= 4 && reranker.is_none() {
             continue;
         }
         eprintln!("\n[{name}]");
         let mut tot = Tally::default();
         for label in labels {
             if let Some(t) = acc[mi].get(label) {
-                eprintln!("  {label:>12} (n={:>4}): {}", t.n, t.cells(KS));
-                for ki in 0..KS.len() {
+                eprintln!("  {label:>12} (n={:>4}): {}", t.n, t.cells(ks));
+                for ki in 0..ks.len() {
                     tot.any[ki] += t.any[ki];
                     tot.all[ki] += t.all[ki];
                 }
                 tot.n += t.n;
             }
         }
-        eprintln!("  {:>12} (n={:>4}): {}", "OVERALL", tot.n, tot.cells(KS));
+        eprintln!("  {:>12} (n={:>4}): {}", "OVERALL", tot.n, tot.cells(ks));
     }
     Ok(())
 }
@@ -608,20 +482,19 @@ fn run_param_sweep(
     eng: &mut MemoryEngine,
     samples: &[Sample],
     embedder: Arc<dyn Embedder>,
+    top_k: usize,
+    reranker: Option<Arc<CrossEncoder>>,
 ) -> Result<(), Box<dyn Error>> {
-    const KS: [usize; 3] = [10, 30, 50];
-    const MAX_K: usize = 50;
+    let ks = [10.min(top_k), 30.min(top_k), top_k];
 
     let mut cases: Vec<SweepCase> = Vec::new();
     for s in samples {
         citadel_membench::create_bench_region(eng, &s.sample_id, Arc::clone(&embedder))?;
         ingest_sample(eng, &s.sample_id, s)?;
-        let scored_qa: Vec<_> =
-            s.qa.iter()
-                .filter(|qa| qa.category != Category::Adversarial && !qa.evidence.is_empty())
-                .collect();
+        let scored_qa: Vec<_> = s.qa.iter().filter(|qa| qa.has_scored_evidence()).collect();
         let q_texts: Vec<&str> = scored_qa.iter().map(|qa| qa.question.as_str()).collect();
         let q_embs = embedder.embed_queries(&q_texts)?;
+        validate_embeddings(&q_embs, q_texts.len(), embedder.dim())?;
         let questions = scored_qa
             .iter()
             .zip(q_embs)
@@ -651,20 +524,19 @@ fn run_param_sweep(
             recency: 0.0,
             importance: 0.0,
         };
-        let t = sweep_combo(eng, &cases, w, KS, MAX_K)?;
+        let t = sweep_combo(eng, &cases, w, ks, top_k)?;
         eprintln!(
             "  sem {sem:.2} / kw {kw:.2} (n={:>4}): {}",
             t.n,
-            t.cells(KS)
+            t.cells(ks)
         );
         phase1.push(((sem, kw), t));
     }
 
-    let Ok(rr_dir) = std::env::var("CITADEL_RERANKER_DIR") else {
+    let Some(ce) = reranker else {
         eprintln!("\nphase 2 skipped: set CITADEL_RERANKER_DIR to sweep rerank strategies");
         return Ok(());
     };
-    let ce = Arc::new(CrossEncoder::ms_marco_minilm_l6(&rr_dir)?);
     phase1.sort_by(|a, b| b.1.any[2].cmp(&a.1.any[2]));
     let top: Vec<(f32, f32)> = phase1.iter().take(2).map(|(ratio, _)| *ratio).collect();
 
@@ -684,8 +556,8 @@ fn run_param_sweep(
         };
         for &strategy in &strategies {
             eng.set_reranker(ce.clone(), strategy);
-            let t = sweep_combo(eng, &cases, w, KS, MAX_K)?;
-            eprintln!("  sem {sem:.2} / kw {kw:.2}  {strategy:?}: {}", t.cells(KS));
+            let t = sweep_combo(eng, &cases, w, ks, top_k)?;
+            eprintln!("  sem {sem:.2} / kw {kw:.2}  {strategy:?}: {}", t.cells(ks));
         }
     }
     Ok(())
@@ -814,10 +686,7 @@ fn run_db_dump(
     Ok(())
 }
 
-/// Token-free encryption + erasure demo on one conversation: ingest into an
-/// encrypted region, prove PRISM-over-sealed recall, then exercise
-/// `forget_atom`/`drop_region`, printing the key-store sidecar bytes
-/// before/after so the destruction is visible.
+/// Inspect encrypted recall, atom deletion, and region deletion locally.
 fn run_erasure_demo(
     eng: &MemoryEngine,
     db: Arc<citadel::Database>,
@@ -828,8 +697,10 @@ fn run_erasure_demo(
     let region = s.sample_id.as_str();
     let atom_sidecar = db.atom_store_path();
     let region_sidecar = db.region_store_path();
-    let len = |p: &std::path::Path| std::fs::read(p).unwrap_or_default().len();
-    let bytes = |p: &std::path::Path| std::fs::read(p).unwrap_or_default();
+    if s.turns.is_empty() {
+        return Err("erasure demo requires a nonempty conversation".into());
+    }
+    let bytes = |p: &std::path::Path| std::fs::read(p);
 
     eprintln!("\n=== ERASURE DEMO: region '{region}' (ENCRYPTED, per-atom sealed) ===");
     eng.create_encrypted_region(region, Arc::clone(&embedder))?;
@@ -838,9 +709,9 @@ fn run_erasure_demo(
         "ingested {} atoms (each sealed under its own ACK)\n  atomkeys sidecar:  {} = {} bytes\n  regions sidecar:   {} = {} bytes",
         ids.len(),
         atom_sidecar.display(),
-        len(&atom_sidecar),
+        std::fs::metadata(&atom_sidecar)?.len(),
         region_sidecar.display(),
-        len(&region_sidecar)
+        std::fs::metadata(&region_sidecar)?.len()
     );
 
     // PRISM over sealed content: a real turn must surface through
@@ -861,17 +732,20 @@ fn run_erasure_demo(
 
     // Per-atom erasure: forget the top hit, show recall drops it + the ACK slot
     // changes.
-    let before = bytes(&atom_sidecar);
+    let before = bytes(&atom_sidecar)?;
     eprintln!(
         "\n[per-atom erasure] forgetting atom {target} (present_before={})",
         eng.fetch_one(region, target)?.is_some()
     );
     eng.forget_atom(region, target)?;
-    let after = bytes(&atom_sidecar);
+    let after = bytes(&atom_sidecar)?;
     let recalled_again = eng
         .recall(region, RecallQuery::by_text(&needle_text, 5))?
         .iter()
         .any(|h| h.id == target);
+    if before == after || recalled_again || eng.fetch_one(region, target)?.is_some() {
+        return Err("atom deletion did not remove the atom and update its key store".into());
+    }
     eprintln!(
         "  atomkeys sidecar overwritten={} ({} -> {} bytes)\n  fetch_one(target)={:?}  recalled_again={recalled_again}",
         before != after,
@@ -880,6 +754,9 @@ fn run_erasure_demo(
         eng.fetch_one(region, target)?.map(|a| a.text)
     );
     if let Some(sib) = ids.iter().copied().find(|&i| i != target) {
+        if eng.fetch_one(region, sib)?.is_none() {
+            return Err("atom deletion removed an unrelated atom".into());
+        }
         eprintln!(
             "  sibling atom {sib} survives={}",
             eng.fetch_one(region, sib)?.is_some()
@@ -888,13 +765,16 @@ fn run_erasure_demo(
 
     // Per-region erasure: drop the region, show recall empties + the RCK slot
     // changes.
-    let rbefore = bytes(&region_sidecar);
+    let rbefore = bytes(&region_sidecar)?;
     eng.drop_region(region)?;
-    let rafter = bytes(&region_sidecar);
+    let rafter = bytes(&region_sidecar)?;
     eng.create_encrypted_region(region, Arc::clone(&embedder))?;
     let after_drop = eng.recall(region, RecallQuery::by_text(&needle_text, 5))?;
+    if rbefore == rafter || !after_drop.is_empty() {
+        return Err("region deletion did not clear recall and update its key store".into());
+    }
     eprintln!(
-        "\n[per-region erasure] drop_region('{region}')\n  regions sidecar overwritten={} ({} -> {} bytes)\n  re-create by name -> recall returns {} hits (content unrecoverable)",
+        "\n[per-region erasure] drop_region('{region}')\n  regions sidecar overwritten={} ({} -> {} bytes)\n  re-create by name -> recall returns {} hits",
         rbefore != rafter,
         rbefore.len(),
         rafter.len(),
@@ -914,12 +794,14 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 /// Cosine similarity, computed fully (robust regardless of normalization).
-fn cosine(a: &[f32], b: &[f32]) -> f32 {
-    let (mut dot, mut na, mut nb) = (0.0f32, 0.0f32, 0.0f32);
-    for i in 0..a.len().min(b.len()) {
-        dot += a[i] * b[i];
-        na += a[i] * a[i];
-        nb += b[i] * b[i];
+fn cosine(a: &[f32], b: &[f32]) -> f64 {
+    debug_assert_eq!(a.len(), b.len());
+    let (mut dot, mut na, mut nb) = (0.0f64, 0.0f64, 0.0f64);
+    for (&a, &b) in a.iter().zip(b) {
+        let (a, b) = (f64::from(a), f64::from(b));
+        dot += a * b;
+        na += a * a;
+        nb += b * b;
     }
     if na == 0.0 || nb == 0.0 {
         0.0
@@ -1045,8 +927,58 @@ fn print_summary(report: &citadel_membench::BenchReport) {
         eprintln!("unscorable (empty gold key): {}", report.unscorable_total);
     }
     eprintln!("recall p95: {} us", report.recall_p95_micros);
+    let cost = report
+        .estimated_cost_usd
+        .map_or_else(|| "unknown".to_string(), |cost| format!("~${cost:.4}"));
     eprintln!(
-        "tokens: in {} / out {}  est cost ~${:.4}",
-        report.total_input_tokens, report.total_output_tokens, report.estimated_cost_usd
+        "tokens: in {} / out {}  est cost {cost}",
+        report.total_input_tokens, report.total_output_tokens
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exact_cosine_stays_finite_for_large_finite_vectors() {
+        assert_eq!(cosine(&[f32::MAX, f32::MAX], &[f32::MAX, f32::MAX]), 1.0);
+        assert_eq!(cosine(&[0.0, 0.0], &[1.0, 0.0]), 0.0);
+    }
+
+    #[test]
+    fn erasure_demo_checks_atom_and_region_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            citadel::DatabaseBuilder::new(dir.path().join("demo.cdl"))
+                .passphrase(b"test")
+                .argon2_profile(citadel::Argon2Profile::Iot)
+                .enable_region_keys(true)
+                .create()
+                .unwrap(),
+        );
+        let eng = MemoryEngine::open(db.clone()).unwrap();
+        let sample = Sample {
+            sample_id: "demo".into(),
+            turns: (0..2)
+                .map(|n| citadel_membench::Turn {
+                    session: 1,
+                    date_time: "1:56 pm on 8 May, 2023".into(),
+                    speaker: "Alice".into(),
+                    dia_id: format!("D1:{n}"),
+                    text: format!("test turn {n}"),
+                    blip_caption: String::new(),
+                    query: String::new(),
+                })
+                .collect(),
+            qa: Vec::new(),
+        };
+        run_erasure_demo(
+            &eng,
+            db,
+            &[sample],
+            Arc::new(citadel_mem::MockEmbedder::new(8)),
+        )
+        .unwrap();
+    }
 }

@@ -4,6 +4,7 @@
 pub mod agentic;
 pub mod benchmark;
 pub mod civil;
+pub mod config;
 pub mod db;
 pub mod error;
 pub mod eval;

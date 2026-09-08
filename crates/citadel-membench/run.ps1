@@ -1,123 +1,215 @@
-# Run the LoCoMo benchmark -> runs/<stamp>__<label>/: report.json, audit.json, live.jsonl, run.log
-# Regions are encrypted by default; reader and judge default to gpt-4o-mini.
-# No machine-specific paths are committed: locations default to environment variables and
-# are overridable by flags. Set these once (or pass the matching flag):
-#   $env:CITADEL_LOCOMO_DATASET    the locomo10.json dataset      (-Dataset)
-#   $env:CITADEL_EMBEDDER_DIR     the embedder model directory   (-EmbedderDir)
-#   $env:CITADEL_RERANKER_DIR      the reranker model directory   (-RerankDir, optional)
-#   $env:OPENAI_API_KEY            the API key directly, or
-#   $env:OPENAI_KEY_FILE           a file holding the key         (-KeyFile); the key is never printed
-#   pwsh -File run.ps1 -Label live2 -MaxSamples 2 -Embedder e5-large
+<#
+.SYNOPSIS
+Runs LoCoMo or LongMemEval through the native benchmark executable.
+.EXAMPLE
+./run.ps1 -Label baseline -Dataset ./locomo10.json -EmbedderDir ./models/e5-large
+.EXAMPLE
+./run.ps1 -Benchmark longmemeval -Label baseline -Dataset ./longmemeval_s_cleaned.json -EmbedderDir ./models/e5-large
+#>
+[CmdletBinding()]
 param(
-  [Parameter(Mandatory = $true)] [string]$Label,
-  [int]$MaxSamples = 0,                  # 0 = all; 1 = conv-26; 2 = first two
-  [string]$Reader  = "gpt-4o-mini",
-  [string]$Judge   = "gpt-4o-mini",
-  [string]$ReaderProvider = "openai",   # reader backend: openai | gemini | claude | ollama
-  [string]$ReasoningEffort = "",        # gemini reader only: low|medium|high ("" = model default)
-  [int]$MaxTokens = 0,                   # reader/judge output cap; 0 = default 512 (raise for a reasoning reader)
-  [int]$ReaderConcurrency = 6,
-  [int]$JudgeConcurrency  = 12,
-  [int]$ReaderTpm = 400000,             # pace under the reader's TPM limit
-  [int]$NeighborRadius = 0,             # adjacent turns rendered around each hit (#3); 0 = off
-  [string]$Dataset   = $env:CITADEL_LOCOMO_DATASET,
-  [string]$KeyFile   = $env:OPENAI_KEY_FILE,
+  [Parameter(Mandatory = $true)] [ValidateScript({ -not [string]::IsNullOrWhiteSpace($_) })] [string]$Label,
+  [ValidateSet('locomo', 'longmemeval')] [string]$Benchmark = 'locomo',
+  [ValidateSet('scored', 'retrieval-diag', 'param-sweep', 'dump', 'erasure', 'dry-run')]
+  [string]$Mode = 'scored',
+  [ValidateRange(0, [int]::MaxValue)] [int]$MaxSamples = 0,
+  [ValidateRange(1, [int]::MaxValue)] [int]$TopK = 50,
+  [ValidateScript({ -not [string]::IsNullOrWhiteSpace($_) })] [string]$Reader = 'gpt-4o-mini',
+  [ValidateScript({ -not [string]::IsNullOrWhiteSpace($_) })] [string]$Judge = 'gpt-4o-mini',
+  [ValidateSet('openai', 'gemini', 'claude', 'ollama')] [string]$ReaderProvider = 'openai',
+  [ValidateSet('openai', 'gemini', 'claude', 'ollama')] [string]$JudgeProvider = 'openai',
+  [ValidateSet('', 'low', 'medium', 'high')] [string]$ReasoningEffort = '',
+  [ValidateRange(0, [int]::MaxValue)] [int]$MaxTokens = 0,
+  [ValidateRange(1, [int]::MaxValue)] [int]$ReaderConcurrency = 6,
+  [ValidateRange(1, [int]::MaxValue)] [int]$JudgeConcurrency = 12,
+  [ValidateRange(1, [int]::MaxValue)] [int]$ReaderTpm = 400000,
+  [ValidateRange(1, [int]::MaxValue)] [int]$JudgeTpm = 1000000,
+  [ValidateSet('sessions', 'chrono', 'relevance')] [string]$ReaderOrder = 'sessions',
+  [ValidateRange(0, [int]::MaxValue)] [int]$NeighborRadius = 0,
+  [switch]$Agentic,
+  [string]$Dataset = '',
+  [ValidateScript({ -not [string]::IsNullOrWhiteSpace($_) })] [string]$OnlyQids = '',
+  [string]$DbPath = '',
+  [string]$KeyFile = $env:OPENAI_KEY_FILE,
   [string]$GeminiKeyFile = $env:GEMINI_KEY_FILE,
-  [string]$EmbedderDir    = $env:CITADEL_EMBEDDER_DIR,
-  [string]$Embedder  = "",              # "" = e5-large (default); else bge-large|bge-base|bge-small|e5-large-v2 (match -EmbedderDir)
+  [string]$AnthropicKeyFile = $env:ANTHROPIC_KEY_FILE,
+  [string]$EmbedderDir = $env:CITADEL_EMBEDDER_DIR,
+  [ValidateSet('e5-large', 'e5-large-v2', 'bge-small', 'bge-base', 'bge-large', 'granite-r2', 'arctic', 'modernbert-embed')]
+  [string]$Embedder = 'e5-large',
   [string]$RerankDir = $env:CITADEL_RERANKER_DIR,
-  [bool]$Encrypted   = $true,           # encrypted regions: per-atom sealed + crypto erasure
-  [switch]$DumpDb                       # also write a free DB dump (mock embed, no key)
+  [ValidateSet('rrf', 'replace')] [string]$RerankStrategy = 'rrf',
+  [bool]$Encrypted = $true,
+  [string]$Executable = '',
+  [string]$OutputRoot = (Join-Path $PSScriptRoot 'runs')
 )
 
-$ErrorActionPreference = "Stop"
-$root = $PSScriptRoot
-$exe  = Join-Path $root "..\..\target\release\locomo.exe"   # prefer the optimized build
-if (-not (Test-Path $exe)) { $exe = Join-Path $root "..\..\target\debug\locomo.exe" }
-if (-not (Test-Path $exe)) {
-  throw "locomo.exe not found (release or debug) - build: cargo build --release -p citadeldb-membench --features openai,cuda-embed --bin locomo"
+$ErrorActionPreference = 'Stop'
+$prefix = if ($Benchmark -eq 'locomo') { 'CITADEL_LOCOMO' } else { 'CITADEL_LONGMEMEVAL' }
+if (-not $PSBoundParameters.ContainsKey('Dataset')) {
+  $Dataset = [Environment]::GetEnvironmentVariable("${prefix}_DATASET", 'Process')
 }
-
-# Required inputs come from a flag or its environment-variable default.
-if (-not $Dataset)             { throw "No dataset. Pass -Dataset or set `$env:CITADEL_LOCOMO_DATASET." }
-if (-not (Test-Path $Dataset)) { throw "Dataset not found: $Dataset" }
-if (-not $EmbedderDir)              { throw "No embedder dir. Pass -EmbedderDir or set `$env:CITADEL_EMBEDDER_DIR." }
-if (-not (Test-Path $EmbedderDir))  { throw "Embedder dir not found: $EmbedderDir" }
-
-$stamp = Get-Date -Format "yyyy-MM-dd_HHmm"
-$safeLabel = ($Label -replace '[^A-Za-z0-9._-]', '-')
-$dir = Join-Path $root "runs\${stamp}__${safeLabel}"
-New-Item -ItemType Directory -Force -Path $dir | Out-Null
-
-$env:CITADEL_EMBEDDER_DIR        = $EmbedderDir
-$env:CITADEL_LOCOMO_EMBEDDER      = $Embedder
-$env:CITADEL_LOCOMO_RERANK_STRATEGY = "rrf"
-$env:CITADEL_LOCOMO_READER_ORDER = "sessions"
-$env:CITADEL_LOCOMO_NEIGHBOR_RADIUS = "$NeighborRadius"
-$env:CITADEL_LOCOMO_ENCRYPTED     = $Encrypted
-# Single-reader-call lane: never inherit multi-call aggregation from a parent shell.
-Remove-Item Env:\CITADEL_LOCOMO_AGENTIC -ErrorAction SilentlyContinue
-if ($RerankDir) { $env:CITADEL_RERANKER_DIR = $RerankDir }
-
-# Judge always runs on gpt-4o-mini (OPENAI_API_KEY); the reader may use a different
-# backend. Use an already-set OPENAI_API_KEY, else read it from the key file. Never printed.
-if (-not $env:OPENAI_API_KEY) {
-  if (-not $KeyFile)             { throw "No API key. Set `$env:OPENAI_API_KEY, or pass -KeyFile / set `$env:OPENAI_KEY_FILE." }
-  if (-not (Test-Path $KeyFile)) { throw "Key file not found: $KeyFile" }
-  $env:OPENAI_API_KEY = (Get-Content $KeyFile -Raw).Trim()
+if ($Benchmark -eq 'longmemeval') {
+  if ($Mode -notin @('scored', 'retrieval-diag', 'dry-run')) { throw "LongMemEval does not support -Mode $Mode." }
+  foreach ($name in @('ReaderOrder', 'Judge', 'JudgeProvider', 'JudgeConcurrency', 'JudgeTpm')) {
+    if ($PSBoundParameters.ContainsKey($name)) { throw "-$name is LoCoMo-only." }
+  }
+  if (-not $PSBoundParameters.ContainsKey('Reader')) { $Reader = 'gpt-4o' }
+  if (-not $PSBoundParameters.ContainsKey('ReaderConcurrency')) { $ReaderConcurrency = 3 }
+  if (-not $PSBoundParameters.ContainsKey('Encrypted')) { $Encrypted = $false }
+} elseif ($PSBoundParameters.ContainsKey('OnlyQids')) {
+  throw '-OnlyQids is LongMemEval-only.'
 }
-
-# Reader backend: default openai; "gemini" uses the OpenAI-compatible Gemini endpoint
-# with its OWN key, so the gpt-4o-mini judge keeps using OPENAI_API_KEY.
-$env:CITADEL_LOCOMO_READER_PROVIDER = $ReaderProvider
-if ($ReaderProvider -eq "gemini" -and -not $env:GEMINI_API_KEY) {
-  if (-not $GeminiKeyFile)             { throw "Gemini reader needs a key. Pass -GeminiKeyFile or set `$env:GEMINI_KEY_FILE." }
-  if (-not (Test-Path $GeminiKeyFile)) { throw "Gemini key file not found: $GeminiKeyFile" }
-  $env:GEMINI_API_KEY = (Get-Content $GeminiKeyFile -Raw).Trim()
-}
-if ($ReasoningEffort) { $env:CITADEL_GEMINI_REASONING_EFFORT = $ReasoningEffort }
-if ($MaxTokens -gt 0) { $env:CITADEL_MEMBENCH_MAX_TOKENS = "$MaxTokens" }
-
-$env:CITADEL_LOCOMO_READER_MODEL = $Reader
-$env:CITADEL_LOCOMO_JUDGE_MODEL  = $Judge
-$env:CITADEL_LOCOMO_READER_CONCURRENCY = "$ReaderConcurrency"
-$env:CITADEL_LOCOMO_JUDGE_CONCURRENCY  = "$JudgeConcurrency"
-$env:CITADEL_LOCOMO_READER_TPM = "$ReaderTpm"
-$env:CITADEL_LOCOMO_LIVE_TRACE = Join-Path $dir "live.jsonl"
-$env:CITADEL_LOCOMO_AUDIT_PATH = Join-Path $dir "audit.json"
-if ($MaxSamples -gt 0) {
-  $env:CITADEL_LOCOMO_MAX_SAMPLES = "$MaxSamples"
+if ($Mode -ne 'scored') {
+  foreach ($name in @('Reader', 'Judge', 'ReaderProvider', 'JudgeProvider', 'ReaderConcurrency',
+      'JudgeConcurrency', 'ReaderTpm', 'JudgeTpm', 'ReaderOrder', 'Agentic', 'MaxTokens', 'ReasoningEffort')) {
+    if ($PSBoundParameters.ContainsKey($name)) { throw "-$name requires scored mode." }
+  }
 } else {
-  Remove-Item Env:\CITADEL_LOCOMO_MAX_SAMPLES -ErrorAction SilentlyContinue
+  if ($ReaderProvider -ne 'openai' -and -not $PSBoundParameters.ContainsKey('Reader')) { throw 'A non-OpenAI reader requires an explicit -Reader model.' }
+  if ($Benchmark -eq 'locomo' -and $JudgeProvider -ne 'openai' -and -not $PSBoundParameters.ContainsKey('Judge')) { throw 'A non-OpenAI judge requires an explicit -Judge model.' }
+  if ($ReasoningEffort -and $ReaderProvider -ne 'gemini' -and ($Benchmark -ne 'locomo' -or $JudgeProvider -ne 'gemini')) {
+    throw '-ReasoningEffort requires a Gemini reader or judge.'
+  }
 }
-
-$report = Join-Path $dir "report.json"
-$log    = Join-Path $dir "run.log"
-$embLabel = if ($Embedder) { $Embedder } else { "e5-large" }
-"run: $Label  reader=$Reader ($ReaderProvider) judge=$Judge order=sessions agentic=false maxSamples=$MaxSamples encrypted=$Encrypted embedder=$embLabel  started $(Get-Date -Format o)" | Set-Content $log
-Write-Host "run dir: $dir"
-Write-Host "watch:   pwsh -File watch.ps1"
-
-# Optional free DB dump (mock embed, no key): a separate early-exit pass.
-if ($DumpDb) {
-  $dump = Join-Path $dir "db-dump.txt"
-  $env:CITADEL_LOCOMO_MOCK_EMBED = "1"; $env:CITADEL_LOCOMO_DUMP_DB = "1"
-  & $exe $Dataset 1> $null 2> $dump
-  Remove-Item Env:\CITADEL_LOCOMO_MOCK_EMBED, Env:\CITADEL_LOCOMO_DUMP_DB -ErrorAction SilentlyContinue
-  Write-Host "db dump: $dump"
+if ([string]::IsNullOrWhiteSpace($Dataset) -or -not (Test-Path -LiteralPath $Dataset -PathType Leaf)) {
+  throw "Pass -Dataset pointing to a dataset file, or set ${prefix}_DATASET."
 }
+if ($OnlyQids -and -not (Test-Path -LiteralPath $OnlyQids -PathType Leaf)) { throw '-OnlyQids must name a question-ID file.' }
+if ($Mode -notin @('dry-run', 'dump') -and
+    ([string]::IsNullOrWhiteSpace($EmbedderDir) -or -not (Test-Path -LiteralPath $EmbedderDir -PathType Container))) {
+  throw 'Pass -EmbedderDir pointing to a model directory, or set CITADEL_EMBEDDER_DIR.'
+}
+$usesEmbedder = $Mode -notin @('dry-run', 'dump')
+$usesReranker = $Mode -in @('scored', 'retrieval-diag', 'param-sweep')
+if ($usesReranker -and $RerankDir -and -not (Test-Path -LiteralPath $RerankDir -PathType Container)) {
+  throw "Reranker directory not found: $RerankDir"
+}
+if ($DbPath -and $Mode -ne 'scored' -and -not ($Benchmark -eq 'longmemeval' -and $Mode -eq 'retrieval-diag')) { throw '-DbPath requires scored mode or LongMemEval retrieval-diag.' }
+if ($DbPath) {
+  $DbPath = [IO.Path]::GetFullPath($DbPath)
+  if ((Test-Path -LiteralPath $DbPath -PathType Container) -or -not (Test-Path -LiteralPath ([IO.Path]::GetDirectoryName($DbPath)) -PathType Container)) {
+    throw '-DbPath must name a file in an existing directory.'
+  }
+}
+if ($Mode -in @('retrieval-diag', 'param-sweep') -and $NeighborRadius -ne 0) { throw 'Diagnostics measure recall before neighbor expansion; use -NeighborRadius 0.' }
+if (-not $Executable) {
+  $binary = if ($IsWindows) { "$Benchmark.exe" } else { $Benchmark }
+  $Executable = Join-Path $PSScriptRoot "../../target/release/$binary"
+}
+if (-not (Test-Path -LiteralPath $Executable -PathType Leaf)) {
+  throw "Release executable not found. Build: cargo build --release -p citadeldb-membench --features openai,candle-embed --bin $Benchmark; add the selected provider feature when needed, or pass -Executable."
+}
+$Executable = (Resolve-Path -LiteralPath $Executable).Path
+$Dataset = (Resolve-Path -LiteralPath $Dataset).Path
+if ($OnlyQids) { $OnlyQids = (Resolve-Path -LiteralPath $OnlyQids).Path }
+$credentials = @{}
+if ($Mode -eq 'scored') {
+  $providers = @($ReaderProvider)
+  if ($Benchmark -eq 'locomo') { $providers += $JudgeProvider }
+  foreach ($provider in $providers | Select-Object -Unique) {
+    if ($provider -eq 'ollama') { continue }
+    $name, $path = switch ($provider) {
+      'openai' { 'OPENAI_API_KEY'; $KeyFile }
+      'gemini' { 'GEMINI_API_KEY'; $GeminiKeyFile }
+      'claude' { 'ANTHROPIC_API_KEY'; $AnthropicKeyFile }
+    }
+    $key = [Environment]::GetEnvironmentVariable($name, 'Process')
+    if ([string]::IsNullOrWhiteSpace($key)) {
+      if (-not $path -or -not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "$provider requires $name or its key-file option." }
+      $key = (Get-Content -LiteralPath $path -Raw).Trim()
+    }
+    if ([string]::IsNullOrWhiteSpace($key)) { throw "$provider credential is empty." }
+    $credentials[$name] = $key
+  }
+}
+$safeLabel = $Label -replace '[^A-Za-z0-9._-]', '-'
+$stamp = Get-Date -Format 'yyyy-MM-dd_HHmmss_fffffff'
+$dir = Join-Path $OutputRoot ("${stamp}__${safeLabel}_" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+New-Item -ItemType Directory -Path $dir | Out-Null
+$dir = (Resolve-Path -LiteralPath $dir).Path
+$log = Join-Path $dir 'run.log'
+$stdoutName = if ($Benchmark -eq 'locomo' -and $Mode -eq 'scored') { 'report.json' } else { 'output.txt' }
+$stdout = Join-Path $dir $stdoutName
 
-$t0 = Get-Date
-& $exe $Dataset 1> $report 2>> $log
-$code = $LASTEXITCODE
-"EXIT=$code  WALL_SEC=$([math]::Round(((Get-Date) - $t0).TotalSeconds))  finished $(Get-Date -Format o)" | Add-Content $log
-
-Remove-Item Env:\OPENAI_API_KEY -ErrorAction SilentlyContinue
-Remove-Item Env:\GEMINI_API_KEY -ErrorAction SilentlyContinue
-Remove-Item Env:\CITADEL_LOCOMO_READER_PROVIDER -ErrorAction SilentlyContinue
-Remove-Item Env:\CITADEL_GEMINI_REASONING_EFFORT -ErrorAction SilentlyContinue
-Remove-Item Env:\CITADEL_MEMBENCH_MAX_TOKENS -ErrorAction SilentlyContinue
-Remove-Item Env:\CITADEL_LOCOMO_MAX_SAMPLES -ErrorAction SilentlyContinue
-Remove-Item Env:\CITADEL_LOCOMO_READER_ORDER -ErrorAction SilentlyContinue
-Remove-Item Env:\CITADEL_LOCOMO_NEIGHBOR_RADIUS -ErrorAction SilentlyContinue
-Write-Host "done: EXIT=$code  ->  $dir"
+$sharedNames = @('CITADEL_EMBEDDER_DIR', 'CITADEL_RERANKER_DIR', 'CITADEL_GEMINI_REASONING_EFFORT',
+  'CITADEL_MEMBENCH_MAX_TOKENS', 'OPENAI_API_KEY', 'GEMINI_API_KEY', 'ANTHROPIC_API_KEY')
+$environmentComparison = if ($IsWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+$environmentComparer = if ($IsWindows) { [StringComparer]::OrdinalIgnoreCase } else { [StringComparer]::Ordinal }
+$sharedSet = [Collections.Generic.HashSet[string]]::new([string[]]$sharedNames, $environmentComparer)
+function Test-ManagedEnvironmentName([string]$Name) {
+  $Name.StartsWith('CITADEL_LOCOMO_', $environmentComparison) -or
+    $Name.StartsWith('CITADEL_LONGMEMEVAL_', $environmentComparison) -or $sharedSet.Contains($Name)
+}
+$saved = [Collections.Generic.Dictionary[string, string]]::new($environmentComparer)
+foreach ($entry in Get-ChildItem Env:) {
+  if (Test-ManagedEnvironmentName $entry.Name) {
+    $saved[$entry.Name] = $entry.Value
+  }
+}
+$code = 0
+$nativeErrorPreference = $PSNativeCommandUseErrorActionPreference
+try {
+  $PSNativeCommandUseErrorActionPreference = $false
+  foreach ($entry in @(Get-ChildItem Env: | Where-Object { Test-ManagedEnvironmentName $_.Name })) {
+    Remove-Item -LiteralPath "Env:$($entry.Name)"
+  }
+  $values = @{
+    "${prefix}_MODE" = $Mode
+    "${prefix}_TOP_K" = "$TopK"
+    "${prefix}_EMBEDDER" = $Embedder
+    "${prefix}_ENCRYPTED" = $Encrypted.ToString().ToLowerInvariant()
+    "${prefix}_RERANK_STRATEGY" = $RerankStrategy
+    "${prefix}_NEIGHBOR_RADIUS" = "$NeighborRadius"
+  }
+  if ($usesEmbedder) { $values.CITADEL_EMBEDDER_DIR = (Resolve-Path -LiteralPath $EmbedderDir).Path }
+  if ($usesReranker -and $RerankDir) { $values.CITADEL_RERANKER_DIR = (Resolve-Path -LiteralPath $RerankDir).Path }
+  if ($DbPath) { $values["${prefix}_DB_PATH"] = $DbPath }
+  if ($OnlyQids) { $values.CITADEL_LONGMEMEVAL_ONLY_QIDS = $OnlyQids }
+  if ($MaxSamples -gt 0) { $values["${prefix}_MAX_SAMPLES"] = "$MaxSamples" }
+  if ($MaxTokens -gt 0) { $values.CITADEL_MEMBENCH_MAX_TOKENS = "$MaxTokens" }
+  if ($ReasoningEffort) { $values.CITADEL_GEMINI_REASONING_EFFORT = $ReasoningEffort }
+  if ($Mode -eq 'scored') {
+    $values["${prefix}_READER_MODEL"] = $Reader
+    $values["${prefix}_READER_PROVIDER"] = $ReaderProvider
+    $values["${prefix}_READER_CONCURRENCY"] = "$ReaderConcurrency"
+    if ($Benchmark -eq 'locomo' -or $PSBoundParameters.ContainsKey('ReaderTpm')) { $values["${prefix}_READER_TPM"] = "$ReaderTpm" }
+    if ($Agentic) { $values["${prefix}_AGENTIC"] = 'true' }
+    if ($Benchmark -eq 'locomo') {
+      $values.CITADEL_LOCOMO_READER_ORDER = $ReaderOrder
+      $values.CITADEL_LOCOMO_JUDGE_MODEL = $Judge
+      $values.CITADEL_LOCOMO_JUDGE_PROVIDER = $JudgeProvider
+      $values.CITADEL_LOCOMO_JUDGE_CONCURRENCY = "$JudgeConcurrency"
+      $values.CITADEL_LOCOMO_JUDGE_TPM = "$JudgeTpm"
+      $values.CITADEL_LOCOMO_LIVE_TRACE = Join-Path $dir 'live.jsonl'
+      $values.CITADEL_LOCOMO_AUDIT_PATH = Join-Path $dir 'audit.json'
+    } else {
+      $values.CITADEL_LONGMEMEVAL_OUT = Join-Path $dir 'hypotheses.jsonl'
+      $values.CITADEL_LONGMEMEVAL_AUDIT_PATH = Join-Path $dir 'audit.jsonl'
+    }
+    foreach ($name in $credentials.Keys) { $values[$name] = $credentials[$name] }
+  }
+  foreach ($name in $values.Keys) { [Environment]::SetEnvironmentVariable($name, $values[$name], 'Process') }
+  "benchmark=$Benchmark mode=$Mode label=$Label started=$(Get-Date -Format o)" | Set-Content -LiteralPath $log
+  Write-Host "run dir: $dir"
+  $started = Get-Date
+  & $Executable $Dataset 1> $stdout 2>> $log
+  $code = $LASTEXITCODE
+  "EXIT=$code WALL_SEC=$([math]::Round(((Get-Date) - $started).TotalSeconds))" | Add-Content -LiteralPath $log
+}
+catch {
+  $launchError = $_
+  try { 'EXIT=1' | Add-Content -LiteralPath $log }
+  catch { Write-Warning 'Could not append launch failure status to run.log.' -WarningAction Continue }
+  throw $launchError
+}
+finally {
+  $PSNativeCommandUseErrorActionPreference = $nativeErrorPreference
+  foreach ($entry in @(Get-ChildItem Env:)) {
+    if (Test-ManagedEnvironmentName $entry.Name) {
+      Remove-Item -LiteralPath "Env:$($entry.Name)"
+    }
+  }
+  foreach ($name in $saved.Keys) { [Environment]::SetEnvironmentVariable($name, $saved[$name], 'Process') }
+}
+Write-Host "done: EXIT=$code -> $dir"
+if ($code -ne 0) { exit $code }

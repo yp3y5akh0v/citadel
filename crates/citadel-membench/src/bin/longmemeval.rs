@@ -1,38 +1,5 @@
-//! Live LongMemEval runner. Emit-only: writes a `{question_id, hypothesis}`
-//! JSONL prediction file; the official score comes from the LongMemEval repo's
-//! Python, not this binary. Gated behind `openai` + `candle-embed` so CI never
-//! compiles it.
-//!
-//! Usage:
-//!   OPENAI_API_KEY=...  CITADEL_EMBEDDER_DIR=/path/to/e5-large  \
-//!     cargo run -p citadeldb-membench --features openai,candle-embed \
-//!     --bin longmemeval -- path/to/longmemeval_oracle.json
-//!
-//! Then score with the official repo (gpt-4o-2024-08-06 judge):
-//!   python3 evaluate_qa.py gpt-4o hypotheses.jsonl longmemeval_oracle.json
-//!   python3 print_qa_metrics.py hypotheses.jsonl.eval-results-gpt-4o DATASET
-//!
-//! Dataset path: argv[1] or CITADEL_LONGMEMEVAL_DATASET. Env knobs:
-//!   CITADEL_LONGMEMEVAL_OUT=path        predictions (def hypotheses.jsonl)
-//!   CITADEL_LONGMEMEVAL_READER_MODEL=m  reader model (default gpt-4o)
-//!   CITADEL_LONGMEMEVAL_TOP_K=n         memories per question (default 50)
-//!   CITADEL_LONGMEMEVAL_NEIGHBOR_RADIUS=n  adjacent turns per hit (default 0)
-//!   CITADEL_LONGMEMEVAL_READER_CONCURRENCY  reader calls in flight (default 3)
-//!   CITADEL_LONGMEMEVAL_READER_TPM      tokens/min cap (default per model)
-//!   CITADEL_MEMBENCH_MAX_TOKENS         reader output-token cap (default 800)
-//!   CITADEL_LONGMEMEVAL_ENCRYPTED=true  seal atoms per-key (default false)
-//!   CITADEL_LONGMEMEVAL_DB_PATH=path    persist + reuse the encrypted DB
-//!                             (validate before reuse; ENCRYPTED must match)
-//!   CITADEL_LONGMEMEVAL_MOCK_EMBED=1    deterministic embedder (smoke only)
-//!   CITADEL_LONGMEMEVAL_EMBEDDER=m      e5-large|e5-large-v2|bge-*|granite-r2
-//!   CITADEL_RERANKER_DIR=/path          cross-encoder reranker dir
-//!   CITADEL_LONGMEMEVAL_RERANK_STRATEGY  replace|rrf (default rrf)
-//!   CITADEL_LONGMEMEVAL_AGENTIC=1       agentic reader for aggregation Qs
-//!                             (extract -> count/sort -> answer); labeled apart
-//!   CITADEL_LONGMEMEVAL_ONLY_QIDS=path  keep only the listed question_ids
-//!   CITADEL_LONGMEMEVAL_MAX_SAMPLES=N   cap to the first N questions
-//!   CITADEL_LONGMEMEVAL_DRY_RUN=1       parse + print stats, then exit
-//!   CITADEL_LONGMEMEVAL_RETRIEVAL_DIAG=1  recall@k vs gold, no reader/key
+//! LongMemEval predictions and offline retrieval diagnostics. The official
+//! Python evaluator scores the emitted `{question_id, hypothesis}` JSONL.
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -40,34 +7,24 @@ use std::io::Write;
 use std::sync::Arc;
 use std::time::Instant;
 
-use citadel_llm::LLMClient;
-use citadel_mem::{
-    CandleEmbedder, CrossEncoder, Embedder, MemoryEngine, MockEmbedder, RecallProfile, RecallQuery,
-    RerankStrategy, Reranker,
-};
+use citadel_mem::{CrossEncoder, Embedder, MemoryEngine, RecallQuery, Reranker};
+use citadel_membench::benchmarks::longmemeval::config::{RunConfig, RunMode};
 use citadel_membench::benchmarks::longmemeval::retrieval::{
     distinct_session_ids, semantic_only_recall, Tally,
 };
 use citadel_membench::benchmarks::longmemeval::{dataset, ingest, run, LmevalConfig};
-use citadel_membench::{default_tpm_for_model, BenchConfig, Pacer, ReaderOrder};
+use citadel_membench::core::retrieval::baseline_recall;
+use citadel_membench::{default_tpm_for_model, Pacer};
 
 const DEFAULT_READER_MODEL: &str = "gpt-4o";
 
-fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .filter(|&n| n >= 1)
-        .unwrap_or(default)
-}
-
 fn main() -> Result<(), Box<dyn Error>> {
-    if let Ok(value) = std::env::var("CITADEL_LONGMEMEVAL_READER_ORDER") {
-        return Err(format!(
-            "CITADEL_LONGMEMEVAL_READER_ORDER={value:?} is unsupported: LongMemEval uses one \
-             canonical prompt order (sessions by date, turns by conversation order); unset it"
-        )
-        .into());
+    let launch = RunConfig::from_env()?;
+    if launch.mode == RunMode::Scored {
+        citadel_membench::core::config::preflight_llm(
+            "CITADEL_LONGMEMEVAL_READER",
+            DEFAULT_READER_MODEL,
+        )?;
     }
 
     let dataset_path = std::env::args()
@@ -76,24 +33,36 @@ fn main() -> Result<(), Box<dyn Error>> {
         .ok_or("dataset path required: argv[1] or CITADEL_LONGMEMEVAL_DATASET")?;
 
     let (mut samples, dataset_sha256) = dataset::load_with_hash(&dataset_path)?;
-    if let Ok(raw) = std::env::var("CITADEL_LONGMEMEVAL_MAX_SAMPLES") {
-        let n: usize = raw
-            .parse()
-            .map_err(|_| "CITADEL_LONGMEMEVAL_MAX_SAMPLES must be a non-negative integer")?;
+    if let Ok(path) = std::env::var("CITADEL_LONGMEMEVAL_ONLY_QIDS") {
+        let mut keep = rustc_hash::FxHashSet::default();
+        for id in std::fs::read_to_string(&path)?
+            .lines()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            if !keep.insert(id.to_string()) {
+                return Err(format!("duplicate question_id in {path}: {id}").into());
+            }
+        }
+        if keep.is_empty() {
+            return Err("CITADEL_LONGMEMEVAL_ONLY_QIDS contains no question IDs".into());
+        }
+        let known: rustc_hash::FxHashSet<_> =
+            samples.iter().map(|s| s.question_id.as_str()).collect();
+        for id in &keep {
+            if !known.contains(id.as_str()) {
+                return Err(
+                    format!("question_id from {path} is missing from dataset: {id}").into(),
+                );
+            }
+        }
+        samples.retain(|s| keep.contains(&s.question_id));
+    }
+    if let Some(n) = launch.max_samples {
         samples.truncate(n);
     }
-    if let Ok(path) = std::env::var("CITADEL_LONGMEMEVAL_ONLY_QIDS") {
-        let keep: rustc_hash::FxHashSet<String> = std::fs::read_to_string(&path)?
-            .lines()
-            .map(|l| l.trim().to_string())
-            .filter(|l| !l.is_empty())
-            .collect();
-        samples.retain(|s| keep.contains(&s.question_id));
-        eprintln!(
-            "only-qids: {} of {} listed found",
-            samples.len(),
-            keep.len()
-        );
+    if samples.is_empty() {
+        return Err("dataset contains no selected questions".into());
     }
     let abstentions = samples.iter().filter(|s| s.abstention).count();
     eprintln!(
@@ -101,35 +70,41 @@ fn main() -> Result<(), Box<dyn Error>> {
         samples.len()
     );
 
-    if std::env::var("CITADEL_LONGMEMEVAL_DRY_RUN").is_ok() {
+    if launch.mode == RunMode::DryRun {
         eprintln!("dry run: dataset parsed OK, no LLM calls made.");
         return Ok(());
     }
 
-    let t_embed = Instant::now();
-    let embedder: Arc<dyn Embedder> = if std::env::var("CITADEL_LONGMEMEVAL_MOCK_EMBED").is_ok() {
-        Arc::new(MockEmbedder::new(384))
+    let reader = if launch.mode == RunMode::Scored {
+        Some(
+            citadel_llm::factory::from_env(
+                "CITADEL_LONGMEMEVAL_READER",
+                "openai",
+                DEFAULT_READER_MODEL,
+            )
+            .map_err(|e| format!("reader LLM: {e}"))?,
+        )
     } else {
-        let model_dir =
-            std::env::var("CITADEL_EMBEDDER_DIR").map_err(|_| "CITADEL_EMBEDDER_DIR not set")?;
-        let ce = match std::env::var("CITADEL_LONGMEMEVAL_EMBEDDER")
-            .unwrap_or_default()
-            .as_str()
-        {
-            "bge-base" => CandleEmbedder::bge_base(&model_dir)?,
-            "bge-large" => CandleEmbedder::bge_large(&model_dir)?,
-            "e5-large" => CandleEmbedder::e5_large(&model_dir)?,
-            "e5-large-v2" => CandleEmbedder::e5_large_v2(&model_dir)?,
-            "granite-r2" => CandleEmbedder::granite_r2(&model_dir)?,
-            _ => CandleEmbedder::e5_large(&model_dir)?,
-        };
-        Arc::new(ce)
+        None
     };
-    eprintln!("embedder loaded in {:.1}s", t_embed.elapsed().as_secs_f64());
+    let reranker = match std::env::var("CITADEL_RERANKER_DIR") {
+        Ok(dir) => Some(Arc::new(
+            CrossEncoder::ms_marco_minilm_l6(&dir).map_err(|e| format!("reranker model: {e}"))?,
+        )),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(_) => return Err("CITADEL_RERANKER_DIR must be Unicode text".into()),
+    };
+    let t_embed = Instant::now();
+    let model_dir =
+        std::env::var("CITADEL_EMBEDDER_DIR").map_err(|_| "CITADEL_EMBEDDER_DIR not set")?;
+    let embedder: Arc<dyn Embedder> = Arc::new(launch.embedder.load(&model_dir)?);
+    eprintln!(
+        "embedder: {} loaded in {:.1}s",
+        embedder.model_id(),
+        t_embed.elapsed().as_secs_f64()
+    );
 
-    let encrypted = std::env::var("CITADEL_LONGMEMEVAL_ENCRYPTED")
-        .map(|v| v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+    let encrypted = launch.encrypted;
     let bench_db = citadel_membench::open_bench_db("CITADEL_LONGMEMEVAL_DB_PATH", encrypted)?;
     let eng = MemoryEngine::open(Arc::clone(&bench_db.db))?;
     if bench_db.reuse {
@@ -146,56 +121,53 @@ fn main() -> Result<(), Box<dyn Error>> {
         eprintln!("db: temp (encrypted_regions={encrypted})");
     }
 
-    // Loaded before the diag so its recall@k matches the reader's reranked
-    // top-k.
-    match std::env::var("CITADEL_RERANKER_DIR") {
-        Ok(rr_dir) => {
-            let ce = CrossEncoder::ms_marco_minilm_l6(&rr_dir)?;
+    let reranker_model = match reranker {
+        Some(ce) => {
             let model = ce.model_id().to_string();
-            let strategy = rerank_strategy_from_env();
-            eng.set_reranker(Arc::new(ce), strategy);
-            eprintln!("reranker: {model} (from {rr_dir}) strategy={strategy:?}");
+            let strategy = launch.rerank_strategy;
+            eng.set_reranker(ce, strategy);
+            eprintln!("reranker: {model} strategy={strategy:?}");
+            Some(model)
         }
-        Err(_) => eprintln!("reranker: none (set CITADEL_RERANKER_DIR to enable)"),
-    }
+        None => {
+            eprintln!("reranker: none (set CITADEL_RERANKER_DIR to enable)");
+            None
+        }
+    };
 
     // Token-free retrieval diagnostic: no reader, no key.
-    if std::env::var("CITADEL_LONGMEMEVAL_RETRIEVAL_DIAG").is_ok() {
-        return run_retrieval_diag(&eng, &samples, embedder, encrypted, bench_db.reuse);
+    if launch.mode == RunMode::RetrievalDiag {
+        return run_retrieval_diag(
+            &eng,
+            &samples,
+            embedder,
+            encrypted,
+            bench_db.reuse,
+            launch.bench.top_k,
+        );
     }
 
-    let reader: Arc<dyn LLMClient> = citadel_llm::factory::from_env(
-        "CITADEL_LONGMEMEVAL_READER",
-        "openai",
-        DEFAULT_READER_MODEL,
-    )
-    .map_err(|e| format!("reader LLM: {e}"))?;
+    let reader = reader.ok_or("scored mode requires a reader client")?;
     let reader_model = reader.model_id().to_string();
-    let reader_tpm = std::env::var("CITADEL_LONGMEMEVAL_READER_TPM")
-        .ok()
-        .and_then(|s| s.parse().ok())
+    let reader_tpm = launch
+        .reader_tpm
         .unwrap_or_else(|| default_tpm_for_model(&reader_model));
     let pacer = Pacer::new(&reader_model, reader_tpm, &reader_model, reader_tpm);
     eprintln!("reader: {reader_model}  embedder: {}", embedder.model_id());
 
     let cfg = LmevalConfig {
-        bench: BenchConfig {
-            top_k: env_usize("CITADEL_LONGMEMEVAL_TOP_K", 50),
-            // Inert: build_reader_prompt regroups by session and re-sorts.
-            reader_order: ReaderOrder::Relevance,
-            neighbor_radius: env_usize("CITADEL_LONGMEMEVAL_NEIGHBOR_RADIUS", 0),
-            // Official CoT gen_length; the reader's step-by-step answer needs
-            // the headroom.
-            reader_max_tokens: 800,
-            agentic: std::env::var("CITADEL_LONGMEMEVAL_AGENTIC").is_ok(),
-        },
+        bench: launch.bench,
         encrypted,
         reuse: bench_db.reuse,
-        reader_concurrency: env_usize("CITADEL_LONGMEMEVAL_READER_CONCURRENCY", 3),
+        reader_concurrency: launch.reader_concurrency,
     };
-
     let out_path =
         std::env::var("CITADEL_LONGMEMEVAL_OUT").unwrap_or_else(|_| "hypotheses.jsonl".to_string());
+    let mut predictions = std::fs::File::create_new(&out_path)?;
+    let mut audit = std::env::var("CITADEL_LONGMEMEVAL_AUDIT_PATH")
+        .ok()
+        .map(std::fs::File::create_new)
+        .transpose()?;
     let total = samples.len();
     let mut done = 0usize;
     let pairs = run(
@@ -205,7 +177,33 @@ fn main() -> Result<(), Box<dyn Error>> {
         reader.as_ref(),
         &pacer,
         &cfg,
-        &mut |_, qid, _hyp| {
+        &mut |index, qid, outcome| {
+            let prediction =
+                serde_json::json!({ "question_id": qid, "hypothesis": outcome.answer });
+            writeln!(predictions, "{prediction}")?;
+            predictions.flush()?;
+            if let Some(file) = audit.as_mut() {
+                let record = serde_json::json!({
+                    "question_id": qid,
+                    "question": samples[index].question,
+                    "hypothesis": outcome.answer,
+                    "retrieved": outcome.retrieved,
+                    "retrieved_atom_ids": outcome.retrieved_atom_ids,
+                    "reader_finish_reasons": outcome.reader_finish_reasons,
+                    "reader_calls": outcome.reader_calls,
+                    "recall_micros": outcome.recall_micros,
+                    "dataset_sha256": dataset_sha256,
+                    "embedder_model": embedder.model_id(),
+                    "encrypted": encrypted,
+                    "top_k": launch.bench.top_k,
+                    "neighbor_radius": launch.bench.neighbor_radius,
+                    "agentic": launch.bench.agentic,
+                    "rerank_strategy": format!("{:?}", launch.rerank_strategy),
+                    "reranker_model": reranker_model,
+                });
+                writeln!(file, "{record}")?;
+                file.flush()?;
+            }
             done += 1;
             if done.is_multiple_of(10) || done == total {
                 eprintln!("  answered {done}/{total} ({qid})");
@@ -214,30 +212,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         },
     )?;
 
-    let mut f = std::fs::File::create(&out_path)?;
-    for (question_id, hypothesis) in &pairs {
-        let line = serde_json::json!({ "question_id": question_id, "hypothesis": hypothesis });
-        writeln!(f, "{line}")?;
-    }
     eprintln!("wrote {} predictions -> {out_path}", pairs.len());
     eprintln!(
         "score: python3 evaluate_qa.py gpt-4o {out_path} {dataset_path} \
          && python3 print_qa_metrics.py {out_path}.eval-results-gpt-4o {dataset_path}"
     );
     Ok(())
-}
-
-const DIAG_KS: [usize; 3] = [10, 30, 50];
-
-/// Parse `CITADEL_LONGMEMEVAL_RERANK_STRATEGY` (replace|rrf, default rrf).
-fn rerank_strategy_from_env() -> RerankStrategy {
-    match std::env::var("CITADEL_LONGMEMEVAL_RERANK_STRATEGY")
-        .unwrap_or_default()
-        .as_str()
-    {
-        "replace" => RerankStrategy::Replace,
-        _ => RerankStrategy::default(),
-    }
 }
 
 /// Token-free retrieval diagnostic: does scored recall surface the gold
@@ -249,8 +229,9 @@ fn run_retrieval_diag(
     embedder: Arc<dyn Embedder>,
     encrypted: bool,
     reuse: bool,
+    top_k: usize,
 ) -> Result<(), Box<dyn Error>> {
-    const MAX_K: usize = 50;
+    let ks = [10.min(top_k), 30.min(top_k), top_k];
     let labels = [
         "single_session_user",
         "single_session_assistant",
@@ -265,7 +246,7 @@ fn run_retrieval_diag(
     // Optional per-question dump (TSV: qid, #gold sessions, session all@50,
     // turn all@50).
     let mut dump = match std::env::var("CITADEL_LONGMEMEVAL_DIAG_DUMP") {
-        Ok(p) => Some(std::io::BufWriter::new(std::fs::File::create(&p)?)),
+        Ok(p) => Some(std::io::BufWriter::new(std::fs::File::create_new(&p)?)),
         Err(_) => None,
     };
 
@@ -309,9 +290,10 @@ fn run_retrieval_diag(
     let (mut win_rc, mut win_rs, mut win_n) = (0u128, 0u128, 0usize);
     for (done, &s) in scored.iter().enumerate() {
         let t = std::time::Instant::now();
-        let hits = eng.recall(
+        let hits = baseline_recall(
+            eng,
             &s.question_id,
-            RecallProfile::default().apply(RecallQuery::by_text(&s.question, MAX_K)),
+            RecallQuery::by_text(&s.question, top_k),
         )?;
         win_rc += t.elapsed().as_micros();
         let label = s.kind.label();
@@ -320,12 +302,12 @@ fn run_retrieval_diag(
         let evidence: Vec<&str> = s.evidence.iter().map(String::as_str).collect();
         sess.entry(label)
             .or_default()
-            .record_membership(&ranked_sessions, &evidence, DIAG_KS);
+            .record_membership(&ranked_sessions, &evidence, ks);
 
         let total_answer = s.turns.iter().filter(|t| t.has_answer).count();
         turn.entry(label)
             .or_default()
-            .record_has_answer(&hits, total_answer, DIAG_KS);
+            .record_has_answer(&hits, total_answer, ks);
 
         if let Some(w) = dump.as_mut() {
             let sess_all = evidence.iter().all(|g| ranked_sessions.contains(g));
@@ -351,12 +333,12 @@ fn run_retrieval_diag(
 
         // Compare configured recall with vector-only retrieval.
         let t = std::time::Instant::now();
-        let hits_sem = semantic_only_recall(eng, &s.question_id, &*embedder, &s.question, MAX_K)?;
+        let hits_sem = semantic_only_recall(eng, &s.question_id, &*embedder, &s.question, top_k)?;
         win_rs += t.elapsed().as_micros();
         turn_sem
             .entry(label)
             .or_default()
-            .record_has_answer(&hits_sem, total_answer, DIAG_KS);
+            .record_has_answer(&hits_sem, total_answer, ks);
 
         win_n += 1;
         if win_n == 50 || done + 1 == scored.len() {
@@ -371,29 +353,37 @@ fn run_retrieval_diag(
         }
     }
 
-    print_diag("session-level (answer_session_ids)", &sess, &labels);
-    print_diag("turn-level, configured recall (has_answer)", &turn, &labels);
-    print_diag("turn-level, semantic-only (has_answer)", &turn_sem, &labels);
+    print_diag("session-level (answer_session_ids)", &sess, &labels, ks);
+    print_diag(
+        "turn-level, configured recall (has_answer)",
+        &turn,
+        &labels,
+        ks,
+    );
+    print_diag(
+        "turn-level, semantic-only (has_answer)",
+        &turn_sem,
+        &labels,
+        ks,
+    );
     Ok(())
 }
 
-fn print_diag(title: &str, acc: &BTreeMap<&str, Tally>, labels: &[&str]) {
-    eprintln!("\n=== retrieval diag [{title}]: recall@10/30/50 as any%/all% ===");
+fn print_diag(title: &str, acc: &BTreeMap<&str, Tally>, labels: &[&str], ks: [usize; 3]) {
+    eprintln!(
+        "\n=== retrieval diag [{title}]: recall@{}/{}/{} as any%/all% ===",
+        ks[0], ks[1], ks[2]
+    );
     let mut tot = Tally::default();
     for &label in labels {
         if let Some(t) = acc.get(label) {
-            eprintln!("  {label:>26} (n={:>4}): {}", t.n, t.cells(DIAG_KS));
-            for ki in 0..DIAG_KS.len() {
+            eprintln!("  {label:>26} (n={:>4}): {}", t.n, t.cells(ks));
+            for ki in 0..ks.len() {
                 tot.any[ki] += t.any[ki];
                 tot.all[ki] += t.all[ki];
             }
             tot.n += t.n;
         }
     }
-    eprintln!(
-        "  {:>26} (n={:>4}): {}",
-        "OVERALL",
-        tot.n,
-        tot.cells(DIAG_KS)
-    );
+    eprintln!("  {:>26} (n={:>4}): {}", "OVERALL", tot.n, tot.cells(ks));
 }

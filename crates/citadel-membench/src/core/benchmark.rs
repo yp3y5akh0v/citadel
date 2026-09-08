@@ -2,9 +2,16 @@
 //! through it. Scoring varies per benchmark and is each plugin's own concern.
 
 use citadel_llm::Message;
-use citadel_mem::AtomHit;
+use citadel_mem::{AtomHit, AtomId};
 
 use crate::core::error::Result;
+
+#[derive(Debug)]
+pub struct ReaderPrompt {
+    pub messages: Vec<Message>,
+    /// Every input atom exactly once, in the order rendered in `messages`.
+    pub atom_ids: Vec<AtomId>,
+}
 
 pub trait Benchmark: Sync {
     /// Atom-payload key holding a turn's gold/evidence id, joined against retrieved hits.
@@ -16,7 +23,7 @@ pub trait Benchmark: Sync {
         hits: &[AtomHit],
         question: &str,
         current_date: &str,
-    ) -> Result<Vec<Message>>;
+    ) -> Result<ReaderPrompt>;
     /// Documented weaknesses, surfaced in every report.
     fn known_flaws(&self) -> &str;
 }

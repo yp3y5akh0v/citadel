@@ -8,6 +8,8 @@ use citadel_llm::Message;
 use citadel_mem::AtomHit;
 use serde::Deserialize;
 
+use crate::core::benchmark::ReaderPrompt;
+
 /// Question shapes that need multi-item aggregation: counting, ordering,
 /// totaling. Conservative on purpose; a false negative just keeps the standard
 /// path.
@@ -41,10 +43,20 @@ pub struct ExtractedItem {
 /// retrieved memories as a JSON array. Memories render date-sorted and flat
 /// (extraction wants a scannable list, not conversation flow).
 pub fn extraction_messages(hits: &[AtomHit], question: &str, current_date: &str) -> Vec<Message> {
+    extraction_prompt(hits, question, current_date).messages
+}
+
+pub(crate) fn extraction_prompt(
+    hits: &[AtomHit],
+    question: &str,
+    current_date: &str,
+) -> ReaderPrompt {
     let mut sorted: Vec<&AtomHit> = hits.iter().collect();
     sorted.sort_by_key(|h| h.created_at);
     let mut memories = String::new();
+    let mut atom_ids = Vec::with_capacity(sorted.len());
     for h in sorted {
+        atom_ids.push(h.id);
         memories.push_str(&format!("- {}\n", h.text));
     }
     let prompt = format!(
@@ -62,7 +74,10 @@ pub fn extraction_messages(hits: &[AtomHit], question: &str, current_date: &str)
          Memories:\n{memories}\nCurrent Date: {current_date}\nQuestion: \
          {question}\nJSON:"
     );
-    vec![Message::user(prompt)]
+    ReaderPrompt {
+        messages: vec![Message::user(prompt)],
+        atom_ids,
+    }
 }
 
 /// Parse the extraction reply (tolerates a ```json fence). `None` = unusable;
