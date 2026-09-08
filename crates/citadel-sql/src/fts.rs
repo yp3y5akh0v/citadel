@@ -237,64 +237,25 @@ pub fn tsvector_overflowed(bytes: &[u8]) -> bool {
     !bytes.is_empty() && bytes[0] & TSV_FLAG_POSITION_OVERFLOW != 0
 }
 
+/// Diagnostic display; SQL text conversion must use the fallible renderer.
 pub fn tsvector_display(bytes: &[u8]) -> String {
-    let (_flags, reader) = match TsVectorReader::open(bytes) {
-        Ok(v) => v,
-        Err(_) => return "<invalid tsvector>".into(),
-    };
-    let mut out = String::new();
-    let mut first = true;
-    for item in reader {
-        let (lex, positions) = match item {
-            Ok(v) => v,
-            Err(_) => return "<invalid tsvector>".into(),
-        };
-        if !first {
-            out.push(' ');
-        }
-        first = false;
-        out.push('\'');
-        out.push_str(&String::from_utf8_lossy(lex));
-        out.push('\'');
-        if !positions.is_empty() {
-            out.push(':');
-            for (i, packed) in positions.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                let (p, w) = unpack_position(*packed);
-                out.push_str(&p.to_string());
-                if w != Weight::D {
-                    out.push(w.label());
-                }
-            }
-        }
-    }
-    out
+    tsvector_to_text_with_cancel(bytes, None).unwrap_or_else(|_| "<invalid tsvector>".into())
 }
 
-pub(crate) fn tsvector_display_with_cancel(
+/// Render SQL text without substituting a diagnostic string for a decode error.
+pub(crate) fn tsvector_to_text_with_cancel(
     bytes: &[u8],
     cancel: Option<&citadel::CancelToken>,
 ) -> Result<String> {
-    if cancel.is_none() {
-        return Ok(tsvector_display(bytes));
-    }
     check_cancel(cancel)?;
-    let (_flags, reader) = match TsVectorReader::open(bytes) {
-        Ok(value) => value,
-        Err(_) => return Ok("<invalid tsvector>".into()),
-    };
+    let (_flags, reader) = TsVectorReader::open(bytes)?;
     let mut out = String::new();
     let mut first = true;
     let mut work = 0usize;
     for item in reader {
         check_cancel_at(cancel, work)?;
         work = work.wrapping_add(1);
-        let (lexeme, positions) = match item {
-            Ok(value) => value,
-            Err(_) => return Ok("<invalid tsvector>".into()),
-        };
+        let (lexeme, positions) = item?;
         if !first {
             out.push(' ');
         }
@@ -731,27 +692,20 @@ impl TsQueryAst {
     }
 }
 
+/// Diagnostic display; SQL text conversion must use the fallible renderer.
 pub fn tsquery_display(bytes: &[u8]) -> String {
-    match TsQueryAst::decode(bytes) {
-        Ok(ast) => display_ast(&ast),
-        Err(_) => "<invalid tsquery>".into(),
-    }
+    tsquery_to_text_with_cancel(bytes, None).unwrap_or_else(|_| "<invalid tsquery>".into())
 }
 
-pub(crate) fn tsquery_display_with_cancel(
+/// Render SQL text without substituting a diagnostic string for a decode error.
+pub(crate) fn tsquery_to_text_with_cancel(
     bytes: &[u8],
     cancel: Option<&citadel::CancelToken>,
 ) -> Result<String> {
     if cancel.is_none() {
-        return Ok(tsquery_display(bytes));
+        return TsQueryAst::decode(bytes).map(|ast| display_ast(&ast));
     }
-    let ast = match TsQueryAst::decode_with_cancel(bytes, cancel) {
-        Ok(ast) => ast,
-        Err(SqlError::Storage(citadel_core::Error::Interrupted)) => {
-            return Err(SqlError::Storage(citadel_core::Error::Interrupted));
-        }
-        Err(_) => return Ok("<invalid tsquery>".into()),
-    };
+    let ast = TsQueryAst::decode_with_cancel(bytes, cancel)?;
     let mut work = 0usize;
     let result = display_ast_with_cancel(&ast, cancel, &mut work)?;
     check_cancel(cancel)?;
@@ -1533,7 +1487,11 @@ fn collect_lex_positions(
 
 pub fn fn_length_tsvector(bytes: &[u8]) -> Result<crate::types::Value> {
     let (_flags, reader) = TsVectorReader::open(bytes)?;
-    let count = reader.count() as i64;
+    let mut count = 0i64;
+    for item in reader {
+        item?;
+        count += 1;
+    }
     Ok(crate::types::Value::Integer(count))
 }
 

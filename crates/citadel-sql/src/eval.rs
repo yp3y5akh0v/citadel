@@ -1612,8 +1612,8 @@ fn eval_unary_op(op: UnaryOp, val: &Value) -> Result<Value> {
     }
 }
 
-fn value_to_text(val: &Value) -> String {
-    match val {
+fn value_to_text(val: &Value) -> Result<String> {
+    Ok(match val {
         Value::Text(s) => s.to_string(),
         Value::Integer(i) => i.to_string(),
         Value::Real(r) => {
@@ -1641,12 +1641,12 @@ fn value_to_text(val: &Value) -> String {
             micros,
         } => crate::datetime::format_interval(*months, *days, *micros),
         Value::Json(s) => s.to_string(),
-        Value::Jsonb(b) => crate::json::decode_to_text(b).unwrap_or_default(),
-        Value::TsVector(b) => crate::fts::tsvector_display(b),
-        Value::TsQuery(b) => crate::fts::tsquery_display(b),
-        Value::Array(_) => val.to_string(),
+        Value::Jsonb(b) => crate::json::decode_to_text(b)?,
+        Value::TsVector(b) => crate::fts::tsvector_to_text_with_cancel(b, None)?,
+        Value::TsQuery(b) => crate::fts::tsquery_to_text_with_cancel(b, None)?,
+        Value::Array(values) => array_to_text_with_cancel(values, None)?,
         Value::Vector(_) => val.to_string(),
-    }
+    })
 }
 
 fn value_to_text_with_cancel(
@@ -1654,10 +1654,43 @@ fn value_to_text_with_cancel(
     cancel: Option<&citadel::CancelToken>,
 ) -> Result<String> {
     match value {
-        Value::TsVector(bytes) => crate::fts::tsvector_display_with_cancel(bytes, cancel),
-        Value::TsQuery(bytes) => crate::fts::tsquery_display_with_cancel(bytes, cancel),
-        _ => Ok(value_to_text(value)),
+        Value::Jsonb(bytes) => crate::json::decode_to_text_with_cancel(bytes, cancel),
+        Value::TsVector(bytes) => crate::fts::tsvector_to_text_with_cancel(bytes, cancel),
+        Value::TsQuery(bytes) => crate::fts::tsquery_to_text_with_cancel(bytes, cancel),
+        Value::Array(values) => array_to_text_with_cancel(values, cancel),
+        _ => value_to_text(value),
     }
+}
+
+/// Match SQL array Display formatting without turning malformed nested values
+/// into a diagnostic placeholder that a SQL statement could persist as data.
+fn array_to_text_with_cancel(
+    values: &[Value],
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<String> {
+    let mut text = String::from("{");
+    for (index, value) in values.iter().enumerate() {
+        if let Some(cancel) = cancel {
+            cancel.check().map_err(SqlError::Storage)?;
+        }
+        if index != 0 {
+            text.push(',');
+        }
+        match value {
+            Value::Text(value) => {
+                text.push('"');
+                text.push_str(&value.replace('\\', "\\\\").replace('"', "\\\""));
+                text.push('"');
+            }
+            Value::Jsonb(_) | Value::TsVector(_) | Value::TsQuery(_) => {
+                text.push_str(&value_to_text_with_cancel(value, cancel)?);
+            }
+            Value::Array(values) => text.push_str(&array_to_text_with_cancel(values, cancel)?),
+            other => text.push_str(&other.to_string()),
+        }
+    }
+    text.push('}');
+    Ok(text)
 }
 
 /// `x BETWEEN lo AND hi` is `x >= lo AND x <= hi`, so each bound collates as its own
@@ -1890,7 +1923,7 @@ pub(crate) fn eval_cast(val: &Value, target: DataType) -> Result<Value> {
                 val.data_type()
             ))),
         },
-        DataType::Text => Ok(Value::Text(value_to_text(val).into())),
+        DataType::Text => Ok(Value::Text(value_to_text(val)?.into())),
         DataType::Boolean => match val {
             Value::Boolean(_) => Ok(val.clone()),
             Value::Integer(i) => Ok(Value::Boolean(*i != 0)),
@@ -2030,10 +2063,13 @@ fn eval_cast_with_cancel(
             .into(),
         ),
         (Value::TsVector(bytes), DataType::Text) => {
-            Value::Text(crate::fts::tsvector_display_with_cancel(bytes, Some(cancel))?.into())
+            Value::Text(crate::fts::tsvector_to_text_with_cancel(bytes, Some(cancel))?.into())
         }
         (Value::TsQuery(bytes), DataType::Text) => {
-            Value::Text(crate::fts::tsquery_display_with_cancel(bytes, Some(cancel))?.into())
+            Value::Text(crate::fts::tsquery_to_text_with_cancel(bytes, Some(cancel))?.into())
+        }
+        (Value::Array(values), DataType::Text) => {
+            Value::Text(array_to_text_with_cancel(values, Some(cancel))?.into())
         }
         _ => return eval_cast(value, target),
     };

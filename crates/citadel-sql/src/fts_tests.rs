@@ -176,7 +176,7 @@ fn websearch_propagates_cancellation_from_a_quoted_phrase() {
 }
 
 #[test]
-fn match_length_and_display_poll_inside_large_fts_values() {
+fn match_length_and_text_conversion_poll_inside_large_fts_values() {
     let vector = many_lexeme_vector(CANCEL_CHECK_INTERVAL * 3);
     let query = TsQueryAst::Lexeme {
         lexeme: b"term".to_vec(),
@@ -208,7 +208,7 @@ fn match_length_and_display_poll_inside_large_fts_values() {
 
     let vector_display_token = citadel::CancelToken::new();
     let _vector_display_cancel = cancel_on_poll_after(vector_display_token.clone(), 3);
-    let display_error = tsvector_display_with_cancel(&vector, Some(&vector_display_token))
+    let display_error = tsvector_to_text_with_cancel(&vector, Some(&vector_display_token))
         .expect_err("TSVECTOR display ignored in-work cancellation");
     assert!(matches!(
         display_error,
@@ -222,12 +222,71 @@ fn match_length_and_display_poll_inside_large_fts_values() {
         .unwrap();
     let query_display_token = citadel::CancelToken::new();
     let _query_display_cancel = cancel_on_poll_after(query_display_token.clone(), 3);
-    let display_error = tsquery_display_with_cancel(&query, Some(&query_display_token))
+    let display_error = tsquery_to_text_with_cancel(&query, Some(&query_display_token))
         .expect_err("TSQUERY display ignored in-work cancellation");
     assert!(matches!(
         display_error,
         SqlError::Storage(citadel_core::Error::Interrupted)
     ));
+}
+
+#[test]
+fn malformed_tsvector_length_propagates_iterator_errors_on_both_paths() {
+    let token = citadel::CancelToken::new();
+    let mut valid = TsVectorBuilder::new();
+    valid.push(b"cat", 1, Weight::D).unwrap();
+    let valid = valid.build();
+    let mut later_truncated = valid.to_vec();
+    later_truncated[1..5].copy_from_slice(&2u32.to_le_bytes());
+    for bytes in [vec![0, 1, 0, 0, 0], later_truncated] {
+        for cancel in [None, Some(&token)] {
+            assert!(matches!(
+                fn_length_tsvector_with_cancel(&bytes, cancel),
+                Err(SqlError::InvalidValue(_))
+            ));
+        }
+    }
+    for cancel in [None, Some(&token)] {
+        assert_eq!(
+            fn_length_tsvector_with_cancel(&valid, cancel).unwrap(),
+            Value::Integer(1)
+        );
+    }
+}
+
+#[test]
+fn fts_text_sql_conversions_forward_mid_value_cancellation() {
+    let vector = Value::TsVector(many_lexeme_vector(CANCEL_CHECK_INTERVAL * 3));
+    let query = Value::TsQuery(
+        and_chain(vec![b"term".to_vec(); CANCEL_CHECK_INTERVAL * 2])
+            .unwrap()
+            .encode()
+            .unwrap(),
+    );
+    let columns = crate::eval::ColumnMap::new(&[]);
+    for value in [vector, query] {
+        let nested = Value::Array(Arc::from(vec![Value::Array(Arc::from(
+            vec![value.clone()],
+        ))]));
+        for value in [value, nested] {
+            for sql in ["CAST($1 AS TEXT)", "LENGTH($1)", "CONCAT('prefix', $1)"] {
+                let token = citadel::CancelToken::new();
+                let _cancel = cancel_on_poll_after(token.clone(), 3);
+                let params = [value.clone()];
+                let context = crate::eval::EvalCtx::with_params(&columns, &[], &params)
+                    .with_cancel(Some(&token));
+                let expression = crate::parser::parse_sql_expr(sql).unwrap();
+                assert!(
+                    matches!(
+                        crate::eval::eval_expr(&expression, &context),
+                        Err(SqlError::Storage(citadel_core::Error::Interrupted))
+                    ),
+                    "{sql}, type={}",
+                    value.data_type()
+                );
+            }
+        }
+    }
 }
 
 #[test]
