@@ -9,6 +9,347 @@ const TEXT_SEARCH_CONSTRUCTORS: [&str; 5] = [
     "websearch_to_tsquery",
 ];
 
+fn malformed_jsonb_text_values() -> Vec<Value> {
+    [
+        vec![],
+        vec![0x30, 1],    // Truncated current-tag signed integer.
+        vec![0x51, 0xff], // Current-tag string with invalid UTF-8.
+        vec![0x61, 0x30], // Current-tag array containing a truncated integer.
+        vec![0x71, 0x00], // Current-tag object with a non-string key.
+        vec![0x00, 0x00], // Valid null followed by trailing bytes.
+    ]
+    .into_iter()
+    .map(|bytes| Value::Jsonb(std::sync::Arc::from(bytes)))
+    .collect()
+}
+
+fn malformed_tsvector_text_values() -> Vec<Value> {
+    [
+        vec![],
+        vec![0, 1],                            // Truncated header.
+        vec![0, 1, 0, 0, 0],                   // Declared lexeme is absent.
+        vec![0, 1, 0, 0, 0, 1, 0, b'x'],       // Missing position count.
+        vec![0, 1, 0, 0, 0, 1, 0, b'x', 1, 0], // Missing position.
+    ]
+    .into_iter()
+    .map(|bytes| Value::TsVector(std::sync::Arc::from(bytes)))
+    .collect()
+}
+
+fn malformed_tsquery_text_values() -> Vec<Value> {
+    [
+        vec![],
+        vec![0],                      // Truncated lexeme length.
+        vec![0, 1, 0, b'x'],          // Missing weight and prefix flags.
+        vec![1, 0, 1, 0, b'x', 0, 0], // AND lacks its right operand.
+        vec![0, 1, 0, b'x', 0, 0, 0], // Trailing byte after a valid leaf.
+        vec![255],                    // Unknown query node tag.
+    ]
+    .into_iter()
+    .map(|bytes| Value::TsQuery(std::sync::Arc::from(bytes)))
+    .collect()
+}
+
+#[test]
+fn malformed_jsonb_text_consumers_return_errors() {
+    assert_malformed_text_consumers_return_errors(malformed_jsonb_text_values());
+}
+
+fn assert_malformed_text_consumers_return_errors(values: Vec<Value>) {
+    let columns = ColumnMap::new(&[]);
+    let token = citadel::CancelToken::new();
+    for value in values {
+        for cancel in [None, Some(&token)] {
+            let params = [value.clone()];
+            let context = EvalCtx::with_params(&columns, &[], &params).with_cancel(cancel);
+            for sql in [
+                "CAST($1 AS TEXT)",
+                "LENGTH($1)",
+                "UPPER($1)",
+                "LOWER($1)",
+                "SUBSTR($1, 1, 2)",
+                "TRIM($1)",
+                "LTRIM($1)",
+                "RTRIM($1)",
+                "LTRIM('value', $1)",
+                "REPLACE($1, 'a', 'b')",
+                "REPLACE('value', $1, 'b')",
+                "REPLACE('value', 'a', $1)",
+                "INSTR($1, 'a')",
+                "INSTR('value', $1)",
+                "CONCAT('prefix', $1, 'suffix')",
+                "HEX($1)",
+            ] {
+                let expression = crate::parser::parse_sql_expr(sql).unwrap();
+                let result = eval_expr(&expression, &context);
+                assert!(
+                    matches!(result, Err(SqlError::InvalidValue(_))),
+                    "{sql}, value={value:?}, cancellable={}: {result:?}",
+                    cancel.is_some(),
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn malformed_jsonb_text_nested_array_conversion_returns_error() {
+    assert_malformed_text_nested_array_conversion_returns_error(malformed_jsonb_text_values());
+}
+
+fn assert_malformed_text_nested_array_conversion_returns_error(values: Vec<Value>) {
+    let token = citadel::CancelToken::new();
+    for value in values {
+        let nested = Value::Array(std::sync::Arc::from(vec![Value::Array(
+            std::sync::Arc::from(vec![value]),
+        )]));
+        for cancel in [None, Some(&token)] {
+            assert!(matches!(
+                eval_cast_with_cancel(&nested, DataType::Text, cancel),
+                Err(SqlError::InvalidValue(_))
+            ));
+            assert!(matches!(
+                eval_binary_op_with_cancel(
+                    &nested,
+                    BinOp::Concat,
+                    &Value::Text("suffix".into()),
+                    cancel
+                ),
+                Err(SqlError::InvalidValue(_))
+            ));
+        }
+    }
+}
+
+#[test]
+fn malformed_jsonb_text_update_is_atomic() {
+    assert_malformed_text_update_is_atomic(
+        crate::json::text_to_jsonb(r#"{"n":1}"#).unwrap(),
+        malformed_jsonb_text_values(),
+    );
+}
+
+fn assert_malformed_text_update_is_atomic(valid: Value, malformed_values: Vec<Value>) {
+    use crate::Connection;
+    use citadel::{Argon2Profile, DatabaseBuilder};
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = DatabaseBuilder::new(dir.path().join("invalid-jsonb.cdl"))
+        .passphrase(b"test")
+        .argon2_profile(Argon2Profile::Iot)
+        .create()
+        .unwrap();
+    let conn = Connection::open(&db).unwrap();
+    conn.execute(&format!(
+        "CREATE TABLE invalid_jsonb_text (id INTEGER PRIMARY KEY, data {}, copied TEXT)",
+        valid.data_type(),
+    ))
+    .unwrap();
+    for cancellable in [false, true] {
+        db.set_cancel(cancellable.then(citadel::CancelToken::new));
+        for malformed in &malformed_values {
+            conn.execute("DELETE FROM invalid_jsonb_text").unwrap();
+            conn.execute_params(
+                "INSERT INTO invalid_jsonb_text VALUES (1, $1, 'before-1'), (2, $2, 'before-2')",
+                &[valid.clone(), malformed.clone()],
+            )
+            .unwrap();
+            let before = conn
+                .query("SELECT id, data, copied FROM invalid_jsonb_text ORDER BY id")
+                .unwrap()
+                .rows;
+            for conversion in ["CAST(data AS TEXT)", "CAST(ARRAY[ARRAY[data]] AS TEXT)"] {
+                assert!(matches!(
+                    conn.query(&format!(
+                        "SELECT {conversion} FROM invalid_jsonb_text ORDER BY id"
+                    )),
+                    Err(SqlError::InvalidValue(_))
+                ));
+                for explicit_transaction in [false, true] {
+                    if explicit_transaction {
+                        conn.execute("BEGIN").unwrap();
+                        conn.execute(
+                        "UPDATE invalid_jsonb_text SET copied = 'earlier-statement' WHERE id = 1",
+                    )
+                    .unwrap();
+                    }
+                    let statement_before = conn
+                        .query("SELECT id, data, copied FROM invalid_jsonb_text ORDER BY id")
+                        .unwrap()
+                        .rows;
+                    assert!(matches!(
+                        conn.execute(&format!(
+                            "UPDATE invalid_jsonb_text SET copied = {conversion}"
+                        )),
+                        Err(SqlError::InvalidValue(_))
+                    ));
+                    assert_eq!(
+                        conn.query("SELECT id, data, copied FROM invalid_jsonb_text ORDER BY id")
+                            .unwrap()
+                            .rows,
+                        statement_before,
+                        "failed UPDATE must not persist a partial or empty conversion",
+                    );
+                    if explicit_transaction {
+                        conn.execute("ROLLBACK").unwrap();
+                    }
+                }
+            }
+            assert_eq!(
+                conn.query("SELECT id, data, copied FROM invalid_jsonb_text ORDER BY id")
+                    .unwrap()
+                    .rows,
+                before
+            );
+        }
+    }
+}
+
+#[test]
+fn malformed_fts_text_consumers_return_errors() {
+    assert_malformed_text_consumers_return_errors(malformed_tsvector_text_values());
+    assert_malformed_text_consumers_return_errors(malformed_tsquery_text_values());
+}
+
+#[test]
+fn malformed_fts_text_nested_array_conversion_returns_error() {
+    assert_malformed_text_nested_array_conversion_returns_error(malformed_tsvector_text_values());
+    assert_malformed_text_nested_array_conversion_returns_error(malformed_tsquery_text_values());
+}
+
+#[test]
+fn malformed_fts_text_update_is_atomic() {
+    for (valid, malformed) in [
+        (
+            crate::fts::fn_to_tsvector("cat dog").unwrap(),
+            malformed_tsvector_text_values(),
+        ),
+        (
+            crate::fts::fn_to_tsquery("cat & dog").unwrap(),
+            malformed_tsquery_text_values(),
+        ),
+    ] {
+        assert_malformed_text_update_is_atomic(valid, malformed);
+    }
+}
+
+#[test]
+fn fts_text_valid_conversions_and_diagnostic_display_are_preserved() {
+    use crate::fts::{TsQueryAst, TsVectorBuilder, Weight};
+
+    let mut builder = TsVectorBuilder::new();
+    builder.push(b"cat", 1, Weight::A).unwrap();
+    builder.push(b"cat", 5, Weight::D).unwrap();
+    builder.push_no_position(b"dog").unwrap();
+    let vector = Value::TsVector(builder.build());
+    let leaf = |text: &[u8]| TsQueryAst::Lexeme {
+        lexeme: text.to_vec(),
+        weight_mask: 0,
+        prefix: false,
+    };
+    let query = TsQueryAst::Phrase {
+        distance: 2,
+        left: Box::new(TsQueryAst::Lexeme {
+            lexeme: b"cat".to_vec(),
+            weight_mask: 9,
+            prefix: true,
+        }),
+        right: Box::new(TsQueryAst::Or(
+            Box::new(leaf(b"dog")),
+            Box::new(TsQueryAst::Not(Box::new(leaf(b"bird")))),
+        )),
+    };
+    let token = citadel::CancelToken::new();
+    for (value, expected) in [
+        (Value::TsVector(TsVectorBuilder::new().build()), ""),
+        (vector, "'cat':1A,5 'dog'"),
+        (
+            Value::TsQuery(query.encode().unwrap()),
+            "'cat':*AD <2> ('dog' | !'bird')",
+        ),
+    ] {
+        assert_eq!(value.to_string(), expected);
+        let nested = Value::Array(std::sync::Arc::from(vec![
+            Value::Null,
+            Value::Text("escaped\\\"text".into()),
+            Value::Array(std::sync::Arc::from(vec![value.clone()])),
+        ]));
+        for cancel in [None, Some(&token)] {
+            assert_eq!(
+                eval_cast_with_cancel(&value, DataType::Text, cancel).unwrap(),
+                Value::Text(expected.into())
+            );
+            assert_eq!(
+                eval_cast_with_cancel(&nested, DataType::Text, cancel).unwrap(),
+                Value::Text(nested.to_string().into())
+            );
+        }
+    }
+    for value in malformed_tsvector_text_values() {
+        assert_eq!(value.to_string(), "<invalid tsvector>");
+    }
+    for value in malformed_tsquery_text_values() {
+        assert_eq!(value.to_string(), "<invalid tsquery>");
+    }
+}
+
+#[test]
+fn jsonb_text_valid_conversions_are_unchanged() {
+    let token = citadel::CancelToken::new();
+    for text in [
+        "null",
+        "true",
+        "42",
+        "1.5",
+        r#""hello""#,
+        r#"{"a":[1,"b"]}"#,
+    ] {
+        let value = crate::json::text_to_jsonb(text).unwrap();
+        let nested = Value::Array(std::sync::Arc::from(vec![
+            Value::Null,
+            Value::Text("escaped\\\"text".into()),
+            Value::Boolean(true),
+            Value::Real(1.0),
+            Value::Array(std::sync::Arc::from(vec![value.clone()])),
+        ]));
+        for cancel in [None, Some(&token)] {
+            assert_eq!(
+                eval_cast_with_cancel(&value, DataType::Text, cancel).unwrap(),
+                Value::Text(text.into())
+            );
+            assert_eq!(
+                eval_cast_with_cancel(&nested, DataType::Text, cancel).unwrap(),
+                Value::Text(nested.to_string().into())
+            );
+        }
+    }
+}
+
+#[test]
+fn jsonb_text_conversion_forwards_mid_decode_cancellation() {
+    let columns = ColumnMap::new(&[]);
+    let jsonb = crate::json::text_to_jsonb("[1,2,3,4]").unwrap();
+    for value in [
+        jsonb.clone(),
+        Value::Array(std::sync::Arc::from(vec![jsonb])),
+    ] {
+        for sql in ["CAST($1 AS TEXT)", "LENGTH($1)", "CONCAT('prefix', $1)"] {
+            let token = citadel::CancelToken::new();
+            let _guard = crate::json::cancel_json_after(token.clone(), 2);
+            let params = [value.clone()];
+            let context = EvalCtx::with_params(&columns, &[], &params).with_cancel(Some(&token));
+            let expression = crate::parser::parse_sql_expr(sql).unwrap();
+            assert!(
+                matches!(
+                    eval_expr(&expression, &context),
+                    Err(SqlError::Storage(citadel_core::Error::Interrupted))
+                ),
+                "{sql}, value={value:?}"
+            );
+        }
+    }
+}
+
 #[test]
 fn literal_jsonpath_analysis_only_unwraps_text_preserving_operations() {
     for sql in ["'$.x'", "CAST('$.x' AS TEXT)", "('$.x' COLLATE BINARY)"] {
