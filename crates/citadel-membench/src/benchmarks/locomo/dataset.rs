@@ -9,7 +9,7 @@ use std::path::Path;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::core::civil::{days_from_civil, days_in_month};
+use crate::core::civil::datetime_micros;
 use crate::core::error::{BenchError, Result};
 use crate::core::hash::sha256_hex;
 
@@ -74,8 +74,8 @@ pub struct Turn {
 
 impl Turn {
     /// Event time in micros since the epoch (UTC-naive), parsed from the session's
-    /// `date_time` ("1:56 pm on 8 May, 2023" - every session in locomo10.json uses
-    /// this exact shape). `None` when the string deviates.
+    /// `date_time` ("1:56 pm on 8 May, 2023"). Loaded samples have valid or empty
+    /// dates; invalid or unrepresentable stamps return `None`.
     pub fn event_micros(&self) -> Option<i64> {
         parse_locomo_datetime(&self.date_time)
     }
@@ -101,14 +101,15 @@ pub struct Sample {
 impl Sample {
     /// The recency reference clock for this conversation's questions: one day after
     /// the last session (LoCoMo probes a finished conversation, so "now" is just
-    /// past its end, not the bench's wall clock). `None` if no session date parses.
+    /// past its end, not the bench's wall clock). `None` if no session date parses
+    /// or adding a day would exceed the timestamp range.
     pub fn as_of_micros(&self) -> Option<i64> {
         const DAY_MICROS: i64 = 86_400 * 1_000_000;
         self.turns
             .iter()
             .filter_map(Turn::event_micros)
             .max()
-            .map(|t| t + DAY_MICROS)
+            .and_then(|t| t.checked_add(DAY_MICROS))
     }
 }
 
@@ -128,11 +129,21 @@ pub fn load_with_hash(path: impl AsRef<Path>) -> Result<(Vec<Sample>, String)> {
 }
 
 /// Parse an already-decoded LoCoMo root array (shared by `load` and tests).
+/// Missing or empty session dates are unknown; present invalid dates are errors.
 pub fn parse_root(root: &Value) -> Result<Vec<Sample>> {
     let arr = root
         .as_array()
         .ok_or_else(|| BenchError::Dataset("top level must be a JSON array".into()))?;
     arr.iter().map(parse_sample).collect()
+}
+
+pub fn validate_samples(samples: &[Sample]) -> Result<()> {
+    for sample in samples {
+        for turn in &sample.turns {
+            validate_date_time(&turn.date_time, &sample.sample_id, turn.session)?;
+        }
+    }
+    Ok(())
 }
 
 fn parse_sample(v: &Value) -> Result<Sample> {
@@ -155,16 +166,19 @@ fn parse_sample(v: &Value) -> Result<Sample> {
         let Some(session) = session_number(key) else {
             continue;
         };
-        let date_time = conversation
-            .get(&format!("session_{session}_date_time"))
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
+        let date_key = format!("session_{session}_date_time");
+        let date_time = match conversation.get(&date_key) {
+            None => "",
+            Some(value) => value.as_str().ok_or_else(|| {
+                BenchError::Dataset(format!("{sample_id}: {date_key} must be a string"))
+            })?,
+        };
+        validate_date_time(date_time, &sample_id, session)?;
         let arr = val
             .as_array()
             .ok_or_else(|| BenchError::Dataset(format!("{key} must be an array of turns")))?;
         for turn in arr {
-            turns.push(parse_turn(turn, session, &date_time)?);
+            turns.push(parse_turn(turn, session, date_time)?);
         }
     }
     turns.sort_by_key(|t| t.session);
@@ -189,6 +203,15 @@ fn parse_sample(v: &Value) -> Result<Sample> {
 /// `Some(n)` iff `key` is `session_<n>` with `<n>` a bare u32 (no further suffix).
 fn session_number(key: &str) -> Option<u32> {
     key.strip_prefix("session_")?.parse::<u32>().ok()
+}
+
+fn validate_date_time(date: &str, sample_id: &str, session: u32) -> Result<()> {
+    if !date.is_empty() && parse_locomo_datetime(date).is_none() {
+        return Err(BenchError::Dataset(format!(
+            "{sample_id}: invalid date at session {session}: {date:?}"
+        )));
+    }
+    Ok(())
 }
 
 fn parse_turn(v: &Value, session: u32, date_time: &str) -> Result<Turn> {
@@ -297,15 +320,12 @@ fn parse_locomo_datetime(s: &str) -> Option<i64> {
         _ => return None,
     };
 
-    let mut parts = date.trim().split([' ', ',']).filter(|t| !t.is_empty());
-    let day = parts.next()?.parse::<i64>().ok()?;
-    let month = month_number(parts.next()?)?;
-    let year = parts.next()?.parse::<i64>().ok()?;
-    if parts.next().is_some() || !(1..=days_in_month(year, month)).contains(&day) {
-        return None;
-    }
-    let days = days_from_civil(year, month, day);
-    Some((((days * 24 + hour) * 60 + m) * 60) * 1_000_000)
+    let (day_month, year) = date.trim().split_once(", ")?;
+    let (day, month) = day_month.split_once(' ')?;
+    let day = day.parse::<i64>().ok()?;
+    let month = month_number(month)?;
+    let year = year.parse::<i64>().ok()?;
+    datetime_micros(year, month, day, hour, m)
 }
 
 fn month_number(name: &str) -> Option<i64> {
@@ -328,7 +348,55 @@ fn month_number(name: &str) -> Option<i64> {
 
 #[cfg(test)]
 mod datetime_tests {
-    use super::parse_locomo_datetime;
+    use super::{parse_locomo_datetime, parse_root, validate_samples};
+    use serde_json::{json, Value};
+
+    fn fixture() -> Value {
+        json!([{
+            "sample_id": "sample",
+            "conversation": {
+                "session_1": [{"speaker": "Alice", "dia_id": "D1:1", "text": "hello"}]
+            },
+            "qa": []
+        }])
+    }
+
+    #[test]
+    fn missing_and_empty_dates_are_unknown_but_invalid_dates_fail() {
+        let mut root = fixture();
+        assert_eq!(parse_root(&root).unwrap()[0].turns[0].event_micros(), None);
+        root[0]["conversation"]["session_1_date_time"] = json!("");
+        assert_eq!(parse_root(&root).unwrap()[0].turns[0].event_micros(), None);
+        for date in [
+            json!(null),
+            json!(42),
+            json!(" "),
+            json!("2pm on 1 Jan 2024"),
+            json!("12:00 am on 1 January, 1000000"),
+        ] {
+            root[0]["conversation"]["session_1_date_time"] = date;
+            assert!(parse_root(&root).is_err());
+            let mut empty = root.clone();
+            empty[0]["conversation"]["session_1"] = json!([]);
+            assert!(parse_root(&empty).is_err());
+        }
+    }
+
+    #[test]
+    fn manually_constructed_invalid_dates_fail_validation() {
+        let mut samples = parse_root(&fixture()).unwrap();
+        samples[0].turns[0].date_time = "invalid".into();
+        assert!(validate_samples(&samples).is_err());
+    }
+
+    #[test]
+    fn recency_reference_addition_is_checked() {
+        let mut sample = parse_root(&fixture()).unwrap().remove(0);
+        sample.turns[0].date_time = "12:00 am on 1 January, 1970".into();
+        assert_eq!(sample.as_of_micros(), Some(86_400_000_000));
+        sample.turns[0].date_time = "4:00 am on 10 January, 294247".into();
+        assert_eq!(sample.as_of_micros(), None);
+    }
 
     #[test]
     fn parses_the_locomo_session_stamp() {
@@ -363,6 +431,8 @@ mod datetime_tests {
         assert_eq!(parse_locomo_datetime("13:56 pm on 8 May, 2023"), None);
         assert_eq!(parse_locomo_datetime("1:56 pm on 8 Floreal, 2023"), None);
         assert_eq!(parse_locomo_datetime("1:56 pm on 8 May, 2023 extra"), None);
+        assert_eq!(parse_locomo_datetime("1:56 pm on 8 May 2023"), None);
+        assert_eq!(parse_locomo_datetime("1:56 pm on 8,May,,2023"), None);
     }
 
     #[test]
@@ -372,5 +442,32 @@ mod datetime_tests {
         assert_eq!(parse_locomo_datetime("12:00 am on 31 April, 2023"), None);
         // 2024 is a leap year: 29 February is real.
         assert!(parse_locomo_datetime("12:00 am on 29 February, 2024").is_some());
+    }
+
+    #[test]
+    fn datetime_range_is_checked_without_rejecting_valid_boundary_minutes() {
+        for year in [i64::MIN, -1_000_000, 1_000_000, i64::MAX] {
+            assert_eq!(
+                parse_locomo_datetime(&format!("12:00 am on 1 January, {year}")),
+                None
+            );
+        }
+        assert_eq!(
+            parse_locomo_datetime("4:00 am on 10 January, 294247"),
+            Some(9_223_372_036_800_000_000)
+        );
+        assert_eq!(parse_locomo_datetime("4:01 am on 10 January, 294247"), None);
+        assert_eq!(
+            parse_locomo_datetime("8:00 pm on 21 December, -290308"),
+            Some(-9_223_372_036_800_000_000)
+        );
+        assert_eq!(
+            parse_locomo_datetime("7:59 pm on 21 December, -290308"),
+            None
+        );
+        assert_eq!(
+            parse_locomo_datetime("12:00 am on 1 January, -1"),
+            Some(-62_198_755_200_000_000)
+        );
     }
 }

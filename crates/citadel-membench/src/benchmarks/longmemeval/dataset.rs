@@ -5,7 +5,7 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use crate::core::civil::{days_from_civil, days_in_month};
+use crate::core::civil::datetime_micros;
 use crate::core::error::{BenchError, Result};
 use crate::core::hash::sha256_hex;
 
@@ -84,11 +84,28 @@ pub fn load_with_hash(path: impl AsRef<Path>) -> Result<(Vec<LmSample>, String)>
     Ok((parse_root(&root)?, sha))
 }
 
+/// Empty date strings are unknown; nonempty question and session dates must be valid.
 pub fn parse_root(root: &Value) -> Result<Vec<LmSample>> {
     let arr = root
         .as_array()
         .ok_or_else(|| BenchError::Dataset("top level must be a JSON array".into()))?;
     arr.iter().map(parse_sample).collect()
+}
+
+pub fn validate_samples(samples: &[LmSample]) -> Result<()> {
+    for sample in samples {
+        validate_question_date(&sample.question_date, &sample.question_id)?;
+        for turn in &sample.turns {
+            let parsed = parse_lmeval_datetime(&turn.date);
+            if (!turn.date.is_empty() && parsed.is_none()) || parsed != turn.event_micros {
+                return Err(BenchError::Dataset(format!(
+                    "invalid or inconsistent haystack date at session occurrence {} in {}",
+                    turn.session_occurrence, sample.question_id
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn parse_sample(v: &Value) -> Result<LmSample> {
@@ -99,6 +116,7 @@ fn parse_sample(v: &Value) -> Result<LmSample> {
     let kind = LmKind::from_str(&str_field(obj, "question_type")?)?;
     let question = str_field(obj, "question")?;
     let question_date = str_field(obj, "question_date")?;
+    validate_question_date(&question_date, &question_id)?;
     let gold = render_answer(obj.get("answer"));
     let abstention = question_id.ends_with("_abs");
 
@@ -175,6 +193,15 @@ fn str_field(obj: &serde_json::Map<String, Value>, key: &str) -> Result<String> 
         .ok_or_else(|| BenchError::Dataset(format!("missing string field '{key}'")))
 }
 
+fn validate_question_date(date: &str, question_id: &str) -> Result<()> {
+    if !date.is_empty() && parse_lmeval_datetime(date).is_none() {
+        return Err(BenchError::Dataset(format!(
+            "invalid question_date in {question_id}: {date:?}"
+        )));
+    }
+    Ok(())
+}
+
 fn str_array(obj: &serde_json::Map<String, Value>, key: &str) -> Result<Vec<String>> {
     obj.get(key)
         .and_then(Value::as_array)
@@ -201,7 +228,7 @@ fn render_answer(v: Option<&Value>) -> String {
 pub(super) fn parse_lmeval_datetime(s: &str) -> Option<i64> {
     let mut parts = s.split_whitespace();
     let date = parts.next()?;
-    let _weekday = parts.next()?;
+    let weekday = parts.next()?;
     let time = parts.next()?;
     if parts.next().is_some() {
         return None;
@@ -211,21 +238,19 @@ pub(super) fn parse_lmeval_datetime(s: &str) -> Option<i64> {
     let year = d.next()?.parse::<i64>().ok()?;
     let month = d.next()?.parse::<i64>().ok()?;
     let day = d.next()?.parse::<i64>().ok()?;
-    if d.next().is_some()
-        || !(1..=12).contains(&month)
-        || !(1..=days_in_month(year, month)).contains(&day)
-    {
+    if d.next().is_some() {
         return None;
     }
 
     let (h, m) = time.split_once(':')?;
     let (hour, min) = (h.parse::<i64>().ok()?, m.parse::<i64>().ok()?);
-    if !(0..=23).contains(&hour) || !(0..=59).contains(&min) {
-        return None;
-    }
-
-    let days = days_from_civil(year, month, day);
-    Some((((days * 24 + hour) * 60 + min) * 60) * 1_000_000)
+    let micros = datetime_micros(year, month, day, hour, min)?;
+    const WEEKDAYS: [&str; 7] = [
+        "(Mon)", "(Tue)", "(Wed)", "(Thu)", "(Fri)", "(Sat)", "(Sun)",
+    ];
+    let days = micros.div_euclid(86_400_000_000);
+    let weekday_index = (days + 3).rem_euclid(7) as usize;
+    (weekday == WEEKDAYS[weekday_index]).then_some(micros)
 }
 
 #[cfg(test)]
@@ -250,6 +275,60 @@ mod tests {
         assert_eq!(parse_lmeval_datetime("2023/02/29 (Wed) 10:00"), None);
         assert_eq!(parse_lmeval_datetime("2023/04/10 (Mon) 24:00"), None);
         assert_eq!(parse_lmeval_datetime("2023/04/10 (Mon) 23:07 extra"), None);
+        assert_eq!(parse_lmeval_datetime("2023/04/10 (Tue) 23:07"), None);
+        assert_eq!(parse_lmeval_datetime("2023/04/10 (Foo) 23:07"), None);
+        assert_eq!(parse_lmeval_datetime("2023/04/10 Mon 23:07"), None);
+        assert_eq!(parse_lmeval_datetime("2023/04/10 (Mon) 23:60"), None);
+        assert_eq!(parse_lmeval_datetime("2023/04/10 (Mon) 23:07:00"), None);
+        assert_eq!(parse_lmeval_datetime("2023/04/10/01 (Mon) 23:07"), None);
+    }
+
+    #[test]
+    fn datetime_range_is_checked_without_rejecting_valid_boundary_minutes() {
+        for year in [i64::MIN, -1_000_000, 1_000_000, i64::MAX] {
+            assert_eq!(
+                parse_lmeval_datetime(&format!("{year}/01/01 (Mon) 00:00")),
+                None
+            );
+        }
+        assert_eq!(
+            parse_lmeval_datetime("294247/01/10 (Sun) 04:00"),
+            Some(9_223_372_036_800_000_000)
+        );
+        assert_eq!(parse_lmeval_datetime("294247/01/10 (Sun) 04:01"), None);
+        assert_eq!(
+            parse_lmeval_datetime("-290308/12/21 (Sun) 20:00"),
+            Some(-9_223_372_036_800_000_000)
+        );
+        assert_eq!(parse_lmeval_datetime("-290308/12/21 (Sun) 19:59"), None);
+        assert_eq!(
+            parse_lmeval_datetime("-1/01/01 (Fri) 00:00"),
+            Some(-62_198_755_200_000_000)
+        );
+    }
+
+    #[test]
+    fn question_dates_validate_even_without_turns_and_allow_explicit_unknown() {
+        let mut root = serde_json::json!([{
+            "question_id": "q", "question_type": "multi-session",
+            "question": "q", "question_date": "", "answer": "a",
+            "haystack_session_ids": [], "haystack_dates": [],
+            "haystack_sessions": [], "answer_session_ids": []
+        }]);
+        assert!(parse_root(&root).is_ok());
+        for date in [
+            " ",
+            "not a date",
+            "2023/02/29 (Wed) 00:00",
+            "2023/04/10 (Tue) 23:07",
+            "1000000/01/01 (Sat) 00:00",
+        ] {
+            root[0]["question_date"] = serde_json::json!(date);
+            assert!(parse_root(&root)
+                .unwrap_err()
+                .to_string()
+                .contains("invalid question_date"));
+        }
     }
 
     #[test]

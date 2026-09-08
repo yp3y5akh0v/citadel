@@ -45,7 +45,9 @@ use citadel_mem::{
     CandleEmbedder, CrossEncoder, Embedder, MemoryEngine, MockEmbedder, RecallProfile, RecallQuery,
     RerankStrategy, Reranker,
 };
-use citadel_membench::benchmarks::longmemeval::retrieval::{distinct_session_ids, Tally};
+use citadel_membench::benchmarks::longmemeval::retrieval::{
+    distinct_session_ids, semantic_only_recall, Tally,
+};
 use citadel_membench::benchmarks::longmemeval::{dataset, ingest, run, LmevalConfig};
 use citadel_membench::{default_tpm_for_model, BenchConfig, Pacer, ReaderOrder};
 
@@ -347,13 +349,9 @@ fn run_retrieval_diag(
             )?;
         }
 
-        // Semantic-only ranking: isolates whether default fusion helps recall
-        // vs similarity.
+        // Compare configured recall with vector-only retrieval.
         let t = std::time::Instant::now();
-        let hits_sem = eng.recall(
-            &s.question_id,
-            RecallProfile::semantic_only().apply(RecallQuery::by_text(&s.question, MAX_K)),
-        )?;
+        let hits_sem = semantic_only_recall(eng, &s.question_id, &*embedder, &s.question, MAX_K)?;
         win_rs += t.elapsed().as_micros();
         turn_sem
             .entry(label)
@@ -374,7 +372,7 @@ fn run_retrieval_diag(
     }
 
     print_diag("session-level (answer_session_ids)", &sess, &labels);
-    print_diag("turn-level, default fusion (has_answer)", &turn, &labels);
+    print_diag("turn-level, configured recall (has_answer)", &turn, &labels);
     print_diag("turn-level, semantic-only (has_answer)", &turn_sem, &labels);
     Ok(())
 }

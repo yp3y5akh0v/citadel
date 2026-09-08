@@ -29,10 +29,12 @@ fn atom_input(t: &LmTurn) -> AtomInput {
 }
 
 pub fn ingest_sample(eng: &MemoryEngine, region: &str, sample: &LmSample) -> Result<Vec<AtomId>> {
+    super::dataset::validate_samples(std::slice::from_ref(sample))?;
     let atoms = sample.turns.iter().map(atom_input).collect();
     Ok(eng.remember_batch(region, atoms)?)
 }
 
 pub fn validate_reuse(eng: &MemoryEngine, region: &str, sample: &LmSample) -> Result<()> {
+    super::dataset::validate_samples(std::slice::from_ref(sample))?;
     validate_ingested_atoms(eng, region, sample.turns.iter().map(atom_input))
 }
