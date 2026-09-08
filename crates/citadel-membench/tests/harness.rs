@@ -30,18 +30,18 @@ fn fixture() -> Value {
                 {"speaker": "Alice", "dia_id": "D1:1", "text": "I adopted a dog named Rex."},
                 {"speaker": "Bob", "dia_id": "D1:2", "text": "Nice! What breed is Rex?"}
             ],
-            "session_1_date_time": "2pm on 1 Jan 2024",
+            "session_1_date_time": "2:00 pm on 1 January, 2024",
             "session_1_summary": "Alice got a dog.",
             "session_2": [
                 {"speaker": "Alice", "dia_id": "D2:1", "text": "Rex is a golden retriever."},
                 {"speaker": "Alice", "dia_id": "D2:2", "text": "I paid 1200 dollars for him."}
             ],
-            "session_2_date_time": "3pm on 5 Jan 2024",
+            "session_2_date_time": "3:00 pm on 5 January, 2024",
             "session_2_observation": "ignore me",
             "session_10": [
                 {"speaker": "Bob", "dia_id": "D10:1", "text": "We hiked Mount Tam last weekend."}
             ],
-            "session_10_date_time": "noon on 20 Mar 2024"
+            "session_10_date_time": "12:00 pm on 20 March, 2024"
         },
         "qa": [
             {"question": "What breed is Rex?", "answer": "golden retriever",
@@ -89,7 +89,7 @@ fn loader_roundtrip_with_dynamic_keys_and_nonstring_answer() {
         "We hiked Mount Tam last weekend."
     );
     // date_time is paired from the matching `session_<n>_date_time`.
-    assert_eq!(s.turns[0].date_time, "2pm on 1 Jan 2024");
+    assert_eq!(s.turns[0].date_time, "2:00 pm on 1 January, 2024");
     assert_eq!(s.turns[0].dia_id, "D1:1");
 
     assert_eq!(s.qa.len(), 5);
@@ -102,6 +102,19 @@ fn loader_roundtrip_with_dynamic_keys_and_nonstring_answer() {
     // Categories mapped correctly, incl. the adversarial one.
     assert!(s.qa.iter().any(|q| q.category == Category::Adversarial));
     assert!(s.qa.iter().any(|q| q.category == Category::SingleHop));
+}
+
+#[test]
+fn invalid_source_dates_fail_before_ingestion_or_reuse() {
+    let (_dir, eng) = open_engine();
+    let mut sample = parse_root(&fixture()).unwrap().remove(0);
+    sample.turns[0].date_time = "2pm on 1 Jan 2024".into();
+    for result in [
+        ingest_sample(&eng, "not-created", &sample).map(|_| ()),
+        citadel_membench::benchmarks::locomo::ingest::validate_reuse(&eng, "not-created", &sample),
+    ] {
+        assert!(matches!(result, Err(BenchError::Dataset(_))));
+    }
 }
 
 #[test]
@@ -148,7 +161,7 @@ fn turn_content_folds_date_speaker_caption_and_query() {
     let samples = parse_root(&fixture()).unwrap();
     assert_eq!(
         turn_content(&samples[0].turns[0]),
-        "[2pm on 1 Jan 2024] Alice: I adopted a dog named Rex."
+        "[2:00 pm on 1 January, 2024] Alice: I adopted a dog named Rex."
     );
 
     let full = Turn {
@@ -253,10 +266,14 @@ fn session_reader_order_keeps_best_session_first_and_turns_chronological() {
 
     let rendered = render(&build_reader_prompt(&grouped, "What happened?", true));
     let s10 = rendered
-        .find("[Session 10 from noon on 20 Mar 2024]")
+        .find("[Session 10 from 12:00 pm on 20 March, 2024]")
         .unwrap();
-    let s1 = rendered.find("[Session 1 from 2pm on 1 Jan 2024]").unwrap();
-    let s2 = rendered.find("[Session 2 from 3pm on 5 Jan 2024]").unwrap();
+    let s1 = rendered
+        .find("[Session 1 from 2:00 pm on 1 January, 2024]")
+        .unwrap();
+    let s2 = rendered
+        .find("[Session 2 from 3:00 pm on 5 January, 2024]")
+        .unwrap();
     assert!(s10 < s1 && s1 < s2, "session block relevance order");
     assert!(
         rendered.find("Rex is a golden retriever").unwrap()
@@ -736,7 +753,7 @@ fn run_sample_records_gold_turn_texts_and_in_view() {
     assert_eq!(single.gold_evidence, vec!["D2:1"]);
     assert_eq!(
         single.gold_turn_texts,
-        vec!["[3pm on 5 Jan 2024] Alice: Rex is a golden retriever."]
+        vec!["[3:00 pm on 5 January, 2024] Alice: Rex is a golden retriever."]
     );
     assert_eq!(single.gold_in_view, vec![true]);
 

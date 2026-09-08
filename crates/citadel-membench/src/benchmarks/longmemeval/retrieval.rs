@@ -1,8 +1,30 @@
 //! Retrieval recall scoring: compare recalled atoms against the LongMemEval gold
 //! (session ids and `has_answer` turns), mirroring the official recall any/all @k metric.
 
-use citadel_mem::AtomHit;
+use citadel_mem::{AtomHit, Embedder, MemoryEngine, RecallProfile, RecallQuery};
 use rustc_hash::FxHashSet;
+
+use crate::core::error::Result;
+use crate::core::retrieval::validate_embeddings;
+
+/// Vector-only control; omitting query text also bypasses an attached reranker.
+pub fn semantic_only_recall(
+    eng: &MemoryEngine,
+    region: &str,
+    embedder: &dyn Embedder,
+    question: &str,
+    k: usize,
+) -> Result<Vec<AtomHit>> {
+    if k == 0 {
+        return Ok(Vec::new());
+    }
+    let mut embeddings = embedder
+        .embed_queries(&[question])
+        .map_err(citadel_mem::MemError::from)?;
+    validate_embeddings(&embeddings, 1, embedder.dim())?;
+    let query = RecallQuery::by_embedding(embeddings.remove(0), k);
+    Ok(eng.recall(region, RecallProfile::semantic_only().apply(query))?)
+}
 
 /// ANY/ALL gold-recall counts at three cutoffs, plus the question count.
 #[derive(Default, Clone, Copy)]
@@ -91,9 +113,158 @@ pub fn distinct_session_ids(hits: &[AtomHit]) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use citadel::{Argon2Profile, CancelToken, DatabaseBuilder};
+    use citadel_mem::{AtomInput, EmbedError, EmbeddingMetric, RerankStrategy, Reranker};
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     const KS: [usize; 3] = [2, 3, 5];
+
+    struct QueryEmbedder {
+        queries: AtomicUsize,
+        output: Vec<Vec<f32>>,
+    }
+
+    impl QueryEmbedder {
+        fn new(output: Vec<Vec<f32>>) -> Self {
+            Self {
+                queries: AtomicUsize::new(0),
+                output,
+            }
+        }
+    }
+
+    impl Embedder for QueryEmbedder {
+        fn dim(&self) -> usize {
+            2
+        }
+        fn metric(&self) -> EmbeddingMetric {
+            EmbeddingMetric::Cosine
+        }
+        fn model_id(&self) -> &str {
+            "semantic-control-test"
+        }
+        fn embed_with_cancel(
+            &self,
+            _: &[&str],
+            _: Option<&CancelToken>,
+        ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
+            panic!("semantic control must use query embedding")
+        }
+        fn embed_queries_with_cancel(
+            &self,
+            texts: &[&str],
+            _: Option<&CancelToken>,
+        ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
+            assert_eq!(texts, ["query"]);
+            self.queries.fetch_add(1, Ordering::Relaxed);
+            Ok(self.output.clone())
+        }
+    }
+
+    struct ReversingReranker(AtomicUsize);
+
+    impl Reranker for ReversingReranker {
+        fn model_id(&self) -> &str {
+            "reversing-test"
+        }
+        fn rerank_with_cancel(
+            &self,
+            _: &str,
+            passages: &[&str],
+            _: Option<&CancelToken>,
+        ) -> std::result::Result<Vec<f32>, EmbedError> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(passages
+                .iter()
+                .map(|passage| if *passage == "far" { 10.0 } else { 0.0 })
+                .collect())
+        }
+    }
+
+    fn engine(sealed: bool) -> (tempfile::TempDir, MemoryEngine, Arc<QueryEmbedder>) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            DatabaseBuilder::new(dir.path().join("semantic-control.cdl"))
+                .passphrase(b"test")
+                .argon2_profile(Argon2Profile::Iot)
+                .enable_region_keys(sealed)
+                .create()
+                .unwrap(),
+        );
+        let eng = MemoryEngine::open(db).unwrap();
+        let embedder = Arc::new(QueryEmbedder::new(vec![vec![1.0, 0.0]]));
+        if sealed {
+            eng.create_encrypted_region("turns", embedder.clone())
+                .unwrap();
+        } else {
+            eng.create_region("turns", embedder.clone()).unwrap();
+        }
+        eng.remember_batch(
+            "turns",
+            vec![
+                AtomInput::new("turn", "near").with_embedding(vec![1.0, 0.0]),
+                AtomInput::new("turn", "far").with_embedding(vec![0.0, 1.0]),
+            ],
+        )
+        .unwrap();
+        (dir, eng, embedder)
+    }
+
+    #[test]
+    fn semantic_control_bypasses_reranker_without_changing_default_recall() {
+        for sealed in [false, true] {
+            let (_dir, eng, embedder) = engine(sealed);
+            let reranker = Arc::new(ReversingReranker(AtomicUsize::new(0)));
+            eng.set_reranker(reranker.clone(), RerankStrategy::Replace);
+
+            let control = semantic_only_recall(&eng, "turns", &*embedder, "query", 2).unwrap();
+            assert_eq!(control[0].text, "near");
+            assert_eq!(control[1].text, "far");
+            assert_eq!(embedder.queries.load(Ordering::Relaxed), 1);
+            assert_eq!(reranker.0.load(Ordering::Relaxed), 0);
+
+            let default = eng
+                .recall(
+                    "turns",
+                    RecallProfile::default().apply(RecallQuery::by_text("query", 2)),
+                )
+                .unwrap();
+            assert_eq!(default[0].text, "far");
+            assert_eq!(default[1].text, "near");
+            assert_eq!(embedder.queries.load(Ordering::Relaxed), 2);
+            assert_eq!(reranker.0.load(Ordering::Relaxed), 1);
+        }
+    }
+
+    #[test]
+    fn semantic_control_rejects_invalid_embeddings_before_recall() {
+        let (_dir, eng, _) = engine(false);
+        for output in [
+            vec![],
+            vec![vec![1.0, 0.0], vec![1.0, 0.0]],
+            vec![vec![1.0]],
+            vec![vec![f32::NAN, 0.0]],
+            vec![vec![f32::INFINITY, 0.0]],
+        ] {
+            let embedder = QueryEmbedder::new(output);
+            let result = semantic_only_recall(&eng, "missing", &embedder, "query", 1);
+            assert!(matches!(result, Err(crate::BenchError::Dataset(_))));
+            assert_eq!(embedder.queries.load(Ordering::Relaxed), 1);
+        }
+    }
+
+    #[test]
+    fn empty_semantic_control_does_not_embed_or_recall() {
+        let (_dir, eng, embedder) = engine(false);
+        assert!(
+            semantic_only_recall(&eng, "missing", &*embedder, "query", 0)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(embedder.queries.load(Ordering::Relaxed), 0);
+    }
 
     fn hit(id: i64, payload: serde_json::Value) -> AtomHit {
         AtomHit {

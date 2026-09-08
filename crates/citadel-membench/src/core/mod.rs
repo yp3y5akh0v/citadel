@@ -9,3 +9,4 @@ pub mod error;
 pub mod eval;
 pub mod hash;
 pub mod ratelimit;
+pub mod retrieval;

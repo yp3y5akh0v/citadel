@@ -140,6 +140,27 @@ fn source_dates_reject_invalid_values_and_preserve_unknown_dates() {
 }
 
 #[test]
+fn invalid_or_inconsistent_dates_fail_before_ingestion_or_reuse() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = engine(dir.path());
+    let valid = dataset::parse_root(&fixture()).unwrap().remove(0);
+    let mut malformed = valid.clone();
+    malformed.turns[0].date = "bad date".into();
+    let mut inconsistent = valid.clone();
+    inconsistent.turns[0].event_micros = None;
+    let mut question = valid;
+    question.question_date = "2023/05/20 (Sun) 02:21".into();
+    for sample in [malformed, inconsistent, question] {
+        for result in [
+            ingest::ingest_sample(&eng, "not-created", &sample).map(|_| ()),
+            ingest::validate_reuse(&eng, "not-created", &sample),
+        ] {
+            assert!(matches!(result, Err(BenchError::Dataset(_))));
+        }
+    }
+}
+
+#[test]
 fn reuse_accepts_exact_corpus_without_reingestion() {
     let dir = tempfile::tempdir().unwrap();
     let eng = engine(dir.path());
