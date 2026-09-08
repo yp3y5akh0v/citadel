@@ -1,24 +1,22 @@
-//! LongMemEval reader prompt and documented flaws (no Rust judge; scored
-//! externally).
+//! LongMemEval reader prompt and evaluation metadata.
 
 use citadel_llm::Message;
 use citadel_mem::{AtomHit, AtomId};
 use rustc_hash::FxHashMap;
 
 use super::dataset::parse_lmeval_datetime;
+use crate::core::benchmark::ReaderPrompt;
 use crate::core::error::{BenchError, Result};
 
-pub(crate) const KNOWN_FLAWS: &str = "Emit-only harness: citadel produces a JSONL \
-     hypothesis file (question_id + hypothesis per line); the official score comes from \
-     the repo's evaluate_qa.py (gpt-4o-2024-08-06 judge, per-question-type prompts) then \
-     print_qa_metrics.py, NOT from citadel. The reader model is a chosen component and \
-     MUST be named with any number; the headline uses a gpt-4o reader, while \
-     gpt-4o-mini runs are lower-cost diagnostics and are not reader-matched. The reader \
-     replicates the official run_generation.py CoT prompt (generic, category-blind) with \
-     Current Date = question_date; recall uses the scored RecallProfile default (no \
-     as-of). Gold is dual: session-level \
-     (answer_session_ids) and turn-level (has_answer); abstention (_abs) questions are \
-     scored by the official judge for correct refusal.";
+/// Evaluation protocol and limitations included in each report.
+pub(crate) const KNOWN_FLAWS: &str = "The runner emits question_id and hypothesis \
+     records as JSONL for the official evaluate_qa.py and print_qa_metrics.py \
+     scripts. Report the reader model and evaluator configuration with scores. \
+     The reader uses the official run_generation.py CoT prompt with question_date \
+     as Current Date. Baseline recall uses the default RecallProfile without an \
+     as-of override. Evidence annotations identify sessions through answer_session_ids \
+     and turns through has_answer. The official evaluator scores abstention \
+     questions for correct refusal.";
 
 struct SessionBlock {
     event_micros: Option<i64>,
@@ -45,6 +43,14 @@ pub fn build_reader_prompt(
     question: &str,
     current_date: &str,
 ) -> Result<Vec<Message>> {
+    Ok(render_reader_prompt(hits, question, current_date)?.messages)
+}
+
+pub fn render_reader_prompt(
+    hits: &[AtomHit],
+    question: &str,
+    current_date: &str,
+) -> Result<ReaderPrompt> {
     let mut by_occurrence: FxHashMap<u64, usize> = FxHashMap::default();
     let mut sessions: Vec<SessionBlock> = Vec::new();
     for hit in hits {
@@ -75,11 +81,17 @@ pub fn build_reader_prompt(
             });
             sessions.len() - 1
         });
+        if sessions[gi].date != date {
+            return Err(BenchError::Dataset(format!(
+                "LongMemEval session occurrence {occurrence} has conflicting dates"
+            )));
+        }
         sessions[gi].turns.push((hit.id, body.to_string()));
     }
     sessions.sort_unstable_by_key(|session| (session.event_micros, session.occurrence));
 
     let mut history = String::new();
+    let mut atom_ids = Vec::with_capacity(hits.len());
     for (i, session) in sessions.iter_mut().enumerate() {
         session.turns.sort_unstable_by_key(|(id, _)| *id);
         history.push_str(&format!(
@@ -87,7 +99,8 @@ pub fn build_reader_prompt(
             i + 1,
             session.date
         ));
-        for (_, body) in &session.turns {
+        for (id, body) in &session.turns {
+            atom_ids.push(*id);
             history.push_str(&format!("\n\n{body}"));
         }
         history.push('\n');
@@ -100,7 +113,10 @@ pub fn build_reader_prompt(
          to get the answer.\n\n\nHistory Chats:\n\n{history}\n\nCurrent Date: {current_date}\n\
          Question: {question}\nAnswer (step by step):"
     );
-    Ok(vec![Message::user(prompt)])
+    Ok(ReaderPrompt {
+        messages: vec![Message::user(prompt)],
+        atom_ids,
+    })
 }
 
 #[cfg(test)]
@@ -126,6 +142,21 @@ mod tests {
     }
 
     #[test]
+    fn one_session_occurrence_cannot_relabel_a_turn_with_another_date() {
+        let dated = hit(1, "[2023/05/01 (Mon) 09:00] user: first", "s", 0, 1);
+        for other in ["[2023/05/02 (Tue) 09:00] user: second", "user: undated"] {
+            let conflicting = hit(2, other, "s", 0, 2);
+            for hits in [
+                vec![dated.clone(), conflicting.clone()],
+                vec![conflicting.clone(), dated.clone()],
+            ] {
+                let error = render_reader_prompt(&hits, "question", "").unwrap_err();
+                assert!(error.to_string().contains("conflicting dates"));
+            }
+        }
+    }
+
+    #[test]
     fn groups_turns_into_sessions_ordered_by_date() {
         // Retrieval order interleaves two sessions and shuffles s1's dialogue:
         // gamma (id 7) outranks alpha (id 5), but conversation order must
@@ -135,7 +166,9 @@ mod tests {
             hit(3, "[2023/05/01 (Mon) 09:00] user: beta", "s2", 1, 100),
             hit(5, "[2023/06/01 (Thu) 09:00] user: alpha", "s1", 0, 200),
         ];
-        let msg = build_reader_prompt(&hits, "who?", "2023/07/01").unwrap();
+        let rendered = render_reader_prompt(&hits, "who?", "2023/07/01").unwrap();
+        assert_eq!(rendered.atom_ids, [3, 5, 7]);
+        let msg = rendered.messages;
         let Message::User(text) = &msg[0] else {
             panic!("expected a user message");
         };
@@ -163,7 +196,9 @@ mod tests {
         assert!(text.contains("Question: who?") && text.contains("Current Date: 2023/07/01"));
 
         let permuted = vec![hits[2].clone(), hits[0].clone(), hits[1].clone()];
-        let permuted_msg = build_reader_prompt(&permuted, "who?", "2023/07/01").unwrap();
+        let permuted_rendered = render_reader_prompt(&permuted, "who?", "2023/07/01").unwrap();
+        assert_eq!(permuted_rendered.atom_ids, [3, 5, 7]);
+        let permuted_msg = permuted_rendered.messages;
         let Message::User(permuted_text) = &permuted_msg[0] else {
             panic!("expected a user message");
         };
@@ -198,9 +233,13 @@ mod tests {
             hit(2, "assistant: reply", "shared", 0, 888),
             hit(3, "user: second", "shared", 1, 1),
         ];
-        let prompt = build_reader_prompt(&hits, "what?", "").unwrap();
+        let rendered = render_reader_prompt(&hits, "what?", "").unwrap();
+        assert_eq!(rendered.atom_ids, [1, 2, 3]);
+        let prompt = rendered.messages;
         hits.reverse();
-        let reversed = build_reader_prompt(&hits, "what?", "").unwrap();
+        let reversed_rendered = render_reader_prompt(&hits, "what?", "").unwrap();
+        assert_eq!(reversed_rendered.atom_ids, [1, 2, 3]);
+        let reversed = reversed_rendered.messages;
         let (Message::User(text), Message::User(reversed_text)) = (&prompt[0], &reversed[0]) else {
             panic!("expected user messages");
         };

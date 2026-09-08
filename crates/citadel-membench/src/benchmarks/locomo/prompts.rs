@@ -1,33 +1,24 @@
-//! LoCoMo reader prompt, judge rubrics, and documented flaws.
+//! LoCoMo reader prompt, judge rubrics, and evaluation metadata.
 
 use citadel_llm::{LLMClient, Message, TokenUsage};
 use citadel_mem::AtomHit;
+use rustc_hash::FxHashMap;
 
-use crate::core::error::Result;
+use crate::core::error::{BenchError, Result};
 use crate::core::eval::{abstention_label, complete_judge, judge_label, JudgeOutcome};
 use crate::core::ratelimit::Pacer;
 
-/// LoCoMo's documented weaknesses, surfaced in every report.
-pub(crate) const KNOWN_FLAWS: &str = "De facto LLM-judge protocol, not the paper's token-F1, \
-     so comparable only to runs using the same judge model. Reader and judge are \
-     separate, independently-selected models (reader and judge gpt-4o-mini, the \
-     reference setup); both are pinned in Provenance. The reader uses \
-     ONE category-blind answer prompt (the answerer never receives the gold \
-     question category), matching the Mem0/Zep single-prompt protocol. A 40-case \
-     adversarial probe of the judge measured 0% false-accept (judge-probe.ps1), so \
-     judge lenience appears low; LoCoMo answer keys nonetheless have ~6.4% errors \
-     (an independent audit found ~99 wrong gold answers), so the honest accuracy \
-     ceiling is ~93.6%, not 100%. Cost is computed from the recorded reader+judge \
-     tokens at each model's published rate (an upper bound: prompt caching lowers \
-     the real bill). Ingestion is raw conversation turns plus \
-     each shared photo's BLIP caption (LoCoMo substitutes the image with its \
-     caption), not LLM-extracted facts, so head-to-head vendor comparison is \
-     apples-to-oranges. Turns carry their session date as event-time created_at, \
-     but recency is graded against the wall clock, where every session is equally \
-     ancient, so the recency weight contributes no rank signal (grading as of the \
-     conversation's end was measured to HURT evidence recall and is not used); the \
-     importance weight is likewise inert (raw turns carry no importance score). Headline \
-     excludes the adversarial category; adversarial is a separate abstention metric.";
+/// Evaluation protocol and limitations included in each report.
+pub(crate) const KNOWN_FLAWS: &str = "Accuracy uses an LLM correctness judge rather than \
+     token-F1. Comparisons require matching reader and judge models, prompts, input \
+     construction, and question sets. The reader receives retrieved turns and the \
+     question, without gold answers or categories. Ingestion uses raw conversation \
+     turns and supplied image descriptions, without LLM fact extraction. Recency \
+     uses the wall clock; raw turns use default importance. Adversarial abstention \
+     is reported separately from answer accuracy. Evidence coverage is measured \
+     against dataset annotations, not answer accuracy. Hosted model outputs can \
+     vary between runs. Token costs are estimates where model rates are known; \
+     unknown rates remain unpriced.";
 
 /// Build the reader prompt from only the hits + question, with one category-blind
 /// system prompt (the gold category would be test-metadata leakage). Hits are
@@ -40,7 +31,7 @@ pub fn build_reader_prompt(
     hits: &[AtomHit],
     question: &str,
     session_headers: bool,
-) -> Vec<Message> {
+) -> Result<Vec<Message>> {
     let system = "You answer the question using ONLY the provided memories. Each \
          memory is a line from a past conversation, prefixed with the date it was \
          said and the speaker, and may end with a photo description in the form \
@@ -85,19 +76,37 @@ pub fn build_reader_prompt(
 
     let mut user = String::from("Memories:\n");
     let mut last_session = None;
+    let mut session_dates = FxHashMap::default();
     for (rank, hit) in hits.iter().enumerate() {
         if session_headers {
             let session = hit
                 .payload
                 .get("session")
                 .and_then(|value| value.as_i64())
-                .expect("session-grouped LoCoMo hit must carry numeric payload.session");
+                .ok_or_else(|| {
+                    BenchError::Dataset(format!(
+                        "LoCoMo atom {} lacks numeric session metadata",
+                        hit.id
+                    ))
+                })?;
+            let date = hit
+                .payload
+                .get("date_time")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| {
+                    BenchError::Dataset(format!(
+                        "LoCoMo atom {} lacks string date_time metadata",
+                        hit.id
+                    ))
+                })?;
+            if let Some(previous) = session_dates.insert(session, date) {
+                if previous != date {
+                    return Err(BenchError::Dataset(format!(
+                        "LoCoMo session {session} has conflicting dates"
+                    )));
+                }
+            }
             if last_session != Some(session) {
-                let date = hit
-                    .payload
-                    .get("date_time")
-                    .and_then(|value| value.as_str())
-                    .expect("session-grouped LoCoMo hit must carry payload.date_time");
                 user.push_str(&format!("\n[Session {session} from {date}]\n"));
                 last_session = Some(session);
             }
@@ -106,7 +115,7 @@ pub fn build_reader_prompt(
     }
     user.push_str(&format!("\nQuestion: {question}"));
 
-    vec![Message::system(system), Message::user(user)]
+    Ok(vec![Message::system(system), Message::user(user)])
 }
 
 /// LLM-as-judge correctness with Mem0's generous LoCoMo rubric (same topic = CORRECT,
@@ -145,9 +154,9 @@ pub(crate) fn judge_correct_observed(
          CORRECT or WRONG, e.g. {\"label\": \"CORRECT\"}. Do not include both CORRECT \
          and WRONG anywhere in your reply.";
     let user = format!("Question: {question}\nGold answer: {gold}\nGenerated answer: {predicted}");
-    let resp = complete_judge(judge, pacer, system, &user)?;
+    let (resp, audit) = complete_judge(judge, pacer, system, &user)?;
     let correct = judge_label(&resp)?;
-    Ok(JudgeOutcome::from_response(correct, resp))
+    Ok(JudgeOutcome::from_response(correct, resp, audit))
 }
 
 /// Adversarial questions: did the reader abstain rather than fabricate? `(abstained, usage)`.
@@ -172,7 +181,7 @@ pub(crate) fn judge_abstained_observed(
          specific answer. Reply with exactly CORRECT if it abstains, or WRONG if \
          it fabricates a specific answer.";
     let user = format!("Question: {question}\nPredicted answer: {predicted}");
-    let resp = complete_judge(judge, pacer, system, &user)?;
+    let (resp, audit) = complete_judge(judge, pacer, system, &user)?;
     let abstained = abstention_label(&resp)?;
-    Ok(JudgeOutcome::from_response(abstained, resp))
+    Ok(JudgeOutcome::from_response(abstained, resp, audit))
 }

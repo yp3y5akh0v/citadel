@@ -48,11 +48,10 @@ retrieval bit-identical to these runs (the same ordered top-50 for all 1,986 que
 the shift is hosted reader/judge variance - cross-date verdict-flip rates equal the
 within-date rates.
 
-**Embedder.** The evaluated runs used `e5-large` (v1). Retrieval was reader-bound, so the
-embedder was a within-noise choice; `e5-large` matched or slightly beat the alternatives
-(85.7% vs 85.5% for `bge-large` over 3 runs each on an earlier reader configuration,
-same reranker + fusion; the embedder ranking is unchanged). Deterministic
-retrieval recall (recall@50, hybrid fusion, no reranker) across the encoders we evaluated:
+**Embedder.** The evaluated runs used `e5-large` (v1). An earlier reader configuration
+with the same reranker and fusion measured 85.7% for `e5-large` versus 85.5% for
+`bge-large` over 3 runs each. Any-evidence retrieval recall (recall@50, hybrid fusion,
+no reranker) across the evaluated encoders:
 
 | Embedder | recall@50 |
 |---|---|
@@ -65,7 +64,7 @@ retrieval recall (recall@50, hybrid fusion, no reranker) across the encoders we 
 | granite-embedding-english-r2 | 89.6 |
 
 The top encoders sit within ~1 point on raw recall; the cross-encoder reranker (see the layers
-below) then lifts the final recall@50 to 94.5%. `bge-large` and the others remain selectable
+below) then lifts the final any-evidence recall@50 to 94.5%. `bge-large` and the others remain selectable
 `--embedder` options.
 
 ## Historical comparison with 2025 paper results
@@ -92,9 +91,6 @@ a paired advantage under a shared protocol. Newer vendor results are not include
 These runs used raw turns enriched with supplied photo captions and image-search
 text, local embedding and reranking, and no LLM calls during memory ingest or
 retrieval. Reader and judge calls generated and scored answers separately.
-
-77% of scored misses have the gold already in the prompt and the reader still missed it
-(Self-audit below), so reader quality dominates the remaining error.
 
 ## LongMemEval_S (full-haystack)
 
@@ -159,7 +155,7 @@ dataset_sha256:    79fa87e90f04081343b8c8debecb80a9a6842b76a7aa537dc9fdf651ea698
 
 This is the configuration recorded for the LoCoMo full runs above.
 
-## How the harness stays reproducible
+## Evaluation configuration
 
 - The dataset is read as raw bytes, SHA-256-hashed, then parsed, so a run pins the
   exact input file.
@@ -168,9 +164,9 @@ This is the configuration recorded for the LoCoMo full runs above.
 - The reader uses one fixed prompt built from only the retrieved turns and the
   question; it never receives the question's category, and sees the top-k retrieved
   turns (50 by default), not the full conversation.
-- Serial and concurrent runs score identically (the harness adds no nondeterminism);
-  `CITADEL_LOCOMO_CONCURRENCY=1` forces a serial path. Concurrency changes wall-clock time, not
-  the score.
+- For direct binary execution, `CITADEL_LOCOMO_CONCURRENCY=1` forces serial question
+  processing. Hosted reader and judge outputs can vary between runs even with
+  identical retrieved packets.
 - A per-question audit and a live trace are written for every question. The report
   includes the configuration and the limitations.
 
@@ -191,14 +187,16 @@ prints it):
 
 ```powershell
 pwsh -File run.ps1 -Label full-enc-mini -Reader gpt-4o-mini -Judge gpt-4o-mini `
-  -Embedder e5-large -EmbedderDir C:\path\to\e5-large
+  -Dataset C:\path\to\locomo10.json -KeyFile C:\path\to\openai-key.txt `
+  -Embedder e5-large -EmbedderDir C:\path\to\e5-large `
+  -RerankDir C:\path\to\ms-marco-MiniLM-L-6-v2
 ```
 
-Token-free retrieval diagnostic (no key, no spend) - prints the layered any/all
+Retrieval diagnostic (no API calls) - prints the layered any/all
 evidence recall (A / B / C / C-asof / D / D-asof):
 
 ```bash
-CITADEL_LOCOMO_ENCRYPTED=true CITADEL_LOCOMO_RETRIEVAL_DIAG=1 CITADEL_LOCOMO_EMBEDDER=e5-large \
+CITADEL_LOCOMO_ENCRYPTED=true CITADEL_LOCOMO_MODE=retrieval-diag CITADEL_LOCOMO_EMBEDDER=e5-large \
   CITADEL_EMBEDDER_DIR=/path/to/e5-large \
   CITADEL_RERANKER_DIR=/path/to/ms-marco-MiniLM-L-6-v2 \
   ./target/release/locomo locomo10.json
@@ -206,23 +204,22 @@ CITADEL_LOCOMO_ENCRYPTED=true CITADEL_LOCOMO_RETRIEVAL_DIAG=1 CITADEL_LOCOMO_EMB
 
 ## Self-audit
 
-`selfaudit.ps1` reports, with no API calls: recall@k (the retrieval ceiling), and the
-split of every scored miss into a retrieval gap (gold evidence not retrieved, not
-reader-fixable) versus a reader miss (gold retrieved, answer still wrong).
+`selfaudit.ps1` reads a saved JSON audit or JSONL trace without API calls and
+reports none, partial, or complete annotated-evidence coverage. Questions without
+annotations are reported separately from the coverage metrics.
 
-Across the full run (Run 1), recall@50 = 94.5% (1451/1536); the denominator is 1536
+Across the full run (Run 1), any-evidence recall@50 = 94.5% (1451/1536); the denominator is 1536
 rather than 1540 because four scored questions list no gold-evidence turns and are
-excluded from the recall computation. Of 200 scored misses, 45 are retrieval gaps and
-154 are reader misses - 77% of the remaining error is reader-bound. By category:
-temporal 62 (11 gap, 51 reader), single_hop 54 (17 gap, 37 reader), multi_hop 50 (7
-gap, 43 reader), open_domain 34 (10 gap, 23 reader, 1 with no gold listed). Some
-reader misses are LoCoMo gold-key errors (the gold turn is attributed to the wrong
-speaker); the audit flags candidates by a speaker-mismatch heuristic.
+excluded from the recall computation. Of 200 scored misses, 45 contain no annotated
+gold turn and 154 contain at least one. By category, misses are temporal 62
+(11 none, 51 some), single_hop 54 (17 none, 37 some), multi_hop 50 (7 none,
+43 some), and open_domain 34 (10 none, 23 some, 1 unannotated). The optional dataset
+check flags speaker-mismatch candidates for manual review.
 
-Layered retrieval diagnostic (token-free, `CITADEL_LOCOMO_RETRIEVAL_DIAG`, n=1536).
+Layered retrieval diagnostic (token-free, `CITADEL_LOCOMO_MODE=retrieval-diag`, n=1536).
 Each cell is any%/all%: some gold turn in the top-k versus every gold turn in the
-top-k (the all column is the true multi-hop ceiling). With the indexed text
-date-prefixed (`[date] speaker: text ...`), overall evidence recall is:
+top-k. With date-prefixed indexed text (`[date] speaker: text ...`),
+overall evidence recall is:
 
 | Layer | @10 | @30 | @50 |
 |---|---|---|---|
@@ -231,31 +228,17 @@ date-prefixed (`[date] speaker: text ...`), overall evidence recall is:
 | C: + linear fusion (BM25 keyword) | 81.6/69.1 | 90.6/79.8 | 92.8/83.3 |
 | D: + cross-encoder reranker | 84.2/71.8 | 92.1/81.5 | 94.5/85.2 |
 
-In this historical diagnostic, A and B agree at the reported precision for the
-same embeddings. (An earlier revision reported A = 67.9% as the "embedder
-ceiling"; that diagnostic embedded the raw turn text while the index held
-speaker-and-caption-enriched text - an instrumentation artifact, not a ceiling.)
-Fusion and the reranker add recall on top of the exact vector layer because they
-merge non-vector signals. In the evaluated fusion-plus-reranker configuration at k=50,
+A and B agree at the reported precision for the same embeddings.
+In the evaluated fusion-plus-reranker configuration at k=50,
 269/282 (95.4%) multi-hop questions surface at least one annotated gold turn and
-172/282 (61.0%) surface every annotated gold turn. Full-set coverage is a
-retrieval diagnostic; by itself, it does not identify which strategy would close
-the remaining evidence gaps. Grading recency as of the conversation's end
-(the diag's C-asof/D-asof rows) was measured to hurt recall (-4.3 any@30) and is
-not used.
+172/282 (61.0%) surface every annotated gold turn. Using the conversation's end as
+the recency reference reduced any-evidence recall@30 by 4.3 percentage points in
+this diagnostic; the recorded configuration uses the wall clock.
 
-`judge-probe.ps1` feeds the judge a fixed 40-item set of answers that are factually wrong
-but on the gold topic and reports how often it marks them correct, bounding judge
-lenience. On this probe the judge marked 0 of 40 correct (0.0% false-accept).
-
-Run-to-run noise decomposes by diffing the per-question audits of the three full
-runs (identical retrieval): 911 of 1,986 answers differ textually between runs at
-temperature 0; 72 questions flip correct/incorrect (46 scored, 26 adversarial) - 67
-because the reader's answer changed, 5 because the judge flipped on a byte-identical
-answer. The 5 judge-side flips are all partial-credit boundaries: the answer names
-some of a multi-part gold, or the question is open-ended and the gold is one of
-several defensible replies. The +/-0.3% band is entirely reader/judge-side;
-retrieval contributes none.
+The historical per-question audit comparison recorded 911 of 1,986 answers
+differing textually at temperature 0 and 72 changed verdicts (46 scored,
+26 adversarial). Of those verdict changes, 67 accompanied changed answers and
+five occurred on byte-identical answers.
 
 ## Limitations
 
@@ -267,8 +250,9 @@ retrieval contributes none.
 - On this benchmark the recency and importance fusion weights contribute no rank signal
   (all sessions are equally old versus the wall clock, and raw turns carry no importance),
   so ranking is effectively semantic plus BM25 keyword.
-- LoCoMo gold labels contain errors (the harness lists candidates), putting a ceiling
-  below 100%. The retrieval ceiling and per-question audit are in each run's local report.
+- Evidence coverage measures retrieval against dataset annotations, not answer
+  accuracy or the cause of an incorrect answer. Annotation-review flags require
+  manual verification.
 - conv-26 is the development split on which the configuration (top-50, session-grouped
   order, no neighbor expansion, date-prefixed indexing) was selected; the full-run
   figures are the reportable ones. The evaluated retrieval settings (fusion ratio, RRF k, rerank pool)
@@ -278,7 +262,7 @@ retrieval contributes none.
 - Three runs at temperature 0; the hosted reader and judge are not bit-deterministic, so
   scored accuracy varies run-to-run (87.2% +/- 0.3%; earlier triples on bit-identical
   retrieval measured 86.0% +/- 0.3% and 85.7% +/- 0.3%). Retrieval is deterministic, so
-  recall@50 is identical (94.5%, the same 1451/1536 questions) across all runs.
+  any-evidence recall@50 is identical (94.5%, the same 1451/1536 questions) across all runs.
 
 ## Prompts
 

@@ -289,7 +289,8 @@ fn run_emits_one_hypothesis_per_question_in_order() {
         &pacer,
         &cfg,
         &mut |_, qid, hyp| {
-            emitted.push((qid.to_string(), hyp.to_string()));
+            assert!(!hyp.reader_calls.is_empty());
+            emitted.push((qid.to_string(), hyp.answer.clone()));
             Ok(())
         },
     )
@@ -300,6 +301,59 @@ fn run_emits_one_hypothesis_per_question_in_order() {
     assert_eq!(out[1].0, "q_second_abs");
     assert!(out.iter().all(|(_, hyp)| hyp == "an answer"));
     assert_eq!(emitted.len(), 2);
+}
+
+#[test]
+fn invalid_configuration_and_session_metadata_fail_before_ingestion() {
+    for invalid in [
+        "concurrency",
+        "top_k",
+        "duplicate_question",
+        "session_id",
+        "session_date",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let eng = engine(dir.path());
+        let mut samples = dataset::parse_root(&fixture()).unwrap();
+        let mut cfg = LmevalConfig {
+            bench: BenchConfig::default(),
+            encrypted: false,
+            reuse: false,
+            reader_concurrency: 1,
+        };
+        match invalid {
+            "concurrency" => cfg.reader_concurrency = 0,
+            "top_k" => cfg.bench.top_k = 0,
+            "duplicate_question" => samples[1].question_id = samples[0].question_id.to_uppercase(),
+            "session_id" => samples[0].turns[1].session_id = "other".into(),
+            "session_date" => {
+                let other = samples[0].turns[2].clone();
+                samples[0].turns[1].date = other.date;
+                samples[0].turns[1].event_micros = other.event_micros;
+            }
+            _ => unreachable!(),
+        }
+        let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::new(DIM));
+        let reader = testing::capturing(Vec::new());
+        let error = run(
+            &eng,
+            &samples,
+            embedder.clone(),
+            &*reader.client(),
+            &Pacer::unbounded(),
+            &cfg,
+            &mut |_, _, _| panic!("invalid input must not emit"),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, BenchError::Dataset(_)),
+            "{invalid}: {error}"
+        );
+        assert!(reader.requests().is_empty());
+        assert!(eng
+            .attach_existing_region(&samples[0].question_id, embedder)
+            .is_err());
+    }
 }
 
 /// Agentic path end-to-end: an aggregation question runs extract -> code

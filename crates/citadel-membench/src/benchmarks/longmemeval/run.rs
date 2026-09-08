@@ -12,7 +12,7 @@ use super::dataset::LmSample;
 use super::{ingest, LongMemEval};
 use crate::core::db::attach_reused_region;
 use crate::core::error::{BenchError, Result};
-use crate::core::eval::{answer_question, Question};
+use crate::core::eval::{answer_question, AnswerOutcome, Question};
 use crate::core::ratelimit::{Gate, Pacer};
 use crate::BenchConfig;
 
@@ -22,6 +22,30 @@ pub struct LmevalConfig {
     /// Reopened persisted DB: validate and re-attach regions without ingestion.
     pub reuse: bool,
     pub reader_concurrency: usize,
+}
+
+struct UsageTotal {
+    input_tokens: u64,
+    output_tokens: u64,
+    cost_usd: Option<f64>,
+}
+
+impl Default for UsageTotal {
+    fn default() -> Self {
+        Self {
+            input_tokens: 0,
+            output_tokens: 0,
+            cost_usd: Some(0.0),
+        }
+    }
+}
+
+impl UsageTotal {
+    fn add(&mut self, usage: &TokenUsage) {
+        self.input_tokens += u64::from(usage.input_tokens);
+        self.output_tokens += u64::from(usage.output_tokens);
+        self.cost_usd = self.cost_usd.zip(usage.cost_usd).map(|(a, b)| a + b);
+    }
 }
 
 /// Ingest + answer every sample, returning `(question_id, hypothesis)` in
@@ -34,19 +58,17 @@ pub fn run(
     reader: &dyn LLMClient,
     pacer: &Pacer,
     cfg: &LmevalConfig,
-    on_emit: &mut (dyn FnMut(usize, &str, &str) -> Result<()> + Send),
+    on_emit: &mut (dyn FnMut(usize, &str, &AnswerOutcome) -> Result<()> + Send),
 ) -> Result<Vec<(String, String)>> {
-    // Region names are case-folded by the engine, so a duplicate
-    // (case-insensitive) question_id would merge two haystacks; fail loud
-    // rather than contaminate.
-    let mut seen = rustc_hash::FxHashSet::default();
-    for s in samples {
-        if !seen.insert(s.question_id.to_ascii_lowercase()) {
-            return Err(BenchError::Dataset(format!(
-                "duplicate question_id (case-insensitive): {}",
-                s.question_id
-            )));
-        }
+    cfg.bench.validate()?;
+    if cfg.reader_concurrency == 0 {
+        return Err(BenchError::Dataset(
+            "reader_concurrency must be positive".into(),
+        ));
+    }
+    super::dataset::validate_samples(samples)?;
+    if samples.is_empty() {
+        return Ok(Vec::new());
     }
 
     // Phase 1: ingest each question's private haystack into its own region.
@@ -88,7 +110,7 @@ pub fn run(
     let failed = AtomicBool::new(false);
     let observed = Mutex::new(on_emit);
     let err_slot: Mutex<Option<BenchError>> = Mutex::new(None);
-    let spent: Mutex<TokenUsage> = Mutex::new(TokenUsage::default());
+    let spent: Mutex<UsageTotal> = Mutex::new(UsageTotal::default());
     let (tx, rx) = std::sync::mpsc::channel::<(usize, (String, String))>();
     let (next_r, failed_r, observed_r, err_r, gate_r, bench_r, spent_r) =
         (&next, &failed, &observed, &err_slot, &gate, &bench, &spent);
@@ -123,11 +145,8 @@ pub fn run(
                 match outcome {
                     Ok(o) => {
                         spent_r.lock().expect("usage poisoned").add(&o.usage);
-                        let emit = (*observed_r.lock().expect("observer poisoned"))(
-                            i,
-                            &s.question_id,
-                            &o.answer,
-                        );
+                        let emit =
+                            (*observed_r.lock().expect("observer poisoned"))(i, &s.question_id, &o);
                         match emit {
                             Ok(()) => {
                                 let _ = tx.send((i, (s.question_id.clone(), o.answer)));
@@ -167,8 +186,8 @@ pub fn run(
         "  tokens: in {} / out {}  (mean {:.0} / {:.0} per question)  {cost}",
         spent.input_tokens,
         spent.output_tokens,
-        f64::from(spent.input_tokens) / total as f64,
-        f64::from(spent.output_tokens) / total as f64,
+        spent.input_tokens as f64 / total as f64,
+        spent.output_tokens as f64 / total as f64,
     );
     let mut slots: Vec<Option<(String, String)>> = (0..total).map(|_| None).collect();
     for (i, pair) in rx {
@@ -178,4 +197,36 @@ pub fn run(
         .into_iter()
         .map(|o| o.expect("every question produced a result"))
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_usage_keeps_unknown_costs_and_wide_token_counts() {
+        let priced = TokenUsage {
+            input_tokens: u32::MAX,
+            output_tokens: u32::MAX,
+            cost_usd: Some(0.5),
+        };
+        let unknown = TokenUsage {
+            cost_usd: None,
+            ..priced
+        };
+        for calls in [[priced, unknown], [unknown, priced]] {
+            let mut total = UsageTotal::default();
+            assert_eq!(total.cost_usd, Some(0.0));
+            for call in calls {
+                total.add(&call);
+            }
+            assert_eq!(total.cost_usd, None);
+            assert_eq!(total.input_tokens, 2 * u64::from(u32::MAX));
+            assert_eq!(total.output_tokens, 2 * u64::from(u32::MAX));
+        }
+        let mut total = UsageTotal::default();
+        total.add(&priced);
+        total.add(&priced);
+        assert_eq!(total.cost_usd, Some(1.0));
+    }
 }

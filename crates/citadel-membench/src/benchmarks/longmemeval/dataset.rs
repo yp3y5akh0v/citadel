@@ -3,6 +3,7 @@
 use std::fs;
 use std::path::Path;
 
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::Value;
 
 use crate::core::civil::datetime_micros;
@@ -89,13 +90,44 @@ pub fn parse_root(root: &Value) -> Result<Vec<LmSample>> {
     let arr = root
         .as_array()
         .ok_or_else(|| BenchError::Dataset("top level must be a JSON array".into()))?;
-    arr.iter().map(parse_sample).collect()
+    let samples = arr.iter().map(parse_sample).collect::<Result<Vec<_>>>()?;
+    validate_samples(&samples)?;
+    Ok(samples)
 }
 
 pub fn validate_samples(samples: &[LmSample]) -> Result<()> {
+    let mut regions = FxHashSet::default();
     for sample in samples {
         validate_question_date(&sample.question_date, &sample.question_id)?;
+        if sample.question_id.trim().is_empty()
+            || !regions.insert(sample.question_id.to_ascii_lowercase())
+        {
+            return Err(BenchError::Dataset(format!(
+                "question_id must be nonempty and unique ignoring ASCII case: {:?}",
+                sample.question_id
+            )));
+        }
+        if sample
+            .turns
+            .iter()
+            .any(|turn| turn.session_id.trim().is_empty())
+        {
+            return Err(BenchError::Dataset(format!(
+                "{}: haystack session IDs must be nonempty",
+                sample.question_id
+            )));
+        }
+        let mut sessions = FxHashMap::default();
         for turn in &sample.turns {
+            let identity = (turn.session_id.as_str(), turn.date.as_str());
+            if let Some(previous) = sessions.insert(turn.session_occurrence, identity) {
+                if previous != identity {
+                    return Err(BenchError::Dataset(format!(
+                        "{}: session occurrence {} has conflicting ID or date metadata",
+                        sample.question_id, turn.session_occurrence
+                    )));
+                }
+            }
             let parsed = parse_lmeval_datetime(&turn.date);
             if (!turn.date.is_empty() && parsed.is_none()) || parsed != turn.event_micros {
                 return Err(BenchError::Dataset(format!(
@@ -121,6 +153,11 @@ fn parse_sample(v: &Value) -> Result<LmSample> {
     let abstention = question_id.ends_with("_abs");
 
     let session_ids = str_array(obj, "haystack_session_ids")?;
+    if session_ids.iter().any(|id| id.trim().is_empty()) {
+        return Err(BenchError::Dataset(format!(
+            "{question_id}: haystack session IDs must be nonempty"
+        )));
+    }
     let dates = str_array(obj, "haystack_dates")?;
     let sessions = obj
         .get("haystack_sessions")
@@ -256,6 +293,31 @@ pub(super) fn parse_lmeval_datetime(s: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_region_and_session_identities_fail_before_ingestion() {
+        let sample = serde_json::json!({
+            "question_id": "Question", "question_type": "multi-session",
+            "question": "q", "question_date": "", "answer": "a",
+            "haystack_session_ids": ["repeated", "repeated"], "haystack_dates": ["", ""],
+            "haystack_sessions": [[{"role": "user", "content": "one"}], [{"role": "user", "content": "two"}]],
+            "answer_session_ids": ["repeated"]
+        });
+        let valid = parse_root(&serde_json::json!([sample.clone()])).unwrap();
+        assert_eq!(valid[0].turns[0].session_occurrence, 0);
+        assert_eq!(valid[0].turns[1].session_occurrence, 1);
+        let mut repeated = sample.clone();
+        repeated["question_id"] = serde_json::json!("QUESTION");
+        assert!(parse_root(&serde_json::json!([sample.clone(), repeated])).is_err());
+        for value in ["", " \t"] {
+            let mut bad = sample.clone();
+            bad["question_id"] = serde_json::json!(value);
+            assert!(parse_root(&serde_json::json!([bad])).is_err());
+            let mut bad = sample.clone();
+            bad["haystack_session_ids"][1] = serde_json::json!(value);
+            assert!(parse_root(&serde_json::json!([bad])).is_err());
+        }
+    }
 
     #[test]
     fn parses_the_lmeval_stamp() {

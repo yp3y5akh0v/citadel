@@ -26,29 +26,16 @@ pub use core::eval::{answer_question, reader_view, AnswerOutcome, Question};
 pub use core::hash::sha256_hex;
 pub use core::ratelimit::{default_tpm_for_model, Gate, Pacer};
 
-/// Published USD per 1M tokens as `(input, output)`, keyed by model id: the
-/// APIs return no `cost_usd`, so the bench estimates from token counts (real
-/// bill is lower with prompt caching). Unknown models fall back to
-/// gpt-4o-mini.
-fn model_rate(model: &str) -> (f64, f64) {
-    if model.starts_with("gpt-4o-mini") {
-        (0.15, 0.60)
-    } else if model.starts_with("gpt-4o") {
-        (2.50, 10.00)
-    } else if model.starts_with("gemini") {
-        // Gemini 3.5 Flash list price (May 2026); other Gemini ids approximated
-        // here.
-        (1.50, 9.00)
-    } else {
-        (0.15, 0.60)
-    }
-}
-
 /// Estimated USD for one model's token usage at its published rate.
-fn token_cost(model: &str, input_tokens: u32, output_tokens: u32) -> f64 {
-    let (rate_in, rate_out) = model_rate(model);
-    (f64::from(input_tokens) / 1_000_000.0) * rate_in
-        + (f64::from(output_tokens) / 1_000_000.0) * rate_out
+fn token_cost(model: &str, input_tokens: u32, output_tokens: u32) -> Option<f64> {
+    if input_tokens == 0 && output_tokens == 0 {
+        return Some(0.0);
+    }
+    let (rate_in, rate_out) = citadel_llm::known_token_rates_usd_per_million(model)?;
+    Some(
+        (f64::from(input_tokens) / 1_000_000.0) * rate_in
+            + (f64::from(output_tokens) / 1_000_000.0) * rate_out,
+    )
 }
 
 /// Order in which retrieved memories are rendered for the reader.
@@ -104,6 +91,20 @@ impl Default for BenchConfig {
     }
 }
 
+impl BenchConfig {
+    pub fn validate(self) -> Result<()> {
+        if self.top_k == 0 || self.reader_max_tokens == 0 {
+            return Err(BenchError::Dataset(
+                "top_k and reader_max_tokens must be positive".into(),
+            ));
+        }
+        i64::try_from(self.neighbor_radius).map_err(|_| {
+            BenchError::Dataset("neighbor_radius exceeds the atom identifier range".into())
+        })?;
+        Ok(())
+    }
+}
+
 /// The per-question outcome, before aggregation.
 #[derive(Debug, Clone, Serialize)]
 pub struct QuestionResult {
@@ -121,11 +122,11 @@ pub struct QuestionResult {
     pub input_tokens: u32,
     pub output_tokens: u32,
     /// Estimated USD: reader + judge tokens, each at its model's rate.
-    pub cost_usd: f64,
-    /// `dia_id`s retrieved into the reader's top-k; vs `gold_evidence` this
-    /// splits a miss into reader-failure (gold retrieved) vs retrieval-gap
-    /// (gold absent).
+    pub cost_usd: Option<f64>,
+    /// Evidence IDs in reader-view order. Annotation coverage alone does not
+    /// establish whether an incorrect answer was caused by retrieval or reading.
     pub retrieved: Vec<String>,
+    pub retrieved_atom_ids: Vec<citadel_mem::AtomId>,
     /// Gold evidence `dia_id`s (from the dataset); joined against `retrieved`.
     pub gold_evidence: Vec<String>,
     /// Rendered text of each gold evidence turn, parallel to `gold_evidence`.
@@ -141,6 +142,7 @@ pub struct QuestionResult {
     pub gold: String,
     pub predicted: String,
     pub reader_finish_reasons: Vec<core::eval::CompletionFinish>,
+    pub reader_calls: Vec<core::eval::CompletionCallAudit>,
     /// Absent only when an unscorable question made no judge call.
     pub judge: Option<core::eval::JudgeOutcome>,
 }
@@ -183,8 +185,8 @@ pub struct Provenance {
     pub dataset_sha256: String,
     /// The reader model's published per-1M rates; the bench costs reader and
     /// judge each at its own model's rate (estimated, not billed).
-    pub cost_rate_input_usd_per_m: f64,
-    pub cost_rate_output_usd_per_m: f64,
+    pub cost_rate_input_usd_per_m: Option<f64>,
+    pub cost_rate_output_usd_per_m: Option<f64>,
     pub known_flaws: String,
 }
 
@@ -208,7 +210,7 @@ pub struct BenchReport {
     pub recall_p95_micros: u128,
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
-    pub estimated_cost_usd: f64,
+    pub estimated_cost_usd: Option<f64>,
 }
 
 /// Whether to use encrypted regions (per-atom sealed + crypto erasure), from
@@ -272,7 +274,8 @@ pub fn run_sample_observed(
     pacer: &Pacer,
     on_result: &mut (dyn FnMut(&QuestionResult) -> Result<()> + Send),
 ) -> Result<Vec<QuestionResult>> {
-    // Ingest or validate the conversation before question workers start.
+    benchmarks::locomo::dataset::validate_samples(std::slice::from_ref(sample))?;
+    config.validate()?;
     if reuse {
         core::db::attach_reused_region(eng, &sample.sample_id, embedder, encrypted_regions())?;
         benchmarks::locomo::ingest::validate_reuse(eng, &sample.sample_id, sample)?;
@@ -415,7 +418,7 @@ fn process_one_question(
     // Empty gold on a scored question = malformed key: record unscorable (no
     // LLM call) rather than grading it wrong. Returns before acquiring any
     // gate/pacer.
-    if qa.category.is_scored() && qa.gold.trim().is_empty() {
+    if !qa.is_scorable() {
         return Ok(QuestionResult {
             sample_id: region.to_owned(),
             qa_index,
@@ -425,8 +428,9 @@ fn process_one_question(
             recall_micros: 0,
             input_tokens: 0,
             output_tokens: 0,
-            cost_usd: 0.0,
+            cost_usd: Some(0.0),
             retrieved: Vec::new(),
+            retrieved_atom_ids: Vec::new(),
             gold_evidence: qa.evidence.clone(),
             gold_turn_texts: resolve_gold_texts(&qa.evidence, gold_index),
             gold_in_view: gold_in_view_flags(&qa.evidence, &[]),
@@ -434,6 +438,7 @@ fn process_one_question(
             gold: qa.gold.clone(),
             predicted: String::new(),
             reader_finish_reasons: Vec::new(),
+            reader_calls: Vec::new(),
             judge: None,
         });
     }
@@ -484,12 +489,15 @@ fn process_one_question(
             reader.model_id(),
             outcome.usage.input_tokens,
             outcome.usage.output_tokens,
-        ) + token_cost(
+        )
+        .zip(token_cost(
             judge.model_id(),
             judge_outcome.usage.input_tokens,
             judge_outcome.usage.output_tokens,
-        ),
+        ))
+        .map(|(reader, judge)| reader + judge),
         retrieved: outcome.retrieved,
+        retrieved_atom_ids: outcome.retrieved_atom_ids,
         gold_evidence: qa.evidence.clone(),
         gold_turn_texts,
         gold_in_view,
@@ -497,6 +505,7 @@ fn process_one_question(
         gold: qa.gold.clone(),
         predicted: outcome.answer,
         reader_finish_reasons: outcome.reader_finish_reasons,
+        reader_calls: outcome.reader_calls,
         judge: Some(judge_outcome),
     })
 }
@@ -513,13 +522,15 @@ pub fn aggregate(results: &[QuestionResult], provenance: Provenance) -> BenchRep
 
     let mut total_input_tokens = 0u64;
     let mut total_output_tokens = 0u64;
-    let mut total_cost_usd = 0.0f64;
+    let mut total_cost_usd = Some(0.0f64);
     let mut latencies = Vec::with_capacity(results.len());
 
     for r in results {
         total_input_tokens += u64::from(r.input_tokens);
         total_output_tokens += u64::from(r.output_tokens);
-        total_cost_usd += r.cost_usd;
+        total_cost_usd = total_cost_usd
+            .zip(r.cost_usd)
+            .map(|(total, cost)| total + cost);
         // Unscorable questions skip recall (latency 0); excluding keeps p95
         // honest.
         if r.scorable {
@@ -586,7 +597,7 @@ pub fn provenance(
 ) -> Provenance {
     let w = FusionWeights::default();
     let reader_model = reader_model.into();
-    let (rate_in, rate_out) = model_rate(&reader_model);
+    let rate = citadel_llm::known_token_rates_usd_per_million(&reader_model);
     Provenance {
         reader_model,
         judge_model: judge_model.into(),
@@ -604,8 +615,8 @@ pub fn provenance(
         fusion_importance: w.importance,
         dataset_note: dataset_note.into(),
         dataset_sha256: dataset_sha256.into(),
-        cost_rate_input_usd_per_m: rate_in,
-        cost_rate_output_usd_per_m: rate_out,
+        cost_rate_input_usd_per_m: rate.map(|(input, _)| input),
+        cost_rate_output_usd_per_m: rate.map(|(_, output)| output),
         known_flaws: Locomo::new(false).known_flaws().to_string(),
     }
 }
@@ -659,64 +670,25 @@ mod cost_tests {
     use super::*;
 
     #[test]
-    fn model_rate_matches_known_models_and_versioned_aliases() {
-        assert_eq!(model_rate("gpt-4o-mini"), (0.15, 0.60));
-        assert_eq!(model_rate("gpt-4o-mini-2024-07-18"), (0.15, 0.60));
-        assert_eq!(model_rate("gpt-4o"), (2.50, 10.00));
-        assert_eq!(model_rate("gpt-4o-2024-08-06"), (2.50, 10.00));
+    fn costs_use_shared_rates_including_the_launch_snapshot() {
+        assert_eq!(token_cost("gpt-4o-mini", 1_000_000, 1_000_000), Some(0.75));
+        assert_eq!(token_cost("gpt-4o", 1_000_000, 1_000_000), Some(12.50));
+        assert_eq!(
+            token_cost("gpt-4o-2024-05-13", 1_000_000, 1_000_000),
+            Some(20.0)
+        );
     }
 
     #[test]
-    fn model_rate_mini_wins_over_the_gpt4o_prefix() {
-        // "gpt-4o-mini" also starts with "gpt-4o"; the mini branch must be
-        // checked first.
-        assert_eq!(model_rate("gpt-4o-mini"), (0.15, 0.60));
-        assert_ne!(model_rate("gpt-4o-mini"), model_rate("gpt-4o"));
-    }
-
-    #[test]
-    fn model_rate_unknown_falls_back_to_mini() {
-        assert_eq!(model_rate("gpt-5.4-mini"), (0.15, 0.60));
-        assert_eq!(model_rate("claude-sonnet"), (0.15, 0.60));
-        assert_eq!(model_rate(""), (0.15, 0.60));
-    }
-
-    #[test]
-    fn model_rate_prices_gemini_at_flash_list() {
-        assert_eq!(model_rate("gemini-3.5-flash"), (1.50, 9.00));
-        assert_eq!(model_rate("gemini-3-pro"), (1.50, 9.00));
-    }
-
-    #[test]
-    fn token_cost_applies_the_models_published_rate() {
-        // 1M input + 1M output at gpt-4o-mini = 0.15 + 0.60 = 0.75.
-        assert!((token_cost("gpt-4o-mini", 1_000_000, 1_000_000) - 0.75).abs() < 1e-9);
-        // 1M input + 1M output at gpt-4o = 2.50 + 10.00 = 12.50.
-        assert!((token_cost("gpt-4o", 1_000_000, 1_000_000) - 12.50).abs() < 1e-9);
+    fn unknown_rates_do_not_fabricate_a_cost() {
+        assert_eq!(token_cost("unlisted-model", 100, 50), None);
+        assert_eq!(token_cost("gemini-unlisted", 100, 50), None);
+        assert_eq!(token_cost("unlisted-model", 0, 0), Some(0.0));
     }
 
     #[test]
     fn token_cost_scales_input_and_output_independently() {
-        // 2M input + 0.5M output at gpt-4o-mini = 2*0.15 + 0.5*0.60 = 0.30 +
-        // 0.30 = 0.60.
-        assert!((token_cost("gpt-4o-mini", 2_000_000, 500_000) - 0.60).abs() < 1e-9);
-    }
-
-    #[test]
-    fn token_cost_is_zero_without_tokens() {
-        assert_eq!(token_cost("gpt-4o-mini", 0, 0), 0.0);
-        assert_eq!(token_cost("gpt-4o", 0, 0), 0.0);
-    }
-
-    #[test]
-    fn per_question_cost_bills_reader_and_judge_at_their_own_models() {
-        // As in process_one_question: a gpt-4o reader and gpt-4o-mini judge are
-        // each costed at their own model's rate, then summed.
-        let reader = token_cost("gpt-4o", 1_000_000, 200_000); // 2.50 + 0.2*10 = 4.50
-        let judge = token_cost("gpt-4o-mini", 400_000, 100_000); // 0.4*0.15 + 0.1*0.60 = 0.12
-        assert!((reader - 4.50).abs() < 1e-9);
-        assert!((judge - 0.12).abs() < 1e-9);
-        assert!(((reader + judge) - 4.62).abs() < 1e-9);
+        assert!((token_cost("gpt-4o-mini", 2_000_000, 500_000).unwrap() - 0.60).abs() < 1e-9);
     }
 }
 

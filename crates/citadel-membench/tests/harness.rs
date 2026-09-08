@@ -235,6 +235,34 @@ fn reader_view_expands_neighbors_dedups_and_orders() {
         view_ids(vec![hit(3), hit(1)], BenchConfig::default()),
         vec![ids[3], ids[1]]
     );
+    let owned = hit(3);
+    let text_allocation = owned.text.as_ptr();
+    let unchanged = reader_view(&eng, &s.sample_id, vec![owned], BenchConfig::default()).unwrap();
+    assert_eq!(unchanged[0].text.as_ptr(), text_allocation);
+}
+
+#[test]
+fn session_prompt_rejects_invalid_or_conflicting_metadata() {
+    let (_dir, eng) = open_engine();
+    eng.create_region("metadata", Arc::new(MockEmbedder::new(DIM)))
+        .unwrap();
+    let sample = parse_root(&fixture()).unwrap().remove(0);
+    let ids = ingest_sample(&eng, "metadata", &sample).unwrap();
+    let first = eng.fetch_one("metadata", ids[0]).unwrap().unwrap();
+    for (field, value) in [("session", json!("1")), ("date_time", json!(null))] {
+        let mut invalid = first.clone();
+        invalid.payload[field] = value;
+        assert!(matches!(
+            build_reader_prompt(&[invalid], "question", true),
+            Err(BenchError::Dataset(_))
+        ));
+    }
+    let mut second = eng.fetch_one("metadata", ids[1]).unwrap().unwrap();
+    second.payload["date_time"] = json!("a conflicting date");
+    assert!(build_reader_prompt(&[first, second], "question", true)
+        .unwrap_err()
+        .to_string()
+        .contains("conflicting dates"));
 }
 
 #[test]
@@ -264,7 +292,7 @@ fn session_reader_order_keeps_best_session_first_and_turns_chronological() {
         vec![ids[4], ids[0], ids[2], ids[3]]
     );
 
-    let rendered = render(&build_reader_prompt(&grouped, "What happened?", true));
+    let rendered = render(&build_reader_prompt(&grouped, "What happened?", true).unwrap());
     let s10 = rendered
         .find("[Session 10 from 12:00 pm on 20 March, 2024]")
         .unwrap();
@@ -323,7 +351,7 @@ fn reader_prompt_contains_only_passed_hits_not_gold_or_evidence() {
     assert_eq!(hits.len(), 1, "k=1 yields exactly one hit");
     let retrieved_text = hits[0].text.clone();
 
-    let prompt = build_reader_prompt(&hits, "What breed is Rex?", false);
+    let prompt = build_reader_prompt(&hits, "What breed is Rex?", false).unwrap();
     let blob = render(&prompt);
 
     // The single retrieved turn and the question are present.
@@ -540,7 +568,12 @@ fn run_sample_preserves_reader_and_judge_completion_audit() {
     let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::new(DIM));
     let mut reader_response = CompletionResponse::text("partial answer");
     reader_response.finish_reason = FinishReason::Length;
-    let reader = testing::scripted(vec![reader_response]);
+    reader_response.usage = TokenUsage {
+        input_tokens: 100,
+        output_tokens: 20,
+        cost_usd: None,
+    };
+    let reader = citadel_llm::factory::from_fn("gpt-4o", move |_| Ok(reader_response.clone()));
     let raw_judge = "The answer is incomplete.\n{\"label\":\"WRONG\"}";
     let mut judge_response = CompletionResponse::text(raw_judge);
     judge_response.usage = TokenUsage {
@@ -548,7 +581,7 @@ fn run_sample_preserves_reader_and_judge_completion_audit() {
         output_tokens: 7,
         cost_usd: Some(0.01),
     };
-    let judge = testing::scripted(vec![judge_response]);
+    let judge = citadel_llm::factory::from_fn("gpt-4o-mini", move |_| Ok(judge_response.clone()));
 
     let results = run_sample(
         &eng,
@@ -565,6 +598,17 @@ fn run_sample_preserves_reader_and_judge_completion_audit() {
     assert!(!result.correct);
     assert_eq!(result.predicted, "partial answer");
     assert_eq!(result.reader_finish_reasons, [CompletionFinish::Length]);
+    assert_eq!(result.reader_calls.len(), 1);
+    assert_eq!(result.reader_calls[0].request_sha256.len(), 64);
+    assert_eq!(result.reader_calls[0].max_output_tokens, Some(512));
+    assert_eq!(result.reader_calls[0].model_id, "gpt-4o");
+    let judge_audit = &result.judge.as_ref().unwrap().call;
+    assert_eq!(judge_audit.model_id, "gpt-4o-mini");
+    assert_eq!(judge_audit.request_sha256.len(), 64);
+    assert!(judge_audit.rendered_atom_ids.is_empty());
+    assert_eq!(judge_audit.usage.input_tokens, 12);
+    assert_eq!(judge_audit.usage.output_tokens, 7);
+    assert!((result.cost_usd.unwrap() - 0.000456).abs() < 1e-12);
     let row = serde_json::to_value(result).unwrap();
     assert_eq!(row["reader_finish_reasons"], json!(["length"]));
     assert_eq!(row["judge"]["response"], raw_judge);
@@ -594,24 +638,54 @@ fn agentic_audit_preserves_both_completions_including_fallback() {
         let mut sample = parse_root(&fixture()).unwrap().remove(0);
         sample.qa.truncate(1);
         sample.qa[0].question = "How many dogs did Alice adopt?".into();
+        for turn in &mut sample.turns {
+            if turn.session == 1 {
+                turn.date_time = "2:00 pm on 10 January, 2024".into();
+            }
+        }
         let (_dir, eng) = open_engine();
         let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::new(DIM));
         let mut extracted = CompletionResponse::text(extraction);
         extracted.finish_reason = extraction_finish;
         let mut answer = CompletionResponse::text("One dog.");
         answer.finish_reason = answer_finish;
-        let reader = testing::scripted(vec![extracted, answer]);
+        let reader = testing::capturing(vec![extracted, answer]);
         let judge = testing::reply_once("CORRECT");
         let config = BenchConfig {
             agentic: true,
+            reader_order: ReaderOrder::Chrono,
             ..BenchConfig::default()
         };
-        let results = run_sample(&eng, &sample, embedder, &*reader, &*judge, config).unwrap();
+        let results =
+            run_sample(&eng, &sample, embedder, &*reader.client(), &*judge, config).unwrap();
         assert_eq!(
             results[0].reader_finish_reasons,
             [extraction_finish.into(), answer_finish.into()]
         );
         assert_eq!(results[0].predicted, "One dog.");
+        assert_eq!(results[0].reader_calls.len(), 2);
+        assert_ne!(
+            results[0].reader_calls[0].request_sha256,
+            results[0].reader_calls[1].request_sha256
+        );
+        let requests = reader.requests();
+        assert_eq!(requests.len(), 2);
+        assert_ne!(
+            results[0].reader_calls[0].rendered_atom_ids,
+            results[0].reader_calls[1].rendered_atom_ids
+        );
+        for (request, audit) in requests.iter().zip(&results[0].reader_calls) {
+            let text = render(&request.messages);
+            let positions: Vec<_> = audit
+                .rendered_atom_ids
+                .iter()
+                .map(|id| {
+                    let hit = eng.fetch_one(&sample.sample_id, *id).unwrap().unwrap();
+                    text.find(&hit.text).unwrap()
+                })
+                .collect();
+            assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+        }
         assert!(results[0].judge.as_ref().unwrap().correct);
     }
 }
@@ -976,8 +1050,9 @@ fn res(category: Category, correct: bool) -> QuestionResult {
         recall_micros: 10,
         input_tokens: 5,
         output_tokens: 3,
-        cost_usd: 0.0,
+        cost_usd: Some(0.0),
         retrieved: Vec::new(),
+        retrieved_atom_ids: Vec::new(),
         gold_evidence: Vec::new(),
         gold_turn_texts: Vec::new(),
         gold_in_view: Vec::new(),
@@ -985,6 +1060,7 @@ fn res(category: Category, correct: bool) -> QuestionResult {
         gold: String::new(),
         predicted: String::new(),
         reader_finish_reasons: Vec::new(),
+        reader_calls: Vec::new(),
         judge: None,
     }
 }
@@ -1000,8 +1076,9 @@ fn unscorable(category: Category) -> QuestionResult {
         recall_micros: 0,
         input_tokens: 0,
         output_tokens: 0,
-        cost_usd: 0.0,
+        cost_usd: Some(0.0),
         retrieved: Vec::new(),
+        retrieved_atom_ids: Vec::new(),
         gold_evidence: Vec::new(),
         gold_turn_texts: Vec::new(),
         gold_in_view: Vec::new(),
@@ -1009,6 +1086,7 @@ fn unscorable(category: Category) -> QuestionResult {
         gold: String::new(),
         predicted: String::new(),
         reader_finish_reasons: Vec::new(),
+        reader_calls: Vec::new(),
         judge: None,
     }
 }
@@ -1042,13 +1120,15 @@ fn aggregate_sums_per_question_cost() {
         res(Category::MultiHop, false),
         res(Category::Adversarial, true),
     ];
-    results[0].cost_usd = 0.10;
-    results[1].cost_usd = 0.25;
-    results[2].cost_usd = 0.05;
+    results[0].cost_usd = Some(0.10);
+    results[1].cost_usd = Some(0.25);
+    results[2].cost_usd = Some(0.05);
     let report = aggregate(&results, prov());
     // Cost is the sum of per-question cost, independent of the token counts in
     // `res`.
-    assert!((report.estimated_cost_usd - 0.40).abs() < 1e-9);
+    assert!((report.estimated_cost_usd.unwrap() - 0.40).abs() < 1e-9);
+    results[1].cost_usd = None;
+    assert_eq!(aggregate(&results, prov()).estimated_cost_usd, None);
 }
 
 #[test]
@@ -1063,8 +1143,8 @@ fn provenance_records_the_reader_models_rate_not_a_hardcoded_one() {
         sha.clone(),
     );
     assert!(!mini.agentic, "the default benchmark is single-reader-call");
-    assert!((mini.cost_rate_input_usd_per_m - 0.15).abs() < 1e-9);
-    assert!((mini.cost_rate_output_usd_per_m - 0.60).abs() < 1e-9);
+    assert!((mini.cost_rate_input_usd_per_m.unwrap() - 0.15).abs() < 1e-9);
+    assert!((mini.cost_rate_output_usd_per_m.unwrap() - 0.60).abs() < 1e-9);
     // A gpt-4o reader records gpt-4o's rate, proving it derives from the model.
     let big = provenance(
         "gpt-4o",
@@ -1074,6 +1154,6 @@ fn provenance_records_the_reader_models_rate_not_a_hardcoded_one() {
         "n",
         sha,
     );
-    assert!((big.cost_rate_input_usd_per_m - 2.50).abs() < 1e-9);
-    assert!((big.cost_rate_output_usd_per_m - 10.00).abs() < 1e-9);
+    assert!((big.cost_rate_input_usd_per_m.unwrap() - 2.50).abs() < 1e-9);
+    assert!((big.cost_rate_output_usd_per_m.unwrap() - 10.00).abs() < 1e-9);
 }

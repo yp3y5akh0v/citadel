@@ -1,14 +1,15 @@
 //! LoCoMo: the long-term-conversational-memory benchmark (ACL 2024). Loader,
 //! per-turn ingest, reader prompt, and judge live here.
 
+pub mod config;
 pub mod dataset;
 pub mod ingest;
 pub mod prompts;
 
-use citadel_llm::{LLMClient, Message};
+use citadel_llm::LLMClient;
 use citadel_mem::AtomHit;
 
-use crate::core::benchmark::Benchmark;
+use crate::core::benchmark::{Benchmark, ReaderPrompt};
 use crate::core::error::Result;
 use crate::core::eval::JudgeOutcome;
 use crate::core::ratelimit::Pacer;
@@ -35,12 +36,11 @@ impl Benchmark for Locomo {
         hits: &[AtomHit],
         question: &str,
         _current_date: &str,
-    ) -> Result<Vec<Message>> {
-        Ok(prompts::build_reader_prompt(
-            hits,
-            question,
-            self.session_headers,
-        ))
+    ) -> Result<ReaderPrompt> {
+        Ok(ReaderPrompt {
+            messages: prompts::build_reader_prompt(hits, question, self.session_headers)?,
+            atom_ids: hits.iter().map(|hit| hit.id).collect(),
+        })
     }
 
     fn known_flaws(&self) -> &str {

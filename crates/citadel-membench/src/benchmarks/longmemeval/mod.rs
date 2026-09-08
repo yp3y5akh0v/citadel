@@ -1,16 +1,16 @@
 //! LongMemEval (ICLR 2025), emit-only: citadel produces `{question_id, hypothesis}`
 //! predictions; the official Python scorer judges them.
 
+pub mod config;
 pub mod dataset;
 pub mod ingest;
 pub mod prompts;
 pub mod retrieval;
 pub mod run;
 
-use citadel_llm::Message;
 use citadel_mem::AtomHit;
 
-use crate::core::benchmark::Benchmark;
+use crate::core::benchmark::{Benchmark, ReaderPrompt};
 use crate::core::error::Result;
 
 pub use run::{run, LmevalConfig};
@@ -27,8 +27,8 @@ impl Benchmark for LongMemEval {
         hits: &[AtomHit],
         question: &str,
         current_date: &str,
-    ) -> Result<Vec<Message>> {
-        prompts::build_reader_prompt(hits, question, current_date)
+    ) -> Result<ReaderPrompt> {
+        prompts::render_reader_prompt(hits, question, current_date)
     }
 
     fn known_flaws(&self) -> &str {

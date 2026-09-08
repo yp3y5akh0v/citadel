@@ -6,6 +6,7 @@
 use std::fs;
 use std::path::Path;
 
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -90,6 +91,16 @@ pub struct QaSample {
     pub evidence: Vec<String>,
 }
 
+impl QaSample {
+    pub fn is_scorable(&self) -> bool {
+        !self.category.is_scored() || !self.gold.trim().is_empty()
+    }
+
+    pub fn has_scored_evidence(&self) -> bool {
+        self.category.is_scored() && self.is_scorable() && !self.evidence.is_empty()
+    }
+}
+
 /// A single LoCoMo conversation with its question set.
 #[derive(Debug, Clone)]
 pub struct Sample {
@@ -134,13 +145,40 @@ pub fn parse_root(root: &Value) -> Result<Vec<Sample>> {
     let arr = root
         .as_array()
         .ok_or_else(|| BenchError::Dataset("top level must be a JSON array".into()))?;
-    arr.iter().map(parse_sample).collect()
+    let samples = arr.iter().map(parse_sample).collect::<Result<Vec<_>>>()?;
+    validate_samples(&samples)?;
+    Ok(samples)
 }
 
 pub fn validate_samples(samples: &[Sample]) -> Result<()> {
+    let mut regions = FxHashSet::default();
     for sample in samples {
+        if sample.sample_id.trim().is_empty()
+            || !regions.insert(sample.sample_id.to_ascii_lowercase())
+        {
+            return Err(BenchError::Dataset(format!(
+                "sample_id must be nonempty and unique ignoring ASCII case: {:?}",
+                sample.sample_id
+            )));
+        }
+        let mut turns = FxHashSet::default();
+        let mut sessions = FxHashMap::default();
         for turn in &sample.turns {
             validate_date_time(&turn.date_time, &sample.sample_id, turn.session)?;
+            if let Some(previous) = sessions.insert(turn.session, turn.date_time.as_str()) {
+                if previous != turn.date_time {
+                    return Err(BenchError::Dataset(format!(
+                        "{}: session {} has conflicting date metadata",
+                        sample.sample_id, turn.session
+                    )));
+                }
+            }
+            if turn.dia_id.trim().is_empty() || !turns.insert(turn.dia_id.as_str()) {
+                return Err(BenchError::Dataset(format!(
+                    "{}: dia_id must be nonempty and unique within its conversation: {:?}",
+                    sample.sample_id, turn.dia_id
+                )));
+            }
         }
     }
     Ok(())
@@ -226,7 +264,7 @@ fn parse_turn(v: &Value, session: u32, date_time: &str) -> Result<Turn> {
     let dia_id = obj
         .get("dia_id")
         .and_then(Value::as_str)
-        .unwrap_or("")
+        .ok_or_else(|| BenchError::Dataset("turn missing string dia_id".into()))?
         .to_string();
     let text = obj
         .get("text")
@@ -347,18 +385,84 @@ fn month_number(name: &str) -> Option<i64> {
 }
 
 #[cfg(test)]
-mod datetime_tests {
-    use super::{parse_locomo_datetime, parse_root, validate_samples};
-    use serde_json::{json, Value};
+mod identity_tests {
+    use super::*;
+    use serde_json::json;
 
     fn fixture() -> Value {
         json!([{
-            "sample_id": "sample",
-            "conversation": {
-                "session_1": [{"speaker": "Alice", "dia_id": "D1:1", "text": "hello"}]
-            },
-            "qa": []
+            "sample_id": "conversation",
+            "conversation": {"session_1": [
+                {"speaker": "A", "text": "one", "dia_id": "D1:1"},
+                {"speaker": "B", "text": "two", "dia_id": "D1:2"}
+            ]},
+            "qa": [{"question": "q", "category": 1,
+                "evidence": ["D1:1", "D1:1", "D-missing"]}]
         }])
+    }
+
+    #[test]
+    fn one_session_cannot_have_conflicting_dates() {
+        let mut samples = parse_root(&fixture()).unwrap();
+        samples[0].turns[0].date_time = "9:00 am on 1 May, 2023".into();
+        assert!(validate_samples(&samples)
+            .unwrap_err()
+            .to_string()
+            .contains("conflicting date metadata"));
+        samples[0].turns[1].date_time = samples[0].turns[0].date_time.clone();
+        assert!(validate_samples(&samples).is_ok());
+    }
+
+    #[test]
+    fn evidence_diagnostics_exclude_unscorable_and_adversarial_questions() {
+        let mut qa = QaSample {
+            question: "q".into(),
+            gold: "answer".into(),
+            category: Category::MultiHop,
+            evidence: vec!["D1:1".into()],
+        };
+        assert!(qa.is_scorable());
+        assert!(qa.has_scored_evidence());
+        qa.gold = " \t".into();
+        assert!(!qa.is_scorable());
+        assert!(!qa.has_scored_evidence());
+        qa.category = Category::Adversarial;
+        assert!(qa.is_scorable());
+        assert!(!qa.has_scored_evidence());
+        qa.category = Category::OpenDomain;
+        qa.gold = "answer".into();
+        qa.evidence.clear();
+        assert!(qa.is_scorable());
+        assert!(!qa.has_scored_evidence());
+    }
+
+    #[test]
+    fn region_identity_is_nonempty_and_case_insensitively_unique() {
+        for id in ["", " \t"] {
+            let mut root = fixture();
+            root[0]["sample_id"] = json!(id);
+            assert!(parse_root(&root).is_err());
+        }
+        let mut root = fixture();
+        let mut repeated = root[0].clone();
+        repeated["sample_id"] = json!("CONVERSATION");
+        root.as_array_mut().unwrap().push(repeated);
+        assert!(parse_root(&root).is_err());
+    }
+
+    #[test]
+    fn missing_empty_or_duplicate_turn_ids_are_rejected() {
+        for id in [Value::Null, json!(42), json!(""), json!(" "), json!("D1:1")] {
+            let mut root = fixture();
+            root[0]["conversation"]["session_1"][1]["dia_id"] = id;
+            assert!(parse_root(&root).is_err());
+        }
+    }
+
+    #[test]
+    fn gold_annotations_are_preserved_including_duplicates_and_unknown_ids() {
+        let samples = parse_root(&fixture()).unwrap();
+        assert_eq!(samples[0].qa[0].evidence, ["D1:1", "D1:1", "D-missing"]);
     }
 
     #[test]
@@ -397,6 +501,11 @@ mod datetime_tests {
         sample.turns[0].date_time = "4:00 am on 10 January, 294247".into();
         assert_eq!(sample.as_of_micros(), None);
     }
+}
+
+#[cfg(test)]
+mod datetime_tests {
+    use super::parse_locomo_datetime;
 
     #[test]
     fn parses_the_locomo_session_stamp() {
