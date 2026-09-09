@@ -39,12 +39,12 @@ fn scalar_subq(from: &str) -> Expr {
     Expr::ScalarSubquery(Box::new(empty_select(from)))
 }
 
-fn compile_generated_insert_template(generated: &str, values: &str) -> CompiledInsert {
-    let mut columns: Vec<ColumnDef> = ["id", "a", "b", "g"]
-        .into_iter()
+fn integer_template_columns(names: &[&str]) -> Vec<ColumnDef> {
+    names
+        .iter()
         .enumerate()
         .map(|(position, name)| ColumnDef {
-            name: name.into(),
+            name: (*name).into(),
             data_type: DataType::Integer,
             nullable: false,
             position: position as u16,
@@ -59,7 +59,11 @@ fn compile_generated_insert_template(generated: &str, values: &str) -> CompiledI
             generated_kind: None,
             collation: Collation::Binary,
         })
-        .collect();
+        .collect()
+}
+
+fn compile_generated_insert_template(generated: &str, values: &str) -> CompiledInsert {
+    let mut columns = integer_template_columns(&["id", "a", "b", "g"]);
     columns[3].generated_expr = Some(crate::parser::parse_sql_expr(generated).unwrap());
     columns[3].generated_sql = Some(generated.into());
     columns[3].generated_kind = Some(GeneratedKind::Stored);
@@ -129,6 +133,100 @@ fn trivial_generated_insert_templates_defer_literal_mul_add_overflow() {
         assert!(cache.trivial_fast_program.is_none(), "{generated}");
         assert!(!cache.is_trivial_fast);
     }
+}
+
+fn compile_upsert_counter_template(
+    generated_kind: Option<GeneratedKind>,
+    assignments: &str,
+) -> CompiledInsert {
+    let mut columns = integer_template_columns(if generated_kind.is_some() {
+        &["id", "counter", "g"]
+    } else {
+        &["id", "counter"]
+    });
+    if let Some(kind) = generated_kind {
+        columns[2].generated_expr = Some(crate::parser::parse_sql_expr("counter * 2 + 1").unwrap());
+        columns[2].generated_sql = Some("counter * 2 + 1".into());
+        columns[2].generated_kind = Some(kind);
+    }
+    let mut schema = SchemaManager::empty();
+    schema.register(TableSchema::new(
+        "t".into(),
+        columns,
+        vec![0],
+        vec![],
+        vec![],
+        vec![],
+    ));
+    let Statement::Insert(stmt) = crate::parser::parse_sql(&format!(
+        "INSERT INTO t (id, counter) VALUES ($1, $2) \
+         ON CONFLICT (id) DO UPDATE SET {assignments}"
+    ))
+    .unwrap() else {
+        panic!("expected INSERT statement");
+    };
+    CompiledInsert::try_compile(&schema, &stmt).expect("UPSERT must remain preparable")
+}
+
+fn assert_trivial_upsert_patch(assignments: &str) {
+    let compiled = compile_upsert_counter_template(None, assignments);
+    let cache = compiled.cached.as_ref().unwrap();
+    let program = cache
+        .trivial_fast_program
+        .as_ref()
+        .expect("simple PK counters must retain the direct template");
+    assert!(cache.is_trivial_fast);
+    assert!(matches!(&program.on_dup, DupPolicy::Patch(paths) if paths.len() == 1));
+}
+
+#[test]
+fn trivial_upsert_counter_addition_retains_patch() {
+    assert_trivial_upsert_patch("counter = counter + 1");
+}
+
+#[test]
+fn trivial_upsert_counter_subtract_min_retains_patch() {
+    assert_trivial_upsert_patch("counter = counter - -9223372036854775808");
+}
+
+fn assert_generated_upsert_excludes_patch(kind: GeneratedKind) {
+    let compiled = compile_upsert_counter_template(Some(kind), "counter = counter + 1");
+    let cache = compiled.cached.as_ref().unwrap();
+    assert!(!matches!(
+        cache.trivial_fast_program.as_ref().map(|p| &p.on_dup),
+        Some(DupPolicy::Patch(_))
+    ));
+}
+
+#[test]
+fn trivial_upsert_stored_generated_excludes_patch() {
+    assert_generated_upsert_excludes_patch(GeneratedKind::Stored);
+}
+
+#[test]
+fn trivial_upsert_virtual_generated_excludes_patch() {
+    assert_generated_upsert_excludes_patch(GeneratedKind::Virtual);
+}
+
+#[test]
+fn trivial_upsert_duplicate_targets_exclude_fast_paths() {
+    let compiled =
+        compile_upsert_counter_template(None, "counter = counter + 1, counter = counter + 2");
+    let cache = compiled.cached.as_ref().unwrap();
+    let Some(CompiledOnConflict::DoUpdate {
+        assignments,
+        fast_paths,
+        ..
+    }) = cache.on_conflict.as_deref()
+    else {
+        panic!("expected DO UPDATE conflict action");
+    };
+    assert_eq!(assignments.len(), 2);
+    assert!(fast_paths.is_none());
+    assert!(!matches!(
+        cache.trivial_fast_program.as_ref().map(|p| &p.on_dup),
+        Some(DupPolicy::Patch(_))
+    ));
 }
 
 #[test]

@@ -1177,21 +1177,39 @@ fn visit_exprs_stmt(stmt: &Statement, visitor: &mut impl FnMut(&Expr)) {
             }
             visit_exprs_query_body(&sq.body, visitor);
         }
-        Statement::Insert(ins) => match &ins.source {
-            InsertSource::Values(rows) => {
-                for row in rows {
-                    for e in row {
-                        visit_expr(e, visitor);
+        Statement::Insert(ins) => {
+            match &ins.source {
+                InsertSource::Values(rows) => {
+                    for row in rows {
+                        for e in row {
+                            visit_expr(e, visitor);
+                        }
                     }
                 }
-            }
-            InsertSource::Select(sq) => {
-                for cte in &sq.ctes {
-                    visit_exprs_query_body(&cte.body, visitor);
+                InsertSource::Select(sq) => {
+                    for cte in &sq.ctes {
+                        visit_exprs_query_body(&cte.body, visitor);
+                    }
+                    visit_exprs_query_body(&sq.body, visitor);
                 }
-                visit_exprs_query_body(&sq.body, visitor);
             }
-        },
+            if let Some(OnConflictClause {
+                action:
+                    OnConflictAction::DoUpdate {
+                        assignments,
+                        where_clause,
+                    },
+                ..
+            }) = &ins.on_conflict
+            {
+                for (_, expr) in assignments {
+                    visit_expr(expr, visitor);
+                }
+                if let Some(expr) = where_clause {
+                    visit_expr(expr, visitor);
+                }
+            }
+        }
         Statement::Update(upd) => {
             for (_, e) in &upd.assignments {
                 visit_expr(e, visitor);

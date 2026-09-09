@@ -853,7 +853,7 @@ fn eval_binary_op(left: &Value, op: BinOp, right: &Value) -> Result<Value> {
     eval_binary_op_with_cancel(left, op, right, None)
 }
 
-fn eval_binary_op_with_cancel(
+pub(crate) fn eval_binary_op_with_cancel(
     left: &Value,
     op: BinOp,
     right: &Value,
