@@ -39,6 +39,98 @@ fn scalar_subq(from: &str) -> Expr {
     Expr::ScalarSubquery(Box::new(empty_select(from)))
 }
 
+fn compile_generated_insert_template(generated: &str, values: &str) -> CompiledInsert {
+    let mut columns: Vec<ColumnDef> = ["id", "a", "b", "g"]
+        .into_iter()
+        .enumerate()
+        .map(|(position, name)| ColumnDef {
+            name: name.into(),
+            data_type: DataType::Integer,
+            nullable: false,
+            position: position as u16,
+            default_expr: None,
+            default_sql: None,
+            check_expr: None,
+            check_sql: None,
+            check_name: None,
+            is_with_timezone: false,
+            generated_expr: None,
+            generated_sql: None,
+            generated_kind: None,
+            collation: Collation::Binary,
+        })
+        .collect();
+    columns[3].generated_expr = Some(crate::parser::parse_sql_expr(generated).unwrap());
+    columns[3].generated_sql = Some(generated.into());
+    columns[3].generated_kind = Some(GeneratedKind::Stored);
+    let mut schema = SchemaManager::empty();
+    schema.register(TableSchema::new(
+        "t".into(),
+        columns,
+        vec![0],
+        vec![],
+        vec![],
+        vec![],
+    ));
+    let Statement::Insert(stmt) =
+        crate::parser::parse_sql(&format!("INSERT INTO t (id, a, b) VALUES ({values})")).unwrap()
+    else {
+        panic!("expected INSERT statement");
+    };
+    CompiledInsert::try_compile(&schema, &stmt)
+        .expect("generated arithmetic must not prevent preparing the INSERT")
+}
+
+#[test]
+fn trivial_generated_insert_templates_preserve_parameter_shapes() {
+    for (generated, values) in [
+        ("a + b", "$1, $2, $3"),
+        ("a + b", "$1, $2, 3"),
+        ("a + b", "$1, 3, $2"),
+        ("a * 2 + 1", "$1, $2, 0"),
+    ] {
+        let compiled = compile_generated_insert_template(generated, values);
+        let cache = compiled.cached.as_ref().unwrap();
+        assert!(
+            cache.trivial_fast_program.is_some(),
+            "generated: {generated}; values: {values}"
+        );
+        assert!(cache.is_trivial_fast);
+    }
+}
+
+#[test]
+fn trivial_generated_insert_templates_preserve_valid_literal_folds() {
+    for (generated, values, expected) in [("a + b", "$1, 3, 4", 7), ("a * 2 + 1", "$1, 5, 0", 11)] {
+        let compiled = compile_generated_insert_template(generated, values);
+        let cache = compiled.cached.as_ref().unwrap();
+        let program = cache.trivial_fast_program.as_ref().unwrap();
+        assert!(cache.is_trivial_fast);
+        assert!(program
+            .ops
+            .iter()
+            .any(|op| { matches!(op, WriteOp::LiteralI64 { value, .. } if *value == expected) }));
+    }
+}
+
+#[test]
+fn trivial_generated_insert_templates_defer_literal_addition_overflow() {
+    let compiled = compile_generated_insert_template("a + b", &format!("$1, {}, 1", i64::MAX));
+    let cache = compiled.cached.as_ref().unwrap();
+    assert!(cache.trivial_fast_program.is_none());
+    assert!(!cache.is_trivial_fast);
+}
+
+#[test]
+fn trivial_generated_insert_templates_defer_literal_mul_add_overflow() {
+    for (generated, value) in [("a * 2 + 1", i64::MAX), ("a * 2 + 2", i64::MAX / 2)] {
+        let compiled = compile_generated_insert_template(generated, &format!("$1, {value}, 0"));
+        let cache = compiled.cached.as_ref().unwrap();
+        assert!(cache.trivial_fast_program.is_none(), "{generated}");
+        assert!(!cache.is_trivial_fast);
+    }
+}
+
 #[test]
 fn has_subquery_literal_false() {
     assert!(!has_subquery(&Expr::Literal(i(1))));

@@ -607,6 +607,112 @@ fn eval_fast_gen_falls_back_for_null_input() {
     assert_eq!(result, Value::Null);
 }
 
+fn generated_mul_add_expr(mul: i64, add: i64) -> Expr {
+    Expr::BinaryOp {
+        left: Box::new(Expr::BinaryOp {
+            left: Box::new(Expr::Column("a".into())),
+            op: BinOp::Mul,
+            right: Box::new(Expr::Literal(i(mul))),
+        }),
+        op: BinOp::Add,
+        right: Box::new(Expr::Literal(i(add))),
+    }
+}
+
+fn generated_fast_results(expr: &Expr, row: &[Value]) -> (Result<Value>, Result<Value>) {
+    let table = schema(
+        "t",
+        cols(&[("a", DataType::Integer), ("b", DataType::Integer)]),
+        vec![],
+    );
+    let col_map = table.column_map();
+    let fast = detect_fast_gen_eval(expr, &table);
+    assert!(!matches!(fast, FastGenEval::None));
+    (
+        eval_fast_gen(&fast, expr, row, col_map),
+        eval_expr(expr, &EvalCtx::new(col_map, row)),
+    )
+}
+
+fn assert_fast_generated_overflow(expr: &Expr, row: &[Value]) {
+    let (fast, generic) = generated_fast_results(expr, row);
+    assert!(
+        matches!(&generic, Err(SqlError::IntegerOverflow)),
+        "generic evaluator must report overflow: {generic:?}"
+    );
+    assert!(
+        matches!(&fast, Err(SqlError::IntegerOverflow)),
+        "fast evaluator must match generic overflow: {fast:?}"
+    );
+}
+
+#[test]
+fn eval_fast_gen_addition_overflow_matches_generic() {
+    let expr = Expr::BinaryOp {
+        left: Box::new(Expr::Column("a".into())),
+        op: BinOp::Add,
+        right: Box::new(Expr::Column("b".into())),
+    };
+    for row in [vec![i(i64::MAX), i(1)], vec![i(i64::MIN), i(-1)]] {
+        assert_fast_generated_overflow(&expr, &row);
+    }
+}
+
+#[test]
+fn eval_fast_gen_multiplication_overflow_matches_generic() {
+    for (value, mul) in [(i64::MAX, 2), (i64::MIN, -1)] {
+        let expr = Expr::BinaryOp {
+            left: Box::new(Expr::Column("a".into())),
+            op: BinOp::Mul,
+            right: Box::new(Expr::Literal(i(mul))),
+        };
+        assert_fast_generated_overflow(&expr, &[i(value), i(0)]);
+    }
+}
+
+#[test]
+fn eval_fast_gen_add_overflow_after_valid_product_matches_generic() {
+    assert_fast_generated_overflow(&generated_mul_add_expr(2, 2), &[i(i64::MAX / 2), i(0)]);
+}
+
+#[test]
+fn eval_fast_gen_intermediate_product_overflow_matches_generic() {
+    // A wider fused computation would fit, but SQL evaluates the product first.
+    let value = i64::MAX;
+    let add = -i64::MAX;
+    assert_eq!(i128::from(value) * 2 + i128::from(add), i128::from(value));
+    assert_fast_generated_overflow(&generated_mul_add_expr(2, add), &[i(value), i(0)]);
+}
+
+#[test]
+fn eval_fast_gen_controls_match_generic() {
+    for expr in [
+        Expr::BinaryOp {
+            left: Box::new(Expr::Column("a".into())),
+            op: BinOp::Add,
+            right: Box::new(Expr::Column("b".into())),
+        },
+        generated_mul_add_expr(3, 1),
+    ] {
+        for row in [
+            vec![i(3), i(4)],
+            vec![Value::Null, i(4)],
+            vec![Value::Real(2.5), i(4)],
+            vec![i(3), Value::Real(1.5)],
+        ] {
+            let (fast, generic) = generated_fast_results(&expr, &row);
+            assert_eq!(fast.unwrap(), generic.unwrap(), "row: {row:?}");
+        }
+        let (fast, generic) = generated_fast_results(&expr, &[Value::Text("3".into()), i(4)]);
+        assert!(matches!(&generic, Err(SqlError::TypeMismatch { .. })));
+        assert!(matches!(&fast, Err(SqlError::TypeMismatch { .. })));
+        assert_eq!(
+            fast.unwrap_err().to_string(),
+            generic.unwrap_err().to_string()
+        );
+    }
+}
+
 #[test]
 fn materialize_virtual_evaluates_generated_columns() {
     let mut c2 = col("doubled", DataType::Integer);
