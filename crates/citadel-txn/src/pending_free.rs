@@ -59,16 +59,17 @@ impl ChainSnapshot {
         root: PageId,
         load: impl FnMut(PageId) -> Result<P>,
     ) -> Result<Self> {
-        Self::read_checked(root, load, |_| Ok(()))
+        Self::read_checked(root, 0, load, |_| Ok(()))
     }
 
     pub(crate) fn read_committed<P: Deref<Target = Page>>(
         root: PageId,
         high_water_mark: u32,
         slot_txn: TxnId,
+        capacity_hint: usize,
         load: impl FnMut(PageId) -> Result<P>,
     ) -> Result<Self> {
-        Self::read_checked(root, load, |entry| {
+        Self::read_checked(root, capacity_hint, load, |entry| {
             if !entry.page_id.is_valid()
                 || entry.page_id.as_u32() >= high_water_mark
                 || entry.freed_at_txn == TxnId::ZERO
@@ -82,13 +83,22 @@ impl ChainSnapshot {
 
     fn read_checked<P: Deref<Target = Page>>(
         root: PageId,
+        capacity_hint: usize,
         mut load: impl FnMut(PageId) -> Result<P>,
         mut check_entry: impl FnMut(PendingFreeEntry) -> Result<()>,
     ) -> Result<Self> {
-        let mut entries = Vec::new();
+        // The caller's existing loan count can avoid repeated allocation and
+        // rehashing. Bound speculative reservation; this is neither a trusted
+        // entry count nor a limit on the chain we must read and validate.
+        let capacity = if root.is_valid() {
+            capacity_hint.min(64 * 1024)
+        } else {
+            0
+        };
+        let mut entries = Vec::with_capacity(capacity);
         let mut page_ids = Vec::new();
         let mut head_entry_count = 0;
-        let mut entry_indices = FxHashMap::default();
+        let mut entry_indices = FxHashMap::with_capacity_and_hasher(capacity, Default::default());
         let mut seen = FxHashSet::default();
         let mut current = root;
 
@@ -235,8 +245,9 @@ pub struct ChainCommit<'a> {
 }
 
 /// Remove consumed entries and record new frees. Without consumption or loans,
-/// share the unchanged tail and pack new entries at the head. Otherwise rewrite
-/// the chain using loan pages first. Replaced structure pages remain pending;
+/// share the unchanged tail and pack new entries at the head. Head-local
+/// consumption can replace just the head; otherwise rewrite the chain using
+/// loan pages first. Replaced structure pages remain pending;
 /// entries leave the durable chain only when a commit records their consumption.
 ///
 /// Returns `(new_chain_root, available_entries)`; entries carry freed_at_txn
@@ -279,6 +290,10 @@ impl ChainSnapshot {
         }
         if commit.consumed.is_empty() && loan_pool.is_empty() {
             return Ok(self.prepend_frees(pages, alloc, commit, retired_chain_pages));
+        }
+        if let Some(replacement) = self.head_replacement(loan_pool, commit) {
+            loan_pool.pop();
+            return Ok(self.replace_consumed_head(pages, replacement, commit, retired_chain_pages));
         }
         let Self {
             mut entries,
@@ -364,6 +379,92 @@ impl ChainSnapshot {
             retired_chain_pages.insert(page_id, txn_id);
         }
         Ok((new_root, entries))
+    }
+
+    /// Prove the entire change fits one borrowed head before mutating loans or
+    /// retirement provenance. Tail consumption and larger changes use the full
+    /// rewrite, keeping both paths on the same validated snapshot.
+    fn head_replacement(&self, loan_pool: &[PageId], commit: &ChainCommit<'_>) -> Option<PageId> {
+        if self.page_ids.len() < 2 || commit.consumed.is_empty() {
+            return None;
+        }
+        if !commit.consumed.iter().all(|id| {
+            self.entry_indices
+                .get(id)
+                .is_some_and(|&index| index < self.head_entry_count)
+        }) {
+            return None;
+        }
+        let replacement = *loan_pool.last()?;
+        if commit.consumed.contains(&replacement)
+            || !self
+                .entry_indices
+                .get(&replacement)
+                .is_some_and(|&index| index < self.head_entry_count)
+        {
+            return None;
+        }
+        // Removing the structure loan and recording the retired head cancel
+        // each other. Every consumed entry was proven to be in this head.
+        let new_head_len =
+            self.head_entry_count - commit.consumed.len() + commit.freed_this_txn.len();
+        (new_head_len <= MAX_ENTRIES_PER_PAGE).then_some(replacement)
+    }
+
+    fn replace_consumed_head(
+        self,
+        pages: &mut FxHashMap<PageId, Page>,
+        replacement: PageId,
+        commit: &ChainCommit<'_>,
+        retired_chain_pages: &mut FxHashMap<PageId, TxnId>,
+    ) -> (PageId, Vec<PendingFreeEntry>) {
+        let Self {
+            mut entries,
+            page_ids,
+            head_entry_count,
+            entry_indices,
+        } = self;
+        drop(entry_indices);
+        for id in commit.consumed {
+            retired_chain_pages.remove(id);
+        }
+        retired_chain_pages.remove(&replacement);
+
+        let mut prefix: Vec<_> = entries[..head_entry_count]
+            .iter()
+            .filter(|entry| {
+                entry.page_id != replacement && !commit.consumed.contains(&entry.page_id)
+            })
+            .copied()
+            .collect();
+        prefix.push(PendingFreeEntry {
+            page_id: page_ids[0],
+            freed_at_txn: commit.txn_id,
+        });
+        prefix.extend(
+            commit
+                .freed_this_txn
+                .iter()
+                .map(|&page_id| PendingFreeEntry {
+                    page_id,
+                    freed_at_txn: commit.txn_id,
+                }),
+        );
+        write_chain_page(pages, commit.txn_id, replacement, page_ids[1], &prefix);
+
+        // Only the old head changed. Tail entries preserve their order and
+        // lifetime; current frees and the retired head are not available yet.
+        let mut index = 0;
+        entries.retain(|entry| {
+            let in_head = index < head_entry_count;
+            index += 1;
+            (!in_head
+                || (entry.page_id != replacement && !commit.consumed.contains(&entry.page_id)))
+                && (entry.freed_at_txn <= commit.reclaim_horizon
+                    || retired_chain_pages.get(&entry.page_id) == Some(&entry.freed_at_txn))
+        });
+        retired_chain_pages.insert(page_ids[0], commit.txn_id);
+        (replacement, entries)
     }
 
     fn prepend_frees(
