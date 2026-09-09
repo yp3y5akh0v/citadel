@@ -1192,6 +1192,14 @@ impl TxnManager {
 
         {
             let mut pool = self.pool.lock();
+            // Keep retired pages available to registered snapshots; otherwise
+            // release cache space for live pages. A reader arriving after this
+            // snapshot may reload safely.
+            if reclaim_horizon == TxnId(u64::MAX) {
+                for &page_id in &freed_this_txn {
+                    pool.invalidate(page_id);
+                }
+            }
             for &(_, page_id) in &dirty_page_info {
                 pool.invalidate(page_id);
                 if let Some(page) = pages.remove(&page_id) {

@@ -143,6 +143,17 @@ impl Default for Page {
 
 impl Page {
     pub fn new(page_id: PageId, page_type: PageType, txn_id: TxnId) -> Self {
+        let mut page = Self::new_for_write(page_id, page_type, txn_id);
+        page.update_checksum();
+        page
+    }
+
+    /// Construct a fully initialized page for a writer that will modify it.
+    ///
+    /// The checksum field remains zero. Call `update_checksum` after the final
+    /// mutation and before persisting or publishing the page to readers.
+    /// Use `new` when an immediately checksummed empty page is required.
+    pub fn new_for_write(page_id: PageId, page_type: PageType, txn_id: TxnId) -> Self {
         let mut data = [0u8; BODY_SIZE];
 
         data[8..12].copy_from_slice(&page_id.as_u32().to_le_bytes());
@@ -154,9 +165,7 @@ impl Page {
         data[28..30].copy_from_slice(&(USABLE_SIZE as u16).to_le_bytes());
         data[30..34].copy_from_slice(&0u32.to_le_bytes());
 
-        let mut page = Self { data };
-        page.update_checksum();
-        page
+        Self { data }
     }
 
     pub fn from_bytes(data: [u8; BODY_SIZE]) -> Self {
