@@ -57,6 +57,225 @@ fn execute_checked_upsert(
 }
 
 #[test]
+fn upsert_checked_excluded_virtual_uses_proposed_value_then_recomputes_new() {
+    for unique_conflict in [false, true] {
+        for_checked_upsert_modes(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER UNIQUE, a INTEGER NOT NULL, g INTEGER GENERATED ALWAYS AS (a * 2) VIRTUAL)",
+                "INSERT INTO t (id, k, a) VALUES (1, 10, 1)",
+            ],
+            |conn, prepared| {
+                let (target, proposed_id) = if unique_conflict { ("k", 9) } else { ("id", 1) };
+                // No trigger or RETURNING independently requests the proposed virtual.
+                for (proposed, predicate, affected, expected) in [
+                    (3, "", 1, 6),
+                    (4, " WHERE excluded.g = 8", 1, 8),
+                    (5, " WHERE excluded.g = 8", 0, 8),
+                ] {
+                    let sql = format!("INSERT INTO t (id, k, a) VALUES ($1, 10, $2) ON CONFLICT ({target}) DO UPDATE SET a = excluded.g{predicate}");
+                    assert_eq!(execute_checked_upsert(conn, prepared, &sql, &[Value::Integer(proposed_id), Value::Integer(proposed)]).unwrap(), affected);
+                    assert_eq!(query(conn, "SELECT * FROM t").rows, vec![vec![Value::Integer(1), Value::Integer(10), Value::Integer(expected), Value::Integer(expected * 2)]]);
+                }
+            },
+        );
+    }
+}
+
+#[test]
+fn upsert_checked_excluded_virtual_is_unused_without_an_accepted_conflict() {
+    for_checked_upsert_modes(
+        &[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER NOT NULL, g INTEGER GENERATED ALWAYS AS (a * 2) VIRTUAL)",
+            "INSERT INTO t (id, a) VALUES (1, 1)",
+        ],
+        |conn, prepared| {
+            assert_eq!(execute_checked_upsert(
+                conn, prepared,
+                "INSERT INTO t (id, a) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET a = excluded.g WHERE FALSE",
+                &[Value::Integer(1), Value::Integer(i64::MAX)],
+            ).unwrap(), 0);
+            assert_eq!(query(conn, "SELECT * FROM t").rows, vec![vec![Value::Integer(1), Value::Integer(1), Value::Integer(2)]]);
+            // Even a WHERE reference is unused when insertion finds no conflict.
+            assert_eq!(execute_checked_upsert(
+                conn, prepared,
+                "INSERT INTO t (id, a) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET a = excluded.g WHERE excluded.g > 0",
+                &[Value::Integer(2), Value::Integer(i64::MAX)],
+            ).unwrap(), 1);
+            // Aggregate projection reads only the requested base columns; full-row scan
+            // projection may evaluate virtuals even when SELECT does not name them.
+            assert_eq!(query(conn, "SELECT COUNT(*) FROM t").rows, vec![vec![Value::Integer(2)]]);
+            for (id, expected) in [(1, 1), (2, i64::MAX)] {
+                assert_eq!(query(conn, &format!("SELECT MAX(a) FROM t WHERE id = {id}")).rows, vec![vec![Value::Integer(expected)]]);
+            }
+            assert!(matches!(conn.query("SELECT g FROM t WHERE id = 2"), Err(SqlError::IntegerOverflow)));
+        },
+    );
+}
+
+#[test]
+fn upsert_checked_excluded_virtual_required_where_or_set_overflow_preserves_old() {
+    for action in ["SET a = excluded.g", "SET a = 2 WHERE excluded.g > 0"] {
+        for_checked_upsert_modes(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER NOT NULL, g INTEGER GENERATED ALWAYS AS (a * 2) VIRTUAL)",
+                "INSERT INTO t (id, a) VALUES (1, 1)",
+            ],
+            |conn, prepared| {
+                let sql = format!("INSERT INTO t (id, a) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE {action}");
+                let error = execute_checked_upsert(conn, prepared, &sql, &[Value::Integer(1), Value::Integer(i64::MAX)]).unwrap_err();
+                assert!(matches!(error, SqlError::IntegerOverflow), "got {error:?}");
+                assert_eq!(query(conn, "SELECT * FROM t").rows, vec![vec![Value::Integer(1), Value::Integer(1), Value::Integer(2)]]);
+            },
+        );
+    }
+}
+
+#[test]
+fn upsert_checked_excluded_virtual_late_overflow_cannot_publish_a_prefix() {
+    for action in [
+        "SET a = excluded.g",
+        "SET a = excluded.a WHERE excluded.g > 0",
+    ] {
+        for prepared in [true, false] {
+            for explicit in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let db = create_db(dir.path());
+                let conn = Connection::open(&db).unwrap();
+                conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER NOT NULL, g INTEGER GENERATED ALWAYS AS (a * 2) VIRTUAL)").unwrap();
+                conn.execute("INSERT INTO t (id, a) VALUES (1, 1), (2, 2)")
+                    .unwrap();
+                let before = query(&conn, "SELECT * FROM t ORDER BY id").rows;
+                if explicit {
+                    conn.execute("BEGIN").unwrap();
+                }
+                let sql = format!("INSERT INTO t (id, a) VALUES (1, 3), (2, $1) ON CONFLICT (id) DO UPDATE {action}");
+                let error =
+                    execute_checked_upsert(&conn, prepared, &sql, &[Value::Integer(i64::MAX)])
+                        .unwrap_err();
+                assert!(matches!(error, SqlError::IntegerOverflow), "got {error:?}");
+                if explicit {
+                    assert!(matches!(
+                        conn.execute("COMMIT"),
+                        Err(SqlError::Storage(citadel_core::Error::TransactionFailed))
+                    ));
+                }
+                assert_eq!(query(&conn, "SELECT * FROM t ORDER BY id").rows, before);
+            }
+        }
+    }
+}
+
+#[test]
+fn upsert_checked_excluded_virtual_preserves_lazy_case_and_coalesce() {
+    for_checked_upsert_modes(
+        &[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER NOT NULL, g INTEGER GENERATED ALWAYS AS (a * 2) VIRTUAL)",
+            "INSERT INTO t (id, a) VALUES (1, 1)",
+        ],
+        |conn, prepared| {
+            for (assignment, predicate, expected) in [
+                ("CASE WHEN excluded.id = 1 THEN 3 ELSE excluded.g END", "CASE WHEN excluded.id = 1 THEN TRUE ELSE excluded.g > 0 END", 3),
+                ("COALESCE(4, excluded.g)", "COALESCE(TRUE, excluded.g > 0)", 4),
+            ] {
+                let sql = format!("INSERT INTO t (id, a) VALUES (1, $1) ON CONFLICT (id) DO UPDATE SET a = {assignment} WHERE {predicate}");
+                assert_eq!(execute_checked_upsert(conn, prepared, &sql, &[Value::Integer(i64::MAX)]).unwrap(), 1);
+                assert_eq!(query(conn, "SELECT * FROM t").rows, vec![vec![Value::Integer(1), Value::Integer(expected), Value::Integer(expected * 2)]]);
+            }
+            // The same references must fail when their lazy branch is actually visited.
+            for action in [
+                "SET a = CASE WHEN FALSE THEN 3 ELSE excluded.g END",
+                "SET a = COALESCE(NULL, excluded.g)",
+                "SET a = 5 WHERE CASE WHEN FALSE THEN TRUE ELSE excluded.g > 0 END",
+                "SET a = 5 WHERE COALESCE(NULL, excluded.g > 0)",
+            ] {
+                let sql = format!("INSERT INTO t (id, a) VALUES (1, $1) ON CONFLICT (id) DO UPDATE {action}");
+                let error = execute_checked_upsert(conn, prepared, &sql, &[Value::Integer(i64::MAX)]).unwrap_err();
+                assert!(matches!(error, SqlError::IntegerOverflow), "got {error:?}");
+                assert_eq!(query(conn, "SELECT * FROM t").rows, vec![vec![Value::Integer(1), Value::Integer(4), Value::Integer(8)]]);
+            }
+        },
+    );
+}
+
+#[test]
+fn upsert_checked_excluded_virtual_does_not_evaluate_unrelated_virtual() {
+    for_checked_upsert_modes(
+        &[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER NOT NULL, sink INTEGER, g INTEGER GENERATED ALWAYS AS (a * 2) VIRTUAL, unused INTEGER GENERATED ALWAYS AS ((a - 1) * 9223372036854775807) VIRTUAL)",
+            "INSERT INTO t (id, a, sink) VALUES (1, 1, 0)",
+        ],
+        |conn, prepared| {
+            // Proposed a=3 overflows unused, but both virtuals of the accepted NEW row are safe.
+            assert_eq!(execute_checked_upsert(
+                conn, prepared,
+                "INSERT INTO t (id, a) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET sink = excluded.g WHERE excluded.g = 6",
+                &[Value::Integer(1), Value::Integer(3)],
+            ).unwrap(), 1);
+            assert_eq!(query(conn, "SELECT * FROM t").rows, vec![vec![Value::Integer(1), Value::Integer(1), Value::Integer(6), Value::Integer(2), Value::Integer(0)]]);
+        },
+    );
+}
+
+#[test]
+fn upsert_checked_excluded_virtual_applies_declared_type_and_null_coercion() {
+    for strict in [false, true] {
+        let ddl = format!("CREATE TABLE t (id INTEGER PRIMARY KEY, a REAL, sink REAL, g INTEGER GENERATED ALWAYS AS (a / 2.0) VIRTUAL){}", if strict { " STRICT" } else { "" });
+        for_checked_upsert_modes(
+            &[&ddl, "INSERT INTO t (id, a, sink) VALUES (1, 4.0, 9.0)"],
+            |conn, prepared| {
+                let sql = "INSERT INTO t (id, a) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET sink = excluded.g";
+                let fractional = execute_checked_upsert(
+                    conn,
+                    prepared,
+                    sql,
+                    &[Value::Integer(1), Value::Real(3.0)],
+                );
+                let expected = if strict {
+                    let error = fractional.unwrap_err();
+                    assert!(
+                        matches!(error, SqlError::TypeMismatch { .. }),
+                        "got {error:?}"
+                    );
+                    Value::Real(9.0)
+                } else {
+                    assert_eq!(fractional.unwrap(), 1);
+                    // INTEGER g truncates 1.5 before assignment coerces it into REAL sink.
+                    Value::Real(1.0)
+                };
+                assert_eq!(
+                    query(conn, "SELECT * FROM t").rows,
+                    vec![vec![
+                        Value::Integer(1),
+                        Value::Real(4.0),
+                        expected,
+                        Value::Integer(2)
+                    ]]
+                );
+                for (proposed, expected) in [
+                    (Value::Real(4.0), Value::Real(2.0)),
+                    (Value::Null, Value::Null),
+                ] {
+                    assert_eq!(
+                        execute_checked_upsert(conn, prepared, sql, &[Value::Integer(1), proposed])
+                            .unwrap(),
+                        1
+                    );
+                    assert_eq!(
+                        query(conn, "SELECT * FROM t").rows,
+                        vec![vec![
+                            Value::Integer(1),
+                            Value::Real(4.0),
+                            expected,
+                            Value::Integer(2)
+                        ]]
+                    );
+                }
+            },
+        );
+    }
+}
+
+#[test]
 fn upsert_checked_arithmetic_boundaries_and_two_target_atomicity() {
     for (initial, expression, expected) in [
         (Value::Integer(i64::MAX), "v + 1", None),

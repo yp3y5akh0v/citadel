@@ -3533,9 +3533,24 @@ fn apply_do_update_with_old_row(
     cancel: Option<&citadel::CancelToken>,
     capture_returning: bool,
 ) -> Result<InsertRowOutcome> {
+    let resolve_excluded = |idx: usize| {
+        let col = &table_schema.columns[idx];
+        if matches!(col.generated_kind, Some(GeneratedKind::Virtual)) {
+            let value = eval_expr(
+                col.generated_expr.as_ref().unwrap(),
+                &EvalCtx::new(col_map, proposed_row).with_cancel(cancel),
+            )?;
+            coerce_for_column(value, col, table_schema.is_strict())
+        } else {
+            Ok(proposed_row[idx].clone())
+        }
+    };
+    let mut ctx =
+        EvalCtx::with_excluded(col_map, old_row, col_map, proposed_row).with_cancel(cancel);
+    if table_schema.has_virtual_columns() {
+        ctx = ctx.with_excluded_resolver(&resolve_excluded);
+    }
     if let Some(w) = where_clause {
-        let ctx =
-            EvalCtx::with_excluded(col_map, old_row, col_map, proposed_row).with_cancel(cancel);
         let result = eval_expr(w, &ctx)?;
         if result.is_null() || !is_truthy(&result) {
             return Ok(InsertRowOutcome::Skipped);
@@ -3544,8 +3559,6 @@ fn apply_do_update_with_old_row(
 
     let mut new_row = old_row.to_vec();
     for (col_idx, expr) in assignments {
-        let ctx =
-            EvalCtx::with_excluded(col_map, old_row, col_map, proposed_row).with_cancel(cancel);
         let val = eval_expr(expr, &ctx)?;
         let col = &table_schema.columns[*col_idx];
         new_row[*col_idx] = coerce_for_column(val, col, table_schema.is_strict())?;

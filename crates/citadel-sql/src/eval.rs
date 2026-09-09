@@ -1,5 +1,7 @@
 //! Expression evaluator with SQL three-valued logic.
 
+use std::panic::RefUnwindSafe;
+
 use rustc_hash::FxHashMap;
 
 use crate::error::{Result, SqlError};
@@ -124,6 +126,7 @@ pub struct EvalCtx<'a> {
     pub params: &'a [Value],
     pub(crate) cancel: Option<&'a citadel::CancelToken>,
     pub excluded: Option<ExcludedRow<'a>>,
+    excluded_resolver: Option<&'a (dyn Fn(usize) -> Result<Value> + Sync + RefUnwindSafe)>,
     pub old_new: Option<OldNewRows<'a>>,
     pub session_tz: Option<jiff::tz::TimeZone>,
 }
@@ -147,6 +150,7 @@ impl<'a> EvalCtx<'a> {
             params: &[],
             cancel: None,
             excluded: None,
+            excluded_resolver: None,
             old_new: None,
             session_tz: None,
         }
@@ -169,6 +173,7 @@ impl<'a> EvalCtx<'a> {
             params,
             cancel: None,
             excluded: None,
+            excluded_resolver: None,
             old_new: None,
             session_tz: None,
         }
@@ -189,6 +194,7 @@ impl<'a> EvalCtx<'a> {
                 col_map: excluded_col_map,
                 row: excluded_row,
             }),
+            excluded_resolver: None,
             old_new: None,
             session_tz: None,
         }
@@ -206,6 +212,7 @@ impl<'a> EvalCtx<'a> {
             params: &[],
             cancel: None,
             excluded: None,
+            excluded_resolver: None,
             old_new: Some(OldNewRows {
                 col_map,
                 old_row,
@@ -213,6 +220,14 @@ impl<'a> EvalCtx<'a> {
             }),
             session_tz: None,
         }
+    }
+
+    pub(crate) fn with_excluded_resolver(
+        mut self,
+        resolver: &'a (dyn Fn(usize) -> Result<Value> + Sync + RefUnwindSafe),
+    ) -> Self {
+        self.excluded_resolver = Some(resolver);
+        self
     }
 }
 
@@ -406,6 +421,9 @@ fn eval_expr_inner(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                 if table.eq_ignore_ascii_case("excluded") {
                     let lowered = column.to_ascii_lowercase();
                     let idx = excluded.col_map.resolve(&lowered)?;
+                    if let Some(resolve) = ctx.excluded_resolver {
+                        return resolve(idx);
+                    }
                     return Ok(excluded.row[idx].clone());
                 }
             }
