@@ -2693,7 +2693,7 @@ fn build_trivial_fast_program(
                         let la = col_to_lit_int.get(left_idx).copied()?;
                         let lb = col_to_lit_int.get(right_idx).copied()?;
                         ops.push(WriteOp::LiteralI64 {
-                            value: la.wrapping_add(lb),
+                            value: la.checked_add(lb)?,
                             off: gen_off,
                         });
                     }
@@ -2717,7 +2717,7 @@ fn build_trivial_fast_program(
                 } else {
                     let lit = col_to_lit_int.get(col_schema_idx).copied()?;
                     ops.push(WriteOp::LiteralI64 {
-                        value: lit.wrapping_mul(*mul).wrapping_add(*add),
+                        value: checked_gen_mul_add(lit, *mul, *add).ok()?,
                         off: gen_off,
                     });
                 }
@@ -3707,8 +3707,9 @@ fn exec_insert_trivial_fast(
                 off,
             } => match (&params[*a_param as usize], &params[*b_param as usize]) {
                 (Value::Integer(a), Value::Integer(b)) => {
+                    let value = a.checked_add(*b).ok_or(SqlError::IntegerOverflow)?;
                     let off = *off as usize;
-                    bufs.value_buf[off..off + 8].copy_from_slice(&a.wrapping_add(*b).to_le_bytes());
+                    bufs.value_buf[off..off + 8].copy_from_slice(&value.to_le_bytes());
                 }
                 _ => return Ok(None),
             },
@@ -3719,9 +3720,9 @@ fn exec_insert_trivial_fast(
                 off,
             } => match &params[*param_idx as usize] {
                 Value::Integer(v) => {
-                    let r = v.wrapping_mul(*mul).wrapping_add(*add);
+                    let value = checked_gen_mul_add(*v, *mul, *add)?;
                     let off = *off as usize;
-                    bufs.value_buf[off..off + 8].copy_from_slice(&r.to_le_bytes());
+                    bufs.value_buf[off..off + 8].copy_from_slice(&value.to_le_bytes());
                 }
                 _ => return Ok(None),
             },

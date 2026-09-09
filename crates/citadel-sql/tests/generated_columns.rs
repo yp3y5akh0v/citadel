@@ -1,5 +1,5 @@
 use citadel::{Argon2Profile, DatabaseBuilder};
-use citadel_sql::{Connection, QueryResult, SqlError, Value};
+use citadel_sql::{Connection, ExecutionResult, QueryResult, SqlError, Value};
 
 fn create_db(dir: &std::path::Path) -> citadel::Database {
     let db_path = dir.join("test.db");
@@ -12,6 +12,471 @@ fn create_db(dir: &std::path::Path) -> citadel::Database {
 
 fn query(conn: &Connection, sql: &str) -> QueryResult {
     conn.query(sql).unwrap()
+}
+
+fn execute_generated(
+    conn: &Connection<'_>,
+    sql: &str,
+    params: &[Value],
+    prepared: bool,
+) -> Result<u64, SqlError> {
+    if prepared {
+        conn.prepare(sql)?.execute(params)
+    } else {
+        match conn.execute_params(sql, params)? {
+            ExecutionResult::RowsAffected(count) => Ok(count),
+            other => panic!("expected affected rows, got {other:?}"),
+        }
+    }
+}
+
+fn assert_generated_overflow(error: SqlError) {
+    assert!(matches!(error, SqlError::IntegerOverflow), "got: {error:?}");
+}
+
+#[test]
+fn stored_checked_insert_autocommit_matches_generic_overflow() {
+    for (expression, a, b) in [
+        ("a + b", i64::MAX, 1),
+        ("a + b", i64::MIN, -1),
+        ("a * 2", i64::MAX, 0),
+        ("a * 2 + 1", i64::MIN, 0),
+        ("a * 1 + 1", i64::MAX, 0),
+        ("a * 1 + -1", i64::MIN, 0),
+        ("a * 2 + -1", i64::MAX / 2 + 1, 0),
+        ("a * 2 + 2", i64::MIN / 2 - 1, 0),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        conn.execute(&format!(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER NOT NULL, b INTEGER NOT NULL, \
+             g INTEGER NOT NULL GENERATED ALWAYS AS ({expression}) STORED)"
+        ))
+        .unwrap();
+        for prepared in [false, true] {
+            assert_generated_overflow(
+                execute_generated(
+                    &conn,
+                    "INSERT INTO t (id, a, b) VALUES ($1, $2, $3)",
+                    &[Value::Integer(1), Value::Integer(a), Value::Integer(b)],
+                    prepared,
+                )
+                .unwrap_err(),
+            );
+            assert!(query(&conn, "SELECT * FROM t").rows.is_empty());
+        }
+    }
+}
+
+#[test]
+fn stored_checked_insert_templates_add_reject_overflow() {
+    for (values, params) in [
+        (
+            "$1, $2, $3".to_string(),
+            vec![
+                Value::Integer(1),
+                Value::Integer(i64::MAX),
+                Value::Integer(1),
+            ],
+        ),
+        (
+            "$1, $2, $3".to_string(),
+            vec![
+                Value::Integer(1),
+                Value::Integer(i64::MIN),
+                Value::Integer(-1),
+            ],
+        ),
+        (
+            "$1, $2, 1".to_string(),
+            vec![Value::Integer(1), Value::Integer(i64::MAX)],
+        ),
+        (
+            "$1, 1, $2".to_string(),
+            vec![Value::Integer(1), Value::Integer(i64::MAX)],
+        ),
+        // Ordinary negative literals are unary expressions and exercise the
+        // cached fallback instead of the direct generated-value template.
+        (
+            "$1, -1, $2".to_string(),
+            vec![Value::Integer(1), Value::Integer(i64::MIN)],
+        ),
+        (format!("$1, {}, 1", i64::MAX), vec![Value::Integer(1)]),
+        (format!("$1, {}, -1", i64::MIN), vec![Value::Integer(1)]),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        conn.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER NOT NULL, b INTEGER NOT NULL, \
+             g INTEGER NOT NULL GENERATED ALWAYS AS (a + b) STORED)",
+        )
+        .unwrap();
+        let stmt = conn
+            .prepare(&format!("INSERT INTO t (id, a, b) VALUES ({values})"))
+            .unwrap();
+        conn.execute("BEGIN").unwrap();
+        assert_generated_overflow(stmt.execute(&params).unwrap_err());
+        assert!(query(&conn, "SELECT * FROM t").rows.is_empty());
+        conn.execute("COMMIT").unwrap();
+    }
+}
+
+#[test]
+fn stored_checked_insert_templates_mul_add_reject_intermediate_overflow() {
+    for (expression, bad) in [
+        ("a * 2", i64::MAX),
+        ("a * 2", i64::MIN),
+        ("a * 2 + 1", i64::MAX),
+        ("a * 1 + 1", i64::MAX),
+        ("a * 1 + -1", i64::MIN),
+        // The final mathematical answers fit; the multiplication still overflows.
+        ("a * 2 + -1", i64::MAX / 2 + 1),
+        ("a * 2 + 2", i64::MIN / 2 - 1),
+    ] {
+        for literal_input in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = create_db(dir.path());
+            let conn = Connection::open(&db).unwrap();
+            conn.execute(&format!(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER NOT NULL, \
+                 g INTEGER NOT NULL GENERATED ALWAYS AS ({expression}) STORED)"
+            ))
+            .unwrap();
+            let (sql, params) = if literal_input {
+                (
+                    format!("INSERT INTO t (id, a) VALUES ($1, {bad})"),
+                    vec![Value::Integer(1)],
+                )
+            } else {
+                (
+                    "INSERT INTO t (id, a) VALUES ($1, $2)".into(),
+                    vec![Value::Integer(1), Value::Integer(bad)],
+                )
+            };
+            let stmt = conn.prepare(&sql).unwrap();
+            conn.execute("BEGIN").unwrap();
+            assert_generated_overflow(stmt.execute(&params).unwrap_err());
+            assert!(query(&conn, "SELECT * FROM t").rows.is_empty());
+            conn.execute("COMMIT").unwrap();
+        }
+    }
+}
+
+#[test]
+fn stored_checked_insert_cached_and_uncached_reject_overflow() {
+    for (expression, a, b) in [
+        ("a + b", i64::MAX, 1),
+        ("a + b", i64::MIN, -1),
+        ("a * 2", i64::MAX, 0),
+        ("a * 2 + 1", i64::MIN, 0),
+        ("a * 2 + -1", i64::MAX / 2 + 1, 0),
+    ] {
+        for prepared in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = create_db(dir.path());
+            let conn = Connection::open(&db).unwrap();
+            // The default excludes direct encoded INSERT templates. Prepared
+            // execution uses its cache; ordinary explicit execution is uncached.
+            conn.execute(&format!(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER NOT NULL, b INTEGER NOT NULL, \
+                 tail INTEGER DEFAULT 7, g INTEGER GENERATED ALWAYS AS ({expression}) STORED)"
+            ))
+            .unwrap();
+            conn.execute("BEGIN").unwrap();
+            assert_generated_overflow(
+                execute_generated(
+                    &conn,
+                    "INSERT INTO t (id, a, b) VALUES ($1, $2, $3)",
+                    &[Value::Integer(1), Value::Integer(a), Value::Integer(b)],
+                    prepared,
+                )
+                .unwrap_err(),
+            );
+            assert!(query(&conn, "SELECT * FROM t").rows.is_empty());
+            conn.execute("COMMIT").unwrap();
+        }
+    }
+}
+
+#[test]
+fn stored_checked_insert_late_error_cannot_publish_a_prefix() {
+    for prepared in [false, true] {
+        for explicit in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = create_db(dir.path());
+            let conn = Connection::open(&db).unwrap();
+            conn.execute(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER NOT NULL, \
+                 g INTEGER NOT NULL GENERATED ALWAYS AS (a * 2 + 1) STORED)",
+            )
+            .unwrap();
+            conn.execute("INSERT INTO t (id, a) VALUES (0, 2)").unwrap();
+            if explicit {
+                conn.execute("BEGIN").unwrap();
+            }
+            assert_generated_overflow(
+                execute_generated(
+                    &conn,
+                    "INSERT INTO t (id, a) VALUES (1, 3), (2, $1)",
+                    &[Value::Integer(i64::MAX)],
+                    prepared,
+                )
+                .unwrap_err(),
+            );
+            if explicit {
+                assert!(matches!(
+                    conn.execute("COMMIT"),
+                    Err(SqlError::Storage(citadel_core::Error::TransactionFailed))
+                ));
+            }
+            assert_eq!(
+                query(&conn, "SELECT * FROM t").rows,
+                vec![vec![
+                    Value::Integer(0),
+                    Value::Integer(2),
+                    Value::Integer(5)
+                ]]
+            );
+        }
+    }
+}
+
+#[test]
+fn stored_checked_update_point_rejects_overflow_before_replacement() {
+    for (expression, bad, b) in [
+        ("a + b", i64::MAX, 1),
+        ("a * 2 + 1", i64::MAX, 0),
+        ("a * 2 + -1", i64::MAX / 2 + 1, 0),
+    ] {
+        for prepared in [false, true] {
+            for explicit in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let db = create_db(dir.path());
+                let conn = Connection::open(&db).unwrap();
+                conn.execute(&format!(
+                    "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER NOT NULL, b INTEGER NOT NULL, \
+                     g INTEGER NOT NULL GENERATED ALWAYS AS ({expression}) STORED)"
+                ))
+                .unwrap();
+                conn.execute(&format!("INSERT INTO t (id, a, b) VALUES (1, 1, {b})"))
+                    .unwrap();
+                let before = query(&conn, "SELECT * FROM t").rows;
+                if explicit {
+                    conn.execute("BEGIN").unwrap();
+                }
+                assert_generated_overflow(
+                    execute_generated(
+                        &conn,
+                        "UPDATE t SET a = $1 WHERE id = 1",
+                        &[Value::Integer(bad)],
+                        prepared,
+                    )
+                    .unwrap_err(),
+                );
+                // Point updates build a replacement before publishing it.
+                if explicit {
+                    conn.execute("COMMIT").unwrap();
+                }
+                assert_eq!(query(&conn, "SELECT * FROM t").rows, before);
+            }
+        }
+    }
+}
+
+#[test]
+fn stored_checked_update_range_and_scan_overflow_are_atomic() {
+    for (nullable, predicate) in [
+        (false, "id >= 1 AND id <= 2"),
+        (true, "id >= 1 AND id <= 2"),
+        (true, "a >= 0"),
+    ] {
+        for prepared in [false, true] {
+            for explicit in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let db = create_db(dir.path());
+                let conn = Connection::open(&db).unwrap();
+                let not_null = if nullable { "" } else { "NOT NULL" };
+                conn.execute(&format!(
+                    "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER {not_null}, \
+                     g INTEGER {not_null} GENERATED ALWAYS AS (a * 2 + 1) STORED)"
+                ))
+                .unwrap();
+                let outside = if nullable { "NULL" } else { "10" };
+                conn.execute(&format!(
+                    "INSERT INTO t (id, a) VALUES (1, 0), (2, {}), (3, {outside})",
+                    i64::MAX / 2
+                ))
+                .unwrap();
+                let before = query(&conn, "SELECT * FROM t ORDER BY id").rows;
+                if explicit {
+                    conn.execute("BEGIN").unwrap();
+                }
+                assert_generated_overflow(
+                    execute_generated(
+                        &conn,
+                        &format!("UPDATE t SET a = a + 1 WHERE {predicate}"),
+                        &[],
+                        prepared,
+                    )
+                    .unwrap_err(),
+                );
+                if explicit {
+                    if nullable {
+                        // Collected rows are evaluated before the batch is written.
+                        conn.execute("COMMIT").unwrap();
+                    } else {
+                        // The fixed-width range already patched the first row.
+                        assert!(matches!(
+                            conn.execute("COMMIT"),
+                            Err(SqlError::Storage(citadel_core::Error::TransactionFailed))
+                        ));
+                    }
+                }
+                assert_eq!(query(&conn, "SELECT * FROM t ORDER BY id").rows, before);
+            }
+        }
+    }
+}
+
+#[test]
+fn stored_checked_update_savepoint_recovers_after_generated_overflow() {
+    for prepared in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        conn.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER NOT NULL, \
+             g INTEGER NOT NULL GENERATED ALWAYS AS (a * 2 + 1) STORED)",
+        )
+        .unwrap();
+        conn.execute(&format!(
+            "INSERT INTO t (id, a) VALUES (1, 0), (2, {})",
+            i64::MAX / 2
+        ))
+        .unwrap();
+        conn.execute("BEGIN").unwrap();
+        conn.execute("SAVEPOINT before_update").unwrap();
+        assert_generated_overflow(
+            execute_generated(
+                &conn,
+                "UPDATE t SET a = a + 1 WHERE id >= 1 AND id <= 2",
+                &[],
+                prepared,
+            )
+            .unwrap_err(),
+        );
+        assert!(matches!(
+            conn.query("SELECT 1"),
+            Err(SqlError::Storage(citadel_core::Error::TransactionFailed))
+        ));
+        conn.execute("ROLLBACK TO before_update").unwrap();
+        assert_eq!(
+            execute_generated(&conn, "UPDATE t SET a = 5 WHERE id = 1", &[], prepared).unwrap(),
+            1
+        );
+        conn.execute("COMMIT").unwrap();
+        assert_eq!(
+            query(&conn, "SELECT * FROM t ORDER BY id").rows,
+            vec![
+                vec![Value::Integer(1), Value::Integer(5), Value::Integer(11)],
+                vec![
+                    Value::Integer(2),
+                    Value::Integer(i64::MAX / 2),
+                    Value::Integer(i64::MAX)
+                ],
+            ]
+        );
+    }
+}
+
+#[test]
+fn stored_checked_integer_boundaries_and_null_real_fallbacks() {
+    for real in [false, true] {
+        for prepared in [false, true] {
+            for explicit in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let db = create_db(dir.path());
+                let conn = Connection::open(&db).unwrap();
+                let data_type = if real { "REAL" } else { "INTEGER" };
+                conn.execute(&format!(
+                    "CREATE TABLE t (id INTEGER PRIMARY KEY, a {data_type}, b {data_type}, \
+                     g {data_type} GENERATED ALWAYS AS (a + b) STORED, \
+                     h {data_type} GENERATED ALWAYS AS (a * 2 + 1) STORED)"
+                ))
+                .unwrap();
+                let inputs = if real {
+                    vec![
+                        (Value::Null, Value::Real(3.0)),
+                        (Value::Real(1.5), Value::Real(2.25)),
+                        (Value::Real(-1.5), Value::Real(2.25)),
+                    ]
+                } else {
+                    vec![
+                        (Value::Null, Value::Integer(3)),
+                        (
+                            Value::Integer(i64::MAX / 2),
+                            Value::Integer(i64::MAX / 2 + 1),
+                        ),
+                        (Value::Integer(i64::MIN / 2), Value::Integer(i64::MIN / 2)),
+                    ]
+                };
+                if explicit {
+                    conn.execute("BEGIN").unwrap();
+                }
+                for (index, (a, b)) in inputs.into_iter().enumerate() {
+                    assert_eq!(
+                        execute_generated(
+                            &conn,
+                            "INSERT INTO t (id, a, b) VALUES ($1, $2, $3)",
+                            &[Value::Integer(index as i64 + 1), a, b],
+                            prepared,
+                        )
+                        .unwrap(),
+                        1
+                    );
+                }
+                assert_eq!(
+                    execute_generated(
+                        &conn,
+                        "INSERT INTO t (id, a, b) VALUES ($1, 10, 20)",
+                        &[Value::Integer(4)],
+                        prepared
+                    )
+                    .unwrap(),
+                    1
+                );
+                assert_eq!(
+                    execute_generated(&conn, "UPDATE t SET a = a + 1 WHERE id = 4", &[], prepared)
+                        .unwrap(),
+                    1
+                );
+                if explicit {
+                    conn.execute("COMMIT").unwrap();
+                }
+                let expected = if real {
+                    vec![
+                        vec![Value::Null, Value::Null],
+                        vec![Value::Real(3.75), Value::Real(4.0)],
+                        vec![Value::Real(0.75), Value::Real(-2.0)],
+                        vec![Value::Real(31.0), Value::Real(23.0)],
+                    ]
+                } else {
+                    vec![
+                        vec![Value::Null, Value::Null],
+                        vec![Value::Integer(i64::MAX), Value::Integer(i64::MAX)],
+                        vec![Value::Integer(i64::MIN), Value::Integer(i64::MIN + 1)],
+                        vec![Value::Integer(31), Value::Integer(23)],
+                    ]
+                };
+                assert_eq!(
+                    query(&conn, "SELECT g, h FROM t ORDER BY id").rows,
+                    expected
+                );
+            }
+        }
+    }
 }
 
 #[test]

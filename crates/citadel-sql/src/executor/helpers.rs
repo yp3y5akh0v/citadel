@@ -533,6 +533,13 @@ pub(super) fn eval_fast_gen(
     eval_fast_gen_with_cancel(fast, expr, partial_row, col_map, None)
 }
 
+pub(super) fn checked_gen_mul_add(value: i64, mul: i64, add: i64) -> Result<i64> {
+    value
+        .checked_mul(mul)
+        .and_then(|product| product.checked_add(add))
+        .ok_or(SqlError::IntegerOverflow)
+}
+
 pub(super) fn eval_fast_gen_with_cancel(
     fast: &FastGenEval,
     expr: &Expr,
@@ -546,49 +553,7 @@ pub(super) fn eval_fast_gen_with_cancel(
             mul,
             add,
         } => match partial_row[*col_schema_idx] {
-            Value::Integer(v) => Ok(Value::Integer(v.wrapping_mul(*mul).wrapping_add(*add))),
-            _ => eval_expr(
-                expr,
-                &EvalCtx::new(col_map, partial_row).with_cancel(cancel),
-            ),
-        },
-        FastGenEval::IntColAddCol {
-            left_idx,
-            right_idx,
-        } => match (&partial_row[*left_idx], &partial_row[*right_idx]) {
-            (Value::Integer(a), Value::Integer(b)) => Ok(Value::Integer(a.wrapping_add(*b))),
-            _ => eval_expr(
-                expr,
-                &EvalCtx::new(col_map, partial_row).with_cancel(cancel),
-            ),
-        },
-        FastGenEval::None => eval_expr(
-            expr,
-            &EvalCtx::new(col_map, partial_row).with_cancel(cancel),
-        ),
-    }
-}
-
-/// Integer overflow returns `IntegerOverflow` (never wraps); non-integer/NULL operands
-/// fall back to `eval_expr`, so results are byte-identical.
-pub(super) fn eval_fast_gen_checked_with_cancel(
-    fast: &FastGenEval,
-    expr: &Expr,
-    partial_row: &[Value],
-    col_map: &ColumnMap,
-    cancel: Option<&citadel::CancelToken>,
-) -> Result<Value> {
-    match fast {
-        FastGenEval::IntColMulAdd {
-            col_schema_idx,
-            mul,
-            add,
-        } => match partial_row[*col_schema_idx] {
-            Value::Integer(v) => v
-                .checked_mul(*mul)
-                .and_then(|p| p.checked_add(*add))
-                .map(Value::Integer)
-                .ok_or(SqlError::IntegerOverflow),
+            Value::Integer(v) => checked_gen_mul_add(v, *mul, *add).map(Value::Integer),
             _ => eval_expr(
                 expr,
                 &EvalCtx::new(col_map, partial_row).with_cancel(cancel),
@@ -789,7 +754,7 @@ impl PartialDecodeCtx {
         cancel: Option<&citadel::CancelToken>,
     ) -> Result<()> {
         for (pos, expr, dt, nullable, fast) in &self.virtuals_to_eval {
-            let val = eval_fast_gen_checked_with_cancel(fast, expr, row, &self.col_map, cancel)?;
+            let val = eval_fast_gen_with_cancel(fast, expr, row, &self.col_map, cancel)?;
             row[*pos] = if val.is_null() {
                 if !*nullable {
                     return Err(SqlError::InvalidValue(format!(
