@@ -1,4 +1,5 @@
 use super::*;
+use crate::encoding::encode_row;
 use crate::parser::{
     BinOp, DerivedTable, Expr, JoinClause, JoinType, SelectColumn, SelectStmt, TableRef,
 };
@@ -712,9 +713,26 @@ fn compiled_update_nullable_patch_eligibility_is_narrow_and_runtime_bound() {
     }
     let mut target = arithmetic_update_target(BinOp::Add, 2, false, false);
     target.col.default_expr = Some(Expr::Literal(i(3)));
-    assert!(!compiled_target_patch_safe(&target));
+    assert!(compiled_target_patch_safe(&target));
     target.col.nullable = false;
-    assert!(!compiled_target_patch_safe(&target));
+    assert!(compiled_target_patch_safe(&target));
+    for expr in [
+        Expr::Literal(Value::Text("7".into())),
+        Expr::Literal(Value::Real(7.0)),
+        Expr::Literal(Value::Null),
+        Expr::BinaryOp {
+            left: Box::new(Expr::Literal(i(3))),
+            op: BinOp::Add,
+            right: Box::new(Expr::Literal(i(4))),
+        },
+    ] {
+        target.col.default_expr = Some(expr);
+        assert!(!compiled_target_patch_safe(&target));
+        assert!(!pk_range_patch_safe(std::slice::from_ref(&target.col), &[]));
+    }
+    target.col.nullable = true;
+    target.col.default_expr = Some(Expr::Literal(Value::Null));
+    assert!(compiled_target_patch_safe(&target));
 }
 
 #[test]
@@ -888,7 +906,7 @@ fn compiled_update_nullable_v1_null_row_is_not_reencoded() {
 }
 
 #[test]
-fn compiled_update_nullable_missing_added_slot_stays_missing() {
+fn compiled_update_nullable_missing_added_slot_materializes_as_null() {
     for explicit in [false, true] {
         let db = update_database();
         let conn = crate::Connection::open(&db).unwrap();
@@ -912,7 +930,12 @@ fn compiled_update_nullable_missing_added_slot_stays_missing() {
             conn.execute("COMMIT").unwrap();
         }
         for (index, raw) in before.iter().enumerate() {
-            assert_eq!(stored_update_row(&db, index as i64 + 1), *raw);
+            let mut values = crate::encoding::decode_row(raw).unwrap();
+            values.push(Value::Null);
+            assert_eq!(
+                stored_update_row(&db, index as i64 + 1),
+                encode_row(&values)
+            );
         }
         assert_eq!(
             conn.query("SELECT id, c0, c7, v FROM t ORDER BY id")
@@ -1057,6 +1080,70 @@ fn compiled_update_nullable_with_added_default_uses_resizing_path() {
         );
         assert_eq!(stored_update_row(&db, 1), encode_row(&[Value::Null, i(7)]));
         assert_eq!(stored_update_row(&db, 2), encode_row(&[i(3), i(7)]));
+        assert_eq!(stored_update_row(&db, 3), outside);
+    }
+}
+
+#[test]
+fn general_autocommit_update_materializes_added_defaults_in_both_fast_paths() {
+    for fixed_width in [true, false] {
+        let db = update_database();
+        let conn = crate::Connection::open(&db).unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER NOT NULL)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 1), (2, 2), (3, 3)")
+            .unwrap();
+        let outside = stored_update_row(&db, 3);
+        conn.execute("ALTER TABLE t ADD COLUMN b INTEGER DEFAULT 10")
+            .unwrap();
+        conn.execute("ALTER TABLE t ADD COLUMN tail TEXT DEFAULT 'keep'")
+            .unwrap();
+        let schema = SchemaManager::load(&db).unwrap();
+        let updates: &[(&str, u64)] = if fixed_width {
+            &[("UPDATE t SET a = a + b WHERE id >= 1 AND id <= 2", 2)]
+        } else {
+            &[
+                ("UPDATE t SET b = b + 1 WHERE id = 1", 1),
+                ("UPDATE t SET b = b + 1 WHERE id >= 2 AND id <= 2", 1),
+            ]
+        };
+        for &(sql, expected_count) in updates {
+            let Statement::Update(update) = crate::parser::parse_sql(sql).unwrap() else {
+                panic!("expected UPDATE");
+            };
+            // Connection::execute autocompiles autocommit UPDATE. Call this
+            // executor directly to cover its fixed-slice and collected loops.
+            assert!(matches!(
+                exec_update(&db, &schema, &update).unwrap(),
+                ExecutionResult::RowsAffected(count) if count == expected_count
+            ));
+        }
+        let expected_b = if fixed_width { 10 } else { 11 };
+        let expected_a = |id| if fixed_width { id + 10 } else { id };
+        assert_eq!(
+            conn.query("SELECT * FROM t ORDER BY id").unwrap().rows,
+            vec![
+                vec![
+                    i(1),
+                    i(expected_a(1)),
+                    i(expected_b),
+                    Value::Text("keep".into())
+                ],
+                vec![
+                    i(2),
+                    i(expected_a(2)),
+                    i(expected_b),
+                    Value::Text("keep".into())
+                ],
+                vec![i(3), i(3), i(10), Value::Text("keep".into())],
+            ]
+        );
+        for id in 1..=2 {
+            assert_eq!(
+                stored_update_row(&db, id),
+                encode_row(&[i(expected_a(id)), i(expected_b), Value::Text("keep".into())])
+            );
+        }
         assert_eq!(stored_update_row(&db, 3), outside);
     }
 }

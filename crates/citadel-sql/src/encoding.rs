@@ -1448,7 +1448,8 @@ fn decode_value_raw(type_tag: u8, data: &[u8]) -> Result<RawColumn<'_>> {
     }
 }
 
-/// Patch column in-place if value size unchanged. Ok(false) = size mismatch, use `patch_row_column`.
+/// Patch a column in place when its payload size and cell framing stay unchanged.
+/// `Ok(false)` requires rebuilding the row with `patch_row_column`.
 pub fn patch_column_in_place(data: &mut [u8], target: usize, new_val: &Value) -> Result<bool> {
     let (version, col_count, bitmap, mut pos) = parse_row_header(data)?;
     if target >= col_count || new_val.is_null() {
@@ -1464,39 +1465,7 @@ pub fn patch_column_in_place(data: &mut [u8], target: usize, new_val: &Value) ->
             pos = skip_cell(data, pos, version)?;
         }
     }
-    if pos >= data.len() {
-        return Err(SqlError::InvalidValue("truncated column data".into()));
-    }
-    let type_tag = data[pos];
-    let (old_data_len, val_start) = match version {
-        RowVersion::V2 => match fixed_width_size(type_tag) {
-            Some(n) => (n, pos + 1),
-            None => {
-                if pos + 5 > data.len() {
-                    return Err(SqlError::InvalidValue("truncated column data".into()));
-                }
-                let len = u32::from_le_bytes(data[pos + 1..pos + 5].try_into().unwrap()) as usize;
-                (len, pos + 5)
-            }
-        },
-        RowVersion::V1 => {
-            if pos + 5 > data.len() {
-                return Err(SqlError::InvalidValue("truncated column data".into()));
-            }
-            let len = u32::from_le_bytes(data[pos + 1..pos + 5].try_into().unwrap()) as usize;
-            (len, pos + 5)
-        }
-    };
-    let new_data_len = match value_encoded_size_v2(new_val) {
-        Some(n) => n,
-        None => return Ok(false),
-    };
-    if new_data_len != old_data_len {
-        return Ok(false);
-    }
-    data[pos] = new_val.data_type().type_tag();
-    write_value_payload_v2(new_val, &mut data[val_start..val_start + new_data_len]);
-    Ok(true)
+    patch_cell_in_place(data, pos, version, new_val)
 }
 
 /// Patch a single column in encoded row, writing result into `out`. Copies others unchanged.
@@ -1523,6 +1492,12 @@ pub fn patch_row_column(
     out.extend_from_slice(&data[2..2 + bitmap_bytes]);
     for _ in bitmap_bytes..new_bitmap_bytes {
         out.push(0xFF);
+    }
+    let used_bits = col_count % 8;
+    if new_col_count > col_count && used_bits != 0 {
+        // Newly exposed slots in the old final bitmap byte are missing NULLs,
+        // just like slots in the newly appended 0xFF bytes.
+        out[bitmap_start + bitmap_bytes - 1] |= u8::MAX << used_bits;
     }
     if new_val.is_null() {
         out[bitmap_start + target / 8] |= 1 << (target % 8);
@@ -1594,7 +1569,8 @@ fn read_column_with_offset(data: &[u8], target: usize) -> Result<Option<(RawColu
     unreachable!()
 }
 
-/// Patch at a known byte offset. Ok(false) if size mismatch or NULL offset.
+/// Patch at a known byte offset. Returns `Ok(false)` for a NULL offset or a
+/// change in payload size or cell framing.
 pub fn patch_at_offset(data: &mut [u8], offset: usize, new_val: &Value) -> Result<bool> {
     if offset == usize::MAX || new_val.is_null() {
         return Ok(false);
@@ -1607,6 +1583,18 @@ pub fn patch_at_offset(data: &mut [u8], offset: usize, new_val: &Value) -> Resul
     } else {
         RowVersion::V1
     };
+    patch_cell_in_place(data, offset, version, new_val)
+}
+
+fn patch_cell_in_place(
+    data: &mut [u8],
+    offset: usize,
+    version: RowVersion,
+    new_val: &Value,
+) -> Result<bool> {
+    if offset >= data.len() {
+        return Err(SqlError::InvalidValue("truncated column data".into()));
+    }
     let type_tag = data[offset];
     let (old_data_len, val_start) = match version {
         RowVersion::V2 => match fixed_width_size(type_tag) {
@@ -1628,14 +1616,23 @@ pub fn patch_at_offset(data: &mut [u8], offset: usize, new_val: &Value) -> Resul
             (len, offset + 5)
         }
     };
+    if old_data_len > data.len() - val_start {
+        return Err(SqlError::InvalidValue("truncated column data".into()));
+    }
     let new_data_len = match value_encoded_size_v2(new_val) {
         Some(n) => n,
         None => return Ok(false),
     };
-    if new_data_len != old_data_len {
+    let new_type_tag = new_val.data_type().type_tag();
+    // V2 variable-width cells have a length field that fixed-width cells omit.
+    // Equal payload sizes alone cannot make a change between them in-place.
+    if new_data_len != old_data_len
+        || (version == RowVersion::V2
+            && fixed_width_size(type_tag).is_some() != fixed_width_size(new_type_tag).is_some())
+    {
         return Ok(false);
     }
-    data[offset] = new_val.data_type().type_tag();
+    data[offset] = new_type_tag;
     write_value_payload_v2(new_val, &mut data[val_start..val_start + new_data_len]);
     Ok(true)
 }
