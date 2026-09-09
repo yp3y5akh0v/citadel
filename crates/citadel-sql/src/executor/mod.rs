@@ -10,6 +10,7 @@ mod ddl;
 mod dml;
 mod explain;
 pub(crate) mod helpers;
+mod index_build;
 mod join;
 pub(crate) mod matviews;
 mod result_cache;

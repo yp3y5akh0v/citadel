@@ -4297,3 +4297,402 @@ fn create_index_concurrently_populates_existing_rows() {
     assert_eq!(r2.rows.len(), 1);
     assert_eq!(r2.rows[0][0], Value::Integer(10));
 }
+
+fn for_each_existing_row_index_mode(
+    mut test: impl FnMut(&citadel::Database, &Connection, bool, &str),
+) {
+    for (explicit, concurrently) in [(false, ""), (true, ""), (false, "CONCURRENTLY ")] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        test(&db, &conn, explicit, concurrently);
+    }
+}
+
+fn create_existing_row_index(conn: &Connection, explicit: bool, sql: &str) {
+    if explicit {
+        conn.execute("BEGIN").unwrap();
+    }
+    assert_ok(conn.execute(sql).unwrap());
+    if explicit {
+        conn.execute("COMMIT").unwrap();
+    }
+}
+
+fn assert_indexed_ids(conn: &Connection, sql: &str, plan_fragment: &str, ids: &[i64]) {
+    let plan = conn.query(&format!("EXPLAIN {sql}")).unwrap();
+    let plan_text = format!("{}", plan.rows[0][0]);
+    assert!(plan_text.contains(plan_fragment), "{plan_text}");
+    let expected: Vec<Vec<Value>> = ids.iter().map(|id| vec![Value::Integer(*id)]).collect();
+    assert_eq!(conn.query(sql).unwrap().rows, expected);
+}
+
+fn assert_inverted_ids(db: &citadel::Database, conn: &Connection, sql: &str, ids: &[i64]) {
+    let citadel_sql::parser::Statement::Select(query) =
+        citadel_sql::parser::parse_sql(sql).unwrap()
+    else {
+        panic!("expected SELECT")
+    };
+    let citadel_sql::parser::QueryBody::Select(select) = query.body else {
+        panic!("expected single-table SELECT")
+    };
+    let schema = citadel_sql::schema::SchemaManager::load(db).unwrap();
+    let table = schema.get("t").unwrap();
+    assert!(matches!(
+        citadel_sql::planner::plan_select_inverted(table, &select.where_clause),
+        citadel_sql::planner::ScanPlan::InvertedScan { .. }
+    ));
+    let expected: Vec<Vec<Value>> = ids.iter().map(|id| vec![Value::Integer(*id)]).collect();
+    assert_eq!(conn.query(sql).unwrap().rows, expected);
+}
+
+#[test]
+fn create_index_skips_unrelated_virtual_for_column_and_expression_keys() {
+    for_each_existing_row_index_mode(|_db, conn, explicit, concurrently| {
+        conn.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, label TEXT, \
+             g INTEGER GENERATED ALWAYS AS (a * 2) VIRTUAL)",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO t (id, a, label) VALUES \
+             (1, 9223372036854775807, 'First'), (2, 1, 'Second')",
+        )
+        .unwrap();
+        create_existing_row_index(
+            conn,
+            explicit,
+            &format!("CREATE INDEX {concurrently}by_a ON t (a)"),
+        );
+        assert_indexed_ids(
+            conn,
+            "SELECT id FROM t WHERE a = 9223372036854775807",
+            "by_a",
+            &[1],
+        );
+        create_existing_row_index(
+            conn,
+            explicit,
+            &format!("CREATE INDEX {concurrently}by_label ON t (LOWER(label))"),
+        );
+        assert_indexed_ids(
+            conn,
+            "SELECT id FROM t WHERE LOWER(label) = 'first'",
+            "by_label",
+            &[1],
+        );
+    });
+}
+
+#[test]
+fn create_index_evaluates_only_requested_virtual_expression_dependencies() {
+    for_each_existing_row_index_mode(|_db, conn, explicit, concurrently| {
+        conn.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, \
+             safe INTEGER GENERATED ALWAYS AS (a / 2) VIRTUAL, \
+             overflowing INTEGER GENERATED ALWAYS AS (a * 2) VIRTUAL)",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO t (id, a) VALUES (1, 1), (2, 9223372036854775807)")
+            .unwrap();
+        create_existing_row_index(
+            conn,
+            explicit,
+            &format!("CREATE INDEX {concurrently}by_safe ON t (CAST(safe + 1 AS INTEGER))"),
+        );
+        assert_indexed_ids(
+            conn,
+            "SELECT id FROM t WHERE CAST(safe + 1 AS INTEGER) = 4611686018427387904",
+            "by_safe",
+            &[2],
+        );
+    });
+}
+
+#[test]
+fn create_partial_index_rejects_rows_before_evaluating_key_dependencies() {
+    for_each_existing_row_index_mode(|_db, conn, explicit, concurrently| {
+        conn.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, active INTEGER, \
+             g INTEGER GENERATED ALWAYS AS (a * 2) VIRTUAL)",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO t (id, a, active) VALUES \
+             (1, 2, 1), (2, 9223372036854775807, 0), (3, 9223372036854775807, NULL)",
+        )
+        .unwrap();
+        create_existing_row_index(
+            conn,
+            explicit,
+            &format!(
+                "CREATE INDEX {concurrently}active_g ON t (CAST(g + 1 AS INTEGER)) WHERE active = 1"
+            ),
+        );
+        assert_indexed_ids(
+            conn,
+            "SELECT id FROM t WHERE active = 1 AND CAST(g + 1 AS INTEGER) = 5",
+            "active_g",
+            &[1],
+        );
+    });
+}
+
+#[test]
+fn create_unique_index_preserves_partial_membership_and_null_expression_keys() {
+    for_each_existing_row_index_mode(|_db, conn, explicit, concurrently| {
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT, active INTEGER)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'same', 0), (2, 'same', NULL), (3, 'same', 1)")
+            .unwrap();
+        create_existing_row_index(
+            conn,
+            explicit,
+            &format!(
+                "CREATE UNIQUE INDEX {concurrently}active_email ON t (email) WHERE active = 1"
+            ),
+        );
+        assert_indexed_ids(
+            conn,
+            "SELECT id FROM t WHERE email = 'same' AND active = 1",
+            "active_email",
+            &[3],
+        );
+        assert!(matches!(
+            conn.execute("INSERT INTO t VALUES (4, 'same', 1)")
+                .unwrap_err(),
+            SqlError::UniqueViolation(_)
+        ));
+        conn.execute("INSERT INTO t VALUES (4, 'same', 0)").unwrap();
+        create_existing_row_index(
+            conn,
+            explicit,
+            &format!("CREATE UNIQUE INDEX {concurrently}null_email ON t (NULLIF(email, 'same'))"),
+        );
+        assert_eq!(
+            conn.query("SELECT COUNT(*) FROM t").unwrap().rows,
+            vec![vec![Value::Integer(4)]]
+        );
+    });
+}
+
+#[test]
+fn create_index_required_virtual_errors_do_not_publish_partial_state() {
+    for_each_existing_row_index_mode(|_db, conn, explicit, concurrently| {
+        conn.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, \
+             g INTEGER GENERATED ALWAYS AS (a * 2) VIRTUAL)",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO t (id, a) VALUES (1, 1), (2, 9223372036854775807)")
+            .unwrap();
+        for definition in ["((g + 1))", "(a) WHERE g > 0"] {
+            if explicit {
+                conn.execute("BEGIN").unwrap();
+            }
+            let sql = format!("CREATE INDEX {concurrently}failed_index ON t {definition}");
+            assert!(matches!(
+                conn.execute(&sql).unwrap_err(),
+                SqlError::IntegerOverflow
+            ));
+            if explicit {
+                assert!(matches!(
+                    conn.execute("COMMIT").unwrap_err(),
+                    SqlError::Storage(citadel_core::Error::TransactionFailed)
+                ));
+            }
+            conn.execute("CREATE INDEX failed_index ON t (a)").unwrap();
+            assert_indexed_ids(
+                conn,
+                "SELECT id FROM t WHERE a = 9223372036854775807",
+                "failed_index",
+                &[2],
+            );
+            conn.execute("DROP INDEX failed_index").unwrap();
+        }
+        assert_eq!(
+            conn.query("SELECT id, a FROM t ORDER BY id").unwrap().rows,
+            vec![
+                vec![Value::Integer(1), Value::Integer(1)],
+                vec![Value::Integer(2), Value::Integer(i64::MAX)],
+            ]
+        );
+    });
+}
+
+#[test]
+fn create_inverted_index_populates_existing_rows_without_unrelated_virtuals() {
+    for_each_existing_row_index_mode(|db, conn, explicit, concurrently| {
+        conn.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, body TEXT, data JSONB, a INTEGER, \
+             g INTEGER GENERATED ALWAYS AS (a * 2) VIRTUAL)",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO t (id, body, data, a) VALUES \
+             (1, 'quick fox', CAST('{\"role\":\"admin\"}' AS JSONB), 9223372036854775807), \
+             (2, 'sleeping dog', CAST('{\"role\":\"member\"}' AS JSONB), 1)",
+        )
+        .unwrap();
+        create_existing_row_index(
+            conn,
+            explicit,
+            &format!("CREATE INDEX {concurrently}by_body ON t USING fts (body)"),
+        );
+        assert_inverted_ids(
+            db,
+            conn,
+            "SELECT id FROM t WHERE body @@ to_tsquery('fox')",
+            &[1],
+        );
+        create_existing_row_index(
+            conn,
+            explicit,
+            &format!("CREATE INDEX {concurrently}by_data ON t USING gin (data)"),
+        );
+        assert_inverted_ids(
+            db,
+            conn,
+            "SELECT id FROM t WHERE data @> CAST('{\"role\":\"admin\"}' AS JSONB)",
+            &[1],
+        );
+    });
+}
+
+#[test]
+fn create_ann_index_populates_existing_filtered_vectors_without_unrelated_virtuals() {
+    for_each_existing_row_index_mode(|_db, conn, explicit, concurrently| {
+        conn.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, category INTEGER, v VECTOR(2), a INTEGER, \
+             g INTEGER GENERATED ALWAYS AS (a * 2) VIRTUAL)",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO t (id, category, v, a) VALUES \
+             (1, 2, '[0, 0]'::VECTOR(2), 9223372036854775807), \
+             (2, 1, '[1, 0]'::VECTOR(2), 9223372036854775807), \
+             (3, 1, '[4, 0]'::VECTOR(2), 9223372036854775807)",
+        )
+        .unwrap();
+        create_existing_row_index(
+            conn,
+            explicit,
+            &format!(
+                "CREATE INDEX {concurrently}by_vector ON t USING ann (v) \
+                 WITH (metric = 'l2', filters = 'category')"
+            ),
+        );
+        assert_eq!(
+            conn.query(
+                "SELECT id FROM t WHERE category = 1 \
+                 ORDER BY v <-> '[0, 0]'::VECTOR(2) LIMIT 2"
+            )
+            .unwrap()
+            .rows,
+            vec![vec![Value::Integer(2)], vec![Value::Integer(3)]]
+        );
+        assert!(conn.ann_cache_status("t", "v").unwrap().is_some());
+    });
+}
+
+#[test]
+fn create_index_decodes_mapped_keys_and_only_required_missing_defaults() {
+    for_each_existing_row_index_mode(|db, conn, explicit, concurrently| {
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, removed INTEGER, a INTEGER)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 99, 1)").unwrap();
+        conn.execute("ALTER TABLE t DROP COLUMN removed").unwrap();
+        conn.execute("ALTER TABLE t ADD COLUMN label TEXT DEFAULT 'Kept'")
+            .unwrap();
+        conn.execute("ALTER TABLE t ADD COLUMN poison INTEGER DEFAULT (9223372036854775807 + 1)")
+            .unwrap();
+        conn.execute("INSERT INTO t (id, a, label, poison) VALUES (2, 2, NULL, NULL)")
+            .unwrap();
+        create_existing_row_index(
+            conn,
+            explicit,
+            &format!("CREATE INDEX {concurrently}by_label ON t (LOWER(label))"),
+        );
+        let index_table = citadel_sql::TableSchema::index_table_name("t", "by_label");
+        let mut entries = Vec::new();
+        db.begin_read()
+            .table_for_each(&index_table, |key, value| {
+                entries.push((key.to_vec(), value.to_vec()));
+                Ok(())
+            })
+            .unwrap();
+        let mut expected = vec![
+            (
+                citadel_sql::encoding::encode_composite_key(&[
+                    Value::Text("kept".into()),
+                    Value::Integer(1),
+                ]),
+                vec![],
+            ),
+            (
+                citadel_sql::encoding::encode_composite_key(&[Value::Null, Value::Integer(2)]),
+                vec![],
+            ),
+        ];
+        expected.sort();
+        assert_eq!(entries, expected);
+        assert_eq!(
+            conn.query("SELECT label FROM t WHERE id = 2").unwrap().rows,
+            vec![vec![Value::Null]]
+        );
+    });
+}
+
+#[test]
+fn create_index_in_explicit_transaction_uses_temp_table_storage() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TEMP TABLE t (id INTEGER PRIMARY KEY, label TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'first'), (2, 'second')")
+        .unwrap();
+    create_existing_row_index(&conn, true, "CREATE INDEX by_label ON t (label)");
+    assert_indexed_ids(
+        &conn,
+        "SELECT id FROM t WHERE label = 'first'",
+        "by_label",
+        &[1],
+    );
+}
+
+#[test]
+fn create_inverted_index_validates_kind_in_every_build_mode() {
+    for_each_existing_row_index_mode(|_db, conn, explicit, concurrently| {
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, body TEXT, data JSONB, a INTEGER)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'fox', CAST('{}' AS JSONB), 1)")
+            .unwrap();
+        for (unique, definition, message) in [
+            ("", "USING gin (body)", Some("GIN index requires")),
+            ("", "USING fts (data)", Some("FTS index requires")),
+            ("", "USING ann (a)", Some("ANN index requires")),
+            ("UNIQUE ", "USING fts (body)", Some("UNIQUE not supported")),
+            ("", "USING fts (body, a)", None),
+            ("", "USING gin (data, data)", None),
+            ("", "USING fts (LOWER(body))", None),
+            ("", "USING gin (COALESCE(data, data))", None),
+        ] {
+            if explicit {
+                conn.execute("BEGIN").unwrap();
+            }
+            let sql = format!("CREATE {unique}INDEX {concurrently}invalid_index ON t {definition}");
+            let error = conn.execute(&sql).unwrap_err();
+            assert!(
+                matches!(&error, SqlError::Unsupported(text) if message.is_none_or(|message| text.contains(message))),
+                "{error:?}"
+            );
+            if explicit {
+                conn.execute("ROLLBACK").unwrap();
+            }
+            conn.execute("CREATE INDEX invalid_index ON t (a)").unwrap();
+            assert_indexed_ids(conn, "SELECT id FROM t WHERE a = 1", "invalid_index", &[1]);
+            conn.execute("DROP INDEX invalid_index").unwrap();
+        }
+    });
+}

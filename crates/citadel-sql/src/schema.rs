@@ -249,6 +249,19 @@ impl SchemaManager {
         Self::load_inner(db, Cancellable::Yes)
     }
 
+    /// Load one table from the caller's transaction snapshot.
+    pub(crate) fn load_table(
+        name: &str,
+        get: impl FnOnce(&[u8], &[u8]) -> citadel_core::Result<Option<Vec<u8>>>,
+    ) -> Result<Option<TableSchema>> {
+        let lower = lower_cow(name);
+        match get(SCHEMA_TABLE, lower.as_bytes()) {
+            Ok(Some(data)) => TableSchema::deserialize(&data).map(Some),
+            Ok(None) | Err(citadel_core::Error::TableNotFound(_)) => Ok(None),
+            Err(error) => Err(SqlError::Storage(error)),
+        }
+    }
+
     /// Loads the schema with cancellation suspended.
     ///
     /// Restoring the schema after a transaction ends is recovery, not the

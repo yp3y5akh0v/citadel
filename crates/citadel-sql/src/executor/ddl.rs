@@ -5,7 +5,7 @@ use crate::parser::*;
 use crate::schema::SchemaManager;
 use crate::types::*;
 
-use super::helpers::*;
+use super::index_build::IndexBuildPlan;
 
 pub(super) fn collect_column_refs(expr: &Expr, out: &mut Vec<String>) {
     match expr {
@@ -782,177 +782,66 @@ pub(super) fn exec_create_index(
     let cancel = cancel.as_ref();
     let lower_table = stmt.table_name.to_ascii_lowercase();
     let lower_idx = stmt.index_name.to_ascii_lowercase();
-
-    let table_schema = schema
+    let storage_table = schema
         .get(&lower_table)
-        .ok_or_else(|| SqlError::TableNotFound(stmt.table_name.clone()))?;
-    // Resolve through any TEMP alias: storage operations must use the schema's actual `name`.
-    let storage_table = table_schema.name.clone();
+        .map(|table| table.name.clone())
+        .unwrap_or_else(|| schema.resolve_temp(&lower_table));
 
+    let prescan = if stmt.concurrently {
+        let mut rtx = db.begin_read();
+        let generation = rtx.commit_generation();
+        let table_schema =
+            SchemaManager::load_table(&storage_table, |table, key| rtx.table_get(table, key))?
+                .ok_or_else(|| SqlError::TableNotFound(stmt.table_name.clone()))?;
+        if table_schema.index_by_name(&lower_idx).is_some() {
+            None
+        } else {
+            let idx_def = build_index_def_for_create(stmt, &table_schema, lower_idx.clone())?;
+            let plan = IndexBuildPlan::new(&table_schema, &idx_def, cancel)?;
+            let entries = plan
+                .collect(|visit| rtx.table_scan_from(table_schema.name.as_bytes(), b"", visit))?;
+            drop(rtx);
+            #[cfg(test)]
+            tests::after_index_prescan(db);
+            Some((entries, generation))
+        }
+    } else {
+        None
+    };
+
+    let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
+    let mut table_schema =
+        SchemaManager::load_table(&storage_table, |table, key| wtx.table_get(table, key))?
+            .ok_or_else(|| SqlError::TableNotFound(stmt.table_name.clone()))?;
     if table_schema.index_by_name(&lower_idx).is_some() {
         if stmt.if_not_exists {
+            schema.register(table_schema);
             return Ok(ExecutionResult::Ok);
         }
         return Err(SqlError::IndexAlreadyExists(stmt.index_name.clone()));
     }
+    let idx_def = build_index_def_for_create(stmt, &table_schema, lower_idx.clone())?;
+    let plan = IndexBuildPlan::new(&table_schema, &idx_def, cancel)?;
+    let idx_table = TableSchema::index_table_name(&table_schema.name, &lower_idx);
 
-    let idx_def = build_index_def_for_create(stmt, table_schema, lower_idx.clone())?;
-
-    let idx_table = TableSchema::index_table_name(&storage_table, &lower_idx);
-
-    let pk_indices = table_schema.pk_indices();
-    // CONCURRENTLY: pre-scan rows under a ReadTxn (no write lock held). Other writers can
-    // proceed during the scan. If a writer commits between the snapshot and the merge,
-    // re-scan under the WriteTxn to ensure correctness.
-    let (mut rows, prescan_gen): (Vec<Vec<Value>>, Option<u64>) = if stmt.concurrently {
-        let mut rtx = db.begin_read();
-        let g1 = rtx.commit_generation();
-        let mut prescan: Vec<Vec<Value>> = Vec::new();
-        let mut scan_err: Option<SqlError> = None;
-        rtx.table_for_each(storage_table.as_bytes(), |key, value| {
-            match decode_full_row_with_cancel(table_schema, key, value, cancel) {
-                Ok(row) => prescan.push(row),
-                Err(e) => scan_err = Some(e),
-            }
-            Ok(())
-        })
-        .map_err(SqlError::Storage)?;
-        drop(rtx);
-        if let Some(e) = scan_err {
-            return Err(e);
-        }
-        (prescan, Some(g1))
-    } else {
-        (Vec::new(), None)
-    };
-
-    let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
     SchemaManager::ensure_schema_table(&mut wtx)?;
     wtx.create_table(&idx_table).map_err(SqlError::Storage)?;
 
-    // For non-concurrent path, scan under the write lock. For concurrent path, re-scan only
-    // if commit_generation moved (a writer committed between our snapshot and now).
-    if let Some(g1) = prescan_gen {
-        let g_now = db.manager().commit_generation();
-        if g_now != g1 {
-            rows.clear();
-            let mut scan_err: Option<SqlError> = None;
-            wtx.table_for_each(storage_table.as_bytes(), |key, value| {
-                match decode_full_row_with_cancel(table_schema, key, value, cancel) {
-                    Ok(row) => rows.push(row),
-                    Err(e) => scan_err = Some(e),
-                }
-                Ok(())
-            })
-            .map_err(SqlError::Storage)?;
-            if let Some(e) = scan_err {
-                return Err(e);
-            }
+    // A commit after the read snapshot invalidates the collected entries.
+    let entries = match prescan {
+        Some((entries, generation)) if db.manager().commit_generation() == generation => entries,
+        stale => {
+            drop(stale);
+            plan.collect(|visit| wtx.table_scan_from(table_schema.name.as_bytes(), b"", visit))?
         }
-    } else {
-        let mut scan_err: Option<SqlError> = None;
-        wtx.table_for_each(storage_table.as_bytes(), |key, value| {
-            match decode_full_row_with_cancel(table_schema, key, value, cancel) {
-                Ok(row) => rows.push(row),
-                Err(e) => scan_err = Some(e),
-            }
-            Ok(())
-        })
-        .map_err(SqlError::Storage)?;
-        if let Some(e) = scan_err {
-            return Err(e);
-        }
-    }
+    };
+    plan.insert(&mut wtx, &idx_table, entries)?;
 
-    if let crate::types::IndexKind::Inverted(inv_kind) = idx_def.kind {
-        let col_idx = idx_def.column_positions_iter().next().ok_or_else(|| {
-            SqlError::Unsupported("inverted index requires at least one column key".into())
-        })? as usize;
-        let col_type = table_schema.columns[col_idx].data_type;
-        match inv_kind {
-            crate::types::InvertedKind::Gin(_) => {
-                if !matches!(
-                    col_type,
-                    crate::types::DataType::Json | crate::types::DataType::Jsonb
-                ) {
-                    return Err(SqlError::Unsupported(
-                        "GIN index requires a JSON or JSONB column".into(),
-                    ));
-                }
-            }
-            crate::types::InvertedKind::Fts { .. } => {
-                if !matches!(
-                    col_type,
-                    crate::types::DataType::Text | crate::types::DataType::TsVector
-                ) {
-                    return Err(SqlError::Unsupported(format!(
-                        "FTS index requires a TEXT or TSVECTOR column, got {col_type}"
-                    )));
-                }
-            }
-            crate::types::InvertedKind::Ann { .. } => {
-                if !matches!(col_type, crate::types::DataType::Vector { .. }) {
-                    return Err(SqlError::Unsupported(format!(
-                        "ANN index requires a VECTOR column, got {col_type}"
-                    )));
-                }
-            }
-        }
-        if idx_def.unique {
-            return Err(SqlError::Unsupported(
-                "UNIQUE not supported on inverted indexes".into(),
-            ));
-        }
-    }
-
-    for row in &rows {
-        let pk_values: Vec<Value> = pk_indices.iter().map(|&i| row[i].clone()).collect();
-        if let crate::types::IndexKind::Inverted(inv_kind) = idx_def.kind {
-            let value = &row[idx_def.column_positions_iter().next().unwrap() as usize];
-            if !value.is_null() {
-                let entries = super::helpers::extract_inverted_entries_with_values_and_cancel(
-                    value,
-                    inv_kind,
-                    wtx.cancel_token(),
-                )?;
-                let pk_encoded = crate::encoding::encode_composite_key(&pk_values);
-                for (entry, val_bytes) in entries {
-                    let full_key = super::helpers::build_inverted_key(&entry, &pk_encoded);
-                    wtx.table_insert(&idx_table, &full_key, &val_bytes)
-                        .map_err(SqlError::Storage)?;
-                }
-            }
-            continue;
-        }
-        let key = encode_index_key_with_schema_and_cancel(
-            &idx_def,
-            row,
-            &pk_values,
-            table_schema,
-            cancel,
-        )?;
-        let value = encode_index_value(&idx_def, row, &pk_values);
-        let is_new = wtx
-            .table_insert(&idx_table, &key, &value)
-            .map_err(SqlError::Storage)?;
-        if idx_def.unique && !is_new {
-            let indexed_values: Vec<Value> = idx_def
-                .column_positions_iter()
-                .map(|col_idx| row[col_idx as usize].clone())
-                .collect();
-            let any_null = indexed_values.iter().any(|v| v.is_null());
-            if !any_null {
-                return Err(SqlError::UniqueViolation(stmt.index_name.clone()));
-            }
-        }
-    }
-
-    let mut updated_schema = table_schema.clone();
-    updated_schema.indices.push(idx_def);
-    SchemaManager::save_schema(&mut wtx, &updated_schema)?;
+    table_schema.indices.push(idx_def);
+    SchemaManager::save_schema(&mut wtx, &table_schema)?;
     super::commit_with_ann_publication(wtx, schema)?;
 
-    schema.register(updated_schema);
+    schema.register(table_schema);
     Ok(ExecutionResult::Ok)
 }
 
@@ -1029,72 +918,37 @@ pub(super) fn exec_create_index_in_txn(
     let cancel = cancel.as_ref();
     let lower_table = stmt.table_name.to_ascii_lowercase();
     let lower_idx = stmt.index_name.to_ascii_lowercase();
-
-    let table_schema = schema
+    let storage_table = schema
         .get(&lower_table)
-        .ok_or_else(|| SqlError::TableNotFound(stmt.table_name.clone()))?;
+        .map(|table| table.name.clone())
+        .unwrap_or_else(|| schema.resolve_temp(&lower_table));
+    let mut table_schema =
+        SchemaManager::load_table(&storage_table, |table, key| wtx.table_get(table, key))?
+            .ok_or_else(|| SqlError::TableNotFound(stmt.table_name.clone()))?;
 
     if table_schema.index_by_name(&lower_idx).is_some() {
         if stmt.if_not_exists {
+            schema.register(table_schema);
             return Ok(ExecutionResult::Ok);
         }
         return Err(SqlError::IndexAlreadyExists(stmt.index_name.clone()));
     }
 
-    let idx_def = build_index_def_for_create(stmt, table_schema, lower_idx.clone())?;
-
-    let idx_table = TableSchema::index_table_name(&lower_table, &lower_idx);
+    let idx_def = build_index_def_for_create(stmt, &table_schema, lower_idx.clone())?;
+    let plan = IndexBuildPlan::new(&table_schema, &idx_def, cancel)?;
+    let idx_table = TableSchema::index_table_name(&table_schema.name, &lower_idx);
 
     SchemaManager::ensure_schema_table(wtx)?;
     wtx.create_table(&idx_table).map_err(SqlError::Storage)?;
 
-    let pk_indices = table_schema.pk_indices();
-    let mut rows: Vec<Vec<Value>> = Vec::new();
-    {
-        let mut scan_err: Option<SqlError> = None;
-        wtx.table_for_each(lower_table.as_bytes(), |key, value| {
-            match decode_full_row_with_cancel(table_schema, key, value, cancel) {
-                Ok(row) => rows.push(row),
-                Err(e) => scan_err = Some(e),
-            }
-            Ok(())
-        })
-        .map_err(SqlError::Storage)?;
-        if let Some(e) = scan_err {
-            return Err(e);
-        }
-    }
+    let entries =
+        plan.collect(|visit| wtx.table_scan_from(table_schema.name.as_bytes(), b"", visit))?;
+    plan.insert(wtx, &idx_table, entries)?;
 
-    for row in &rows {
-        let pk_values: Vec<Value> = pk_indices.iter().map(|&i| row[i].clone()).collect();
-        let key = encode_index_key_with_schema_and_cancel(
-            &idx_def,
-            row,
-            &pk_values,
-            table_schema,
-            cancel,
-        )?;
-        let value = encode_index_value(&idx_def, row, &pk_values);
-        let is_new = wtx
-            .table_insert(&idx_table, &key, &value)
-            .map_err(SqlError::Storage)?;
-        if idx_def.unique && !is_new {
-            let indexed_values: Vec<Value> = idx_def
-                .column_positions_iter()
-                .map(|col_idx| row[col_idx as usize].clone())
-                .collect();
-            let any_null = indexed_values.iter().any(|v| v.is_null());
-            if !any_null {
-                return Err(SqlError::UniqueViolation(stmt.index_name.clone()));
-            }
-        }
-    }
+    table_schema.indices.push(idx_def);
+    SchemaManager::save_schema(wtx, &table_schema)?;
 
-    let mut updated_schema = table_schema.clone();
-    updated_schema.indices.push(idx_def);
-    SchemaManager::save_schema(wtx, &updated_schema)?;
-
-    schema.register(updated_schema);
+    schema.register(table_schema);
     Ok(ExecutionResult::Ok)
 }
 

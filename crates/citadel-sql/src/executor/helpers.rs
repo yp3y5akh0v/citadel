@@ -643,24 +643,7 @@ impl<'a> SelectRowDecoder<'a> {
             Some(ctx) => ctx.reset_cols.clone(),
             None => (0..self.schema.columns.len()).collect(),
         };
-        let mut remaining = PartialDecodeCtx::new(self.schema, &needed);
-        let known = |column: &usize| decoded.reset_cols.binary_search(column).is_ok();
-        remaining.pk_positions.retain(|(_, column)| !known(column));
-        let mut position = 0;
-        remaining.nonpk_targets.retain(|_| {
-            let keep = !known(&remaining.nonpk_schema[position]);
-            position += 1;
-            keep
-        });
-        remaining.nonpk_schema.retain(|column| !known(column));
-        remaining
-            .nonpk_defaults
-            .retain(|(_, column, _)| !known(column));
-        remaining
-            .virtuals_to_eval
-            .retain(|(column, ..)| !known(column));
-        remaining.reset_cols.retain(|column| !known(column));
-        remaining
+        PartialDecodeCtx::new(self.schema, &needed).remaining_after(decoded)
     }
 }
 
@@ -683,6 +666,22 @@ pub(super) struct PartialDecodeCtx {
 }
 
 impl PartialDecodeCtx {
+    pub(super) fn remaining_after(mut self, decoded: &Self) -> Self {
+        let known = |column: &usize| decoded.reset_cols.binary_search(column).is_ok();
+        self.pk_positions.retain(|(_, column)| !known(column));
+        let mut position = 0;
+        self.nonpk_targets.retain(|_| {
+            let keep = !known(&self.nonpk_schema[position]);
+            position += 1;
+            keep
+        });
+        self.nonpk_schema.retain(|column| !known(column));
+        self.nonpk_defaults.retain(|(_, column, _)| !known(column));
+        self.virtuals_to_eval.retain(|(column, ..)| !known(column));
+        self.reset_cols.retain(|column| !known(column));
+        self
+    }
+
     pub(super) fn new_with_cancel(
         schema: &TableSchema,
         needed: &[usize],
