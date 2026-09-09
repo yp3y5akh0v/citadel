@@ -530,6 +530,138 @@ fn eval_context_timezone_reaches_jsonpath() {
 }
 
 #[test]
+fn eval_context_preserves_auto_traits() {
+    fn assert_traits<T: Send + Sync + std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
+    assert_traits::<EvalCtx<'static>>();
+}
+
+#[test]
+fn eval_excluded_resolver_skips_unread_branches_and_ordinary_columns() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let columns = test_columns();
+    let column_map = ColumnMap::new(&columns);
+    let row = test_row();
+    let excluded = vec![Value::Null; columns.len()];
+    let calls = AtomicUsize::new(0);
+    let resolver = |_: usize| -> Result<Value> {
+        calls.fetch_add(1, Ordering::Relaxed);
+        Err(SqlError::IntegerOverflow)
+    };
+    let context = EvalCtx::with_excluded(&column_map, &row, &column_map, &excluded)
+        .with_excluded_resolver(&resolver);
+
+    for (sql, expected) in [
+        ("CASE WHEN TRUE THEN 42 ELSE excluded.id END", 42),
+        ("CASE WHEN FALSE THEN excluded.id ELSE 42 END", 42),
+        ("CASE id WHEN 1 THEN 42 ELSE excluded.id END", 42),
+        ("COALESCE(42, excluded.id)", 42),
+        ("COALESCE(NULL, 42, excluded.id)", 42),
+        ("id", 1),
+        ("t.id", 1),
+    ] {
+        let expression = crate::parser::parse_sql_expr(sql).unwrap();
+        assert_eq!(
+            eval_expr(&expression, &context).unwrap(),
+            Value::Integer(expected),
+            "{sql}",
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 0, "{sql}");
+    }
+}
+
+#[test]
+fn eval_excluded_resolver_receives_resolved_index_and_supplies_value() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let column_map = ColumnMap::new(&[col("id", DataType::Integer, false, 0)]);
+    let excluded_map = ColumnMap::new(&[
+        col("other", DataType::Integer, false, 0),
+        col("id", DataType::Integer, false, 1),
+    ]);
+    let row = [Value::Integer(1)];
+    let excluded = [Value::Integer(999), Value::Integer(888)];
+    let calls = AtomicUsize::new(0);
+    let resolver = |index: usize| -> Result<Value> {
+        assert_eq!(index, 1);
+        calls.fetch_add(1, Ordering::Relaxed);
+        Ok(Value::Integer(42))
+    };
+    let context = EvalCtx::with_excluded(&column_map, &row, &excluded_map, &excluded)
+        .with_excluded_resolver(&resolver);
+
+    for (index, sql) in [
+        "ExClUdEd.ID",
+        "CASE WHEN TRUE THEN excluded.id ELSE 0 END",
+        "COALESCE(NULL, excluded.id)",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let expression = crate::parser::parse_sql_expr(sql).unwrap();
+        assert_eq!(
+            eval_expr(&expression, &context).unwrap(),
+            Value::Integer(42),
+            "{sql}",
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), index + 1, "{sql}");
+    }
+}
+
+#[test]
+fn eval_excluded_resolver_propagates_errors_after_column_resolution() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let column_map = ColumnMap::new(&[col("id", DataType::Integer, false, 0)]);
+    let row = [Value::Integer(1)];
+    let excluded = [Value::Integer(2)];
+    let calls = AtomicUsize::new(0);
+    let resolver = |_: usize| -> Result<Value> {
+        calls.fetch_add(1, Ordering::Relaxed);
+        Err(SqlError::IntegerOverflow)
+    };
+    let context = EvalCtx::with_excluded(&column_map, &row, &column_map, &excluded)
+        .with_excluded_resolver(&resolver);
+
+    let unknown = crate::parser::parse_sql_expr("excluded.missing").unwrap();
+    assert!(matches!(
+        eval_expr(&unknown, &context),
+        Err(SqlError::ColumnNotFound(name)) if name == "missing"
+    ));
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+
+    let actual = crate::parser::parse_sql_expr("excluded.id").unwrap();
+    assert!(matches!(
+        eval_expr(&actual, &context),
+        Err(SqlError::IntegerOverflow)
+    ));
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn eval_excluded_without_resolver_clones_the_backing_row() {
+    let column_map = ColumnMap::new(&[col("name", DataType::Text, true, 0)]);
+    let row = [Value::Text("old".into())];
+    let excluded = [Value::Text(
+        "proposed value retained by the backing row".into(),
+    )];
+    let context = EvalCtx::with_excluded(&column_map, &row, &column_map, &excluded);
+    let expression = crate::parser::parse_sql_expr("excluded.name").unwrap();
+    let mut resolved = eval_expr(&expression, &context).unwrap();
+    assert_eq!(resolved, excluded[0]);
+    if let Value::Text(text) = &mut resolved {
+        text.push_str(" changed");
+    } else {
+        panic!("expected a cloned text value");
+    }
+    assert_eq!(
+        excluded[0],
+        Value::Text("proposed value retained by the backing row".into()),
+    );
+    assert_ne!(resolved, excluded[0]);
+}
+
+#[test]
 fn eval_column_ref() {
     let cols = test_columns();
     let cm = ColumnMap::new(&cols);
