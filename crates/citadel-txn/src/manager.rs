@@ -293,7 +293,7 @@ pub struct TxnManager {
     /// When true, freed pages past all readers are zero-filled on commit
     /// (secure delete).
     secure_delete: AtomicBool,
-    /// Reusable encrypt output buffer, capped at COMMIT_ARENA_PAGES pages.
+    /// Reusable encrypt output buffer; each batch uses a prefix.
     commit_arena: Mutex<Vec<u8>>,
 }
 
@@ -347,6 +347,9 @@ impl Drop for WriterExclusion<'_> {
 /// Commit encrypt/write chunk size; bounds arena retention and transient
 /// memory.
 const COMMIT_ARENA_PAGES: usize = 64;
+const PARALLEL_COMMIT_ARENA_PAGES: usize = 256;
+#[cfg(feature = "parallel")]
+const MIN_PARALLEL_COMMIT_PAGES: usize = 128;
 
 enum PendingFreePage<'a> {
     Borrowed(&'a Page),
@@ -1051,14 +1054,27 @@ impl TxnManager {
 
         let hmac_state = &self.hmac_state;
         if !dirty_page_info.is_empty() {
+            // Check the workload before querying Rayon: small commits should
+            // neither initialize its pool nor pay dispatch/join overhead.
+            #[cfg(feature = "parallel")]
+            let parallel = dirty_page_info.len() >= MIN_PARALLEL_COMMIT_PAGES
+                && rayon::current_num_threads() > 1;
+            #[cfg(not(feature = "parallel"))]
+            let parallel = false;
+            let batch_pages = if parallel {
+                PARALLEL_COMMIT_ARENA_PAGES
+            } else {
+                COMMIT_ARENA_PAGES
+            };
             // encrypt_page_with_hmac overwrites every output byte: no
-            // re-zeroing.
+            // re-zeroing. Larger parallel batches amortize dispatch barriers;
+            // serial commits use smaller batches and the caller-thread loop.
             let mut arena = self.commit_arena.lock();
-            let arena_len = COMMIT_ARENA_PAGES.min(dirty_page_info.len()) * PAGE_SIZE;
+            let arena_len = batch_pages.min(dirty_page_info.len()) * PAGE_SIZE;
             if arena.len() < arena_len {
                 arena.resize(arena_len, 0);
             }
-            for chunk in dirty_page_info.chunks(COMMIT_ARENA_PAGES) {
+            for chunk in dirty_page_info.chunks(batch_pages) {
                 let bufs = &mut arena[..chunk.len() * PAGE_SIZE];
                 // The destination is a page-sized array by type, so the length is a
                 // guarantee rather than a runtime check inside the encrypt loop.
@@ -1073,7 +1089,7 @@ impl TxnManager {
                     );
                 };
                 #[cfg(feature = "parallel")]
-                {
+                if parallel {
                     use rayon::prelude::*;
                     // Rayon has no const-generic chunker, so the conversion lives here.
                     bufs.par_chunks_exact_mut(PAGE_SIZE)
@@ -1083,12 +1099,13 @@ impl TxnManager {
                         .zip(chunk.par_iter())
                         .for_each(encrypt_one);
                 }
-                #[cfg(not(feature = "parallel"))]
-                bufs.as_chunks_mut::<PAGE_SIZE>()
-                    .0
-                    .iter_mut()
-                    .zip(chunk.iter())
-                    .for_each(encrypt_one);
+                if !parallel {
+                    bufs.as_chunks_mut::<PAGE_SIZE>()
+                        .0
+                        .iter_mut()
+                        .zip(chunk.iter())
+                        .for_each(encrypt_one);
+                }
 
                 if let [(offset, _)] = chunk {
                     let buf: &[u8; PAGE_SIZE] = (&arena[..PAGE_SIZE]).try_into().unwrap();
