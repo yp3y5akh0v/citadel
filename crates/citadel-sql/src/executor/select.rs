@@ -380,6 +380,12 @@ pub(super) fn exec_select_with_read(
         return super::exec_select_join_with_read(rtx, schema, stmt);
     }
 
+    if let Some(result) = try_plain_projection_scan(stmt, table_schema, cancel, |cb| {
+        rtx.table_scan_raw(lower_name.as_bytes(), cb)
+    }) {
+        return result;
+    }
+
     // One decision, shared with EXPLAIN. The arms below consume what it picked
     // rather than re-deciding, so the two cannot drift apart.
     let strategy = choose_strategy_with_cancel(stmt, table_schema, cancel)?;
@@ -5203,6 +5209,7 @@ enum StreamProj {
     Identity {
         /// Push-build the full row; precomputed eligibility.
         full_push: bool,
+        ctx: Option<PartialDecodeCtx>,
     },
     Columns {
         idxs: Vec<usize>,
@@ -5292,7 +5299,11 @@ fn decode_and_project(
     cancel: Option<&CancelToken>,
 ) -> Result<Vec<Value>> {
     match proj {
-        StreamProj::Identity { full_push } => {
+        StreamProj::Identity { full_push, ctx } => {
+            if let Some(ctx) = ctx {
+                ctx.decode_into_with_cancel(key, value, scratch, cancel)?;
+                return Ok(std::mem::take(scratch));
+            }
             if *full_push {
                 if let Some(row) = decode_full_row_push(schema, key, value)? {
                     return Ok(row);
@@ -5332,6 +5343,14 @@ fn stream_scan_setup(
         QueryBody::Select(s) => s,
         _ => return None,
     };
+    let lower = sel.from.to_ascii_lowercase();
+    let table_schema = schema.get(&lower)?.clone();
+    let proj = plain_scan_projection(sel, &table_schema)?;
+    let columns = projection_column_names(&sel.columns, &table_schema.columns);
+    Some((table_schema.name.clone(), table_schema, proj, columns))
+}
+
+fn plain_scan_projection(sel: &SelectStmt, schema: &TableSchema) -> Option<StreamProj> {
     if sel.where_clause.is_some()
         || !sel.order_by.is_empty()
         || sel.limit.is_some()
@@ -5346,11 +5365,20 @@ fn stream_scan_setup(
     {
         return None;
     }
-    let lower = sel.from.to_ascii_lowercase();
-    let table_schema = schema.get(&lower)?.clone();
-    let proj = build_stream_proj(&sel.columns, &table_schema)?;
-    let columns = projection_column_names(&sel.columns, &table_schema.columns);
-    Some((lower, table_schema, proj, columns))
+    build_stream_proj(&sel.columns, schema)
+}
+
+pub(super) fn try_plain_projection_scan(
+    stmt: &SelectStmt,
+    schema: &TableSchema,
+    cancel: Option<&CancelToken>,
+    scan: impl FnOnce(&mut dyn FnMut(&[u8], &[u8]) -> bool) -> citadel_core::Result<()>,
+) -> Option<Result<ExecutionResult>> {
+    let proj = plain_scan_projection(stmt, schema)?;
+    let columns = projection_column_names(&stmt.columns, &schema.columns);
+    Some(
+        collect_projected_scan(&proj, schema, columns, 0, cancel, scan).map(ExecutionResult::Query),
+    )
 }
 
 /// Materialize a full scan off borrowed page cells (no per-row key/value copy).
@@ -5386,25 +5414,45 @@ fn collect_scan(
         }
     };
 
+    collect_projected_scan(proj, table_schema, columns, row_count, cancel, |cb| {
+        rtx.scan_leaves(&leaves, cb)
+    })
+}
+
+fn collect_projected_scan(
+    proj: &StreamProj,
+    table_schema: &TableSchema,
+    columns: Vec<String>,
+    row_count: usize,
+    cancel: Option<&CancelToken>,
+    scan: impl FnOnce(&mut dyn FnMut(&[u8], &[u8]) -> bool) -> citadel_core::Result<()>,
+) -> Result<QueryResult> {
+    check_cancel(cancel)?;
     let mut rows = Vec::with_capacity(row_count);
     let mut scratch: Vec<Value> = Vec::new();
     let mut err: Option<SqlError> = None;
-    rtx.scan_leaves(&leaves, |key, value| {
-        match decode_and_project(proj, table_schema, key, value, &mut scratch, cancel) {
-            Ok(row) => {
-                rows.push(row);
-                true
-            }
-            Err(e) => {
-                err = Some(e);
-                false
-            }
+    scan(&mut |key, value| match decode_and_project(
+        proj,
+        table_schema,
+        key,
+        value,
+        &mut scratch,
+        cancel,
+    ) {
+        Ok(row) => {
+            rows.push(row);
+            true
+        }
+        Err(e) => {
+            err = Some(e);
+            false
         }
     })
     .map_err(SqlError::Storage)?;
     if let Some(e) = err {
         return Err(e);
     }
+    check_cancel(cancel)?;
     Ok(QueryResult { columns, rows })
 }
 
@@ -5445,6 +5493,9 @@ fn build_stream_proj(select_cols: &[SelectColumn], schema: &TableSchema) -> Opti
         if identity {
             return Some(StreamProj::Identity {
                 full_push: full_row_push_eligible(schema),
+                ctx: schema.has_virtual_columns().then(|| {
+                    PartialDecodeCtx::new(schema, &(0..schema.columns.len()).collect::<Vec<_>>())
+                }),
             });
         }
         let mut needed = idxs.clone();
@@ -5457,7 +5508,7 @@ fn build_stream_proj(select_cols: &[SelectColumn], schema: &TableSchema) -> Opti
         let ctx = proj_decoder
             .is_none()
             .then(|| {
-                (needed.len() < schema.columns.len())
+                (needed.len() < schema.columns.len() || schema.has_virtual_columns())
                     .then(|| PartialDecodeCtx::new(schema, &needed))
             })
             .flatten();
@@ -5475,7 +5526,8 @@ fn build_stream_proj(select_cols: &[SelectColumn], schema: &TableSchema) -> Opti
     }
     needed.sort_unstable();
     needed.dedup();
-    let ctx = (needed.len() < schema.columns.len()).then(|| PartialDecodeCtx::new(schema, &needed));
+    let ctx = (needed.len() < schema.columns.len() || schema.has_virtual_columns())
+        .then(|| PartialDecodeCtx::new(schema, &needed));
     Some(StreamProj::Exprs {
         col_map: ColumnMap::new(&schema.columns),
         exprs,

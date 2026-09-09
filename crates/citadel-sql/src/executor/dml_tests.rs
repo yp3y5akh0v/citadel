@@ -62,6 +62,80 @@ fn integer_template_columns(names: &[&str]) -> Vec<ColumnDef> {
         .collect()
 }
 
+#[test]
+fn selected_row_binding_moves_heap_values_to_target_positions() {
+    let mut columns = integer_template_columns(&["id", "name", "payload"]);
+    columns[1].data_type = DataType::Text;
+    columns[2].data_type = DataType::Blob;
+    let schema = TableSchema::new("t".into(), columns, vec![0], vec![], vec![], vec![]);
+    let text = "selected-row-text".repeat(32);
+    let source_text = Value::Text(text.clone().into());
+    let source_blob = Value::Blob(vec![0xa5; 1_024]);
+    let text_ptr = match &source_text {
+        Value::Text(value) => value.as_ptr(),
+        _ => unreachable!(),
+    };
+    let blob_ptr = match &source_blob {
+        Value::Blob(value) => value.as_ptr(),
+        _ => unreachable!(),
+    };
+    let mut source = vec![source_blob, source_text];
+    let mut row = vec![i(7), Value::Null, Value::Null];
+
+    bind_selected_row(&mut source, &mut row, &[2, 1], &schema).unwrap();
+
+    assert!(source.is_empty());
+    assert_eq!(row[0], i(7));
+    let Value::Text(value) = &row[1] else {
+        panic!("expected text");
+    };
+    assert_eq!(value.as_str(), text);
+    assert_eq!(value.as_ptr(), text_ptr);
+    let Value::Blob(value) = &row[2] else {
+        panic!("expected blob");
+    };
+    assert_eq!(value.as_slice(), &[0xa5; 1_024]);
+    assert_eq!(value.as_ptr(), blob_ptr);
+}
+
+#[test]
+fn selected_row_binding_checks_width_before_moving_values() {
+    let schema = TableSchema::new(
+        "t".into(),
+        integer_template_columns(&["id", "value"]),
+        vec![0],
+        vec![],
+        vec![],
+        vec![],
+    );
+    let mut source = vec![i(1)];
+    let mut row = vec![i(7), i(9)];
+
+    let error = bind_selected_row(&mut source, &mut row, &[1, 0], &schema).unwrap_err();
+
+    assert!(matches!(error, SqlError::InvalidValue(message)
+        if message == "INSERT ... SELECT column count mismatch: expected 2, got 1"));
+    assert_eq!(source, vec![i(1)]);
+    assert_eq!(row, vec![i(7), i(9)]);
+}
+
+#[test]
+fn selected_rows_validate_metadata_independently_of_row_count() {
+    for rows in [vec![], vec![vec![i(1)]]] {
+        let error = insert_select_rows(qr(vec!["id"], rows), 2).unwrap_err();
+        assert!(matches!(error, SqlError::InvalidValue(message)
+            if message == "INSERT ... SELECT column count mismatch: expected 2, got 1"));
+    }
+    assert!(insert_select_rows(qr(vec!["id", "value"], vec![]), 2)
+        .unwrap()
+        .is_empty());
+    let result = qr(vec!["id", "value"], vec![vec![i(1), i(2)]]);
+    let rows_ptr = result.rows.as_ptr();
+    let rows = insert_select_rows(result, 2).unwrap();
+    assert_eq!(rows, vec![vec![i(1), i(2)]]);
+    assert_eq!(rows.as_ptr(), rows_ptr);
+}
+
 fn compile_generated_insert_template(generated: &str, values: &str) -> CompiledInsert {
     let mut columns = integer_template_columns(&["id", "a", "b", "g"]);
     columns[3].generated_expr = Some(crate::parser::parse_sql_expr(generated).unwrap());

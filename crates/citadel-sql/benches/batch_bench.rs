@@ -147,5 +147,98 @@ fn bench_create_index(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, bench, bench_create_index);
+fn bench_insert_select(c: &mut Criterion) {
+    const CREATE_SINK: &str = "CREATE TABLE sink (id INTEGER NOT NULL PRIMARY KEY, val TEXT)";
+    const COPY: &str = "INSERT INTO sink SELECT id, val FROM source";
+
+    let mut g = c.benchmark_group("insert_select_copy");
+    g.sample_size(10);
+    g.warm_up_time(Duration::from_secs(1));
+    g.measurement_time(Duration::from_secs(3));
+
+    for rows in [1_000i64, 10_000] {
+        g.throughput(Throughput::Elements(rows as u64));
+        for (width, wide) in [("short", false), ("1kib", true)] {
+            for (operation, create_sink) in [("create_and_insert", true), ("insert_only", false)] {
+                g.bench_function(
+                    BenchmarkId::new(format!("{operation}_{width}"), rows),
+                    |b| {
+                        let dir = tempfile::tempdir().unwrap();
+                        let db = DatabaseBuilder::new(dir.path().join("insert-select.citadel"))
+                            .passphrase(b"bench-passphrase")
+                            .argon2_profile(Argon2Profile::Iot)
+                            .cache_size(4096)
+                            .sync_mode(SyncMode::Off)
+                            .create()
+                            .unwrap();
+                        let conn = Connection::open(&db).unwrap();
+                        conn.execute(
+                            "CREATE TABLE source (id INTEGER NOT NULL PRIMARY KEY, val TEXT)",
+                        )
+                        .unwrap();
+                        let expected: Vec<Vec<Value>> = (0..rows)
+                            .map(|id| {
+                                let mut value = format!("a_{id}");
+                                if wide {
+                                    value.push_str(&"AbCdEf0123456789".repeat(64));
+                                    value.truncate(1_024);
+                                }
+                                vec![Value::Integer(id), Value::Text(value.into())]
+                            })
+                            .collect();
+                        let insert = conn.prepare("INSERT INTO source VALUES ($1, $2)").unwrap();
+                        conn.execute("BEGIN").unwrap();
+                        for row in &expected {
+                            insert.execute(row).unwrap();
+                        }
+                        conn.execute("COMMIT").unwrap();
+                        assert_eq!(
+                            conn.query("SELECT id, val FROM source ORDER BY id")
+                                .unwrap()
+                                .rows,
+                            expected
+                        );
+                        if !create_sink {
+                            conn.execute(CREATE_SINK).unwrap();
+                        }
+
+                        b.iter_batched(
+                            || {
+                                conn.execute(if create_sink {
+                                    "DROP TABLE IF EXISTS sink"
+                                } else {
+                                    "DELETE FROM sink"
+                                })
+                                .unwrap();
+                            },
+                            |()| {
+                                if create_sink {
+                                    conn.execute(CREATE_SINK).unwrap();
+                                }
+                                conn.execute(COPY).unwrap()
+                            },
+                            BatchSize::PerIteration,
+                        );
+
+                        assert_eq!(
+                            conn.query("SELECT id, val FROM sink ORDER BY id")
+                                .unwrap()
+                                .rows,
+                            expected
+                        );
+                        assert_eq!(
+                            conn.query("SELECT id, val FROM source ORDER BY id")
+                                .unwrap()
+                                .rows,
+                            expected
+                        );
+                    },
+                );
+            }
+        }
+    }
+    g.finish();
+}
+
+criterion_group!(benches, bench, bench_create_index, bench_insert_select);
 criterion_main!(benches);
