@@ -204,7 +204,7 @@ impl BTree {
             return Ok(Some(true));
         }
         let (sep_key, right_id) =
-            split_leaf_with_insert(pages, alloc, txn_id, cow_id, key, val_type, value);
+            split_leaf_with_insert(pages, alloc, txn_id, cow_id, key, val_type, value, true);
         self.root = propagate_split_up(
             pages,
             alloc,
@@ -351,8 +351,9 @@ impl BTree {
                     self.last_insert = Some((cached_path, cow_id));
                     return Ok(true);
                 }
-                let (sep_key, right_id) =
-                    split_leaf_with_insert(pages, alloc, txn_id, cow_id, key, val_type, value);
+                let (sep_key, right_id) = split_leaf_with_insert(
+                    pages, alloc, txn_id, cow_id, key, val_type, value, true,
+                );
                 self.root = propagate_split_up(
                     pages,
                     alloc,
@@ -388,7 +389,7 @@ impl BTree {
         path: Vec<(PageId, usize)>,
         leaf_id: PageId,
     ) -> Result<(bool, Option<PageId>)> {
-        let (existing_idx, replaced_overflow) = {
+        let (existing_idx, replaced_overflow, is_append) = {
             let page = pages.get(&leaf_id).unwrap();
             match leaf_node::search(page, key) {
                 Ok(idx) => {
@@ -398,9 +399,9 @@ impl BTree {
                     } else {
                         None
                     };
-                    (Some(idx), head)
+                    (Some(idx), head, false)
                 }
-                Err(_) => (None, None),
+                Err(idx) => (None, None, idx == page.num_cells()),
             }
         };
         let key_exists = existing_idx.is_some();
@@ -452,8 +453,17 @@ impl BTree {
         }
 
         self.clear_lil_caches();
-        let (sep_key, right_id) =
-            split_leaf_with_insert(pages, alloc, txn_id, new_leaf_id, key, val_type, value);
+        let append_rightmost = is_append && is_rightmost_path(pages, &path);
+        let (sep_key, right_id) = split_leaf_with_insert(
+            pages,
+            alloc,
+            txn_id,
+            new_leaf_id,
+            key,
+            val_type,
+            value,
+            append_rightmost,
+        );
         self.root = propagate_split_up(
             pages,
             alloc,
@@ -513,8 +523,9 @@ impl BTree {
                     self.last_insert = Some((cached_path, cow_id));
                     return Ok(None);
                 }
-                let (sep_key, right_id) =
-                    split_leaf_with_insert(pages, alloc, txn_id, cow_id, key, val_type, value);
+                let (sep_key, right_id) = split_leaf_with_insert(
+                    pages, alloc, txn_id, cow_id, key, val_type, value, true,
+                );
                 self.root = propagate_split_up(
                     pages,
                     alloc,
@@ -534,18 +545,18 @@ impl BTree {
 
         let (path, leaf_id) = self.walk_to_leaf(pages, key)?;
 
-        let existing_value = {
+        let (existing_value, is_append) = {
             let page = pages.get(&leaf_id).unwrap();
             match leaf_node::search(page, key) {
                 Ok(idx) => {
                     let cell = leaf_node::read_cell(page, idx);
                     if matches!(cell.val_type, ValueType::Tombstone) {
-                        None
+                        (None, false)
                     } else {
-                        Some((cell.val_type, cell.value.to_vec()))
+                        (Some((cell.val_type, cell.value.to_vec())), false)
                     }
                 }
-                Err(_) => None,
+                Err(idx) => (None, idx == page.num_cells()),
             }
         };
         if let Some(v) = existing_value {
@@ -590,8 +601,17 @@ impl BTree {
         }
 
         self.clear_lil_caches();
-        let (sep_key, right_id) =
-            split_leaf_with_insert(pages, alloc, txn_id, new_leaf_id, key, val_type, value);
+        let append_rightmost = is_append && is_rightmost_path(pages, &path);
+        let (sep_key, right_id) = split_leaf_with_insert(
+            pages,
+            alloc,
+            txn_id,
+            new_leaf_id,
+            key,
+            val_type,
+            value,
+            append_rightmost,
+        );
         self.root = propagate_split_up(
             pages,
             alloc,
@@ -646,8 +666,9 @@ impl BTree {
                     self.last_insert = Some((cached_path, cow_id));
                     return Ok(true);
                 }
-                let (sep_key, right_id) =
-                    split_leaf_with_insert(pages, alloc, txn_id, cow_id, key, val_type, value);
+                let (sep_key, right_id) = split_leaf_with_insert(
+                    pages, alloc, txn_id, cow_id, key, val_type, value, true,
+                );
                 self.root = propagate_split_up(
                     pages,
                     alloc,
@@ -682,14 +703,14 @@ impl BTree {
         path: Vec<(PageId, usize)>,
         leaf_id: PageId,
     ) -> Result<bool> {
-        let exists = {
+        let (exists, is_append) = {
             let page = pages.get(&leaf_id).unwrap();
             match leaf_node::search(page, key) {
                 Ok(idx) => {
                     let cell = leaf_node::read_cell(page, idx);
-                    !matches!(cell.val_type, ValueType::Tombstone)
+                    (!matches!(cell.val_type, ValueType::Tombstone), false)
                 }
-                Err(_) => false,
+                Err(idx) => (false, idx == page.num_cells()),
             }
         };
         if exists {
@@ -734,8 +755,17 @@ impl BTree {
         }
 
         self.clear_lil_caches();
-        let (sep_key, right_id) =
-            split_leaf_with_insert(pages, alloc, txn_id, new_leaf_id, key, val_type, value);
+        let append_rightmost = is_append && is_rightmost_path(pages, &path);
+        let (sep_key, right_id) = split_leaf_with_insert(
+            pages,
+            alloc,
+            txn_id,
+            new_leaf_id,
+            key,
+            val_type,
+            value,
+            append_rightmost,
+        );
         self.root = propagate_split_up(
             pages,
             alloc,
@@ -860,7 +890,7 @@ impl BTree {
                     // replace_at already removed the old cell, so the
                     // split-insert restores the key (net-zero entry count).
                     let (sep_key, right_id) = split_leaf_with_insert(
-                        pages, alloc, txn_id, cow_leaf, key, val_type, value,
+                        pages, alloc, txn_id, cow_leaf, key, val_type, value, false,
                     );
                     self.root = propagate_split_up(
                         pages,
@@ -1015,7 +1045,15 @@ pub fn propagate_cow_up(
     new_child
 }
 
+fn is_rightmost_path(pages: &FxHashMap<PageId, Page>, path: &[(PageId, usize)]) -> bool {
+    path.iter()
+        .all(|(id, child_idx)| *child_idx == pages.get(id).unwrap().num_cells() as usize)
+}
+
 /// Split full leaf and insert. Returns (separator_key, right_page_id).
+/// `append_rightmost` requires a new key beyond the tree's maximum, checked
+/// before attempting the leaf write: failed replacements can remove that key.
+#[allow(clippy::too_many_arguments)]
 fn split_leaf_with_insert(
     pages: &mut FxHashMap<PageId, Page>,
     alloc: &mut PageAllocator,
@@ -1024,7 +1062,22 @@ fn split_leaf_with_insert(
     key: &[u8],
     val_type: ValueType,
     value: &[u8],
+    append_rightmost: bool,
 ) -> (Vec<u8>, PageId) {
+    let new_raw = leaf_node::build_cell(key, val_type, value);
+    if append_rightmost && new_raw.len() + 2 <= citadel_core::constants::USABLE_SIZE {
+        // Sequential appends will fill this new right edge. Keep the completed
+        // left leaf intact instead of copying half its cells into the new page
+        // and leaving every historical leaf half full.
+        let right_id = alloc.allocate();
+        let mut right_page = Page::new(right_id, PageType::Leaf, txn_id);
+        right_page
+            .write_cell(&new_raw)
+            .expect("append cell fits a fresh leaf");
+        pages.insert(right_id, right_page);
+        return (key.to_vec(), right_id);
+    }
+
     let mut cells: Vec<(Vec<u8>, Vec<u8>)> = {
         let page = pages.get(&leaf_id).unwrap();
         let n = page.num_cells() as usize;
@@ -1037,7 +1090,6 @@ fn split_leaf_with_insert(
             .collect()
     };
 
-    let new_raw = leaf_node::build_cell(key, val_type, value);
     match cells.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
         Ok(idx) => cells[idx] = (key.to_vec(), new_raw),
         Err(idx) => cells.insert(idx, (key.to_vec(), new_raw)),

@@ -600,7 +600,9 @@ fn cached_batch_callback_can_reenter_manager_and_preserve_its_snapshot() {
         );
         return;
     }
-    let (manager, io, expected) = seeded(192);
+    // Each 13-row group has twelve 1,000-byte inline values, requiring more
+    // than one 8 KiB leaf even when sequential inserts pack leaves densely.
+    let (manager, io, expected) = seeded((13 * SCAN_CACHE_BATCH_SIZE) as u32);
     let mut reader = manager.begin_read();
     let root = reader.lookup_table(TABLE).unwrap().root_page;
     let leaves = reader.collect_table_leaves(TABLE).unwrap();
