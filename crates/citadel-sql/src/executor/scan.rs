@@ -385,6 +385,100 @@ pub(super) enum RangeCheck {
     ExceedsUpper,
 }
 
+struct SelectScanDecoder<'a> {
+    output: SelectRowDecoder<'a>,
+    predicate: Option<PredicateDecode>,
+    where_clause: Option<&'a Expr>,
+    col_map: &'a ColumnMap,
+}
+
+struct PredicateDecode {
+    input: PartialDecodeCtx,
+    remaining: PartialDecodeCtx,
+}
+
+impl<'a> SelectScanDecoder<'a> {
+    fn new(
+        schema: &'a TableSchema,
+        stmt: &'a SelectStmt,
+        cancel: Option<&citadel::CancelToken>,
+    ) -> Result<Option<Self>> {
+        if !schema.has_virtual_columns() {
+            return Ok(None);
+        }
+        let output = SelectRowDecoder::new(schema, stmt, cancel)?;
+        let predicate = stmt
+            .where_clause
+            .as_ref()
+            .map(|expr| {
+                let input = PartialDecodeCtx::new_with_cancel(
+                    schema,
+                    &referenced_columns(expr, &schema.columns),
+                    cancel,
+                )?;
+                let remaining = output.remaining_after(&input);
+                Ok::<_, SqlError>(PredicateDecode { input, remaining })
+            })
+            .transpose()?;
+        Ok(Some(Self {
+            output,
+            predicate,
+            where_clause: stmt.where_clause.as_ref(),
+            col_map: schema.column_map(),
+        }))
+    }
+
+    fn read(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        filter: Option<&Expr>,
+        cancel: Option<&citadel::CancelToken>,
+    ) -> Result<Option<Vec<Value>>> {
+        if let Some(expr) = filter {
+            let predicate = self
+                .predicate
+                .as_ref()
+                .expect("scan filter has a decode plan");
+            let mut row = predicate.input.decode_with_cancel(key, value, cancel)?;
+            if !is_truthy(&eval_expr(
+                expr,
+                &EvalCtx::new(self.col_map, &row).with_cancel(cancel),
+            )?) {
+                return Ok(None);
+            }
+            predicate
+                .remaining
+                .decode_additional_into_with_cancel(key, value, &mut row, cancel)?;
+            return Ok(Some(row));
+        }
+        self.output.decode(key, value, cancel).map(Some)
+    }
+}
+
+fn read_scan_row(
+    schema: &TableSchema,
+    key: &[u8],
+    value: &[u8],
+    filter: Option<&Expr>,
+    projection: Option<&SelectScanDecoder<'_>>,
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<Option<Vec<Value>>> {
+    if let Some(projection) = projection {
+        return projection.read(key, value, filter, cancel);
+    }
+    let row = decode_full_row_with_cancel(schema, key, value, cancel)?;
+    if let Some(expr) = filter {
+        if !is_truthy(&eval_expr(
+            expr,
+            &EvalCtx::new(schema.column_map(), &row).with_cancel(cancel),
+        )?) {
+            return Ok(None);
+        }
+    }
+    Ok(Some(row))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn scan_step(
     schema: &TableSchema,
@@ -396,40 +490,44 @@ fn scan_step(
     jsonb_pred: Option<&JsonbContainsPredicate>,
     col_map: Option<&ColumnMap>,
     partial_ctx: Option<&PartialDecodeCtx>,
+    projection: Option<&SelectScanDecoder<'_>>,
     cancel: Option<&citadel::CancelToken>,
 ) -> Result<Option<Vec<Value>>> {
+    let decode_output = || match projection {
+        Some(projection) => projection.output.decode(key, value, cancel),
+        None => decode_full_row_with_cancel(schema, key, value, cancel),
+    };
     if let Some(pred) = simple_pred {
         return if pred.matches_raw(key, value)? {
-            Ok(Some(decode_full_row_with_cancel(
-                schema, key, value, cancel,
-            )?))
+            decode_output().map(Some)
         } else {
             Ok(None)
         };
     }
     if let Some(pred) = between_pred {
         return if pred.matches_raw(key, value)? {
-            Ok(Some(decode_full_row_with_cancel(
-                schema, key, value, cancel,
-            )?))
+            decode_output().map(Some)
         } else {
             Ok(None)
         };
     }
     if let Some(pred) = jsonb_pred {
         return if pred.matches_raw(key, value, cancel)? {
-            Ok(Some(decode_full_row_with_cancel(
-                schema, key, value, cancel,
-            )?))
+            decode_output().map(Some)
         } else {
             Ok(None)
         };
+    }
+    if let Some(projection) = projection {
+        return projection.read(key, value, projection.where_clause, cancel);
     }
     match (compiled, col_map, partial_ctx) {
         (Some(pred), Some(map), Some(pctx)) => {
             let partial = pctx.decode_with_cancel(key, value, cancel)?;
             if is_truthy(&pred.eval(&EvalCtx::new(map, &partial).with_cancel(cancel))?) {
-                Ok(Some(pctx.complete(partial, key, value)?))
+                Ok(Some(
+                    pctx.complete_with_cancel(partial, key, value, cancel)?,
+                ))
             } else {
                 Ok(None)
             }
@@ -475,12 +573,43 @@ pub(super) fn collect_rows_with_read_planned(
     limit: Option<usize>,
     plan: ScanPlan,
 ) -> Result<(Vec<Vec<Value>>, bool)> {
+    collect_rows_with_read_decoded(rtx, table_schema, where_clause, limit, plan, None)
+}
+
+pub(super) fn collect_select_rows_with_read(
+    rtx: &mut ReadTxn<'_>,
+    table_schema: &TableSchema,
+    stmt: &SelectStmt,
+    limit: Option<usize>,
+) -> Result<(Vec<Vec<Value>>, bool)> {
+    let cancel = rtx.cancel_token().cloned();
+    let projection = SelectScanDecoder::new(table_schema, stmt, cancel.as_ref())?;
+    let plan = planner::plan_select_inverted(table_schema, &stmt.where_clause);
+    collect_rows_with_read_decoded(
+        rtx,
+        table_schema,
+        &stmt.where_clause,
+        limit,
+        plan,
+        projection.as_ref(),
+    )
+}
+
+fn collect_rows_with_read_decoded(
+    rtx: &mut ReadTxn<'_>,
+    table_schema: &TableSchema,
+    where_clause: &Option<Expr>,
+    limit: Option<usize>,
+    plan: ScanPlan,
+    projection: Option<&SelectScanDecoder<'_>>,
+) -> Result<(Vec<Vec<Value>>, bool)> {
     let cancel = rtx.cancel_token().cloned();
     let cancel = cancel.as_ref();
     let lower_name = &table_schema.name;
     let columns = &table_schema.columns;
-    let decode =
-        |key: &[u8], value: &[u8]| decode_full_row_with_cancel(table_schema, key, value, cancel);
+    let read_row = |key: &[u8], value: &[u8], filter: Option<&Expr>| {
+        read_scan_row(table_schema, key, value, filter, projection, cancel)
+    };
 
     match plan {
         ScanPlan::SeqScan => {
@@ -550,6 +679,7 @@ pub(super) fn collect_rows_with_read_planned(
                     jsonb_pred.as_ref(),
                     col_map,
                     partial_ctx.as_ref(),
+                    projection,
                     cancel,
                 );
                 match step {
@@ -576,17 +706,8 @@ pub(super) fn collect_rows_with_read_planned(
                 .map_err(SqlError::Storage)?
             {
                 Some(value) => {
-                    let row = decode(&key, &value)?;
-                    if let Some(ref expr) = where_clause {
-                        let col_map = table_schema.column_map();
-                        match eval_expr(expr, &EvalCtx::new(col_map, &row).with_cancel(cancel)) {
-                            Ok(val) if is_truthy(&val) => Ok((vec![row], true)),
-                            Ok(_) => Ok((vec![], true)),
-                            Err(e) => Err(e),
-                        }
-                    } else {
-                        Ok((vec![row], false))
-                    }
+                    let row = read_row(&key, &value, where_clause.as_ref())?;
+                    Ok((row.into_iter().collect(), where_clause.is_some()))
                 }
                 None => Ok((vec![], true)),
             }
@@ -595,18 +716,8 @@ pub(super) fn collect_rows_with_read_planned(
         ScanPlan::PkPrefixScan { prefix, .. } => {
             let mut rows = Vec::new();
             let mut scan_err = None;
-            let col_map = table_schema.column_map();
             rtx.table_scan_prefix(lower_name.as_bytes(), &prefix, |key, value| {
-                let row = decode(key, value).and_then(|row| {
-                    let keep = match &where_clause {
-                        Some(expr) => is_truthy(&eval_expr(
-                            expr,
-                            &EvalCtx::new(col_map, &row).with_cancel(cancel),
-                        )?),
-                        None => true,
-                    };
-                    Ok(keep.then_some(row))
-                });
+                let row = read_row(key, value, where_clause.as_ref());
                 match row {
                     Ok(Some(row)) => rows.push(row),
                     Ok(None) => {}
@@ -629,7 +740,6 @@ pub(super) fn collect_rows_with_read_planned(
         } => {
             let mut rows = Vec::new();
             let mut scan_err: Option<SqlError> = None;
-            let col_map = table_schema.column_map();
             rtx.table_scan_from(lower_name.as_bytes(), start_key, |key, value| {
                 let pk_vals = match decode_composite_key(key, num_pk_cols) {
                     Ok(v) => v,
@@ -643,27 +753,9 @@ pub(super) fn collect_rows_with_read_planned(
                     1 => return Ok(true),
                     _ => {}
                 }
-                match decode(key, value) {
-                    Ok(row) => {
-                        let keep = match &where_clause {
-                            Some(expr) => {
-                                match eval_expr(
-                                    expr,
-                                    &EvalCtx::new(col_map, &row).with_cancel(cancel),
-                                ) {
-                                    Ok(value) => is_truthy(&value),
-                                    Err(e) => {
-                                        scan_err = Some(e);
-                                        return Ok(false);
-                                    }
-                                }
-                            }
-                            None => true,
-                        };
-                        if keep {
-                            rows.push(row);
-                        }
-                    }
+                match read_row(key, value, where_clause.as_ref()) {
+                    Ok(Some(row)) => rows.push(row),
+                    Ok(None) => {}
                     Err(e) => {
                         scan_err = Some(e);
                         return Ok(false);
@@ -728,20 +820,12 @@ pub(super) fn collect_rows_with_read_planned(
             }
 
             let mut rows = Vec::new();
-            let col_map = table_schema.column_map();
             for pk_key in &pk_keys {
                 if let Some(value) = rtx
                     .table_get(lower_name.as_bytes(), pk_key)
                     .map_err(SqlError::Storage)?
                 {
-                    let row = decode(pk_key, &value)?;
-                    if let Some(ref expr) = where_clause {
-                        match eval_expr(expr, &EvalCtx::new(col_map, &row).with_cancel(cancel)) {
-                            Ok(val) if is_truthy(&val) => rows.push(row),
-                            Ok(_) => {}
-                            Err(e) => return Err(e),
-                        }
-                    } else {
+                    if let Some(row) = read_row(pk_key, &value, where_clause.as_ref())? {
                         rows.push(row);
                     }
                 }
@@ -758,24 +842,15 @@ pub(super) fn collect_rows_with_read_planned(
         } => {
             let candidate_pks = inverted_intersect_candidates(rtx, &idx_table, &probe_entries)?;
             let mut rows = Vec::new();
-            let col_map = table_schema.column_map();
             for pk_key in &candidate_pks {
                 if let Some(value) = rtx
                     .table_get(lower_name.as_bytes(), pk_key)
                     .map_err(SqlError::Storage)?
                 {
-                    let row = decode(pk_key, &value)?;
-                    if !recheck_needed {
+                    if let Some(row) =
+                        read_row(pk_key, &value, recheck_needed.then_some(&recheck_expr))?
+                    {
                         rows.push(row);
-                        continue;
-                    }
-                    match eval_expr(
-                        &recheck_expr,
-                        &EvalCtx::new(col_map, &row).with_cancel(cancel),
-                    ) {
-                        Ok(val) if is_truthy(&val) => rows.push(row),
-                        Ok(_) => {}
-                        Err(e) => return Err(e),
                     }
                 }
             }
@@ -876,6 +951,33 @@ pub(super) fn collect_rows_write(
     where_clause: &Option<Expr>,
     limit: Option<usize>,
 ) -> Result<(Vec<Vec<Value>>, bool)> {
+    collect_rows_write_decoded(wtx, table_schema, where_clause, limit, None)
+}
+
+pub(super) fn collect_select_rows_write(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    table_schema: &TableSchema,
+    stmt: &SelectStmt,
+    limit: Option<usize>,
+) -> Result<(Vec<Vec<Value>>, bool)> {
+    let cancel = wtx.cancel_token().cloned();
+    let projection = SelectScanDecoder::new(table_schema, stmt, cancel.as_ref())?;
+    collect_rows_write_decoded(
+        wtx,
+        table_schema,
+        &stmt.where_clause,
+        limit,
+        projection.as_ref(),
+    )
+}
+
+fn collect_rows_write_decoded(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    table_schema: &TableSchema,
+    where_clause: &Option<Expr>,
+    limit: Option<usize>,
+    projection: Option<&SelectScanDecoder<'_>>,
+) -> Result<(Vec<Vec<Value>>, bool)> {
     let cancel = wtx.cancel_token().cloned();
     let cancel = cancel.as_ref();
     let plan = planner::plan_select(table_schema, where_clause);
@@ -883,9 +985,42 @@ pub(super) fn collect_rows_write(
     let columns = &table_schema.columns;
     let decode =
         |key: &[u8], value: &[u8]| decode_full_row_with_cancel(table_schema, key, value, cancel);
+    let read_row = |key: &[u8], value: &[u8], filter: Option<&Expr>| {
+        read_scan_row(table_schema, key, value, filter, projection, cancel)
+    };
 
     match plan {
         ScanPlan::SeqScan => {
+            if let Some(projection) = projection {
+                let fast_pred = where_clause
+                    .as_ref()
+                    .and_then(|expr| FastPredicate::try_new(expr, table_schema));
+                let mut rows = Vec::new();
+                let mut scan_err = None;
+                wtx.table_scan_from(lower_name.as_bytes(), b"", |key, value| {
+                    let result = match &fast_pred {
+                        Some(pred) => pred.matches_raw(key, value).and_then(|matched| {
+                            if matched {
+                                projection.read(key, value, None, cancel)
+                            } else {
+                                Ok(None)
+                            }
+                        }),
+                        None => projection.read(key, value, where_clause.as_ref(), cancel),
+                    };
+                    match result {
+                        Ok(Some(row)) => rows.push(row),
+                        Ok(None) => {}
+                        Err(error) => scan_err = Some(error),
+                    }
+                    Ok(scan_err.is_none() && limit.is_none_or(|n| rows.len() < n))
+                })
+                .map_err(SqlError::Storage)?;
+                if let Some(error) = scan_err {
+                    return Err(error);
+                }
+                return Ok((rows, where_clause.is_some()));
+            }
             let simple_pred = where_clause
                 .as_ref()
                 .and_then(|expr| try_simple_predicate(expr, table_schema));
@@ -938,10 +1073,12 @@ pub(super) fn collect_rows_write(
                             expr,
                             &EvalCtx::new(col_map, &partial).with_cancel(cancel),
                         ) {
-                            Ok(val) if is_truthy(&val) => match ctx.complete(partial, key, value) {
-                                Ok(row) => rows.push(row),
-                                Err(e) => scan_err = Some(e),
-                            },
+                            Ok(val) if is_truthy(&val) => {
+                                match ctx.complete_with_cancel(partial, key, value, cancel) {
+                                    Ok(row) => rows.push(row),
+                                    Err(e) => scan_err = Some(e),
+                                }
+                            }
                             Err(e) => scan_err = Some(e),
                             _ => {}
                         },
@@ -980,17 +1117,8 @@ pub(super) fn collect_rows_write(
                 .map_err(SqlError::Storage)?
             {
                 Some(value) => {
-                    let row = decode(&key, &value)?;
-                    if let Some(ref expr) = where_clause {
-                        let col_map = table_schema.column_map();
-                        match eval_expr(expr, &EvalCtx::new(col_map, &row).with_cancel(cancel)) {
-                            Ok(val) if is_truthy(&val) => Ok((vec![row], true)),
-                            Ok(_) => Ok((vec![], true)),
-                            Err(e) => Err(e),
-                        }
-                    } else {
-                        Ok((vec![row], false))
-                    }
+                    let row = read_row(&key, &value, where_clause.as_ref())?;
+                    Ok((row.into_iter().collect(), where_clause.is_some()))
                 }
                 None => Ok((vec![], true)),
             }
@@ -999,18 +1127,8 @@ pub(super) fn collect_rows_write(
         ScanPlan::PkPrefixScan { prefix, .. } => {
             let mut rows = Vec::new();
             let mut scan_err = None;
-            let col_map = table_schema.column_map();
             wtx.table_scan_prefix(lower_name.as_bytes(), &prefix, |key, value| {
-                let row = decode(key, value).and_then(|row| {
-                    let keep = match &where_clause {
-                        Some(expr) => is_truthy(&eval_expr(
-                            expr,
-                            &EvalCtx::new(col_map, &row).with_cancel(cancel),
-                        )?),
-                        None => true,
-                    };
-                    Ok(keep.then_some(row))
-                });
+                let row = read_row(key, value, where_clause.as_ref());
                 match row {
                     Ok(Some(row)) => rows.push(row),
                     Ok(None) => {}
@@ -1033,7 +1151,6 @@ pub(super) fn collect_rows_write(
         } => {
             let mut rows = Vec::new();
             let mut scan_err: Option<SqlError> = None;
-            let col_map = table_schema.column_map();
             wtx.table_scan_from(lower_name.as_bytes(), start_key, |key, value| {
                 let pk_vals = match decode_composite_key(key, num_pk_cols) {
                     Ok(v) => v,
@@ -1047,27 +1164,9 @@ pub(super) fn collect_rows_write(
                     1 => return Ok(true),
                     _ => {}
                 }
-                match decode(key, value) {
-                    Ok(row) => {
-                        let keep = match &where_clause {
-                            Some(expr) => {
-                                match eval_expr(
-                                    expr,
-                                    &EvalCtx::new(col_map, &row).with_cancel(cancel),
-                                ) {
-                                    Ok(value) => is_truthy(&value),
-                                    Err(e) => {
-                                        scan_err = Some(e);
-                                        return Ok(false);
-                                    }
-                                }
-                            }
-                            None => true,
-                        };
-                        if keep {
-                            rows.push(row);
-                        }
-                    }
+                match read_row(key, value, where_clause.as_ref()) {
+                    Ok(Some(row)) => rows.push(row),
+                    Ok(None) => {}
                     Err(e) => {
                         scan_err = Some(e);
                         return Ok(false);
@@ -1132,20 +1231,12 @@ pub(super) fn collect_rows_write(
             }
 
             let mut rows = Vec::new();
-            let col_map = table_schema.column_map();
             for pk_key in &pk_keys {
                 if let Some(value) = wtx
                     .table_get(lower_name.as_bytes(), pk_key)
                     .map_err(SqlError::Storage)?
                 {
-                    let row = decode(pk_key, &value)?;
-                    if let Some(ref expr) = where_clause {
-                        match eval_expr(expr, &EvalCtx::new(col_map, &row).with_cancel(cancel)) {
-                            Ok(val) if is_truthy(&val) => rows.push(row),
-                            Ok(_) => {}
-                            Err(e) => return Err(e),
-                        }
-                    } else {
+                    if let Some(row) = read_row(pk_key, &value, where_clause.as_ref())? {
                         rows.push(row);
                     }
                 }

@@ -429,7 +429,7 @@ pub(super) fn exec_select_with_read(
     }
 
     let (rows, predicate_applied) =
-        collect_rows_with_read(rtx, table_schema, &stmt.where_clause, scan_limit)?;
+        collect_select_rows_with_read(rtx, table_schema, stmt, scan_limit)?;
     process_select(
         rows,
         SelectCtx::new(&table_schema.columns, stmt, cancel).predicate_applied(predicate_applied),

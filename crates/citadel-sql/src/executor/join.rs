@@ -1176,7 +1176,7 @@ pub(super) fn collect_rows_partial(
 ) -> Result<Vec<Vec<Value>>> {
     let cancel = rtx.cancel_token().cloned();
     let cancel = cancel.as_ref();
-    if needed.is_empty() || needed.len() == table_schema.columns.len() {
+    if needed.len() == table_schema.columns.len() {
         return collect_all_rows_raw(rtx, table_schema);
     }
     let ctx = PartialDecodeCtx::new_with_cancel(table_schema, needed, cancel)?;
@@ -1223,7 +1223,7 @@ pub(super) fn collect_rows_partial_write(
 ) -> Result<Vec<Vec<Value>>> {
     let cancel = wtx.cancel_token().cloned();
     let cancel = cancel.as_ref();
-    if needed.is_empty() || needed.len() == table_schema.columns.len() {
+    if needed.len() == table_schema.columns.len() {
         return collect_all_rows_write(wtx, table_schema);
     }
     let ctx = PartialDecodeCtx::new_with_cancel(table_schema, needed, cancel)?;

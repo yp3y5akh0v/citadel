@@ -28,8 +28,8 @@ use crate::types::*;
 use super::aggregate::is_aggregate_expr;
 use super::ann_persist;
 use super::helpers::{
-    check_cancel, check_cancel_at, decode_full_row_with_cancel, eval_const_expr, eval_row_count,
-    project_rows, project_rows_with_cancel, sort_vec_by,
+    check_cancel, check_cancel_at, eval_const_expr, eval_row_count, project_rows,
+    project_rows_with_cancel, sort_vec_by, SelectRowDecoder,
 };
 use super::window::has_any_window_function;
 
@@ -470,6 +470,7 @@ impl AnnTopKPlan {
         let cancel = txn.ann_cancel_token();
         let cancel = cancel.as_ref();
         check_cancel(cancel)?;
+        let decoder = SelectRowDecoder::new(table_schema, stmt, cancel)?;
         // A filter value absent from the dict matches no indexed row, but a fresh
         // tail row still might, so skip only the index search (not the tail).
         let mut constraints: Vec<(usize, Vec<u32>)> = Vec::with_capacity(self.pushable.len());
@@ -490,7 +491,6 @@ impl AnnTopKPlan {
             constraints.push((*dim, codes));
         }
 
-        let want = self.k.saturating_add(self.offset).max(1);
         let mut merged: Vec<RankedRow> = if index_unsat {
             Vec::new()
         } else {
@@ -499,10 +499,17 @@ impl AnnTopKPlan {
             } else {
                 Filter::new(constraints)
             };
-            self.collect_survivors(txn, &cached.index, &filter, table_schema, want, cancel)?
+            self.collect_survivors(txn, &cached.index, &filter, table_schema, &decoder, cancel)?
         };
 
-        match self.collect_tail(txn, &cached.index, table_schema, allow_rebuild, cancel)? {
+        match self.collect_tail(
+            txn,
+            &cached.index,
+            table_schema,
+            &decoder,
+            allow_rebuild,
+            cancel,
+        )? {
             Some(tail) if cancel.is_none() => merged.extend(tail),
             Some(tail) => {
                 merged.reserve(tail.len());
@@ -546,10 +553,11 @@ impl AnnTopKPlan {
         index: &AnnIndex,
         filter: &Filter,
         table_schema: &TableSchema,
-        want: usize,
+        decoder: &SelectRowDecoder<'_>,
         cancel: Option<&CancelToken>,
     ) -> Result<Vec<RankedRow>> {
         let col_map = ColumnMap::new(&table_schema.columns);
+        let want = self.k.saturating_add(self.offset).max(1);
         let max_target = index.indexed_len().max(1);
         let mut key_buf: Vec<u8> = Vec::with_capacity(10);
         let mut target = want;
@@ -567,7 +575,7 @@ impl AnnTopKPlan {
                 let Some(row_bytes) = txn.ann_get(table_schema.name.as_bytes(), &key_buf)? else {
                     continue;
                 };
-                let row = decode_full_row_with_cancel(table_schema, &key_buf, &row_bytes, cancel)?;
+                let row = decoder.decode(&key_buf, &row_bytes, cancel)?;
                 let keep = match &self.residual {
                     None => true,
                     Some(expr) => {
@@ -596,6 +604,7 @@ impl AnnTopKPlan {
         txn: &mut dyn AnnScan,
         index: &AnnIndex,
         table_schema: &TableSchema,
+        decoder: &SelectRowDecoder<'_>,
         allow_rebuild: bool,
         cancel: Option<&CancelToken>,
     ) -> Result<Option<Vec<RankedRow>>> {
@@ -624,7 +633,7 @@ impl AnnTopKPlan {
                     over_threshold = true;
                     return Ok(false);
                 }
-                let row = decode_full_row_with_cancel(table_schema, key, value, cancel)?;
+                let row = decoder.decode(key, value, cancel)?;
                 if !self.tail_passes_pushable(&row, table_schema) {
                     return Ok(true);
                 }
@@ -1284,6 +1293,7 @@ impl VectorTopKPlan {
         check_cancel(cancel)?;
         let want = self.k.saturating_add(self.offset);
         let col_map = ColumnMap::new(&table_schema.columns);
+        let decoder = SelectRowDecoder::new(table_schema, stmt, cancel)?;
         // NULL distances sort like NULLs under the requested ordering.
         let null_dist = if self.nulls_first {
             f64::NEG_INFINITY
@@ -1294,7 +1304,7 @@ impl VectorTopKPlan {
         let mut seq: u64 = 0;
 
         txn.ann_scan(table_schema.name.as_bytes(), &mut |key, value| {
-            let row = decode_full_row_with_cancel(table_schema, key, value, cancel)?;
+            let row = decoder.decode(key, value, cancel)?;
             let ctx = EvalCtx::new(&col_map, &row).with_cancel(cancel);
             if let Some(w) = &self.where_clause {
                 if !is_truthy(&eval_expr(w, &ctx)?) {

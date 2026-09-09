@@ -34,6 +34,38 @@ fn assert_generated_overflow(error: SqlError) {
     assert!(matches!(error, SqlError::IntegerOverflow), "got: {error:?}");
 }
 
+fn query_generated(
+    conn: &Connection<'_>,
+    sql: &str,
+    prepared: bool,
+) -> Result<QueryResult, SqlError> {
+    if prepared {
+        conn.prepare(sql)?.query_collect(&[])
+    } else {
+        conn.query(sql)
+    }
+}
+
+fn generated_query_rows(conn: &Connection<'_>, sql: &str, prepared: bool) -> Vec<Vec<Value>> {
+    query_generated(conn, sql, prepared)
+        .unwrap_or_else(|error| panic!("prepared={prepared}: {sql}: {error:?}"))
+        .rows
+}
+
+fn for_each_generated_query_mode(conn: &Connection<'_>, mut run: impl FnMut(bool)) {
+    for begin in [None, Some("BEGIN READ ONLY"), Some("BEGIN")] {
+        if let Some(sql) = begin {
+            conn.execute(sql).unwrap();
+        }
+        for prepared in [false, true] {
+            run(prepared);
+        }
+        if begin.is_some() {
+            conn.execute("ROLLBACK").unwrap();
+        }
+    }
+}
+
 #[test]
 fn stored_checked_insert_autocommit_matches_generic_overflow() {
     for (expression, a, b) in [
@@ -1169,4 +1201,274 @@ fn order_by_virtual_column_with_limit() {
         qr.rows,
         vec![vec![Value::Integer(1)], vec![Value::Integer(3)]]
     );
+}
+
+#[test]
+fn virtual_select_base_columns_do_not_evaluate_unused_virtuals() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER NOT NULL, \
+         g INTEGER GENERATED ALWAYS AS (a * 2) VIRTUAL)",
+    )
+    .unwrap();
+    conn.execute(&format!(
+        "INSERT INTO t (id, a) VALUES (1, 1), (2, {})",
+        i64::MAX
+    ))
+    .unwrap();
+
+    let all = vec![
+        vec![Value::Integer(1), Value::Integer(1)],
+        vec![Value::Integer(2), Value::Integer(i64::MAX)],
+    ];
+    let last = vec![all[1].clone()];
+    for_each_generated_query_mode(&conn, |prepared| {
+        for (sql, expected) in [
+            ("SELECT id, a FROM t ORDER BY id", &all),
+            ("SELECT id, a FROM t WHERE id = 2", &last),
+            ("SELECT id, a FROM t WHERE id >= 2 ORDER BY id", &last),
+            ("SELECT id, a FROM t WHERE a > 1 ORDER BY a", &last),
+            ("SELECT id, a FROM t ORDER BY a DESC LIMIT 1", &last),
+            ("SELECT DISTINCT id, a FROM t ORDER BY id", &all),
+        ] {
+            assert_eq!(
+                generated_query_rows(&conn, sql, prepared),
+                *expected,
+                "prepared={prepared}: {sql}"
+            );
+        }
+    });
+}
+
+#[test]
+fn virtual_select_required_columns_still_report_overflow() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER NOT NULL, \
+         g INTEGER GENERATED ALWAYS AS (a * 2) VIRTUAL)",
+    )
+    .unwrap();
+    conn.execute(&format!(
+        "INSERT INTO t (id, a) VALUES (1, 1), (2, {})",
+        i64::MAX
+    ))
+    .unwrap();
+
+    for_each_generated_query_mode(&conn, |prepared| {
+        for sql in [
+            "SELECT g FROM t WHERE id = 1",
+            "SELECT g FROM t WHERE a = 1 ORDER BY id",
+        ] {
+            assert_eq!(
+                generated_query_rows(&conn, sql, prepared),
+                vec![vec![Value::Integer(2)]],
+                "prepared={prepared}: {sql}"
+            );
+        }
+        for sql in [
+            "SELECT g FROM t WHERE id = 2",
+            "SELECT * FROM t WHERE id = 2",
+            "SELECT g FROM t ORDER BY id",
+            "SELECT id FROM t WHERE g > 0",
+            "SELECT id FROM t ORDER BY g",
+            "SELECT SUM(g) FROM t",
+            "SELECT g, COUNT(*) FROM t GROUP BY g",
+        ] {
+            let error = query_generated(&conn, sql, prepared).unwrap_err();
+            assert!(
+                matches!(error, SqlError::IntegerOverflow),
+                "prepared={prepared}: {sql}: {error:?}"
+            );
+        }
+        assert_eq!(
+            generated_query_rows(&conn, "SELECT g FROM t WHERE id = 1", prepared),
+            vec![vec![Value::Integer(2)]]
+        );
+    });
+}
+
+#[test]
+fn virtual_select_only_evaluates_referenced_virtual_columns() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER NOT NULL, \
+         safe INTEGER GENERATED ALWAYS AS (a / 2) VIRTUAL, \
+         overflowing INTEGER GENERATED ALWAYS AS (a * 2) VIRTUAL)",
+    )
+    .unwrap();
+    conn.execute(&format!(
+        "INSERT INTO t (id, a) VALUES (1, 1), (2, {})",
+        i64::MAX
+    ))
+    .unwrap();
+
+    let max_half = Value::Integer(i64::MAX / 2);
+    for_each_generated_query_mode(&conn, |prepared| {
+        for sql in [
+            "SELECT safe FROM t WHERE id = 2",
+            "SELECT safe FROM t WHERE safe > 0 ORDER BY id",
+            "SELECT safe FROM t ORDER BY safe DESC LIMIT 1",
+            "SELECT safe AS value FROM t ORDER BY value DESC LIMIT 1",
+            "SELECT safe FROM t ORDER BY 1 DESC LIMIT 1",
+            "SELECT MAX(safe) FROM t",
+        ] {
+            assert_eq!(
+                generated_query_rows(&conn, sql, prepared),
+                vec![vec![max_half.clone()]],
+                "prepared={prepared}: {sql}"
+            );
+        }
+        assert_eq!(
+            generated_query_rows(&conn, "SELECT safe FROM t ORDER BY id", prepared),
+            vec![vec![Value::Integer(0)], vec![max_half.clone()]]
+        );
+        assert_eq!(
+            generated_query_rows(
+                &conn,
+                "SELECT safe, COUNT(*) FROM t GROUP BY safe ORDER BY safe",
+                prepared,
+            ),
+            vec![
+                vec![Value::Integer(0), Value::Integer(1)],
+                vec![max_half.clone(), Value::Integer(1)],
+            ]
+        );
+        assert_eq!(
+            generated_query_rows(
+                &conn,
+                "SELECT safe, ROW_NUMBER() OVER (ORDER BY safe) FROM t ORDER BY safe",
+                prepared,
+            ),
+            vec![
+                vec![Value::Integer(0), Value::Integer(1)],
+                vec![max_half.clone(), Value::Integer(2)],
+            ]
+        );
+        assert_generated_overflow(
+            query_generated(&conn, "SELECT overflowing FROM t WHERE id = 2", prepared).unwrap_err(),
+        );
+    });
+}
+
+#[test]
+fn virtual_select_generic_filter_materializes_requested_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER NOT NULL, \
+         g INTEGER GENERATED ALWAYS AS (a * 2) VIRTUAL)",
+    )
+    .unwrap();
+    conn.execute(&format!(
+        "INSERT INTO t (id, a) VALUES (1, 1), (2, {})",
+        i64::MAX
+    ))
+    .unwrap();
+    for_each_generated_query_mode(&conn, |prepared| {
+        for sql in [
+            "SELECT g FROM t WHERE COALESCE(a, 0) = 1",
+            "SELECT g FROM t WHERE COALESCE(a, 0) = 1 ORDER BY id",
+        ] {
+            assert_eq!(
+                generated_query_rows(&conn, sql, prepared),
+                vec![vec![Value::Integer(2)]],
+                "prepared={prepared}: {sql}"
+            );
+        }
+    });
+}
+
+#[test]
+fn virtual_select_constant_join_does_not_materialize_columns() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER NOT NULL, \
+         g INTEGER GENERATED ALWAYS AS (a * 2) VIRTUAL)",
+    )
+    .unwrap();
+    conn.execute("CREATE TABLE tiny (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO tiny VALUES (1), (2)").unwrap();
+    conn.execute(&format!("INSERT INTO t (id, a) VALUES (1, {})", i64::MAX))
+        .unwrap();
+    for_each_generated_query_mode(&conn, |prepared| {
+        assert_eq!(
+            generated_query_rows(&conn, "SELECT 1 FROM t CROSS JOIN tiny", prepared),
+            vec![vec![Value::Integer(1)], vec![Value::Integer(1)]]
+        );
+    });
+}
+
+#[test]
+fn virtual_select_index_and_prefix_scans_skip_unused_columns() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute(
+        "CREATE TABLE t (tenant INTEGER, id INTEGER, a INTEGER NOT NULL, \
+         g INTEGER GENERATED ALWAYS AS (a * 2) VIRTUAL, PRIMARY KEY (tenant, id))",
+    )
+    .unwrap();
+    conn.execute("CREATE INDEX a_index ON t (a)").unwrap();
+    conn.execute(&format!(
+        "INSERT INTO t (tenant, id, a) VALUES (1, 1, {}), (2, 1, 1)",
+        i64::MAX
+    ))
+    .unwrap();
+    for_each_generated_query_mode(&conn, |prepared| {
+        for sql in [
+            "SELECT a FROM t WHERE tenant = 1 ORDER BY id",
+            "SELECT a FROM t WHERE a = 9223372036854775807",
+        ] {
+            assert_eq!(
+                generated_query_rows(&conn, sql, prepared),
+                vec![vec![Value::Integer(i64::MAX)]],
+                "prepared={prepared}: {sql}"
+            );
+        }
+    });
+}
+
+#[test]
+fn virtual_select_defaults_apply_only_to_requested_missing_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER NOT NULL, \
+         g INTEGER GENERATED ALWAYS AS (a * 2) VIRTUAL)",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO t (id, a) VALUES (1, 1)").unwrap();
+    conn.execute("ALTER TABLE t ADD COLUMN b INTEGER DEFAULT (9223372036854775807 + 1)")
+        .unwrap();
+    conn.execute("INSERT INTO t (id, a, b) VALUES (2, 1, NULL)")
+        .unwrap();
+    for_each_generated_query_mode(&conn, |prepared| {
+        for id in [1, 2] {
+            let sql = format!("SELECT id FROM t WHERE id = {id}");
+            assert_eq!(
+                generated_query_rows(&conn, &sql, prepared),
+                vec![vec![Value::Integer(id)]],
+                "prepared={prepared}: {sql}"
+            );
+        }
+        assert_eq!(
+            generated_query_rows(&conn, "SELECT b FROM t WHERE id = 2", prepared),
+            vec![vec![Value::Null]]
+        );
+        assert!(generated_query_rows(&conn, "SELECT b FROM t WHERE id = 999", prepared).is_empty());
+        assert_generated_overflow(
+            query_generated(&conn, "SELECT b FROM t WHERE id = 1", prepared).unwrap_err(),
+        );
+    });
 }

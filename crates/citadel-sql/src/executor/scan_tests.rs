@@ -1233,6 +1233,7 @@ fn nonscalar_arithmetic_defaults_keep_cancellable_generic_evaluation() {
             None,
             Some(&col_map),
             Some(&partial),
+            None,
             Some(&token),
         )
         .unwrap_err();
@@ -1298,6 +1299,7 @@ fn scan_predicate_passes_cancellation_into_scalar_evaluation() {
         None,
         None,
         Some(&col_map),
+        None,
         None,
         Some(&token),
     )
@@ -1386,4 +1388,48 @@ fn scan_decode_passes_cancellation_to_a_virtual_generated_value() {
         error,
         SqlError::Storage(citadel_core::Error::Interrupted)
     ));
+}
+
+#[test]
+fn select_scan_preserves_defaults_between_filter_and_projection() {
+    use crate::encoding::{encode_composite_key, encode_row};
+    use crate::parser::{GeneratedKind, QueryBody, Statement};
+
+    let default = crate::parser::parse_sql_expr("TO_TSVECTOR('x')").unwrap();
+    let expected = eval_const_expr(&default).unwrap();
+    let mut cols = columns(&[
+        ("id", DataType::Integer),
+        ("search", DataType::TsVector),
+        ("g", DataType::Integer),
+        ("unused", DataType::Integer),
+    ]);
+    cols[1].default_expr = Some(default);
+    for (index, sql) in [(2, "id * 2"), (3, "9223372036854775807 + id")] {
+        cols[index].generated_kind = Some(GeneratedKind::Virtual);
+        cols[index].generated_expr = Some(crate::parser::parse_sql_expr(sql).unwrap());
+    }
+    let table = schema("docs", cols, vec![0]);
+    let Statement::Select(query) =
+        crate::parser::parse_sql("SELECT search, g FROM docs WHERE search IS NOT NULL").unwrap()
+    else {
+        panic!("SELECT fixture required")
+    };
+    let QueryBody::Select(stmt) = query.body else {
+        panic!("single-table SELECT fixture required")
+    };
+    let key = encode_composite_key(&[i(1)]);
+    let value = encode_row(&[]);
+    let token = citadel::CancelToken::new();
+    let decoder = SelectScanDecoder::new(&table, &stmt, Some(&token))
+        .unwrap()
+        .unwrap();
+    let _cancel = crate::fts::cancel_tokenize_after(token.clone(), 3);
+
+    let row = decoder
+        .read(&key, &value, stmt.where_clause.as_ref(), Some(&token))
+        .expect("filter and projection must share one default evaluation")
+        .unwrap();
+
+    assert_eq!(row, vec![i(1), expected, i(2), Value::Null]);
+    assert!(!token.is_cancelled());
 }

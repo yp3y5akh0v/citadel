@@ -579,6 +579,91 @@ pub(super) fn eval_fast_gen_with_cancel(
     }
 }
 
+pub(super) struct SelectRowDecoder<'a> {
+    schema: &'a TableSchema,
+    partial: Option<PartialDecodeCtx>,
+}
+
+impl<'a> SelectRowDecoder<'a> {
+    pub(super) fn new(
+        schema: &'a TableSchema,
+        stmt: &SelectStmt,
+        cancel: Option<&citadel::CancelToken>,
+    ) -> Result<Self> {
+        let partial = if schema.has_virtual_columns() {
+            let mut needed = Vec::new();
+            for column in &stmt.columns {
+                match column {
+                    SelectColumn::Expr { expr, .. } => {
+                        needed.extend(crate::eval::referenced_columns(expr, &schema.columns));
+                    }
+                    SelectColumn::AllColumns
+                    | SelectColumn::AllFromOld
+                    | SelectColumn::AllFromNew => {
+                        needed.extend(0..schema.columns.len());
+                    }
+                }
+            }
+            for expr in stmt
+                .where_clause
+                .iter()
+                .chain(&stmt.group_by)
+                .chain(&stmt.having)
+            {
+                needed.extend(crate::eval::referenced_columns(expr, &schema.columns));
+            }
+            for item in &stmt.order_by {
+                if !order_by_uses_projected_output(item) {
+                    needed.extend(crate::eval::referenced_columns(&item.expr, &schema.columns));
+                }
+            }
+            needed.sort_unstable();
+            needed.dedup();
+            Some(PartialDecodeCtx::new_with_cancel(schema, &needed, cancel)?)
+        } else {
+            None
+        };
+        Ok(Self { schema, partial })
+    }
+
+    pub(super) fn decode(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        cancel: Option<&citadel::CancelToken>,
+    ) -> Result<Vec<Value>> {
+        match &self.partial {
+            Some(ctx) => ctx.decode_with_cancel(key, value, cancel),
+            None => decode_full_row_with_cancel(self.schema, key, value, cancel),
+        }
+    }
+
+    pub(super) fn remaining_after(&self, decoded: &PartialDecodeCtx) -> PartialDecodeCtx {
+        let needed = match &self.partial {
+            Some(ctx) => ctx.reset_cols.clone(),
+            None => (0..self.schema.columns.len()).collect(),
+        };
+        let mut remaining = PartialDecodeCtx::new(self.schema, &needed);
+        let known = |column: &usize| decoded.reset_cols.binary_search(column).is_ok();
+        remaining.pk_positions.retain(|(_, column)| !known(column));
+        let mut position = 0;
+        remaining.nonpk_targets.retain(|_| {
+            let keep = !known(&remaining.nonpk_schema[position]);
+            position += 1;
+            keep
+        });
+        remaining.nonpk_schema.retain(|column| !known(column));
+        remaining
+            .nonpk_defaults
+            .retain(|(_, column, _)| !known(column));
+        remaining
+            .virtuals_to_eval
+            .retain(|(column, ..)| !known(column));
+        remaining.reset_cols.retain(|column| !known(column));
+        remaining
+    }
+}
+
 pub(super) struct PartialDecodeCtx {
     strict: bool,
     pk_positions: Vec<(usize, usize)>,
@@ -589,8 +674,8 @@ pub(super) struct PartialDecodeCtx {
     remaining_pk: Vec<(usize, usize)>,
     remaining_nonpk_targets: Vec<usize>,
     remaining_nonpk_schema: Vec<usize>,
-    nonpk_defaults: Vec<(usize, usize, Value)>,
-    remaining_defaults: Vec<(usize, usize, Value)>,
+    nonpk_defaults: Vec<(usize, usize, Expr)>,
+    remaining_defaults: Vec<(usize, usize, Expr)>,
     virtuals_to_eval: Vec<(usize, Expr, DataType, bool, FastGenEval)>,
     col_map: ColumnMap,
     /// Columns this ctx writes; the only ones a reused buffer must clear.
@@ -598,25 +683,16 @@ pub(super) struct PartialDecodeCtx {
 }
 
 impl PartialDecodeCtx {
-    pub(super) fn new(schema: &TableSchema, needed: &[usize]) -> Self {
-        Self::new_inner(schema, needed, None, false)
-            .expect("non-strict partial decoder construction cannot fail")
-    }
-
     pub(super) fn new_with_cancel(
         schema: &TableSchema,
         needed: &[usize],
         cancel: Option<&citadel::CancelToken>,
     ) -> Result<Self> {
-        Self::new_inner(schema, needed, cancel, true)
+        check_cancel(cancel)?;
+        Ok(Self::new(schema, needed))
     }
 
-    fn new_inner(
-        schema: &TableSchema,
-        needed: &[usize],
-        cancel: Option<&citadel::CancelToken>,
-        propagate_default_error: bool,
-    ) -> Result<Self> {
+    pub(super) fn new(schema: &TableSchema, needed: &[usize]) -> Self {
         let non_pk = schema.non_pk_indices();
         let enc_pos = schema.encoding_positions();
         let mut pk_positions = Vec::new();
@@ -625,27 +701,32 @@ impl PartialDecodeCtx {
 
         let mut expanded_needed: Vec<usize> = needed.to_vec();
         if schema.has_virtual_columns() {
-            let mut to_add: rustc_hash::FxHashSet<usize> = rustc_hash::FxHashSet::default();
+            let mut seen = vec![false; schema.columns.len()];
             for &col in needed {
+                seen[col] = true;
+            }
+            let mut cursor = 0;
+            while cursor < expanded_needed.len() {
+                let col = expanded_needed[cursor];
+                cursor += 1;
                 let c = &schema.columns[col];
                 if matches!(
                     c.generated_kind,
                     Some(crate::parser::GeneratedKind::Virtual)
                 ) {
-                    let mut refs = Vec::new();
-                    super::ddl::collect_column_refs(c.generated_expr.as_ref().unwrap(), &mut refs);
-                    for r in refs {
-                        if let Some(idx) = schema.column_index(&r) {
-                            if !needed.contains(&idx) {
-                                to_add.insert(idx);
-                            }
+                    for dependency in crate::eval::referenced_columns(
+                        c.generated_expr.as_ref().unwrap(),
+                        &schema.columns,
+                    ) {
+                        if !seen[dependency] {
+                            seen[dependency] = true;
+                            expanded_needed.push(dependency);
                         }
                     }
                 }
             }
-            for idx in to_add {
-                expanded_needed.push(idx);
-            }
+            expanded_needed.sort_unstable();
+            expanded_needed.dedup();
         }
         let needed: &[usize] = &expanded_needed;
 
@@ -690,11 +771,7 @@ impl PartialDecodeCtx {
         let mut nonpk_defaults = Vec::new();
         for (&phys_pos, &schema_col) in nonpk_targets.iter().zip(nonpk_schema.iter()) {
             if let Some(ref expr) = schema.columns[schema_col].default_expr {
-                match eval_const_expr_with_cancel(expr, cancel) {
-                    Ok(val) => nonpk_defaults.push((phys_pos, schema_col, val)),
-                    Err(e) if propagate_default_error => return Err(e),
-                    Err(_) => {}
-                }
+                nonpk_defaults.push((phys_pos, schema_col, expr.clone()));
             }
         }
         let mut remaining_defaults = Vec::new();
@@ -703,11 +780,7 @@ impl PartialDecodeCtx {
             .zip(remaining_nonpk_schema.iter())
         {
             if let Some(ref expr) = schema.columns[schema_col].default_expr {
-                match eval_const_expr_with_cancel(expr, cancel) {
-                    Ok(val) => remaining_defaults.push((phys_pos, schema_col, val)),
-                    Err(e) if propagate_default_error => return Err(e),
-                    Err(_) => {}
-                }
+                remaining_defaults.push((phys_pos, schema_col, expr.clone()));
             }
         }
 
@@ -730,7 +803,7 @@ impl PartialDecodeCtx {
         reset_cols.sort_unstable();
         reset_cols.dedup();
 
-        Ok(Self {
+        Self {
             strict: schema.is_strict(),
             pk_positions,
             nonpk_targets,
@@ -745,7 +818,7 @@ impl PartialDecodeCtx {
             virtuals_to_eval,
             col_map: ColumnMap::new(&schema.columns),
             reset_cols,
-        })
+        }
     }
 
     fn materialize_virtuals(
@@ -796,6 +869,16 @@ impl PartialDecodeCtx {
             }
         }
 
+        self.decode_additional_into_with_cancel(key, value, row, cancel)
+    }
+
+    pub(super) fn decode_additional_into_with_cancel(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        row: &mut [Value],
+        cancel: Option<&citadel::CancelToken>,
+    ) -> Result<()> {
         if self.pk_positions.len() == 1 && self.num_pk_cols == 1 {
             let (_, schema_col) = self.pk_positions[0];
             let (v, _) = decode_key_value(key)?;
@@ -815,7 +898,7 @@ impl PartialDecodeCtx {
             let stored = row_non_pk_count(value);
             for (nonpk_idx, schema_col, default) in &self.nonpk_defaults {
                 if *nonpk_idx >= stored {
-                    row[*schema_col] = default.clone();
+                    row[*schema_col] = eval_const_expr_with_cancel(default, cancel)?;
                 }
             }
         }
@@ -827,11 +910,12 @@ impl PartialDecodeCtx {
         Ok(())
     }
 
-    pub(super) fn complete(
+    pub(super) fn complete_with_cancel(
         &self,
         mut row: Vec<Value>,
         key: &[u8],
         value: &[u8],
+        cancel: Option<&citadel::CancelToken>,
     ) -> Result<Vec<Value>> {
         if !self.remaining_pk.is_empty() {
             let mut pk_values = decode_composite_key(key, self.num_pk_cols)?;
@@ -849,7 +933,7 @@ impl PartialDecodeCtx {
             let stored = row_non_pk_count(value);
             for (nonpk_idx, schema_col, default) in &self.remaining_defaults {
                 if *nonpk_idx >= stored {
-                    row[*schema_col] = default.clone();
+                    row[*schema_col] = eval_const_expr_with_cancel(default, cancel)?;
                 }
             }
         }

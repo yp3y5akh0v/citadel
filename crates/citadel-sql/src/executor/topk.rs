@@ -344,6 +344,7 @@ impl TopKScanPlan {
         if k == 0 {
             return finish_topk(schema, stmt, Vec::new(), cancel);
         }
+        let decoder = SelectRowDecoder::new(schema, stmt, cancel)?;
         // Primary-tree order == output order: keep the first k, skip the heap.
         if matches!(self.sort_target, SortTarget::Primary(0))
             && !self.descending
@@ -370,7 +371,7 @@ impl TopKScanPlan {
             let mut rows: Vec<Vec<Value>> = Vec::with_capacity(firsts.len());
             for (row_idx, (key, value)) in firsts.iter().enumerate() {
                 check_cancel_at(cancel, row_idx)?;
-                rows.push(decode_full_row_with_cancel(schema, key, value, cancel)?);
+                rows.push(decoder.decode(key, value, cancel)?);
             }
             return finish_topk(schema, stmt, rows, cancel);
         }
@@ -424,12 +425,7 @@ impl TopKScanPlan {
         let mut rows: Vec<Vec<Value>> = Vec::with_capacity(winners.len());
         for (winner_idx, w) in winners.iter().enumerate() {
             check_cancel_at(cancel, winner_idx)?;
-            rows.push(decode_full_row_with_cancel(
-                schema,
-                &w.raw_key,
-                &w.raw_value,
-                cancel,
-            )?);
+            rows.push(decoder.decode(&w.raw_key, &w.raw_value, cancel)?);
         }
 
         finish_topk(schema, stmt, rows, cancel)

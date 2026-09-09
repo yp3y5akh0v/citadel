@@ -2829,8 +2829,7 @@ pub(super) fn exec_select_in_txn(
     }
 
     let scan_limit = compute_scan_limit(stmt, table_schema);
-    let (rows, predicate_applied) =
-        collect_rows_write(wtx, table_schema, &stmt.where_clause, scan_limit)?;
+    let (rows, predicate_applied) = collect_select_rows_write(wtx, table_schema, stmt, scan_limit)?;
     super::process_select(
         rows,
         super::SelectCtx::new(&table_schema.columns, stmt, cancel)
