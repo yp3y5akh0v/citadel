@@ -197,3 +197,33 @@ fn checked_cell_readers_validate_all_pointers_before_decoding_cells() {
         assert!(error.to_string().contains("cell 1 offset"));
     }
 }
+
+#[test]
+fn writable_constructor_preserves_initialized_format_and_public_checksum_contract() {
+    for page_type in [
+        PageType::Leaf,
+        PageType::Branch,
+        PageType::Overflow,
+        PageType::PendingFree,
+    ] {
+        let checksummed = Page::new(PageId(42), page_type, TxnId(17));
+        assert!(
+            checksummed.verify_checksum(),
+            "Page::new must return a checksummed page"
+        );
+
+        let mut writable = Page::new_for_write(PageId(42), page_type, TxnId(17));
+        assert_eq!(writable.checksum(), 0);
+        assert_eq!(
+            &writable.as_bytes()[CHECKSUM_SIZE..],
+            &checksummed.as_bytes()[CHECKSUM_SIZE..]
+        );
+        assert!(writable.as_bytes()[PAGE_HEADER_SIZE..]
+            .iter()
+            .all(|&byte| byte == 0));
+
+        writable.update_checksum();
+        assert!(writable.verify_checksum());
+        assert_eq!(writable.as_bytes(), checksummed.as_bytes());
+    }
+}

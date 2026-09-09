@@ -892,3 +892,64 @@ fn authenticated_cross_page_cycles_are_rejected_without_recursion() {
         run_stream_child(full_name, CHILD, mode);
     }
 }
+
+#[test]
+fn dense_append_leaf_checksums_survive_commit_and_cold_reopen() {
+    use citadel_core::types::SyncMode;
+
+    for sync_mode in [SyncMode::Off, SyncMode::Normal, SyncMode::Full] {
+        let io = RecordingIO {
+            inner: MemIO::new(1024 * 1024),
+            trace: Arc::default(),
+        };
+        let (dek, mac, dek_id) = test_keys();
+        let manager = TxnManager::create_with_sync(
+            Box::new(io.share()),
+            dek,
+            mac,
+            1,
+            0x1234,
+            dek_id,
+            CACHE_PAGES,
+            sync_mode,
+        )
+        .unwrap();
+        let expected: Rows = (0..84u32)
+            .map(|id| (id.to_be_bytes().to_vec(), vec![id as u8; 1_024]))
+            .collect();
+        let mut writer = manager.begin_write().unwrap();
+        writer.create_table(TABLE).unwrap();
+        for (key, value) in &expected {
+            assert!(writer.table_insert_if_absent(TABLE, key, value).unwrap());
+        }
+        writer.commit().unwrap();
+
+        let mut reader = manager.begin_read();
+        let leaves = reader.collect_table_leaves(TABLE).unwrap();
+        assert_eq!(leaves.len(), 12, "{sync_mode:?}: dense append layout");
+        for leaf in &leaves {
+            assert_eq!(leaf.num_cells(), 7);
+            // Bypass both read and manager caches: read_and_decrypt also checks
+            // the persisted plaintext checksum after authentication/decryption.
+            let stored = io.read_plain(leaf.page_id());
+            assert!(
+                stored.verify_checksum(),
+                "{sync_mode:?}: {:?}",
+                leaf.page_id()
+            );
+            assert_eq!(stored.as_bytes(), leaf.as_bytes());
+        }
+        drop(leaves);
+        drop(reader);
+        drop(manager);
+
+        let reopened =
+            TxnManager::open_with_sync(Box::new(io.share()), dek, mac, 1, CACHE_PAGES, sync_mode)
+                .unwrap();
+        let mut reader = reopened.begin_read();
+        assert_eq!(scan(&mut reader), expected, "{sync_mode:?}");
+        drop(reader);
+        let integrity = reopened.integrity_check().unwrap();
+        assert!(integrity.is_ok(), "{sync_mode:?}: {integrity:?}");
+    }
+}

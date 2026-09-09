@@ -1070,7 +1070,7 @@ fn split_leaf_with_insert(
         // left leaf intact instead of copying half its cells into the new page
         // and leaving every historical leaf half full.
         let right_id = alloc.allocate();
-        let mut right_page = Page::new(right_id, PageType::Leaf, txn_id);
+        let mut right_page = Page::new_for_write(right_id, PageType::Leaf, txn_id);
         right_page
             .write_cell(&new_raw)
             .expect("append cell fits a fresh leaf");

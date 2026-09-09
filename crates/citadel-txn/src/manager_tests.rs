@@ -169,6 +169,209 @@ fn capped_commit_io_refuses_growth_before_modifying_backing() {
     assert!(backing.data.lock().unwrap().iter().all(|&byte| byte == 1));
 }
 
+struct CacheReadCountingIO {
+    inner: MemIO,
+    page_reads: Arc<AtomicU64>,
+}
+
+impl PageIO for CacheReadCountingIO {
+    fn read_page(&self, offset: u64, buf: &mut [u8; PAGE_SIZE]) -> Result<()> {
+        self.page_reads.fetch_add(1, Ordering::Relaxed);
+        self.inner.read_page(offset, buf)
+    }
+
+    fn write_page(&self, offset: u64, buf: &[u8; PAGE_SIZE]) -> Result<()> {
+        self.inner.write_page(offset, buf)
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        self.inner.read_at(offset, buf)
+    }
+
+    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
+        self.inner.write_at(offset, buf)
+    }
+
+    fn fsync(&self) -> Result<()> {
+        self.inner.fsync()
+    }
+
+    fn file_size(&self) -> Result<u64> {
+        self.inner.file_size()
+    }
+
+    fn truncate(&self, size: u64) -> Result<()> {
+        self.inner.truncate(size)
+    }
+}
+
+#[test]
+fn retired_cache_eviction_retains_registered_readers_and_resumes_after_release() {
+    const MAX_BYTES: u64 = 2 * 1024 * 1024;
+    let (dek, mac_key, dek_id) = test_keys();
+    for sync_mode in [SyncMode::Off, SyncMode::Full] {
+        for secure_delete in [false, true] {
+            let io = MemIO::new(1024 * 1024);
+            let page_reads = Arc::new(AtomicU64::new(0));
+            let manager = TxnManager::create_with_sync(
+                Box::new(CappedCommitIO::new(
+                    CacheReadCountingIO {
+                        inner: io.share(),
+                        page_reads: Arc::clone(&page_reads),
+                    },
+                    MAX_BYTES,
+                )),
+                dek,
+                mac_key,
+                1,
+                0x1234,
+                dek_id,
+                32,
+                sync_mode,
+            )
+            .unwrap();
+            manager.set_secure_delete(secure_delete);
+            commit_insert(&manager, b"key", b"original");
+            let old_root = manager.current_slot().tree_root;
+            let mut pinned = manager.begin_read();
+            assert_eq!(
+                pinned.get(b"key").unwrap().as_deref(),
+                Some(b"original".as_slice())
+            );
+            let mut cold = manager.begin_read();
+            let mut reload = manager.begin_read();
+            assert!(manager.pool.lock().is_cached(old_root));
+            let mut old_ciphertext = [0u8; PAGE_SIZE];
+            io.read_page(page_offset(old_root), &mut old_ciphertext)
+                .unwrap();
+
+            commit_insert(&manager, b"key", b"committed");
+            let new_root = manager.current_slot().tree_root;
+            assert_ne!(new_root, old_root);
+            {
+                let pool = manager.pool.lock();
+                assert!(
+                    pool.is_cached(old_root),
+                    "registered readers conservatively retain retired shared pages"
+                );
+                assert!(
+                    pool.is_cached(new_root),
+                    "the committed replacement must be cached"
+                );
+            }
+            let mut after = [0u8; PAGE_SIZE];
+            io.read_page(page_offset(old_root), &mut after).unwrap();
+            assert_eq!(
+                after, old_ciphertext,
+                "cache eviction must not erase retired storage"
+            );
+
+            page_reads.store(0, Ordering::Relaxed);
+            assert_eq!(
+                pinned.get(b"key").unwrap().as_deref(),
+                Some(b"original".as_slice())
+            );
+            assert_eq!(
+                page_reads.load(Ordering::Relaxed),
+                0,
+                "a pinned reader retains its Arc"
+            );
+            assert_eq!(
+                manager.begin_read().get(b"key").unwrap().as_deref(),
+                Some(b"committed".as_slice())
+            );
+            assert_eq!(
+                page_reads.load(Ordering::Relaxed),
+                0,
+                "new readers use the committed cache page"
+            );
+            assert_eq!(
+                cold.get(b"key").unwrap().as_deref(),
+                Some(b"original".as_slice())
+            );
+            assert_eq!(
+                page_reads.load(Ordering::Relaxed),
+                0,
+                "an unread old snapshot still benefits from the retained shared page"
+            );
+            assert!(
+                manager.pool.lock().is_cached(old_root),
+                "the old snapshot remains shared-cache resident"
+            );
+            assert_eq!(
+                pinned.get(b"key").unwrap().as_deref(),
+                Some(b"original".as_slice())
+            );
+            assert_eq!(page_reads.load(Ordering::Relaxed), 0);
+
+            // Normal cache pressure can still evict the page. A registered
+            // reader must reload its protected disk snapshot correctly.
+            manager.pool.lock().invalidate(old_root);
+            assert_eq!(
+                reload.get(b"key").unwrap().as_deref(),
+                Some(b"original".as_slice())
+            );
+            assert_eq!(page_reads.load(Ordering::Relaxed), 1);
+            drop(reload);
+            drop(pinned);
+            drop(cold);
+
+            // The gate is per commit; after readers leave, newly retired
+            // current pages should stop occupying shared cache slots.
+            commit_insert(&manager, b"key", b"after readers");
+            let latest_root = manager.current_slot().tree_root;
+            assert_ne!(latest_root, new_root);
+            assert!(!manager.pool.lock().is_cached(new_root));
+            assert!(manager.pool.lock().is_cached(latest_root));
+            assert_eq!(
+                manager.begin_read().get(b"key").unwrap().as_deref(),
+                Some(b"after readers".as_slice())
+            );
+            assert!(manager.integrity_check().unwrap().is_ok());
+        }
+    }
+}
+
+#[test]
+fn aborted_or_failed_commits_do_not_evict_committed_pages() {
+    let (dek, mac_key, dek_id) = test_keys();
+    for sync_mode in [SyncMode::Off, SyncMode::Full] {
+        let io = MemIO::new(1024 * 1024);
+        let faulty = FaultingIO::new(io, i64::MAX);
+        let writes_left = Arc::clone(&faulty.writes_left);
+        let manager = TxnManager::create_with_sync(
+            Box::new(CappedCommitIO::new(faulty, 2 * 1024 * 1024)),
+            dek,
+            mac_key,
+            1,
+            0x1234,
+            dek_id,
+            32,
+            sync_mode,
+        )
+        .unwrap();
+        commit_insert(&manager, b"key", b"original");
+        let before = manager.current_slot();
+        assert!(manager.pool.lock().is_cached(before.tree_root));
+
+        let mut aborted = manager.begin_write().unwrap();
+        aborted.insert(b"key", b"aborted").unwrap();
+        aborted.abort();
+        assert!(manager.pool.lock().is_cached(before.tree_root));
+
+        let mut failed = manager.begin_write().unwrap();
+        failed.insert(b"key", b"failed").unwrap();
+        writes_left.store(0, Ordering::SeqCst);
+        assert!(matches!(failed.commit(), Err(Error::Io(_))));
+        assert_eq!(manager.current_slot(), before);
+        assert!(manager.pool.lock().is_cached(before.tree_root));
+        assert_eq!(
+            manager.begin_read().get(b"key").unwrap().as_deref(),
+            Some(b"original".as_slice())
+        );
+    }
+}
+
 pub fn test_keys() -> ([u8; DEK_SIZE], [u8; MAC_KEY_SIZE], [u8; 32]) {
     let rek = [0x42u8; 32];
     let keys = derive_keys_from_rek(&rek);
