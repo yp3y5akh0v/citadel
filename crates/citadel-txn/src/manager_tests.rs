@@ -4,6 +4,10 @@ use citadel_crypto::hkdf_utils::derive_keys_from_rek;
 use citadel_crypto::page_cipher::compute_dek_id;
 use std::sync::Mutex as StdMutex;
 
+#[cfg(feature = "parallel")]
+#[path = "manager_parallel_tests.rs"]
+mod parallel_commit_batches;
+
 pub struct MemIO {
     data: Arc<StdMutex<Vec<u8>>>,
 }
