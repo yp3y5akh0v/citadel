@@ -2828,6 +2828,14 @@ pub(super) fn exec_select_in_txn(
         });
     }
 
+    if let Some(result) =
+        super::select::try_plain_projection_scan(stmt, table_schema, cancel, |cb| {
+            wtx.table_scan_from(lower_name.as_bytes(), b"", |key, value| Ok(cb(key, value)))
+        })
+    {
+        return result;
+    }
+
     let scan_limit = compute_scan_limit(stmt, table_schema);
     let (rows, predicate_applied) = collect_select_rows_write(wtx, table_schema, stmt, scan_limit)?;
     super::process_select(

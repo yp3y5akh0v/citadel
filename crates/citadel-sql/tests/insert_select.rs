@@ -24,6 +24,22 @@ fn assert_rows_affected(result: ExecutionResult, expected: u64) {
     }
 }
 
+fn execute_insert_select(
+    conn: &Connection<'_>,
+    sql: &str,
+    params: &[Value],
+    prepared: bool,
+) -> Result<u64, SqlError> {
+    if prepared {
+        conn.prepare(sql)?.execute(params)
+    } else {
+        match conn.execute_params(sql, params)? {
+            ExecutionResult::RowsAffected(count) => Ok(count),
+            other => panic!("expected RowsAffected, got {other:?}"),
+        }
+    }
+}
+
 fn setup_src(conn: &Connection) {
     assert_ok(
         conn.execute("CREATE TABLE src (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER)")
@@ -472,4 +488,270 @@ fn insert_select_with_join() {
     assert_eq!(qr.rows[1][0], Value::Integer(2));
     assert_eq!(qr.rows[1][1], Value::Text("Bob".into()));
     assert_eq!(qr.rows[1][2], Value::Integer(25));
+}
+
+#[test]
+fn insert_select_empty_sources_still_validate_projection_width() {
+    for prepared in [false, true] {
+        for explicit in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = create_db(dir.path());
+            let conn = Connection::open(&db).unwrap();
+            setup_src(&conn);
+            conn.execute("CREATE TABLE empty_src (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)")
+                .unwrap();
+            conn.execute(
+                "CREATE TABLE dst (id INTEGER PRIMARY KEY, name TEXT, age INTEGER DEFAULT 99)",
+            )
+            .unwrap();
+
+            for (sql, expected, actual) in [
+                ("INSERT INTO dst SELECT id, name FROM empty_src", 3, 2),
+                ("INSERT INTO dst (id, name) SELECT id, name, age FROM empty_src", 2, 3),
+                ("INSERT INTO dst SELECT id, name FROM src WHERE 1 = 0", 3, 2),
+                ("INSERT INTO dst (id, name) SELECT * FROM src LIMIT 0", 2, 3),
+                ("INSERT INTO dst WITH empty AS (SELECT id, name FROM src WHERE 1 = 0) SELECT * FROM empty", 3, 2),
+                ("INSERT INTO dst SELECT id, name FROM empty_src UNION ALL SELECT id, name FROM empty_src", 3, 2),
+            ] {
+                if explicit {
+                    conn.execute("BEGIN").unwrap();
+                }
+                let error = execute_insert_select(&conn, sql, &[], prepared)
+                    .expect_err(&format!("{sql}; prepared={prepared}, explicit={explicit}"));
+                assert!(
+                    matches!(error, SqlError::InvalidValue(ref message)
+                        if message == &format!("INSERT ... SELECT column count mismatch: expected {expected}, got {actual}")),
+                    "{error:?}"
+                );
+                if explicit {
+                    conn.execute("COMMIT").unwrap();
+                }
+                assert_eq!(
+                    conn.query("SELECT COUNT(*) FROM dst").unwrap().rows,
+                    vec![vec![Value::Integer(0)]]
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn insert_select_empty_sources_with_matching_width_succeed() {
+    for prepared in [false, true] {
+        for explicit in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = create_db(dir.path());
+            let conn = Connection::open(&db).unwrap();
+            setup_src(&conn);
+            conn.execute(
+                "CREATE TABLE dst (id INTEGER PRIMARY KEY, name TEXT, age INTEGER DEFAULT 99)",
+            )
+            .unwrap();
+            for sql in [
+                "INSERT INTO dst SELECT id, name, age FROM src WHERE id > $1",
+                "INSERT INTO dst (id, name) SELECT id, name FROM src WHERE id > $1",
+                "INSERT INTO dst (id, name) WITH empty AS (SELECT id, name FROM src WHERE id > $1) SELECT * FROM empty",
+                "INSERT INTO dst SELECT * FROM src WHERE id > $1 UNION ALL SELECT * FROM src WHERE id > $1",
+            ] {
+                if explicit {
+                    conn.execute("BEGIN").unwrap();
+                }
+                assert_eq!(
+                    execute_insert_select(&conn, sql, &[Value::Integer(99)], prepared).unwrap(),
+                    0
+                );
+                if explicit {
+                    conn.execute("COMMIT").unwrap();
+                }
+            }
+            assert_eq!(
+                conn.query("SELECT COUNT(*) FROM dst").unwrap().rows,
+                vec![vec![Value::Integer(0)]]
+            );
+        }
+    }
+}
+
+#[test]
+fn insert_select_owned_values_preserve_reordering_defaults_and_generation() {
+    for prepared in [false, true] {
+        for explicit in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = create_db(dir.path());
+            let conn = Connection::open(&db).unwrap();
+            conn.execute("CREATE TABLE src (id INTEGER PRIMARY KEY, name TEXT, payload BLOB)")
+                .unwrap();
+            conn.execute(
+                "CREATE TABLE dst (id INTEGER PRIMARY KEY, name TEXT, payload BLOB, \
+                 base INTEGER DEFAULT 9, doubled INTEGER GENERATED ALWAYS AS (base * 2) STORED)",
+            )
+            .unwrap();
+            let mut source = Vec::new();
+            for id in 1..=2 {
+                let row = vec![
+                    Value::Integer(id),
+                    Value::Text(format!("row-{id}-{}", "text".repeat(32)).into()),
+                    Value::Blob(vec![id as u8; 1_024]),
+                ];
+                conn.execute_params("INSERT INTO src VALUES ($1, $2, $3)", &row)
+                    .unwrap();
+                source.push(row);
+            }
+            if explicit {
+                conn.execute("BEGIN").unwrap();
+            }
+            assert_eq!(
+                execute_insert_select(
+                    &conn,
+                    "INSERT INTO dst (payload, name, id) SELECT payload, name, id FROM src",
+                    &[],
+                    prepared,
+                )
+                .unwrap(),
+                2
+            );
+            if explicit {
+                conn.execute("COMMIT").unwrap();
+            }
+            assert_eq!(
+                conn.query("SELECT id, name, payload FROM src ORDER BY id")
+                    .unwrap()
+                    .rows,
+                source
+            );
+            let expected: Vec<_> = source
+                .into_iter()
+                .map(|mut row| {
+                    row.extend([Value::Integer(9), Value::Integer(18)]);
+                    row
+                })
+                .collect();
+            assert_eq!(
+                conn.query("SELECT id, name, payload, base, doubled FROM dst ORDER BY id")
+                    .unwrap()
+                    .rows,
+                expected
+            );
+        }
+    }
+}
+
+#[test]
+fn insert_select_self_reference_materializes_before_mutation_in_all_modes() {
+    for prepared in [false, true] {
+        for explicit in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = create_db(dir.path());
+            let conn = Connection::open(&db).unwrap();
+            conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)")
+                .unwrap();
+            conn.execute("INSERT INTO items VALUES (1, 'one'), (2, 'two')")
+                .unwrap();
+            if explicit {
+                conn.execute("BEGIN").unwrap();
+            }
+            assert_eq!(
+                execute_insert_select(
+                    &conn,
+                    "INSERT INTO items SELECT id + 10, name FROM items",
+                    &[],
+                    prepared,
+                )
+                .unwrap(),
+                2
+            );
+            if explicit {
+                conn.execute("COMMIT").unwrap();
+            }
+            assert_eq!(
+                conn.query("SELECT id, name FROM items ORDER BY id")
+                    .unwrap()
+                    .rows,
+                vec![
+                    vec![Value::Integer(1), Value::Text("one".into())],
+                    vec![Value::Integer(2), Value::Text("two".into())],
+                    vec![Value::Integer(11), Value::Text("one".into())],
+                    vec![Value::Integer(12), Value::Text("two".into())],
+                ]
+            );
+        }
+    }
+}
+
+#[test]
+fn insert_select_view_targets_validate_empty_projection_width() {
+    for prepared in [false, true] {
+        for explicit in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = create_db(dir.path());
+            let conn = Connection::open(&db).unwrap();
+            conn.execute("CREATE TABLE base (id INTEGER PRIMARY KEY, name TEXT)")
+                .unwrap();
+            conn.execute("CREATE TABLE src (id INTEGER PRIMARY KEY, name TEXT)")
+                .unwrap();
+            conn.execute("CREATE VIEW visible (id, label) AS SELECT id, name FROM base")
+                .unwrap();
+            conn.execute(
+                "CREATE TRIGGER redirect INSTEAD OF INSERT ON visible FOR EACH ROW \
+                 BEGIN INSERT INTO base VALUES (NEW.id, NEW.label); END",
+            )
+            .unwrap();
+
+            for (sql, expected, actual) in [
+                ("INSERT INTO visible SELECT id FROM src", 2, 1),
+                ("INSERT INTO visible (id) SELECT id, name FROM src", 1, 2),
+            ] {
+                if explicit {
+                    conn.execute("BEGIN").unwrap();
+                }
+                let error = execute_insert_select(&conn, sql, &[], prepared).unwrap_err();
+                assert!(matches!(error, SqlError::InvalidValue(message)
+                    if message == format!("INSERT ... SELECT column count mismatch: expected {expected}, got {actual}")));
+                if explicit {
+                    conn.execute("COMMIT").unwrap();
+                }
+            }
+            if explicit {
+                conn.execute("BEGIN").unwrap();
+            }
+            assert_eq!(
+                execute_insert_select(
+                    &conn,
+                    "INSERT INTO visible SELECT id, name FROM src",
+                    &[],
+                    prepared,
+                )
+                .unwrap(),
+                0
+            );
+            if explicit {
+                conn.execute("COMMIT").unwrap();
+            }
+            assert_eq!(
+                conn.query("SELECT COUNT(*) FROM base").unwrap().rows,
+                vec![vec![Value::Integer(0)]]
+            );
+            conn.execute("INSERT INTO src VALUES (1, 'one')").unwrap();
+            if explicit {
+                conn.execute("BEGIN").unwrap();
+            }
+            assert_eq!(
+                execute_insert_select(
+                    &conn,
+                    "INSERT INTO visible (label, id) SELECT name, id FROM src",
+                    &[],
+                    prepared,
+                )
+                .unwrap(),
+                1
+            );
+            if explicit {
+                conn.execute("COMMIT").unwrap();
+            }
+            assert_eq!(
+                conn.query("SELECT id, name FROM base").unwrap().rows,
+                vec![vec![Value::Integer(1), Value::Text("one".into())]]
+            );
+        }
+    }
 }

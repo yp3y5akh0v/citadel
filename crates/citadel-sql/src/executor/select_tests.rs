@@ -1587,3 +1587,254 @@ fn numeric_aggregate_states_report_the_first_non_null_family_for_bad_types() {
         }
     }
 }
+
+mod plain_projection_scan {
+    use super::*;
+    use crate::encoding::{encode_composite_key, encode_row};
+    use crate::parser::{parse_sql_expr, GeneratedKind};
+
+    fn collect(table: &TableSchema, sql: &str, rows: &[(Vec<u8>, Vec<u8>)]) -> Result<QueryResult> {
+        let result = try_plain_projection_scan(&agg_select_stmt(sql), table, None, |visit| {
+            for (key, value) in rows {
+                if !visit(key, value) {
+                    break;
+                }
+            }
+            Ok(())
+        })
+        .expect("expected plain projection scan")?;
+        let ExecutionResult::Query(result) = result else {
+            panic!("expected query result")
+        };
+        Ok(result)
+    }
+
+    fn generated_schema() -> TableSchema {
+        let mut columns = cols(&[
+            ("id", DataType::Integer),
+            ("a", DataType::Integer),
+            ("g", DataType::Integer),
+        ]);
+        columns[2].nullable = false;
+        columns[2].generated_kind = Some(GeneratedKind::Virtual);
+        columns[2].generated_expr = Some(parse_sql_expr("a * 2").unwrap());
+        TableSchema::new("t".into(), columns, vec![0], vec![], vec![], vec![])
+    }
+
+    #[test]
+    fn clauses_and_non_scalar_projections_do_not_enter_the_plain_scan() {
+        let table = scan_limit_schema();
+        for sql in [
+            "SELECT id FROM t WHERE x > 0",
+            "SELECT id FROM t ORDER BY id",
+            "SELECT id FROM t LIMIT 1",
+            "SELECT id FROM t OFFSET 1",
+            "SELECT t.id FROM t CROSS JOIN other",
+            "SELECT id FROM t GROUP BY id",
+            "SELECT id FROM t HAVING id > 0",
+            "SELECT DISTINCT id FROM t",
+            "SELECT id FROM (SELECT id FROM t) AS derived",
+            "SELECT * FROM jsonb_each(CAST('{}' AS JSONB))",
+            "SELECT * FROM JSON_TABLE(CAST('[1]' AS JSONB), '$[*]' \
+             COLUMNS (x INT PATH '$')) AS jt",
+            "SELECT SUM(x) FROM t",
+            "SELECT ROW_NUMBER() OVER () FROM t",
+            "SELECT (SELECT 1) FROM t",
+        ] {
+            let stmt = agg_select_stmt(sql);
+            assert!(plain_scan_projection(&stmt, &table).is_none(), "{sql}");
+            assert!(
+                try_plain_projection_scan(&stmt, &table, None, |_| {
+                    panic!("ineligible statement scanned rows: {sql}")
+                })
+                .is_none(),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_reorder_duplicates_and_scalar_projection_preserve_rows_and_names() {
+        let table = TableSchema::new(
+            "t".into(),
+            cols(&[
+                ("id", DataType::Integer),
+                ("x", DataType::Integer),
+                ("label", DataType::Text),
+            ]),
+            vec![0],
+            vec![],
+            vec![],
+            vec![],
+        );
+        let text = |text: &str| Value::Text(text.into());
+        let rows = vec![
+            (
+                encode_composite_key(&[i(1)]),
+                encode_row(&[i(2), text("first")]),
+            ),
+            (
+                encode_composite_key(&[i(3)]),
+                encode_row(&[Value::Null, text("second")]),
+            ),
+        ];
+        for (sql, names, expected) in [
+            (
+                "SELECT * FROM t",
+                vec!["id", "x", "label"],
+                vec![
+                    vec![i(1), i(2), text("first")],
+                    vec![i(3), Value::Null, text("second")],
+                ],
+            ),
+            (
+                "SELECT label AS name, x, id FROM t",
+                vec!["name", "x", "id"],
+                vec![
+                    vec![text("first"), i(2), i(1)],
+                    vec![text("second"), Value::Null, i(3)],
+                ],
+            ),
+            (
+                "SELECT label, label AS again FROM t",
+                vec!["label", "again"],
+                vec![
+                    vec![text("first"), text("first")],
+                    vec![text("second"), text("second")],
+                ],
+            ),
+            (
+                "SELECT id + COALESCE(x, 0) AS total, label || label AS doubled FROM t",
+                vec!["total", "doubled"],
+                vec![
+                    vec![i(3), text("firstfirst")],
+                    vec![i(3), text("secondsecond")],
+                ],
+            ),
+        ] {
+            let result = collect(&table, sql, &rows).unwrap();
+            assert_eq!(result.columns, names, "{sql}");
+            assert_eq!(result.rows, expected, "{sql}");
+        }
+    }
+
+    #[test]
+    fn demanded_virtual_not_null_checks_apply_to_every_full_row_projection() {
+        let table = generated_schema();
+        let rows = vec![(
+            encode_composite_key(&[i(1)]),
+            encode_row(&[Value::Null, Value::Null]),
+        )];
+        for sql in [
+            "SELECT * FROM t",
+            "SELECT g, a, id FROM t",
+            "SELECT g + 0, a, id FROM t",
+        ] {
+            let error = collect(&table, sql, &rows).unwrap_err();
+            assert!(
+                matches!(error, SqlError::InvalidValue(ref message)
+                    if message == "VIRTUAL generated column at position 2 produced NULL but is NOT NULL"),
+                "{sql}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn unused_virtual_errors_are_not_evaluated() {
+        let table = generated_schema();
+        let rows = vec![(
+            encode_composite_key(&[i(1)]),
+            encode_row(&[i(i64::MAX), Value::Null]),
+        )];
+        assert_eq!(
+            collect(&table, "SELECT a, id FROM t", &rows).unwrap().rows,
+            vec![vec![i(i64::MAX), i(1)]]
+        );
+        assert_eq!(
+            collect(&table, "SELECT id + 1 FROM t", &rows).unwrap().rows,
+            vec![vec![i(2)]]
+        );
+        assert!(matches!(
+            collect(&table, "SELECT g FROM t", &rows),
+            Err(SqlError::IntegerOverflow)
+        ));
+    }
+
+    #[test]
+    fn scan_errors_discard_the_partial_result_and_pre_cancelled_scans_do_not_start() {
+        let table = scan_limit_schema();
+        let stmt = agg_select_stmt("SELECT * FROM t");
+        let key = encode_composite_key(&[i(1)]);
+        let value = encode_row(&[i(2)]);
+        for interrupted in [false, true] {
+            let result = try_plain_projection_scan(&stmt, &table, None, |visit| {
+                assert!(visit(&key, &value));
+                Err(if interrupted {
+                    citadel_core::Error::Interrupted
+                } else {
+                    citadel_core::Error::DatabaseCorrupted
+                })
+            })
+            .unwrap();
+            assert!(
+                matches!(
+                    (&result, interrupted),
+                    (
+                        Err(SqlError::Storage(citadel_core::Error::Interrupted)),
+                        true
+                    ) | (
+                        Err(SqlError::Storage(citadel_core::Error::DatabaseCorrupted)),
+                        false
+                    )
+                ),
+                "{result:?}"
+            );
+        }
+        let token = CancelToken::new();
+        token.cancel();
+        let result = try_plain_projection_scan(&stmt, &table, Some(&token), |_| {
+            panic!("cancelled scan started")
+        })
+        .unwrap();
+        assert!(matches!(
+            result,
+            Err(SqlError::Storage(citadel_core::Error::Interrupted))
+        ));
+    }
+
+    #[test]
+    fn scalar_projection_error_stops_the_source_scan() {
+        let table = scan_limit_schema();
+        let stmt = agg_select_stmt("SELECT id / x FROM t");
+        let mut visited = 0;
+        let result = try_plain_projection_scan(&stmt, &table, None, |visit| {
+            for (id, divisor) in [(1, 0), (2, 1)] {
+                visited += 1;
+                if !visit(&encode_composite_key(&[i(id)]), &encode_row(&[i(divisor)])) {
+                    break;
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert!(matches!(result, Err(SqlError::DivisionByZero)));
+        assert_eq!(visited, 1);
+    }
+
+    #[test]
+    fn cancellation_after_the_last_callback_discards_the_result() {
+        let table = scan_limit_schema();
+        let stmt = agg_select_stmt("SELECT * FROM t");
+        let token = CancelToken::new();
+        let result = try_plain_projection_scan(&stmt, &table, Some(&token), |visit| {
+            assert!(visit(&encode_composite_key(&[i(1)]), &encode_row(&[i(2)])));
+            token.cancel();
+            Ok(())
+        })
+        .unwrap();
+        assert!(matches!(
+            result,
+            Err(SqlError::Storage(citadel_core::Error::Interrupted))
+        ));
+    }
+}

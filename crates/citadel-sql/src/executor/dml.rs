@@ -77,6 +77,35 @@ fn is_single_int_pk(table_schema: &TableSchema) -> bool {
         )
 }
 
+fn insert_select_rows(result: QueryResult, expected: usize) -> Result<Vec<Vec<Value>>> {
+    if result.columns.len() != expected {
+        return Err(SqlError::InvalidValue(format!(
+            "INSERT ... SELECT column count mismatch: expected {expected}, got {}",
+            result.columns.len()
+        )));
+    }
+    Ok(result.rows)
+}
+
+fn bind_selected_row(
+    source: &mut Vec<Value>,
+    row: &mut [Value],
+    indices: &[usize],
+    schema: &TableSchema,
+) -> Result<()> {
+    if source.len() != indices.len() {
+        return Err(SqlError::InvalidValue(format!(
+            "INSERT ... SELECT column count mismatch: expected {}, got {}",
+            indices.len(),
+            source.len()
+        )));
+    }
+    for (value, &index) in source.drain(..).zip(indices) {
+        row[index] = coerce_for_column(value, &schema.columns[index], schema.is_strict())?;
+    }
+    Ok(())
+}
+
 pub(super) fn exec_insert(
     db: &Database,
     schema: &SchemaManager,
@@ -176,7 +205,7 @@ pub(super) fn exec_insert(
     let check_col_map = has_checks.then(|| table_schema.column_map());
 
     let cancel = db.cancel_token();
-    let select_rows = match &stmt.source {
+    let mut select_rows = match &stmt.source {
         InsertSource::Select(sq) => {
             let insert_ctes = super::materialize_all_ctes(
                 &sq.ctes,
@@ -190,7 +219,7 @@ pub(super) fn exec_insert(
                 },
             )?;
             let qr = exec_query_body_read(db, schema, &sq.body, &insert_ctes)?;
-            Some(qr.rows)
+            Some(insert_select_rows(qr, insert_columns.len())?)
         }
         InsertSource::Values(_) => None,
     };
@@ -231,23 +260,11 @@ pub(super) fn exec_insert(
         InsertSource::Values(rows) => Some(rows.as_slice()),
         InsertSource::Select(_) => None,
     };
-    let sel_rows = select_rows.as_deref();
-
-    let total = match (values, sel_rows) {
+    let total = match (values, select_rows.as_deref()) {
         (Some(rows), _) => rows.len(),
         (_, Some(rows)) => rows.len(),
         _ => 0,
     };
-
-    if let Some(sel) = sel_rows {
-        if !sel.is_empty() && sel[0].len() != insert_columns.len() {
-            return Err(SqlError::InvalidValue(format!(
-                "INSERT ... SELECT column count mismatch: expected {}, got {}",
-                insert_columns.len(),
-                sel[0].len()
-            )));
-        }
-    }
 
     let has_insert_statement_triggers = schema.triggers_for(&table_schema.name).iter().any(|t| {
         t.enabled
@@ -319,17 +336,8 @@ pub(super) fn exec_insert(
                     coerce_for_column(val, col, strict)?
                 };
             }
-        } else if let Some(sel) = sel_rows {
-            let sel_row = &sel[idx];
-            for (i, val) in sel_row.iter().enumerate() {
-                let col_idx = col_indices[i];
-                let col = &table_schema.columns[col_idx];
-                row[col_idx] = if val.is_null() {
-                    Value::Null
-                } else {
-                    coerce_for_column(val.clone(), col, strict)?
-                };
-            }
+        } else if let Some(sel) = select_rows.as_mut() {
+            bind_selected_row(&mut sel[idx], &mut row, &col_indices, table_schema)?;
         }
 
         for &(pos, def_expr) in &defaults {
@@ -1943,7 +1951,7 @@ fn exec_insert_in_txn_impl(
         .then(|| table_schema.column_map());
 
     let cancel = wtx.cancel_token().cloned();
-    let select_rows = match &stmt.source {
+    let mut select_rows = match &stmt.source {
         InsertSource::Select(sq) => {
             let insert_ctes = super::materialize_all_ctes_with_outer(
                 &sq.ctes,
@@ -1958,7 +1966,7 @@ fn exec_insert_in_txn_impl(
                 },
             )?;
             let qr = exec_query_body_write(wtx, schema, &sq.body, &insert_ctes)?;
-            Some(qr.rows)
+            Some(insert_select_rows(qr, insert_columns.len())?)
         }
         InsertSource::Values(_) => None,
     };
@@ -1975,23 +1983,11 @@ fn exec_insert_in_txn_impl(
         InsertSource::Values(rows) => Some(rows.as_slice()),
         InsertSource::Select(_) => None,
     };
-    let sel_rows = select_rows.as_deref();
-
-    let total = match (values, sel_rows) {
+    let total = match (values, select_rows.as_deref()) {
         (Some(rows), _) => rows.len(),
         (_, Some(rows)) => rows.len(),
         _ => 0,
     };
-
-    if let Some(sel) = sel_rows {
-        if !sel.is_empty() && sel[0].len() != insert_columns.len() {
-            return Err(SqlError::InvalidValue(format!(
-                "INSERT ... SELECT column count mismatch: expected {}, got {}",
-                insert_columns.len(),
-                sel[0].len()
-            )));
-        }
-    }
 
     let has_insert_statement_triggers_impl =
         schema.triggers_for(&table_schema.name).iter().any(|t| {
@@ -2088,13 +2084,13 @@ fn exec_insert_in_txn_impl(
                     bufs.row[col_idx] = coerce_for_column(val, col, strict)?;
                 }
             }
-        } else if let Some(sel) = sel_rows {
-            let sel_row = &sel[idx];
-            for (i, val) in sel_row.iter().enumerate() {
-                let col_idx = bufs.col_indices[i];
-                let col = &table_schema.columns[col_idx];
-                bufs.row[col_idx] = coerce_for_column(val.clone(), col, strict)?;
-            }
+        } else if let Some(sel) = select_rows.as_mut() {
+            bind_selected_row(
+                &mut sel[idx],
+                &mut bufs.row,
+                &bufs.col_indices,
+                table_schema,
+            )?;
         }
 
         if has_defaults {
@@ -4419,7 +4415,7 @@ fn exec_instead_of_view_insert_in_txn(
         InsertSource::Select(sq) => {
             let empty_ctes = CteContext::default();
             let qr = exec_query_body_write(wtx, schema, &sq.body, &empty_ctes)?;
-            qr.rows
+            insert_select_rows(qr, target_positions.len())?
         }
     };
 
