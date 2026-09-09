@@ -1000,3 +1000,690 @@ fn lil_delete_falls_back_on_missing_cached_leaf() {
     assert!(res.is_none());
     assert!(tree.last_delete.is_none());
 }
+
+mod rightmost_append_split {
+    use super::*;
+    use crate::cursor::Cursor;
+    use std::collections::BTreeMap;
+
+    type Expected = BTreeMap<Vec<u8>, (ValueType, Vec<u8>)>;
+
+    #[derive(Clone, Copy, Debug)]
+    enum Route {
+        Insert,
+        IfAbsent,
+        OrFetch,
+        Lil,
+        AtLeaf,
+        IfAbsentAtLeaf,
+    }
+
+    fn key(id: u32) -> Vec<u8> {
+        id.to_be_bytes().to_vec()
+    }
+
+    fn wide_key(id: u32) -> Vec<u8> {
+        let mut bytes = key(id);
+        bytes.resize(2_000, b'k');
+        bytes
+    }
+
+    fn payload(id: u32, size: usize) -> Vec<u8> {
+        let mut bytes = vec![id as u8; size];
+        if size >= 4 {
+            bytes[..4].copy_from_slice(&id.to_le_bytes());
+        }
+        bytes
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_new(
+        tree: &mut BTree,
+        pages: &mut FxHashMap<PageId, Page>,
+        alloc: &mut PageAllocator,
+        txn: TxnId,
+        key: &[u8],
+        value: &[u8],
+        route: Route,
+        cold: bool,
+    ) -> bool {
+        if cold {
+            tree.clear_lil_caches();
+        }
+        match route {
+            Route::Insert => assert!(tree
+                .insert(pages, alloc, txn, key, ValueType::Inline, value)
+                .unwrap()),
+            Route::IfAbsent => assert!(tree
+                .insert_if_absent(pages, alloc, txn, key, ValueType::Inline, value)
+                .unwrap()),
+            Route::OrFetch => assert!(tree
+                .insert_or_fetch(pages, alloc, txn, key, ValueType::Inline, value)
+                .unwrap()
+                .is_none()),
+            Route::Lil => {
+                if let Some(inserted) = tree
+                    .try_lil_insert(pages, alloc, txn, key, ValueType::Inline, value)
+                    .unwrap()
+                {
+                    assert!(inserted);
+                    tree.debug_assert_lil_disjoint();
+                    return true;
+                }
+                assert!(tree
+                    .insert(pages, alloc, txn, key, ValueType::Inline, value)
+                    .unwrap());
+            }
+            Route::AtLeaf => {
+                let (path, leaf) = tree.walk_to_leaf(pages, key).unwrap();
+                assert_eq!(
+                    tree.insert_at_leaf(
+                        pages,
+                        alloc,
+                        txn,
+                        key,
+                        ValueType::Inline,
+                        value,
+                        path,
+                        leaf,
+                    )
+                    .unwrap(),
+                    (true, None)
+                );
+            }
+            Route::IfAbsentAtLeaf => {
+                let (path, leaf) = tree.walk_to_leaf(pages, key).unwrap();
+                assert!(tree
+                    .insert_if_absent_at_leaf(
+                        pages,
+                        alloc,
+                        txn,
+                        key,
+                        ValueType::Inline,
+                        value,
+                        path,
+                        leaf,
+                    )
+                    .unwrap());
+            }
+        }
+        tree.debug_assert_lil_disjoint();
+        false
+    }
+
+    fn assert_contents(tree: &BTree, pages: &FxHashMap<PageId, Page>, expected: &Expected) {
+        assert_eq!(tree.entry_count, expected.len() as u64);
+        let mut cursor = Cursor::first(pages, tree.root).unwrap();
+        let mut actual = Vec::new();
+        while let Some(entry) = cursor.current(pages) {
+            actual.push((entry.key, (entry.val_type, entry.value)));
+            cursor.next(pages).unwrap();
+        }
+        assert_eq!(
+            actual,
+            expected
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect::<Vec<_>>()
+        );
+        for (key, value) in expected {
+            assert_eq!(tree.search(pages, key).unwrap(), Some(value.clone()));
+        }
+    }
+
+    fn leaf_ids(tree: &BTree, pages: &FxHashMap<PageId, Page>) -> Vec<PageId> {
+        let mut cursor = Cursor::first(pages, tree.root).unwrap();
+        let mut ids = Vec::new();
+        while cursor.is_valid() {
+            let id = cursor.leaf_page_id();
+            if ids.last() != Some(&id) {
+                ids.push(id);
+            }
+            cursor.next(pages).unwrap();
+        }
+        ids
+    }
+
+    fn dense_sequential(route: Route, cold: bool) {
+        let (mut pages, mut alloc, mut tree) = new_tree();
+        let mut expected = Expected::new();
+        let mut lil_hits = 0;
+        for id in 0..84 {
+            let key = key(id);
+            let value = payload(id, 1_024);
+            lil_hits += usize::from(insert_new(
+                &mut tree,
+                &mut pages,
+                &mut alloc,
+                TxnId(1),
+                &key,
+                &value,
+                route,
+                cold,
+            ));
+            expected.insert(key, (ValueType::Inline, value));
+        }
+        assert_contents(&tree, &pages, &expected);
+        if matches!(route, Route::Lil) {
+            assert!(lil_hits > 0, "explicit LIL route was never exercised");
+        }
+        let counts: Vec<_> = leaf_ids(&tree, &pages)
+            .into_iter()
+            .map(|id| pages[&id].num_cells() as usize)
+            .collect();
+        // Seven 1 KiB cells fit, eight do not. Completed append leaves should
+        // retain that capacity instead of being left half full after a split.
+        let capacity = citadel_core::USABLE_SIZE / (leaf_node::cell_size(4, 1_024) + 2);
+        assert_eq!(capacity, 7);
+        assert_eq!(
+            counts,
+            vec![capacity; 84 / capacity],
+            "{route:?}, cold={cold}"
+        );
+    }
+
+    #[test]
+    fn dense_insert_cached() {
+        dense_sequential(Route::Insert, false);
+    }
+
+    #[test]
+    fn dense_insert_uncached() {
+        dense_sequential(Route::Insert, true);
+    }
+
+    #[test]
+    fn dense_insert_if_absent_cached() {
+        dense_sequential(Route::IfAbsent, false);
+    }
+
+    #[test]
+    fn dense_insert_if_absent_uncached() {
+        dense_sequential(Route::IfAbsent, true);
+    }
+
+    #[test]
+    fn dense_insert_or_fetch_cached() {
+        dense_sequential(Route::OrFetch, false);
+    }
+
+    #[test]
+    fn dense_insert_or_fetch_uncached() {
+        dense_sequential(Route::OrFetch, true);
+    }
+
+    #[test]
+    fn dense_explicit_lil_insert() {
+        dense_sequential(Route::Lil, false);
+    }
+
+    #[test]
+    fn dense_insert_at_leaf() {
+        dense_sequential(Route::AtLeaf, true);
+    }
+
+    #[test]
+    fn dense_insert_if_absent_at_leaf() {
+        dense_sequential(Route::IfAbsentAtLeaf, true);
+    }
+
+    #[test]
+    fn deep_append_and_deletion_preserve_cow_snapshot() {
+        for route in [Route::Insert, Route::IfAbsent, Route::OrFetch] {
+            let (mut pages, mut alloc, mut tree) = new_tree();
+            let mut expected = Expected::new();
+            for id in 0..24 {
+                let key = wide_key(id);
+                let value = payload(id, 1_024);
+                insert_new(
+                    &mut tree,
+                    &mut pages,
+                    &mut alloc,
+                    TxnId(1),
+                    &key,
+                    &value,
+                    route,
+                    false,
+                );
+                expected.insert(key, (ValueType::Inline, value));
+            }
+            let snapshot = tree.clone();
+            let original = expected.clone();
+            for id in 24..96 {
+                let key = wide_key(id);
+                let value = payload(id, 1_024);
+                insert_new(
+                    &mut tree,
+                    &mut pages,
+                    &mut alloc,
+                    TxnId(2),
+                    &key,
+                    &value,
+                    route,
+                    false,
+                );
+                expected.insert(key, (ValueType::Inline, value));
+            }
+            assert!(
+                tree.depth >= 3,
+                "wide keys must exercise branch split propagation"
+            );
+            assert_ne!(tree.root, snapshot.root);
+            assert_contents(&tree, &pages, &expected);
+            assert_contents(&snapshot, &pages, &original);
+            assert_eq!(snapshot.search(&pages, &wide_key(24)).unwrap(), None);
+
+            // Drain an interleaved order, including the new sparse right edge.
+            for step in 0..96 {
+                let id = (step * 37) % 96;
+                let key = wide_key(id);
+                assert!(tree.delete(&mut pages, &mut alloc, TxnId(3), &key).unwrap());
+                expected.remove(&key);
+                if step % 24 == 23 {
+                    assert_contents(&tree, &pages, &expected);
+                }
+            }
+            assert_eq!(pages[&tree.root].page_type(), Some(PageType::Leaf));
+            // Interior branch splicing can leave depth as a conservative
+            // walk-capacity bound; the observable root must still be a leaf.
+            assert!(tree.depth >= 1);
+            assert_contents(&snapshot, &pages, &original);
+            insert_new(
+                &mut tree,
+                &mut pages,
+                &mut alloc,
+                TxnId(3),
+                &wide_key(100),
+                b"reused",
+                route,
+                false,
+            );
+            expected.insert(wide_key(100), (ValueType::Inline, b"reused".to_vec()));
+            assert_contents(&tree, &pages, &expected);
+        }
+    }
+
+    #[test]
+    fn growing_last_key_is_replacement_after_failed_leaf_write() {
+        for sorted_update in [false, true] {
+            let (mut pages, mut alloc, mut tree) = new_tree();
+            let mut expected = Expected::new();
+            for id in 0..7 {
+                let key = key(id);
+                let value = payload(id, 1_024);
+                insert_new(
+                    &mut tree,
+                    &mut pages,
+                    &mut alloc,
+                    TxnId(1),
+                    &key,
+                    &value,
+                    Route::Insert,
+                    false,
+                );
+                expected.insert(key, (ValueType::Inline, value));
+            }
+            assert_eq!(tree.depth, 1);
+            let snapshot = tree.clone();
+            let original = expected.clone();
+            let last_key = key(6);
+            let grown = payload(106, citadel_core::MAX_INLINE_VALUE_SIZE);
+            if sorted_update {
+                let mut replaced = Vec::new();
+                let mut skipped = Vec::new();
+                assert_eq!(
+                    tree.update_sorted(
+                        &mut pages,
+                        &mut alloc,
+                        TxnId(2),
+                        &[(&last_key, ValueType::Inline, &grown)],
+                        &mut replaced,
+                        &mut skipped,
+                    )
+                    .unwrap(),
+                    1
+                );
+                assert!(replaced.is_empty());
+                assert!(skipped.is_empty());
+            } else {
+                assert!(!tree
+                    .insert(
+                        &mut pages,
+                        &mut alloc,
+                        TxnId(2),
+                        &last_key,
+                        ValueType::Inline,
+                        &grown
+                    )
+                    .unwrap());
+            }
+            expected.insert(last_key.clone(), (ValueType::Inline, grown));
+            assert_contents(&tree, &pages, &expected);
+            assert_contents(&snapshot, &pages, &original);
+            let leaves = leaf_ids(&tree, &pages);
+            assert_eq!(
+                leaves.len(),
+                2,
+                "growing the maximum must split this full leaf"
+            );
+            assert!(
+                leaves.iter().all(|id| pages[id].num_cells() >= 2),
+                "replacement must retain the balanced fallback, not a new singleton append leaf"
+            );
+            assert!(!tree
+                .insert(
+                    &mut pages,
+                    &mut alloc,
+                    TxnId(2),
+                    &last_key,
+                    ValueType::Inline,
+                    b""
+                )
+                .unwrap());
+            expected.insert(last_key, (ValueType::Inline, Vec::new()));
+            insert_new(
+                &mut tree,
+                &mut pages,
+                &mut alloc,
+                TxnId(2),
+                &key(7),
+                b"next",
+                Route::Insert,
+                false,
+            );
+            expected.insert(key(7), (ValueType::Inline, b"next".to_vec()));
+            assert_contents(&tree, &pages, &expected);
+        }
+    }
+
+    #[test]
+    fn maximum_tombstone_revival_keeps_one_key_and_balanced_split() {
+        for route in [Route::IfAbsent, Route::OrFetch] {
+            let (mut pages, mut alloc, mut tree) = new_tree();
+            let mut expected = Expected::new();
+            for id in 0..6 {
+                let key = key(id);
+                let value = payload(id, 1_024);
+                insert_new(
+                    &mut tree,
+                    &mut pages,
+                    &mut alloc,
+                    TxnId(1),
+                    &key,
+                    &value,
+                    Route::Insert,
+                    false,
+                );
+                expected.insert(key, (ValueType::Inline, value));
+            }
+            let last_key = key(6);
+            assert!(tree
+                .insert(
+                    &mut pages,
+                    &mut alloc,
+                    TxnId(1),
+                    &last_key,
+                    ValueType::Tombstone,
+                    b"",
+                )
+                .unwrap());
+            assert_eq!(tree.depth, 1);
+            let grown = payload(106, citadel_core::MAX_INLINE_VALUE_SIZE);
+            // Six existing 1 KiB cells plus this replacement no longer fit.
+            // The failed leaf insertion removes the tombstone first, so a
+            // comparison against the remaining max would misclassify it.
+            match route {
+                Route::IfAbsent => assert!(tree
+                    .insert_if_absent(
+                        &mut pages,
+                        &mut alloc,
+                        TxnId(2),
+                        &last_key,
+                        ValueType::Inline,
+                        &grown,
+                    )
+                    .unwrap()),
+                Route::OrFetch => assert!(tree
+                    .insert_or_fetch(
+                        &mut pages,
+                        &mut alloc,
+                        TxnId(2),
+                        &last_key,
+                        ValueType::Inline,
+                        &grown,
+                    )
+                    .unwrap()
+                    .is_none()),
+                _ => unreachable!(),
+            }
+            expected.insert(last_key, (ValueType::Inline, grown));
+            // The existing APIs count tombstone revival as an insertion;
+            // verify physical rows here to isolate split classification.
+            let mut cursor = Cursor::first(&pages, tree.root).unwrap();
+            let mut actual = Vec::new();
+            while let Some(entry) = cursor.current(&pages) {
+                actual.push((entry.key, (entry.val_type, entry.value)));
+                cursor.next(&pages).unwrap();
+            }
+            assert_eq!(
+                actual,
+                expected
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect::<Vec<_>>()
+            );
+            for (key, value) in &expected {
+                assert_eq!(tree.search(&pages, key).unwrap(), Some(value.clone()));
+            }
+            let leaves = leaf_ids(&tree, &pages);
+            assert_eq!(leaves.len(), 2);
+            assert!(
+                leaves.iter().all(|id| pages[id].num_cells() >= 2),
+                "reviving the physical maximum is not a new rightmost append"
+            );
+        }
+    }
+
+    #[test]
+    fn non_rightmost_leaf_maximum_gap_uses_balanced_fallback() {
+        for route in [Route::Insert, Route::IfAbsent, Route::OrFetch] {
+            let (mut pages, mut alloc, mut tree) = new_tree();
+            let mut expected = Expected::new();
+            for id in (0..7).map(|id| id * 100).chain([1_000]) {
+                let key = key(id);
+                let value = payload(id, 1_024);
+                insert_new(
+                    &mut tree,
+                    &mut pages,
+                    &mut alloc,
+                    TxnId(1),
+                    &key,
+                    &value,
+                    route,
+                    false,
+                );
+                expected.insert(key, (ValueType::Inline, value));
+            }
+            let leaves = leaf_ids(&tree, &pages);
+            assert_eq!(leaves.len(), 2);
+            let left = leaves[0];
+            let upper = u32::from_be_bytes(
+                leaf_node::read_cell(&pages[&leaves[1]], 0)
+                    .key
+                    .try_into()
+                    .unwrap(),
+            );
+            // Adapt to either the old half split or dense append layout, then
+            // fill the first leaf using keys below its neighbor's lower bound.
+            while pages[&left].num_cells() < 7 {
+                let page = &pages[&left];
+                let id = u32::from_be_bytes(
+                    leaf_node::read_cell(page, page.num_cells() - 1)
+                        .key
+                        .try_into()
+                        .unwrap(),
+                ) + 1;
+                assert!(id < upper);
+                let value = payload(id, 1_024);
+                insert_new(
+                    &mut tree,
+                    &mut pages,
+                    &mut alloc,
+                    TxnId(1),
+                    &key(id),
+                    &value,
+                    route,
+                    true,
+                );
+                expected.insert(key(id), (ValueType::Inline, value));
+            }
+            let page = &pages[&left];
+            let id = u32::from_be_bytes(
+                leaf_node::read_cell(page, page.num_cells() - 1)
+                    .key
+                    .try_into()
+                    .unwrap(),
+            ) + 1;
+            assert!(id < upper);
+            let (path, _) = tree.walk_to_leaf(&pages, &key(id)).unwrap();
+            assert!(path
+                .iter()
+                .any(|(id, child)| *child < pages[id].num_cells() as usize));
+            let value = payload(id, 1_024);
+            insert_new(
+                &mut tree,
+                &mut pages,
+                &mut alloc,
+                TxnId(1),
+                &key(id),
+                &value,
+                route,
+                true,
+            );
+            expected.insert(key(id), (ValueType::Inline, value));
+            assert_contents(&tree, &pages, &expected);
+            let leaves = leaf_ids(&tree, &pages);
+            assert_eq!(leaves.len(), 3);
+            assert!(
+                leaves[..2].iter().all(|id| pages[id].num_cells() >= 2),
+                "an interior gap must not create an append-only singleton leaf"
+            );
+        }
+    }
+
+    #[test]
+    fn random_backfill_duplicates_and_delete_collapse_preserve_rows() {
+        let (mut pages, mut alloc, mut tree) = new_tree();
+        let mut expected = Expected::new();
+        for id in (0..128)
+            .step_by(2)
+            .chain((0..64).map(|i| ((i * 37) % 64) * 2 + 1))
+        {
+            let key = key(id);
+            let value = payload(id, 1_024);
+            insert_new(
+                &mut tree,
+                &mut pages,
+                &mut alloc,
+                TxnId(1),
+                &key,
+                &value,
+                Route::IfAbsent,
+                false,
+            );
+            expected.insert(key, (ValueType::Inline, value));
+        }
+        assert_contents(&tree, &pages, &expected);
+        for id in [0, 1, 63, 126, 127] {
+            assert!(!tree
+                .insert_if_absent(
+                    &mut pages,
+                    &mut alloc,
+                    TxnId(1),
+                    &key(id),
+                    ValueType::Inline,
+                    b"wrong"
+                )
+                .unwrap());
+            assert_eq!(
+                tree.insert_or_fetch(
+                    &mut pages,
+                    &mut alloc,
+                    TxnId(1),
+                    &key(id),
+                    ValueType::Inline,
+                    b"wrong"
+                )
+                .unwrap(),
+                expected.get(&key(id)).cloned()
+            );
+        }
+        assert_contents(&tree, &pages, &expected);
+        for step in 0..128 {
+            let key = key((step * 53) % 128);
+            assert!(tree.delete(&mut pages, &mut alloc, TxnId(2), &key).unwrap());
+            expected.remove(&key);
+            if step % 16 == 15 {
+                assert_contents(&tree, &pages, &expected);
+            }
+        }
+        assert_eq!(tree.depth, 1);
+        assert_eq!(pages[&tree.root].page_type(), Some(PageType::Leaf));
+    }
+
+    #[test]
+    fn large_keys_and_staged_overflow_append_preserve_tags_and_snapshot() {
+        let (mut pages, mut alloc, mut tree) = new_tree();
+        let mut expected = Expected::new();
+        for id in 0..2 {
+            let key = wide_key(id);
+            let value = payload(id, citadel_core::MAX_INLINE_VALUE_SIZE);
+            insert_new(
+                &mut tree,
+                &mut pages,
+                &mut alloc,
+                TxnId(1),
+                &key,
+                &value,
+                Route::Insert,
+                false,
+            );
+            expected.insert(key, (ValueType::Inline, value));
+        }
+        assert_eq!(tree.depth, 1);
+        let snapshot = tree.clone();
+        let original = expected.clone();
+        let overflow = leaf_node::OverflowRef {
+            first_page: PageId(4_242),
+            total_len: 8_000,
+        }
+        .to_bytes();
+        assert!(tree
+            .insert_if_absent(
+                &mut pages,
+                &mut alloc,
+                TxnId(2),
+                &wide_key(2),
+                ValueType::Overflow,
+                &overflow
+            )
+            .unwrap());
+        expected.insert(wide_key(2), (ValueType::Overflow, overflow.to_vec()));
+        assert!(tree.depth >= 2);
+        assert_contents(&tree, &pages, &expected);
+        assert_contents(&snapshot, &pages, &original);
+        assert_eq!(
+            tree.insert_or_fetch(
+                &mut pages,
+                &mut alloc,
+                TxnId(2),
+                &wide_key(2),
+                ValueType::Inline,
+                b"wrong"
+            )
+            .unwrap(),
+            Some((ValueType::Overflow, overflow.to_vec()))
+        );
+        assert_eq!(tree.entry_count, 3);
+    }
+}
