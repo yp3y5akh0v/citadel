@@ -1,5 +1,5 @@
 use citadel::{Argon2Profile, DatabaseBuilder};
-use citadel_sql::{Connection, ExecutionResult, Value};
+use citadel_sql::{Connection, ExecutionResult, SqlError, Value};
 
 fn create_db(dir: &std::path::Path) -> citadel::Database {
     let db_path = dir.join("test.db");
@@ -23,6 +23,86 @@ fn seed(conn: &Connection<'_>) {
         .unwrap();
     conn.execute("INSERT INTO t VALUES (5, '[1.0, 1.0, 1.0]'::VECTOR(3))")
         .unwrap();
+}
+
+#[test]
+fn vector_topk_materializes_referenced_virtual_columns_for_hits_and_tail() {
+    for indexed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        conn.execute(
+            "CREATE TABLE t (
+                id INTEGER PRIMARY KEY,
+                category INTEGER,
+                a INTEGER,
+                v VECTOR(2),
+                g INTEGER GENERATED ALWAYS AS (a * 2) VIRTUAL,
+                h INTEGER GENERATED ALWAYS AS (id + category) VIRTUAL
+            )",
+        )
+        .unwrap();
+        if indexed {
+            conn.execute(
+                "CREATE INDEX ix_v ON t USING ann (v)
+                 WITH (metric = 'l2', filters = 'category')",
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO t (id, category, a, v) VALUES
+             (1, 1, 9223372036854775807, '[0, 0]'::VECTOR(2)),
+             (2, 1, 9223372036854775807, '[1, 0]'::VECTOR(2)),
+             (3, 1, 9223372036854775807, '[2, 0]'::VECTOR(2)),
+             (4, 1, 9223372036854775807, '[3, 0]'::VECTOR(2))",
+        )
+        .unwrap();
+
+        for (tail, expected) in [(false, [2, 3]), (true, [5, 6])] {
+            if tail {
+                conn.execute(
+                    "INSERT INTO t (id, category, a, v) VALUES
+                     (5, 1, 9223372036854775807, '[0.25, 0]'::VECTOR(2))",
+                )
+                .unwrap();
+                if indexed {
+                    assert!(conn.ann_cache_status("t", "v").unwrap().is_some());
+                }
+            }
+            for begin in [None, Some("BEGIN READ ONLY"), Some("BEGIN")] {
+                if let Some(begin) = begin {
+                    conn.execute(begin).unwrap();
+                }
+                let sql = "SELECT id, h FROM t WHERE category = 1 AND h > 2
+                           ORDER BY v <-> '[0, 0]'::VECTOR(2) LIMIT 1";
+                let expected = vec![expected.map(Value::Integer).to_vec()];
+                assert_eq!(conn.query(sql).unwrap().rows, expected);
+                assert_eq!(
+                    conn.prepare(sql).unwrap().query_collect(&[]).unwrap().rows,
+                    expected
+                );
+                if indexed && begin.is_none() {
+                    assert!(conn.ann_cache_status("t", "v").unwrap().is_some());
+                }
+                let empty = "SELECT id FROM t WHERE category = 1 AND h < 0
+                             ORDER BY v <-> '[0, 0]'::VECTOR(2) LIMIT 1";
+                assert!(conn.query(empty).unwrap().rows.is_empty());
+                let demanded = "SELECT g FROM t WHERE category = 1
+                                ORDER BY v <-> '[0, 0]'::VECTOR(2) LIMIT 1";
+                assert!(matches!(
+                    conn.query(demanded),
+                    Err(SqlError::IntegerOverflow)
+                ));
+                assert!(matches!(
+                    conn.prepare(demanded).unwrap().query_collect(&[]),
+                    Err(SqlError::IntegerOverflow)
+                ));
+                if begin.is_some() {
+                    conn.execute("ROLLBACK").unwrap();
+                }
+            }
+        }
+    }
 }
 
 #[test]

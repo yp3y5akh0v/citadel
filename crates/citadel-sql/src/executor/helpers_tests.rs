@@ -750,6 +750,111 @@ fn materialize_virtual_no_op_when_no_virtual_columns() {
 }
 
 #[test]
+fn partial_virtual_decode_collects_dependencies_in_scalar_expression_forms() {
+    for (sql, data_type, expected) in [
+        ("a IS NULL", DataType::Boolean, Value::Boolean(false)),
+        ("a IS NOT NULL", DataType::Boolean, Value::Boolean(true)),
+        ("a BETWEEN b AND c", DataType::Boolean, Value::Boolean(true)),
+        ("a IN (b, c)", DataType::Boolean, Value::Boolean(false)),
+        (
+            "a IS DISTINCT FROM b",
+            DataType::Boolean,
+            Value::Boolean(true),
+        ),
+        (
+            "body LIKE pattern ESCAPE '!'",
+            DataType::Boolean,
+            Value::Boolean(true),
+        ),
+        (
+            "body COLLATE NOCASE",
+            DataType::Text,
+            Value::Text("pre_fix".into()),
+        ),
+        ("CAST(a IS NOT NULL AS INTEGER)", DataType::Integer, i(1)),
+    ] {
+        let mut columns = cols(&[
+            ("id", DataType::Integer),
+            ("a", DataType::Integer),
+            ("b", DataType::Integer),
+            ("c", DataType::Integer),
+            ("body", DataType::Text),
+            ("pattern", DataType::Text),
+            ("g", data_type),
+            ("unused", DataType::Integer),
+        ]);
+        columns[6].generated_kind = Some(GeneratedKind::Virtual);
+        columns[6].generated_expr = Some(crate::parser::parse_sql_expr(sql).unwrap());
+        columns[7].generated_kind = Some(GeneratedKind::Virtual);
+        columns[7].generated_expr =
+            Some(crate::parser::parse_sql_expr("9223372036854775807 + a").unwrap());
+        let table = schema("t", columns, vec![0]);
+        let key = encode_composite_key(&[i(1)]);
+        let value = crate::encoding::encode_row(&[
+            i(3),
+            i(2),
+            i(4),
+            Value::Text("pre_fix".into()),
+            Value::Text("pre!_%".into()),
+            Value::Null,
+            Value::Null,
+        ]);
+
+        let decoder = PartialDecodeCtx::new_with_cancel(&table, &[6], None).unwrap();
+        let row = decoder.decode_with_cancel(&key, &value, None).unwrap();
+        assert_eq!(row[6], expected, "{sql}");
+        assert_eq!(row[7], Value::Null, "{sql}");
+    }
+}
+
+#[test]
+fn partial_virtual_decode_deduplicates_dependencies_and_resets_reused_rows() {
+    let mut columns = cols(&[
+        ("id", DataType::Integer),
+        ("a", DataType::Integer),
+        ("g", DataType::Boolean),
+    ]);
+    columns[2].generated_kind = Some(GeneratedKind::Virtual);
+    columns[2].generated_expr = Some(crate::parser::parse_sql_expr("a BETWEEN a AND a").unwrap());
+    let table = schema("t", columns, vec![0]);
+    let decoder = PartialDecodeCtx::new_with_cancel(&table, &[2, 1, 2], None).unwrap();
+    assert_eq!(decoder.nonpk_targets, vec![0, 1]);
+    let key = encode_composite_key(&[i(1)]);
+    let mut row = Vec::new();
+    for (input, expected) in [(i(3), Value::Boolean(true)), (Value::Null, Value::Null)] {
+        let value = crate::encoding::encode_row(&[input, Value::Null]);
+        decoder
+            .decode_into_with_cancel(&key, &value, &mut row, None)
+            .unwrap();
+        assert_eq!(row[2], expected);
+    }
+}
+
+#[test]
+fn partial_virtual_decode_matches_full_decode_for_nested_dependencies() {
+    let mut columns = cols(&[
+        ("id", DataType::Integer),
+        ("a", DataType::Integer),
+        ("g1", DataType::Integer),
+        ("g2", DataType::Boolean),
+    ]);
+    for (index, sql) in [(2, "a * 2"), (3, "g1 IS NULL")] {
+        columns[index].generated_kind = Some(GeneratedKind::Virtual);
+        columns[index].generated_expr = Some(crate::parser::parse_sql_expr(sql).unwrap());
+    }
+    let table = schema("t", columns, vec![0]);
+    let key = encode_composite_key(&[i(1)]);
+    let decoder = PartialDecodeCtx::new_with_cancel(&table, &[3], None).unwrap();
+    for (input, expected) in [(i(3), false), (Value::Null, true)] {
+        let value = crate::encoding::encode_row(&[input, Value::Null, Value::Null]);
+        let full = decode_full_row_with_cancel(&table, &key, &value, None).unwrap();
+        let partial = decoder.decode_with_cancel(&key, &value, None).unwrap();
+        assert_eq!(partial[3], Value::Boolean(expected));
+        assert_eq!(partial[3], full[3]);
+    }
+}
+
+#[test]
 fn decoding_an_old_row_passes_cancellation_to_its_default_expression() {
     use crate::encoding::{encode_composite_key, encode_row};
 

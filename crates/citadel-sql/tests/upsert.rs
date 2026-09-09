@@ -101,12 +101,10 @@ fn upsert_checked_excluded_virtual_is_unused_without_an_accepted_conflict() {
                 "INSERT INTO t (id, a) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET a = excluded.g WHERE excluded.g > 0",
                 &[Value::Integer(2), Value::Integer(i64::MAX)],
             ).unwrap(), 1);
-            // Aggregate projection reads only the requested base columns; full-row scan
-            // projection may evaluate virtuals even when SELECT does not name them.
-            assert_eq!(query(conn, "SELECT COUNT(*) FROM t").rows, vec![vec![Value::Integer(2)]]);
-            for (id, expected) in [(1, 1), (2, i64::MAX)] {
-                assert_eq!(query(conn, &format!("SELECT MAX(a) FROM t WHERE id = {id}")).rows, vec![vec![Value::Integer(expected)]]);
-            }
+            assert_eq!(query(conn, "SELECT id, a FROM t ORDER BY id").rows, vec![
+                vec![Value::Integer(1), Value::Integer(1)],
+                vec![Value::Integer(2), Value::Integer(i64::MAX)],
+            ]);
             assert!(matches!(conn.query("SELECT g FROM t WHERE id = 2"), Err(SqlError::IntegerOverflow)));
         },
     );

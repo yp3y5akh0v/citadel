@@ -1,5 +1,5 @@
 use citadel::{Argon2Profile, DatabaseBuilder};
-use citadel_sql::{Connection, DataType, ExecutionResult, Value};
+use citadel_sql::{Connection, DataType, ExecutionResult, SqlError, Value};
 
 const MAX_ROWS: &str = "9223372036854775807";
 
@@ -44,6 +44,48 @@ fn seed_small_tables(conn: &Connection<'_>) {
     }
     conn.execute("INSERT INTO items VALUES (1, 9), (2, 1)")
         .unwrap();
+}
+
+#[test]
+fn topk_materializes_only_referenced_virtual_columns() {
+    let db = database();
+    let conn = Connection::open(&db).unwrap();
+    conn.execute(
+        "CREATE TABLE items (
+            id INTEGER PRIMARY KEY,
+            rank INTEGER,
+            a INTEGER,
+            g INTEGER GENERATED ALWAYS AS (a * 2) VIRTUAL,
+            h INTEGER GENERATED ALWAYS AS (rank + 1) VIRTUAL
+        )",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO items (id, rank, a) VALUES
+         (1, 2, 9223372036854775807), (2, 1, 9223372036854775807)",
+    )
+    .unwrap();
+
+    in_transactions(&conn, || {
+        for (order, id, rank) in [("id", 1, 2), ("items.rank", 2, 1)] {
+            assert_query(
+                &conn,
+                &format!("SELECT id, rank FROM items ORDER BY {order} LIMIT 1"),
+                &[vec![Value::Integer(id), Value::Integer(rank)]],
+            );
+            assert_query(
+                &conn,
+                &format!("SELECT id, h AS rank FROM items ORDER BY {order} LIMIT 1"),
+                &[vec![Value::Integer(id), Value::Integer(rank + 1)]],
+            );
+            let sql = format!("SELECT g FROM items ORDER BY {order} LIMIT 1");
+            assert!(matches!(conn.query(&sql), Err(SqlError::IntegerOverflow)));
+            assert!(matches!(
+                conn.prepare(&sql).unwrap().query_collect(&[]),
+                Err(SqlError::IntegerOverflow)
+            ));
+        }
+    });
 }
 
 #[test]
