@@ -937,6 +937,7 @@ impl TxnManager {
             old_slot.pending_free_root,
             old_slot.high_water_mark,
             old_slot.txn_id,
+            alloc.ready_count(),
         )?;
         // Publish provenance only with the new slot. Failed commits must leave
         // the current slot's classifications unchanged.
@@ -947,6 +948,16 @@ impl TxnManager {
             write_god_byte(&*self.io, recovery_god_byte)?;
         }
 
+        // Reclaimed allocations are below the committed high water mark;
+        // fresh allocations start at it. The allocation log also follows
+        // savepoint rollback, so discovery scales with this transaction's
+        // allocations rather than the entire reusable-page pool.
+        let consumed: FxHashSet<PageId> = alloc
+            .allocated_this_txn()
+            .iter()
+            .copied()
+            .filter(|page_id| page_id.as_u32() < old_slot.high_water_mark)
+            .collect();
         let freed_this_txn = alloc.commit();
 
         // Freed pages are unreachable via tree; don't encrypt+write them.
@@ -955,21 +966,9 @@ impl TxnManager {
         }
 
         // Data-page reuse respects readers; metadata needs only recovery-slot
-        // protection. Consumption is the loan minus this remainder, which also
-        // supplies the chain rewrite's structure pages.
+        // protection. The unconsumed loan remainder supplies the chain
+        // rewrite's structure pages.
         let mut loan_pool = alloc.take_ready_to_use();
-        let consumed: FxHashSet<PageId> = {
-            // Set lookup: a Vec::contains scan here is quadratic in the
-            // reclaimed batch (a bulk DELETE can loan 100k+ pages).
-            let remainder: FxHashSet<PageId> = loan_pool.iter().copied().collect();
-            let state = self.state.lock();
-            state
-                .reclaimed_pages
-                .iter()
-                .filter(|page_id| !remainder.contains(page_id))
-                .copied()
-                .collect()
-        };
         let (new_pf_root, available) = {
             pending_free.process_with_metadata(
                 pages,
@@ -1212,7 +1211,10 @@ impl TxnManager {
             state.cached_file_size = new_file_size;
             // Availability is re-derived from the durable chain every commit,
             // so an abort, no-op commit, or shutdown strands nothing.
-            state.reclaimed_pages = Arc::new(available.iter().map(|entry| entry.page_id).collect());
+            // The allocator pops from the end. Prefer entries near the chain
+            // head so small commits can share the unchanged metadata tail.
+            state.reclaimed_pages =
+                Arc::new(available.iter().rev().map(|entry| entry.page_id).collect());
             state.retired_chain_pages = retired_chain_pages;
             if let Some((watermark, chain_watermark)) = zeroed_watermark {
                 state.zeroed_up_to = watermark;
@@ -2435,23 +2437,30 @@ impl TxnManager {
         root: PageId,
         high_water_mark: u32,
         slot_txn: TxnId,
+        capacity_hint: usize,
     ) -> Result<pending_free::ChainSnapshot> {
         // Local reclaim invariants only. Proving an entry is absent from every
         // live tree needs an O(database) walk per commit, so that stays behind
         // the explicit integrity_check boundary.
-        pending_free::ChainSnapshot::read_committed(root, high_water_mark, slot_txn, |page_id| {
-            if page_id.as_u32() >= high_water_mark {
-                return Err(Error::PageOutOfBounds(page_id));
-            }
-            let page = match pages.get(&page_id) {
-                Some(page) => PendingFreePage::Borrowed(page),
-                None => PendingFreePage::Cached(self.fetch_page(page_id)?),
-            };
-            if page.txn_id() > slot_txn {
-                return Err(Error::DatabaseCorrupted);
-            }
-            Ok(page)
-        })
+        pending_free::ChainSnapshot::read_committed(
+            root,
+            high_water_mark,
+            slot_txn,
+            capacity_hint,
+            |page_id| {
+                if page_id.as_u32() >= high_water_mark {
+                    return Err(Error::PageOutOfBounds(page_id));
+                }
+                let page = match pages.get(&page_id) {
+                    Some(page) => PendingFreePage::Borrowed(page),
+                    None => PendingFreePage::Cached(self.fetch_page(page_id)?),
+                };
+                if page.txn_id() > slot_txn {
+                    return Err(Error::DatabaseCorrupted);
+                }
+                Ok(page)
+            },
+        )
     }
 
     pub(crate) fn fetch_page_owned(&self, page_id: PageId) -> Result<Page> {

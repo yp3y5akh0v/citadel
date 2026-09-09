@@ -410,7 +410,7 @@ fn chain_snapshot_reads_each_page_once_and_processes_without_old_pages_in_write_
     let root = write_chain(&mut pages, TxnId(7), &initial, &old_ids);
     let mut loaded = Vec::new();
     let snapshot =
-        ChainSnapshot::read_committed(root, alloc.high_water_mark(), TxnId(7), |page_id| {
+        ChainSnapshot::read_committed(root, alloc.high_water_mark(), TxnId(7), 0, |page_id| {
             loaded.push(page_id);
             pages.get(&page_id).ok_or(Error::PageOutOfBounds(page_id))
         })
@@ -785,7 +785,7 @@ fn chain_snapshot_validates_committed_entry_bounds_and_ages() {
             }],
             &[PageId(100)],
         );
-        let result = ChainSnapshot::read_committed(root, high_water_mark, slot_txn, |id| {
+        let result = ChainSnapshot::read_committed(root, high_water_mark, slot_txn, 0, |id| {
             pages.get(&id).ok_or(Error::PageOutOfBounds(id))
         });
         assert_eq!(
@@ -953,7 +953,7 @@ fn an_invalid_committed_entry_stops_before_loading_the_next_page() {
     );
     pages.get_mut(&root).unwrap().set_right_child(PageId(102));
     let mut loaded = Vec::new();
-    let result = ChainSnapshot::read_committed(root, 103, TxnId(6), |id| {
+    let result = ChainSnapshot::read_committed(root, 103, TxnId(6), 0, |id| {
         loaded.push(id);
         pages.get(&id).ok_or(Error::PageOutOfBounds(id))
     });
@@ -987,7 +987,7 @@ fn chain_snapshot_conserves_entries_across_the_loan_overshoot_boundary() {
             .map(|id| pages[id].as_bytes().to_vec())
             .collect();
         let high_water_mark = alloc.high_water_mark();
-        let snapshot = ChainSnapshot::read_committed(root, high_water_mark, TxnId(7), |id| {
+        let snapshot = ChainSnapshot::read_committed(root, high_water_mark, TxnId(7), 0, |id| {
             pages.get(&id).ok_or(Error::PageOutOfBounds(id))
         })
         .unwrap();
@@ -1142,5 +1142,670 @@ fn chain_snapshot_updates_swapped_indices_and_handles_exhausted_loans() {
         }));
         assert_same_entries(&read_chain(&pages, new_root).unwrap(), &expected);
         assert_same_entries(&available, &expected_available);
+    }
+}
+
+#[test]
+fn committed_chain_capacity_hints_preserve_validation_and_load_order() {
+    let count = MAX_ENTRIES_PER_PAGE + 3;
+    let ids = [PageId(10_000), PageId(10_001)];
+    let high_water_mark = 10_002;
+    let original: Vec<_> = (0..count)
+        .map(|index| PendingFreeEntry {
+            page_id: PageId(100 + index as u32),
+            freed_at_txn: TxnId(index as u64 % 7 + 1),
+        })
+        .collect();
+    for case in [
+        "valid",
+        "duplicate",
+        "cycle",
+        "future age",
+        "bounds",
+        "chain ID",
+    ] {
+        let mut entries = original.clone();
+        match case {
+            "duplicate" => entries[MAX_ENTRIES_PER_PAGE] = entries[0],
+            "future age" => entries[0].freed_at_txn = TxnId(8),
+            "bounds" => entries[0].page_id = PageId(high_water_mark),
+            "chain ID" => entries[0].page_id = ids[1],
+            _ => {}
+        }
+        let mut pages = FxHashMap::default();
+        let root = write_chain(&mut pages, TxnId(7), &entries, &ids);
+        if case == "cycle" {
+            pages.get_mut(&ids[1]).unwrap().set_right_child(root);
+        }
+        let expected_loads = if matches!(case, "future age" | "bounds") {
+            &ids[..1]
+        } else {
+            &ids[..]
+        };
+        for hint in [0, 1, count, usize::MAX] {
+            let mut loaded = Vec::new();
+            let result =
+                ChainSnapshot::read_committed(root, high_water_mark, TxnId(7), hint, |id| {
+                    loaded.push(id);
+                    pages.get(&id).ok_or(Error::PageOutOfBounds(id))
+                });
+            assert_eq!(loaded, expected_loads, "case {case}, hint {hint}");
+            if case == "valid" {
+                let snapshot = result.unwrap();
+                assert_eq!(snapshot.entries, original);
+                assert_eq!(snapshot.page_ids, ids);
+            } else {
+                assert!(
+                    matches!(result, Err(Error::DatabaseCorrupted)),
+                    "case {case}, hint {hint}"
+                );
+            }
+        }
+    }
+    for hint in [0, 1, count, usize::MAX] {
+        let empty = ChainSnapshot::read_committed(
+            PageId::INVALID,
+            high_water_mark,
+            TxnId(7),
+            hint,
+            |id| -> Result<std::sync::Arc<Page>> { panic!("empty chain must not load {id}") },
+        )
+        .unwrap();
+        assert!(empty.entries.is_empty());
+        assert!(empty.page_ids.is_empty());
+        assert_eq!(
+            empty.entries.capacity(),
+            0,
+            "empty chain allocates no entries"
+        );
+        assert_eq!(
+            empty.entry_indices.capacity(),
+            0,
+            "empty chain allocates no index"
+        );
+    }
+}
+
+mod head_consuming_cow {
+    use super::*;
+
+    struct Fixture {
+        pages: FxHashMap<PageId, Page>,
+        alloc: PageAllocator,
+        ids: [PageId; 3],
+        entries: Vec<PendingFreeEntry>,
+        head_len: usize,
+    }
+
+    impl Fixture {
+        fn new(head_len: usize) -> Self {
+            let mut alloc = PageAllocator::new(10_000);
+            let ids = [alloc.allocate(), alloc.allocate(), alloc.allocate()];
+            let entries: Vec<_> = (0..head_len + MAX_ENTRIES_PER_PAGE + 3)
+                .map(|index| PendingFreeEntry {
+                    page_id: PageId(100 + index as u32),
+                    freed_at_txn: TxnId(if index % 2 == 0 { 1 } else { 4 }),
+                })
+                .collect();
+            let mut pages = FxHashMap::default();
+            write_chain_page(&mut pages, TxnId(7), ids[0], ids[1], &entries[..head_len]);
+            write_chain_page(
+                &mut pages,
+                TxnId(7),
+                ids[1],
+                ids[2],
+                &entries[head_len..head_len + MAX_ENTRIES_PER_PAGE],
+            );
+            write_chain_page(
+                &mut pages,
+                TxnId(7),
+                ids[2],
+                PageId::INVALID,
+                &entries[head_len + MAX_ENTRIES_PER_PAGE..],
+            );
+            Self {
+                pages,
+                alloc,
+                ids,
+                entries,
+                head_len,
+            }
+        }
+
+        fn snapshot(&self) -> ChainSnapshot {
+            ChainSnapshot::read_committed(
+                self.ids[0],
+                self.alloc.high_water_mark(),
+                TxnId(7),
+                0,
+                |id| self.pages.get(&id).ok_or(Error::PageOutOfBounds(id)),
+            )
+            .unwrap()
+        }
+
+        fn metadata(&self) -> FxHashMap<PageId, TxnId> {
+            // Exact metadata ages bypass the pinned data horizon; stale ages do not.
+            [
+                (self.entries[1].page_id, TxnId(4)),
+                (self.entries[3].page_id, TxnId(3)),
+                (self.entries[self.head_len + 1].page_id, TxnId(4)),
+            ]
+            .into_iter()
+            .collect()
+        }
+
+        fn combined(&self, written: &FxHashMap<PageId, Page>) -> FxHashMap<PageId, Page> {
+            let mut combined = self.pages.clone();
+            combined.extend(written.iter().map(|(&id, page)| (id, page.clone())));
+            combined
+        }
+    }
+
+    fn eligible(
+        entries: &[PendingFreeEntry],
+        metadata: &FxHashMap<PageId, TxnId>,
+        horizon: TxnId,
+    ) -> Vec<PendingFreeEntry> {
+        entries
+            .iter()
+            .filter(|entry| {
+                entry.freed_at_txn <= horizon
+                    || metadata.get(&entry.page_id) == Some(&entry.freed_at_txn)
+            })
+            .copied()
+            .collect()
+    }
+
+    #[test]
+    fn consumption_replaces_only_the_head_and_preserves_two_tail_pages() {
+        // The second case fills the replacement head exactly, including its retirement.
+        for head_len in [8, MAX_ENTRIES_PER_PAGE] {
+            let mut fixture = Fixture::new(head_len);
+            let snapshot = fixture.snapshot();
+            let consumed: FxHashSet<_> = [fixture.entries[0].page_id].into_iter().collect();
+            let replacement = fixture.entries[2].page_id;
+            let mut loans = vec![
+                fixture.entries[head_len].page_id,
+                fixture.entries[4].page_id,
+                replacement,
+            ];
+            let remaining_loans = loans[..2].to_vec();
+            let mut metadata = fixture.metadata();
+            let prior_metadata = metadata.clone();
+            let high_water_mark = fixture.alloc.high_water_mark();
+            let old_bytes: Vec<_> = fixture
+                .ids
+                .iter()
+                .map(|id| fixture.pages[id].clone())
+                .collect();
+            let freed = [PageId(9000)];
+            // Processing a validated snapshot must not require loading its shared tail again.
+            let mut written = FxHashMap::default();
+            let (root, available) = snapshot
+                .process_with_metadata(
+                    &mut written,
+                    &mut fixture.alloc,
+                    &mut loans,
+                    &ChainCommit {
+                        txn_id: TxnId(9),
+                        current_root: fixture.ids[0],
+                        freed_this_txn: &freed,
+                        consumed: &consumed,
+                        reclaim_horizon: TxnId(2),
+                    },
+                    &mut metadata,
+                )
+                .unwrap();
+
+            assert_eq!(root, replacement);
+            assert_eq!(written.len(), 1, "only the replacement head is dirty");
+            assert_eq!(written[&root].right_child(), fixture.ids[1]);
+            assert_eq!(written[&root].txn_id(), TxnId(9));
+            assert!(written[&root].verify_checksum());
+            assert_eq!(fixture.alloc.high_water_mark(), high_water_mark);
+            assert_eq!(loans, remaining_loans);
+            let combined = fixture.combined(&written);
+            assert_eq!(
+                collect_chain_page_ids(&combined, root).unwrap(),
+                vec![replacement, fixture.ids[1], fixture.ids[2]]
+            );
+            for (&id, old) in fixture.ids.iter().zip(&old_bytes) {
+                assert_eq!(combined[&id].as_bytes(), old.as_bytes());
+            }
+            assert_same_entries(
+                &read_chain(&combined, fixture.ids[0]).unwrap(),
+                &fixture.entries,
+            );
+
+            let surviving: Vec<_> = fixture
+                .entries
+                .iter()
+                .filter(|entry| !consumed.contains(&entry.page_id) && entry.page_id != replacement)
+                .copied()
+                .collect();
+            let mut expected = surviving.clone();
+            expected.extend([fixture.ids[0], freed[0]].map(|page_id| PendingFreeEntry {
+                page_id,
+                freed_at_txn: TxnId(9),
+            }));
+            assert_same_entries(&read_chain(&combined, root).unwrap(), &expected);
+            assert_same_entries(&available, &eligible(&surviving, &prior_metadata, TxnId(2)));
+            let mut expected_metadata = prior_metadata;
+            expected_metadata.insert(fixture.ids[0], TxnId(9));
+            assert_eq!(metadata, expected_metadata, "shared tails are not retired");
+        }
+    }
+
+    #[test]
+    fn replaced_head_waits_one_commit_and_current_data_frees_stay_pinned() {
+        for first_horizon in [TxnId(2), TxnId(u64::MAX)] {
+            let mut fixture = Fixture::new(8);
+            let snapshot = fixture.snapshot();
+            let consumed: FxHashSet<_> = [fixture.entries[0].page_id].into_iter().collect();
+            let replacement = fixture.entries[2].page_id;
+            let mut metadata = fixture.metadata();
+            let mut written = FxHashMap::default();
+            let (root, available) = snapshot
+                .process_with_metadata(
+                    &mut written,
+                    &mut fixture.alloc,
+                    &mut vec![replacement],
+                    &ChainCommit {
+                        txn_id: TxnId(9),
+                        current_root: fixture.ids[0],
+                        freed_this_txn: &[PageId(9000)],
+                        consumed: &consumed,
+                        reclaim_horizon: first_horizon,
+                    },
+                    &mut metadata,
+                )
+                .unwrap();
+            assert!(available
+                .iter()
+                .all(|entry| { entry.page_id != fixture.ids[0] && entry.page_id != PageId(9000) }));
+            let combined = fixture.combined(&written);
+            let stored = read_chain(&combined, root).unwrap();
+            let snapshot = ChainSnapshot::read_committed(
+                root,
+                fixture.alloc.high_water_mark(),
+                TxnId(9),
+                0,
+                |id| combined.get(&id).ok_or(Error::PageOutOfBounds(id)),
+            )
+            .unwrap();
+            let mut next_writes = FxHashMap::default();
+            let (same, next_available) = snapshot
+                .process_with_metadata(
+                    &mut next_writes,
+                    &mut fixture.alloc,
+                    &mut Vec::new(),
+                    &ChainCommit {
+                        txn_id: TxnId(10),
+                        current_root: root,
+                        freed_this_txn: &[],
+                        consumed: &FxHashSet::default(),
+                        reclaim_horizon: TxnId(2),
+                    },
+                    &mut metadata,
+                )
+                .unwrap();
+            assert_eq!(same, root);
+            assert!(next_writes.is_empty());
+            assert_same_entries(&next_available, &eligible(&stored, &metadata, TxnId(2)));
+            assert!(next_available.contains(&PendingFreeEntry {
+                page_id: fixture.ids[0],
+                freed_at_txn: TxnId(9),
+            }));
+            assert!(!next_available
+                .iter()
+                .any(|entry| entry.page_id == PageId(9000)));
+        }
+    }
+
+    #[test]
+    fn consumed_and_repurposed_metadata_lose_their_old_provenance() {
+        let mut fixture = Fixture::new(8);
+        let snapshot = fixture.snapshot();
+        let consumed_id = fixture.entries[0].page_id;
+        let replacement = fixture.entries[2].page_id;
+        let consumed: FxHashSet<_> = [consumed_id].into_iter().collect();
+        let mut metadata = fixture.metadata();
+        metadata.insert(consumed_id, TxnId(1));
+        metadata.insert(replacement, TxnId(1));
+        let mut written = FxHashMap::default();
+        let (root, available) = snapshot
+            .process_with_metadata(
+                &mut written,
+                &mut fixture.alloc,
+                &mut vec![replacement],
+                &ChainCommit {
+                    txn_id: TxnId(9),
+                    current_root: fixture.ids[0],
+                    // Reused metadata is now data and is freed again at its new age.
+                    freed_this_txn: &[consumed_id],
+                    consumed: &consumed,
+                    reclaim_horizon: TxnId::ZERO,
+                },
+                &mut metadata,
+            )
+            .unwrap();
+        assert_eq!(root, replacement);
+        assert!(!metadata.contains_key(&consumed_id));
+        assert!(!metadata.contains_key(&replacement));
+        assert_eq!(metadata.get(&fixture.ids[0]), Some(&TxnId(9)));
+        let expected_available = [fixture.entries[1], fixture.entries[fixture.head_len + 1]];
+        assert_same_entries(&available, &expected_available);
+        let combined = fixture.combined(&written);
+        let stored = read_chain(&combined, root).unwrap();
+        let matching: Vec<_> = stored
+            .iter()
+            .filter(|entry| entry.page_id == consumed_id)
+            .collect();
+        assert_eq!(matching.len(), 1);
+        assert_eq!(matching[0].freed_at_txn, TxnId(9));
+        assert!(!stored.iter().any(|entry| entry.page_id == replacement));
+        assert!(eligible(&stored, &metadata, TxnId::ZERO)
+            .iter()
+            .all(|entry| entry.page_id != consumed_id));
+    }
+
+    #[test]
+    fn page_zero_can_be_the_replacement_head() {
+        let mut fixture = Fixture::new(8);
+        fixture.entries[2].page_id = PageId(0);
+        write_chain_page(
+            &mut fixture.pages,
+            TxnId(7),
+            fixture.ids[0],
+            fixture.ids[1],
+            &fixture.entries[..fixture.head_len],
+        );
+        let snapshot = fixture.snapshot();
+        let consumed: FxHashSet<_> = [fixture.entries[0].page_id].into_iter().collect();
+        let mut metadata = fixture.metadata();
+        metadata.insert(PageId(0), TxnId(1));
+        let mut written = FxHashMap::default();
+        let high_water_mark = fixture.alloc.high_water_mark();
+        let (root, available) = snapshot
+            .process_with_metadata(
+                &mut written,
+                &mut fixture.alloc,
+                &mut vec![PageId(0)],
+                &ChainCommit {
+                    txn_id: TxnId(9),
+                    current_root: fixture.ids[0],
+                    freed_this_txn: &[],
+                    consumed: &consumed,
+                    reclaim_horizon: TxnId(2),
+                },
+                &mut metadata,
+            )
+            .unwrap();
+        assert_eq!(root, PageId(0));
+        assert!(root.is_valid());
+        assert_eq!(written.len(), 1);
+        assert!(written[&root].verify_checksum());
+        assert_eq!(fixture.alloc.high_water_mark(), high_water_mark);
+        let combined = fixture.combined(&written);
+        assert_eq!(
+            collect_chain_page_ids(&combined, root).unwrap(),
+            vec![PageId(0), fixture.ids[1], fixture.ids[2]]
+        );
+        let mut expected: Vec<_> = fixture
+            .entries
+            .iter()
+            .filter(|entry| entry.page_id != PageId(0) && !consumed.contains(&entry.page_id))
+            .copied()
+            .collect();
+        assert_same_entries(&available, &eligible(&expected, &metadata, TxnId(2)));
+        expected.push(PendingFreeEntry {
+            page_id: fixture.ids[0],
+            freed_at_txn: TxnId(9),
+        });
+        assert_same_entries(&read_chain(&combined, root).unwrap(), &expected);
+        assert!(!metadata.contains_key(&PageId(0)));
+    }
+
+    #[test]
+    fn multiple_consumed_entries_allow_an_exactly_full_replacement() {
+        let mut fixture = Fixture::new(MAX_ENTRIES_PER_PAGE);
+        let snapshot = fixture.snapshot();
+        let consumed: FxHashSet<_> = fixture.entries[..5]
+            .iter()
+            .map(|entry| entry.page_id)
+            .collect();
+        let replacement = fixture.entries[6].page_id;
+        let freed: Vec<_> = (9000..9005).map(PageId).collect();
+        let mut metadata = fixture.metadata();
+        let mut written = FxHashMap::default();
+        let high_water_mark = fixture.alloc.high_water_mark();
+        let (root, available) = snapshot
+            .process_with_metadata(
+                &mut written,
+                &mut fixture.alloc,
+                &mut vec![replacement],
+                &ChainCommit {
+                    txn_id: TxnId(9),
+                    current_root: fixture.ids[0],
+                    freed_this_txn: &freed,
+                    consumed: &consumed,
+                    reclaim_horizon: TxnId(u64::MAX),
+                },
+                &mut metadata,
+            )
+            .unwrap();
+        assert_eq!(root, replacement);
+        assert_eq!(written.len(), 1);
+        assert_eq!(
+            read_page_entries(&written[&root]).unwrap().len(),
+            MAX_ENTRIES_PER_PAGE
+        );
+        assert!(written[&root].verify_checksum());
+        assert_eq!(fixture.alloc.high_water_mark(), high_water_mark);
+        let combined = fixture.combined(&written);
+        assert_eq!(
+            collect_chain_page_ids(&combined, root).unwrap(),
+            vec![replacement, fixture.ids[1], fixture.ids[2]]
+        );
+        let mut expected: Vec<_> = fixture
+            .entries
+            .iter()
+            .filter(|entry| entry.page_id != replacement && !consumed.contains(&entry.page_id))
+            .copied()
+            .collect();
+        assert_same_entries(&available, &expected);
+        expected.extend(
+            std::iter::once(&fixture.ids[0])
+                .chain(&freed)
+                .map(|&page_id| PendingFreeEntry {
+                    page_id,
+                    freed_at_txn: TxnId(9),
+                }),
+        );
+        assert_same_entries(&read_chain(&combined, root).unwrap(), &expected);
+        for id in &consumed {
+            assert!(!metadata.contains_key(id));
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Fallback {
+        TailConsumption,
+        TooManyFrees,
+        NoLoan,
+        LoanAtTail,
+        UnknownConsumption,
+    }
+
+    fn check_fallback(reason: Fallback) {
+        let mut fixture = Fixture::new(8);
+        let snapshot = fixture.snapshot();
+        let mut consumed: FxHashSet<_> = [fixture.entries[0].page_id].into_iter().collect();
+        let mut loans = vec![fixture.entries[2].page_id];
+        let mut freed = vec![PageId(9000)];
+        match reason {
+            Fallback::TailConsumption => {
+                consumed.insert(fixture.entries[fixture.head_len + 2].page_id);
+            }
+            Fallback::TooManyFrees => {
+                freed = (0..MAX_ENTRIES_PER_PAGE - fixture.head_len + 2)
+                    .map(|index| PageId(5000 + index as u32))
+                    .collect();
+            }
+            Fallback::NoLoan => loans.clear(),
+            Fallback::LoanAtTail => loans.push(fixture.entries[fixture.head_len].page_id),
+            Fallback::UnknownConsumption => {
+                consumed.insert(PageId(9001));
+            }
+        }
+        let offered_loans = loans.clone();
+        let mut metadata = fixture.metadata();
+        let previous_metadata = metadata.clone();
+        let high_water_mark = fixture.alloc.high_water_mark();
+        let mut written = FxHashMap::default();
+        let (root, available) = snapshot
+            .process_with_metadata(
+                &mut written,
+                &mut fixture.alloc,
+                &mut loans,
+                &ChainCommit {
+                    txn_id: TxnId(9),
+                    current_root: fixture.ids[0],
+                    freed_this_txn: &freed,
+                    consumed: &consumed,
+                    reclaim_horizon: TxnId(2),
+                },
+                &mut metadata,
+            )
+            .unwrap();
+        let combined = fixture.combined(&written);
+        let structure = collect_chain_page_ids(&combined, root).unwrap();
+        assert!(
+            structure.iter().all(|id| !fixture.ids.contains(id)),
+            "{reason:?}"
+        );
+        assert_eq!(written.len(), structure.len());
+        assert_eq!(
+            fixture.alloc.high_water_mark() - high_water_mark,
+            structure
+                .iter()
+                .filter(|id| !offered_loans.contains(id))
+                .count() as u32
+        );
+        assert_eq!(
+            loans,
+            offered_loans
+                .iter()
+                .filter(|id| !structure.contains(id))
+                .copied()
+                .collect::<Vec<_>>()
+        );
+        let surviving: Vec<_> = fixture
+            .entries
+            .iter()
+            .filter(|entry| {
+                !consumed.contains(&entry.page_id) && !structure.contains(&entry.page_id)
+            })
+            .copied()
+            .collect();
+        let mut expected = surviving.clone();
+        expected.extend(
+            fixture
+                .ids
+                .iter()
+                .chain(&freed)
+                .map(|&page_id| PendingFreeEntry {
+                    page_id,
+                    freed_at_txn: TxnId(9),
+                }),
+        );
+        assert_same_entries(&read_chain(&combined, root).unwrap(), &expected);
+        assert_same_entries(
+            &available,
+            &eligible(&surviving, &previous_metadata, TxnId(2)),
+        );
+        for id in fixture.ids {
+            assert_eq!(metadata.get(&id), Some(&TxnId(9)));
+            assert_eq!(combined[&id].as_bytes(), fixture.pages[&id].as_bytes());
+            assert!(!available.iter().any(|entry| entry.page_id == id));
+        }
+        for id in consumed.iter().chain(&structure) {
+            assert!(!metadata.contains_key(id));
+        }
+    }
+
+    #[test]
+    fn tail_consumption_rewrites_the_chain() {
+        check_fallback(Fallback::TailConsumption);
+    }
+
+    #[test]
+    fn too_many_current_frees_rewrite_the_chain() {
+        check_fallback(Fallback::TooManyFrees);
+    }
+
+    #[test]
+    fn no_remaining_loan_rewrites_the_chain() {
+        check_fallback(Fallback::NoLoan);
+    }
+
+    #[test]
+    fn a_tail_loan_does_not_skip_ahead_to_a_suitable_head_loan() {
+        check_fallback(Fallback::LoanAtTail);
+    }
+
+    #[test]
+    fn an_unknown_consumed_id_cannot_authorize_head_sharing() {
+        // Preserve the existing full-rewrite handling of an unknown consumed ID;
+        // its absence must not count as a removed head entry in the size proof.
+        check_fallback(Fallback::UnknownConsumption);
+    }
+
+    #[test]
+    fn a_consumable_head_does_not_hide_an_invalid_shared_tail() {
+        for corruption in ["cycle", "duplicate", "future age"] {
+            let mut fixture = Fixture::new(8);
+            let tail = fixture.ids[2];
+            match corruption {
+                "cycle" => fixture
+                    .pages
+                    .get_mut(&tail)
+                    .unwrap()
+                    .set_right_child(fixture.ids[1]),
+                "duplicate" | "future age" => {
+                    let mut entries =
+                        fixture.entries[fixture.head_len + MAX_ENTRIES_PER_PAGE..].to_vec();
+                    if corruption == "duplicate" {
+                        entries[0] = fixture.entries[0];
+                    } else {
+                        entries[0].freed_at_txn = TxnId(8);
+                    }
+                    write_chain_page(
+                        &mut fixture.pages,
+                        TxnId(7),
+                        tail,
+                        PageId::INVALID,
+                        &entries,
+                    );
+                }
+                _ => unreachable!(),
+            }
+            let mut loaded = Vec::new();
+            let result = ChainSnapshot::read_committed(
+                fixture.ids[0],
+                fixture.alloc.high_water_mark(),
+                TxnId(7),
+                0,
+                |id| {
+                    loaded.push(id);
+                    fixture.pages.get(&id).ok_or(Error::PageOutOfBounds(id))
+                },
+            );
+            assert!(
+                matches!(result, Err(Error::DatabaseCorrupted)),
+                "{corruption}"
+            );
+            assert_eq!(loaded, fixture.ids, "the entire shared tail is validated");
+        }
     }
 }

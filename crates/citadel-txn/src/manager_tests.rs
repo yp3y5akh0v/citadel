@@ -1093,6 +1093,396 @@ fn shared_pending_free_tail_survives_each_commit_write_failure() {
     }
 }
 
+fn consuming_head_base(sync_mode: SyncMode) -> MemIO {
+    const MAX_BYTES: u64 = 32 * 1024 * 1024;
+    let (dek, mac_key, dek_id) = test_keys();
+    let io = MemIO::new(1024 * 1024);
+    let manager = TxnManager::create_with_sync(
+        Box::new(CappedCommitIO::new(io.share(), MAX_BYTES)),
+        dek,
+        mac_key,
+        1,
+        0x1234,
+        dek_id,
+        32,
+        sync_mode,
+    )
+    .unwrap();
+    let original = vec![
+        b'o';
+        (2 * pending_free::MAX_ENTRIES_PER_PAGE + 32)
+            * citadel_page::overflow::OVERFLOW_DATA_CAPACITY
+    ];
+    commit_insert(&manager, b"key", &original);
+    commit_insert(&manager, b"key", b"durable0");
+    commit_insert(&manager, b"key", b"durable1");
+    assert_eq!(
+        pending_chain_pages(&manager, manager.current_slot().pending_free_root).len(),
+        3,
+        "the bounded fixture must produce three retirement pages"
+    );
+    io
+}
+
+#[test]
+fn consuming_pending_head_survives_each_commit_write_failure() {
+    use citadel_io::file_manager::{read_commit_slot, write_commit_slot, write_god_byte};
+
+    const MAX_BYTES: u64 = 32 * 1024 * 1024;
+    let (dek, mac_key, _) = test_keys();
+    let run = |base: &MemIO, sync_mode, secure_delete, fail_after: Option<i64>| {
+        let io = base.deep_clone();
+        let faulty = FaultingIO::new(io.share(), i64::MAX);
+        let writes_left = Arc::clone(&faulty.writes_left);
+        let manager = TxnManager::open_with_sync(
+            Box::new(CappedCommitIO::new(faulty, MAX_BYTES)),
+            dek,
+            mac_key,
+            1,
+            32,
+            sync_mode,
+        )
+        .unwrap();
+        manager.set_secure_delete(secure_delete);
+        // Reopen deliberately starts without loans. The first update makes
+        // old entries available; the next packs the chain using those loans.
+        commit_insert(&manager, b"key", b"durable2");
+        let older_slot = manager.current_slot();
+        let mut older_reader = manager.begin_read();
+        commit_insert(&manager, b"key", b"durable3");
+        let before = manager.current_slot();
+        let mut current_reader = manager.begin_read();
+        let before_generation = manager.commit_generation();
+        let chain = pending_chain_pages(&manager, before.pending_free_root);
+        assert_eq!(chain.len(), 3);
+        let old_ids: Vec<_> = chain.iter().map(Page::page_id).collect();
+        let head_ids: FxHashSet<_> = pending_free::read_page_entries(&chain[0])
+            .unwrap()
+            .map(|entry| entry.page_id)
+            .collect();
+        let old_entries: FxHashMap<_, _> = chain
+            .iter()
+            .flat_map(|page| pending_free::read_page_entries(page).unwrap())
+            .map(|entry| (entry.page_id, entry.freed_at_txn))
+            .collect();
+        let (loan, before_tags) = {
+            let state = manager.state.lock();
+            (
+                state.reclaimed_pages.clone(),
+                state.retired_chain_pages.clone(),
+            )
+        };
+        assert!(loan.len() >= 2);
+        assert!(
+            loan.iter().rev().take(2).all(|id| head_ids.contains(id)),
+            "the next body and structure loans must both be in the old head"
+        );
+        let body_loan = loan[loan.len() - 1];
+        let structure_loan = loan[loan.len() - 2];
+        let old_bytes: Vec<_> = old_ids
+            .iter()
+            .map(|&id| {
+                let mut bytes = [0u8; PAGE_SIZE];
+                io.read_page(page_offset(id), &mut bytes).unwrap();
+                (id, bytes)
+            })
+            .collect();
+        let before_slots = [
+            read_commit_slot(&io, 0).unwrap(),
+            read_commit_slot(&io, 1).unwrap(),
+        ];
+        assert_ne!(before_slots[0].tree_root, before_slots[1].tree_root);
+        let older_chain_ids: Vec<_> = pending_chain_pages(&manager, older_slot.pending_free_root)
+            .iter()
+            .map(Page::page_id)
+            .collect();
+        assert!(before_slots
+            .iter()
+            .any(|slot| slot.txn_id == older_slot.txn_id));
+
+        let mut writer = manager.begin_write().unwrap();
+        writer.insert(b"key", b"newvalue").unwrap();
+        assert_eq!(writer.pending_free_count(), 1);
+        let target_txn = writer.txn_id();
+        let budget = fail_after.unwrap_or(i64::MAX);
+        writes_left.store(budget, Ordering::SeqCst);
+        let result = writer.commit();
+        let attempts = budget - writes_left.load(Ordering::SeqCst);
+        assert_eq!(
+            result.is_ok(),
+            fail_after.is_none(),
+            "{sync_mode:?}, secure={secure_delete}, budget={fail_after:?}: {result:?}"
+        );
+        if let Some(limit) = fail_after {
+            assert!(matches!(result, Err(Error::Io(_))));
+            assert!(attempts > limit);
+            assert_eq!(manager.current_slot(), before);
+            assert_eq!(manager.commit_generation(), before_generation);
+            let state = manager.state.lock();
+            assert_eq!(state.reclaimed_pages.as_ref(), loan.as_ref());
+            assert_eq!(state.retired_chain_pages, before_tags);
+        } else {
+            let after = manager.current_slot();
+            let next_chain = pending_chain_pages(&manager, after.pending_free_root);
+            let next_ids: Vec<_> = next_chain.iter().map(Page::page_id).collect();
+            assert_eq!(after.tree_root, body_loan);
+            assert_eq!(after.pending_free_root, structure_loan);
+            assert_eq!(next_ids.len(), old_ids.len());
+            assert_eq!(next_ids[1..], old_ids[1..], "must share the actual tail");
+            assert_eq!(after.high_water_mark, before.high_water_mark);
+            let mut expected_entries = old_entries.clone();
+            assert!(expected_entries.remove(&body_loan).is_some());
+            assert!(expected_entries.remove(&structure_loan).is_some());
+            assert!(expected_entries.insert(old_ids[0], target_txn).is_none());
+            assert!(expected_entries
+                .insert(before.tree_root, target_txn)
+                .is_none());
+            let actual_entries: Vec<_> = next_chain
+                .iter()
+                .flat_map(|page| pending_free::read_page_entries(page).unwrap())
+                .map(|entry| (entry.page_id, entry.freed_at_txn))
+                .collect();
+            assert_eq!(actual_entries.len(), expected_entries.len());
+            assert_eq!(
+                actual_entries.into_iter().collect::<FxHashMap<_, _>>(),
+                expected_entries
+            );
+            let mut expected_tags = before_tags.clone();
+            expected_tags.remove(&body_loan);
+            expected_tags.remove(&structure_loan);
+            expected_tags.insert(old_ids[0], target_txn);
+            let state = manager.state.lock();
+            assert_eq!(state.retired_chain_pages, expected_tags);
+            for id in [body_loan, structure_loan, old_ids[0], before.tree_root] {
+                assert!(!state.reclaimed_pages.contains(&id));
+            }
+        }
+        for (id, expected) in &old_bytes {
+            let mut actual = [0u8; PAGE_SIZE];
+            io.read_page(page_offset(*id), &mut actual).unwrap();
+            assert_eq!(
+                &actual, expected,
+                "{sync_mode:?}, secure={secure_delete}, budget={fail_after:?}: old chain {id} changed"
+            );
+        }
+        manager.pool.lock().clear();
+        assert_eq!(
+            older_reader.get(b"key").unwrap().as_deref(),
+            Some(b"durable2".as_slice())
+        );
+        assert_eq!(
+            current_reader.get(b"key").unwrap().as_deref(),
+            Some(b"durable3".as_slice())
+        );
+        let expected_slot = manager.current_slot();
+        drop(older_reader);
+        drop(current_reader);
+        drop(manager);
+
+        let reopened = TxnManager::open_with_sync(
+            Box::new(CappedCommitIO::new(io.share(), MAX_BYTES)),
+            dek,
+            mac_key,
+            1,
+            32,
+            sync_mode,
+        )
+        .unwrap();
+        assert_eq!(
+            reopened.current_slot(),
+            CommitSlot::deserialize(&expected_slot.serialize())
+        );
+        let expected = if fail_after.is_none() {
+            b"newvalue"
+        } else {
+            b"durable3"
+        };
+        assert_eq!(
+            reopened.begin_read().get(b"key").unwrap().as_deref(),
+            Some(expected.as_slice())
+        );
+        let report = reopened.integrity_check().unwrap();
+        if secure_delete && fail_after.is_some() {
+            // The existing secure-delete path can zero retired metadata of
+            // the older physical slot before an interrupted commit replaces
+            // that slot. integrity_check walks both slots. Admit only that
+            // exact old retirement, never damage to the selected slot graph.
+            for error in &report.errors {
+                let integrity::IntegrityError::PageTampered(page_id) = error else {
+                    panic!("unexpected secure-delete recovery error: {report:?}");
+                };
+                assert!(older_chain_ids.contains(page_id));
+                assert!(!old_ids.contains(page_id));
+                assert_eq!(old_entries.get(page_id), Some(&before.txn_id));
+                assert_eq!(before_tags.get(page_id), Some(&before.txn_id));
+                let mut bytes = [0xff; PAGE_SIZE];
+                io.read_page(page_offset(*page_id), &mut bytes).unwrap();
+                assert!(bytes.iter().all(|byte| *byte == 0));
+            }
+            // Audit every selected-slot root on an independent fork. Using
+            // that same authenticated slot in both positions prevents the
+            // older metadata lifetime from changing the scope of this audit.
+            let selected = reopened.current_slot();
+            let audit_io = io.deep_clone();
+            for index in 0..2 {
+                write_commit_slot(&audit_io, index, &selected).unwrap();
+            }
+            let audited = TxnManager::open_with_sync(
+                Box::new(CappedCommitIO::new(audit_io, MAX_BYTES)),
+                dek,
+                mac_key,
+                1,
+                32,
+                sync_mode,
+            )
+            .unwrap();
+            assert_eq!(audited.current_slot(), selected);
+            let selected_report = audited.integrity_check().unwrap();
+            assert!(selected_report.is_ok(), "{selected_report:?}");
+        } else {
+            assert!(
+                report.is_ok(),
+                "{sync_mode:?}, secure={secure_delete}, budget={fail_after:?}: {report:?}"
+            );
+        }
+        drop(reopened);
+
+        // Readers pinned both pre-target data generations, including when
+        // secure delete is enabled. Retired metadata has its separate lifetime;
+        // check row snapshots in both physical slots, with the selected graph
+        // independently audited above when interrupted secure deletion erased
+        // an older metadata retirement.
+        for (slot_index, before_slot) in before_slots.iter().enumerate() {
+            let slot = read_commit_slot(&io, slot_index).unwrap();
+            let expected = if slot.txn_id == target_txn {
+                b"newvalue".as_slice()
+            } else {
+                assert_eq!(&slot, before_slot);
+                if slot.txn_id == before.txn_id {
+                    b"durable3".as_slice()
+                } else {
+                    assert_eq!(slot.txn_id, older_slot.txn_id);
+                    b"durable2".as_slice()
+                }
+            };
+            let fork = io.deep_clone();
+            write_god_byte(&fork, slot_index as u8).unwrap();
+            let recovered = TxnManager::open_with_sync(
+                Box::new(CappedCommitIO::new(fork, MAX_BYTES)),
+                dek,
+                mac_key,
+                1,
+                32,
+                sync_mode,
+            )
+            .unwrap();
+            assert_eq!(recovered.current_slot(), slot);
+            assert_eq!(
+                recovered.begin_read().get(b"key").unwrap().as_deref(),
+                Some(expected)
+            );
+        }
+        attempts
+    };
+    for sync_mode in [SyncMode::Off, SyncMode::Full] {
+        let base = consuming_head_base(sync_mode);
+        for secure_delete in [false, true] {
+            let writes = run(&base, sync_mode, secure_delete, None);
+            assert!((1..=16).contains(&writes), "keep the fault matrix bounded");
+            for budget in 0..writes {
+                run(&base, sync_mode, secure_delete, Some(budget));
+            }
+        }
+    }
+}
+
+#[test]
+fn consuming_pending_head_preserves_aborted_and_restored_loans() {
+    const MAX_BYTES: u64 = 32 * 1024 * 1024;
+    let (dek, mac_key, _) = test_keys();
+    let io = consuming_head_base(SyncMode::Off);
+    let manager = TxnManager::open_with_sync(
+        Box::new(CappedCommitIO::new(io, MAX_BYTES)),
+        dek,
+        mac_key,
+        1,
+        32,
+        SyncMode::Off,
+    )
+    .unwrap();
+    commit_insert(&manager, b"key", b"durable2");
+    let mut reader = manager.begin_read();
+    commit_insert(&manager, b"key", b"durable3");
+    let before = manager.current_slot();
+    let loan = manager.state.lock().reclaimed_pages.clone();
+    let old_chain = pending_chain_pages(&manager, before.pending_free_root);
+    let old_ids: Vec<_> = old_chain.iter().map(Page::page_id).collect();
+    let old_entries: FxHashMap<_, _> = old_chain
+        .iter()
+        .flat_map(|page| pending_free::read_page_entries(page).unwrap())
+        .map(|entry| (entry.page_id, entry.freed_at_txn))
+        .collect();
+    // Cross the head boundary: recording these rolled-back allocations as
+    // consumed would remove still-free tail entries or force a full rewrite.
+    let discarded = vec![
+        b'x';
+        (pending_free::MAX_ENTRIES_PER_PAGE + 8)
+            * citadel_page::overflow::OVERFLOW_DATA_CAPACITY
+    ];
+    let mut aborted = manager.begin_write().unwrap();
+    aborted.insert(b"key", &discarded).unwrap();
+    aborted.abort();
+    manager.begin_write().unwrap().commit().unwrap();
+    assert_eq!(manager.current_slot(), before);
+    assert_eq!(manager.state.lock().reclaimed_pages.as_ref(), loan.as_ref());
+
+    let mut writer = manager.begin_write().unwrap();
+    let snapshot = writer.begin_savepoint();
+    for _ in 0..2 {
+        writer.insert(b"key", &discarded).unwrap();
+        writer.restore_snapshot(snapshot.clone());
+        assert_eq!(writer.pending_free_count(), 0);
+        assert_eq!(
+            writer.get(b"key").unwrap().as_deref(),
+            Some(b"durable3".as_slice())
+        );
+    }
+    writer.insert(b"key", b"committed").unwrap();
+    let target_txn = writer.txn_id();
+    writer.commit().unwrap();
+    let after = manager.current_slot();
+    let new_chain = pending_chain_pages(&manager, after.pending_free_root);
+    let new_ids: Vec<_> = new_chain.iter().map(Page::page_id).collect();
+    assert_eq!(new_ids.len(), old_ids.len());
+    assert_eq!(new_ids[1..], old_ids[1..]);
+    assert_eq!(after.high_water_mark, before.high_water_mark);
+    assert_eq!(after.tree_root, loan[loan.len() - 1]);
+    assert_eq!(after.pending_free_root, loan[loan.len() - 2]);
+    let mut expected = old_entries;
+    assert!(expected.remove(&after.tree_root).is_some());
+    assert!(expected.remove(&after.pending_free_root).is_some());
+    assert!(expected.insert(old_ids[0], target_txn).is_none());
+    assert!(expected.insert(before.tree_root, target_txn).is_none());
+    let actual: Vec<_> = new_chain
+        .iter()
+        .flat_map(|page| pending_free::read_page_entries(page).unwrap())
+        .map(|entry| (entry.page_id, entry.freed_at_txn))
+        .collect();
+    assert_eq!(actual.len(), expected.len());
+    assert_eq!(actual.into_iter().collect::<FxHashMap<_, _>>(), expected);
+    manager.pool.lock().clear();
+    assert_eq!(
+        reader.get(b"key").unwrap().as_deref(),
+        Some(b"durable2".as_slice())
+    );
+    assert_eq!(
+        manager.begin_read().get(b"key").unwrap().as_deref(),
+        Some(b"committed".as_slice())
+    );
+    drop(reader);
+    assert!(manager.integrity_check().unwrap().is_ok());
+}
+
 #[test]
 fn rolling_readers_bound_retired_metadata_and_survive_reopen() {
     const LAG: usize = 1000;
