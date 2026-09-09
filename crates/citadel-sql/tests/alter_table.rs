@@ -1299,6 +1299,506 @@ fn add_column_with_default_then_update_old_row() {
     assert_eq!(qr.rows[0][0], Value::Integer(99));
 }
 
+fn for_added_default_update_modes(setup: &[&str], check: impl Fn(&Connection<'_>, bool)) {
+    for prepared in [true, false] {
+        for explicit_transaction in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = create_db(dir.path());
+            let conn = Connection::open(&db).unwrap();
+            for sql in setup {
+                conn.execute(sql).unwrap();
+            }
+            if explicit_transaction {
+                conn.execute("BEGIN").unwrap();
+            }
+            check(&conn, prepared);
+            if explicit_transaction {
+                conn.execute("COMMIT").unwrap();
+            }
+        }
+    }
+}
+
+fn execute_added_default_update(conn: &Connection<'_>, prepared: bool, sql: &str, count: u64) {
+    if prepared {
+        assert_eq!(conn.prepare(sql).unwrap().execute(&[]).unwrap(), count);
+    } else {
+        assert_rows_affected(conn.execute(sql).unwrap(), count);
+    }
+}
+
+#[test]
+fn update_added_default_target_reads_missing_but_preserves_stored_null() {
+    for_added_default_update_modes(
+        &[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY)",
+            "INSERT INTO t VALUES (1), (2)",
+            "ALTER TABLE t ADD COLUMN v INTEGER DEFAULT 10",
+            "INSERT INTO t VALUES (3, NULL), (4, 30)",
+        ],
+        |conn, prepared| {
+            execute_added_default_update(
+                conn,
+                prepared,
+                "UPDATE t SET v = v + 1 WHERE id >= 1 AND id <= 4",
+                4,
+            );
+            assert_eq!(
+                conn.query("SELECT v FROM t ORDER BY id").unwrap().rows,
+                vec![
+                    vec![Value::Integer(11)],
+                    vec![Value::Integer(11)],
+                    vec![Value::Null],
+                    vec![Value::Integer(31)],
+                ]
+            );
+        },
+    );
+}
+
+#[test]
+fn update_added_default_rhs_and_simultaneous_assignments_use_old_values() {
+    for_added_default_update_modes(
+        &[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER NOT NULL)",
+            "INSERT INTO t VALUES (1, 3), (2, 4)",
+            "ALTER TABLE t ADD COLUMN b INTEGER NOT NULL DEFAULT (2 * 5)",
+        ],
+        |conn, prepared| {
+            execute_added_default_update(conn, prepared, "UPDATE t SET a = b + 1, b = a + 2", 2);
+            assert_eq!(
+                conn.query("SELECT a, b FROM t ORDER BY id").unwrap().rows,
+                vec![
+                    vec![Value::Integer(11), Value::Integer(5)],
+                    vec![Value::Integer(11), Value::Integer(6)],
+                ]
+            );
+        },
+    );
+}
+
+#[test]
+fn update_added_default_fixed_width_range_mixes_short_and_full_rows() {
+    for_added_default_update_modes(
+        &[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER NOT NULL)",
+            "INSERT INTO t VALUES (2, 20), (4, 40)",
+            "ALTER TABLE t ADD COLUMN b INTEGER NOT NULL DEFAULT 10",
+            "ALTER TABLE t ADD COLUMN c TEXT DEFAULT 'untouched'",
+            "INSERT INTO t VALUES (1, 10, 3, 'first'), (3, 30, 7, NULL)",
+        ],
+        |conn, prepared| {
+            // A fixed-width SET target permits the fused range path, but the
+            // alternating old rows must grow to store their RHS and untouched defaults.
+            execute_added_default_update(
+                conn,
+                prepared,
+                "UPDATE t SET a = a + b WHERE id >= 1 AND id <= 4",
+                4,
+            );
+            assert_eq!(
+                conn.query("SELECT * FROM t ORDER BY id").unwrap().rows,
+                vec![
+                    vec![
+                        Value::Integer(1),
+                        Value::Integer(13),
+                        Value::Integer(3),
+                        Value::Text("first".into())
+                    ],
+                    vec![
+                        Value::Integer(2),
+                        Value::Integer(30),
+                        Value::Integer(10),
+                        Value::Text("untouched".into())
+                    ],
+                    vec![
+                        Value::Integer(3),
+                        Value::Integer(37),
+                        Value::Integer(7),
+                        Value::Null
+                    ],
+                    vec![
+                        Value::Integer(4),
+                        Value::Integer(50),
+                        Value::Integer(10),
+                        Value::Text("untouched".into())
+                    ],
+                ]
+            );
+        },
+    );
+}
+
+#[test]
+fn update_added_default_cross_type_storage_rewrites_preserve_neighbors() {
+    for default_sql in ["'7'", "'12345678'", "(7 + 0)", "0"] {
+        let add_default =
+            format!("ALTER TABLE t ADD COLUMN d INTEGER NOT NULL DEFAULT {default_sql}");
+        for_added_default_update_modes(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER NOT NULL, label TEXT)",
+                "INSERT INTO t VALUES (1, 10, 'first'), (2, 20, 'second')",
+                &add_default,
+                "ALTER TABLE t ADD COLUMN sentinel INTEGER NOT NULL DEFAULT 42",
+            ],
+            |conn, prepared| {
+                // The default can have a different storage type from the declared
+                // column, including a TEXT payload with the same width as INTEGER.
+                execute_added_default_update(conn, prepared, "UPDATE t SET d = 9 WHERE id = 1", 1);
+                let first = vec![
+                    Value::Integer(1),
+                    Value::Integer(10),
+                    Value::Text("first".into()),
+                    Value::Integer(9),
+                    Value::Integer(42),
+                ];
+                assert_eq!(
+                    conn.query("SELECT * FROM t WHERE id = 1").unwrap().rows,
+                    vec![first.clone()],
+                    "direct PK update with DEFAULT {default_sql}"
+                );
+
+                // Materialize d without assigning it, then exercise a fixed-width
+                // range assignment over the resulting full stored row.
+                execute_added_default_update(
+                    conn,
+                    prepared,
+                    "UPDATE t SET x = x + 1 WHERE id = 2",
+                    1,
+                );
+                execute_added_default_update(
+                    conn,
+                    prepared,
+                    "UPDATE t SET d = 9 WHERE id >= 2 AND id <= 3",
+                    1,
+                );
+                assert_eq!(
+                    conn.query("SELECT * FROM t ORDER BY id").unwrap().rows,
+                    vec![
+                        first,
+                        vec![
+                            Value::Integer(2),
+                            Value::Integer(21),
+                            Value::Text("second".into()),
+                            Value::Integer(9),
+                            Value::Integer(42),
+                        ],
+                    ],
+                    "materialized range update with DEFAULT {default_sql}"
+                );
+            },
+        );
+    }
+}
+
+#[test]
+fn update_added_default_range_error_cannot_publish_a_full_row_prefix() {
+    for prepared in [true, false] {
+        for explicit_transaction in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let original_first = vec![vec![Value::Integer(1), Value::Integer(10), Value::Null]];
+            {
+                let db = create_db(dir.path());
+                let conn = Connection::open(&db).unwrap();
+                conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER NOT NULL)")
+                    .unwrap();
+                conn.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+                conn.execute(
+                    "ALTER TABLE t ADD COLUMN b INTEGER DEFAULT (9223372036854775807 + 1)",
+                )
+                .unwrap();
+                conn.execute("INSERT INTO t VALUES (1, 10, NULL)").unwrap();
+                if explicit_transaction {
+                    conn.execute("BEGIN").unwrap();
+                }
+
+                // The first row is patched in place. Materializing the next
+                // row's untouched default fails before its grown row can be queued.
+                let sql = "UPDATE t SET a = a + 1 WHERE id >= 1 AND id <= 2";
+                let error = if prepared {
+                    conn.prepare(sql).unwrap().execute(&[]).unwrap_err()
+                } else {
+                    conn.execute(sql).unwrap_err()
+                };
+                assert!(matches!(error, SqlError::IntegerOverflow), "got: {error:?}");
+                if explicit_transaction {
+                    assert!(matches!(
+                        conn.execute("COMMIT").unwrap_err(),
+                        SqlError::Storage(citadel_core::Error::TransactionFailed)
+                    ));
+                }
+                assert_eq!(
+                    conn.query("SELECT * FROM t WHERE id = 1").unwrap().rows,
+                    original_first
+                );
+            }
+            let db = open_db(dir.path());
+            let conn = Connection::open(&db).unwrap();
+            assert_eq!(
+                conn.query("SELECT * FROM t WHERE id = 1").unwrap().rows,
+                original_first
+            );
+        }
+    }
+}
+
+#[test]
+fn update_added_default_residual_where_and_returning() {
+    for_added_default_update_modes(
+        &[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER NOT NULL)",
+            "INSERT INTO t VALUES (1, 3), (2, 4)",
+            "ALTER TABLE t ADD COLUMN b INTEGER DEFAULT 10",
+            "INSERT INTO t VALUES (3, 5, NULL)",
+        ],
+        |conn, prepared| {
+            let sql =
+                "UPDATE t SET a = a + b WHERE id >= 1 AND id <= 3 AND b = 10 RETURNING id, a, b";
+            let rows = if prepared {
+                conn.prepare(sql).unwrap().query_collect(&[]).unwrap().rows
+            } else {
+                conn.query(sql).unwrap().rows
+            };
+            assert_eq!(
+                rows,
+                vec![
+                    vec![Value::Integer(1), Value::Integer(13), Value::Integer(10)],
+                    vec![Value::Integer(2), Value::Integer(14), Value::Integer(10)],
+                ]
+            );
+            assert_eq!(
+                conn.query("SELECT a, b FROM t WHERE id = 3").unwrap().rows,
+                vec![vec![Value::Integer(5), Value::Null]]
+            );
+        },
+    );
+}
+
+#[test]
+fn update_added_default_virtual_generated_input_and_returning() {
+    for_added_default_update_modes(
+        &[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)",
+            "INSERT INTO t VALUES (1, 3), (2, 4)",
+            "ALTER TABLE t ADD COLUMN b INTEGER DEFAULT 10",
+            "ALTER TABLE t ADD COLUMN g INTEGER GENERATED ALWAYS AS (a + b) VIRTUAL",
+        ],
+        |conn, prepared| {
+            let sql = "UPDATE t SET a = g + 1 WHERE id >= 1 AND id <= 2 RETURNING a, b, g";
+            let rows = if prepared {
+                conn.prepare(sql).unwrap().query_collect(&[]).unwrap().rows
+            } else {
+                conn.query(sql).unwrap().rows
+            };
+            assert_eq!(
+                rows,
+                vec![
+                    vec![Value::Integer(14), Value::Integer(10), Value::Integer(24)],
+                    vec![Value::Integer(15), Value::Integer(10), Value::Integer(25)],
+                ]
+            );
+            assert_eq!(
+                conn.query("SELECT a, b, g FROM t ORDER BY id")
+                    .unwrap()
+                    .rows,
+                rows
+            );
+        },
+    );
+}
+
+#[test]
+fn update_added_default_preserves_intervening_same_bitmap_byte() {
+    for_added_default_update_modes(
+        &[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT)",
+            "INSERT INTO t VALUES (1, 'old')",
+            "ALTER TABLE t ADD COLUMN b INTEGER DEFAULT 10",
+            "ALTER TABLE t ADD COLUMN c INTEGER DEFAULT 20",
+        ],
+        |conn, prepared| {
+            execute_added_default_update(conn, prepared, "UPDATE t SET c = 99 WHERE id = 1", 1);
+            assert_eq!(
+                conn.query("SELECT a, b, c FROM t").unwrap().rows,
+                vec![vec![
+                    Value::Text("old".into()),
+                    Value::Integer(10),
+                    Value::Integer(99)
+                ]]
+            );
+        },
+    );
+}
+
+#[test]
+fn update_added_default_preserves_intervening_new_bitmap_byte() {
+    for_added_default_update_modes(
+        &[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER, d INTEGER, e INTEGER, f INTEGER)",
+            "INSERT INTO t VALUES (1, 1, NULL, 3, 4, 5, 6), (2, 11, 12, 13, 14, 15, 16)",
+            "ALTER TABLE t ADD COLUMN g INTEGER DEFAULT 70",
+            "ALTER TABLE t ADD COLUMN h TEXT DEFAULT 'eight'",
+            "ALTER TABLE t ADD COLUMN i INTEGER DEFAULT 90",
+        ],
+        |conn, prepared| {
+            execute_added_default_update(
+                conn,
+                prepared,
+                "UPDATE t SET i = 99 WHERE id >= 1 AND id <= 2",
+                2,
+            );
+            assert_eq!(
+                conn.query("SELECT b, f, g, h, i FROM t ORDER BY id").unwrap().rows,
+                vec![
+                    vec![Value::Null, Value::Integer(6), Value::Integer(70), Value::Text("eight".into()), Value::Integer(99)],
+                    vec![Value::Integer(12), Value::Integer(16), Value::Integer(70), Value::Text("eight".into()), Value::Integer(99)],
+                ]
+            );
+        },
+    );
+}
+
+#[test]
+fn update_added_default_after_nontrailing_drop() {
+    for_added_default_update_modes(
+        &[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, dropped TEXT, a INTEGER)",
+            "INSERT INTO t VALUES (1, 'gone', 4), (2, 'gone', 5)",
+            "ALTER TABLE t DROP COLUMN dropped",
+            "ALTER TABLE t ADD COLUMN b INTEGER DEFAULT 10",
+            "ALTER TABLE t ADD COLUMN c INTEGER DEFAULT 20",
+        ],
+        |conn, prepared| {
+            execute_added_default_update(conn, prepared, "UPDATE t SET a = a + b, c = c + 1", 2);
+            assert_eq!(
+                conn.query("SELECT a, b, c FROM t ORDER BY id")
+                    .unwrap()
+                    .rows,
+                vec![
+                    vec![Value::Integer(14), Value::Integer(10), Value::Integer(21)],
+                    vec![Value::Integer(15), Value::Integer(10), Value::Integer(21)],
+                ]
+            );
+        },
+    );
+}
+
+#[test]
+fn update_added_default_volatile_value_is_materialized_once_per_row() {
+    for_added_default_update_modes(
+        &[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, copied INTEGER)",
+            "INSERT INTO t VALUES (1, NULL), (2, NULL), (3, NULL)",
+            "ALTER TABLE t ADD COLUMN token INTEGER DEFAULT (RANDOM())",
+        ],
+        |conn, prepared| {
+            execute_added_default_update(conn, prepared, "UPDATE t SET copied = token", 3);
+            let rows = conn
+                .query("SELECT copied, token FROM t ORDER BY id")
+                .unwrap()
+                .rows;
+            for row in &rows {
+                assert!(matches!(row[0], Value::Integer(_)), "got {row:?}");
+                assert_eq!(
+                    row[0], row[1],
+                    "RHS and stored default must use the same evaluation"
+                );
+            }
+            assert!(rows.windows(2).any(|pair| pair[0][1] != pair[1][1]));
+            assert_eq!(
+                conn.query("SELECT copied, token FROM t ORDER BY id")
+                    .unwrap()
+                    .rows,
+                rows
+            );
+        },
+    );
+}
+
+#[test]
+fn update_added_default_error_is_lazy_for_stored_values() {
+    for_added_default_update_modes(
+        &[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)",
+            "INSERT INTO t VALUES (1, 5)",
+            "ALTER TABLE t ADD COLUMN b INTEGER DEFAULT (9223372036854775807 + 1)",
+            "INSERT INTO t VALUES (2, 6, NULL)",
+        ],
+        |conn, prepared| {
+            execute_added_default_update(conn, prepared, "UPDATE t SET a = a + 1 WHERE id = 2", 1);
+            assert_eq!(
+                conn.query("SELECT * FROM t WHERE id = 2").unwrap().rows,
+                vec![vec![Value::Integer(2), Value::Integer(7), Value::Null]]
+            );
+            let sql = "UPDATE t SET a = a + b WHERE id = 1";
+            let err = if prepared {
+                conn.prepare(sql).unwrap().execute(&[]).unwrap_err()
+            } else {
+                conn.execute(sql).unwrap_err()
+            };
+            assert!(matches!(err, SqlError::IntegerOverflow), "got: {err:?}");
+        },
+    );
+}
+
+#[test]
+fn update_added_default_rollback_snapshot_and_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let db = create_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1), (2)").unwrap();
+        conn.execute("ALTER TABLE t ADD COLUMN v INTEGER DEFAULT 10")
+            .unwrap();
+        let observer = Connection::open(&db).unwrap();
+        observer.execute("BEGIN READ ONLY").unwrap();
+        let original = vec![vec![Value::Integer(10)], vec![Value::Integer(10)]];
+        assert_eq!(
+            observer.query("SELECT v FROM t ORDER BY id").unwrap().rows,
+            original
+        );
+
+        let stmt = conn
+            .prepare("UPDATE t SET v = v + 1 WHERE id >= 1 AND id <= 2")
+            .unwrap();
+        conn.execute("BEGIN").unwrap();
+        assert_eq!(stmt.execute(&[]).unwrap(), 2);
+        let updated = vec![vec![Value::Integer(11)], vec![Value::Integer(11)]];
+        assert_eq!(
+            conn.query("SELECT v FROM t ORDER BY id").unwrap().rows,
+            updated
+        );
+        conn.execute("ROLLBACK").unwrap();
+        assert_eq!(
+            conn.query("SELECT v FROM t ORDER BY id").unwrap().rows,
+            original
+        );
+
+        assert_eq!(stmt.execute(&[]).unwrap(), 2);
+        assert_eq!(
+            conn.query("SELECT v FROM t ORDER BY id").unwrap().rows,
+            updated
+        );
+        assert_eq!(
+            observer.query("SELECT v FROM t ORDER BY id").unwrap().rows,
+            original
+        );
+        observer.execute("COMMIT").unwrap();
+        assert_eq!(
+            observer.query("SELECT v FROM t ORDER BY id").unwrap().rows,
+            updated
+        );
+    }
+    let db = open_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    assert_eq!(
+        conn.query("SELECT v FROM t ORDER BY id").unwrap().rows,
+        vec![vec![Value::Integer(11)], vec![Value::Integer(11)]]
+    );
+}
+
 #[test]
 fn alter_internal_schema_table_errors() {
     let dir = tempfile::tempdir().unwrap();

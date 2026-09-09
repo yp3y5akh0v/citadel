@@ -678,6 +678,185 @@ fn patch_array_different_size_returns_false() {
 }
 
 #[test]
+fn patch_row_column_initializes_missing_bitmap_slots() {
+    for (stored_count, target) in [(1, 2), (6, 8), (0, 2)] {
+        let values: Vec<Value> = (0..stored_count)
+            .map(|column| {
+                if column == 1 {
+                    Value::Null
+                } else {
+                    Value::Integer(column as i64 + 10)
+                }
+            })
+            .collect();
+        let encoded = encode_row(&values);
+        for replacement in [Value::Integer(99), Value::Null] {
+            let mut patched = Vec::new();
+            patch_row_column(&encoded, target, &replacement, &mut patched).unwrap();
+            let mut expected = values.clone();
+            expected.resize(target + 1, Value::Null);
+            expected[target] = replacement;
+            assert_eq!(
+                decode_row(&patched).unwrap(),
+                expected,
+                "stored count: {stored_count}; target: {target}"
+            );
+        }
+    }
+}
+
+fn assert_v2_framing_change_rejected(at_offset: bool) {
+    for (original, replacement) in [
+        (Value::Text("12345678".into()), Value::Integer(9)),
+        (Value::Integer(9), Value::Text("12345678".into())),
+    ] {
+        let mut values = vec![Value::Null, original, Value::Integer(77)];
+        let mut encoded = encode_row(&values);
+        let before = encoded.clone();
+        let patched = if at_offset {
+            let (_, offset) = decode_column_with_offset(&encoded, 1).unwrap();
+            patch_at_offset(&mut encoded, offset, &replacement).unwrap()
+        } else {
+            patch_column_in_place(&mut encoded, 1, &replacement).unwrap()
+        };
+        assert!(
+            !patched,
+            "equal payload sizes cannot change V2 length framing: {:?} -> {replacement:?}",
+            values[1]
+        );
+        assert_eq!(encoded, before, "a rejected patch must not change the row");
+
+        let mut rewritten = Vec::new();
+        patch_row_column(&encoded, 1, &replacement, &mut rewritten).unwrap();
+        values[1] = replacement;
+        assert_eq!(decode_row(&rewritten).unwrap(), values);
+        assert_eq!(rewritten, encode_row(&values));
+    }
+}
+
+#[test]
+fn patch_column_in_place_rejects_v2_framing_changes() {
+    assert_v2_framing_change_rejected(false);
+}
+
+#[test]
+fn patch_at_offset_rejects_v2_framing_changes() {
+    assert_v2_framing_change_rejected(true);
+}
+
+#[test]
+fn in_place_patches_preserve_v1_framing() {
+    for (original, replacement) in [
+        (Value::Text("12345678".into()), Value::Integer(9)),
+        (Value::Integer(9), Value::Text("12345678".into())),
+    ] {
+        // V1 retains the length field for both fixed and variable-width cells.
+        let mut encoded = vec![2, 0, 0, original.data_type().type_tag()];
+        encoded.extend_from_slice(&8u32.to_le_bytes());
+        match &original {
+            Value::Text(text) => encoded.extend_from_slice(text.as_bytes()),
+            Value::Integer(value) => encoded.extend_from_slice(&value.to_le_bytes()),
+            _ => unreachable!(),
+        }
+        encoded.push(DataType::Boolean.type_tag());
+        encoded.extend_from_slice(&1u32.to_le_bytes());
+        encoded.push(1);
+        assert_eq!(
+            decode_row(&encoded).unwrap(),
+            vec![original, Value::Boolean(true)]
+        );
+
+        for at_offset in [false, true] {
+            let mut patched = encoded.clone();
+            let applied = if at_offset {
+                let (_, offset) = decode_column_with_offset(&patched, 0).unwrap();
+                patch_at_offset(&mut patched, offset, &replacement).unwrap()
+            } else {
+                patch_column_in_place(&mut patched, 0, &replacement).unwrap()
+            };
+            assert!(applied);
+            assert_eq!(patched.len(), encoded.len());
+            assert_eq!(
+                decode_row(&patched).unwrap(),
+                vec![replacement.clone(), Value::Boolean(true)]
+            );
+        }
+    }
+}
+
+#[test]
+fn in_place_patches_allow_equal_width_fixed_types() {
+    for (original, replacement) in [
+        (Value::Integer(42), Value::Real(3.5)),
+        (Value::Real(3.5), Value::Timestamp(42)),
+        (Value::Timestamp(42), Value::Time(56)),
+        (Value::Date(1), Value::Date(2)),
+        (Value::Boolean(false), Value::Boolean(true)),
+    ] {
+        let encoded = encode_row(&[original, Value::Integer(77)]);
+        for at_offset in [false, true] {
+            let mut patched = encoded.clone();
+            let applied = if at_offset {
+                let (_, offset) = decode_column_with_offset(&patched, 0).unwrap();
+                patch_at_offset(&mut patched, offset, &replacement).unwrap()
+            } else {
+                patch_column_in_place(&mut patched, 0, &replacement).unwrap()
+            };
+            assert!(applied);
+            assert_eq!(patched.len(), encoded.len());
+            assert_eq!(
+                decode_row(&patched).unwrap(),
+                vec![replacement.clone(), Value::Integer(77)]
+            );
+        }
+    }
+}
+
+fn assert_truncated_patch_payload_is_rejected(at_offset: bool) {
+    for version in [RowVersion::V1, RowVersion::V2] {
+        for value in [Value::Integer(42), Value::Text("12345678".into())] {
+            let mut encoded = encode_row(std::slice::from_ref(&value));
+            if version == RowVersion::V1 {
+                encoded[..2].copy_from_slice(&1u16.to_le_bytes());
+                if matches!(value, Value::Integer(_)) {
+                    encoded.splice(4..4, 8u32.to_le_bytes());
+                }
+            }
+            let (_, offset) = decode_column_with_offset(&encoded, 0).unwrap();
+            encoded.pop();
+            let before = encoded.clone();
+            let replacement = match &value {
+                Value::Integer(_) => Value::Real(3.5),
+                Value::Text(_) => Value::Blob(vec![9; 8]),
+                _ => unreachable!(),
+            };
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if at_offset {
+                    patch_at_offset(&mut encoded, offset, &replacement)
+                } else {
+                    patch_column_in_place(&mut encoded, 0, &replacement)
+                }
+            }));
+            assert!(
+                matches!(outcome, Ok(Err(SqlError::InvalidValue(_)))),
+                "{version:?} truncated {value:?} must return an error: {outcome:?}"
+            );
+            assert_eq!(encoded, before, "an invalid row must remain unchanged");
+        }
+    }
+}
+
+#[test]
+fn patch_column_in_place_rejects_truncated_payloads_without_mutation() {
+    assert_truncated_patch_payload_is_rejected(false);
+}
+
+#[test]
+fn patch_at_offset_rejects_truncated_payloads_without_mutation() {
+    assert_truncated_patch_payload_is_rejected(true);
+}
+
+#[test]
 fn raw_column_array_decodes() {
     let v = arr(vec![Value::Integer(7), Value::Text("x".into())]);
     let encoded = encode_row(std::slice::from_ref(&v));

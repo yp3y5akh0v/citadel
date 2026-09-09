@@ -1003,6 +1003,57 @@ pub(crate) fn decode_full_row_with_cancel(
     Ok(row)
 }
 
+/// Encode physical slots, retaining dropped and VIRTUAL slots as NULL.
+pub(super) fn encode_stored_row(
+    schema: &TableSchema,
+    row: &[Value],
+    physical_values: &mut Vec<Value>,
+) -> Vec<u8> {
+    physical_values.resize(schema.physical_non_pk_count(), Value::Null);
+    physical_values.fill(Value::Null);
+    for (&logical_idx, &physical_idx) in schema
+        .non_pk_indices()
+        .iter()
+        .zip(schema.encoding_positions())
+    {
+        if !matches!(
+            schema.columns[logical_idx].generated_kind,
+            Some(crate::parser::GeneratedKind::Virtual)
+        ) {
+            physical_values[physical_idx as usize] = row[logical_idx].clone();
+        }
+    }
+    crate::encoding::encode_row(physical_values)
+}
+
+/// Reusable buffers for materializing pre-ALTER rows before byte-level UPDATE.
+#[derive(Default)]
+pub(super) struct UpdateRowMaterializer {
+    logical_row: Vec<Value>,
+    physical_values: Vec<Value>,
+}
+
+impl UpdateRowMaterializer {
+    /// Materialize missing columns; full-width rows need no allocation.
+    pub(super) fn expand(
+        &mut self,
+        schema: &TableSchema,
+        key: &[u8],
+        encoded: &[u8],
+        cancel: Option<&citadel::CancelToken>,
+    ) -> Result<Option<Vec<u8>>> {
+        if encoded.len() >= 2 && row_non_pk_count(encoded) >= schema.physical_non_pk_count() {
+            return Ok(None);
+        }
+        let result =
+            decode_full_row_into_with_cancel(schema, key, encoded, &mut self.logical_row, cancel)
+                .map(|()| encode_stored_row(schema, &self.logical_row, &mut self.physical_values));
+        self.logical_row.clear();
+        self.physical_values.clear();
+        result.map(Some)
+    }
+}
+
 /// True when a full row can be push-built (single PK at logical 0, no virtual columns,
 /// no dropped slots).
 pub(crate) fn full_row_push_eligible(schema: &TableSchema) -> bool {
