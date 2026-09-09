@@ -1002,6 +1002,78 @@ fn count_params_none() {
 }
 
 #[test]
+fn count_params_insert_conflict_assignments() {
+    for (sql, expected) in [
+        (
+            "INSERT INTO t VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET v = $3",
+            3,
+        ),
+        (
+            "INSERT INTO t VALUES (1, 0) ON CONFLICT (id) DO UPDATE SET v = COALESCE($4, v) + $2",
+            4,
+        ),
+        (
+            "INSERT INTO t VALUES ($1, $2) ON CONFLICT (id) DO NOTHING",
+            2,
+        ),
+    ] {
+        let stmt = parse_sql(sql).unwrap();
+        assert_eq!(count_params(&stmt), expected, "{sql}");
+    }
+}
+
+#[test]
+fn count_params_insert_conflict_where() {
+    let stmt = parse_sql(
+        "INSERT INTO t VALUES ($1, $2) \
+         ON CONFLICT (id) DO UPDATE SET v = excluded.v WHERE v < ($3 + 1)",
+    )
+    .unwrap();
+    assert_eq!(count_params(&stmt), 3);
+}
+
+#[test]
+fn count_params_insert_conflict_nested_subqueries() {
+    for (sql, expected) in [
+        (
+            "INSERT INTO t VALUES ($1, $2) \
+             ON CONFLICT (id) DO UPDATE SET v = COALESCE($3, (SELECT $6)) \
+             WHERE EXISTS (SELECT 1 FROM gate WHERE mark = $4)",
+            6,
+        ),
+        (
+            "INSERT INTO t VALUES ($1, $2) \
+             ON CONFLICT (id) DO UPDATE SET v = COALESCE($3, (SELECT $4)) \
+             WHERE EXISTS (SELECT 1 FROM gate WHERE mark = $7)",
+            7,
+        ),
+    ] {
+        let stmt = parse_sql(sql).unwrap();
+        assert_eq!(count_params(&stmt), expected, "{sql}");
+    }
+}
+
+#[test]
+fn count_params_insert_conflict_select_source() {
+    let stmt = parse_sql(
+        "INSERT INTO t (id, v) SELECT id, v FROM source WHERE id = $1 \
+         ON CONFLICT (id) DO UPDATE SET v = $2 WHERE v < $3",
+    )
+    .unwrap();
+    assert_eq!(count_params(&stmt), 3);
+}
+
+#[test]
+fn count_params_insert_conflict_explain_wrapper() {
+    let stmt = parse_sql(
+        "EXPLAIN INSERT INTO t VALUES ($1, $2) \
+         ON CONFLICT (id) DO UPDATE SET v = ($3 + 1) WHERE v < $4",
+    )
+    .unwrap();
+    assert_eq!(count_params(&stmt), 4);
+}
+
+#[test]
 fn parse_table_constraint_pk() {
     let stmt = parse_sql("CREATE TABLE t (a INTEGER, b TEXT, PRIMARY KEY (a))").unwrap();
     match stmt {

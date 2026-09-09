@@ -157,10 +157,16 @@ pub(super) fn exec_insert(
         .map(|c| (c.position as usize, c.default_expr.as_ref().unwrap()))
         .collect();
 
+    let required_virtuals = required_insert_virtuals(schema, table_schema, stmt);
     let generated_cols: Vec<(usize, &Expr)> = table_schema
         .columns
         .iter()
-        .filter(|c| matches!(c.generated_kind, Some(crate::parser::GeneratedKind::Stored)))
+        .filter(|c| {
+            matches!(c.generated_kind, Some(crate::parser::GeneratedKind::Stored))
+                || required_virtuals
+                    .before_insert
+                    .contains(&(c.position as usize))
+        })
         .map(|c| (c.position as usize, c.generated_expr.as_ref().unwrap()))
         .collect();
 
@@ -274,6 +280,8 @@ pub(super) fn exec_insert(
     let mut min_inserted_pk: Option<i64> = None;
     let (has_before_insert_triggers, has_after_insert_triggers, has_after_update_triggers) =
         row_insert_trigger_flags(schema, &table_schema.name);
+    let capture_insert_row =
+        returning_rows.is_some() || has_insert_statement_triggers || has_after_insert_triggers;
 
     // The autocommit twin of the in-transaction row loop, and cancellable for
     // the same reason: neither reaches a scan.
@@ -411,14 +419,6 @@ pub(super) fn exec_insert(
             }
         }
 
-        let proposed_row_for_returning: Option<Vec<Value>> =
-            returning_rows.as_ref().map(|_| row.clone());
-        let row_for_stmt_trigger: Option<Vec<Value>> = if has_insert_statement_triggers {
-            Some(row.clone())
-        } else {
-            None
-        };
-
         if has_before_insert_triggers {
             super::triggers::fire_row_triggers(
                 &mut wtx,
@@ -449,7 +449,6 @@ pub(super) fn exec_insert(
                 Some(crate::parser::GeneratedKind::Virtual)
             ) {
                 value_values[enc_pos[j] as usize] = Value::Null;
-                row[i] = Value::Null;
             } else {
                 value_values[enc_pos[j] as usize] = std::mem::replace(&mut row[i], Value::Null);
             }
@@ -477,49 +476,45 @@ pub(super) fn exec_insert(
                 if !is_new {
                     return Err(SqlError::DuplicateKey);
                 }
-                if !table_schema.indices.is_empty() || has_after_insert_triggers {
-                    for (j, &i) in pk_indices.iter().enumerate() {
-                        row[i] = pk_values[j].clone();
-                    }
-                    for (j, &i) in non_pk.iter().enumerate() {
-                        row[i] =
-                            std::mem::replace(&mut value_values[enc_pos[j] as usize], Value::Null);
-                    }
+                if !table_schema.indices.is_empty() || capture_insert_row {
+                    restore_insert_row(table_schema, &pk_values, &mut value_values, &mut row);
                     if !table_schema.indices.is_empty() {
                         insert_index_entries(&mut wtx, table_schema, &row, &pk_values)?;
                     }
-                    if has_after_insert_triggers {
-                        super::triggers::fire_row_triggers(
-                            &mut wtx,
-                            schema,
-                            &table_schema.name,
-                            crate::parser::TriggerTiming::After,
-                            super::triggers::FireEvent::Insert,
-                            None,
-                            Some(row.clone()),
-                            &table_schema.columns,
-                        )?;
-                    }
                 }
-                if let Some(r) = row_for_stmt_trigger.clone() {
-                    stmt_new_rows.push(r);
+                if capture_insert_row {
+                    materialize_insert_result_virtuals(
+                        table_schema,
+                        &required_virtuals.after_insert,
+                        &mut row,
+                        cancel.as_ref(),
+                    )?;
+                }
+                if has_after_insert_triggers {
+                    super::triggers::fire_row_triggers(
+                        &mut wtx,
+                        schema,
+                        &table_schema.name,
+                        crate::parser::TriggerTiming::After,
+                        super::triggers::FireEvent::Insert,
+                        None,
+                        Some(row.clone()),
+                        &table_schema.columns,
+                    )?;
+                }
+                if has_insert_statement_triggers {
+                    stmt_new_rows.push(row.clone());
                 }
                 count += 1;
                 if let Some(buf) = returning_rows.as_mut() {
-                    buf.push((None, proposed_row_for_returning));
+                    buf.push((None, Some(row.clone())));
                 }
             }
             Some(oc) => {
                 let oc_ref: &CompiledOnConflict = oc;
                 let needs_row = upsert_needs_row(oc_ref, table_schema);
                 if needs_row {
-                    for (j, &i) in pk_indices.iter().enumerate() {
-                        row[i] = pk_values[j].clone();
-                    }
-                    for (j, &i) in non_pk.iter().enumerate() {
-                        row[i] =
-                            std::mem::replace(&mut value_values[enc_pos[j] as usize], Value::Null);
-                    }
+                    restore_insert_row(table_schema, &pk_values, &mut value_values, &mut row);
                 }
                 let outcome = apply_insert_with_conflict(
                     &mut wtx,
@@ -536,12 +531,28 @@ pub(super) fn exec_insert(
                 )?;
                 match outcome {
                     InsertRowOutcome::Inserted => {
+                        if capture_insert_row {
+                            if !needs_row {
+                                restore_insert_row(
+                                    table_schema,
+                                    &pk_values,
+                                    &mut value_values,
+                                    &mut row,
+                                );
+                            }
+                            materialize_insert_result_virtuals(
+                                table_schema,
+                                &required_virtuals.after_insert,
+                                &mut row,
+                                cancel.as_ref(),
+                            )?;
+                        }
                         count += 1;
                         if let Some(buf) = returning_rows.as_mut() {
-                            buf.push((None, proposed_row_for_returning));
+                            buf.push((None, Some(row.clone())));
                         }
-                        if let Some(r) = row_for_stmt_trigger.clone() {
-                            stmt_new_rows.push(r);
+                        if has_insert_statement_triggers {
+                            stmt_new_rows.push(row.clone());
                         }
                         if has_after_insert_triggers {
                             super::triggers::fire_row_triggers(
@@ -556,31 +567,35 @@ pub(super) fn exec_insert(
                             )?;
                         }
                     }
-                    InsertRowOutcome::Updated { old, new } => {
+                    InsertRowOutcome::Updated { rows } => {
                         count += 1;
-                        if let Some(buf) = returning_rows.as_mut() {
-                            buf.push((Some(old.clone()), Some(new.clone())));
-                        }
-                        if has_after_update_triggers {
-                            let changed_cols: Vec<String> = match oc_ref {
-                                CompiledOnConflict::DoUpdate { assignments, .. } => assignments
-                                    .iter()
-                                    .map(|(col_idx, _)| table_schema.columns[*col_idx].name.clone())
-                                    .collect(),
-                                _ => Vec::new(),
-                            };
-                            super::triggers::fire_row_triggers(
-                                &mut wtx,
-                                schema,
-                                &table_schema.name,
-                                crate::parser::TriggerTiming::After,
-                                super::triggers::FireEvent::Update {
-                                    changed_columns: &changed_cols,
-                                },
-                                Some(old),
-                                Some(new),
-                                &table_schema.columns,
-                            )?;
+                        if let Some((old, new)) = rows {
+                            if let Some(buf) = returning_rows.as_mut() {
+                                buf.push((Some(old.clone()), Some(new.clone())));
+                            }
+                            if has_after_update_triggers {
+                                let changed_cols: Vec<String> = match oc_ref {
+                                    CompiledOnConflict::DoUpdate { assignments, .. } => assignments
+                                        .iter()
+                                        .map(|(col_idx, _)| {
+                                            table_schema.columns[*col_idx].name.clone()
+                                        })
+                                        .collect(),
+                                    _ => Vec::new(),
+                                };
+                                super::triggers::fire_row_triggers(
+                                    &mut wtx,
+                                    schema,
+                                    &table_schema.name,
+                                    crate::parser::TriggerTiming::After,
+                                    super::triggers::FireEvent::Update {
+                                        changed_columns: &changed_cols,
+                                    },
+                                    Some(old),
+                                    Some(new),
+                                    &table_schema.columns,
+                                )?;
+                            }
                         }
                     }
                     InsertRowOutcome::Skipped => {}
@@ -1634,6 +1649,7 @@ pub(super) struct UpsertBufs {
     new_row: Vec<Value>,
     value_values: Vec<Value>,
     new_value_buf: Vec<u8>,
+    materializer: UpdateRowMaterializer,
 }
 
 impl UpsertBufs {
@@ -1643,6 +1659,7 @@ impl UpsertBufs {
             new_row: Vec::new(),
             value_values: Vec::new(),
             new_value_buf: Vec::with_capacity(256),
+            materializer: UpdateRowMaterializer::default(),
         }
     }
 }
@@ -1821,17 +1838,27 @@ fn exec_insert_in_txn_impl(
     let generated_cols_uncached: Vec<(usize, &Expr, FastGenEval)>;
     let cached_gen_positions: &[usize];
     let cached_gen_fast_evals: &[FastGenEval];
+    let late_virtual_positions: &[usize];
+    let uncached_virtuals;
     if let Some(c) = cache {
         cached_gen_positions = &c.generated_col_positions;
         cached_gen_fast_evals = &c.generated_fast_evals;
+        late_virtual_positions = &c.late_virtual_positions;
         generated_cols_uncached = Vec::new();
     } else {
         cached_gen_positions = &[];
         cached_gen_fast_evals = &[];
+        uncached_virtuals = required_insert_virtuals(schema, table_schema, stmt);
+        late_virtual_positions = &uncached_virtuals.after_insert;
         generated_cols_uncached = table_schema
             .columns
             .iter()
-            .filter(|c| matches!(c.generated_kind, Some(crate::parser::GeneratedKind::Stored)))
+            .filter(|c| {
+                matches!(c.generated_kind, Some(crate::parser::GeneratedKind::Stored))
+                    || uncached_virtuals
+                        .before_insert
+                        .contains(&(c.position as usize))
+            })
             .map(|c| {
                 let expr = c.generated_expr.as_ref().unwrap();
                 let fe = detect_fast_gen_eval(expr, table_schema);
@@ -1995,6 +2022,8 @@ fn exec_insert_in_txn_impl(
     let (has_before_insert_triggers, has_after_insert_triggers, has_after_update_triggers) =
         row_insert_trigger_flags(schema, &table_schema.name);
 
+    let capture_insert_row =
+        returning_rows.is_some() || has_insert_statement_triggers_impl || has_after_insert_triggers;
     let skip_row_clear = cache.is_some_and(|c| c.row_fully_overwritten);
     // A wide VALUES list or an INSERT ... SELECT is a row loop like any scan,
     // and it never enters one, so this is the only place a cancel can land.
@@ -2185,14 +2214,6 @@ fn exec_insert_in_txn_impl(
             }
         }
 
-        let proposed_row_for_returning: Option<Vec<Value>> =
-            returning_rows.as_ref().map(|_| bufs.row.clone());
-        let row_for_stmt_trigger_impl: Option<Vec<Value>> = if has_insert_statement_triggers_impl {
-            Some(bufs.row.clone())
-        } else {
-            None
-        };
-
         if has_before_insert_triggers {
             super::triggers::fire_row_triggers(
                 wtx,
@@ -2232,7 +2253,6 @@ fn exec_insert_in_txn_impl(
                 Some(crate::parser::GeneratedKind::Virtual)
             ) {
                 bufs.value_values[enc_pos[j] as usize] = Value::Null;
-                bufs.row[i] = Value::Null;
             } else {
                 bufs.value_values[enc_pos[j] as usize] =
                     std::mem::replace(&mut bufs.row[i], Value::Null);
@@ -2268,53 +2288,55 @@ fn exec_insert_in_txn_impl(
                 if !is_new {
                     return Err(SqlError::DuplicateKey);
                 }
-                if has_indices || has_after_insert_triggers {
-                    for (j, &i) in pk_indices.iter().enumerate() {
-                        bufs.row[i] = bufs.pk_values[j].clone();
-                    }
-                    for (j, &i) in non_pk.iter().enumerate() {
-                        bufs.row[i] = std::mem::replace(
-                            &mut bufs.value_values[enc_pos[j] as usize],
-                            Value::Null,
-                        );
-                    }
+                if has_indices || capture_insert_row {
+                    restore_insert_row(
+                        table_schema,
+                        &bufs.pk_values,
+                        &mut bufs.value_values,
+                        &mut bufs.row,
+                    );
                     if has_indices {
                         insert_index_entries(wtx, table_schema, &bufs.row, &bufs.pk_values)?;
                     }
-                    if has_after_insert_triggers {
-                        super::triggers::fire_row_triggers(
-                            wtx,
-                            schema,
-                            &table_schema.name,
-                            crate::parser::TriggerTiming::After,
-                            super::triggers::FireEvent::Insert,
-                            None,
-                            Some(bufs.row.clone()),
-                            &table_schema.columns,
-                        )?;
-                    }
                 }
-                if let Some(r) = row_for_stmt_trigger_impl.clone() {
-                    stmt_new_rows_impl.push(r);
+                if capture_insert_row {
+                    materialize_insert_result_virtuals(
+                        table_schema,
+                        late_virtual_positions,
+                        &mut bufs.row,
+                        cancel.as_ref(),
+                    )?;
+                }
+                if has_after_insert_triggers {
+                    super::triggers::fire_row_triggers(
+                        wtx,
+                        schema,
+                        &table_schema.name,
+                        crate::parser::TriggerTiming::After,
+                        super::triggers::FireEvent::Insert,
+                        None,
+                        Some(bufs.row.clone()),
+                        &table_schema.columns,
+                    )?;
+                }
+                if has_insert_statement_triggers_impl {
+                    stmt_new_rows_impl.push(bufs.row.clone());
                 }
                 count += 1;
                 if let Some(buf) = returning_rows.as_mut() {
-                    buf.push((None, proposed_row_for_returning));
+                    buf.push((None, Some(bufs.row.clone())));
                 }
             }
             Some(oc) => {
                 let oc_ref: &CompiledOnConflict = oc;
                 let needs_row = upsert_needs_row(oc_ref, table_schema);
                 if needs_row {
-                    for (j, &i) in pk_indices.iter().enumerate() {
-                        bufs.row[i] = bufs.pk_values[j].clone();
-                    }
-                    for (j, &i) in non_pk.iter().enumerate() {
-                        bufs.row[i] = std::mem::replace(
-                            &mut bufs.value_values[enc_pos[j] as usize],
-                            Value::Null,
-                        );
-                    }
+                    restore_insert_row(
+                        table_schema,
+                        &bufs.pk_values,
+                        &mut bufs.value_values,
+                        &mut bufs.row,
+                    );
                 }
                 let outcome = apply_insert_with_conflict(
                     wtx,
@@ -2331,12 +2353,28 @@ fn exec_insert_in_txn_impl(
                 )?;
                 match outcome {
                     InsertRowOutcome::Inserted => {
+                        if capture_insert_row {
+                            if !needs_row {
+                                restore_insert_row(
+                                    table_schema,
+                                    &bufs.pk_values,
+                                    &mut bufs.value_values,
+                                    &mut bufs.row,
+                                );
+                            }
+                            materialize_insert_result_virtuals(
+                                table_schema,
+                                late_virtual_positions,
+                                &mut bufs.row,
+                                cancel.as_ref(),
+                            )?;
+                        }
                         count += 1;
                         if let Some(buf) = returning_rows.as_mut() {
-                            buf.push((None, proposed_row_for_returning));
+                            buf.push((None, Some(bufs.row.clone())));
                         }
-                        if let Some(r) = row_for_stmt_trigger_impl.clone() {
-                            stmt_new_rows_impl.push(r);
+                        if has_insert_statement_triggers_impl {
+                            stmt_new_rows_impl.push(bufs.row.clone());
                         }
                         if has_after_insert_triggers {
                             super::triggers::fire_row_triggers(
@@ -2351,31 +2389,35 @@ fn exec_insert_in_txn_impl(
                             )?;
                         }
                     }
-                    InsertRowOutcome::Updated { old, new } => {
+                    InsertRowOutcome::Updated { rows } => {
                         count += 1;
-                        if let Some(buf) = returning_rows.as_mut() {
-                            buf.push((Some(old.clone()), Some(new.clone())));
-                        }
-                        if has_after_update_triggers {
-                            let changed_cols: Vec<String> = match oc_ref {
-                                CompiledOnConflict::DoUpdate { assignments, .. } => assignments
-                                    .iter()
-                                    .map(|(col_idx, _)| table_schema.columns[*col_idx].name.clone())
-                                    .collect(),
-                                _ => Vec::new(),
-                            };
-                            super::triggers::fire_row_triggers(
-                                wtx,
-                                schema,
-                                &table_schema.name,
-                                crate::parser::TriggerTiming::After,
-                                super::triggers::FireEvent::Update {
-                                    changed_columns: &changed_cols,
-                                },
-                                Some(old),
-                                Some(new),
-                                &table_schema.columns,
-                            )?;
+                        if let Some((old, new)) = rows {
+                            if let Some(buf) = returning_rows.as_mut() {
+                                buf.push((Some(old.clone()), Some(new.clone())));
+                            }
+                            if has_after_update_triggers {
+                                let changed_cols: Vec<String> = match oc_ref {
+                                    CompiledOnConflict::DoUpdate { assignments, .. } => assignments
+                                        .iter()
+                                        .map(|(col_idx, _)| {
+                                            table_schema.columns[*col_idx].name.clone()
+                                        })
+                                        .collect(),
+                                    _ => Vec::new(),
+                                };
+                                super::triggers::fire_row_triggers(
+                                    wtx,
+                                    schema,
+                                    &table_schema.name,
+                                    crate::parser::TriggerTiming::After,
+                                    super::triggers::FireEvent::Update {
+                                        changed_columns: &changed_cols,
+                                    },
+                                    Some(old),
+                                    Some(new),
+                                    &table_schema.columns,
+                                )?;
+                            }
                         }
                     }
                     InsertRowOutcome::Skipped => {}
@@ -2443,6 +2485,7 @@ struct InsertCache {
     on_conflict: Option<Arc<CompiledOnConflict>>,
     generated_col_positions: Vec<usize>,
     generated_fast_evals: Vec<FastGenEval>,
+    late_virtual_positions: Vec<usize>,
     pk_indices: Vec<usize>,
     non_pk_indices: Vec<usize>,
     encoding_positions: Vec<u16>,
@@ -2526,6 +2569,151 @@ enum WriteOp {
     },
 }
 
+/// Restore stored values without replacing logical virtuals with physical NULLs.
+fn restore_insert_row(ts: &TableSchema, pk: &[Value], values: &mut [Value], row: &mut [Value]) {
+    for (&i, value) in ts.pk_indices().iter().zip(pk) {
+        row[i] = value.clone();
+    }
+    for (&i, &slot) in ts.non_pk_indices().iter().zip(ts.encoding_positions()) {
+        if !matches!(
+            ts.columns[i].generated_kind,
+            Some(crate::parser::GeneratedKind::Virtual)
+        ) {
+            row[i] = std::mem::replace(&mut values[slot as usize], Value::Null);
+        }
+    }
+}
+
+#[derive(Default)]
+struct InsertVirtuals {
+    before_insert: Vec<usize>,
+    after_insert: Vec<usize>,
+}
+
+/// Keep INSERT constraints separate from consumers that require an inserted row.
+fn required_insert_virtuals(
+    schema: &SchemaManager,
+    ts: &TableSchema,
+    stmt: &InsertStmt,
+) -> InsertVirtuals {
+    if !ts.has_virtual_columns() {
+        return InsertVirtuals::default();
+    }
+    let mut required = vec![false; ts.columns.len()];
+    let mut after_insert = vec![false; ts.columns.len()];
+    for trigger in schema.triggers_for(&ts.name) {
+        if !trigger.enabled
+            || !trigger
+                .events
+                .iter()
+                .any(|event| matches!(event, TriggerEvent::Insert))
+        {
+            continue;
+        }
+        match trigger.timing {
+            TriggerTiming::Before if trigger.granularity == TriggerGranularity::ForEachRow => {
+                required.fill(true);
+            }
+            TriggerTiming::After => after_insert.fill(true),
+            _ => {}
+        }
+    }
+    for col in &ts.columns {
+        if !col.nullable {
+            required[col.position as usize] = true;
+        }
+        if let Some(expr) = &col.check_expr {
+            require_virtual_refs(ts, expr, &mut required, |_| true);
+        }
+    }
+    for check in &ts.check_constraints {
+        require_virtual_refs(ts, &check.expr, &mut required, |_| true);
+    }
+    for fk in &ts.foreign_keys {
+        for &col in &fk.columns {
+            required[col as usize] = true;
+        }
+    }
+    for index in &ts.indices {
+        for key in &index.keys {
+            match key {
+                IndexKey::Column { idx, .. } => required[*idx as usize] = true,
+                IndexKey::Expr { expr, .. } => {
+                    require_virtual_refs(ts, expr, &mut required, |_| true)
+                }
+            }
+        }
+        if let Some(expr) = &index.predicate_expr {
+            require_virtual_refs(ts, expr, &mut required, |_| true);
+        }
+    }
+    if let Some(returning) = &stmt.returning {
+        for col in returning {
+            match col {
+                SelectColumn::AllColumns | SelectColumn::AllFromNew => after_insert.fill(true),
+                SelectColumn::AllFromOld => {}
+                SelectColumn::Expr { expr, .. } => {
+                    require_virtual_refs(ts, expr, &mut after_insert, |qualifier| {
+                        !qualifier.is_some_and(|q| q.eq_ignore_ascii_case("old"))
+                    })
+                }
+            }
+        }
+    }
+    let mut positions = InsertVirtuals::default();
+    for (i, col) in ts.columns.iter().enumerate() {
+        if matches!(col.generated_kind, Some(GeneratedKind::Virtual)) {
+            if required[i] {
+                positions.before_insert.push(i);
+            } else if after_insert[i] {
+                positions.after_insert.push(i);
+            }
+        }
+    }
+    positions
+}
+
+fn materialize_insert_result_virtuals(
+    ts: &TableSchema,
+    positions: &[usize],
+    row: &mut [Value],
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<()> {
+    if positions.is_empty() {
+        return Ok(());
+    }
+    let col_map = ts.column_map();
+    for &pos in positions {
+        let col = &ts.columns[pos];
+        let value = eval_expr(
+            col.generated_expr.as_ref().unwrap(),
+            &EvalCtx::new(col_map, row).with_cancel(cancel),
+        )?;
+        row[pos] = coerce_for_column(value, col, ts.is_strict())?;
+    }
+    Ok(())
+}
+
+fn require_virtual_refs(
+    ts: &TableSchema,
+    expr: &Expr,
+    required: &mut [bool],
+    include: impl Fn(Option<&str>) -> bool,
+) {
+    crate::parser::visit_expr(expr, &mut |expr| {
+        let (qualifier, name) = match expr {
+            Expr::Column(name) => (None, name),
+            Expr::QualifiedColumn { table, column } => (Some(table.as_str()), column),
+            _ => return,
+        };
+        if include(qualifier) {
+            if let Some(i) = ts.column_index(name) {
+                required[i] = true;
+            }
+        }
+    });
+}
+
 fn build_trivial_fast_program(
     bind_plan: &[BindAction],
     phys_count: usize,
@@ -2553,9 +2741,7 @@ fn build_trivial_fast_program(
             where_clause: None,
             fast_paths: Some(fps),
             ..
-        }) if ts.indices.is_empty() && ts.foreign_keys.is_empty() && !ts.has_checks() => {
-            DupPolicy::Patch(fps.clone())
-        }
+        }) => DupPolicy::Patch(fps.clone()),
         _ => return None,
     };
 
@@ -2790,8 +2976,33 @@ pub(super) enum CompiledOnConflict {
 }
 
 #[derive(Clone, Copy)]
-pub(super) enum DoUpdateFastPath {
-    IntAddConst { phys_idx: usize, delta: i64 },
+pub(super) struct DoUpdateFastPath {
+    col_idx: usize,
+    phys_idx: usize,
+    arithmetic: IntPatchArithmetic,
+}
+
+#[derive(Clone, Copy)]
+enum IntPatchArithmetic {
+    Add(i64),
+    Sub(i64),
+}
+
+impl IntPatchArithmetic {
+    fn eval(self, value: i64) -> Result<Value> {
+        let result = match self {
+            Self::Add(rhs) => value.checked_add(rhs),
+            Self::Sub(rhs) => value.checked_sub(rhs),
+        };
+        result.map(Value::Integer).ok_or(SqlError::IntegerOverflow)
+    }
+
+    fn parts(self) -> (BinOp, Value) {
+        match self {
+            Self::Add(rhs) => (BinOp::Add, Value::Integer(rhs)),
+            Self::Sub(rhs) => (BinOp::Sub, Value::Integer(rhs)),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -2856,7 +3067,7 @@ fn set_equal(a: &[u16], b: &[u16]) -> bool {
 
 pub(super) enum InsertRowOutcome {
     Inserted,
-    Updated { old: Vec<Value>, new: Vec<Value> },
+    Updated { rows: Option<UpsertRows> },
     Skipped,
 }
 
@@ -3020,60 +3231,75 @@ pub(super) fn apply_insert_with_conflict(
 
 #[inline]
 fn apply_fast_path_patch(
+    schema: &TableSchema,
+    key: &[u8],
     old_bytes: &[u8],
     fast_paths: &[DoUpdateFastPath],
+    cancel: Option<&citadel::CancelToken>,
+    captured: Option<&RefCell<Option<UpsertRows>>>,
 ) -> Result<UpsertAction> {
-    UPSERT_SCRATCH.with(|slot| {
-        let mut bufs = slot.borrow_mut();
-        bufs.new_value_buf.clear();
-        bufs.new_value_buf.extend_from_slice(old_bytes);
+    use crate::encoding::{
+        decode_column_with_offset, patch_at_offset, patch_row_column, RawColumn,
+    };
 
-        let mut patch_scratch: Vec<u8> = Vec::new();
-
-        for fp in fast_paths {
-            match fp {
-                DoUpdateFastPath::IntAddConst { phys_idx, delta } => {
-                    let decoded =
-                        crate::encoding::decode_columns(&bufs.new_value_buf, &[*phys_idx])?;
-                    let old_val = &decoded[0];
-                    let new_val = match old_val {
-                        Value::Integer(i) => Value::Integer(i.wrapping_add(*delta)),
-                        Value::Null => Value::Null,
-                        _ => {
-                            return Err(SqlError::TypeMismatch {
-                                expected: "INTEGER".into(),
-                                got: old_val.data_type().to_string(),
-                            });
-                        }
-                    };
-                    if !crate::encoding::patch_column_in_place(
-                        &mut bufs.new_value_buf,
-                        *phys_idx,
-                        &new_val,
-                    )? {
-                        patch_scratch.clear();
-                        crate::encoding::patch_row_column(
-                            &bufs.new_value_buf,
-                            *phys_idx,
-                            &new_val,
-                            &mut patch_scratch,
-                        )?;
-                        std::mem::swap(&mut bufs.new_value_buf, &mut patch_scratch);
-                    }
-                }
+    let normalized = UPSERT_SCRATCH.with(|slot| {
+        slot.borrow_mut()
+            .materializer
+            .expand(schema, key, old_bytes, cancel)
+    })?;
+    let old_row = captured
+        .map(|_| {
+            decode_full_row_with_cancel(
+                schema,
+                key,
+                normalized.as_deref().unwrap_or(old_bytes),
+                cancel,
+            )
+        })
+        .transpose()?;
+    let mut bytes = normalized.unwrap_or_else(|| old_bytes.to_vec());
+    let mut scratch = Vec::new();
+    let mut null_violation = None;
+    for fp in fast_paths {
+        // Admission permits distinct targets that each read only their own old value.
+        let (old, offset) = decode_column_with_offset(&bytes, fp.phys_idx)?;
+        let value = match old {
+            RawColumn::Integer(i) => fp.arithmetic.eval(i)?,
+            RawColumn::Null => Value::Null,
+            _ => {
+                let decoded = crate::encoding::decode_columns(&bytes, &[fp.phys_idx])?;
+                let (op, rhs) = fp.arithmetic.parts();
+                let value = crate::eval::eval_binary_op_with_cancel(&decoded[0], op, &rhs, cancel)?;
+                coerce_for_column(value, &schema.columns[fp.col_idx], schema.is_strict())?
             }
+        };
+        let col = &schema.columns[fp.col_idx];
+        if value.is_null() && !col.nullable && null_violation.is_none() {
+            null_violation = Some(&col.name);
         }
-
-        if bufs.new_value_buf.len() > citadel_core::MAX_VALUE_SIZE {
-            return Err(SqlError::RowTooLarge {
-                size: bufs.new_value_buf.len(),
-                max: citadel_core::MAX_VALUE_SIZE,
-            });
+        if !patch_at_offset(&mut bytes, offset, &value)? {
+            scratch.clear();
+            patch_row_column(&bytes, fp.phys_idx, &value, &mut scratch)?;
+            std::mem::swap(&mut bytes, &mut scratch);
         }
-
-        Ok(UpsertAction::Replace(bufs.new_value_buf.clone()))
-    })
+    }
+    if let Some(name) = null_violation {
+        return Err(SqlError::NotNullViolation(name.clone()));
+    }
+    if bytes.len() > citadel_core::MAX_VALUE_SIZE {
+        return Err(SqlError::RowTooLarge {
+            size: bytes.len(),
+            max: citadel_core::MAX_VALUE_SIZE,
+        });
+    }
+    if let (Some(captured), Some(old)) = (captured, old_row) {
+        let new = decode_full_row_with_cancel(schema, key, &bytes, cancel)?;
+        *captured.borrow_mut() = Some((old, new));
+    }
+    Ok(UpsertAction::Replace(bytes))
 }
+
+type UpsertRows = (Vec<Value>, Vec<Value>);
 
 fn upsert_needs_row(oc: &CompiledOnConflict, ts: &TableSchema) -> bool {
     if !ts.indices.is_empty() {
@@ -3081,7 +3307,7 @@ fn upsert_needs_row(oc: &CompiledOnConflict, ts: &TableSchema) -> bool {
     }
     match oc {
         CompiledOnConflict::DoNothing { .. } => false,
-        CompiledOnConflict::DoUpdate { fast_paths, .. } => fast_paths.is_none() || ts.has_checks(),
+        CompiledOnConflict::DoUpdate { fast_paths, .. } => fast_paths.is_none(),
     }
 }
 
@@ -3120,35 +3346,19 @@ fn apply_do_update_fused(
     let phys_count = table_schema.physical_non_pk_count();
     let dropped = table_schema.dropped_non_pk_slots();
     let has_checks = table_schema.has_checks();
-    let has_fks = !table_schema.foreign_keys.is_empty();
-
-    let captured: std::cell::RefCell<Option<(Vec<Value>, Vec<Value>)>> =
-        std::cell::RefCell::new(None);
+    let captured = RefCell::new(None);
 
     let outcome =
         wtx.table_upsert_with::<_, SqlError>(table_bytes, key_buf, value_buf, |old_bytes| {
             if let Some(fps) = fast_paths {
-                if !has_checks {
-                    let action = apply_fast_path_patch(old_bytes, fps)?;
-                    if capture_returning {
-                        if let UpsertAction::Replace(ref new_bytes) = action {
-                            let old_row = decode_full_row_with_cancel(
-                                table_schema,
-                                key_buf,
-                                old_bytes,
-                                cancel,
-                            )?;
-                            let new_row = decode_full_row_with_cancel(
-                                table_schema,
-                                key_buf,
-                                new_bytes,
-                                cancel,
-                            )?;
-                            *captured.borrow_mut() = Some((old_row, new_row));
-                        }
-                    }
-                    return Ok(action);
-                }
+                return apply_fast_path_patch(
+                    table_schema,
+                    key_buf,
+                    old_bytes,
+                    fps,
+                    cancel,
+                    capture_returning.then_some(&captured),
+                );
             }
             UPSERT_SCRATCH.with(|slot| {
                 let mut bufs = slot.borrow_mut();
@@ -3157,6 +3367,7 @@ fn apply_do_update_fused(
                     new_row,
                     value_values,
                     new_value_buf,
+                    ..
                 } = &mut *bufs;
 
                 old_row.clear();
@@ -3214,7 +3425,6 @@ fn apply_do_update_fused(
                         }
                     }
                 }
-                let _ = has_fks;
 
                 value_values.clear();
                 value_values.resize(phys_count, Value::Null);
@@ -3244,14 +3454,14 @@ fn apply_do_update_fused(
     match outcome {
         UpsertOutcome::Inserted => Ok(InsertRowOutcome::Inserted),
         UpsertOutcome::Updated => {
-            if capture_returning {
-                let (old, new) = captured.into_inner().ok_or_else(|| {
+            let rows = if capture_returning {
+                Some(captured.into_inner().ok_or_else(|| {
                     SqlError::InvalidValue("DO UPDATE produced no captured rows".into())
-                })?;
-                Ok(InsertRowOutcome::Updated { old, new })
+                })?)
             } else {
-                Ok(InsertRowOutcome::Inserted)
-            }
+                None
+            };
+            Ok(InsertRowOutcome::Updated { rows })
         }
         UpsertOutcome::Skipped => Ok(InsertRowOutcome::Skipped),
     }
@@ -3342,10 +3552,7 @@ fn apply_do_update_with_old_row(
     }
 
     for col in &table_schema.columns {
-        if matches!(
-            col.generated_kind,
-            Some(crate::parser::GeneratedKind::Stored)
-        ) {
+        if col.generated_kind.is_some() {
             let val = eval_expr(
                 col.generated_expr.as_ref().unwrap(),
                 &EvalCtx::new(col_map, &new_row).with_cancel(cancel),
@@ -3581,24 +3788,25 @@ fn apply_do_update_with_old_row(
         }
     }
 
-    if capture_returning {
-        Ok(InsertRowOutcome::Updated {
-            old: old_row.to_vec(),
-            new: new_row,
-        })
-    } else {
-        Ok(InsertRowOutcome::Inserted)
-    }
+    Ok(InsertRowOutcome::Updated {
+        rows: capture_returning.then(|| (old_row.to_vec(), new_row)),
+    })
 }
 
 fn detect_fast_paths(
     ts: &TableSchema,
     assignments: &[(usize, Expr)],
 ) -> Option<Vec<DoUpdateFastPath>> {
+    if !can_fuse_do_update(ts, assignments) || ts.has_checks() {
+        return None;
+    }
     let non_pk = ts.non_pk_indices();
     let enc_pos = ts.encoding_positions();
-    let mut out = Vec::with_capacity(assignments.len());
+    let mut out: Vec<DoUpdateFastPath> = Vec::with_capacity(assignments.len());
     for (col_idx, expr) in assignments {
+        if out.iter().any(|p| p.col_idx == *col_idx) {
+            return None;
+        }
         let col = &ts.columns[*col_idx];
         if col.data_type != DataType::Integer {
             return None;
@@ -3616,9 +3824,16 @@ fn detect_fast_paths(
                 return None;
             }
             if let Expr::Literal(Value::Integer(n)) = right.as_ref() {
-                let delta = if matches!(op, BinOp::Sub) { -n } else { *n };
-                let _ = col_idx;
-                out.push(DoUpdateFastPath::IntAddConst { phys_idx, delta });
+                let arithmetic = if matches!(op, BinOp::Sub) {
+                    IntPatchArithmetic::Sub(*n)
+                } else {
+                    IntPatchArithmetic::Add(*n)
+                };
+                out.push(DoUpdateFastPath {
+                    col_idx: *col_idx,
+                    phys_idx,
+                    arithmetic,
+                });
                 continue;
             }
             return None;
@@ -3649,6 +3864,9 @@ fn compile_on_conflict(oc: &OnConflictClause, ts: &TableSchema) -> Result<Compil
                     let col_idx = ts
                         .column_index(name)
                         .ok_or_else(|| SqlError::ColumnNotFound(name.clone()))?;
+                    if ts.columns[col_idx].generated_kind.is_some() {
+                        return Err(SqlError::CannotUpdateGeneratedColumn(name.clone()));
+                    }
                     Ok((col_idx, expr.clone()))
                 })
                 .collect::<Result<_>>()?;
@@ -3670,6 +3888,7 @@ fn compile_on_conflict(oc: &OnConflictClause, ts: &TableSchema) -> Result<Compil
 /// Integer-only template; other values use the validated cached lane.
 fn exec_insert_trivial_fast(
     wtx: &mut WriteTxn<'_>,
+    schema: &SchemaManager,
     table_lower: &str,
     cache: &InsertCache,
     bufs: &mut InsertBufs,
@@ -3751,11 +3970,24 @@ fn exec_insert_trivial_fast(
     }
 
     if let DupPolicy::Patch(fps) = &prog.on_dup {
+        let cancel = wtx.cancel_token().cloned();
         let outcome = wtx.table_upsert_with::<_, SqlError>(
             table_lower.as_bytes(),
             &bufs.key_buf,
             &bufs.value_buf,
-            |old_bytes| apply_fast_path_patch(old_bytes, fps),
+            |old_bytes| {
+                let table_schema = schema
+                    .get(table_lower)
+                    .ok_or_else(|| SqlError::TableNotFound(table_lower.into()))?;
+                apply_fast_path_patch(
+                    table_schema,
+                    &bufs.key_buf,
+                    old_bytes,
+                    fps,
+                    cancel.as_ref(),
+                    None,
+                )
+            },
         )?;
         return Ok(Some(match outcome {
             UpsertOutcome::Inserted | UpsertOutcome::Updated => ExecutionResult::RowsAffected(1),
@@ -3867,16 +4099,17 @@ impl CompiledInsert {
                 .as_ref()
                 .map(|oc| compile_on_conflict(oc, ts))
                 .transpose()
-                .ok()
-                .flatten()
+                .ok()?
                 .map(Arc::new);
+            let required_virtuals = required_insert_virtuals(schema, ts, stmt);
             let generated_col_positions: Vec<usize> = ts
                 .columns
                 .iter()
                 .enumerate()
                 .filter_map(|(i, c)| {
-                    matches!(c.generated_kind, Some(crate::parser::GeneratedKind::Stored))
-                        .then_some(i)
+                    (matches!(c.generated_kind, Some(crate::parser::GeneratedKind::Stored))
+                        || required_virtuals.before_insert.contains(&i))
+                    .then_some(i)
                 })
                 .collect();
             let generated_fast_evals: Vec<FastGenEval> = generated_col_positions
@@ -3966,6 +4199,8 @@ impl CompiledInsert {
             };
             // build_trivial_fast_program rejects any shape it can't compile.
             let is_trivial_fast_eligible = !insert_has_subquery(stmt)
+                && required_virtuals.before_insert.is_empty()
+                && required_virtuals.after_insert.is_empty()
                 && !ts.columns.iter().any(|c| c.default_expr.is_some())
                 && !ts.has_checks()
                 && stmt.returning.is_none()
@@ -4011,6 +4246,7 @@ impl CompiledInsert {
                 on_conflict,
                 generated_col_positions,
                 generated_fast_evals,
+                late_virtual_positions: required_virtuals.after_insert,
                 pk_indices,
                 non_pk_indices,
                 encoding_positions,
@@ -4070,7 +4306,7 @@ impl CompiledPlan for CompiledInsert {
                         schema.mark_dml(&self.table_lower);
                     }
                     match with_insert_scratch(|bufs| {
-                        exec_insert_trivial_fast(outer, &self.table_lower, c, bufs, params)
+                        exec_insert_trivial_fast(outer, schema, &self.table_lower, c, bufs, params)
                     })? {
                         Some(r) => Ok(r),
                         None => exec_insert_in_txn_cached(outer, schema, ins, params, c),
