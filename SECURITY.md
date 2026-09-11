@@ -24,8 +24,8 @@ I will acknowledge your report within 5 business days and provide updates as the
 
 | Version | Supported           |
 |---------|---------------------|
-| 2.3.x   | Yes                 |
-| < 2.3.0 | No                  |
+| 2.4.x   | Yes                 |
+| < 2.4.0 | No                  |
 
 Upgrade to the latest release before reporting issues in older versions.
 
