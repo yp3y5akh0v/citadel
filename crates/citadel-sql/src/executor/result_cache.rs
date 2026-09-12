@@ -73,26 +73,7 @@ impl ResultCacheSlot {
 /// Bit-exact param equality: `-0.0` vs `0.0` and NaN payloads must not be
 /// conflated, or a hit could return the other representation's result.
 fn params_match(a: &[Value], b: &[Value]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| value_bit_eq(x, y))
-}
-
-fn value_bit_eq(a: &Value, b: &Value) -> bool {
-    if std::mem::discriminant(a) != std::mem::discriminant(b) {
-        return false;
-    }
-    match (a, b) {
-        (Value::Real(x), Value::Real(y)) => x.to_bits() == y.to_bits(),
-        (Value::Array(x), Value::Array(y)) => {
-            x.len() == y.len() && x.iter().zip(y.iter()).all(|(v, w)| value_bit_eq(v, w))
-        }
-        (Value::Vector(x), Value::Vector(y)) => {
-            x.len() == y.len()
-                && x.iter()
-                    .zip(y.iter())
-                    .all(|(v, w)| v.to_bits() == w.to_bits())
-        }
-        _ => a == b,
-    }
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.bit_eq(y))
 }
 
 fn within_cap(params: &[Value], result: &QueryResult) -> bool {

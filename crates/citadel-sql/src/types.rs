@@ -124,6 +124,27 @@ pub enum Value {
 }
 
 impl Value {
+    /// Exact value representation, separate from SQL numeric equality.
+    /// Used when detecting row changes or matching cached parameters.
+    pub(crate) fn bit_eq(&self, other: &Self) -> bool {
+        if std::mem::discriminant(self) != std::mem::discriminant(other) {
+            return false;
+        }
+        match (self, other) {
+            (Value::Real(x), Value::Real(y)) => x.to_bits() == y.to_bits(),
+            (Value::Array(x), Value::Array(y)) => {
+                x.len() == y.len() && x.iter().zip(y.iter()).all(|(v, w)| v.bit_eq(w))
+            }
+            (Value::Vector(x), Value::Vector(y)) => {
+                x.len() == y.len()
+                    && x.iter()
+                        .zip(y.iter())
+                        .all(|(v, w)| v.to_bits() == w.to_bits())
+            }
+            _ => self == other,
+        }
+    }
+
     pub fn data_type(&self) -> DataType {
         match self {
             Value::Null => DataType::Null,
