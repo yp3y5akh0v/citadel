@@ -256,3 +256,23 @@ fn oversized_arrays_are_rejected_by_the_budgeted_walk() {
 
     assert!(!within_cap(&[], &result));
 }
+
+#[test]
+fn cache_budget_counts_nested_array_contents_at_the_boundary() {
+    let value = Value::Array(
+        vec![
+            Value::Integer(7),
+            Value::Array(vec![Value::Blob(vec![0; 7]), Value::Text("x".repeat(25).into())].into()),
+            Value::Array(Vec::new().into()),
+        ]
+        .into(),
+    );
+    // Three outer slots, two nested slots, then the blob and heap text.
+    let required = 3 * 32 + 2 * 32 + 7 + 25;
+    let mut exact = required;
+    assert!(value_fits(&value, &mut exact));
+    assert_eq!(exact, 0);
+
+    let mut short = required - 1;
+    assert!(!value_fits(&value, &mut short));
+}

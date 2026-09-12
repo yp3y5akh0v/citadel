@@ -127,8 +127,10 @@ fn charge(remaining: &mut usize, bytes: usize) -> bool {
 /// explicit stack avoids recursive sizing, and charging array slots before pushing
 /// children bounds the walk.
 fn value_fits(root: &Value, remaining: &mut usize) -> bool {
-    let mut pending = vec![root];
-    while let Some(value) = pending.pop() {
+    // Scalar roots need no worklist allocation; only nested arrays add work.
+    let mut first = Some(root);
+    let mut pending = Vec::new();
+    while let Some(value) = first.take().or_else(|| pending.pop()) {
         let bytes = match value {
             Value::Text(s) | Value::Json(s) => {
                 // CompactString stores up to 24 bytes inline.
