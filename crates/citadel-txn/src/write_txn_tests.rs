@@ -142,7 +142,16 @@ fn exercise_deep_delete(named: bool) {
         key[..4].copy_from_slice(&index.to_be_bytes());
         key
     };
-    let value = |index: u32| vec![index as u8; if index % 31 == 0 { 24_000 } else { 256 }];
+    let value = |index: u32| {
+        vec![
+            index as u8;
+            if index.is_multiple_of(31) {
+                24_000
+            } else {
+                256
+            }
+        ]
+    };
     let get = |writer: &mut super::WriteTxn<'_>, key: &[u8]| {
         if named {
             writer.table_get(b"deep", key)
