@@ -2351,33 +2351,30 @@ fn exec_update_in_txn_compiled(
     } = &plan
     {
         let key = encode_composite_key(pk_values);
-        let mut raw_value = match wtx
-            .table_get(compiled.table_name_lower.as_bytes(), &key)
-            .map_err(SqlError::Storage)?
-        {
-            Some(v) => v,
-            None => return Ok(ExecutionResult::RowsAffected(0)),
-        };
-        if let Some(expanded) = bufs
-            .materializer
-            .expand(table_schema, &key, &raw_value, cancel)?
-        {
-            raw_value = expanded;
-        }
-        let partial_row = &mut bufs.partial_row;
-        let patch_buf = &mut bufs.patch_buf;
-        if single_int_pk {
-            partial_row[pk_idx_cache[0]] = Value::Integer(decode_pk_integer(&key)?);
-        } else {
-            let pk_vals = decode_composite_key(&key, num_pk_cols)?;
-            for (i, &pi) in pk_idx_cache.iter().enumerate() {
-                partial_row[pi] = pk_vals[i].clone();
-            }
-        }
-        patch_compiled_update_value(&mut raw_value, fast, partial_row, cancel, patch_buf)?;
-        wtx.table_insert(compiled.table_name_lower.as_bytes(), &key, &raw_value)
-            .map_err(SqlError::Storage)?;
-        return Ok(ExecutionResult::RowsAffected(1));
+        let updated = wtx.table_update_with(
+            compiled.table_name_lower.as_bytes(),
+            &key,
+            |raw_value| -> Result<()> {
+                if let Some(expanded) =
+                    bufs.materializer
+                        .expand(table_schema, &key, raw_value, cancel)?
+                {
+                    *raw_value = expanded;
+                }
+                let partial_row = &mut bufs.partial_row;
+                let patch_buf = &mut bufs.patch_buf;
+                if single_int_pk {
+                    partial_row[pk_idx_cache[0]] = Value::Integer(decode_pk_integer(&key)?);
+                } else {
+                    let pk_vals = decode_composite_key(&key, num_pk_cols)?;
+                    for (i, &pi) in pk_idx_cache.iter().enumerate() {
+                        partial_row[pi] = pk_vals[i].clone();
+                    }
+                }
+                patch_compiled_update_value(raw_value, fast, partial_row, cancel, patch_buf)
+            },
+        )?;
+        return Ok(ExecutionResult::RowsAffected(u64::from(updated.is_some())));
     }
 
     bufs.kv_pairs.clear();
@@ -2475,40 +2472,36 @@ fn exec_pk_lookup_update(
     bufs: &mut UpdateBufs,
 ) -> Result<ExecutionResult> {
     let key = encode_composite_key(std::slice::from_ref(pk_value));
-    let mut raw_value = match wtx
-        .table_get(schema.name.as_bytes(), &key)
-        .map_err(SqlError::Storage)?
-    {
-        Some(v) => v,
-        None => {
-            return Ok(match ret_fast {
-                Some(rf) => ExecutionResult::Query(QueryResult {
+    let updated = wtx.table_update_with(
+        schema.name.as_bytes(),
+        &key,
+        |raw_value| -> Result<ExecutionResult> {
+            if let Some(expanded) = bufs.materializer.expand(schema, &key, raw_value, cancel)? {
+                *raw_value = expanded;
+            }
+            let partial_row = &mut bufs.partial_row;
+            let patch_buf = &mut bufs.patch_buf;
+            partial_row[fast.pk_idx_cache[0]] = pk_value.clone();
+            patch_compiled_update_value(raw_value, fast, partial_row, cancel, patch_buf)?;
+            if let Some(rf) = ret_fast {
+                // Build RETURNING from the replacement before it is stored.
+                decode_cols_into(raw_value, &rf.extra_decode, partial_row)?;
+                let row = rf.out_idx.iter().map(|&i| partial_row[i].clone()).collect();
+                return Ok(ExecutionResult::Query(QueryResult {
                     columns: rf.col_names.clone(),
-                    rows: Vec::new(),
-                }),
-                None => ExecutionResult::RowsAffected(0),
-            })
-        }
-    };
-    if let Some(expanded) = bufs.materializer.expand(schema, &key, &raw_value, cancel)? {
-        raw_value = expanded;
-    }
-    let partial_row = &mut bufs.partial_row;
-    let patch_buf = &mut bufs.patch_buf;
-    partial_row[fast.pk_idx_cache[0]] = pk_value.clone();
-    patch_compiled_update_value(&mut raw_value, fast, partial_row, cancel, patch_buf)?;
-    wtx.table_insert(schema.name.as_bytes(), &key, &raw_value)
-        .map_err(SqlError::Storage)?;
-    if let Some(rf) = ret_fast {
-        // Post-patch bytes hold the new values RETURNING reports.
-        decode_cols_into(&raw_value, &rf.extra_decode, partial_row)?;
-        let row: Vec<Value> = rf.out_idx.iter().map(|&i| partial_row[i].clone()).collect();
-        return Ok(ExecutionResult::Query(QueryResult {
+                    rows: vec![row],
+                }));
+            }
+            Ok(ExecutionResult::RowsAffected(1))
+        },
+    )?;
+    Ok(updated.unwrap_or_else(|| match ret_fast {
+        Some(rf) => ExecutionResult::Query(QueryResult {
             columns: rf.col_names.clone(),
-            rows: vec![row],
-        }));
-    }
-    Ok(ExecutionResult::RowsAffected(1))
+            rows: Vec::new(),
+        }),
+        None => ExecutionResult::RowsAffected(0),
+    }))
 }
 
 fn patch_compiled_update_value(
