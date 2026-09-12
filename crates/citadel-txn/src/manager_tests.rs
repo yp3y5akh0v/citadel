@@ -3824,3 +3824,136 @@ fn catalog_lookup_rejects_an_authenticated_cross_page_cycle() {
 
 #[path = "manager_retry_tests.rs"]
 mod retry_tests;
+
+struct PausedCatalogIO {
+    inner: MemIO,
+    pause_at: Arc<AtomicU64>,
+    entered: std::sync::mpsc::Sender<()>,
+    resume: StdMutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl PageIO for PausedCatalogIO {
+    fn read_page(&self, offset: u64, buf: &mut [u8; PAGE_SIZE]) -> Result<()> {
+        if self
+            .pause_at
+            .compare_exchange(offset, u64::MAX, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            self.entered.send(()).unwrap();
+            self.resume
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .map_err(|error| {
+                    Error::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, error))
+                })?;
+        }
+        self.inner.read_page(offset, buf)
+    }
+
+    fn write_page(&self, offset: u64, buf: &[u8; PAGE_SIZE]) -> Result<()> {
+        self.inner.write_page(offset, buf)
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        self.inner.read_at(offset, buf)
+    }
+
+    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
+        self.inner.write_at(offset, buf)
+    }
+
+    fn fsync(&self) -> Result<()> {
+        self.inner.fsync()
+    }
+
+    fn file_size(&self) -> Result<u64> {
+        self.inner.file_size()
+    }
+
+    fn truncate(&self, size: u64) -> Result<()> {
+        self.inner.truncate(size)
+    }
+}
+
+fn assert_manager_catalog_walk_pins_snapshot(operation: &str) {
+    let pause_at = Arc::new(AtomicU64::new(u64::MAX));
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let (dek, mac, dek_id) = test_keys();
+    let manager = TxnManager::create(
+        Box::new(PausedCatalogIO {
+            inner: MemIO::new(1024 * 1024),
+            pause_at: Arc::clone(&pause_at),
+            entered: entered_tx,
+            resume: StdMutex::new(resume_rx),
+        }),
+        dek,
+        mac,
+        1,
+        0x1234,
+        dek_id,
+        16,
+    )
+    .unwrap();
+    let original = b"generation_0".to_vec();
+    let mut writer = manager.begin_write().unwrap();
+    writer.create_table(&original).unwrap();
+    writer.commit().unwrap();
+    // Complete collision-index initialization before pausing a read, so
+    // writers never wait on the same initialization lock as the reader.
+    manager.list_tables().unwrap();
+    let original_root = manager.table_root(&original).unwrap().unwrap();
+    let slot = manager.current_slot();
+    manager.pool.lock().clear();
+    pause_at.store(page_offset(slot.catalog_root), Ordering::SeqCst);
+
+    std::thread::scope(|scope| {
+        let lookup = scope.spawn(|| -> Result<Vec<Vec<u8>>> {
+            match operation {
+                "list_tables" => manager
+                    .list_tables()
+                    .map(|tables| tables.into_iter().map(|(name, _)| name).collect()),
+                "table_root" => manager.table_root(&original).map(|root| {
+                    assert_eq!(root, Some(original_root));
+                    vec![original.clone()]
+                }),
+                _ => unreachable!(),
+            }
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        let mut name = original.clone();
+        let mut root_reused = false;
+        for generation in 1..=128 {
+            let next = format!("generation_{generation}").into_bytes();
+            let mut writer = manager.begin_write().unwrap();
+            writer.rename_table(&name, &next).unwrap();
+            writer.commit().unwrap();
+            name = next;
+            let page = manager.read_page_from_disk(slot.catalog_root).unwrap();
+            root_reused |= page.txn_id() > slot.txn_id;
+        }
+        resume_tx.send(()).unwrap();
+        let result = lookup
+            .join()
+            .unwrap()
+            .unwrap_or_else(|error| panic!("{operation}, reused={root_reused}: {error:?}"));
+        assert_eq!(
+            result,
+            vec![original.clone()],
+            "{operation}, reused={root_reused}"
+        );
+    });
+}
+
+#[test]
+fn manager_list_tables_pins_its_snapshot_while_commits_recycle_pages() {
+    assert_manager_catalog_walk_pins_snapshot("list_tables");
+}
+
+#[test]
+fn manager_table_root_pins_its_snapshot_while_commits_recycle_pages() {
+    assert_manager_catalog_walk_pins_snapshot("table_root");
+}

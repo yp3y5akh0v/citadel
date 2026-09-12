@@ -489,6 +489,11 @@ impl<'db> ReadTxn<'db> {
         self.snapshot.tree_entries
     }
 
+    /// Metadata protected by this transaction's reader registration.
+    pub(crate) fn snapshot_slot(&self) -> &CommitSlot {
+        &self.snapshot
+    }
+
     /// The table's catalog root in this transaction (a lookup, no scan).
     /// Use [`ReadTxn::table_root_stamp`] when allocator reuse must be detected.
     pub fn table_root_page(&self, table: &[u8]) -> Result<Option<PageId>> {
