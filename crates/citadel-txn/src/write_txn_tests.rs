@@ -2045,3 +2045,65 @@ fn update_with_buffer_keeps_overflow_materialization_out_of_retained_scratch() {
     );
     assert!(manager.integrity_check().unwrap().is_ok());
 }
+
+#[test]
+fn table_contains_key_uses_the_live_write_view_without_materializing_values() {
+    use citadel_core::types::{PageType, ValueType};
+
+    let manager = create_test_manager();
+    let mut seed = manager.begin_write().unwrap();
+    seed.create_table(b"contains").unwrap();
+    seed.table_insert(b"contains", b"inline", b"value").unwrap();
+    seed.table_insert(b"contains", b"overflow", &vec![0x5a; 32_768])
+        .unwrap();
+    seed.named_trees
+        .get_mut(b"contains".as_slice())
+        .unwrap()
+        .insert(
+            &mut seed.pages,
+            &mut seed.alloc,
+            seed.txn_id,
+            b"tombstone",
+            ValueType::Tombstone,
+            b"",
+        )
+        .unwrap();
+    seed.commit().unwrap();
+
+    let mut writer = manager.begin_write().unwrap();
+    let budget = crate::ReadBudget::new(0, 0);
+    writer.set_read_budget(Some(budget.clone()));
+    let marker = writer.mutation_marker();
+    for (key, expected) in [
+        (b"before".as_slice(), false),
+        (b"inline", true),
+        (b"overflow", true),
+        (b"tombstone", false),
+        (b"zz-after", false),
+    ] {
+        assert_eq!(
+            writer.table_contains_key(b"contains", key).unwrap(),
+            expected
+        );
+    }
+    assert_eq!(budget.remaining(), 0);
+    assert!(!writer.mutated_since(marker));
+    assert!(writer
+        .pages
+        .values()
+        .all(|page| page.page_type() != Some(PageType::Overflow)));
+
+    writer.table_delete(b"contains", b"inline").unwrap();
+    writer
+        .table_insert(b"contains", b"new", b"new value")
+        .unwrap();
+    assert!(!writer.table_contains_key(b"contains", b"inline").unwrap());
+    assert!(writer.table_contains_key(b"contains", b"new").unwrap());
+    let token = citadel_core::CancelToken::new();
+    token.cancel();
+    writer.set_cancel(Some(token));
+    assert!(matches!(
+        writer.table_contains_key(b"contains", b"new"),
+        Err(citadel_core::Error::Interrupted)
+    ));
+}

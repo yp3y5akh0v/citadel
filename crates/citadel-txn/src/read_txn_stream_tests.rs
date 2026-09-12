@@ -963,6 +963,7 @@ fn assert_normal_operations_reject_malformed_page(kind: &str) {
         "raw_scan",
         "collect",
         "write_get",
+        "write_contains",
         "write_scan",
         "insert",
         "delete",
@@ -1020,6 +1021,7 @@ fn assert_normal_operations_reject_malformed_page(kind: &str) {
             "collect" => reader.collect_table_leaves(TABLE).map(|_| ()),
             "write_scan" => writer.table_scan_from(TABLE, &key, |_, _| Ok(false)),
             "write_get" => writer.table_get(TABLE, &key).map(|_| ()),
+            "write_contains" => writer.table_contains_key(TABLE, &key).map(|_| ()),
             "insert" => writer.table_insert(TABLE, &key, b"after").map(|_| ()),
             "delete" => writer.table_delete(TABLE, &key).map(|_| ()),
             "update" => writer
