@@ -669,6 +669,71 @@ fn compiled_update_reused_nullable_and_text_width_changes() {
 }
 
 #[test]
+fn compiled_update_returning_relocates_generated_columns_after_row_rebuilds() {
+    for explicit in [false, true] {
+        let db = update_database();
+        let conn = crate::Connection::open(&db).unwrap();
+        conn.execute(
+            "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, s TEXT, n INTEGER NOT NULL, \
+             g TEXT GENERATED ALWAYS AS (COALESCE(s, 'nil') || ':') STORED, \
+             h INTEGER GENERATED ALWAYS AS (LENGTH(COALESCE(s, '')) + n) STORED, \
+             tail TEXT NOT NULL)",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO t (id, s, n, tail) VALUES (1, 'a', 10, 'first'), (2, 'seed', 20, 'second')")
+            .unwrap();
+        let update = conn
+            .prepare(
+                "UPDATE t SET s = $1, n = LENGTH(COALESCE(s, '')) + n WHERE id = $2 \
+             RETURNING id, s, n, g, h, tail",
+            )
+            .unwrap();
+        if explicit {
+            conn.execute("BEGIN").unwrap();
+        }
+        let mut old_lengths = [1, 4];
+        let mut numbers = [10, 20];
+        for (id, text) in [
+            (1, Some("L".repeat(6000))),
+            (2, None),
+            (1, None),
+            (2, Some("x".into())),
+            (1, Some("tail".into())),
+            (2, Some("M".repeat(8000))),
+        ] {
+            let index = id as usize - 1;
+            numbers[index] += old_lengths[index];
+            let length = text.as_ref().map_or(0, |value| value.len() as i64);
+            let generated = format!("{}:", text.as_deref().unwrap_or("nil"));
+            let text = text.map_or(Value::Null, |value| Value::Text(value.into()));
+            let expected = vec![
+                i(id),
+                text.clone(),
+                i(numbers[index]),
+                Value::Text(generated.into()),
+                i(length + numbers[index]),
+                Value::Text(if id == 1 { "first" } else { "second" }.into()),
+            ];
+            assert_eq!(
+                update.query_collect(&[text, i(id)]).unwrap().rows,
+                vec![expected.clone()],
+                "explicit transaction: {explicit}; row: {id}",
+            );
+            assert_eq!(
+                conn.query(&format!("SELECT * FROM t WHERE id = {id}"))
+                    .unwrap()
+                    .rows,
+                vec![expected],
+            );
+            old_lengths[index] = length;
+        }
+        if explicit {
+            conn.execute("COMMIT").unwrap();
+        }
+    }
+}
+
+#[test]
 fn compiled_update_nullable_patch_eligibility_is_narrow_and_runtime_bound() {
     for op in [BinOp::Add, BinOp::Sub, BinOp::Mul] {
         for parameter in [false, true] {
@@ -1145,5 +1210,34 @@ fn general_autocommit_update_materializes_added_defaults_in_both_fast_paths() {
             );
         }
         assert_eq!(stored_update_row(&db, 3), outside);
+    }
+}
+
+#[test]
+fn compiled_update_repeated_target_keeps_final_null_assignment() {
+    for explicit in [false, true] {
+        for condition in ["id = $1", "id BETWEEN $1 AND $1"] {
+            let db = update_database();
+            let conn = crate::Connection::open(&db).unwrap();
+            conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, x INTEGER, g INTEGER GENERATED ALWAYS AS (COALESCE(x, -1)) STORED)").unwrap();
+            conn.execute("INSERT INTO t (id, x) VALUES (1, NULL), (2, 7)")
+                .unwrap();
+            let update = conn
+                .prepare(&format!("UPDATE t SET x = 1, x = NULL WHERE {condition}"))
+                .unwrap();
+            if explicit {
+                conn.execute("BEGIN").unwrap();
+            }
+            assert_eq!(update.execute(&[i(1)]).unwrap(), 1);
+            assert_eq!(
+                conn.query("SELECT id, x, g FROM t ORDER BY id")
+                    .unwrap()
+                    .rows,
+                vec![vec![i(1), Value::Null, i(-1)], vec![i(2), i(7), i(7)]]
+            );
+            if explicit {
+                conn.execute("COMMIT").unwrap();
+            }
+        }
     }
 }
