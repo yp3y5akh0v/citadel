@@ -3,9 +3,8 @@ use std::cell::RefCell;
 use citadel::Database;
 
 use crate::encoding::{
-    decode_column_raw, decode_column_with_offset, decode_composite_key, decode_pk_integer,
-    encode_composite_key, encode_composite_key_into, patch_at_offset, patch_column_in_place,
-    patch_row_column,
+    decode_column_raw, decode_composite_key, decode_pk_integer, encode_composite_key,
+    encode_composite_key_into, patch_column_in_place, patch_row_column, RawColumn, RowLayout,
 };
 use crate::error::{Result, SqlError};
 use crate::eval::{eval_expr, is_truthy, ColumnMap, EvalCtx};
@@ -26,7 +25,7 @@ struct UpdateBufs {
     key_buf: Vec<u8>,
     partial_row: Vec<Value>,
     patch_buf: Vec<u8>,
-    offsets: Vec<usize>,
+    row_layout: RowLayout,
     kv_pairs: Vec<(Vec<u8>, Vec<u8>)>,
     patched: Vec<(Vec<u8>, Vec<u8>)>,
     materializer: UpdateRowMaterializer,
@@ -38,7 +37,7 @@ impl UpdateBufs {
             key_buf: Vec::with_capacity(32),
             partial_row: Vec::new(),
             patch_buf: Vec::with_capacity(256),
-            offsets: Vec::new(),
+            row_layout: RowLayout::default(),
             kv_pairs: Vec::new(),
             patched: Vec::new(),
             materializer: UpdateRowMaterializer::default(),
@@ -608,12 +607,12 @@ fn coerce_update_value(val: Value, col: &ColumnDef, strict: bool) -> Result<Valu
     }
 }
 
-enum UpdateValue<'a> {
+enum UpdateStorage<'a> {
     Fixed(&'a mut [u8]),
     Growable(&'a mut Vec<u8>),
 }
 
-impl UpdateValue<'_> {
+impl UpdateStorage<'_> {
     fn bytes(&self) -> &[u8] {
         match self {
             Self::Fixed(value) => value,
@@ -627,14 +626,48 @@ impl UpdateValue<'_> {
             Self::Growable(value) => value,
         }
     }
+}
 
-    fn patch(&mut self, column: usize, value: &Value, scratch: &mut Vec<u8>) -> Result<bool> {
-        if patch_column_in_place(self.bytes_mut(), column, value)? {
-            return Ok(false);
+struct UpdateValue<'a> {
+    storage: UpdateStorage<'a>,
+    layout: &'a mut RowLayout,
+}
+
+impl<'a> UpdateValue<'a> {
+    fn fixed(bytes: &'a mut [u8], layout: &'a mut RowLayout) -> Self {
+        layout.reset();
+        Self {
+            storage: UpdateStorage::Fixed(bytes),
+            layout,
         }
-        patch_row_column(self.bytes(), column, value, scratch)?;
-        match self {
-            Self::Fixed(bytes) => {
+    }
+
+    fn growable(bytes: &'a mut Vec<u8>, layout: &'a mut RowLayout) -> Self {
+        layout.reset();
+        Self {
+            storage: UpdateStorage::Growable(bytes),
+            layout,
+        }
+    }
+
+    fn column(&mut self, column: usize) -> Result<RawColumn<'_>> {
+        self.layout.column(self.storage.bytes(), column)
+    }
+
+    fn decode_columns(&mut self, columns: &[(usize, usize)], row: &mut [Value]) -> Result<()> {
+        for &(schema_idx, physical_idx) in columns {
+            row[schema_idx] = self.column(physical_idx)?.to_value();
+        }
+        Ok(())
+    }
+
+    fn patch(&mut self, column: usize, value: &Value, scratch: &mut Vec<u8>) -> Result<()> {
+        if self.layout.patch(self.storage.bytes_mut(), column, value)? {
+            return Ok(());
+        }
+        patch_row_column(self.storage.bytes(), column, value, scratch)?;
+        match &mut self.storage {
+            UpdateStorage::Fixed(bytes) => {
                 if bytes.len() != scratch.len() {
                     return Err(SqlError::InvalidValue(
                         "fixed-width UPDATE changed the encoded row length".into(),
@@ -642,9 +675,10 @@ impl UpdateValue<'_> {
                 }
                 bytes.copy_from_slice(scratch);
             }
-            Self::Growable(bytes) => std::mem::swap(*bytes, scratch),
+            UpdateStorage::Growable(bytes) => std::mem::swap(*bytes, scratch),
         }
-        Ok(true)
+        self.layout.reset();
+        Ok(())
     }
 }
 
@@ -660,7 +694,7 @@ fn apply_gen_col_patches(
     if gen_targets.is_empty() {
         return Ok(());
     }
-    decode_cols_into(value.bytes(), gen_extra_cols, partial_row)?;
+    value.decode_columns(gen_extra_cols, partial_row)?;
     for gp in gen_targets {
         let raw = eval_fast_gen_with_cancel(&gp.fast_eval, &gp.expr, partial_row, col_map, cancel)?;
         let coerced = coerce_update_value(raw, &gp.col, gp.strict)?;
@@ -1292,8 +1326,6 @@ fn exec_compiled_range_update(
     } else {
         None
     };
-    bufs.offsets.clear();
-    bufs.offsets.resize(fast.targets.len(), usize::MAX);
     bufs.patched.clear();
 
     let count =
@@ -1340,39 +1372,13 @@ fn exec_compiled_range_update(
             }
             let mut expanded = bufs.materializer.expand(schema, key, value, cancel)?;
             let mut value = match expanded.as_mut() {
-                Some(bytes) => UpdateValue::Growable(bytes),
-                None => UpdateValue::Fixed(value),
+                Some(bytes) => UpdateValue::growable(bytes, &mut bufs.row_layout),
+                None => UpdateValue::fixed(value, &mut bufs.row_layout),
             };
-            for (i, target) in fast.targets.iter().enumerate() {
-                let (raw, off) = decode_column_with_offset(value.bytes(), target.phys_idx)?;
-                bufs.partial_row[target.schema_idx] = raw.to_value();
-                bufs.offsets[i] = off;
-            }
-            decode_cols_into(value.bytes(), &fast.rhs_extra_cols, &mut bufs.partial_row)?;
-            for (i, target) in fast.targets.iter().enumerate() {
-                let new_val =
-                    compiled_target_eval(target, &bufs.partial_row, &fast.col_map, cancel)?;
-                let coerced = coerce_update_value(new_val, &target.col, fast.strict)?;
-                if coerced.is_null() && bufs.partial_row[target.schema_idx].is_null() {
-                    continue;
-                }
-                if !patch_at_offset(value.bytes_mut(), bufs.offsets[i], &coerced)?
-                    && value.patch(target.phys_idx, &coerced, &mut bufs.patch_buf)?
-                {
-                    for off in bufs.offsets.iter_mut().skip(i + 1) {
-                        *off = usize::MAX;
-                    }
-                }
-                if fast.targets.len() == 1 {
-                    bufs.partial_row[target.schema_idx] = coerced;
-                }
-            }
-            apply_gen_col_patches(
+            patch_compiled_update_value(
                 &mut value,
+                fast,
                 &mut bufs.partial_row,
-                &fast.gen_targets,
-                &fast.gen_extra_cols,
-                &fast.col_map,
                 cancel,
                 &mut bufs.patch_buf,
             )?;
@@ -1601,6 +1607,7 @@ pub(super) fn exec_update(
             let mut partial_row = vec![Value::Null; table_schema.columns.len()];
             let pk_idx_cache = table_schema.pk_indices().to_vec();
             let mut patch_buf: Vec<u8> = Vec::with_capacity(256);
+            let mut row_layout = RowLayout::default();
             let mut materializer = UpdateRowMaterializer::default();
             let mut expanded_rows = Vec::new();
 
@@ -1640,14 +1647,13 @@ pub(super) fn exec_update(
                     }
                     let mut expanded = materializer.expand(table_schema, key, value, cancel)?;
                     let mut value = match expanded.as_mut() {
-                        Some(bytes) => UpdateValue::Growable(bytes),
-                        None => UpdateValue::Fixed(value),
+                        Some(bytes) => UpdateValue::growable(bytes, &mut row_layout),
+                        None => UpdateValue::fixed(value, &mut row_layout),
                     };
                     for target in &targets {
-                        partial_row[target.schema_idx] =
-                            decode_column_raw(value.bytes(), target.phys_idx)?.to_value();
+                        partial_row[target.schema_idx] = value.column(target.phys_idx)?.to_value();
                     }
-                    decode_cols_into(value.bytes(), &rhs_extra_cols, &mut partial_row)?;
+                    value.decode_columns(&rhs_extra_cols, &mut partial_row)?;
                     for target in &targets {
                         let new_val = eval_expr(
                             &target.expr,
@@ -1741,6 +1747,7 @@ pub(super) fn exec_update(
         }
 
         let mut patch_buf: Vec<u8> = Vec::with_capacity(256);
+        let mut row_layout = RowLayout::default();
         let mut partial_row = vec![Value::Null; table_schema.columns.len()];
         let pk_idx_cache = table_schema.pk_indices().to_vec();
         let mut patched: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(kv_pairs.len());
@@ -1794,7 +1801,7 @@ pub(super) fn exec_update(
                 }
             }
             apply_gen_col_patches(
-                &mut UpdateValue::Growable(raw_value),
+                &mut UpdateValue::growable(raw_value, &mut row_layout),
                 &mut partial_row,
                 &gen_targets,
                 &gen_extra_cols,
@@ -2357,6 +2364,7 @@ fn exec_update_in_txn_compiled(
             key_buf,
             partial_row,
             patch_buf,
+            row_layout,
             materializer,
             ..
         } = bufs;
@@ -2377,7 +2385,13 @@ fn exec_update_in_txn_compiled(
                         partial_row[pi] = pk_vals[i].clone();
                     }
                 }
-                patch_compiled_update_value(raw_value, fast, partial_row, cancel, patch_buf)
+                patch_compiled_update_value(
+                    &mut UpdateValue::growable(raw_value, row_layout),
+                    fast,
+                    partial_row,
+                    cancel,
+                    patch_buf,
+                )
             },
         )?;
         return Ok(ExecutionResult::RowsAffected(u64::from(updated.is_some())));
@@ -2434,6 +2448,7 @@ fn exec_update_in_txn_compiled(
 
     let partial_row = &mut bufs.partial_row;
     let patch_buf = &mut bufs.patch_buf;
+    let row_layout = &mut bufs.row_layout;
 
     for (key, raw_value) in bufs.kv_pairs.iter_mut() {
         if let Some(expanded) = bufs
@@ -2459,7 +2474,13 @@ fn exec_update_in_txn_compiled(
                 partial_row[pi] = pk_vals[i].clone();
             }
         }
-        patch_compiled_update_value(raw_value, fast, partial_row, cancel, patch_buf)?;
+        patch_compiled_update_value(
+            &mut UpdateValue::growable(raw_value, row_layout),
+            fast,
+            partial_row,
+            cancel,
+            patch_buf,
+        )?;
         bufs.patched
             .push((std::mem::take(key), std::mem::take(raw_value)));
     }
@@ -2481,6 +2502,7 @@ fn exec_pk_lookup_update(
         key_buf,
         partial_row,
         patch_buf,
+        row_layout,
         materializer,
         ..
     } = bufs;
@@ -2494,7 +2516,13 @@ fn exec_pk_lookup_update(
                 *raw_value = expanded;
             }
             partial_row[fast.pk_idx_cache[0]] = pk_value.clone();
-            patch_compiled_update_value(raw_value, fast, partial_row, cancel, patch_buf)?;
+            patch_compiled_update_value(
+                &mut UpdateValue::growable(raw_value, row_layout),
+                fast,
+                partial_row,
+                cancel,
+                patch_buf,
+            )?;
             if let Some(rf) = ret_fast {
                 // Build RETURNING from the replacement before it is stored.
                 decode_cols_into(raw_value, &rf.extra_decode, partial_row)?;
@@ -2517,7 +2545,7 @@ fn exec_pk_lookup_update(
 }
 
 fn patch_compiled_update_value(
-    raw_value: &mut Vec<u8>,
+    value: &mut UpdateValue<'_>,
     fast: &CompiledFastPath,
     partial_row: &mut [Value],
     cancel: Option<&citadel::CancelToken>,
@@ -2525,23 +2553,24 @@ fn patch_compiled_update_value(
 ) -> Result<()> {
     let targets = &fast.targets;
     let col_map = &fast.col_map;
+    // Capture every SET input before patching: multiple assignments share the
+    // old row, while generated expressions below observe the completed SET.
     for target in targets {
-        partial_row[target.schema_idx] = decode_column_raw(raw_value, target.phys_idx)?.to_value();
+        partial_row[target.schema_idx] = value.column(target.phys_idx)?.to_value();
     }
-    decode_cols_into(raw_value, &fast.rhs_extra_cols, partial_row)?;
+    value.decode_columns(&fast.rhs_extra_cols, partial_row)?;
     for target in targets {
         let new_val = compiled_target_eval(target, partial_row, col_map, cancel)?;
         let coerced = coerce_update_value(new_val, &target.col, fast.strict)?;
-        if !patch_column_in_place(raw_value, target.phys_idx, &coerced)? {
-            patch_row_column(raw_value, target.phys_idx, &coerced, patch_buf)?;
-            std::mem::swap(raw_value, patch_buf);
+        if !(coerced.is_null() && matches!(value.column(target.phys_idx)?, RawColumn::Null)) {
+            value.patch(target.phys_idx, &coerced, patch_buf)?;
         }
         if targets.len() == 1 {
             partial_row[target.schema_idx] = coerced;
         }
     }
     apply_gen_col_patches(
-        &mut UpdateValue::Growable(raw_value),
+        value,
         partial_row,
         &fast.gen_targets,
         &fast.gen_extra_cols,
@@ -2714,6 +2743,7 @@ fn try_fast_update_in_txn(
         let range_conds = range_conds.clone();
         let mut partial_row = vec![Value::Null; table_schema.columns.len()];
         let mut patch_buf: Vec<u8> = Vec::with_capacity(256);
+        let mut row_layout = RowLayout::default();
         let mut materializer = UpdateRowMaterializer::default();
         let mut expanded_rows = Vec::new();
 
@@ -2755,14 +2785,13 @@ fn try_fast_update_in_txn(
                 }
                 let mut expanded = materializer.expand(table_schema, key, value, cancel)?;
                 let mut value = match expanded.as_mut() {
-                    Some(bytes) => UpdateValue::Growable(bytes),
-                    None => UpdateValue::Fixed(value),
+                    Some(bytes) => UpdateValue::growable(bytes, &mut row_layout),
+                    None => UpdateValue::fixed(value, &mut row_layout),
                 };
                 for target in &targets {
-                    partial_row[target.schema_idx] =
-                        decode_column_raw(value.bytes(), target.phys_idx)?.to_value();
+                    partial_row[target.schema_idx] = value.column(target.phys_idx)?.to_value();
                 }
-                decode_cols_into(value.bytes(), &rhs_extra_cols, &mut partial_row)?;
+                value.decode_columns(&rhs_extra_cols, &mut partial_row)?;
                 for target in &targets {
                     let new_val = eval_expr(
                         &target.expr,
@@ -2842,6 +2871,7 @@ fn try_fast_update_in_txn(
     }
 
     let mut patch_buf: Vec<u8> = Vec::with_capacity(256);
+    let mut row_layout = RowLayout::default();
     let mut partial_row = vec![Value::Null; table_schema.columns.len()];
     let mut patched: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(kv_pairs.len());
     let mut materializer = UpdateRowMaterializer::default();
@@ -2887,7 +2917,7 @@ fn try_fast_update_in_txn(
             }
         }
         apply_gen_col_patches(
-            &mut UpdateValue::Growable(raw_value),
+            &mut UpdateValue::growable(raw_value, &mut row_layout),
             &mut partial_row,
             &gen_targets,
             &gen_extra_cols,

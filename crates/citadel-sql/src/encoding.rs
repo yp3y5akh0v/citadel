@@ -1556,6 +1556,91 @@ pub fn decode_column_raw(data: &[u8], target: usize) -> Result<RawColumn<'_>> {
     Ok(decode_stored_column_raw(data, target)?.unwrap_or(RawColumn::Null))
 }
 
+/// Reusable column locations for one row. Reset after replacing the row or
+/// changing its framing; successful in-place patches preserve these locations.
+#[derive(Default)]
+pub(crate) struct RowLayout {
+    header: Option<(RowVersion, usize)>,
+    cells: Vec<CellLocation>,
+    next_offset: usize,
+}
+
+#[derive(Clone, Copy)]
+struct CellLocation {
+    tag_offset: usize,
+    body_start: usize,
+    end: usize,
+}
+
+impl CellLocation {
+    const NULL: Self = Self {
+        tag_offset: usize::MAX,
+        body_start: 0,
+        end: 0,
+    };
+}
+
+impl RowLayout {
+    pub(crate) fn reset(&mut self) {
+        self.header = None;
+        self.cells.clear();
+    }
+
+    fn locate(&mut self, data: &[u8], target: usize) -> Result<CellLocation> {
+        let (version, count) = match self.header {
+            Some(header) => header,
+            None => {
+                let (version, count, _, start) = parse_row_header(data)?;
+                self.next_offset = start;
+                self.header = Some((version, count));
+                (version, count)
+            }
+        };
+        if target >= count {
+            return Ok(CellLocation::NULL);
+        }
+        for column in self.cells.len()..=target {
+            let location = if data[2 + column / 8] & (1 << (column % 8)) != 0 {
+                CellLocation::NULL
+            } else {
+                let (_, body, end) = read_cell(data, self.next_offset, version)?;
+                let location = CellLocation {
+                    tag_offset: self.next_offset,
+                    body_start: end - body.len(),
+                    end,
+                };
+                self.next_offset = end;
+                location
+            };
+            self.cells.push(location);
+        }
+        Ok(self.cells[target])
+    }
+
+    pub(crate) fn column<'a>(&mut self, data: &'a [u8], target: usize) -> Result<RawColumn<'a>> {
+        let location = self.locate(data, target)?;
+        if location.tag_offset == usize::MAX {
+            return Ok(RawColumn::Null);
+        }
+        decode_value_raw(
+            data[location.tag_offset],
+            &data[location.body_start..location.end],
+        )
+    }
+
+    pub(crate) fn patch(&mut self, data: &mut [u8], target: usize, value: &Value) -> Result<bool> {
+        if value.is_null() {
+            return Ok(false);
+        }
+        let location = self.locate(data, target)?;
+        if location.tag_offset == usize::MAX {
+            return Ok(false);
+        }
+        let (version, _) = self.header.unwrap();
+        patch_cell_in_place(data, location.tag_offset, version, value)
+    }
+}
+
 /// `None` identifies a missing physical column; a stored NULL is `Some(Null)`.
 pub(crate) fn decode_stored_column_raw(
     data: &[u8],
