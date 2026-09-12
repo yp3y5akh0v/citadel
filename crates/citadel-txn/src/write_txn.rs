@@ -1118,6 +1118,28 @@ impl<'db> WriteTxn<'db> {
         F: FnOnce(&mut Vec<u8>) -> std::result::Result<R, E>,
         E: From<Error>,
     {
+        self.table_update_with_buffer(table, key, &mut Vec::new(), f)
+    }
+
+    /// Update with the same guarantees as [`Self::table_update_with`], reusing
+    /// `buffer` for inline values. Overflow values are materialized in a local
+    /// allocation so large reads do not replace the caller's retained buffer.
+    /// The callback always receives detached bytes and may resize them.
+    ///
+    /// The buffer's contents are scratch, including after a missing key, error
+    /// or panic. Its allocation may grow when the callback changes an inline
+    /// value; callers that retain it can impose their own capacity limit.
+    pub fn table_update_with_buffer<F, R, E>(
+        &mut self,
+        table: &[u8],
+        key: &[u8],
+        buffer: &mut Vec<u8>,
+        f: F,
+    ) -> std::result::Result<Option<R>, E>
+    where
+        F: FnOnce(&mut Vec<u8>) -> std::result::Result<R, E>,
+        E: From<Error>,
+    {
         self.check_cancel()?;
         Self::validate_key_value(key, &[])?;
         self.ensure_table(table)?;
@@ -1129,19 +1151,35 @@ impl<'db> WriteTxn<'db> {
             &[],
         )?;
         let found = match &leaf {
-            Some(leaf) => BTree::search_at_leaf(&self.pages, leaf.id, key)?,
+            Some(leaf) => BTree::search_at_leaf_ref(&self.pages, leaf.id, key)?,
             None => None,
         };
-        let value = self.materialize_value(found)?;
+        let mut overflow_value;
+        let value = match found {
+            None | Some((ValueType::Tombstone, _)) => None,
+            Some((ValueType::Overflow, payload)) => {
+                let oref = OverflowRef::from_bytes(payload);
+                overflow_value = self.materialize_overflow(&oref)?;
+                Some(&mut overflow_value)
+            }
+            Some((_, payload)) => {
+                if let Some(budget) = &self.read_budget {
+                    budget.try_charge(payload.len())?;
+                }
+                buffer.clear();
+                buffer.extend_from_slice(payload);
+                Some(buffer)
+            }
+        };
         self.check_cancel()?;
-        let Some(mut value) = value else {
+        let Some(value) = value else {
             return Ok(None);
         };
-        let result = f(&mut value)?;
-        Self::validate_key_value(key, &value)?;
+        let result = f(value)?;
+        Self::validate_key_value(key, value)?;
         self.check_cancel()?;
         self.invalidate_fk_cache_for(table);
-        self.stage_and_insert_at_leaf(table, key, &value, leaf)?;
+        self.stage_and_insert_at_leaf(table, key, value, leaf)?;
         self.finish_mutation(Some(result), true).map_err(E::from)
     }
 
