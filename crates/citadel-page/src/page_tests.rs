@@ -227,3 +227,257 @@ fn writable_constructor_preserves_initialized_format_and_public_checksum_contrac
         assert_eq!(writable.as_bytes(), checksummed.as_bytes());
     }
 }
+
+fn assert_cell_validation_modes(page: &Page, expected_error: Option<&str>) {
+    let (decoded, validated) = match page.page_type().unwrap() {
+        PageType::Leaf => (
+            crate::leaf_node::read_cells_checked(page).map(|_| ()),
+            crate::leaf_node::validate_cells_checked(page),
+        ),
+        PageType::Branch => (
+            crate::branch_node::read_cells_checked(page).map(|_| ()),
+            crate::branch_node::validate_cells_checked(page),
+        ),
+        _ => unreachable!(),
+    };
+    assert_eq!(validated, decoded);
+    assert_eq!(
+        page.validate_for_read(page.page_id()).is_ok(),
+        expected_error.is_none()
+    );
+    if let Some(expected) = expected_error {
+        let error = decoded.unwrap_err().to_string();
+        assert!(
+            error.contains(expected),
+            "expected {expected:?}, got {error:?}"
+        );
+    } else {
+        decoded.unwrap();
+    }
+}
+
+fn raw_validation_page(kind: PageType, cells: &[Vec<u8>], right_child: PageId) -> Page {
+    let mut page = Page::new(PageId(10), kind, TxnId(1));
+    page.set_right_child(right_child);
+    for cell in cells {
+        page.write_cell(cell).unwrap();
+    }
+    page
+}
+
+#[test]
+fn leaf_validation_modes_preserve_combined_corruption_priority() {
+    use crate::leaf_node::{build_cell, OverflowRef};
+    use citadel_core::types::ValueType;
+
+    let malformed = raw_validation_page(
+        PageType::Leaf,
+        &[
+            build_cell(b"a", ValueType::Overflow, &[0; 7]),
+            build_cell(b"b", ValueType::Inline, b"value"),
+        ],
+        PageId(0),
+    );
+    assert_cell_validation_modes(
+        &malformed,
+        Some("leaf cell 0 overflow reference has 7 bytes"),
+    );
+
+    let mut later_parse = malformed.clone();
+    let offset = later_parse.cell_offset(1) as usize;
+    later_parse.data[offset + 2..offset + 6].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert_cell_validation_modes(&later_parse, Some("leaf cell 1 value"));
+
+    let mut bad_layout = malformed.clone();
+    bad_layout.set_free_space(bad_layout.free_space() + 1);
+    assert_cell_validation_modes(&bad_layout, Some("free-space accounting"));
+
+    let mut overlap = malformed.clone();
+    overlap.set_cell_offset(1, overlap.cell_offset(0));
+    assert_cell_validation_modes(&overlap, Some("overlap"));
+
+    let unordered = raw_validation_page(
+        PageType::Leaf,
+        &[
+            build_cell(b"b", ValueType::Overflow, &[0; 7]),
+            build_cell(b"a", ValueType::Inline, b"value"),
+        ],
+        PageId(0),
+    );
+    assert_cell_validation_modes(
+        &unordered,
+        Some("leaf keys 0 and 1 are not strictly ordered"),
+    );
+
+    let mut invalid_type = malformed.clone();
+    let offset = invalid_type.cell_offset(0) as usize;
+    invalid_type.data[offset + 7] = u8::MAX;
+    assert_cell_validation_modes(
+        &invalid_type,
+        Some("leaf cell 0 has invalid value type 255"),
+    );
+    invalid_type.set_cell_offset(1, BODY_SIZE as u16);
+    assert_cell_validation_modes(&invalid_type, Some("cell 1 offset"));
+
+    for first_page in [PageId(0), PageId::INVALID] {
+        let reference = OverflowRef {
+            first_page,
+            total_len: 1,
+        }
+        .to_bytes();
+        let page = raw_validation_page(
+            PageType::Leaf,
+            &[build_cell(b"key", ValueType::Overflow, &reference)],
+            PageId(0),
+        );
+        assert_cell_validation_modes(&page, Some("overflow reference has invalid first page"));
+    }
+    let reference = OverflowRef {
+        first_page: PageId(7),
+        total_len: citadel_core::MAX_VALUE_SIZE as u32 + 1,
+    }
+    .to_bytes();
+    let page = raw_validation_page(
+        PageType::Leaf,
+        &[build_cell(b"key", ValueType::Overflow, &reference)],
+        PageId(0),
+    );
+    assert_cell_validation_modes(&page, Some("overflow length"));
+}
+
+#[test]
+fn branch_validation_modes_preserve_combined_corruption_priority() {
+    use crate::branch_node::build_cell;
+
+    let malformed = raw_validation_page(
+        PageType::Branch,
+        &[
+            build_cell(PageId::INVALID, b"a"),
+            build_cell(PageId(7), b"b"),
+        ],
+        PageId(8),
+    );
+    assert_cell_validation_modes(&malformed, Some("branch child 0 is invalid"));
+
+    let mut later_parse = malformed.clone();
+    let offset = later_parse.cell_offset(1) as usize;
+    later_parse.data[offset + 4..offset + 6].copy_from_slice(&u16::MAX.to_le_bytes());
+    assert_cell_validation_modes(&later_parse, Some("branch cell 1 key"));
+
+    let mut bad_layout = malformed.clone();
+    bad_layout.set_free_space(bad_layout.free_space() + 1);
+    assert_cell_validation_modes(&bad_layout, Some("free-space accounting"));
+
+    let mut overlap = malformed.clone();
+    overlap.set_cell_offset(1, overlap.cell_offset(0));
+    assert_cell_validation_modes(&overlap, Some("overlap"));
+
+    let unordered = raw_validation_page(
+        PageType::Branch,
+        &[
+            build_cell(PageId::INVALID, b"b"),
+            build_cell(PageId(7), b"a"),
+        ],
+        PageId(8),
+    );
+    assert_cell_validation_modes(
+        &unordered,
+        Some("branch separator keys 0 and 1 are not strictly ordered"),
+    );
+
+    let invalid_right_child = raw_validation_page(
+        PageType::Branch,
+        &[build_cell(PageId(7), b"a"), build_cell(PageId(7), b"b")],
+        PageId::INVALID,
+    );
+    assert_cell_validation_modes(&invalid_right_child, Some("branch child 2 is invalid"));
+
+    let duplicates = raw_validation_page(
+        PageType::Branch,
+        &[
+            build_cell(PageId(9), b"a"),
+            build_cell(PageId(9), b"b"),
+            build_cell(PageId(2), b"c"),
+            build_cell(PageId(2), b"d"),
+        ],
+        PageId(5),
+    );
+    assert_cell_validation_modes(&duplicates, Some("branch child duplicates page page:2"));
+
+    for (child, expected) in [
+        (PageId::INVALID, "branch child 0 is invalid"),
+        (PageId(10), "branch child 0 points back to page page:10"),
+    ] {
+        let empty = raw_validation_page(PageType::Branch, &[], child);
+        assert_cell_validation_modes(&empty, Some(expected));
+    }
+}
+
+#[test]
+fn validation_modes_accept_logical_order_independent_of_physical_layout() {
+    use crate::{branch_node, leaf_node};
+    use citadel_core::types::ValueType;
+
+    let reference = leaf_node::OverflowRef {
+        first_page: PageId(7),
+        total_len: 1,
+    }
+    .to_bytes();
+    let mut leaf = raw_validation_page(
+        PageType::Leaf,
+        &[
+            leaf_node::build_cell(b"c", ValueType::Overflow, &reference),
+            leaf_node::build_cell(b"a", ValueType::Inline, b"value"),
+            leaf_node::build_cell(b"b", ValueType::Tombstone, b""),
+        ],
+        PageId(0),
+    );
+    let mut branch = raw_validation_page(
+        PageType::Branch,
+        &[
+            branch_node::build_cell(PageId(0), b"c"),
+            branch_node::build_cell(PageId(8), b"a"),
+            branch_node::build_cell(PageId(2), b"b"),
+        ],
+        PageId(7),
+    );
+    for page in [&mut leaf, &mut branch] {
+        let offsets = [
+            page.cell_offset(0),
+            page.cell_offset(1),
+            page.cell_offset(2),
+        ];
+        for (index, offset) in [offsets[1], offsets[2], offsets[0]].into_iter().enumerate() {
+            page.set_cell_offset(index as u16, offset);
+        }
+        assert_cell_validation_modes(page, None);
+    }
+    let keys: Vec<_> = leaf_node::read_cells_checked(&leaf)
+        .unwrap()
+        .into_iter()
+        .map(|cell| cell.key)
+        .collect();
+    assert_eq!(keys, [b"a".as_slice(), b"b".as_slice(), b"c".as_slice()]);
+    let children: Vec<_> = branch_node::read_cells_checked(&branch)
+        .unwrap()
+        .into_iter()
+        .map(|cell| cell.child)
+        .collect();
+    assert_eq!(children, [PageId(8), PageId(2), PageId(0)]);
+
+    let area_start = leaf.cell_area_start();
+    leaf_node::delete_at(&mut leaf, 1);
+    assert_eq!(leaf.cell_area_start(), area_start);
+    assert_cell_validation_modes(&leaf, None);
+    assert!(leaf_node::insert(
+        &mut leaf,
+        b"bb",
+        ValueType::Inline,
+        &[7; 128]
+    ));
+    assert_cell_validation_modes(&leaf, None);
+
+    for kind in [PageType::Leaf, PageType::Branch] {
+        assert_cell_validation_modes(&raw_validation_page(kind, &[], PageId(0)), None);
+    }
+}

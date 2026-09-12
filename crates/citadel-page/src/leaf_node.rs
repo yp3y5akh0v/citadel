@@ -57,6 +57,17 @@ pub fn read_cell(page: &Page, i: u16) -> LeafCell<'_> {
 /// value kinds rather than treating them as inline data, enforces key ordering, and
 /// proves overflow references have their fixed width and a usable page and length.
 pub fn read_cells_checked(page: &Page) -> Result<Vec<LeafCell<'_>>, CellDecodeError> {
+    decode_cells_checked::<true>(page)
+}
+
+/// Apply the same checks without allocating a decoded-cell collection.
+pub(crate) fn validate_cells_checked(page: &Page) -> Result<(), CellDecodeError> {
+    decode_cells_checked::<false>(page).map(|_| ())
+}
+
+fn decode_cells_checked<const COLLECT: bool>(
+    page: &Page,
+) -> Result<Vec<LeafCell<'_>>, CellDecodeError> {
     if page.page_type() != Some(PageType::Leaf) {
         return Err(CellDecodeError::new(format!(
             "checked leaf decode received page type {}",
@@ -65,8 +76,11 @@ pub fn read_cells_checked(page: &Page) -> Result<Vec<LeafCell<'_>>, CellDecodeEr
     }
 
     let offsets = checked_cell_offsets(page)?;
-    let mut cells = Vec::with_capacity(offsets.len());
+    let mut cells = Vec::with_capacity(if COLLECT { offsets.len() } else { 0 });
     let mut spans = Vec::with_capacity(offsets.len());
+    let mut previous_key: Option<&[u8]> = None;
+    let mut bad_key_order = None;
+    let mut bad_overflow = None;
     for (index, offset) in offsets.enumerate() {
         let fixed_end = offset.checked_add(6).ok_or_else(|| {
             CellDecodeError::new(format!("leaf cell {index} header length overflows"))
@@ -111,51 +125,60 @@ pub fn read_cells_checked(page: &Page) -> Result<Vec<LeafCell<'_>>, CellDecodeEr
             start: offset,
             end,
         });
-        cells.push(LeafCell {
+        let cell = LeafCell {
             key: &page.data[fixed_end..value_type_offset],
             val_type,
             value: &page.data[value_start..end],
-        });
+        };
+        if bad_key_order.is_none() && previous_key.is_some_and(|previous| previous >= cell.key) {
+            bad_key_order = Some(index - 1);
+        }
+        previous_key = Some(cell.key);
+        if cell.val_type == ValueType::Overflow && bad_overflow.is_none() {
+            bad_overflow = validate_overflow_reference(index, cell.value).err();
+        }
+        if COLLECT {
+            cells.push(cell);
+        }
     }
     validate_cell_layout(page, &mut spans)?;
 
-    if let Some((index, _)) = cells
-        .windows(2)
-        .enumerate()
-        .find(|(_, pair)| pair[0].key >= pair[1].key)
-    {
+    // Aggregate layout errors precede ordering and overflow-reference errors.
+    if let Some(index) = bad_key_order {
         return Err(CellDecodeError::new(format!(
             "leaf keys {index} and {} are not strictly ordered",
             index + 1
         )));
     }
 
-    for (index, cell) in cells.iter().enumerate() {
-        if cell.val_type != ValueType::Overflow {
-            continue;
-        }
-        if cell.value.len() != 8 {
-            return Err(CellDecodeError::new(format!(
-                "leaf cell {index} overflow reference has {} bytes instead of 8",
-                cell.value.len()
-            )));
-        }
-        let reference = OverflowRef::from_bytes(cell.value);
-        if reference.first_page.as_u32() == 0 || !reference.first_page.is_valid() {
-            return Err(CellDecodeError::new(format!(
-                "leaf cell {index} overflow reference has invalid first page {}",
-                reference.first_page
-            )));
-        }
-        if reference.total_len as usize > MAX_VALUE_SIZE {
-            return Err(CellDecodeError::new(format!(
-                "leaf cell {index} overflow length {} exceeds {MAX_VALUE_SIZE}",
-                reference.total_len
-            )));
-        }
+    if let Some(error) = bad_overflow {
+        return Err(error);
     }
 
     Ok(cells)
+}
+
+fn validate_overflow_reference(index: usize, value: &[u8]) -> Result<(), CellDecodeError> {
+    if value.len() != 8 {
+        return Err(CellDecodeError::new(format!(
+            "leaf cell {index} overflow reference has {} bytes instead of 8",
+            value.len()
+        )));
+    }
+    let reference = OverflowRef::from_bytes(value);
+    if reference.first_page.as_u32() == 0 || !reference.first_page.is_valid() {
+        return Err(CellDecodeError::new(format!(
+            "leaf cell {index} overflow reference has invalid first page {}",
+            reference.first_page
+        )));
+    }
+    if reference.total_len as usize > MAX_VALUE_SIZE {
+        return Err(CellDecodeError::new(format!(
+            "leaf cell {index} overflow length {} exceeds {MAX_VALUE_SIZE}",
+            reference.total_len
+        )));
+    }
+    Ok(())
 }
 
 /// Get the total byte size of a leaf cell.

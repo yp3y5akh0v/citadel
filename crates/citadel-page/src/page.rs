@@ -171,6 +171,7 @@ impl Page {
     /// Validate a disk page before exposing unchecked cell access to normal
     /// readers. Locally constructed writer pages already satisfy these layout
     /// invariants; integrity tools may retain the raw bytes for detailed errors.
+    /// Call after authentication, decryption, and checksum verification.
     pub fn validate_for_read(&self, expected_id: PageId) -> citadel_core::Result<()> {
         use citadel_core::Error;
         if self.page_id() != expected_id {
@@ -178,10 +179,11 @@ impl Page {
         }
         match self.page_type() {
             Some(PageType::Leaf) => {
-                crate::leaf_node::read_cells_checked(self).map_err(|_| Error::DatabaseCorrupted)?;
+                crate::leaf_node::validate_cells_checked(self)
+                    .map_err(|_| Error::DatabaseCorrupted)?;
             }
             Some(PageType::Branch) => {
-                crate::branch_node::read_cells_checked(self)
+                crate::branch_node::validate_cells_checked(self)
                     .map_err(|_| Error::DatabaseCorrupted)?;
             }
             // Their dedicated chain decoders validate payload and link bounds.
