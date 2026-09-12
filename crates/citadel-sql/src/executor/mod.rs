@@ -12,6 +12,7 @@ mod explain;
 mod fk;
 pub(crate) mod helpers;
 mod index_build;
+mod insert_copy;
 mod join;
 pub(crate) mod matviews;
 mod result_cache;
