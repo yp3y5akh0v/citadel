@@ -145,9 +145,13 @@ impl PageLoader for WritePages<'_> {
 
 #[derive(Debug, Clone)]
 pub struct DeferredFkCheck {
-    pub fk_name: String,
-    pub foreign_table: Vec<u8>,
-    pub parent_key: Vec<u8>,
+    /// Physical identity of the child whose final reference must be checked.
+    pub child_table: Vec<u8>,
+    pub child_key: Vec<u8>,
+    /// Column names keep the constraint identity stable when ordinals shift.
+    pub child_columns: Vec<String>,
+    pub foreign_table: String,
+    pub referred_columns: Vec<String>,
 }
 
 pub struct WriteTxn<'a> {

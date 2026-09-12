@@ -868,6 +868,23 @@ pub enum IndexKey {
 }
 
 impl IndexDef {
+    /// Whether this index covers every row with exactly these column keys.
+    ///
+    /// FK lookups need the full ordered key, not just the column keys left after
+    /// dropping expressions. Collations are allowed; probes must encode them and
+    /// recheck the original row values when a collation folds distinct values.
+    pub fn is_full_column_btree(&self, columns: &[u16]) -> bool {
+        self.kind == IndexKind::BTree
+            && self.predicate_sql.is_none()
+            && self.predicate_expr.is_none()
+            && self.keys.len() == columns.len()
+            && self
+                .keys
+                .iter()
+                .zip(columns)
+                .all(|(key, column)| matches!(key, IndexKey::Column { idx, .. } if idx == column))
+    }
+
     /// Used by FK/UNIQUE auto-indexes; expression-key indexes go through a different path.
     pub fn from_column_lists(
         name: String,
