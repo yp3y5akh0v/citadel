@@ -2941,6 +2941,10 @@ enum PkKeyRepr {
 }
 
 impl FkChildHits {
+    pub(super) fn len(&self) -> usize {
+        self.hits.len()
+    }
+
     pub(super) fn entries(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
         self.hits
             .iter()

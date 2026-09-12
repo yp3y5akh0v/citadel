@@ -3095,6 +3095,39 @@ mod tests {
     }
 
     #[test]
+    fn late_cancellation_of_complete_cascade_cannot_commit_deleted_trees() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        conn.execute("CREATE TABLE child (id INTEGER PRIMARY KEY, p INTEGER REFERENCES parent(id) ON DELETE CASCADE)").unwrap();
+        conn.execute("INSERT INTO parent VALUES (1)").unwrap();
+        conn.execute("INSERT INTO child VALUES (10, 1), (20, 1)")
+            .unwrap();
+        conn.execute("BEGIN").unwrap();
+        let token = citadel::CancelToken::new();
+        db.set_cancel(Some(token.clone()));
+        let _late_cancel = cancel_after_statement(token);
+        assert!(matches!(
+            conn.execute("DELETE FROM parent WHERE id = 1"),
+            Err(SqlError::Storage(citadel_core::Error::Interrupted))
+        ));
+        db.set_cancel(None);
+        assert!(conn.execute("COMMIT").is_err());
+        assert_eq!(
+            conn.query("SELECT id FROM parent").unwrap().rows,
+            vec![vec![Value::Integer(1)]]
+        );
+        assert_eq!(
+            conn.query("SELECT id FROM child ORDER BY id").unwrap().rows,
+            vec![vec![Value::Integer(10)], vec![Value::Integer(20)]]
+        );
+        let index = crate::TableSchema::index_table_name("child", "__fk_child_0");
+        assert_eq!(db.begin_read().table_entry_count(&index).unwrap(), 2);
+    }
+
+    #[test]
     fn late_cancellation_restores_a_timezone_change_before_commit() {
         let dir = tempfile::tempdir().unwrap();
         let db = fresh_db(dir.path());
