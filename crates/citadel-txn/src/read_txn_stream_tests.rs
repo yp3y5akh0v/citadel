@@ -1173,6 +1173,9 @@ fn normal_operations_reject_authenticated_cross_page_branch_cycle() {
             "write_get" => writer.table_get(TABLE, &key).map(|_| ()),
             "write_scan" => writer.table_scan_from(TABLE, &key, |_, _| Ok(false)),
             "insert" => writer.table_insert(TABLE, &key, b"after").map(|_| ()),
+            "insert_if_absent" => writer
+                .table_insert_if_absent(TABLE, &key, b"after")
+                .map(|_| ()),
             "delete" => writer.table_delete(TABLE, &key).map(|_| ()),
             "update" => writer
                 .table_update_with(TABLE, &key, |_| Ok::<(), Error>(()))
@@ -1196,6 +1199,7 @@ fn normal_operations_reject_authenticated_cross_page_branch_cycle() {
         "write_get",
         "write_scan",
         "insert",
+        "insert_if_absent",
         "delete",
         "update",
     ] {
