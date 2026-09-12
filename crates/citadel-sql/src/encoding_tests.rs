@@ -938,3 +938,95 @@ fn skipped_cell_bodies_are_checked_before_a_null_target() {
         }
     }
 }
+
+#[test]
+fn key_decoders_reject_invalid_signed_width_markers() {
+    for tag in [TAG_INTEGER, TAG_TIME, TAG_DATE, TAG_TIMESTAMP] {
+        for marker in 0..=u8::MAX {
+            if (0x78..=0x88).contains(&marker) {
+                continue;
+            }
+            // Satisfy even the largest bogus width, so truncation cannot hide
+            // indexing outside the signed decoder's eight-byte destination.
+            let mut encoded = vec![0; 130];
+            encoded[0] = tag;
+            encoded[1] = marker;
+            assert!(matches!(
+                decode_key_value(&encoded),
+                Err(SqlError::InvalidValue(_))
+            ));
+            assert!(matches!(
+                skip_key_value(&encoded),
+                Err(SqlError::InvalidValue(_))
+            ));
+        }
+    }
+}
+
+#[test]
+fn key_skip_rejects_truncated_fixed_width_values() {
+    for value in [
+        Value::Boolean(true),
+        Value::Interval {
+            months: 1,
+            days: -2,
+            micros: 3,
+        },
+    ] {
+        let encoded = encode_key_value(&value);
+        for length in 0..encoded.len() {
+            assert!(
+                matches!(
+                    skip_key_value(&encoded[..length]),
+                    Err(SqlError::InvalidValue(_))
+                ),
+                "value: {value:?}; available bytes: {length}"
+            );
+        }
+        assert_eq!(skip_key_value(&encoded).unwrap(), encoded.len());
+    }
+}
+
+#[test]
+fn key_decoders_reject_out_of_range_signed_magnitudes() {
+    for tag in [TAG_INTEGER, TAG_TIME, TAG_DATE, TAG_TIMESTAMP] {
+        for (marker, magnitudes) in [
+            (0x88, [1u64 << 63, u64::MAX]),
+            (0x78, [(1u64 << 63) + 1, u64::MAX]),
+        ] {
+            for magnitude in magnitudes {
+                let mut encoded = vec![tag, marker];
+                let payload = magnitude.to_be_bytes();
+                if marker == 0x78 {
+                    encoded.extend(payload.map(|byte| !byte));
+                } else {
+                    encoded.extend(payload);
+                }
+                assert!(
+                    matches!(decode_key_value(&encoded), Err(SqlError::InvalidValue(_))),
+                    "tag: {tag}; marker: {marker}; magnitude: {magnitude}"
+                );
+                assert!(matches!(
+                    skip_key_value(&encoded),
+                    Err(SqlError::InvalidValue(_))
+                ));
+            }
+        }
+    }
+}
+
+#[test]
+fn key_skip_rejects_unknown_type_tags() {
+    for tag in TAG_VECTOR + 1..=u8::MAX {
+        // A terminator must not turn an unrecognized type into a byte string.
+        let encoded = [tag, 0];
+        assert!(matches!(
+            decode_key_value(&encoded),
+            Err(SqlError::InvalidValue(_))
+        ));
+        assert!(matches!(
+            skip_key_value(&encoded),
+            Err(SqlError::InvalidValue(_))
+        ));
+    }
+}
