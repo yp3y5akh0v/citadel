@@ -21,18 +21,37 @@ pub fn read_and_decrypt(
     mac_key: &[u8; MAC_KEY_SIZE],
     encryption_epoch: u32,
 ) -> Result<Page> {
+    read_with_decrypt(io, page_id, offset, |encrypted, body| {
+        page_cipher::decrypt_page(dek, mac_key, page_id, encryption_epoch, encrypted, body)
+    })
+}
+
+/// Authenticate, decrypt and check the checksum using an exact key/epoch state.
+/// Page layout is left uninterpreted for integrity and maintenance callers.
+pub fn read_and_decrypt_with_hmac(
+    io: &dyn PageIO,
+    page_id: PageId,
+    offset: u64,
+    dek: &[u8; DEK_SIZE],
+    hmac_state: &page_cipher::HmacState,
+) -> Result<Page> {
+    read_with_decrypt(io, page_id, offset, |encrypted, body| {
+        page_cipher::decrypt_page_with_hmac(dek, hmac_state, page_id, encrypted, body)
+    })
+}
+
+#[inline]
+fn read_with_decrypt(
+    io: &dyn PageIO,
+    page_id: PageId,
+    offset: u64,
+    decrypt: impl FnOnce(&[u8; PAGE_SIZE], &mut [u8; BODY_SIZE]) -> Result<()>,
+) -> Result<Page> {
     let mut encrypted = [0u8; PAGE_SIZE];
     io.read_page(offset, &mut encrypted)?;
 
     let mut body = [0u8; BODY_SIZE];
-    page_cipher::decrypt_page(
-        dek,
-        mac_key,
-        page_id,
-        encryption_epoch,
-        &encrypted,
-        &mut body,
-    )?;
+    decrypt(&encrypted, &mut body)?;
 
     let page = Page::from_bytes(body);
 
@@ -58,15 +77,29 @@ pub fn read_and_validate(
     Ok(page)
 }
 
+/// Load a normal source page using an exact key/epoch HMAC state, then validate
+/// identity and layout after authentication, decryption and checksum verification.
+pub fn read_and_validate_with_hmac(
+    io: &dyn PageIO,
+    page_id: PageId,
+    offset: u64,
+    dek: &[u8; DEK_SIZE],
+    hmac_state: &page_cipher::HmacState,
+) -> Result<Page> {
+    let page = read_and_decrypt_with_hmac(io, page_id, offset, dek, hmac_state)?;
+    page.validate_for_read(page_id)?;
+    Ok(page)
+}
+
 /// Buffer pool: caches decrypted pages in memory with SIEVE eviction.
 ///
-/// Keyed by physical disk offset (not logical page_id) because under CoW/MVCC
-/// the same logical page_id can exist at different disk locations.
+/// Entries are keyed by physical disk offsets derived from `PageId`.
 ///
 /// Invariants:
 /// - HMAC is verified BEFORE decryption on every page fetch (cache miss).
-/// - Dirty pages are PINNED and never evictable until commit.
-/// - Transaction size is bounded by buffer pool capacity.
+/// - Dirty entries are excluded from eviction until their dirty mark is cleared.
+/// - Capacity bounds resident cache entries. Transaction writers keep changed
+///   pages separately, so this cache does not bound transaction size.
 pub struct BufferPool {
     cache: SieveCache<Arc<Page>>,
     capacity: usize,

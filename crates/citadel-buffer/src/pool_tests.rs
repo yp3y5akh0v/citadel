@@ -206,3 +206,122 @@ fn clear_releases_cached_pages_without_invalidating_readers() {
     drop(reader);
     assert!(second_weak.upgrade().is_none());
 }
+
+#[test]
+fn cached_hmac_loaders_preserve_auth_checksum_and_layout_boundaries() {
+    let io = MockIO::new();
+    let page_id = PageId(4);
+    let offset = page_offset(page_id);
+    for (dek, mac_key, epoch) in [
+        ([0x12; DEK_SIZE], [0x34; MAC_KEY_SIZE], 0),
+        ([0x56; DEK_SIZE], [0x78; MAC_KEY_SIZE], u32::MAX),
+    ] {
+        let state = page_cipher::HmacState::new(&mac_key, epoch);
+        let mut page = Page::new(page_id, PageType::Leaf, TxnId(1));
+        page.update_checksum();
+        write_encrypted_page(&io, &page, &dek, &mac_key, epoch);
+        for loaded in [
+            read_and_decrypt(&io, page_id, offset, &dek, &mac_key, epoch),
+            read_and_decrypt_with_hmac(&io, page_id, offset, &dek, &state),
+            read_and_validate(&io, page_id, offset, &dek, &mac_key, epoch),
+            read_and_validate_with_hmac(&io, page_id, offset, &dek, &state),
+        ] {
+            assert_eq!(loaded.unwrap().as_bytes(), page.as_bytes());
+        }
+
+        // A valid MAC does not replace the plaintext checksum check.
+        page.as_bytes_mut()[BODY_SIZE - 1] ^= 1;
+        write_encrypted_page(&io, &page, &dek, &mac_key, epoch);
+        for loaded in [
+            read_and_decrypt(&io, page_id, offset, &dek, &mac_key, epoch),
+            read_and_decrypt_with_hmac(&io, page_id, offset, &dek, &state),
+            read_and_validate(&io, page_id, offset, &dek, &mac_key, epoch),
+            read_and_validate_with_hmac(&io, page_id, offset, &dek, &state),
+        ] {
+            assert!(matches!(loaded, Err(Error::ChecksumMismatch(id)) if id == page_id));
+        }
+
+        // Integrity callers must receive authenticated malformed layout bytes.
+        page.set_num_cells(u16::MAX);
+        page.update_checksum();
+        write_encrypted_page(&io, &page, &dek, &mac_key, epoch);
+        for loaded in [
+            read_and_decrypt(&io, page_id, offset, &dek, &mac_key, epoch),
+            read_and_decrypt_with_hmac(&io, page_id, offset, &dek, &state),
+        ] {
+            assert_eq!(loaded.unwrap().as_bytes(), page.as_bytes());
+        }
+        for loaded in [
+            read_and_validate(&io, page_id, offset, &dek, &mac_key, epoch),
+            read_and_validate_with_hmac(&io, page_id, offset, &dek, &state),
+        ] {
+            assert!(matches!(loaded, Err(Error::DatabaseCorrupted)));
+        }
+
+        // Authentication takes priority over that malformed plaintext layout.
+        io.pages.lock().get_mut(&offset).unwrap()[100] ^= 1;
+        for loaded in [
+            read_and_decrypt(&io, page_id, offset, &dek, &mac_key, epoch),
+            read_and_decrypt_with_hmac(&io, page_id, offset, &dek, &state),
+            read_and_validate(&io, page_id, offset, &dek, &mac_key, epoch),
+            read_and_validate_with_hmac(&io, page_id, offset, &dek, &state),
+        ] {
+            assert!(matches!(loaded, Err(Error::PageTampered(id)) if id == page_id));
+        }
+        let mut pool = BufferPool::new(2);
+        assert!(matches!(pool.fetch(&io, page_id, &dek, &mac_key, epoch),
+            Err(Error::PageTampered(id)) if id == page_id));
+        assert!(!pool.is_cached(page_id));
+        let mut repaired = Page::new(page_id, PageType::Leaf, TxnId(1));
+        repaired.update_checksum();
+        write_encrypted_page(&io, &repaired, &dek, &mac_key, epoch);
+        assert_eq!(
+            pool.fetch(&io, page_id, &dek, &mac_key, epoch)
+                .unwrap()
+                .as_bytes(),
+            repaired.as_bytes()
+        );
+    }
+}
+
+#[test]
+fn pool_cold_misses_use_each_supplied_key_and_epoch() {
+    let io = MockIO::new();
+    let contexts = [
+        (PageId(3), [0x12; DEK_SIZE], [0x34; MAC_KEY_SIZE], 0),
+        (PageId(7), [0x56; DEK_SIZE], [0x78; MAC_KEY_SIZE], u32::MAX),
+    ];
+    for (id, dek, mac_key, epoch) in &contexts {
+        let mut page = Page::new(*id, PageType::Leaf, TxnId(1));
+        page.update_checksum();
+        write_encrypted_page(&io, &page, dek, mac_key, *epoch);
+    }
+    let mut pool = BufferPool::new(4);
+    for (position, (id, dek, mac_key, epoch)) in contexts.iter().enumerate() {
+        let other_key = &contexts[1 - position].2;
+        assert!(matches!(pool.fetch(&io, *id, dek, other_key, *epoch),
+            Err(Error::PageTampered(actual)) if actual == *id));
+        assert!(!pool.is_cached(*id));
+        assert!(
+            matches!(pool.fetch_mut(&io, *id, dek, mac_key, epoch.wrapping_add(1)),
+            Err(Error::PageTampered(actual)) if actual == *id)
+        );
+        assert!(!pool.is_cached(*id));
+        if position == 0 {
+            assert_eq!(
+                pool.fetch(&io, *id, dek, mac_key, *epoch)
+                    .unwrap()
+                    .page_id(),
+                *id
+            );
+        } else {
+            assert_eq!(
+                pool.fetch_mut(&io, *id, dek, mac_key, *epoch)
+                    .unwrap()
+                    .page_id(),
+                *id
+            );
+        }
+    }
+    assert_eq!(pool.len(), 2);
+}
