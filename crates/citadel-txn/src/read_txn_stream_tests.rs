@@ -223,6 +223,7 @@ fn scan_view<'a>(
         cache,
         manager,
         high_water_mark,
+        snapshot_txn_id: manager.current_slot().txn_id,
         current: None,
         cached_leaves: Vec::with_capacity(SCAN_CACHE_BATCH_SIZE - 1),
     }
@@ -319,12 +320,12 @@ fn cached_scan_batch_stops_before_misses_nonleaves_and_snapshot_bounds() {
 }
 
 #[test]
-fn cached_scan_batch_defers_bad_headers_and_observes_cancellation_first() {
+fn cached_scan_batch_observes_cancellation_before_loading_a_later_invalid_page() {
     let (manager, io, ids) = scan_page_fixture(&[PageType::Leaf; 3], 8);
     let mut bad = io.read_plain(ids[1]);
     bad.set_page_id(ids[2]);
     io.rewrite_at(ids[1], bad);
-    for &id in &ids {
+    for id in [ids[0], ids[2]] {
         manager.fetch_page(id).unwrap();
     }
     let cache = FxHashMap::default();
@@ -342,19 +343,20 @@ fn cached_scan_batch_defers_bad_headers_and_observes_cancellation_first() {
             .page_id(),
         ids[0]
     );
-    assert_eq!(view.cached_leaves.len(), 2);
+    assert!(view.cached_leaves.is_empty());
     let token = CancelToken::new();
     token.cancel();
     assert!(matches!(
         traversal.next_leaf(Some(&token), |id, pending| view.load_scan_page(id, pending)),
         Err(Error::Interrupted)
     ));
-    assert_eq!(view.cached_leaves.len(), 2);
+    assert!(view.cached_leaves.is_empty());
+    assert!(io.reads().is_empty());
     assert!(matches!(
         traversal.next_leaf(None, |id, pending| view.load_scan_page(id, pending)),
         Err(Error::DatabaseCorrupted)
     ));
-    assert!(io.reads().is_empty());
+    assert_eq!(io.reads(), [page_offset(ids[1])]);
 }
 
 #[test]
@@ -951,5 +953,285 @@ fn dense_append_leaf_checksums_survive_commit_and_cold_reopen() {
         drop(reader);
         let integrity = reopened.integrity_check().unwrap();
         assert!(integrity.is_ok(), "{sync_mode:?}: {integrity:?}");
+    }
+}
+
+fn assert_normal_operations_reject_malformed_page(kind: &str) {
+    for operation in [
+        "get",
+        "scan",
+        "raw_scan",
+        "collect",
+        "write_get",
+        "write_scan",
+        "insert",
+        "delete",
+        "update",
+    ] {
+        let (manager, io, _) = seeded(1);
+        let root = manager
+            .begin_read()
+            .table_root_page(TABLE)
+            .unwrap()
+            .unwrap();
+        let stored = io.read_plain(root);
+        let key = 0u32.to_be_bytes();
+        let mut page = Page::new(root, PageType::Leaf, stored.txn_id());
+        assert!(leaf_node::insert_append_direct(
+            &mut page,
+            &key,
+            ValueType::Inline,
+            b"before"
+        ));
+        match kind {
+            "truncated_leaf" => {
+                let offset = (citadel_core::BODY_SIZE - 2) as u16;
+                page.set_cell_area_start(offset);
+                page.set_cell_offset(0, offset);
+            }
+            "invalid_value_type" => {
+                let offset = page.cell_offset(0) as usize;
+                page.data[offset + 6 + key.len()] = 255;
+            }
+            "short_overflow_reference" => {
+                page.rebuild_cells(&[]);
+                assert!(leaf_node::insert_append_direct(
+                    &mut page,
+                    &key,
+                    ValueType::Overflow,
+                    &[1]
+                ));
+            }
+            "impossible_branch_count" => {
+                page.set_page_type(PageType::Branch);
+                page.set_num_cells(u16::MAX);
+            }
+            _ => unreachable!(),
+        }
+        io.rewrite_at(root, page);
+        drop(manager);
+        let manager = io.open();
+        let mut reader = manager.begin_read();
+        let mut writer = manager.begin_write().unwrap();
+        let result = match operation {
+            "get" => reader.table_get(TABLE, &key).map(|_| ()),
+            "scan" => reader.table_scan_from(TABLE, &key, |_, _| Ok(false)),
+            "raw_scan" => reader.table_scan_raw(TABLE, |_, _| false),
+            "collect" => reader.collect_table_leaves(TABLE).map(|_| ()),
+            "write_scan" => writer.table_scan_from(TABLE, &key, |_, _| Ok(false)),
+            "write_get" => writer.table_get(TABLE, &key).map(|_| ()),
+            "insert" => writer.table_insert(TABLE, &key, b"after").map(|_| ()),
+            "delete" => writer.table_delete(TABLE, &key).map(|_| ()),
+            "update" => writer
+                .table_update_with(TABLE, &key, |_| Ok::<(), Error>(()))
+                .map(|_| ()),
+            _ => unreachable!(),
+        };
+        assert!(
+            matches!(result, Err(Error::DatabaseCorrupted)),
+            "{kind}/{operation}: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn normal_operations_reject_authenticated_truncated_leaf() {
+    assert_normal_operations_reject_malformed_page("truncated_leaf");
+}
+
+#[test]
+fn normal_operations_reject_authenticated_invalid_value_type() {
+    assert_normal_operations_reject_malformed_page("invalid_value_type");
+}
+
+#[test]
+fn normal_operations_reject_authenticated_short_overflow_reference() {
+    assert_normal_operations_reject_malformed_page("short_overflow_reference");
+}
+
+#[test]
+fn normal_operations_reject_authenticated_impossible_branch_count() {
+    assert_normal_operations_reject_malformed_page("impossible_branch_count");
+}
+
+#[test]
+fn writer_rejects_authenticated_page_header_identity_mismatch() {
+    let (manager, io, _) = seeded(1);
+    let root = manager
+        .begin_read()
+        .table_root_page(TABLE)
+        .unwrap()
+        .unwrap();
+    let mut page = io.read_plain(root);
+    page.set_page_id(manager.current_slot().tree_root);
+    io.rewrite_at(root, page);
+    drop(manager);
+    let manager = io.open();
+    let mut writer = manager.begin_write().unwrap();
+    assert!(matches!(
+        writer.table_get(TABLE, &0u32.to_be_bytes()),
+        Err(Error::DatabaseCorrupted)
+    ));
+}
+
+fn assert_future_page_transaction_is_rejected(write: bool) {
+    let (manager, io, _) = seeded(1);
+    let root = manager
+        .begin_read()
+        .table_root_page(TABLE)
+        .unwrap()
+        .unwrap();
+    let future = manager.current_slot().txn_id.next();
+    let mut page = io.read_plain(root);
+    page.set_txn_id(future);
+    io.rewrite(page);
+    drop(manager);
+    let manager = io.open();
+    let key = 0u32.to_be_bytes();
+    let result = if write {
+        let mut writer = manager.begin_write().unwrap();
+        assert_eq!(
+            writer.txn_id(),
+            future,
+            "fixture must target the CoW ownership test"
+        );
+        writer.table_insert(TABLE, &key, b"after").map(|_| ())
+    } else {
+        manager.begin_read().table_get(TABLE, &key).map(|_| ())
+    };
+    assert!(
+        matches!(result, Err(Error::DatabaseCorrupted)),
+        "write={write}: {result:?}"
+    );
+}
+
+#[test]
+fn read_rejects_authenticated_page_newer_than_snapshot() {
+    assert_future_page_transaction_is_rejected(false);
+}
+
+#[test]
+fn writer_rejects_authenticated_future_page_before_cow_ownership_test() {
+    assert_future_page_transaction_is_rejected(true);
+}
+
+#[test]
+fn catalog_apis_reject_authenticated_malformed_cells() {
+    for operation in ["list_tables", "table_root"] {
+        let (manager, io, _) = seeded(1);
+        let root = manager.current_slot().catalog_root;
+        let mut page = io.read_plain(root);
+        assert_eq!(page.page_type(), Some(PageType::Leaf));
+        let offset = (citadel_core::BODY_SIZE - 2) as u16;
+        page.set_cell_area_start(offset);
+        page.set_cell_offset(0, offset);
+        io.rewrite(page);
+        drop(manager);
+        let manager = io.open();
+        let result = match operation {
+            "list_tables" => manager.list_tables().map(|_| ()),
+            "table_root" => manager.table_root(TABLE).map(|_| ()),
+            _ => unreachable!(),
+        };
+        assert!(
+            matches!(result, Err(Error::DatabaseCorrupted)),
+            "{operation}: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn normal_operations_reject_authenticated_cross_page_branch_cycle() {
+    const CHILD: &str = "CITADEL_NORMAL_PAGE_CYCLE_CHILD";
+    if let Ok(operation) = std::env::var(CHILD) {
+        let (manager, io, _) = seeded(1);
+        let root = manager
+            .begin_read()
+            .table_root_page(TABLE)
+            .unwrap()
+            .unwrap();
+        let other = manager.current_slot().tree_root;
+        assert_ne!(root, other);
+        for (id, child) in [(root, other), (other, root)] {
+            let mut page = io.read_plain(id);
+            page.set_page_type(PageType::Branch);
+            page.rebuild_cells(&[]);
+            page.set_right_child(child);
+            // Both pages pass existing per-page branch checks; the cycle spans pages.
+            citadel_page::branch_node::read_cells_checked(&page).unwrap();
+            io.rewrite(page);
+        }
+        drop(manager);
+        let manager = io.open();
+        let mut reader = manager.begin_read();
+        let mut writer = manager.begin_write().unwrap();
+        let key = 0u32.to_be_bytes();
+        let result = match operation.as_str() {
+            "get" => reader.table_get(TABLE, &key).map(|_| ()),
+            "scan" => reader.table_scan_from(TABLE, &key, |_, _| Ok(false)),
+            "for_each" => reader.table_for_each(TABLE, |_, _| Ok(())),
+            "write_get" => writer.table_get(TABLE, &key).map(|_| ()),
+            "write_scan" => writer.table_scan_from(TABLE, &key, |_, _| Ok(false)),
+            "insert" => writer.table_insert(TABLE, &key, b"after").map(|_| ()),
+            "delete" => writer.table_delete(TABLE, &key).map(|_| ()),
+            "update" => writer
+                .table_update_with(TABLE, &key, |_| Ok::<(), Error>(()))
+                .map(|_| ()),
+            _ => unreachable!(),
+        };
+        assert!(
+            matches!(result, Err(Error::DatabaseCorrupted)),
+            "{operation}: {result:?}"
+        );
+        return;
+    }
+    let full_name = concat!(
+        module_path!(),
+        "::normal_operations_reject_authenticated_cross_page_branch_cycle"
+    );
+    for operation in [
+        "get",
+        "scan",
+        "for_each",
+        "write_get",
+        "write_scan",
+        "insert",
+        "delete",
+        "update",
+    ] {
+        run_stream_child(full_name, CHILD, operation);
+    }
+}
+
+#[test]
+fn snapshot_overflow_bridge_rejects_future_page_metadata_anywhere_in_chain() {
+    for target_link in [0, 1] {
+        let (manager, io, _) = seeded(1);
+        let root = manager
+            .begin_read()
+            .table_root_page(TABLE)
+            .unwrap()
+            .unwrap();
+        let leaf = io.read_plain(root);
+        let cell = leaf_node::read_cell(&leaf, 0);
+        assert_eq!(cell.val_type, ValueType::Overflow);
+        let reference = leaf_node::OverflowRef::from_bytes(cell.value);
+        let mut target = reference.first_page;
+        for _ in 0..target_link {
+            target = citadel_page::overflow::next_page(&io.read_plain(target));
+            assert_ne!(target, PageId(0));
+        }
+        let mut page = io.read_plain(target);
+        page.set_txn_id(manager.current_slot().txn_id.next());
+        io.rewrite(page);
+        drop(manager);
+        let manager = io.open();
+        let result = manager
+            .begin_read()
+            .read_reachable_overflow_value(&reference);
+        assert!(
+            matches!(result, Err(Error::DatabaseCorrupted)),
+            "future link {target_link}"
+        );
     }
 }

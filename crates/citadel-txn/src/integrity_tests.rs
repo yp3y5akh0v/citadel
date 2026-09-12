@@ -573,7 +573,11 @@ fn opening_is_lazy_and_schema_listing_populates_the_collision_index() {
 
     let mut reader = reopened.begin_read();
     assert_eq!(reader.table_entry_count(b"table").unwrap(), 1);
-    assert!(reads.load(std::sync::atomic::Ordering::Relaxed) > 0);
+    assert_eq!(
+        reads.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "schema listing leaves the authenticated catalog page reusable by readers"
+    );
     reads.store(0, std::sync::atomic::Ordering::Relaxed);
 
     // The transaction proves the exact catalog name once before trusting the
@@ -586,7 +590,7 @@ fn opening_is_lazy_and_schema_listing_populates_the_collision_index() {
     let root = slot.named_entry_root(b"table").unwrap().0;
     drop(
         reopened
-            .fetch_reachable_page(root, slot.high_water_mark)
+            .fetch_reachable_page(root, slot.high_water_mark, slot.txn_id)
             .unwrap(),
     );
     assert_eq!(reads.load(std::sync::atomic::Ordering::Relaxed), 1);
@@ -630,7 +634,7 @@ fn cold_catalog_resolutions_reuse_authenticated_buffer_pages() {
     assert_eq!(reopened.list_tables().unwrap().len(), 2);
     let slot = reopened.current_slot();
     let catalog = reopened
-        .fetch_reachable_page(slot.catalog_root, slot.high_water_mark)
+        .fetch_reachable_page(slot.catalog_root, slot.high_water_mark, slot.txn_id)
         .unwrap();
     assert_eq!(catalog.page_type(), Some(PageType::Leaf));
     drop(catalog);

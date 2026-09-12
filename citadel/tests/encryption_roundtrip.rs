@@ -11,6 +11,7 @@ use citadel_crypto::page_cipher;
 use citadel_io::file_manager::*;
 use citadel_io::mmap_io::MmapPageIO;
 use citadel_io::traits::PageIO;
+use citadel_page::leaf_node;
 use citadel_page::page::Page;
 
 use std::fs::File;
@@ -55,8 +56,9 @@ fn full_encryption_roundtrip() {
 
     for i in 0..10u32 {
         let mut page = Page::new(PageId(i), PageType::Leaf, TxnId(1));
-        let cell = format!("key-{i}:value-{i}");
-        page.write_cell(cell.as_bytes()).unwrap();
+        let value = format!("key-{i}:value-{i}");
+        let cell = leaf_node::build_cell(b"key", ValueType::Inline, value.as_bytes());
+        page.write_cell(&cell).unwrap();
         page.update_checksum();
 
         let offset = page_offset(PageId(i));
@@ -92,10 +94,11 @@ fn full_encryption_roundtrip() {
         assert_eq!(page.num_cells(), 1);
         assert!(page.verify_checksum());
 
-        let offset = page.cell_offset(0);
+        let cell = leaf_node::read_cell(page, 0);
         let expected = format!("key-{i}:value-{i}");
-        let data = page.cell_data(offset, expected.len());
-        assert_eq!(data, expected.as_bytes());
+        assert_eq!(cell.key, b"key");
+        assert_eq!(cell.val_type, ValueType::Inline);
+        assert_eq!(cell.value, expected.as_bytes());
     }
 
     {
@@ -385,8 +388,9 @@ fn buffer_pool_eviction_under_pressure() {
     let epoch = 1u32;
     for i in 0..50u32 {
         let mut page = Page::new(PageId(i), PageType::Leaf, TxnId(1));
-        let cell = format!("data-{i:04}");
-        page.write_cell(cell.as_bytes()).unwrap();
+        let value = format!("data-{i:04}");
+        let cell = leaf_node::build_cell(b"key", ValueType::Inline, value.as_bytes());
+        page.write_cell(&cell).unwrap();
         page.update_checksum();
         let offset = page_offset(PageId(i));
         ensure_file_size(&io, offset).unwrap();
@@ -623,8 +627,8 @@ fn cache_hit_returns_identical_data() {
     write_file_header(&io, &header).unwrap();
 
     let mut page = Page::new(PageId(0), PageType::Leaf, TxnId(1));
-    let cell = b"test-cell-data";
-    page.write_cell(cell).unwrap();
+    let cell = leaf_node::build_cell(b"key", ValueType::Inline, b"test-cell-data");
+    page.write_cell(&cell).unwrap();
     page.update_checksum();
     let offset = page_offset(PageId(0));
     ensure_file_size(&io, offset).unwrap();

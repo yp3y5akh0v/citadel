@@ -2457,6 +2457,7 @@ fn cancel_aware_overflow_walk_stops_between_pages() {
             first_page,
             total_len,
             slot.high_water_mark,
+            Some(slot.txn_id),
             true,
             || {
                 checks += 1;

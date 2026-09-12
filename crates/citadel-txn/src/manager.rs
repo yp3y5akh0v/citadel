@@ -749,20 +749,20 @@ impl TxnManager {
         self.read_page_into_pool(page_id)
     }
 
-    fn read_page_into_pool(&self, page_id: PageId) -> Result<Arc<Page>> {
-        let offset = page_offset(page_id);
-        let page = citadel_buffer::pool::read_and_decrypt(
+    fn read_validated_page(&self, page_id: PageId) -> Result<Page> {
+        citadel_buffer::pool::read_and_validate(
             &*self.io,
             page_id,
-            offset,
+            page_offset(page_id),
             &self.dek,
             &self.mac_key,
             self.epoch,
-        )?;
+        )
+    }
 
-        let arc = Arc::new(page);
+    fn read_page_into_pool(&self, page_id: PageId) -> Result<Arc<Page>> {
+        let arc = Arc::new(self.read_validated_page(page_id)?);
         self.pool.lock().insert_if_absent(page_id, Arc::clone(&arc));
-
         Ok(arc)
     }
 
@@ -772,6 +772,7 @@ impl TxnManager {
         &self,
         page_id: PageId,
         high_water_mark: u32,
+        snapshot_txn_id: TxnId,
         pending: &[PageId],
         cached_leaves: &mut Vec<(PageId, Arc<Page>)>,
     ) -> Result<Arc<Page>> {
@@ -783,7 +784,7 @@ impl TxnManager {
             let mut pool = self.pool.lock();
             let page = pool.get_cached(page_id);
             if let Some(page) = &page {
-                if page.page_id() != page_id {
+                if page.page_id() != page_id || page.txn_id() > snapshot_txn_id {
                     return Err(Error::DatabaseCorrupted);
                 }
                 if page.page_type() == Some(PageType::Leaf) {
@@ -808,7 +809,7 @@ impl TxnManager {
             Some(page) => page,
             None => self.read_page_into_pool(page_id)?,
         };
-        if page.page_id() != page_id {
+        if page.page_id() != page_id || page.txn_id() > snapshot_txn_id {
             return Err(Error::DatabaseCorrupted);
         }
         Ok(page)
@@ -818,12 +819,13 @@ impl TxnManager {
         &self,
         page_id: PageId,
         high_water_mark: u32,
+        snapshot_txn_id: TxnId,
     ) -> Result<Arc<Page>> {
         if page_id.as_u32() >= high_water_mark {
             return Err(Error::PageOutOfBounds(page_id));
         }
         let page = self.fetch_page(page_id)?;
-        if page.page_id() != page_id {
+        if page.page_id() != page_id || page.txn_id() > snapshot_txn_id {
             return Err(Error::DatabaseCorrupted);
         }
         Ok(page)
@@ -1398,7 +1400,8 @@ impl TxnManager {
         use citadel_core::types::{PageType, ValueType};
         use citadel_page::{branch_node, leaf_node};
 
-        let root = self.current_slot().catalog_root;
+        let slot = self.current_slot();
+        let root = slot.catalog_root;
         if !root.is_valid() {
             return Ok(FxHashMap::default());
         }
@@ -1414,7 +1417,7 @@ impl TxnManager {
             if !visited.insert(page_id) {
                 return Err(Error::DatabaseCorrupted);
             }
-            let page = self.read_page_from_disk(page_id)?;
+            let page = self.fetch_reachable_page(page_id, slot.high_water_mark, slot.txn_id)?;
             match page.page_type() {
                 Some(PageType::Leaf) => {
                     for index in 0..page.num_cells() {
@@ -1485,7 +1488,6 @@ impl TxnManager {
             _collision_init.is_some() && self.named_table_hash_collisions.get().is_none();
         let mut first_by_hash = FxHashMap::default();
         let mut collisions = FxHashMap::default();
-        let mut collision_scan_complete = true;
         let slot = self.current_slot();
         if !slot.catalog_root.is_valid() {
             if populate_collisions {
@@ -1495,9 +1497,13 @@ impl TxnManager {
         }
 
         let mut tables = Vec::new();
+        let mut visited = FxHashSet::default();
         let mut stack = vec![slot.catalog_root];
         while let Some(page_id) = stack.pop() {
-            let page = self.read_page_from_disk(page_id)?;
+            if !visited.insert(page_id) {
+                return Err(Error::DatabaseCorrupted);
+            }
+            let page = self.fetch_reachable_page(page_id, slot.high_water_mark, slot.txn_id)?;
             match page.page_type() {
                 Some(citadel_core::types::PageType::Leaf) => {
                     for i in 0..page.num_cells() {
@@ -1521,10 +1527,10 @@ impl TxnManager {
                         stack.push(right);
                     }
                 }
-                _ => collision_scan_complete = false,
+                _ => return Err(Error::InvalidPageType(page.page_type_raw(), page_id)),
             }
         }
-        if populate_collisions && collision_scan_complete {
+        if populate_collisions {
             let _ = self.named_table_hash_collisions.set(collisions);
         }
         Ok(tables)
@@ -1539,9 +1545,13 @@ impl TxnManager {
             return Ok(None);
         }
 
+        let mut visited = FxHashSet::default();
         let mut stack = vec![slot.catalog_root];
         while let Some(page_id) = stack.pop() {
-            let page = self.read_page_from_disk(page_id)?;
+            if !visited.insert(page_id) {
+                return Err(Error::DatabaseCorrupted);
+            }
+            let page = self.fetch_reachable_page(page_id, slot.high_water_mark, slot.txn_id)?;
             match page.page_type() {
                 Some(citadel_core::types::PageType::Leaf) => {
                     for i in 0..page.num_cells() {
@@ -1564,7 +1574,7 @@ impl TxnManager {
                         stack.push(right);
                     }
                 }
-                _ => {}
+                _ => return Err(Error::InvalidPageType(page.page_type_raw(), page_id)),
             }
         }
         Ok(None)
@@ -1592,6 +1602,7 @@ impl TxnManager {
         &self,
         reference: &citadel_page::leaf_node::OverflowRef,
         high_water_mark: u32,
+        snapshot_txn_id: TxnId,
         merkle_scheme: MerkleScheme,
         cancel: Option<&CancelToken>,
         budget: Option<&crate::ReadBudget>,
@@ -1621,6 +1632,7 @@ impl TxnManager {
                     reference.first_page,
                     reference.total_len,
                     high_water_mark,
+                    Some(snapshot_txn_id),
                     require_digest,
                     || token.check(),
                     |_, chunk| {
@@ -1634,6 +1646,7 @@ impl TxnManager {
                     reference.first_page,
                     reference.total_len,
                     high_water_mark,
+                    Some(snapshot_txn_id),
                     require_digest,
                     || Ok(()),
                     |_, chunk| {
@@ -2172,17 +2185,20 @@ impl TxnManager {
             first_page,
             total_len,
             high_water_mark,
+            None,
             false,
             || Ok(()),
             visit,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn walk_overflow_chain_checked<C, F>(
         &self,
         first_page: PageId,
         total_len: u32,
         high_water_mark: u32,
+        snapshot_txn_id: Option<TxnId>,
         require_digest: bool,
         mut check: C,
         mut visit: F,
@@ -2216,6 +2232,9 @@ impl TxnManager {
                 )));
             }
             let page = self.read_reachable_page(current, high_water_mark)?;
+            if snapshot_txn_id.is_some_and(|snapshot| page.txn_id() > snapshot) {
+                return Err(Error::DatabaseCorrupted);
+            }
             if page.page_type() != Some(PageType::Overflow) {
                 return Err(Error::InvalidPageType(page.page_type_raw(), current));
             }
@@ -2494,13 +2513,32 @@ impl TxnManager {
     }
 
     pub(crate) fn fetch_page_owned(&self, page_id: PageId) -> Result<Page> {
+        // Single-writer exclusion keeps these committed bounds stable. Copy
+        // only the scalar bounds; writer-owned/savepoint pages never load here.
+        let (high_water_mark, committed_txn_id) = {
+            let state = self.state.lock();
+            (
+                state.current_slot.high_water_mark,
+                state.current_slot.txn_id,
+            )
+        };
+        if page_id.as_u32() >= high_water_mark {
+            return Err(Error::PageOutOfBounds(page_id));
+        }
         {
             let mut pool = self.pool.lock();
             if let Some(arc) = pool.get_cached(page_id) {
+                if arc.page_id() != page_id || arc.txn_id() > committed_txn_id {
+                    return Err(Error::DatabaseCorrupted);
+                }
                 return Ok((*arc).clone());
             }
         }
-        self.read_page_from_disk(page_id)
+        let page = self.read_validated_page(page_id)?;
+        if page.txn_id() > committed_txn_id {
+            return Err(Error::DatabaseCorrupted);
+        }
+        Ok(page)
     }
 
     pub(crate) fn fetch_merkle_hash(
