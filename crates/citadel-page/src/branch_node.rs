@@ -37,6 +37,17 @@ pub fn read_cell(page: &Page, i: u16) -> BranchCell<'_> {
 /// following child pointers: separators strictly ordered, and every child valid,
 /// unique within the page, and not a self-reference.
 pub fn read_cells_checked(page: &Page) -> Result<Vec<BranchCell<'_>>, CellDecodeError> {
+    decode_cells_checked::<true>(page)
+}
+
+/// Apply the same checks without allocating a decoded-cell collection.
+pub(crate) fn validate_cells_checked(page: &Page) -> Result<(), CellDecodeError> {
+    decode_cells_checked::<false>(page).map(|_| ())
+}
+
+fn decode_cells_checked<const COLLECT: bool>(
+    page: &Page,
+) -> Result<Vec<BranchCell<'_>>, CellDecodeError> {
     if page.page_type() != Some(PageType::Branch) {
         return Err(CellDecodeError::new(format!(
             "checked branch decode received page type {}",
@@ -45,8 +56,11 @@ pub fn read_cells_checked(page: &Page) -> Result<Vec<BranchCell<'_>>, CellDecode
     }
 
     let offsets = checked_cell_offsets(page)?;
-    let mut cells = Vec::with_capacity(offsets.len());
+    let mut cells = Vec::with_capacity(if COLLECT { offsets.len() } else { 0 });
     let mut spans = Vec::with_capacity(offsets.len());
+    let mut children = Vec::with_capacity(offsets.len() + 1);
+    let mut previous_key: Option<&[u8]> = None;
+    let mut bad_key_order = None;
     for (index, offset) in offsets.enumerate() {
         let fixed_end = offset.checked_add(BRANCH_CELL_FIXED).ok_or_else(|| {
             CellDecodeError::new(format!("branch cell {index} header length overflows"))
@@ -76,18 +90,23 @@ pub fn read_cells_checked(page: &Page) -> Result<Vec<BranchCell<'_>>, CellDecode
             start: offset,
             end,
         });
-        cells.push(BranchCell {
+        let cell = BranchCell {
             child,
             key: &page.data[fixed_end..end],
-        });
+        };
+        if bad_key_order.is_none() && previous_key.is_some_and(|previous| previous >= cell.key) {
+            bad_key_order = Some(index - 1);
+        }
+        previous_key = Some(cell.key);
+        children.push(child);
+        if COLLECT {
+            cells.push(cell);
+        }
     }
     validate_cell_layout(page, &mut spans)?;
 
-    if let Some((index, _)) = cells
-        .windows(2)
-        .enumerate()
-        .find(|(_, pair)| pair[0].key >= pair[1].key)
-    {
+    // Aggregate layout errors precede separator and child-pointer errors.
+    if let Some(index) = bad_key_order {
         return Err(CellDecodeError::new(format!(
             "branch separator keys {index} and {} are not strictly ordered",
             index + 1
@@ -95,10 +114,9 @@ pub fn read_cells_checked(page: &Page) -> Result<Vec<BranchCell<'_>>, CellDecode
     }
 
     let own_page = page.page_id();
-    let mut children = Vec::with_capacity(cells.len() + 1);
-    for (index, child) in cells
+    for (index, child) in children
         .iter()
-        .map(|cell| cell.child)
+        .copied()
         .chain(std::iter::once(page.right_child()))
         .enumerate()
     {
@@ -112,8 +130,8 @@ pub fn read_cells_checked(page: &Page) -> Result<Vec<BranchCell<'_>>, CellDecode
                 "branch child {index} points back to page {own_page}"
             )));
         }
-        children.push(child);
     }
+    children.push(page.right_child());
     children.sort_unstable();
     if let Some(pair) = children.windows(2).find(|pair| pair[0] == pair[1]) {
         let child = pair[0];
