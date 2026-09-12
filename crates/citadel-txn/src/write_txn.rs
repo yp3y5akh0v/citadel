@@ -517,9 +517,8 @@ impl<'db> WriteTxn<'db> {
 
     pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         self.check_cancel()?;
-        self.preload_path(self.tree.root, key)?;
-        let tree = self.tree.clone();
-        let found = tree.search(&self.pages, key)?;
+        let leaf_id = Self::descend_to_leaf(&mut self.pages, self.manager, self.tree.root, key)?;
+        let found = BTree::search_at_leaf(&self.pages, leaf_id, key)?;
         let value = self.materialize_value(found)?;
         self.check_cancel()?;
         Ok(value)
@@ -592,30 +591,24 @@ impl<'db> WriteTxn<'db> {
 
     pub fn delete(&mut self, key: &[u8]) -> Result<bool> {
         self.check_cancel()?;
-        let root = self.tree.root;
-        let overflow_head = self.peek_overflow_head(root, key)?;
-        self.preload_path(root, key)?;
-        let deleted = self
-            .tree
-            .delete(&mut self.pages, &mut self.alloc, self.txn_id, key);
-        let deleted = match deleted {
-            Ok(deleted) => deleted,
+        let (mut path, leaf_id) =
+            Self::walk_loading(&mut self.pages, self.manager, self.tree.root, key)?;
+        let deleted = self.tree.delete_at_leaf_with_overflow(
+            &mut self.pages,
+            &mut self.alloc,
+            self.txn_id,
+            key,
+            &mut path,
+            leaf_id,
+        );
+        let (deleted, overflow_head) = match deleted {
+            Ok(result) => result,
             Err(err) => return self.fail(err),
         };
         if let Some(head) = overflow_head {
             self.free_overflow_chain(head)?;
         }
         self.finish_mutation(deleted, deleted)
-    }
-
-    fn peek_overflow_head(&mut self, root: PageId, key: &[u8]) -> Result<Option<PageId>> {
-        let leaf_id = Self::descend_to_leaf(&mut self.pages, self.manager, root, key)?;
-        match BTree::search_at_leaf(&self.pages, leaf_id, key)? {
-            Some((ValueType::Overflow, bytes)) => {
-                Ok(Some(OverflowRef::from_bytes(&bytes).first_page))
-            }
-            _ => Ok(None),
-        }
     }
 
     pub fn for_each<F>(&mut self, mut f: F) -> Result<()>
@@ -1699,16 +1692,9 @@ impl<'db> WriteTxn<'db> {
             let mut path = pb.borrow_mut();
             path.clear();
             let leaf_id = Self::walk_loading_into(pages, manager, root, key, &mut path)?;
-            let head = match BTree::search_at_leaf(pages, leaf_id, key)? {
-                Some((ValueType::Overflow, bytes)) => {
-                    Some(OverflowRef::from_bytes(&bytes).first_page)
-                }
-                _ => None,
-            };
-            let d = tree.delete_at_leaf(pages, alloc, txn_id, key, &mut path, leaf_id)?;
-            Ok((head, d))
+            tree.delete_at_leaf_with_overflow(pages, alloc, txn_id, key, &mut path, leaf_id)
         });
-        let (overflow_head, deleted) = match deleted {
+        let (deleted, overflow_head) = match deleted {
             Ok(result) => result,
             Err(err) => return Self::fail_with(failure, err),
         };

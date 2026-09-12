@@ -123,6 +123,108 @@ fn delete_key() {
 }
 
 #[test]
+fn root_delete_reclaims_overflow_across_cold_paths_and_savepoints() {
+    exercise_deep_delete(false);
+}
+
+#[test]
+fn table_delete_reclaims_overflow_across_cold_paths_and_savepoints() {
+    exercise_deep_delete(true);
+}
+
+fn exercise_deep_delete(named: bool) {
+    use crate::manager::tests::{test_keys, MemIO};
+    use crate::manager::TxnManager;
+
+    const ROWS: u32 = 384;
+    let key = |index: u32| {
+        let mut key = vec![b'k'; 512];
+        key[..4].copy_from_slice(&index.to_be_bytes());
+        key
+    };
+    let value = |index: u32| vec![index as u8; if index % 31 == 0 { 24_000 } else { 256 }];
+    let get = |writer: &mut super::WriteTxn<'_>, key: &[u8]| {
+        if named {
+            writer.table_get(b"deep", key)
+        } else {
+            writer.get(key)
+        }
+    };
+    let delete = |writer: &mut super::WriteTxn<'_>, key: &[u8]| {
+        if named {
+            writer.table_delete(b"deep", key)
+        } else {
+            writer.delete(key)
+        }
+    };
+    let (dek, mac_key, dek_id) = test_keys();
+    let io = MemIO::new(1024 * 1024);
+    let manager =
+        TxnManager::create(Box::new(io.share()), dek, mac_key, 1, 0x1234, dek_id, 32).unwrap();
+    let mut seed = manager.begin_write().unwrap();
+    if named {
+        seed.create_table(b"deep").unwrap();
+    }
+    for index in 0..ROWS {
+        if named {
+            seed.table_insert(b"deep", &key(index), &value(index))
+                .unwrap();
+        } else {
+            seed.insert(&key(index), &value(index)).unwrap();
+        }
+    }
+    let tree = if named {
+        &seed.named_trees[b"deep".as_slice()]
+    } else {
+        &seed.tree
+    };
+    assert!(tree.depth >= 3);
+    seed.commit().unwrap();
+    drop(manager);
+
+    let manager = TxnManager::open(Box::new(io.share()), dek, mac_key, 1, 32).unwrap();
+    let mut old_reader = manager.begin_read();
+    let mut writer = manager.begin_write().unwrap();
+    let checkpoint = writer.begin_savepoint();
+    assert!(delete(&mut writer, &key(0)).unwrap());
+    assert!(writer.pending_free_count() > 0);
+    assert_eq!(get(&mut writer, &key(0)).unwrap(), None);
+    writer.restore_snapshot(checkpoint);
+    assert_eq!(get(&mut writer, &key(0)).unwrap(), Some(value(0)));
+    // Alternate distant leaves, then drain every leaf and collapse the tree.
+    for index in (0..ROWS / 2).flat_map(|i| [i, ROWS - 1 - i]) {
+        assert!(delete(&mut writer, &key(index)).unwrap());
+        assert!(!delete(&mut writer, &key(index)).unwrap());
+        assert_eq!(get(&mut writer, &key(index)).unwrap(), None);
+    }
+    writer.commit().unwrap();
+    for index in 0..ROWS {
+        let actual = if named {
+            old_reader.table_get(b"deep", &key(index)).unwrap()
+        } else {
+            old_reader.get(&key(index)).unwrap()
+        };
+        assert_eq!(actual, Some(value(index)));
+    }
+    drop(old_reader);
+    let mut reader = manager.begin_read();
+    if named {
+        reader
+            .table_for_each(b"deep", |_, _| panic!("deleted row survived"))
+            .unwrap();
+    } else {
+        reader
+            .for_each(|_, _| panic!("deleted row survived"))
+            .unwrap();
+    }
+    drop(reader);
+    assert!(manager.integrity_check().unwrap().is_ok());
+    drop(manager);
+    let reopened = TxnManager::open(Box::new(io), dek, mac_key, 1, 32).unwrap();
+    assert!(reopened.integrity_check().unwrap().is_ok());
+}
+
+#[test]
 fn abort_discards_changes() {
     let mgr = create_test_manager();
 
@@ -1389,7 +1491,7 @@ fn exercise_callback_split_overflow_and_savepoint(fused_update: bool) {
 }
 
 #[test]
-fn insert_variants_leave_no_staged_overflow_after_a_cold_path_read_failure() {
+fn point_operations_leave_no_staged_pages_after_a_cold_path_read_failure() {
     use crate::manager::tests::{test_keys, MemIO};
     use crate::manager::TxnManager;
     use citadel_core::{Result, PAGE_SIZE};
@@ -1451,7 +1553,7 @@ fn insert_variants_leave_no_staged_overflow_after_a_cold_path_read_failure() {
     seed.commit().unwrap();
     drop(manager);
     let incoming = vec![b'n'; MAX_INLINE_VALUE_SIZE * 3 + 17];
-    for operation in 0..6 {
+    for operation in 0..8 {
         let reads_left = Arc::new(AtomicI64::new(i64::MAX));
         let manager = TxnManager::open(
             Box::new(FaultingReadIO {
@@ -1492,6 +1594,8 @@ fn insert_variants_leave_no_staged_overflow_after_a_cold_path_read_failure() {
                     panic!("failed tree walk must not invoke the callback")
                 })
                 .map(|_| ()),
+            6 => writer.get(&key).map(|_| ()),
+            7 => writer.delete(&key).map(|_| ()),
             _ => unreachable!(),
         };
         assert!(
