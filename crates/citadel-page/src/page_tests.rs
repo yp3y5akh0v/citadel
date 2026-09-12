@@ -481,3 +481,174 @@ fn validation_modes_accept_logical_order_independent_of_physical_layout() {
         assert_cell_validation_modes(&raw_validation_page(kind, &[], PageId(0)), None);
     }
 }
+
+fn page_with_layout_spans(offsets: &[usize], lengths: &[usize]) -> Page {
+    assert_eq!(offsets.len(), lengths.len());
+    let mut page = Page::new(PageId(10), PageType::Leaf, TxnId(1));
+    page.set_num_cells(offsets.len() as u16);
+    page.set_cell_area_start(offsets.iter().copied().min().unwrap_or(BODY_SIZE) as u16);
+    page.set_free_space((USABLE_SIZE - offsets.len() * 2 - lengths.iter().sum::<usize>()) as u16);
+    for (index, &offset) in offsets.iter().enumerate() {
+        page.set_cell_offset(index as u16, offset as u16);
+    }
+    page
+}
+
+#[test]
+fn checked_offsets_identify_strict_physical_order() {
+    for (offsets, expected) in [
+        (vec![], CellOffsetOrder::Ascending),
+        (vec![8000], CellOffsetOrder::Ascending),
+        (vec![8000, 8010, 8020], CellOffsetOrder::Ascending),
+        (vec![8020, 8010, 8000], CellOffsetOrder::Descending),
+        (vec![8000, 8000], CellOffsetOrder::Unordered),
+        (vec![8020, 8000, 8010], CellOffsetOrder::Unordered),
+    ] {
+        let page = page_with_layout_spans(&offsets, &vec![5; offsets.len()]);
+        let checked = checked_cell_offsets(&page).unwrap();
+        assert_eq!(checked.order(), expected);
+        assert_eq!(checked.collect::<Vec<_>>(), offsets);
+    }
+}
+
+#[test]
+fn ordered_and_fallback_layouts_match_sorted_span_validation() {
+    let fixtures: &[(&[usize], &[usize], Option<&str>)] = &[
+        (&[], &[], None),
+        (&[8000], &[7], None),
+        (&[8000, 8007, 8014], &[7, 7, 7], None),
+        (&[8014, 8007, 8000], &[7, 7, 7], None),
+        (&[7900, 8000, 8100], &[7, 7, 7], None),
+        (&[8100, 8000, 7900], &[7, 7, 7], None),
+        (&[8100, 7900, 8000], &[7, 7, 7], None),
+        (&[8000, 8000], &[7, 7], Some("overlap at byte 8000")),
+        (
+            &[8020, 8010, 8000],
+            &[5, 11, 11],
+            Some("cells 2 and 1 overlap at byte 8010"),
+        ),
+        (
+            &[8020, 8010, 8000],
+            &[5, 11, 5],
+            Some("cells 1 and 0 overlap at byte 8020"),
+        ),
+        (
+            &[8000, 8010, 8020],
+            &[11, 11, 5],
+            Some("cells 0 and 1 overlap at byte 8010"),
+        ),
+    ];
+    for &(offsets, lengths, expected_error) in fixtures {
+        for wrong_free_space in [false, true] {
+            let mut page = page_with_layout_spans(offsets, lengths);
+            if wrong_free_space {
+                page.set_free_space(page.free_space() + 1);
+            }
+            let checked = checked_cell_offsets(&page).unwrap();
+            let mut layout = CellLayout::new(&checked);
+            let ordered = checked.order() != CellOffsetOrder::Unordered;
+            assert_eq!(matches!(&layout, CellLayout::Ordered { .. }), ordered);
+            let mut spans = Vec::new();
+            for (index, (start, &length)) in checked.zip(lengths).enumerate() {
+                let span = CellSpan {
+                    index,
+                    start,
+                    end: start + length,
+                };
+                layout.push(span);
+                spans.push(span);
+            }
+            let result = layout.finish(&page);
+            assert_eq!(result, validate_cell_layout(&page, &mut spans));
+            let expected = expected_error.or(wrong_free_space.then_some("free-space accounting"));
+            if let Some(expected) = expected {
+                let error = result.unwrap_err().to_string();
+                assert!(
+                    error.contains(expected),
+                    "expected {expected:?}, got {error:?}"
+                );
+            } else {
+                result.unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn monotonic_parsers_report_the_lowest_physical_overlap_after_complete_parsing() {
+    use crate::{branch_node, leaf_node};
+    use citadel_core::types::ValueType;
+
+    let descending_leaf = raw_validation_page(
+        PageType::Leaf,
+        &[
+            leaf_node::build_cell(b"a", ValueType::Inline, &[0; 4]),
+            leaf_node::build_cell(b"b", ValueType::Inline, &[0; 4]),
+            leaf_node::build_cell(b"c", ValueType::Inline, &[0; 4]),
+        ],
+        PageId(0),
+    );
+    assert_eq!(
+        checked_cell_offsets(&descending_leaf).unwrap().order(),
+        CellOffsetOrder::Descending
+    );
+    let mut multiple = descending_leaf.clone();
+    for index in [1, 2] {
+        let offset = multiple.cell_offset(index) as usize;
+        multiple.data[offset + 2..offset + 6].copy_from_slice(&5u32.to_le_bytes());
+    }
+    let expected = format!("cells 2 and 1 overlap at byte {}", BODY_SIZE - 24);
+    assert_cell_validation_modes(&multiple, Some(&expected));
+
+    let mut first_only = descending_leaf.clone();
+    let offset = first_only.cell_offset(1) as usize;
+    first_only.data[offset + 2..offset + 6].copy_from_slice(&5u32.to_le_bytes());
+    let expected = format!("cells 1 and 0 overlap at byte {}", BODY_SIZE - 12);
+    assert_cell_validation_modes(&first_only, Some(&expected));
+    let offset = first_only.cell_offset(2) as usize;
+    first_only.data[offset + 2..offset + 6].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert_cell_validation_modes(&first_only, Some("leaf cell 2 value"));
+
+    let mut ascending_leaf = raw_validation_page(
+        PageType::Leaf,
+        &[
+            leaf_node::build_cell(b"c", ValueType::Inline, &[0; 4]),
+            leaf_node::build_cell(b"b", ValueType::Inline, &[0; 4]),
+            leaf_node::build_cell(b"a", ValueType::Inline, &[0; 4]),
+        ],
+        PageId(0),
+    );
+    let offsets = [ascending_leaf.cell_offset(0), ascending_leaf.cell_offset(2)];
+    ascending_leaf.set_cell_offset(0, offsets[1]);
+    ascending_leaf.set_cell_offset(2, offsets[0]);
+    assert_eq!(
+        checked_cell_offsets(&ascending_leaf).unwrap().order(),
+        CellOffsetOrder::Ascending
+    );
+    assert_cell_validation_modes(&ascending_leaf, None);
+    for index in [0, 1] {
+        let offset = ascending_leaf.cell_offset(index) as usize;
+        ascending_leaf.data[offset + 2..offset + 6].copy_from_slice(&5u32.to_le_bytes());
+    }
+    let expected = format!("cells 0 and 1 overlap at byte {}", BODY_SIZE - 24);
+    assert_cell_validation_modes(&ascending_leaf, Some(&expected));
+
+    let mut descending_branch = raw_validation_page(
+        PageType::Branch,
+        &[
+            branch_node::build_cell(PageId(1), b"a"),
+            branch_node::build_cell(PageId(2), b"b"),
+            branch_node::build_cell(PageId(3), b"c"),
+        ],
+        PageId(4),
+    );
+    for index in [1, 2] {
+        let offset = descending_branch.cell_offset(index) as usize;
+        descending_branch.data[offset + 4..offset + 6].copy_from_slice(&2u16.to_le_bytes());
+    }
+    let expected = format!("cells 2 and 1 overlap at byte {}", BODY_SIZE - 14);
+    assert_cell_validation_modes(&descending_branch, Some(&expected));
+    let offset = descending_branch.cell_offset(2) as usize;
+    descending_branch.data[offset + 4..offset + 6].copy_from_slice(&u16::MAX.to_le_bytes());
+    assert_cell_validation_modes(&descending_branch, Some("branch cell 2 key"));
+}
