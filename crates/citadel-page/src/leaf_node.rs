@@ -374,12 +374,22 @@ fn compact_page(page: &mut Page) {
     page.rebuild_cells(&refs);
 }
 
+/// Delete a cell at an index already resolved in this page.
+///
+/// The index remains valid across a page clone, but not across a cell insertion
+/// or deletion. Panics if the index is outside the page's current cells.
+#[inline]
+pub fn delete_at(page: &mut Page, idx: u16) {
+    assert!(idx < page.num_cells(), "delete_at: index out of bounds");
+    let cell_sz = get_cell_size(page, idx);
+    page.delete_cell_at(idx, cell_sz);
+}
+
 /// Delete a key. Returns true if found and deleted.
 pub fn delete(page: &mut Page, key: &[u8]) -> bool {
     match search(page, key) {
         Ok(idx) => {
-            let cell_sz = get_cell_size(page, idx);
-            page.delete_cell_at(idx, cell_sz);
+            delete_at(page, idx);
             true
         }
         Err(_) => false,

@@ -275,9 +275,9 @@ impl BTree {
         if !in_range {
             return Ok(None);
         }
-        if found_idx.is_none() {
+        let Some(found_idx) = found_idx else {
             return Ok(Some((false, None)));
-        }
+        };
 
         let mut cached_path = self.last_delete.take().unwrap().0;
         let cow_id = if needs_cow {
@@ -287,7 +287,7 @@ impl BTree {
         };
         {
             let page = pages.get_mut(&cow_id).unwrap();
-            leaf_node::delete(page, key);
+            leaf_node::delete_at(page, found_idx);
         }
 
         let leaf_empty = pages.get(&cow_id).unwrap().num_cells() == 0;
@@ -975,18 +975,18 @@ impl BTree {
     ) -> Result<bool> {
         self.clear_lil_caches();
 
-        let found = {
+        let found_idx = {
             let page = pages.get(&leaf_id).unwrap();
-            leaf_node::search(page, key).is_ok()
+            leaf_node::search(page, key)
         };
-        if !found {
+        let Ok(found_idx) = found_idx else {
             return Ok(false);
-        }
+        };
 
         let new_leaf_id = cow_page(pages, alloc, leaf_id, txn_id);
         {
             let page = pages.get_mut(&new_leaf_id).unwrap();
-            leaf_node::delete(page, key);
+            leaf_node::delete_at(page, found_idx);
         }
 
         let leaf_empty = pages.get(&new_leaf_id).unwrap().num_cells() == 0;
