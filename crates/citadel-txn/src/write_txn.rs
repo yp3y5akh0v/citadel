@@ -1786,6 +1786,21 @@ impl<'db> WriteTxn<'db> {
         self.finish_mutation(old_tree.entry_count, true)
     }
 
+    /// Check for a live key in the current write view without materializing its value.
+    ///
+    /// Tombstones are absent. This key-only lookup does not read overflow chains
+    /// or spend the read budget, which accounts for materialized values.
+    pub fn table_contains_key(&mut self, table: &[u8], key: &[u8]) -> Result<bool> {
+        self.check_cancel()?;
+        self.ensure_table(table)?;
+        let root = self.named_trees[table].root;
+        let leaf_id = Self::descend_to_leaf(&mut self.pages, self.manager, root, key)?;
+        let found = BTree::search_at_leaf_ref(&self.pages, leaf_id, key)?
+            .is_some_and(|(kind, _)| kind != ValueType::Tombstone);
+        self.check_cancel()?;
+        Ok(found)
+    }
+
     pub fn table_get(&mut self, table: &[u8], key: &[u8]) -> Result<Option<Vec<u8>>> {
         self.check_cancel()?;
         self.ensure_table(table)?;
