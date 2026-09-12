@@ -298,7 +298,7 @@ fn apply_row(
                     !matches!(
                         column.generated_kind,
                         Some(crate::parser::GeneratedKind::Virtual)
-                    ) && current[i] != row.old[i]
+                    ) && !current[i].bit_eq(&row.old[i])
                 })
             }
         };
@@ -502,7 +502,9 @@ fn run<'a>(
                             &value,
                             wtx.cancel_token(),
                         )?;
-                        if current != row.old {
+                        if current.len() != row.old.len()
+                            || current.iter().zip(&row.old).any(|(a, b)| !a.bit_eq(b))
+                        {
                             row.new = operation
                                 .assignments
                                 .as_ref()

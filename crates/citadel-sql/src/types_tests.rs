@@ -767,3 +767,22 @@ fn trigger_def_roundtrip_disabled() {
     let back = TriggerDef::deserialize(&td.serialize()).unwrap();
     assert!(!back.enabled);
 }
+
+#[test]
+fn exact_value_identity_preserves_nested_numeric_representations() {
+    let nested = |value| Value::Array(vec![Value::Array(vec![value].into())].into());
+    let nan = f64::from_bits(0x7ff8_0000_0000_0042);
+    assert!(nested(Value::Real(nan)).bit_eq(&nested(Value::Real(nan))));
+    assert!(!nested(Value::Real(nan))
+        .bit_eq(&nested(Value::Real(f64::from_bits(0x7ff8_0000_0000_0043)))));
+    assert!(!nested(Value::Integer(1)).bit_eq(&nested(Value::Real(1.0))));
+    assert!(!nested(Value::Real(0.0)).bit_eq(&nested(Value::Real(-0.0))));
+    let vector = Value::Vector(vec![f32::from_bits(0x7fc0_0042), -0.0].into());
+    assert!(vector.bit_eq(&vector.clone()));
+    assert!(!vector.bit_eq(&Value::Vector(
+        vec![f32::from_bits(0x7fc0_0042), 0.0].into()
+    )));
+    // SQL-level equality remains deliberately distinct.
+    assert_eq!(Value::Integer(1), Value::Real(1.0));
+    assert_eq!(Value::Real(0.0), Value::Real(-0.0));
+}
