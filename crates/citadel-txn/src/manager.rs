@@ -640,8 +640,8 @@ impl TxnManager {
         self.sync_mode
     }
 
-    /// Enable/disable secure delete: zero-fill freed pages once they are past
-    /// all readers.
+    /// Enable/disable secure delete: zero-fill freed pages after reader and
+    /// committed-generation protection expires.
     pub fn set_secure_delete(&self, on: bool) {
         self.secure_delete.store(on, Ordering::Release);
     }
@@ -1132,6 +1132,11 @@ impl TxnManager {
             let mut high = zeroed_up_to;
             let mut chain_high = zeroed_chain_up_to;
             for entry in &available {
+                // The newest retirement may still belong to the inactive slot.
+                // Preserve it until a later commit has replaced that slot.
+                if entry.freed_at_txn >= old_slot.txn_id {
+                    continue;
+                }
                 let is_chain = retired_chain_pages.get(&entry.page_id) == Some(&entry.freed_at_txn);
                 let watermark = if is_chain {
                     zeroed_chain_up_to
