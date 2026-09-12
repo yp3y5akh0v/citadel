@@ -23,6 +23,7 @@ use super::{CteContext, CteRows};
 
 struct UpdateBufs {
     key_buf: Vec<u8>,
+    value_buf: Vec<u8>,
     partial_row: Vec<Value>,
     patch_buf: Vec<u8>,
     row_layout: RowLayout,
@@ -35,6 +36,7 @@ impl UpdateBufs {
     fn new() -> Self {
         Self {
             key_buf: Vec::with_capacity(32),
+            value_buf: Vec::new(),
             partial_row: Vec::new(),
             patch_buf: Vec::with_capacity(256),
             row_layout: RowLayout::default(),
@@ -50,7 +52,21 @@ thread_local! {
 }
 
 fn with_update_scratch<R>(f: impl FnOnce(&mut UpdateBufs) -> R) -> R {
-    UPDATE_SCRATCH.with(|slot| f(&mut slot.borrow_mut()))
+    struct Guard<'a>(std::cell::RefMut<'a, UpdateBufs>);
+    impl Drop for Guard<'_> {
+        fn drop(&mut self) {
+            // An inline row may grow into overflow storage during a callback.
+            // Retain small values, including on errors, without keeping a large
+            // replacement alive in TLS after an error or panic.
+            if self.0.value_buf.capacity() > citadel_core::MAX_INLINE_VALUE_SIZE {
+                self.0.value_buf = Vec::new();
+            }
+        }
+    }
+    UPDATE_SCRATCH.with(|slot| {
+        let mut guard = Guard(slot.borrow_mut());
+        f(&mut guard.0)
+    })
 }
 
 fn filter_keyed_rows(
@@ -2362,6 +2378,7 @@ fn exec_update_in_txn_compiled(
     {
         let UpdateBufs {
             key_buf,
+            value_buf,
             partial_row,
             patch_buf,
             row_layout,
@@ -2370,9 +2387,10 @@ fn exec_update_in_txn_compiled(
         } = bufs;
         encode_composite_key_into(pk_values, key_buf);
         let key = key_buf.as_slice();
-        let updated = wtx.table_update_with(
+        let updated = wtx.table_update_with_buffer(
             compiled.table_name_lower.as_bytes(),
             key,
+            value_buf,
             |raw_value| -> Result<()> {
                 if let Some(expanded) = materializer.expand(table_schema, key, raw_value, cancel)? {
                     *raw_value = expanded;
@@ -2500,6 +2518,7 @@ fn exec_pk_lookup_update(
 ) -> Result<ExecutionResult> {
     let UpdateBufs {
         key_buf,
+        value_buf,
         partial_row,
         patch_buf,
         row_layout,
@@ -2508,9 +2527,10 @@ fn exec_pk_lookup_update(
     } = bufs;
     encode_composite_key_into(std::slice::from_ref(pk_value), key_buf);
     let key = key_buf.as_slice();
-    let updated = wtx.table_update_with(
+    let updated = wtx.table_update_with_buffer(
         schema.name.as_bytes(),
         key,
+        value_buf,
         |raw_value| -> Result<ExecutionResult> {
             if let Some(expanded) = materializer.expand(schema, key, raw_value, cancel)? {
                 *raw_value = expanded;

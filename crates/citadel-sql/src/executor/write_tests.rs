@@ -725,6 +725,12 @@ fn compiled_update_returning_relocates_generated_columns_after_row_rebuilds() {
                     .rows,
                 vec![expected],
             );
+            UPDATE_SCRATCH.with(|slot| {
+                assert!(
+                    slot.borrow().value_buf.capacity() <= citadel_core::MAX_INLINE_VALUE_SIZE,
+                    "a large replacement must not remain in the retained point buffer"
+                );
+            });
             old_lengths[index] = length;
         }
         if explicit {
@@ -1239,5 +1245,32 @@ fn compiled_update_repeated_target_keeps_final_null_assignment() {
                 conn.execute("COMMIT").unwrap();
             }
         }
+    }
+}
+
+#[test]
+fn update_scratch_releases_oversized_value_buffers_on_return_error_and_panic() {
+    for outcome in 0..3 {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_update_scratch(|bufs| -> Result<()> {
+                bufs.value_buf
+                    .resize(citadel_core::MAX_INLINE_VALUE_SIZE * 3, 0x5a);
+                match outcome {
+                    0 => Ok(()),
+                    1 => Err(SqlError::InvalidValue("rejected large replacement".into())),
+                    2 => panic!("large replacement panicked"),
+                    _ => unreachable!(),
+                }
+            })
+        }));
+        match outcome {
+            0 => assert!(matches!(result, Ok(Ok(())))),
+            1 => assert!(matches!(result, Ok(Err(SqlError::InvalidValue(_))))),
+            2 => assert!(result.is_err()),
+            _ => unreachable!(),
+        }
+        UPDATE_SCRATCH.with(|slot| {
+            assert_eq!(slot.borrow().value_buf.capacity(), 0);
+        });
     }
 }

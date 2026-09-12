@@ -66,11 +66,22 @@ impl BTree {
         leaf_id: PageId,
         key: &[u8],
     ) -> Result<Option<(ValueType, Vec<u8>)>> {
+        Self::search_at_leaf_ref(pages, leaf_id, key)
+            .map(|found| found.map(|(val_type, value)| (val_type, value.to_vec())))
+    }
+
+    /// Borrow a value from an already loaded leaf. The value remains tied to
+    /// the page map, so callers must release it before loading or mutating pages.
+    pub fn search_at_leaf_ref<'a>(
+        pages: &'a FxHashMap<PageId, Page>,
+        leaf_id: PageId,
+        key: &[u8],
+    ) -> Result<Option<(ValueType, &'a [u8])>> {
         let page = pages.get(&leaf_id).ok_or(Error::PageOutOfBounds(leaf_id))?;
         match leaf_node::search(page, key) {
             Ok(idx) => {
                 let cell = leaf_node::read_cell(page, idx);
-                Ok(Some((cell.val_type, cell.value.to_vec())))
+                Ok(Some((cell.val_type, cell.value)))
             }
             Err(_) => Ok(None),
         }

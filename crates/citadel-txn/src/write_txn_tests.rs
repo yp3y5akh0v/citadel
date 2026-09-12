@@ -1877,3 +1877,171 @@ fn update_with_read_budget_admits_once_before_the_callback_and_any_mutation() {
         assert!(report.is_ok(), "{report:?}");
     }
 }
+
+#[test]
+fn update_with_buffer_reuses_bytes_after_failure_missing_key_and_savepoint_restore() {
+    let manager = create_test_manager();
+    let mut seed = manager.begin_write().unwrap();
+    seed.create_table(b"buffered").unwrap();
+    seed.table_insert(b"buffered", b"a", b"alpha").unwrap();
+    seed.table_insert(b"buffered", b"b", b"bravo").unwrap();
+    seed.commit().unwrap();
+    let mut old_reader = manager.begin_read();
+    let mut writer = manager.begin_write().unwrap();
+    let mut buffer = Vec::with_capacity(64);
+    buffer.extend_from_slice(b"stale bytes longer than either row");
+    let allocation = buffer.as_ptr();
+
+    writer.set_read_budget(Some(crate::ReadBudget::new(5, 5)));
+    assert_eq!(
+        writer
+            .table_update_with_buffer::<_, (), Error>(b"buffered", b"a", &mut buffer, |value| {
+                assert_eq!(value.as_ptr(), allocation);
+                assert_eq!(value, b"alpha");
+                value.copy_from_slice(b"gamma");
+                Ok(())
+            })
+            .unwrap(),
+        Some(())
+    );
+    writer.set_read_budget(None);
+    let checkpoint = writer.begin_savepoint();
+
+    for panic in [false, true] {
+        let marker = writer.mutation_marker();
+        let allocated = writer.alloc.allocated_this_txn().len();
+        let freed = writer.pending_free_count();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            writer.table_update_with_buffer::<_, (), Error>(
+                b"buffered",
+                b"b",
+                &mut buffer,
+                |value| {
+                    assert_eq!(value.as_ptr(), allocation);
+                    assert_eq!(value, b"bravo");
+                    value.resize(31, 0x5a);
+                    if panic {
+                        panic!("callback panicked after changing retained scratch");
+                    }
+                    Err(Error::Sync("callback rejected retained scratch".into()))
+                },
+            )
+        }));
+        if panic {
+            assert!(result.is_err());
+        } else {
+            assert!(matches!(result, Ok(Err(Error::Sync(_)))));
+        }
+        assert!(!writer.is_poisoned());
+        assert!(!writer.mutated_since(marker));
+        assert_eq!(writer.alloc.allocated_this_txn().len(), allocated);
+        assert_eq!(writer.pending_free_count(), freed);
+        assert_eq!(
+            writer.table_get(b"buffered", b"b").unwrap(),
+            Some(b"bravo".to_vec())
+        );
+    }
+
+    let marker = writer.mutation_marker();
+    writer.set_read_budget(Some(crate::ReadBudget::new(4, 5)));
+    assert!(matches!(
+        writer.table_update_with_buffer::<_, (), Error>(
+            b"buffered",
+            b"b",
+            &mut buffer,
+            |_| panic!("a denied value must not reach the callback"),
+        ),
+        Err(Error::ReadBudgetExceeded { .. })
+    ));
+    assert_eq!(
+        writer
+            .table_update_with_buffer::<_, (), Error>(
+                b"buffered",
+                b"missing",
+                &mut buffer,
+                |_| panic!("a missing value must not reach the callback"),
+            )
+            .unwrap(),
+        None
+    );
+    assert!(!writer.mutated_since(marker));
+    writer.set_read_budget(Some(crate::ReadBudget::new(5, 5)));
+    writer
+        .table_update_with_buffer::<_, (), Error>(b"buffered", b"b", &mut buffer, |value| {
+            assert_eq!(value.as_ptr(), allocation);
+            assert_eq!(value, b"bravo");
+            value.clear();
+            value.push(b'x');
+            Ok(())
+        })
+        .unwrap();
+    writer.set_read_budget(None);
+    writer.restore_snapshot(checkpoint);
+    writer
+        .table_update_with_buffer::<_, (), Error>(b"buffered", b"b", &mut buffer, |value| {
+            assert_eq!(value.as_ptr(), allocation);
+            assert_eq!(value, b"bravo", "rollback must supersede scratch contents");
+            value.copy_from_slice(b"final");
+            Ok(())
+        })
+        .unwrap();
+    writer.commit().unwrap();
+    assert_eq!(
+        old_reader.table_get(b"buffered", b"a").unwrap(),
+        Some(b"alpha".to_vec())
+    );
+    assert_eq!(
+        old_reader.table_get(b"buffered", b"b").unwrap(),
+        Some(b"bravo".to_vec())
+    );
+    let mut reader = manager.begin_read();
+    assert_eq!(
+        reader.table_get(b"buffered", b"a").unwrap(),
+        Some(b"gamma".to_vec())
+    );
+    assert_eq!(
+        reader.table_get(b"buffered", b"b").unwrap(),
+        Some(b"final".to_vec())
+    );
+    assert!(manager.integrity_check().unwrap().is_ok());
+}
+
+#[test]
+fn update_with_buffer_keeps_overflow_materialization_out_of_retained_scratch() {
+    let manager = create_test_manager();
+    let original = vec![0x5a; MAX_INLINE_VALUE_SIZE * 3 + 17];
+    let mut seed = manager.begin_write().unwrap();
+    seed.create_table(b"buffered").unwrap();
+    seed.table_insert(b"buffered", b"large", &original).unwrap();
+    seed.commit().unwrap();
+    let mut writer = manager.begin_write().unwrap();
+    let mut buffer = Vec::with_capacity(64);
+    buffer.extend_from_slice(b"retained");
+    let allocation = buffer.as_ptr();
+    let capacity = buffer.capacity();
+    writer.set_read_budget(Some(crate::ReadBudget::new(original.len(), original.len())));
+    assert_eq!(
+        writer
+            .table_update_with_buffer::<_, (), Error>(b"buffered", b"large", &mut buffer, |value| {
+                assert_eq!(value, &original);
+                value.clear();
+                value.extend_from_slice(b"small");
+                Ok(())
+            },)
+            .unwrap(),
+        Some(())
+    );
+    assert_eq!(buffer, b"retained");
+    assert_eq!(buffer.as_ptr(), allocation);
+    assert_eq!(buffer.capacity(), capacity);
+    writer.set_read_budget(None);
+    writer.commit().unwrap();
+    assert_eq!(
+        manager
+            .begin_read()
+            .table_get(b"buffered", b"large")
+            .unwrap(),
+        Some(b"small".to_vec())
+    );
+    assert!(manager.integrity_check().unwrap().is_ok());
+}
