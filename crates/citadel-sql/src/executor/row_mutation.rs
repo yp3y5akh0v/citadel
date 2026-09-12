@@ -7,7 +7,7 @@ use crate::error::{Result, SqlError};
 use crate::eval::{eval_expr, is_truthy, EvalCtx};
 use crate::parser::{Expr, ReferentialAction, SelectColumn, TriggerTiming, UpdateStmt};
 use crate::schema::SchemaManager;
-use crate::types::{ExecutionResult, ForeignKeySchemaEntry, TableSchema, Value};
+use crate::types::{ExecutionResult, ForeignKeySchemaEntry, IndexDef, TableSchema, Value};
 
 use super::helpers::*;
 use super::triggers::{self, FireEvent};
@@ -641,12 +641,14 @@ fn run<'a>(
                     let index_table = TableSchema::index_table_name(&child.name, &index.name);
                     // Leaf children have no observable row actions. Their sole
                     // backing index supplies both encoded keys without decoding.
-                    for (index_key, key) in hits.entries() {
-                        check_cancel(wtx.cancel_token())?;
-                        wtx.table_delete(&index_table, index_key)
-                            .map_err(SqlError::Storage)?;
-                        wtx.table_delete(child.name.as_bytes(), key)
-                            .map_err(SqlError::Storage)?;
+                    if !try_truncate_leaf_children(wtx, child, index, &index_table, &hits)? {
+                        for (index_key, key) in hits.entries() {
+                            check_cancel(wtx.cancel_token())?;
+                            wtx.table_delete(&index_table, index_key)
+                                .map_err(SqlError::Storage)?;
+                            wtx.table_delete(child.name.as_bytes(), key)
+                                .map_err(SqlError::Storage)?;
+                        }
                     }
                     work.push(Work::ForeignKeys(parent, position + 1));
                     continue;
@@ -712,3 +714,43 @@ fn run<'a>(
     }
     completed.ok_or_else(|| SqlError::Unsupported("row mutation did not complete".into()))
 }
+
+/// The caller has excluded child triggers, descendants and additional indexes.
+/// Keep the original hit scan and its budget charges before proving coverage.
+fn try_truncate_leaf_children(
+    wtx: &mut WriteTxn<'_>,
+    child: &TableSchema,
+    index: &IndexDef,
+    index_table: &[u8],
+    hits: &FkChildHits,
+) -> Result<bool> {
+    // A non-NULL UNIQUE prefix has at most one child. For a singleton, two
+    // keyed deletes already do no more tree mutations than two truncations.
+    if index.unique || hits.len() < 2 {
+        return Ok(false);
+    }
+    let count = hits.len() as u64;
+    if wtx.table_entry_count(child.name.as_bytes())? != count
+        || wtx.table_entry_count(index_table)? != count
+    {
+        return Ok(false);
+    }
+    // Nonunique index hits have distinct complete primary-key suffixes. Their
+    // existence plus the physical entry count proves every base row is covered;
+    // tombstones or unrelated rows make this proof fail. Checking existence also
+    // prevents a dangling index entry from standing in for an unindexed row.
+    for (_, key) in hits.entries() {
+        if !wtx.table_contains_key(child.name.as_bytes(), key)? {
+            return Ok(false);
+        }
+    }
+    // Preserve the leaf-child lane's index-before-base mutation order. The
+    // statement guard makes any failure after the first mutation uncommittable.
+    wtx.table_truncate(index_table)?;
+    wtx.table_truncate(child.name.as_bytes())?;
+    Ok(true)
+}
+
+#[cfg(test)]
+#[path = "row_mutation_tests.rs"]
+mod tests;
