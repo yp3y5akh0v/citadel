@@ -328,6 +328,9 @@ pub(crate) fn decode_signed_varint(data: &[u8]) -> Result<(i64, usize)> {
         return Err(SqlError::InvalidValue("truncated integer".into()));
     }
     let marker = data[0];
+    if !(0x78..=0x88).contains(&marker) {
+        return Err(SqlError::InvalidValue("invalid integer width".into()));
+    }
     if marker == 0x80 {
         return Ok((0, 1));
     }
@@ -339,6 +342,11 @@ pub(crate) fn decode_signed_varint(data: &[u8]) -> Result<(i64, usize)> {
         let mut bytes = [0u8; 8];
         bytes[8 - byte_count..].copy_from_slice(&data[1..1 + byte_count]);
         let val = i64::from_be_bytes(bytes);
+        if val < 0 {
+            return Err(SqlError::InvalidValue(
+                "positive integer out of range".into(),
+            ));
+        }
         Ok((val, 1 + byte_count))
     } else {
         let byte_count = (0x80 - marker) as usize;
@@ -350,6 +358,11 @@ pub(crate) fn decode_signed_varint(data: &[u8]) -> Result<(i64, usize)> {
             bytes[8 - byte_count + i] = !data[1 + i];
         }
         let abs_val = u64::from_be_bytes(bytes);
+        if abs_val > 1u64 << 63 {
+            return Err(SqlError::InvalidValue(
+                "negative integer out of range".into(),
+            ));
+        }
         let val = (-(abs_val as i128)) as i64;
         Ok((val, 1 + byte_count))
     }
@@ -379,13 +392,24 @@ pub(crate) fn skip_key_value(data: &[u8]) -> Result<usize> {
     }
     match data[0] {
         TAG_NULL => Ok(1),
-        TAG_BOOLEAN => Ok(2),
+        TAG_BOOLEAN => {
+            if data.len() < 2 {
+                return Err(SqlError::InvalidValue("truncated boolean".into()));
+            }
+            Ok(2)
+        }
         TAG_INTEGER => decode_integer(&data[1..]).map(|(_, n)| n + 1),
         TAG_REAL => decode_real(&data[1..]).map(|(_, n)| n + 1),
         TAG_TIME | TAG_DATE | TAG_TIMESTAMP => decode_signed_varint(&data[1..]).map(|(_, n)| n + 1),
-        TAG_INTERVAL => Ok(17),
-        // Every remaining tag wraps a null-escaped payload.
-        _ => skip_null_escaped(&data[1..]).map(|n| n + 1),
+        TAG_INTERVAL => {
+            if data.len() < 17 {
+                return Err(SqlError::InvalidValue("truncated interval".into()));
+            }
+            Ok(17)
+        }
+        TAG_BLOB | TAG_TEXT | TAG_JSON | TAG_JSONB | TAG_TSVECTOR | TAG_TSQUERY | TAG_ARRAY
+        | TAG_VECTOR => skip_null_escaped(&data[1..]).map(|n| n + 1),
+        tag => Err(SqlError::InvalidValue(format!("unknown key tag: {tag:#x}"))),
     }
 }
 
