@@ -1121,20 +1121,25 @@ fn split_leaf_with_insert(
     value: &[u8],
     append_rightmost: bool,
 ) -> (Vec<u8>, PageId) {
-    let new_raw = leaf_node::build_cell(key, val_type, value);
-    if append_rightmost && new_raw.len() + 2 <= citadel_core::constants::USABLE_SIZE {
+    if append_rightmost
+        && leaf_node::cell_size(key.len(), value.len()) + 2 <= citadel_core::constants::USABLE_SIZE
+    {
         // Sequential appends will fill this new right edge. Keep the completed
         // left leaf intact instead of copying half its cells into the new page
         // and leaving every historical leaf half full.
         let right_id = alloc.allocate();
         let mut right_page = Page::new_for_write(right_id, PageType::Leaf, txn_id);
-        right_page
-            .write_cell(&new_raw)
-            .expect("append cell fits a fresh leaf");
+        assert!(leaf_node::insert_append_direct(
+            &mut right_page,
+            key,
+            val_type,
+            value,
+        ));
         pages.insert(right_id, right_page);
         return (key.to_vec(), right_id);
     }
 
+    let new_raw = leaf_node::build_cell(key, val_type, value);
     let mut cells: Vec<(Vec<u8>, Vec<u8>)> = {
         let page = pages.get(&leaf_id).unwrap();
         let n = page.num_cells() as usize;
