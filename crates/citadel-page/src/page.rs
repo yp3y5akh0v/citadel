@@ -168,6 +168,29 @@ impl Page {
         Self { data }
     }
 
+    /// Validate a disk page before exposing unchecked cell access to normal
+    /// readers. Locally constructed writer pages already satisfy these layout
+    /// invariants; integrity tools may retain the raw bytes for detailed errors.
+    pub fn validate_for_read(&self, expected_id: PageId) -> citadel_core::Result<()> {
+        use citadel_core::Error;
+        if self.page_id() != expected_id {
+            return Err(Error::DatabaseCorrupted);
+        }
+        match self.page_type() {
+            Some(PageType::Leaf) => {
+                crate::leaf_node::read_cells_checked(self).map_err(|_| Error::DatabaseCorrupted)?;
+            }
+            Some(PageType::Branch) => {
+                crate::branch_node::read_cells_checked(self)
+                    .map_err(|_| Error::DatabaseCorrupted)?;
+            }
+            // Their dedicated chain decoders validate payload and link bounds.
+            Some(PageType::Overflow | PageType::PendingFree) => {}
+            None => return Err(Error::InvalidPageType(self.page_type_raw(), expected_id)),
+        }
+        Ok(())
+    }
+
     pub fn from_bytes(data: [u8; BODY_SIZE]) -> Self {
         Self { data }
     }

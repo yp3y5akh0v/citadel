@@ -11,6 +11,8 @@ use citadel_page::page::Page;
 
 use crate::sieve::SieveCache;
 
+/// Authenticate and decrypt raw bytes without interpreting the page layout.
+/// Integrity tools use this boundary to retain precise corruption diagnostics.
 pub fn read_and_decrypt(
     io: &dyn PageIO,
     page_id: PageId,
@@ -41,6 +43,21 @@ pub fn read_and_decrypt(
     Ok(page)
 }
 
+/// Load a source page for normal reads, validating its identity and structural
+/// layout once before it can enter a trusted cache or a writer's local page map.
+pub fn read_and_validate(
+    io: &dyn PageIO,
+    page_id: PageId,
+    offset: u64,
+    dek: &[u8; DEK_SIZE],
+    mac_key: &[u8; MAC_KEY_SIZE],
+    encryption_epoch: u32,
+) -> Result<Page> {
+    let page = read_and_decrypt(io, page_id, offset, dek, mac_key, encryption_epoch)?;
+    page.validate_for_read(page_id)?;
+    Ok(page)
+}
+
 /// Buffer pool: caches decrypted pages in memory with SIEVE eviction.
 ///
 /// Keyed by physical disk offset (not logical page_id) because under CoW/MVCC
@@ -66,7 +83,7 @@ impl BufferPool {
     /// Fetch a page by page_id. Reads from cache or disk.
     ///
     /// On cache miss: reads from disk, verifies HMAC BEFORE decrypting,
-    /// verifies xxHash64 checksum after decrypting.
+    /// verifies xxHash64 checksum and page layout after decrypting.
     pub fn fetch(
         &mut self,
         io: &dyn PageIO,
@@ -81,7 +98,7 @@ impl BufferPool {
             return Ok(self.cache.get(offset).unwrap());
         }
 
-        let page = read_and_decrypt(io, page_id, offset, dek, mac_key, encryption_epoch)?;
+        let page = read_and_validate(io, page_id, offset, dek, mac_key, encryption_epoch)?;
         self.cache
             .insert(offset, Arc::new(page))
             .map_err(|()| Error::BufferPoolFull)?;
@@ -100,7 +117,7 @@ impl BufferPool {
         let offset = page_offset(page_id);
 
         if !self.cache.contains(offset) {
-            let page = read_and_decrypt(io, page_id, offset, dek, mac_key, encryption_epoch)?;
+            let page = read_and_validate(io, page_id, offset, dek, mac_key, encryption_epoch)?;
             self.cache
                 .insert(offset, Arc::new(page))
                 .map_err(|()| Error::BufferPoolFull)?;

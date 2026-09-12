@@ -10,6 +10,42 @@ use citadel_page::leaf_node::LeafCell;
 use citadel_page::page::Page;
 use citadel_page::{branch_node, leaf_node};
 
+/// Detect cycles in an immutable, deterministic root-to-leaf descent without
+/// allocating a visited set. The next child must be selected with the same key
+/// throughout the walk. This does not validate a complete tree traversal.
+#[doc(hidden)]
+pub struct DescentGuard {
+    anchor: PageId,
+    window: usize,
+    steps: usize,
+}
+
+impl DescentGuard {
+    #[inline]
+    pub fn new(root: PageId) -> Self {
+        Self {
+            anchor: root,
+            window: 1,
+            steps: 0,
+        }
+    }
+
+    /// Observe the next child before following it (Brent cycle detection).
+    #[inline]
+    pub fn follow(&mut self, next: PageId) -> Result<()> {
+        if next == self.anchor {
+            return Err(Error::DatabaseCorrupted);
+        }
+        self.steps += 1;
+        if self.steps == self.window {
+            self.anchor = next;
+            self.window = self.window.saturating_mul(2);
+            self.steps = 0;
+        }
+        Ok(())
+    }
+}
+
 pub trait PageMap {
     fn get_page(&self, id: &PageId) -> Option<&Page>;
 }
@@ -56,6 +92,9 @@ impl Cursor {
         let mut current = root;
 
         loop {
+            if path.iter().any(|&(ancestor, _)| ancestor == current) {
+                return Err(Error::DatabaseCorrupted);
+            }
             let page = pages
                 .get_page(&current)
                 .ok_or(Error::PageOutOfBounds(current))?;
@@ -102,6 +141,9 @@ impl Cursor {
         let mut current = root;
 
         loop {
+            if path.iter().any(|&(ancestor, _)| ancestor == current) {
+                return Err(Error::DatabaseCorrupted);
+            }
             let page = pages
                 .get_page(&current)
                 .ok_or(Error::PageOutOfBounds(current))?;
@@ -133,6 +175,9 @@ impl Cursor {
         let mut current = root;
 
         loop {
+            if path.iter().any(|&(ancestor, _)| ancestor == current) {
+                return Err(Error::DatabaseCorrupted);
+            }
             let page = pages
                 .get_page(&current)
                 .ok_or(Error::PageOutOfBounds(current))?;
@@ -257,6 +302,9 @@ impl Cursor {
 
                 let mut current = next_child;
                 loop {
+                    if self.path.iter().any(|&(ancestor, _)| ancestor == current) {
+                        return Err(Error::DatabaseCorrupted);
+                    }
                     let page = pages
                         .get_page(&current)
                         .ok_or(Error::PageOutOfBounds(current))?;
@@ -290,6 +338,9 @@ impl Cursor {
         let mut current = root;
 
         loop {
+            if path.iter().any(|&(ancestor, _)| ancestor == current) {
+                return Err(Error::DatabaseCorrupted);
+            }
             pages.ensure_loaded(current)?;
             let page = pages
                 .get_page(&current)
@@ -377,6 +428,9 @@ impl Cursor {
 
                 let mut current = next_child;
                 loop {
+                    if self.path.iter().any(|&(ancestor, _)| ancestor == current) {
+                        return Err(Error::DatabaseCorrupted);
+                    }
                     pages.ensure_loaded(current)?;
                     let page = pages
                         .get_page(&current)
@@ -416,6 +470,9 @@ impl Cursor {
 
                 let mut current = prev_child;
                 loop {
+                    if self.path.iter().any(|&(ancestor, _)| ancestor == current) {
+                        return Err(Error::DatabaseCorrupted);
+                    }
                     let page = pages
                         .get_page(&current)
                         .ok_or(Error::PageOutOfBounds(current))?;

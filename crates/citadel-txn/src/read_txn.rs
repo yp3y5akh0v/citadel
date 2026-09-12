@@ -11,7 +11,7 @@ use citadel_page::leaf_node::OverflowRef;
 use citadel_page::page::Page;
 use citadel_page::{branch_node, leaf_node};
 
-use citadel_buffer::cursor::{Cursor, PageLoader, PageMap};
+use citadel_buffer::cursor::{Cursor, DescentGuard, PageLoader, PageMap};
 
 use crate::catalog::{ResolvedCatalog, TableDescriptor};
 use crate::manager::TxnManager;
@@ -22,6 +22,7 @@ struct ReadPages<'a> {
     cache: &'a mut FxHashMap<PageId, Arc<Page>>,
     manager: &'a TxnManager,
     high_water_mark: u32,
+    snapshot_txn_id: TxnId,
 }
 
 impl PageMap for ReadPages<'_> {
@@ -33,9 +34,11 @@ impl PageMap for ReadPages<'_> {
 impl PageLoader for ReadPages<'_> {
     fn ensure_loaded(&mut self, id: PageId) -> Result<()> {
         if !self.cache.contains_key(&id) {
-            let arc = self
-                .manager
-                .fetch_reachable_page(id, self.high_water_mark)?;
+            let arc = self.manager.fetch_reachable_page(
+                id,
+                self.high_water_mark,
+                self.snapshot_txn_id,
+            )?;
             self.cache.insert(id, arc);
         }
         Ok(())
@@ -48,6 +51,7 @@ struct StreamingReadPages<'a> {
     cache: &'a FxHashMap<PageId, Arc<Page>>,
     manager: &'a TxnManager,
     high_water_mark: u32,
+    snapshot_txn_id: TxnId,
     current: Option<Arc<Page>>,
     cached_leaves: Vec<(PageId, Arc<Page>)>,
 }
@@ -56,7 +60,10 @@ impl StreamingReadPages<'_> {
     fn load(&self, id: PageId) -> Result<Arc<Page>> {
         match self.cache.get(&id) {
             Some(page) => Ok(Arc::clone(page)),
-            None => self.manager.fetch_reachable_page(id, self.high_water_mark),
+            None => {
+                self.manager
+                    .fetch_reachable_page(id, self.high_water_mark, self.snapshot_txn_id)
+            }
         }
     }
 
@@ -75,13 +82,18 @@ impl StreamingReadPages<'_> {
             return Ok(Arc::clone(page));
         }
         if let Some(page) = cached {
-            if page.page_id() != id {
+            if page.page_id() != id || page.txn_id() > self.snapshot_txn_id {
                 return Err(Error::DatabaseCorrupted);
             }
             return Ok(page);
         }
-        self.manager
-            .fetch_scan_page(id, self.high_water_mark, pending, &mut self.cached_leaves)
+        self.manager.fetch_scan_page(
+            id,
+            self.high_water_mark,
+            self.snapshot_txn_id,
+            pending,
+            &mut self.cached_leaves,
+        )
     }
 }
 
@@ -154,11 +166,12 @@ impl LeafTraversal {
             match page.page_type() {
                 Some(PageType::Leaf) => return Ok(Some(page)),
                 Some(PageType::Branch) => {
-                    let cells = branch_node::read_cells_checked(&page)
-                        .map_err(|_| Error::DatabaseCorrupted)?;
                     self.pending.push(page.right_child());
-                    self.pending
-                        .extend(cells.iter().rev().map(|cell| cell.child));
+                    self.pending.extend(
+                        (0..page.num_cells())
+                            .rev()
+                            .map(|index| branch_node::read_cell(&page, index).child),
+                    );
                 }
                 _ => return Err(Error::InvalidPageType(page.page_type_raw(), id)),
             }
@@ -277,6 +290,7 @@ pub struct LeafShardScanner<'t> {
     cache: FxHashMap<PageId, Arc<Page>>,
     measurements: Vec<Arc<AtomicU64>>,
     high_water_mark: u32,
+    snapshot_txn_id: TxnId,
     /// Inherited from the producing txn so a cancel reaches every shard; a
     /// per-shard flag would let the rest run on after one stopped.
     cancel: Option<CancelToken>,
@@ -295,6 +309,7 @@ impl LeafShardScanner<'_> {
             cache,
             measurements,
             high_water_mark,
+            snapshot_txn_id,
             cancel,
             budget,
         } = self;
@@ -306,6 +321,7 @@ impl LeafShardScanner<'_> {
             cache,
             manager,
             high_water_mark: *high_water_mark,
+            snapshot_txn_id: *snapshot_txn_id,
         };
         scan_leaf_cells(
             &mut view,
@@ -524,9 +540,8 @@ impl<'db> ReadTxn<'db> {
             let page = self.read_reachable_page(page_id)?;
             match page.page_type() {
                 Some(PageType::Leaf) => {
-                    let cells = leaf_node::read_cells_checked(&page)
-                        .map_err(|_| Error::DatabaseCorrupted)?;
-                    for cell in cells {
+                    for index in 0..page.num_cells() {
+                        let cell = leaf_node::read_cell(&page, index);
                         if cell.val_type == ValueType::Tombstone {
                             continue;
                         }
@@ -560,10 +575,8 @@ impl<'db> ReadTxn<'db> {
                     }
                 }
                 Some(PageType::Branch) => {
-                    let cells = branch_node::read_cells_checked(&page)
-                        .map_err(|_| Error::DatabaseCorrupted)?;
-                    for cell in cells {
-                        stack.push(cell.child);
+                    for index in 0..page.num_cells() {
+                        stack.push(branch_node::read_cell(&page, index).child);
                     }
                     stack.push(page.right_child());
                 }
@@ -585,6 +598,10 @@ impl<'db> ReadTxn<'db> {
         let page = self
             .manager
             .read_reachable_page(page_id, self.snapshot.high_water_mark)?;
+        if page.txn_id() > self.snapshot.txn_id {
+            return Err(Error::DatabaseCorrupted);
+        }
+        page.validate_for_read(page_id)?;
         self.check_cancel()?;
         Ok(page)
     }
@@ -595,6 +612,7 @@ impl<'db> ReadTxn<'db> {
         self.manager.read_overflow_value(
             reference,
             self.snapshot.high_water_mark,
+            self.snapshot.txn_id,
             self.snapshot.merkle_scheme,
             self.cancel.as_ref(),
             self.read_budget.as_ref(),
@@ -746,6 +764,7 @@ impl<'db> ReadTxn<'db> {
             cache: &mut self.page_cache,
             manager: self.manager,
             high_water_mark: self.snapshot.high_water_mark,
+            snapshot_txn_id: self.snapshot.txn_id,
         };
         let mut cursor = Cursor::seek_lazy(&mut view, root, start_key)?;
         while let Some(c) = cursor.current_ref_lazy(&mut view) {
@@ -809,6 +828,7 @@ impl<'db> ReadTxn<'db> {
             cache: &mut self.page_cache,
             manager: self.manager,
             high_water_mark: self.snapshot.high_water_mark,
+            snapshot_txn_id: self.snapshot.txn_id,
         };
         let mut cursor = Cursor::seek_lazy(&mut view, root, start_key)?;
         if !cursor.is_valid() {
@@ -876,6 +896,7 @@ impl<'db> ReadTxn<'db> {
                 cache: &mut self.page_cache,
                 manager: self.manager,
                 high_water_mark: self.snapshot.high_water_mark,
+                snapshot_txn_id: self.snapshot.txn_id,
             };
             Cursor::seek_lazy(&mut view, root, start_key)?
         };
@@ -901,6 +922,7 @@ impl<'db> ReadTxn<'db> {
                 cache: &mut self.page_cache,
                 manager: self.manager,
                 high_water_mark: self.snapshot.high_water_mark,
+                snapshot_txn_id: self.snapshot.txn_id,
             };
             Cursor::seek_lazy(&mut view, root, start_key)?
         };
@@ -921,11 +943,12 @@ impl<'db> ReadTxn<'db> {
         let cache = &mut self.page_cache;
         let manager = self.manager;
         let high_water_mark = self.snapshot.high_water_mark;
+        let snapshot_txn_id = self.snapshot.txn_id;
         while let Some(page) = traversal.next_leaf(self.cancel.as_ref(), |id, _| {
             if let Some(page) = cache.get(&id) {
                 return Ok(Arc::clone(page));
             }
-            let page = manager.fetch_reachable_page(id, high_water_mark)?;
+            let page = manager.fetch_reachable_page(id, high_water_mark, snapshot_txn_id)?;
             cache.insert(id, Arc::clone(&page));
             Ok(page)
         })? {
@@ -948,6 +971,7 @@ impl<'db> ReadTxn<'db> {
             cache: &mut self.page_cache,
             manager: self.manager,
             high_water_mark: self.snapshot.high_water_mark,
+            snapshot_txn_id: self.snapshot.txn_id,
         };
         scan_leaf_cells(
             &mut view,
@@ -971,6 +995,7 @@ impl<'db> ReadTxn<'db> {
             cache: FxHashMap::default(),
             measurements,
             high_water_mark: self.snapshot.high_water_mark,
+            snapshot_txn_id: self.snapshot.txn_id,
             cancel: self.cancel.clone(),
             budget: self.read_budget.clone(),
         }
@@ -991,6 +1016,7 @@ impl<'db> ReadTxn<'db> {
             cache: &self.page_cache,
             manager: self.manager,
             high_water_mark: self.snapshot.high_water_mark,
+            snapshot_txn_id: self.snapshot.txn_id,
             current: None,
             cached_leaves: Vec::with_capacity(crate::manager::SCAN_CACHE_BATCH_SIZE - 1),
         };
@@ -1055,23 +1081,20 @@ impl<'db> ReadTxn<'db> {
         }
 
         let mut current = catalog_root;
-        let mut visited = FxHashSet::default();
+        let mut descent = DescentGuard::new(catalog_root);
         let descriptor = loop {
             self.check_cancel()?;
-            if !visited.insert(current) {
-                return Err(Error::DatabaseCorrupted);
-            }
-            let page = self
-                .manager
-                .fetch_reachable_page(current, self.snapshot.high_water_mark)?;
+            let page = self.manager.fetch_reachable_page(
+                current,
+                self.snapshot.high_water_mark,
+                self.snapshot.txn_id,
+            )?;
             self.check_cancel()?;
             match page.page_type() {
                 Some(PageType::Leaf) => {
-                    let cells = leaf_node::read_cells_checked(&page)
-                        .map_err(|_| Error::DatabaseCorrupted)?;
-                    break match cells.binary_search_by(|cell| cell.key.cmp(name)) {
+                    break match leaf_node::search(&page, name) {
                         Ok(idx) => {
-                            let cell = cells[idx];
+                            let cell = leaf_node::read_cell(&page, idx);
                             if cell.val_type == ValueType::Tombstone {
                                 Err(Error::TableNotFound(
                                     String::from_utf8_lossy(name).into_owned(),
@@ -1089,24 +1112,10 @@ impl<'db> ReadTxn<'db> {
                     };
                 }
                 Some(PageType::Branch) => {
-                    let cells = branch_node::read_cells_checked(&page)
-                        .map_err(|_| Error::DatabaseCorrupted)?;
-                    // Find the first separator strictly greater than the name.
-                    let mut lo = 0usize;
-                    let mut hi = cells.len();
-                    while lo < hi {
-                        let mid = lo + (hi - lo) / 2;
-                        if name < cells[mid].key {
-                            hi = mid;
-                        } else {
-                            lo = mid + 1;
-                        }
-                    }
-                    current = if lo < cells.len() {
-                        cells[lo].child
-                    } else {
-                        page.right_child()
-                    };
+                    let index = branch_node::search_child_index(&page, name);
+                    let next = branch_node::get_child(&page, index);
+                    descent.follow(next)?;
+                    current = next;
                 }
                 _ => {
                     return Err(Error::InvalidPageType(page.page_type_raw(), current));
@@ -1122,6 +1131,7 @@ impl<'db> ReadTxn<'db> {
     fn search_tree(&mut self, root: PageId, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let budget = self.read_budget.clone();
         let mut current = root;
+        let mut descent = DescentGuard::new(root);
         let snapshot: Option<(ValueType, Vec<u8>)> = loop {
             let page = self.load_page(current)?;
             match page.page_type() {
@@ -1145,7 +1155,9 @@ impl<'db> ReadTxn<'db> {
                 }
                 Some(PageType::Branch) => {
                     let idx = branch_node::search_child_index(page, key);
-                    current = branch_node::get_child(page, idx);
+                    let next = branch_node::get_child(page, idx);
+                    descent.follow(next)?;
+                    current = next;
                 }
                 _ => {
                     return Err(Error::InvalidPageType(page.page_type_raw(), current));
@@ -1164,9 +1176,11 @@ impl<'db> ReadTxn<'db> {
 
     fn load_page(&mut self, page_id: PageId) -> Result<&Page> {
         if !self.page_cache.contains_key(&page_id) {
-            let arc = self
-                .manager
-                .fetch_reachable_page(page_id, self.snapshot.high_water_mark)?;
+            let arc = self.manager.fetch_reachable_page(
+                page_id,
+                self.snapshot.high_water_mark,
+                self.snapshot.txn_id,
+            )?;
             self.page_cache.insert(page_id, arc);
         }
         Ok(self.page_cache.get(&page_id).unwrap())
@@ -1174,16 +1188,22 @@ impl<'db> ReadTxn<'db> {
 
     fn preload_all_pages(&mut self, root: PageId) -> Result<()> {
         let mut stack = vec![root];
+        let mut visited = FxHashSet::default();
         while let Some(current) = stack.pop() {
+            if !visited.insert(current) {
+                return Err(Error::DatabaseCorrupted);
+            }
             // Runs to completion before `for_each` yields anything, so without
             // its own check a cancel waits out the whole tree walk.
             if let Some(t) = self.cancel.as_ref() {
                 t.check()?;
             }
             if !self.page_cache.contains_key(&current) {
-                let arc = self
-                    .manager
-                    .fetch_reachable_page(current, self.snapshot.high_water_mark)?;
+                let arc = self.manager.fetch_reachable_page(
+                    current,
+                    self.snapshot.high_water_mark,
+                    self.snapshot.txn_id,
+                )?;
                 self.page_cache.insert(current, arc);
             }
             let page: &Page = self.page_cache.get(&current).unwrap();
@@ -1225,6 +1245,7 @@ impl<'a, 'db: 'a> crate::scan_iter::TxnScanAdapter for ReadTxnScanAdapter<'a, 'd
             cache: &mut self.txn.page_cache,
             manager: self.txn.manager,
             high_water_mark: self.txn.snapshot.high_water_mark,
+            snapshot_txn_id: self.txn.snapshot.txn_id,
         };
         f(&mut view)
     }
@@ -1256,6 +1277,7 @@ impl<'db> crate::scan_iter::TxnScanAdapter for OwnedReadTxnAdapter<'db> {
             cache: &mut self.txn.page_cache,
             manager: self.txn.manager,
             high_water_mark: self.txn.snapshot.high_water_mark,
+            snapshot_txn_id: self.txn.snapshot.txn_id,
         };
         f(&mut view)
     }

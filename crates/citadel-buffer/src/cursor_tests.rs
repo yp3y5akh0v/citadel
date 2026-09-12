@@ -187,3 +187,44 @@ fn cursor_large_tree_forward() {
     }
     assert_eq!(count, 2000);
 }
+
+#[test]
+fn descent_guard_accepts_finite_unique_chains() {
+    let mut guard = DescentGuard::new(PageId(4096));
+    for id in (0..4096).rev() {
+        guard.follow(PageId(id)).unwrap();
+    }
+}
+
+#[test]
+fn descent_guard_rejects_a_self_loop() {
+    let mut guard = DescentGuard::new(PageId(0));
+    assert!(matches!(
+        guard.follow(PageId(0)),
+        Err(Error::DatabaseCorrupted)
+    ));
+}
+
+#[test]
+fn descent_guard_rejects_cycles_after_finite_tails() {
+    for tail in 0..9 {
+        for cycle in 1..10 {
+            let mut guard = DescentGuard::new(PageId(0));
+            let mut current = 0;
+            let mut detected = false;
+            for _ in 0..4 * (tail + cycle + 1) {
+                current = if current + 1 < tail + cycle {
+                    current + 1
+                } else {
+                    tail
+                };
+                if let Err(error) = guard.follow(PageId(current)) {
+                    assert!(matches!(error, Error::DatabaseCorrupted));
+                    detected = true;
+                    break;
+                }
+            }
+            assert!(detected, "tail {tail}, cycle {cycle}");
+        }
+    }
+}

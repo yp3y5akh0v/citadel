@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use citadel_buffer::allocator::{AllocCheckpoint, PageAllocator};
 use citadel_buffer::btree::{self, BTree, UpsertAction, UpsertOutcome};
-use citadel_buffer::cursor::{Cursor, PageLoader, PageMap};
+use citadel_buffer::cursor::{Cursor, DescentGuard, PageLoader, PageMap};
 
 use crate::catalog::TableDescriptor;
 use crate::manager::TxnManager;
@@ -1994,6 +1994,7 @@ impl<'db> WriteTxn<'db> {
         let root = self.old_slot.catalog_root;
         let mut depth: u16 = 1;
         let mut current = root;
+        let mut descent = DescentGuard::new(root);
         loop {
             self.check_cancel()?;
             if !self.pages.contains_key(&current) {
@@ -2004,8 +2005,10 @@ impl<'db> WriteTxn<'db> {
             match page.page_type() {
                 Some(PageType::Leaf) => break,
                 Some(PageType::Branch) => {
-                    depth += 1;
-                    current = branch_node::get_child(page, 0);
+                    depth = depth.checked_add(1).ok_or(Error::DatabaseCorrupted)?;
+                    let next = branch_node::get_child(page, 0);
+                    descent.follow(next)?;
+                    current = next;
                 }
                 _ => return Err(Error::InvalidPageType(page.page_type_raw(), current)),
             }
@@ -2276,7 +2279,11 @@ impl<'db> WriteTxn<'db> {
     fn count_leaf_entries(&mut self, root: PageId) -> Result<u64> {
         let mut count: u64 = 0;
         let mut stack = vec![root];
+        let mut visited = FxHashSet::default();
         while let Some(current) = stack.pop() {
+            if !visited.insert(current) {
+                return Err(Error::DatabaseCorrupted);
+            }
             self.check_cancel()?;
             if !self.pages.contains_key(&current) {
                 let page = self.manager.fetch_page_owned(current)?;
@@ -2296,7 +2303,7 @@ impl<'db> WriteTxn<'db> {
                 Some(PageType::Leaf) => {
                     count += page.num_cells() as u64;
                 }
-                _ => {}
+                _ => return Err(Error::InvalidPageType(page.page_type_raw(), current)),
             }
         }
         self.check_cancel()?;
@@ -2314,6 +2321,7 @@ impl<'db> WriteTxn<'db> {
         key: &[u8],
     ) -> Result<PageId> {
         let mut current = root;
+        let mut descent = DescentGuard::new(root);
         loop {
             let page = match pages.entry(current) {
                 std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
@@ -2326,7 +2334,9 @@ impl<'db> WriteTxn<'db> {
                 Some(PageType::Leaf) => return Ok(current),
                 Some(PageType::Branch) => {
                     let idx = branch_node::search_child_index(page, key);
-                    current = branch_node::get_child(page, idx);
+                    let next = branch_node::get_child(page, idx);
+                    descent.follow(next)?;
+                    current = next;
                 }
                 _ => return Err(Error::InvalidPageType(page.page_type_raw(), current)),
             }
@@ -2354,6 +2364,9 @@ impl<'db> WriteTxn<'db> {
         path.clear();
         let mut current = root;
         loop {
+            if path.iter().any(|&(ancestor, _)| ancestor == current) {
+                return Err(Error::DatabaseCorrupted);
+            }
             let page = match pages.entry(current) {
                 std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
                 std::collections::hash_map::Entry::Vacant(e) => {
@@ -2376,7 +2389,11 @@ impl<'db> WriteTxn<'db> {
 
     fn preload_all_pages(&mut self, root: PageId) -> Result<()> {
         let mut stack = vec![root];
+        let mut visited = FxHashSet::default();
         while let Some(current) = stack.pop() {
+            if !visited.insert(current) {
+                return Err(Error::DatabaseCorrupted);
+            }
             // Completes before `for_each` yields anything; see the read side.
             if let Some(t) = self.cancel.as_ref() {
                 t.check()?;
