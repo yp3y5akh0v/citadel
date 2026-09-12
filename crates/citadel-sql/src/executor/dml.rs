@@ -3201,7 +3201,7 @@ pub(super) fn apply_insert_with_conflict(
 fn apply_fast_path_patch(
     schema: &TableSchema,
     key: &[u8],
-    old_bytes: &[u8],
+    old_bytes: Vec<u8>,
     fast_paths: &[DoUpdateFastPath],
     cancel: Option<&citadel::CancelToken>,
     captured: Option<&RefCell<Option<UpsertRows>>>,
@@ -3213,19 +3213,19 @@ fn apply_fast_path_patch(
     let normalized = UPSERT_SCRATCH.with(|slot| {
         slot.borrow_mut()
             .materializer
-            .expand(schema, key, old_bytes, cancel)
+            .expand(schema, key, &old_bytes, cancel)
     })?;
     let old_row = captured
         .map(|_| {
             decode_full_row_with_cancel(
                 schema,
                 key,
-                normalized.as_deref().unwrap_or(old_bytes),
+                normalized.as_deref().unwrap_or(&old_bytes),
                 cancel,
             )
         })
         .transpose()?;
-    let mut bytes = normalized.unwrap_or_else(|| old_bytes.to_vec());
+    let mut bytes = normalized.unwrap_or(old_bytes);
     let mut scratch = Vec::new();
     let mut null_violation = None;
     for fp in fast_paths {
@@ -3317,7 +3317,7 @@ fn apply_do_update_fused(
     let captured = RefCell::new(None);
 
     let outcome =
-        wtx.table_upsert_with::<_, SqlError>(table_bytes, key_buf, value_buf, |old_bytes| {
+        wtx.table_upsert_with_owned::<_, SqlError>(table_bytes, key_buf, value_buf, |old_bytes| {
             if let Some(fps) = fast_paths {
                 return apply_fast_path_patch(
                     table_schema,
@@ -3343,7 +3343,7 @@ fn apply_do_update_fused(
                 decode_full_row_into_with_cancel(
                     table_schema,
                     key_buf,
-                    old_bytes,
+                    &old_bytes,
                     old_row,
                     cancel,
                 )?;
@@ -3928,7 +3928,7 @@ fn exec_insert_trivial_fast(
 
     if let DupPolicy::Patch(fps) = &prog.on_dup {
         let cancel = wtx.cancel_token().cloned();
-        let outcome = wtx.table_upsert_with::<_, SqlError>(
+        let outcome = wtx.table_upsert_with_owned::<_, SqlError>(
             table_lower.as_bytes(),
             &bufs.key_buf,
             &bufs.value_buf,

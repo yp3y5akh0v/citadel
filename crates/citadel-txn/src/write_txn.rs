@@ -1162,6 +1162,25 @@ impl<'db> WriteTxn<'db> {
         F: FnMut(&[u8]) -> std::result::Result<UpsertAction, E>,
         E: From<Error>,
     {
+        self.table_upsert_with_owned(table, key, default_value, |old| f(&old))
+    }
+
+    /// Upsert while allowing the callback to reuse the materialized value's
+    /// allocation. The callback runs only for an existing, non-tombstoned key.
+    /// Its owned bytes are detached from stored pages: an error, panic or Skip
+    /// leaves the stored value unchanged. Replacement and default values are
+    /// validated and staged using the same rules as [`Self::table_upsert_with`].
+    pub fn table_upsert_with_owned<F, E>(
+        &mut self,
+        table: &[u8],
+        key: &[u8],
+        default_value: &[u8],
+        f: F,
+    ) -> std::result::Result<UpsertOutcome, E>
+    where
+        F: FnOnce(Vec<u8>) -> std::result::Result<UpsertAction, E>,
+        E: From<Error>,
+    {
         self.check_cancel()?;
         Self::validate_key_value(key, default_value)?;
         self.invalidate_fk_cache_for(table);
@@ -1181,7 +1200,7 @@ impl<'db> WriteTxn<'db> {
         let existing = self.materialize_value(found)?;
 
         let outcome = match existing {
-            Some(old) => match f(&old)? {
+            Some(old) => match f(old)? {
                 UpsertAction::Skip => Ok(UpsertOutcome::Skipped),
                 UpsertAction::Replace(new_bytes) => {
                     Self::validate_key_value(key, &new_bytes)?;
