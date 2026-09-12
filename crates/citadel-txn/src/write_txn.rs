@@ -84,6 +84,12 @@ pub enum InsertOutcome {
     Existed(Vec<u8>),
 }
 
+/// A path loaded before value staging, valid until this operation mutates the tree.
+struct LoadedLeaf {
+    path: Vec<(PageId, usize)>,
+    id: PageId,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WriteFailure {
     Cancelled,
@@ -509,20 +515,8 @@ impl<'db> WriteTxn<'db> {
         self.check_cancel()?;
         self.preload_path(self.tree.root, key)?;
         let tree = self.tree.clone();
-        let value = match tree.search(&self.pages, key)? {
-            Some((ValueType::Tombstone, _)) => Ok(None),
-            Some((ValueType::Overflow, payload)) => {
-                let oref = OverflowRef::from_bytes(&payload);
-                self.materialize_overflow(&oref).map(Some)
-            }
-            Some((_, value)) => {
-                if let Some(budget) = &self.read_budget {
-                    budget.try_charge(value.len())?;
-                }
-                Ok(Some(value))
-            }
-            None => Ok(None),
-        }?;
+        let found = tree.search(&self.pages, key)?;
+        let value = self.materialize_value(found)?;
         self.check_cancel()?;
         Ok(value)
     }
@@ -530,22 +524,17 @@ impl<'db> WriteTxn<'db> {
     pub fn insert(&mut self, key: &[u8], value: &[u8]) -> Result<bool> {
         self.check_cancel()?;
         Self::validate_key_value(key, value)?;
-        let root = self.tree.root;
-        let lil_hit =
-            value.len() <= MAX_INLINE_VALUE_SIZE && self.tree.lil_would_hit(&self.pages, key);
-        if !lil_hit {
-            self.preload_path(root, key)?;
-        }
+        let leaf = Self::load_insert_leaf(&self.tree, &mut self.pages, self.manager, key, value)?;
         let (val_type, val_payload) = self.stage_value(value)?;
         let inserted = Self::insert_into_tree(
             &mut self.tree,
             &mut self.pages,
             &mut self.alloc,
-            self.manager,
             self.txn_id,
             key,
             val_type,
             val_payload.as_ref(),
+            leaf,
         );
         let (inserted, replaced) = match inserted {
             Ok(result) => result,
@@ -562,26 +551,39 @@ impl<'db> WriteTxn<'db> {
         tree: &mut BTree,
         pages: &mut FxHashMap<PageId, Page>,
         alloc: &mut PageAllocator,
-        manager: &TxnManager,
         txn_id: TxnId,
         key: &[u8],
         val_type: ValueType,
         val_bytes: &[u8],
+        leaf: Option<LoadedLeaf>,
     ) -> Result<(bool, Option<PageId>)> {
-        if val_type == ValueType::Inline {
-            if let Some(was_new) =
-                tree.try_lil_insert(pages, alloc, txn_id, key, val_type, val_bytes)?
-            {
-                return Ok((was_new, None));
+        match leaf {
+            Some(LoadedLeaf { path, id }) => {
+                tree.insert_at_leaf(pages, alloc, txn_id, key, val_type, val_bytes, path, id)
+            }
+            None => {
+                let inserted = tree
+                    .try_lil_insert(pages, alloc, txn_id, key, val_type, val_bytes)?
+                    .expect("staging an inline value preserves the loaded append path");
+                Ok((inserted, None))
             }
         }
+    }
 
-        let root = tree.root;
-        let (path, leaf_id) = Self::walk_loading(pages, manager, root, key)?;
-        let (was_new, replaced) = tree.insert_at_leaf(
-            pages, alloc, txn_id, key, val_type, val_bytes, path, leaf_id,
-        )?;
-        Ok((was_new, replaced))
+    /// Resolve all fallible reads before staging overflow pages. A missing leaf
+    /// denotes a proven inline append through the tree's existing rightmost path.
+    fn load_insert_leaf(
+        tree: &BTree,
+        pages: &mut FxHashMap<PageId, Page>,
+        manager: &TxnManager,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<Option<LoadedLeaf>> {
+        if value.len() <= MAX_INLINE_VALUE_SIZE && tree.lil_would_hit(pages, key) {
+            return Ok(None);
+        }
+        let (path, id) = Self::walk_loading(pages, manager, tree.root, key)?;
+        Ok(Some(LoadedLeaf { path, id }))
     }
 
     pub fn delete(&mut self, key: &[u8]) -> Result<bool> {
@@ -646,6 +648,26 @@ impl<'db> WriteTxn<'db> {
             cursor.next(&self.pages)?;
         }
         Ok(())
+    }
+
+    /// Turn an owned leaf value into the caller-visible value, admitting the
+    /// complete payload against the read budget before exposing it.
+    fn materialize_value(
+        &mut self,
+        found: Option<(ValueType, Vec<u8>)>,
+    ) -> Result<Option<Vec<u8>>> {
+        match found {
+            None | Some((ValueType::Tombstone, _)) => Ok(None),
+            Some((ValueType::Overflow, payload)) => self
+                .materialize_overflow(&OverflowRef::from_bytes(&payload))
+                .map(Some),
+            Some((_, value)) => {
+                if let Some(budget) = &self.read_budget {
+                    budget.try_charge(value.len())?;
+                }
+                Ok(Some(value))
+            }
+        }
     }
 
     fn materialize_overflow(&mut self, oref: &OverflowRef) -> Result<Vec<u8>> {
@@ -989,23 +1011,34 @@ impl<'db> WriteTxn<'db> {
     /// Stage `value` and insert through the split-safe tree path, freeing any
     /// replaced overflow chain. Table must already be ensured.
     fn stage_and_insert(&mut self, table: &[u8], key: &[u8], value: &[u8]) -> Result<bool> {
-        let root = self.named_trees[table].root;
-        let lil_hit = value.len() <= MAX_INLINE_VALUE_SIZE
-            && self.named_trees[table].lil_would_hit(&self.pages, key);
-        if !lil_hit {
-            self.preload_path(root, key)?;
-        }
+        let leaf = Self::load_insert_leaf(
+            &self.named_trees[table],
+            &mut self.pages,
+            self.manager,
+            key,
+            value,
+        )?;
+        self.stage_and_insert_at_leaf(table, key, value, leaf)
+    }
+
+    fn stage_and_insert_at_leaf(
+        &mut self,
+        table: &[u8],
+        key: &[u8],
+        value: &[u8],
+        leaf: Option<LoadedLeaf>,
+    ) -> Result<bool> {
         let (val_type, val_payload) = self.stage_value(value)?;
         let tree = self.named_trees.get_mut(table).unwrap();
         let inserted = Self::insert_into_tree(
             tree,
             &mut self.pages,
             &mut self.alloc,
-            self.manager,
             self.txn_id,
             key,
             val_type,
             val_payload.as_ref(),
+            leaf,
         );
         let (inserted, replaced) = match inserted {
             Ok(result) => result,
@@ -1031,15 +1064,38 @@ impl<'db> WriteTxn<'db> {
         // can fail or be cancelled; staging first would leave allocated
         // overflow pages in an otherwise committable transaction.
         self.ensure_table(table)?;
-        let root = self.named_trees[table].root;
-        let lil_hit = value.len() <= MAX_INLINE_VALUE_SIZE
-            && self.named_trees[table].lil_would_hit(&self.pages, key);
-        if !lil_hit {
-            self.preload_path(root, key)?;
-        }
+        let leaf = Self::load_insert_leaf(
+            &self.named_trees[table],
+            &mut self.pages,
+            self.manager,
+            key,
+            value,
+        )?;
         let (val_type, val_payload) = self.stage_value(value)?;
         let val_bytes = val_payload.as_ref();
-        let inserted = self.insert_if_absent_staged(table, key, val_type, val_bytes);
+        let tree = self.named_trees.get_mut(table).unwrap();
+        let inserted = match leaf {
+            Some(LoadedLeaf { path, id }) => tree.insert_if_absent_at_leaf(
+                &mut self.pages,
+                &mut self.alloc,
+                self.txn_id,
+                key,
+                val_type,
+                val_bytes,
+                path,
+                id,
+            ),
+            None => tree
+                .try_lil_insert(
+                    &mut self.pages,
+                    &mut self.alloc,
+                    self.txn_id,
+                    key,
+                    val_type,
+                    val_bytes,
+                )
+                .map(|inserted| inserted.expect("staging preserves the loaded append path")),
+        };
         let inserted = match inserted {
             Ok(inserted) => inserted,
             Err(err) => return self.fail(err),
@@ -1051,36 +1107,48 @@ impl<'db> WriteTxn<'db> {
         self.finish_mutation(inserted, inserted)
     }
 
-    fn insert_if_absent_staged(
+    /// Update an existing value through one loaded tree path. The callback
+    /// receives an owned, fully materialized value and may resize it; overflow
+    /// staging and replacement are handled after the callback succeeds.
+    ///
+    /// Missing and tombstoned keys return `None` without calling `f`. A callback
+    /// error or panic leaves the stored value unchanged. Errors after staging
+    /// starts use the same transaction poisoning rules as [`Self::table_insert`].
+    pub fn table_update_with<F, R, E>(
         &mut self,
         table: &[u8],
         key: &[u8],
-        val_type: ValueType,
-        val_bytes: &[u8],
-    ) -> Result<bool> {
-        if !self.named_trees.contains_key(table) {
-            self.ensure_table(table)?;
-        }
-        let Self {
-            named_trees,
-            pages,
-            alloc,
-            manager,
-            txn_id,
-            ..
-        } = self;
-        let tree = named_trees.get_mut(table).unwrap();
-        let root = tree.root;
-        let manager = *manager;
-        let txn_id = *txn_id;
-
-        if val_type == ValueType::Inline && tree.lil_would_hit(pages, key) {
-            return tree.insert_if_absent(pages, alloc, txn_id, key, val_type, val_bytes);
-        }
-        let (path, leaf_id) = Self::walk_loading(pages, manager, root, key)?;
-        tree.insert_if_absent_at_leaf(
-            pages, alloc, txn_id, key, val_type, val_bytes, path, leaf_id,
-        )
+        f: F,
+    ) -> std::result::Result<Option<R>, E>
+    where
+        F: FnOnce(&mut Vec<u8>) -> std::result::Result<R, E>,
+        E: From<Error>,
+    {
+        self.check_cancel()?;
+        Self::validate_key_value(key, &[])?;
+        self.ensure_table(table)?;
+        let leaf = Self::load_insert_leaf(
+            &self.named_trees[table],
+            &mut self.pages,
+            self.manager,
+            key,
+            &[],
+        )?;
+        let found = match &leaf {
+            Some(leaf) => BTree::search_at_leaf(&self.pages, leaf.id, key)?,
+            None => None,
+        };
+        let value = self.materialize_value(found)?;
+        self.check_cancel()?;
+        let Some(mut value) = value else {
+            return Ok(None);
+        };
+        let result = f(&mut value)?;
+        Self::validate_key_value(key, &value)?;
+        self.check_cancel()?;
+        self.invalidate_fk_cache_for(table);
+        self.stage_and_insert_at_leaf(table, key, &value, leaf)?;
+        self.finish_mutation(Some(result), true).map_err(E::from)
     }
 
     /// Upsert via callback. The existing value handed to `f` is fully
@@ -1102,34 +1170,30 @@ impl<'db> WriteTxn<'db> {
         self.invalidate_fk_cache_for(table);
         self.ensure_table(table)?;
 
-        let root = self.named_trees[table].root;
-        let leaf_id = Self::descend_to_leaf(&mut self.pages, self.manager, root, key)?;
-        let existing = match BTree::search_at_leaf(&self.pages, leaf_id, key)? {
-            Some((ValueType::Tombstone, _)) => None,
-            Some((ValueType::Overflow, payload)) => {
-                let oref = OverflowRef::from_bytes(&payload);
-                Some(self.materialize_overflow(&oref)?)
-            }
-            Some((_, value)) => {
-                if let Some(budget) = &self.read_budget {
-                    budget.try_charge(value.len())?;
-                }
-                Some(value)
-            }
+        let leaf = Self::load_insert_leaf(
+            &self.named_trees[table],
+            &mut self.pages,
+            self.manager,
+            key,
+            default_value,
+        )?;
+        let found = match &leaf {
+            Some(leaf) => BTree::search_at_leaf(&self.pages, leaf.id, key)?,
             None => None,
         };
+        let existing = self.materialize_value(found)?;
 
         let outcome = match existing {
             Some(old) => match f(&old)? {
                 UpsertAction::Skip => Ok(UpsertOutcome::Skipped),
                 UpsertAction::Replace(new_bytes) => {
                     Self::validate_key_value(key, &new_bytes)?;
-                    self.stage_and_insert(table, key, &new_bytes)?;
+                    self.stage_and_insert_at_leaf(table, key, &new_bytes, leaf)?;
                     Ok(UpsertOutcome::Updated)
                 }
             },
             None => {
-                self.stage_and_insert(table, key, default_value)?;
+                self.stage_and_insert_at_leaf(table, key, default_value, leaf)?;
                 Ok(UpsertOutcome::Inserted)
             }
         }?;
@@ -1151,12 +1215,13 @@ impl<'db> WriteTxn<'db> {
         }
         // Load every fallible tree path before staging an overflow chain. A
         // failed cold-page walk must not leave allocated pages behind.
-        let root = self.named_trees[table].root;
-        let lil_hit = value.len() <= MAX_INLINE_VALUE_SIZE
-            && self.named_trees[table].lil_would_hit(&self.pages, key);
-        if !lil_hit {
-            self.preload_path(root, key)?;
-        }
+        let leaf = Self::load_insert_leaf(
+            &self.named_trees[table],
+            &mut self.pages,
+            self.manager,
+            key,
+            value,
+        )?;
         let (val_type, val_payload) = self.stage_value(value)?;
         let val_bytes = val_payload.as_ref();
 
@@ -1176,7 +1241,16 @@ impl<'db> WriteTxn<'db> {
         let manager = *manager;
         let txn_id = *txn_id;
 
-        let outcome = tree.insert_or_fetch(pages, alloc, txn_id, key, val_type, val_bytes);
+        let outcome = match leaf {
+            Some(LoadedLeaf { path, id }) => tree
+                .insert_or_fetch_at_leaf(pages, alloc, txn_id, key, val_type, val_bytes, path, id),
+            None => tree
+                .try_lil_insert(pages, alloc, txn_id, key, val_type, val_bytes)
+                .map(|inserted| {
+                    inserted.expect("staging preserves the loaded append path");
+                    None
+                }),
+        };
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(err) => return Self::fail_with(failure, err),
@@ -1206,12 +1280,10 @@ impl<'db> WriteTxn<'db> {
                 )
                 .map(InsertOutcome::Existed)
             }
-            Some((_, value)) => {
-                if let Some(budget) = read_budget {
-                    budget.try_charge(value.len())?;
-                }
-                Ok(InsertOutcome::Existed(value))
-            }
+            Some((_, value)) => read_budget
+                .as_ref()
+                .map_or(Ok(()), |budget| budget.try_charge(value.len()))
+                .map(|()| InsertOutcome::Existed(value)),
         };
         match result {
             Ok(result) => {
@@ -1675,20 +1747,8 @@ impl<'db> WriteTxn<'db> {
         self.ensure_table(table)?;
         let root = self.named_trees[table].root;
         let leaf_id = Self::descend_to_leaf(&mut self.pages, self.manager, root, key)?;
-        let value = match BTree::search_at_leaf(&self.pages, leaf_id, key)? {
-            Some((ValueType::Tombstone, _)) => Ok(None),
-            Some((ValueType::Overflow, payload)) => {
-                let oref = OverflowRef::from_bytes(&payload);
-                self.materialize_overflow(&oref).map(Some)
-            }
-            Some((_, value)) => {
-                if let Some(budget) = &self.read_budget {
-                    budget.try_charge(value.len())?;
-                }
-                Ok(Some(value))
-            }
-            None => Ok(None),
-        }?;
+        let found = BTree::search_at_leaf(&self.pages, leaf_id, key)?;
+        let value = self.materialize_value(found)?;
         self.check_cancel()?;
         Ok(value)
     }
