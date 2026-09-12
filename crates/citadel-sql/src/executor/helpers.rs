@@ -2832,12 +2832,12 @@ pub(super) fn index_columns_changed(
 ) -> bool {
     idx.keys.iter().any(|key| match key {
         crate::types::IndexKey::Column { idx: col_idx, .. } => {
-            old_row[*col_idx as usize] != new_row[*col_idx as usize]
+            !old_row[*col_idx as usize].bit_eq(&new_row[*col_idx as usize])
         }
         crate::types::IndexKey::Expr { expr, .. } => {
             crate::eval::referenced_columns(expr, &schema.columns)
                 .into_iter()
-                .any(|col_idx| old_row[col_idx] != new_row[col_idx])
+                .any(|col_idx| !old_row[col_idx].bit_eq(&new_row[col_idx]))
         }
     })
 }

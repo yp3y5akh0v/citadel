@@ -3555,7 +3555,7 @@ fn apply_do_update_with_old_row(
 
     let pk_indices = table_schema.pk_indices();
     let assigned_pk = assignments.iter().any(|(ci, _)| pk_indices.contains(ci));
-    let pk_changed = assigned_pk && pk_indices.iter().any(|&i| old_row[i] != new_row[i]);
+    let pk_changed = assigned_pk && pk_indices.iter().any(|&i| !old_row[i].bit_eq(&new_row[i]));
 
     for (assigned_idx, _) in assignments {
         let col = &table_schema.columns[*assigned_idx];
@@ -3589,7 +3589,7 @@ fn apply_do_update_with_old_row(
             || fk
                 .columns
                 .iter()
-                .any(|&ci| old_row[ci as usize] != new_row[ci as usize])
+                .any(|&ci| !old_row[ci as usize].bit_eq(&new_row[ci as usize]))
         {
             super::fk::check_row_reference(wtx, schema, table_schema, fk, &new_row, &mut fk_key)?;
         }
