@@ -1624,6 +1624,102 @@ fn point_operations_leave_no_staged_pages_after_a_cold_path_read_failure() {
 }
 
 #[test]
+fn owned_upsert_callback_edits_are_detached_until_replacement() {
+    for size in [8, MAX_INLINE_VALUE_SIZE * 3 + 11] {
+        let original = vec![0x5a; size];
+        let manager = create_test_manager();
+        let mut seed = manager.begin_write().unwrap();
+        seed.create_table(b"owned").unwrap();
+        seed.table_insert(b"owned", b"key", &original).unwrap();
+        seed.commit().unwrap();
+        let before = manager.current_slot();
+        for outcome in 0..3 {
+            let mut writer = manager.begin_write().unwrap();
+            let marker = writer.mutation_marker();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                writer.table_upsert_with_owned::<_, Error>(
+                    b"owned",
+                    b"key",
+                    b"unused",
+                    |mut old| {
+                        assert_eq!(old, original);
+                        old.clear();
+                        old.extend_from_slice(b"speculative");
+                        match outcome {
+                            0 => Err(Error::Sync(
+                                "callback failed after editing owned bytes".into(),
+                            )),
+                            1 => panic!("callback panicked after editing owned bytes"),
+                            2 => Ok(UpsertAction::Skip),
+                            _ => unreachable!(),
+                        }
+                    },
+                )
+            }));
+            match outcome {
+                0 => assert!(matches!(result, Ok(Err(Error::Sync(_))))),
+                1 => assert!(result.is_err()),
+                2 => assert!(matches!(result, Ok(Ok(UpsertOutcome::Skipped)))),
+                _ => unreachable!(),
+            }
+            assert!(!writer.is_poisoned());
+            assert!(!writer.mutated_since(marker));
+            assert!(writer.alloc.allocated_this_txn().is_empty());
+            assert_eq!(writer.pending_free_count(), 0);
+            assert_eq!(
+                writer.table_get(b"owned", b"key").unwrap(),
+                Some(original.clone())
+            );
+            writer.commit().unwrap();
+            assert_eq!(manager.current_slot(), before);
+        }
+        let mut old_reader = manager.begin_read();
+        let mut writer = manager.begin_write().unwrap();
+        writer.set_read_budget(Some(crate::ReadBudget::new(size - 1, size)));
+        assert!(matches!(
+            writer.table_upsert_with_owned::<_, Error>(b"owned", b"key", b"unused", |_| {
+                panic!("a denied value must not reach the callback")
+            }),
+            Err(Error::ReadBudgetExceeded { .. })
+        ));
+        writer.set_read_budget(Some(crate::ReadBudget::new(size, size)));
+        assert!(matches!(
+            writer
+                .table_upsert_with_owned::<_, Error>(b"owned", b"key", b"unused", |mut old| {
+                    assert_eq!(old, original);
+                    old.clear();
+                    old.extend_from_slice(b"replacement");
+                    Ok(UpsertAction::Replace(old))
+                })
+                .unwrap(),
+            UpsertOutcome::Updated
+        ));
+        writer.set_read_budget(None);
+        assert!(matches!(
+            writer
+                .table_upsert_with_owned::<_, Error>(b"owned", b"new", &original, |_| {
+                    panic!("a missing key must not reach the callback")
+                })
+                .unwrap(),
+            UpsertOutcome::Inserted
+        ));
+        writer.commit().unwrap();
+        assert_eq!(
+            old_reader.table_get(b"owned", b"key").unwrap(),
+            Some(original.clone())
+        );
+        assert_eq!(old_reader.table_get(b"owned", b"new").unwrap(), None);
+        let mut reader = manager.begin_read();
+        assert_eq!(
+            reader.table_get(b"owned", b"key").unwrap(),
+            Some(b"replacement".to_vec())
+        );
+        assert_eq!(reader.table_get(b"owned", b"new").unwrap(), Some(original));
+        assert!(manager.integrity_check().unwrap().is_ok());
+    }
+}
+
+#[test]
 fn update_with_missing_and_tombstoned_keys_never_call_or_insert() {
     use citadel_core::types::ValueType;
 
