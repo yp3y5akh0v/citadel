@@ -92,9 +92,10 @@ fn decrypt_page_using(
     let computed_mac = compute(iv, ciphertext);
 
     if stored_mac.ct_eq(&computed_mac).into() {
-        body.copy_from_slice(ciphertext);
         let mut cipher = Aes256Ctr::new(dek.into(), iv.into());
-        cipher.apply_keystream(body);
+        cipher
+            .apply_keystream_b2b(ciphertext, body)
+            .expect("ciphertext/body size match");
         Ok(())
     } else {
         Err(citadel_core::Error::PageTampered(page_id))
