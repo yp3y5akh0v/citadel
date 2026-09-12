@@ -249,11 +249,11 @@ fn validate_update(
             ));
         }
     }
-    let pk_changed = table.pk_indices().iter().any(|&i| old[i] != new[i]);
+    let pk_changed = table.pk_indices().iter().any(|&i| !old[i].bit_eq(&new[i]));
     let mut key = Vec::new();
     for fk in &table.foreign_keys {
         let assigned_or_changed = fk.columns.iter().any(|&i| {
-            old[i as usize] != new[i as usize]
+            !old[i as usize].bit_eq(&new[i as usize])
                 || changed_columns
                     .iter()
                     .any(|name| table.columns[i as usize].name.eq_ignore_ascii_case(name))
@@ -426,7 +426,7 @@ fn reference_changed(
         if old[i].is_null() {
             return Ok(false);
         }
-        changed |= new.is_some_and(|row| old[i] != row[i]);
+        changed |= new.is_some_and(|row| !old[i].bit_eq(&row[i]));
     }
     Ok(changed)
 }
