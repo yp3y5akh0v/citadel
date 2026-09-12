@@ -1410,7 +1410,7 @@ mod rightmost_append_split {
 
     #[test]
     fn growing_last_key_is_replacement_after_failed_leaf_write() {
-        for sorted_update in [false, true] {
+        for route in 0..3 {
             let (mut pages, mut alloc, mut tree) = new_tree();
             let mut expected = Expected::new();
             for id in 0..7 {
@@ -1433,7 +1433,7 @@ mod rightmost_append_split {
             let original = expected.clone();
             let last_key = key(6);
             let grown = payload(106, citadel_core::MAX_INLINE_VALUE_SIZE);
-            if sorted_update {
+            if route == 1 {
                 let mut replaced = Vec::new();
                 let mut skipped = Vec::new();
                 assert_eq!(
@@ -1450,6 +1450,27 @@ mod rightmost_append_split {
                 );
                 assert!(replaced.is_empty());
                 assert!(skipped.is_empty());
+            } else if route == 2 {
+                let (path, leaf) = tree.walk_to_leaf(&pages, &last_key).unwrap();
+                let hint = BTree::search_at_leaf_ref_with_hint(&pages, leaf, &last_key)
+                    .unwrap()
+                    .unwrap()
+                    .0;
+                assert_eq!(
+                    tree.insert_at_leaf_with_hint(
+                        &mut pages,
+                        &mut alloc,
+                        TxnId(2),
+                        &last_key,
+                        ValueType::Inline,
+                        &grown,
+                        path,
+                        leaf,
+                        hint,
+                    )
+                    .unwrap(),
+                    (false, None),
+                );
             } else {
                 assert!(!tree
                     .insert(
@@ -1877,6 +1898,242 @@ fn indexed_delete_preserves_cow_snapshots_and_sibling_paths() {
         assert_eq!(
             tree.search(&pages, key).unwrap(),
             if removed.contains(key) { None } else { value }
+        );
+    }
+}
+
+mod checked_leaf_hint {
+    use super::*;
+
+    fn hint_for(tree: &BTree, pages: &FxHashMap<PageId, Page>, key: &[u8]) -> LeafEntryHint {
+        let (_, leaf) = tree.walk_to_leaf(pages, key).unwrap();
+        BTree::search_at_leaf_ref_with_hint(pages, leaf, key)
+            .unwrap()
+            .unwrap()
+            .0
+    }
+
+    #[test]
+    fn same_width_matches_preserve_layout_and_lookup_adapters() {
+        let (mut pages, mut alloc, mut tree) = new_tree();
+        for key in 0..32u8 {
+            tree.insert(
+                &mut pages,
+                &mut alloc,
+                TxnId(1),
+                &[key],
+                ValueType::Inline,
+                &[key; 8],
+            )
+            .unwrap();
+        }
+        let root = tree.root;
+        let start = pages[&root].cell_area_start();
+        let free = pages[&root].free_space();
+        let offsets: Vec<_> = (0..32).map(|i| pages[&root].cell_offset(i)).collect();
+        for key in [0u8, 16, 31] {
+            let old = BTree::search_at_leaf(&pages, root, &[key]).unwrap();
+            let (hint, kind, borrowed) = BTree::search_at_leaf_ref_with_hint(&pages, root, &[key])
+                .unwrap()
+                .unwrap();
+            assert_eq!(old, Some((kind, borrowed.to_vec())));
+            assert_eq!(
+                BTree::search_at_leaf_ref(&pages, root, &[key]).unwrap(),
+                Some((kind, borrowed))
+            );
+            assert_eq!(
+                tree.insert_at_leaf_with_hint(
+                    &mut pages,
+                    &mut alloc,
+                    TxnId(1),
+                    &[key],
+                    ValueType::Inline,
+                    &[key + 1; 8],
+                    Vec::new(),
+                    root,
+                    hint,
+                )
+                .unwrap(),
+                (false, None)
+            );
+        }
+        assert_eq!(tree.root, root);
+        assert_eq!(tree.entry_count, 32);
+        assert_eq!(pages[&root].cell_area_start(), start);
+        assert_eq!(pages[&root].free_space(), free);
+        assert_eq!(
+            (0..32)
+                .map(|i| pages[&root].cell_offset(i))
+                .collect::<Vec<_>>(),
+            offsets
+        );
+        for key in 0..32u8 {
+            let expected = if [0, 16, 31].contains(&key) {
+                key + 1
+            } else {
+                key
+            };
+            assert_eq!(
+                tree.search(&pages, &[key]).unwrap(),
+                Some((ValueType::Inline, vec![expected; 8]))
+            );
+        }
+        assert!(BTree::search_at_leaf_ref_with_hint(&pages, root, &[32])
+            .unwrap()
+            .is_none());
+        assert!(matches!(
+            BTree::search_at_leaf_ref_with_hint(&pages, PageId(999), b"x"),
+            Err(Error::PageOutOfBounds(PageId(999)))
+        ));
+    }
+
+    #[test]
+    fn shifted_out_of_range_foreign_and_wrong_key_hints_fall_back() {
+        for case in 0..5 {
+            let (mut pages, mut alloc, mut tree) = new_tree();
+            for key in *b"bdf" {
+                tree.insert(
+                    &mut pages,
+                    &mut alloc,
+                    TxnId(1),
+                    &[key],
+                    ValueType::Inline,
+                    &[key],
+                )
+                .unwrap();
+            }
+            let key = if case == 2 || case == 4 { b'f' } else { b'd' };
+            let hint = match case {
+                2 => hint_for(&tree, &pages, b"f"),
+                3 => {
+                    let mut foreign = BTree::new(&mut pages, &mut alloc, TxnId(1));
+                    foreign
+                        .insert(
+                            &mut pages,
+                            &mut alloc,
+                            TxnId(1),
+                            b"d",
+                            ValueType::Inline,
+                            b"foreign",
+                        )
+                        .unwrap();
+                    let hint = hint_for(&foreign, &pages, b"d");
+                    assert_ne!(foreign.root, tree.root);
+                    hint
+                }
+                _ => hint_for(&tree, &pages, b"d"),
+            };
+            match case {
+                0 => {
+                    assert!(tree
+                        .insert(
+                            &mut pages,
+                            &mut alloc,
+                            TxnId(1),
+                            b"a",
+                            ValueType::Inline,
+                            b"a"
+                        )
+                        .unwrap());
+                }
+                1 => {
+                    assert!(tree.delete(&mut pages, &mut alloc, TxnId(1), b"b").unwrap());
+                }
+                2 => {
+                    assert!(tree.delete(&mut pages, &mut alloc, TxnId(1), b"f").unwrap());
+                }
+                _ => {}
+            }
+            let before = tree.entry_count;
+            let (path, leaf) = tree.walk_to_leaf(&pages, &[key]).unwrap();
+            assert_eq!(
+                tree.insert_at_leaf_with_hint(
+                    &mut pages,
+                    &mut alloc,
+                    TxnId(1),
+                    &[key],
+                    ValueType::Inline,
+                    b"updated",
+                    path,
+                    leaf,
+                    hint,
+                )
+                .unwrap(),
+                (case == 2, None)
+            );
+            assert_eq!(tree.entry_count, before + u64::from(case == 2));
+            for original in *b"abdf" {
+                let expected = if original == key {
+                    Some(b"updated".to_vec())
+                } else if (original == b'a' && case != 0) || (original == b'b' && case == 1) {
+                    None
+                } else {
+                    Some(vec![original])
+                };
+                assert_eq!(
+                    tree.search(&pages, &[original]).unwrap().map(|(_, v)| v),
+                    expected,
+                    "case {case}, key {original}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn accepted_hint_reads_current_overflow_metadata_before_cow() {
+        let (mut pages, mut alloc, mut tree) = new_tree();
+        let reference = |head| {
+            leaf_node::OverflowRef {
+                first_page: PageId(head),
+                total_len: 12_000,
+            }
+            .to_bytes()
+        };
+        tree.insert(
+            &mut pages,
+            &mut alloc,
+            TxnId(1),
+            b"key",
+            ValueType::Overflow,
+            &reference(101),
+        )
+        .unwrap();
+        let hint = hint_for(&tree, &pages, b"key");
+        tree.insert(
+            &mut pages,
+            &mut alloc,
+            TxnId(1),
+            b"key",
+            ValueType::Overflow,
+            &reference(202),
+        )
+        .unwrap();
+        let old_tree = tree.clone();
+        let (path, leaf) = tree.walk_to_leaf(&pages, b"key").unwrap();
+        assert_eq!(
+            tree.insert_at_leaf_with_hint(
+                &mut pages,
+                &mut alloc,
+                TxnId(2),
+                b"key",
+                ValueType::Inline,
+                b"small",
+                path,
+                leaf,
+                hint,
+            )
+            .unwrap(),
+            (false, Some(PageId(202)))
+        );
+        assert_ne!(old_tree.root, tree.root);
+        assert_eq!(tree.entry_count, 1);
+        assert_eq!(
+            tree.search(&pages, b"key").unwrap(),
+            Some((ValueType::Inline, b"small".to_vec()))
+        );
+        assert_eq!(
+            old_tree.search(&pages, b"key").unwrap(),
+            Some((ValueType::Overflow, reference(202).to_vec()))
         );
     }
 }

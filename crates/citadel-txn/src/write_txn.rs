@@ -15,7 +15,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use citadel_buffer::allocator::{AllocCheckpoint, PageAllocator};
-use citadel_buffer::btree::{self, BTree, UpsertAction, UpsertOutcome};
+use citadel_buffer::btree::{self, BTree, LeafEntryHint, UpsertAction, UpsertOutcome};
 use citadel_buffer::cursor::{Cursor, DescentGuard, PageLoader, PageMap};
 
 use crate::catalog::TableDescriptor;
@@ -88,6 +88,7 @@ pub enum InsertOutcome {
 struct LoadedLeaf {
     path: Vec<(PageId, usize)>,
     id: PageId,
+    hint: Option<LeafEntryHint>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -561,9 +562,14 @@ impl<'db> WriteTxn<'db> {
         leaf: Option<LoadedLeaf>,
     ) -> Result<(bool, Option<PageId>)> {
         match leaf {
-            Some(LoadedLeaf { path, id }) => {
-                tree.insert_at_leaf(pages, alloc, txn_id, key, val_type, val_bytes, path, id)
-            }
+            Some(LoadedLeaf { path, id, hint }) => match hint {
+                Some(hint) => tree.insert_at_leaf_with_hint(
+                    pages, alloc, txn_id, key, val_type, val_bytes, path, id, hint,
+                ),
+                None => {
+                    tree.insert_at_leaf(pages, alloc, txn_id, key, val_type, val_bytes, path, id)
+                }
+            },
             None => {
                 let inserted = tree
                     .try_lil_insert(pages, alloc, txn_id, key, val_type, val_bytes)?
@@ -586,7 +592,11 @@ impl<'db> WriteTxn<'db> {
             return Ok(None);
         }
         let (path, id) = Self::walk_loading(pages, manager, tree.root, key)?;
-        Ok(Some(LoadedLeaf { path, id }))
+        Ok(Some(LoadedLeaf {
+            path,
+            id,
+            hint: None,
+        }))
     }
 
     pub fn delete(&mut self, key: &[u8]) -> Result<bool> {
@@ -1069,7 +1079,7 @@ impl<'db> WriteTxn<'db> {
         let val_bytes = val_payload.as_ref();
         let tree = self.named_trees.get_mut(table).unwrap();
         let inserted = match leaf {
-            Some(LoadedLeaf { path, id }) => tree.insert_if_absent_at_leaf(
+            Some(LoadedLeaf { path, id, .. }) => tree.insert_if_absent_at_leaf(
                 &mut self.pages,
                 &mut self.alloc,
                 self.txn_id,
@@ -1143,15 +1153,22 @@ impl<'db> WriteTxn<'db> {
         self.check_cancel()?;
         Self::validate_key_value(key, &[])?;
         self.ensure_table(table)?;
-        let leaf = Self::load_insert_leaf(
+        let mut leaf = Self::load_insert_leaf(
             &self.named_trees[table],
             &mut self.pages,
             self.manager,
             key,
             &[],
         )?;
-        let found = match &leaf {
-            Some(leaf) => BTree::search_at_leaf_ref(&self.pages, leaf.id, key)?,
+        let found = match &mut leaf {
+            Some(leaf) => BTree::search_at_leaf_ref_with_hint(&self.pages, leaf.id, key)?.map(
+                |(hint, val_type, payload)| {
+                    // Only this detached callback operation retains the match.
+                    // Overflow staging can rehash pages but cannot edit this leaf.
+                    leaf.hint = Some(hint);
+                    (val_type, payload)
+                },
+            ),
             None => None,
         };
         let mut overflow_value;
@@ -1293,7 +1310,7 @@ impl<'db> WriteTxn<'db> {
         let txn_id = *txn_id;
 
         let outcome = match leaf {
-            Some(LoadedLeaf { path, id }) => tree
+            Some(LoadedLeaf { path, id, .. }) => tree
                 .insert_or_fetch_at_leaf(pages, alloc, txn_id, key, val_type, val_bytes, path, id),
             None => tree
                 .try_lil_insert(pages, alloc, txn_id, key, val_type, val_bytes)
