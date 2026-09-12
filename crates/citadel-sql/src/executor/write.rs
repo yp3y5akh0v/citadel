@@ -4,7 +4,8 @@ use citadel::Database;
 
 use crate::encoding::{
     decode_column_raw, decode_column_with_offset, decode_composite_key, decode_pk_integer,
-    encode_composite_key, patch_at_offset, patch_column_in_place, patch_row_column,
+    encode_composite_key, encode_composite_key_into, patch_at_offset, patch_column_in_place,
+    patch_row_column,
 };
 use crate::error::{Result, SqlError};
 use crate::eval::{eval_expr, is_truthy, ColumnMap, EvalCtx};
@@ -22,6 +23,7 @@ use super::view::*;
 use super::{CteContext, CteRows};
 
 struct UpdateBufs {
+    key_buf: Vec<u8>,
     partial_row: Vec<Value>,
     patch_buf: Vec<u8>,
     offsets: Vec<usize>,
@@ -33,6 +35,7 @@ struct UpdateBufs {
 impl UpdateBufs {
     fn new() -> Self {
         Self {
+            key_buf: Vec::with_capacity(32),
             partial_row: Vec::new(),
             patch_buf: Vec::with_capacity(256),
             offsets: Vec::new(),
@@ -2350,23 +2353,26 @@ fn exec_update_in_txn_compiled(
         full_cover: true,
     } = &plan
     {
-        let key = encode_composite_key(pk_values);
+        let UpdateBufs {
+            key_buf,
+            partial_row,
+            patch_buf,
+            materializer,
+            ..
+        } = bufs;
+        encode_composite_key_into(pk_values, key_buf);
+        let key = key_buf.as_slice();
         let updated = wtx.table_update_with(
             compiled.table_name_lower.as_bytes(),
-            &key,
+            key,
             |raw_value| -> Result<()> {
-                if let Some(expanded) =
-                    bufs.materializer
-                        .expand(table_schema, &key, raw_value, cancel)?
-                {
+                if let Some(expanded) = materializer.expand(table_schema, key, raw_value, cancel)? {
                     *raw_value = expanded;
                 }
-                let partial_row = &mut bufs.partial_row;
-                let patch_buf = &mut bufs.patch_buf;
                 if single_int_pk {
-                    partial_row[pk_idx_cache[0]] = Value::Integer(decode_pk_integer(&key)?);
+                    partial_row[pk_idx_cache[0]] = Value::Integer(decode_pk_integer(key)?);
                 } else {
-                    let pk_vals = decode_composite_key(&key, num_pk_cols)?;
+                    let pk_vals = decode_composite_key(key, num_pk_cols)?;
                     for (i, &pi) in pk_idx_cache.iter().enumerate() {
                         partial_row[pi] = pk_vals[i].clone();
                     }
@@ -2471,16 +2477,22 @@ fn exec_pk_lookup_update(
     cancel: Option<&citadel::CancelToken>,
     bufs: &mut UpdateBufs,
 ) -> Result<ExecutionResult> {
-    let key = encode_composite_key(std::slice::from_ref(pk_value));
+    let UpdateBufs {
+        key_buf,
+        partial_row,
+        patch_buf,
+        materializer,
+        ..
+    } = bufs;
+    encode_composite_key_into(std::slice::from_ref(pk_value), key_buf);
+    let key = key_buf.as_slice();
     let updated = wtx.table_update_with(
         schema.name.as_bytes(),
-        &key,
+        key,
         |raw_value| -> Result<ExecutionResult> {
-            if let Some(expanded) = bufs.materializer.expand(schema, &key, raw_value, cancel)? {
+            if let Some(expanded) = materializer.expand(schema, key, raw_value, cancel)? {
                 *raw_value = expanded;
             }
-            let partial_row = &mut bufs.partial_row;
-            let patch_buf = &mut bufs.patch_buf;
             partial_row[fast.pk_idx_cache[0]] = pk_value.clone();
             patch_compiled_update_value(raw_value, fast, partial_row, cancel, patch_buf)?;
             if let Some(rf) = ret_fast {
