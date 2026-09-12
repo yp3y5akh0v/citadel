@@ -1488,7 +1488,8 @@ impl TxnManager {
             _collision_init.is_some() && self.named_table_hash_collisions.get().is_none();
         let mut first_by_hash = FxHashMap::default();
         let mut collisions = FxHashMap::default();
-        let slot = self.current_slot();
+        let reader = self.begin_read();
+        let slot = reader.snapshot_slot();
         if !slot.catalog_root.is_valid() {
             if populate_collisions {
                 let _ = self.named_table_hash_collisions.set(collisions);
@@ -1540,7 +1541,8 @@ impl TxnManager {
         use citadel_core::types::ValueType;
         use citadel_page::{branch_node, leaf_node};
 
-        let slot = self.current_slot();
+        let reader = self.begin_read();
+        let slot = reader.snapshot_slot();
         if !slot.catalog_root.is_valid() {
             return Ok(None);
         }
