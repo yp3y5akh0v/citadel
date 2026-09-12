@@ -1187,3 +1187,484 @@ fn drop_table_invalidates_only_its_fk_cache_entry() {
     assert!(!wtx.fk_check_cached(b"parent_b", b"k2"));
     wtx.commit().unwrap();
 }
+
+#[test]
+fn insert_or_fetch_budget_failure_after_overflow_staging_poison_transaction() {
+    use citadel_core::Error;
+
+    for (max_value, total) in [(4, 64), (64, 4)] {
+        let manager = create_test_manager();
+        let mut setup = manager.begin_write().unwrap();
+        setup.create_table(b"budget").unwrap();
+        setup.table_insert(b"budget", b"key", b"original").unwrap();
+        setup.commit().unwrap();
+        let before = manager.current_slot();
+        let generation = manager.commit_generation();
+
+        let mut writer = manager.begin_write().unwrap();
+        writer.set_read_budget(Some(crate::ReadBudget::new(max_value, total)));
+        let incoming = vec![0x5a; citadel_core::MAX_INLINE_VALUE_SIZE * 2 + 5];
+        assert!(matches!(
+            writer.table_insert_or_fetch(b"budget", b"key", &incoming),
+            Err(Error::ReadBudgetExceeded { size: 8, .. })
+        ));
+        assert!(
+            writer.pending_free_count() > 0,
+            "the rejected incoming overflow chain must have been staged and freed"
+        );
+        assert!(
+            writer.is_poisoned(),
+            "inline result admission failed after allocator mutation"
+        );
+        writer.set_read_budget(None);
+        assert!(matches!(writer.commit(), Err(Error::TransactionFailed)));
+        assert_eq!(manager.current_slot(), before);
+        assert_eq!(manager.commit_generation(), generation);
+        assert_eq!(
+            manager.begin_read().table_get(b"budget", b"key").unwrap(),
+            Some(b"original".to_vec())
+        );
+        let report = manager.integrity_check().unwrap();
+        assert!(report.is_ok(), "{report:?}");
+    }
+}
+
+#[test]
+fn upsert_split_overflow_and_savepoint_preserve_deep_tree_snapshots() {
+    exercise_callback_split_overflow_and_savepoint(false);
+}
+
+#[test]
+fn update_with_split_overflow_and_savepoint_preserve_deep_tree_snapshots() {
+    exercise_callback_split_overflow_and_savepoint(true);
+}
+
+fn exercise_callback_split_overflow_and_savepoint(fused_update: bool) {
+    fn replace_existing(
+        writer: &mut super::WriteTxn<'_>,
+        key: &[u8],
+        old_value: &[u8],
+        new_value: &[u8],
+        fused_update: bool,
+    ) {
+        if fused_update {
+            let previous_len = writer
+                .table_update_with::<_, _, Error>(b"deep", key, |value| {
+                    assert_eq!(value, old_value);
+                    let previous_len = value.len();
+                    value.clear();
+                    value.extend_from_slice(new_value);
+                    Ok(previous_len)
+                })
+                .unwrap();
+            assert_eq!(previous_len, Some(old_value.len()));
+        } else {
+            assert!(matches!(
+                writer
+                    .table_upsert_with::<_, Error>(b"deep", key, b"unused", |old| {
+                        assert_eq!(old, old_value);
+                        Ok(UpsertAction::Replace(new_value.to_vec()))
+                    })
+                    .unwrap(),
+                UpsertOutcome::Updated
+            ));
+        }
+    }
+    use crate::manager::tests::{test_keys, MemIO};
+    use crate::manager::TxnManager;
+
+    const ROWS: u32 = 384;
+    let key = |index: u32| {
+        let mut key = vec![b'k'; 512];
+        key[..4].copy_from_slice(&index.to_be_bytes());
+        key
+    };
+    let original = vec![b'o'; 256];
+    let grown = vec![b'g'; MAX_INLINE_VALUE_SIZE];
+    let overflow = vec![b'v'; MAX_INLINE_VALUE_SIZE * 3 + 17];
+    let (dek, mac_key, dek_id) = test_keys();
+    let io = MemIO::new(1024 * 1024);
+    let manager =
+        TxnManager::create(Box::new(io.share()), dek, mac_key, 1, 0x1234, dek_id, 32).unwrap();
+    let mut seed = manager.begin_write().unwrap();
+    seed.create_table(b"deep").unwrap();
+    for index in 0..ROWS {
+        seed.table_insert(b"deep", &key(index), &original).unwrap();
+    }
+    let root = seed.named_trees[b"deep".as_slice()].root;
+    assert!(seed.named_trees[b"deep".as_slice()].depth >= 3);
+    let first = super::WriteTxn::descend_to_leaf(&mut seed.pages, &manager, root, &key(0)).unwrap();
+    let tenth = super::WriteTxn::descend_to_leaf(&mut seed.pages, &manager, root, &key(9)).unwrap();
+    assert_eq!(
+        first, tenth,
+        "fixture must start with a densely packed leaf"
+    );
+    seed.commit().unwrap();
+    drop(manager);
+
+    // Reopen makes the first mutation descend a genuinely cold multi-level tree.
+    let manager = TxnManager::open(Box::new(io.share()), dek, mac_key, 1, 32).unwrap();
+    let mut old_reader = manager.begin_read();
+    let mut writer = manager.begin_write().unwrap();
+    writer.ensure_table(b"deep").unwrap();
+    let root = writer.named_trees[b"deep".as_slice()].root;
+    assert!(writer.named_trees[b"deep".as_slice()].depth >= 3);
+    assert!(!writer.pages.contains_key(&root));
+    replace_existing(&mut writer, &key(0), &original, &grown, fused_update);
+    let root = writer.named_trees[b"deep".as_slice()].root;
+    let first =
+        super::WriteTxn::descend_to_leaf(&mut writer.pages, &manager, root, &key(0)).unwrap();
+    let tenth =
+        super::WriteTxn::descend_to_leaf(&mut writer.pages, &manager, root, &key(9)).unwrap();
+    assert_ne!(first, tenth, "callback growth must actually split the leaf");
+
+    let checkpoint = writer.begin_savepoint();
+    replace_existing(&mut writer, &key(0), &grown, &overflow, fused_update);
+    assert!(writer
+        .table_insert_if_absent(b"deep", &key(ROWS), b"speculative")
+        .unwrap());
+    writer.restore_snapshot(checkpoint);
+    assert_eq!(
+        writer.table_get(b"deep", &key(0)).unwrap(),
+        Some(grown.clone())
+    );
+    assert_eq!(writer.table_get(b"deep", &key(ROWS)).unwrap(), None);
+
+    assert!(matches!(
+        writer
+            .table_insert_or_fetch(b"deep", &key(ROWS), &overflow)
+            .unwrap(),
+        InsertOutcome::Inserted
+    ));
+    assert!(matches!(
+        writer
+            .table_upsert_with::<_, Error>(b"deep", &key(ROWS + 1), b"appended", |_| {
+                panic!("new rightmost key must not invoke the callback")
+            })
+            .unwrap(),
+        UpsertOutcome::Inserted
+    ));
+    replace_existing(&mut writer, &key(0), &grown, &overflow, fused_update);
+    let freed_before_shrink = writer.pending_free_count();
+    replace_existing(&mut writer, &key(0), &overflow, b"kept", fused_update);
+    assert!(writer.pending_free_count() > freed_before_shrink);
+    writer.commit().unwrap();
+
+    // This reader has not read any data before the mutations and rollback.
+    let mut index = 0;
+    old_reader
+        .table_for_each(b"deep", |actual_key, value| {
+            assert_eq!(actual_key, key(index));
+            assert_eq!(value, original);
+            index += 1;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(index, ROWS);
+    drop(old_reader);
+    let report = manager.integrity_check().unwrap();
+    assert!(report.is_ok(), "{report:?}");
+    drop(manager);
+
+    let reopened = TxnManager::open(Box::new(io), dek, mac_key, 1, 32).unwrap();
+    let mut reader = reopened.begin_read();
+    let mut index = 0;
+    reader
+        .table_for_each(b"deep", |actual_key, value| {
+            assert_eq!(actual_key, key(index));
+            let expected: &[u8] = match index {
+                0 => b"kept",
+                ROWS => &overflow,
+                i if i == ROWS + 1 => b"appended",
+                _ => &original,
+            };
+            assert_eq!(value, expected);
+            index += 1;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(index, ROWS + 2);
+    let report = reopened.integrity_check().unwrap();
+    assert!(report.is_ok(), "{report:?}");
+}
+
+#[test]
+fn insert_variants_leave_no_staged_overflow_after_a_cold_path_read_failure() {
+    use crate::manager::tests::{test_keys, MemIO};
+    use crate::manager::TxnManager;
+    use citadel_core::{Result, PAGE_SIZE};
+    use citadel_io::traits::PageIO;
+    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::sync::Arc;
+
+    struct FaultingReadIO {
+        inner: MemIO,
+        reads_left: Arc<AtomicI64>,
+    }
+
+    impl PageIO for FaultingReadIO {
+        fn read_page(&self, offset: u64, buf: &mut [u8; PAGE_SIZE]) -> Result<()> {
+            if self.reads_left.fetch_sub(1, Ordering::SeqCst) <= 0 {
+                return Err(Error::Io(std::io::Error::other(
+                    "injected cold-path failure",
+                )));
+            }
+            self.inner.read_page(offset, buf)
+        }
+
+        fn write_page(&self, offset: u64, buf: &[u8; PAGE_SIZE]) -> Result<()> {
+            self.inner.write_page(offset, buf)
+        }
+
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+            self.inner.read_at(offset, buf)
+        }
+
+        fn write_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
+            self.inner.write_at(offset, buf)
+        }
+
+        fn fsync(&self) -> Result<()> {
+            self.inner.fsync()
+        }
+
+        fn file_size(&self) -> Result<u64> {
+            self.inner.file_size()
+        }
+
+        fn truncate(&self, size: u64) -> Result<()> {
+            self.inner.truncate(size)
+        }
+    }
+
+    let (dek, mac_key, dek_id) = test_keys();
+    let io = MemIO::new(1024 * 1024);
+    let manager =
+        TxnManager::create(Box::new(io.share()), dek, mac_key, 1, 0x1234, dek_id, 32).unwrap();
+    let mut seed = manager.begin_write().unwrap();
+    seed.create_table(b"cold").unwrap();
+    for index in 0..128u32 {
+        seed.insert(&index.to_be_bytes(), &[b'o'; 256]).unwrap();
+        seed.table_insert(b"cold", &index.to_be_bytes(), &[b'o'; 256])
+            .unwrap();
+    }
+    seed.commit().unwrap();
+    drop(manager);
+    let incoming = vec![b'n'; MAX_INLINE_VALUE_SIZE * 3 + 17];
+    for operation in 0..6 {
+        let reads_left = Arc::new(AtomicI64::new(i64::MAX));
+        let manager = TxnManager::open(
+            Box::new(FaultingReadIO {
+                inner: io.deep_clone(),
+                reads_left: Arc::clone(&reads_left),
+            }),
+            dek,
+            mac_key,
+            1,
+            32,
+        )
+        .unwrap();
+        let before = manager.current_slot();
+        let generation = manager.commit_generation();
+        let mut writer = manager.begin_write().unwrap();
+        writer.ensure_table(b"cold").unwrap();
+        assert!(writer.tree.depth > 1);
+        assert!(writer.named_trees[b"cold".as_slice()].depth > 1);
+        // Permit the root read, fail the next page before any overflow staging.
+        reads_left.store(1, Ordering::SeqCst);
+        let key = 64u32.to_be_bytes();
+        let result = match operation {
+            0 => writer.insert(&key, &incoming).map(|_| ()),
+            1 => writer.table_insert(b"cold", &key, &incoming).map(|_| ()),
+            2 => writer
+                .table_insert_if_absent(b"cold", &key, &incoming)
+                .map(|_| ()),
+            3 => writer
+                .table_insert_or_fetch(b"cold", &key, &incoming)
+                .map(|_| ()),
+            4 => writer
+                .table_upsert_with::<_, Error>(b"cold", &key, &incoming, |_| {
+                    panic!("failed tree walk must not invoke the callback")
+                })
+                .map(|_| ()),
+            5 => writer
+                .table_update_with::<_, (), Error>(b"cold", &key, |_| {
+                    panic!("failed tree walk must not invoke the callback")
+                })
+                .map(|_| ()),
+            _ => unreachable!(),
+        };
+        assert!(
+            matches!(result, Err(Error::Io(_))),
+            "operation {operation}: {result:?}"
+        );
+        assert!(
+            !writer.is_poisoned(),
+            "read-only failure poisoned operation {operation}"
+        );
+        assert!(writer.alloc.allocated_this_txn().is_empty());
+        assert_eq!(writer.pending_free_count(), 0);
+        reads_left.store(i64::MAX, Ordering::SeqCst);
+        writer.commit().unwrap();
+        assert_eq!(manager.current_slot(), before);
+        assert_eq!(manager.commit_generation(), generation);
+        let mut reader = manager.begin_read();
+        assert_eq!(reader.get(&key).unwrap(), Some(vec![b'o'; 256]));
+        assert_eq!(
+            reader.table_get(b"cold", &key).unwrap(),
+            Some(vec![b'o'; 256])
+        );
+        let report = manager.integrity_check().unwrap();
+        assert!(report.is_ok(), "{report:?}");
+    }
+}
+
+#[test]
+fn update_with_missing_and_tombstoned_keys_never_call_or_insert() {
+    use citadel_core::types::ValueType;
+
+    let manager = create_test_manager();
+    let mut writer = manager.begin_write().unwrap();
+    writer.create_table(b"update").unwrap();
+    writer.table_insert(b"update", b"middle", b"kept").unwrap();
+    writer
+        .named_trees
+        .get_mut(b"update".as_slice())
+        .unwrap()
+        .insert(
+            &mut writer.pages,
+            &mut writer.alloc,
+            writer.txn_id,
+            b"tombstone",
+            ValueType::Tombstone,
+            b"",
+        )
+        .unwrap();
+    let marker = writer.mutation_marker();
+    let allocated = writer.alloc.allocated_this_txn().len();
+    let freed = writer.pending_free_count();
+    for key in [b"before".as_slice(), b"tombstone", b"zz-after"] {
+        assert_eq!(
+            writer
+                .table_update_with::<_, (), Error>(b"update", key, |_| {
+                    panic!("a missing or tombstoned key must not invoke the callback")
+                })
+                .unwrap(),
+            None
+        );
+        assert_eq!(writer.table_get(b"update", key).unwrap(), None);
+    }
+    assert!(!writer.mutated_since(marker));
+    assert_eq!(writer.alloc.allocated_this_txn().len(), allocated);
+    assert_eq!(writer.pending_free_count(), freed);
+    assert_eq!(
+        writer.table_get(b"update", b"middle").unwrap(),
+        Some(b"kept".to_vec())
+    );
+}
+
+#[test]
+fn update_with_callback_failure_panic_and_cancellation_leave_owned_changes_unstored() {
+    let manager = create_test_manager();
+    let mut seed = manager.begin_write().unwrap();
+    seed.create_table(b"update").unwrap();
+    seed.table_insert(b"update", b"key", b"original").unwrap();
+    seed.commit().unwrap();
+    let before = manager.current_slot();
+    let generation = manager.commit_generation();
+    for outcome in 0..3 {
+        let mut writer = manager.begin_write().unwrap();
+        let token = CancelToken::new();
+        writer.set_cancel(Some(token.clone()));
+        let marker = writer.mutation_marker();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            writer.table_update_with::<_, (), Error>(b"update", b"key", |value| {
+                value.resize(MAX_INLINE_VALUE_SIZE * 3 + 7, 0x5a);
+                match outcome {
+                    0 => Err(Error::Sync(
+                        "callback failed after editing owned bytes".into(),
+                    )),
+                    1 => panic!("callback panicked after editing owned bytes"),
+                    2 => {
+                        token.cancel();
+                        Ok(())
+                    }
+                    _ => unreachable!(),
+                }
+            })
+        }));
+        match outcome {
+            0 => assert!(matches!(result, Ok(Err(Error::Sync(_))))),
+            1 => assert!(result.is_err()),
+            2 => assert!(matches!(result, Ok(Err(Error::Interrupted)))),
+            _ => unreachable!(),
+        }
+        assert!(!writer.is_poisoned());
+        assert!(!writer.mutated_since(marker));
+        assert!(writer.alloc.allocated_this_txn().is_empty());
+        assert_eq!(writer.pending_free_count(), 0);
+        writer.set_cancel(None);
+        assert_eq!(
+            writer.table_get(b"update", b"key").unwrap(),
+            Some(b"original".to_vec())
+        );
+        writer.commit().unwrap();
+        assert_eq!(manager.current_slot(), before);
+        assert_eq!(manager.commit_generation(), generation);
+    }
+}
+
+#[test]
+fn update_with_read_budget_admits_once_before_the_callback_and_any_mutation() {
+    for size in [8, MAX_INLINE_VALUE_SIZE * 3 + 11] {
+        let original = vec![0x5a; size];
+        let manager = create_test_manager();
+        let mut seed = manager.begin_write().unwrap();
+        seed.create_table(b"update").unwrap();
+        seed.table_insert(b"update", b"key", &original).unwrap();
+        seed.commit().unwrap();
+        for (max_value, total) in [(size - 1, size), (size, size - 1)] {
+            let mut writer = manager.begin_write().unwrap();
+            writer.set_read_budget(Some(crate::ReadBudget::new(max_value, total)));
+            let marker = writer.mutation_marker();
+            assert!(matches!(
+                writer.table_update_with::<_, (), Error>(b"update", b"key", |_| {
+                    panic!("a denied value must not reach the callback")
+                }),
+                Err(Error::ReadBudgetExceeded { .. })
+            ));
+            assert!(!writer.is_poisoned());
+            assert!(!writer.mutated_since(marker));
+            assert!(writer.alloc.allocated_this_txn().is_empty());
+            assert_eq!(writer.pending_free_count(), 0);
+            writer.set_read_budget(None);
+            assert_eq!(
+                writer.table_get(b"update", b"key").unwrap(),
+                Some(original.clone())
+            );
+            writer.commit().unwrap();
+        }
+        let mut writer = manager.begin_write().unwrap();
+        writer.set_read_budget(Some(crate::ReadBudget::new(size, size)));
+        let returned = String::from("consumed once");
+        assert_eq!(
+            writer
+                .table_update_with::<_, _, Error>(b"update", b"key", |value| {
+                    assert_eq!(value, &original);
+                    value.clear();
+                    value.extend_from_slice(b"updated");
+                    Ok(returned)
+                })
+                .unwrap(),
+            Some(String::from("consumed once"))
+        );
+        writer.set_read_budget(None);
+        writer.commit().unwrap();
+        assert_eq!(
+            manager.begin_read().table_get(b"update", b"key").unwrap(),
+            Some(b"updated".to_vec())
+        );
+        let report = manager.integrity_check().unwrap();
+        assert!(report.is_ok(), "{report:?}");
+    }
+}
