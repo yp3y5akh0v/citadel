@@ -1340,36 +1340,37 @@ fn insert_or_fetch_budget_failure_after_overflow_staging_poison_transaction() {
     }
 }
 
+#[derive(Clone, Copy)]
+enum CallbackWriteRoute {
+    Upsert,
+    Update,
+    UpdateWithBuffer,
+}
+
 #[test]
 fn upsert_split_overflow_and_savepoint_preserve_deep_tree_snapshots() {
-    exercise_callback_split_overflow_and_savepoint(false);
+    exercise_callback_split_overflow_and_savepoint(CallbackWriteRoute::Upsert);
 }
 
 #[test]
 fn update_with_split_overflow_and_savepoint_preserve_deep_tree_snapshots() {
-    exercise_callback_split_overflow_and_savepoint(true);
+    exercise_callback_split_overflow_and_savepoint(CallbackWriteRoute::Update);
 }
 
-fn exercise_callback_split_overflow_and_savepoint(fused_update: bool) {
+#[test]
+fn update_with_buffer_split_overflow_and_savepoint_preserve_deep_tree_snapshots() {
+    exercise_callback_split_overflow_and_savepoint(CallbackWriteRoute::UpdateWithBuffer);
+}
+
+fn exercise_callback_split_overflow_and_savepoint(route: CallbackWriteRoute) {
     fn replace_existing(
         writer: &mut super::WriteTxn<'_>,
         key: &[u8],
         old_value: &[u8],
         new_value: &[u8],
-        fused_update: bool,
+        route: CallbackWriteRoute,
     ) {
-        if fused_update {
-            let previous_len = writer
-                .table_update_with::<_, _, Error>(b"deep", key, |value| {
-                    assert_eq!(value, old_value);
-                    let previous_len = value.len();
-                    value.clear();
-                    value.extend_from_slice(new_value);
-                    Ok(previous_len)
-                })
-                .unwrap();
-            assert_eq!(previous_len, Some(old_value.len()));
-        } else {
+        if matches!(route, CallbackWriteRoute::Upsert) {
             assert!(matches!(
                 writer
                     .table_upsert_with::<_, Error>(b"deep", key, b"unused", |old| {
@@ -1379,6 +1380,23 @@ fn exercise_callback_split_overflow_and_savepoint(fused_update: bool) {
                     .unwrap(),
                 UpsertOutcome::Updated
             ));
+        } else {
+            let update = |value: &mut Vec<u8>| -> Result<usize, Error> {
+                assert_eq!(value, old_value);
+                let previous_len = value.len();
+                value.clear();
+                value.extend_from_slice(new_value);
+                Ok(previous_len)
+            };
+            let previous_len = match route {
+                CallbackWriteRoute::Update => writer.table_update_with(b"deep", key, update),
+                CallbackWriteRoute::UpdateWithBuffer => {
+                    writer.table_update_with_buffer(b"deep", key, &mut Vec::new(), update)
+                }
+                CallbackWriteRoute::Upsert => unreachable!(),
+            }
+            .unwrap();
+            assert_eq!(previous_len, Some(old_value.len()));
         }
     }
     use crate::manager::tests::{test_keys, MemIO};
@@ -1421,7 +1439,7 @@ fn exercise_callback_split_overflow_and_savepoint(fused_update: bool) {
     let root = writer.named_trees[b"deep".as_slice()].root;
     assert!(writer.named_trees[b"deep".as_slice()].depth >= 3);
     assert!(!writer.pages.contains_key(&root));
-    replace_existing(&mut writer, &key(0), &original, &grown, fused_update);
+    replace_existing(&mut writer, &key(0), &original, &grown, route);
     let root = writer.named_trees[b"deep".as_slice()].root;
     let first =
         super::WriteTxn::descend_to_leaf(&mut writer.pages, &manager, root, &key(0)).unwrap();
@@ -1430,7 +1448,7 @@ fn exercise_callback_split_overflow_and_savepoint(fused_update: bool) {
     assert_ne!(first, tenth, "callback growth must actually split the leaf");
 
     let checkpoint = writer.begin_savepoint();
-    replace_existing(&mut writer, &key(0), &grown, &overflow, fused_update);
+    replace_existing(&mut writer, &key(0), &grown, &overflow, route);
     assert!(writer
         .table_insert_if_absent(b"deep", &key(ROWS), b"speculative")
         .unwrap());
@@ -1455,9 +1473,9 @@ fn exercise_callback_split_overflow_and_savepoint(fused_update: bool) {
             .unwrap(),
         UpsertOutcome::Inserted
     ));
-    replace_existing(&mut writer, &key(0), &grown, &overflow, fused_update);
+    replace_existing(&mut writer, &key(0), &grown, &overflow, route);
     let freed_before_shrink = writer.pending_free_count();
-    replace_existing(&mut writer, &key(0), &overflow, b"kept", fused_update);
+    replace_existing(&mut writer, &key(0), &overflow, b"kept", route);
     assert!(writer.pending_free_count() > freed_before_shrink);
     writer.commit().unwrap();
 
@@ -2106,4 +2124,125 @@ fn table_contains_key_uses_the_live_write_view_without_materializing_values() {
         writer.table_contains_key(b"contains", b"new"),
         Err(citadel_core::Error::Interrupted)
     ));
+}
+
+#[test]
+fn update_with_hint_survives_overflow_staging_map_growth_and_frees_each_chain_once() {
+    use crate::manager::tests::{test_keys, MemIO};
+    use crate::manager::TxnManager;
+    use citadel_buffer::btree::BTree;
+    use citadel_core::types::ValueType;
+    use citadel_page::{leaf_node, overflow};
+
+    let (dek, mac_key, dek_id) = test_keys();
+    let io = MemIO::new(1024 * 1024);
+    let manager =
+        TxnManager::create(Box::new(io.share()), dek, mac_key, 1, 0x1234, dek_id, 32).unwrap();
+    let mut seed = manager.begin_write().unwrap();
+    seed.create_table(b"hints").unwrap();
+    for key in 0..100u8 {
+        seed.table_insert(b"hints", &[key], &[key; 8]).unwrap();
+    }
+    assert_eq!(seed.named_trees[b"hints".as_slice()].depth, 1);
+    seed.commit().unwrap();
+    let mut old_reader = manager.begin_read();
+    let mut writer = manager.begin_write().unwrap();
+    writer.ensure_table(b"hints").unwrap();
+    let root = writer.named_trees[b"hints".as_slice()].root;
+    super::WriteTxn::descend_to_leaf(&mut writer.pages, &manager, root, &[50]).unwrap();
+    let capacity = writer.pages.capacity();
+    let large = vec![0xa5; (capacity + 2) * overflow::OVERFLOW_DATA_CAPACITY];
+    assert!(large.len() <= citadel_core::MAX_VALUE_SIZE);
+    let mut buffer = Vec::with_capacity(64);
+    writer.set_read_budget(Some(crate::ReadBudget::new(8, 8)));
+    assert_eq!(
+        writer
+            .table_update_with_buffer::<_, _, Error>(b"hints", &[50], &mut buffer, |value| {
+                assert_eq!(value, &[50; 8]);
+                value.clear();
+                value.extend_from_slice(&large);
+                Ok(50)
+            })
+            .unwrap(),
+        Some(50)
+    );
+    assert!(
+        writer.pages.capacity() > capacity,
+        "staging must actually grow the page map"
+    );
+    writer.set_read_budget(None);
+    let root = writer.named_trees[b"hints".as_slice()].root;
+    let leaf = super::WriteTxn::descend_to_leaf(&mut writer.pages, &manager, root, &[50]).unwrap();
+    let (kind, payload) = BTree::search_at_leaf_ref(&writer.pages, leaf, &[50])
+        .unwrap()
+        .unwrap();
+    assert_eq!(kind, ValueType::Overflow);
+    let mut next = leaf_node::OverflowRef::from_bytes(payload).first_page;
+    let mut old_chain = Vec::new();
+    while next != PageId(0) {
+        old_chain.push(next);
+        next = overflow::next_page(&writer.pages[&next]);
+    }
+    assert!(old_chain.len() > capacity);
+    let second = vec![0x5a; large.len() + 17];
+    writer
+        .table_update_with::<_, (), Error>(b"hints", &[50], |value| {
+            assert_eq!(value, &large);
+            value.clear();
+            value.extend_from_slice(&second);
+            Ok(())
+        })
+        .unwrap();
+    for page in &old_chain {
+        assert_eq!(
+            writer
+                .alloc
+                .freed_this_txn()
+                .iter()
+                .filter(|p| *p == page)
+                .count(),
+            1
+        );
+    }
+    writer
+        .table_update_with_buffer::<_, (), Error>(b"hints", &[50], &mut buffer, |value| {
+            assert_eq!(value, &second);
+            value.clear();
+            value.extend_from_slice(b"small");
+            Ok(())
+        })
+        .unwrap();
+    for page in &old_chain {
+        assert_eq!(
+            writer
+                .alloc
+                .freed_this_txn()
+                .iter()
+                .filter(|p| *p == page)
+                .count(),
+            1
+        );
+    }
+    assert_eq!(writer.table_entry_count(b"hints").unwrap(), 100);
+    writer.commit().unwrap();
+    for key in 0..100u8 {
+        assert_eq!(
+            old_reader.table_get(b"hints", &[key]).unwrap(),
+            Some(vec![key; 8])
+        );
+    }
+    drop(old_reader);
+    assert!(manager.integrity_check().unwrap().is_ok());
+    drop(manager);
+    let reopened = TxnManager::open(Box::new(io), dek, mac_key, 1, 32).unwrap();
+    let mut reader = reopened.begin_read();
+    for key in 0..100u8 {
+        let expected = if key == 50 {
+            b"small".to_vec()
+        } else {
+            vec![key; 8]
+        };
+        assert_eq!(reader.table_get(b"hints", &[key]).unwrap(), Some(expected));
+    }
+    assert!(reopened.integrity_check().unwrap().is_ok());
 }

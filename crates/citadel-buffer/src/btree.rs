@@ -31,6 +31,15 @@ pub enum UpsertAction {
     Skip,
 }
 
+/// An advisory match from an already loaded leaf. Insertion rechecks the leaf,
+/// cell bounds and key before using it; a stale or foreign hint falls back to
+/// the ordinary search. It does not establish that a supplied tree path is current.
+#[derive(Debug)]
+pub struct LeafEntryHint {
+    leaf_id: PageId,
+    index: u16,
+}
+
 impl BTree {
     /// Create a new empty B+ tree with a single leaf root.
     pub fn new(
@@ -77,11 +86,27 @@ impl BTree {
         leaf_id: PageId,
         key: &[u8],
     ) -> Result<Option<(ValueType, &'a [u8])>> {
+        Self::search_at_leaf_ref_with_hint(pages, leaf_id, key)
+            .map(|found| found.map(|(_, val_type, value)| (val_type, value)))
+    }
+
+    /// Borrow a value and retain its checked position for a subsequent write.
+    /// The borrowed bytes must be released before loading or mutating pages;
+    /// the hint contains no reference into the page map.
+    pub fn search_at_leaf_ref_with_hint<'a>(
+        pages: &'a FxHashMap<PageId, Page>,
+        leaf_id: PageId,
+        key: &[u8],
+    ) -> Result<Option<(LeafEntryHint, ValueType, &'a [u8])>> {
         let page = pages.get(&leaf_id).ok_or(Error::PageOutOfBounds(leaf_id))?;
         match leaf_node::search(page, key) {
             Ok(idx) => {
                 let cell = leaf_node::read_cell(page, idx);
-                Ok(Some((cell.val_type, cell.value)))
+                let hint = LeafEntryHint {
+                    leaf_id,
+                    index: idx,
+                };
+                Ok(Some((hint, cell.val_type, cell.value)))
             }
             Err(_) => Ok(None),
         }
@@ -401,14 +426,75 @@ impl BTree {
         key: &[u8],
         val_type: ValueType,
         value: &[u8],
+        path: Vec<(PageId, usize)>,
+        leaf_id: PageId,
+    ) -> Result<(bool, Option<PageId>)> {
+        self.insert_at_leaf_impl(
+            pages, alloc, txn_id, key, val_type, value, path, leaf_id, None,
+        )
+    }
+
+    /// Insert using an advisory match from a previous lookup. The path and
+    /// leaf must be current, as for [`Self::insert_at_leaf`]. The hint is
+    /// independently rechecked and a stale or foreign match falls back to search.
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    pub fn insert_at_leaf_with_hint(
+        &mut self,
+        pages: &mut FxHashMap<PageId, Page>,
+        alloc: &mut PageAllocator,
+        txn_id: TxnId,
+        key: &[u8],
+        val_type: ValueType,
+        value: &[u8],
+        path: Vec<(PageId, usize)>,
+        leaf_id: PageId,
+        hint: LeafEntryHint,
+    ) -> Result<(bool, Option<PageId>)> {
+        self.insert_at_leaf_impl(
+            pages,
+            alloc,
+            txn_id,
+            key,
+            val_type,
+            value,
+            path,
+            leaf_id,
+            Some(hint),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    fn insert_at_leaf_impl(
+        &mut self,
+        pages: &mut FxHashMap<PageId, Page>,
+        alloc: &mut PageAllocator,
+        txn_id: TxnId,
+        key: &[u8],
+        val_type: ValueType,
+        value: &[u8],
         mut path: Vec<(PageId, usize)>,
         leaf_id: PageId,
+        hint: Option<LeafEntryHint>,
     ) -> Result<(bool, Option<PageId>)> {
         let (existing_idx, replaced_overflow, is_append) = {
             let page = pages.get(&leaf_id).unwrap();
-            match leaf_node::search(page, key) {
-                Ok(idx) => {
-                    let cell = leaf_node::read_cell(page, idx);
+            let hinted = hint.and_then(|hint| {
+                if hint.leaf_id != leaf_id || hint.index >= page.num_cells() {
+                    return None;
+                }
+                let cell = leaf_node::read_cell(page, hint.index);
+                (cell.key == key).then_some((hint.index, cell))
+            });
+            let found = match hinted {
+                Some(found) => Ok(found),
+                None => {
+                    leaf_node::search(page, key).map(|idx| (idx, leaf_node::read_cell(page, idx)))
+                }
+            };
+            match found {
+                Ok((idx, cell)) => {
                     let head = if cell.val_type == ValueType::Overflow {
                         Some(leaf_node::OverflowRef::from_bytes(cell.value).first_page)
                     } else {
