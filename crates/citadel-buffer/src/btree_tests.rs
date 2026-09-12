@@ -1795,3 +1795,88 @@ mod rightmost_append_split {
         assert_eq!(tree.entry_count, 3);
     }
 }
+
+#[test]
+fn indexed_delete_preserves_cow_snapshots_and_sibling_paths() {
+    let (mut pages, mut alloc, mut tree) = new_tree();
+    let keys: Vec<_> = (0..128u32).map(u32::to_be_bytes).collect();
+    for (i, key) in keys.iter().enumerate() {
+        tree.insert(
+            &mut pages,
+            &mut alloc,
+            TxnId(1),
+            key,
+            ValueType::Inline,
+            &[i as u8; 128],
+        )
+        .unwrap();
+    }
+    assert!(tree.depth > 1);
+    let original = tree.clone();
+    let mut removed = vec![keys[24]];
+    assert!(tree
+        .delete(&mut pages, &mut alloc, TxnId(2), &removed[0])
+        .unwrap());
+    let checkpoint = tree.clone();
+    let checkpoint_leaf = tree.last_delete.as_ref().unwrap().1;
+
+    // Resolve middle/front/end positions after each prior deletion. The first
+    // cached deletion also clones the leaf, retaining its resolved cell index.
+    for position in 0..3 {
+        let leaf_id = tree.last_delete.as_ref().unwrap().1;
+        let page = &pages[&leaf_id];
+        let n = page.num_cells();
+        assert!(n > 3);
+        let index = match position {
+            0 => n / 2,
+            1 => 0,
+            _ => n - 1,
+        };
+        let key: [u8; 4] = leaf_node::read_cell(page, index).key.try_into().unwrap();
+        assert_eq!(
+            tree.try_lil_delete(&mut pages, &mut alloc, TxnId(3), &key)
+                .unwrap(),
+            Some((true, None))
+        );
+        assert_ne!(tree.last_delete.as_ref().unwrap().1, checkpoint_leaf);
+        removed.push(key);
+    }
+
+    let cached_leaf = tree.last_delete.as_ref().unwrap().1;
+    let sibling_key = *keys
+        .iter()
+        .find(|key| {
+            !removed.contains(key)
+                && tree.walk_to_leaf(&pages, key.as_slice()).unwrap().1 != cached_leaf
+        })
+        .unwrap();
+    assert_eq!(
+        tree.try_lil_delete(&mut pages, &mut alloc, TxnId(3), &sibling_key)
+            .unwrap(),
+        None
+    );
+    assert!(tree
+        .delete(&mut pages, &mut alloc, TxnId(3), &sibling_key)
+        .unwrap());
+    removed.push(sibling_key);
+
+    assert_eq!(original.entry_count, keys.len() as u64);
+    assert_eq!(checkpoint.entry_count, keys.len() as u64 - 1);
+    assert_eq!(tree.entry_count, (keys.len() - removed.len()) as u64);
+    for (i, key) in keys.iter().enumerate() {
+        let value = Some((ValueType::Inline, vec![i as u8; 128]));
+        assert_eq!(original.search(&pages, key).unwrap(), value);
+        assert_eq!(
+            checkpoint.search(&pages, key).unwrap(),
+            if key == &removed[0] {
+                None
+            } else {
+                value.clone()
+            }
+        );
+        assert_eq!(
+            tree.search(&pages, key).unwrap(),
+            if removed.contains(key) { None } else { value }
+        );
+    }
+}

@@ -205,3 +205,48 @@ fn cell_size_calculation() {
     assert_eq!(cell_size(5, 10), 7 + 5 + 10);
     assert_eq!(cell_size(2048, 1920), 7 + 2048 + 1920);
 }
+
+#[test]
+fn delete_at_preserves_remaining_cells_and_fragment_accounting() {
+    let overflow = OverflowRef {
+        first_page: PageId(42),
+        total_len: 4096,
+    }
+    .to_bytes();
+    let entries = [
+        (b"a".as_slice(), ValueType::Inline, b"first".as_slice()),
+        (b"b".as_slice(), ValueType::Overflow, overflow.as_slice()),
+        (
+            b"c".as_slice(),
+            ValueType::Inline,
+            b"last and longer".as_slice(),
+        ),
+    ];
+    for removed in 0..entries.len() {
+        let mut page = Page::new(PageId(0), PageType::Leaf, TxnId(1));
+        for &(key, kind, value) in &entries {
+            assert!(insert(&mut page, key, kind, value));
+        }
+        let cell_area_start = page.cell_area_start();
+        delete_at(&mut page, removed as u16);
+        assert_eq!(page.cell_area_start(), cell_area_start);
+        let cells = read_cells_checked(&page).unwrap();
+        let actual: Vec<_> = cells
+            .iter()
+            .map(|cell| (cell.key, cell.val_type, cell.value))
+            .collect();
+        let expected: Vec<_> = entries
+            .iter()
+            .enumerate()
+            .filter_map(|(i, entry)| (i != removed).then_some(*entry))
+            .collect();
+        assert_eq!(actual, expected);
+        assert!(!delete(&mut page, entries[removed].0));
+
+        // A later insertion must coexist with the hole and shifted pointers.
+        assert!(insert(&mut page, b"bb", ValueType::Inline, &[7; 128]));
+        let cells = read_cells_checked(&page).unwrap();
+        assert_eq!(cells.len(), 3);
+        assert_eq!(cells.iter().filter(|cell| cell.key == b"bb").count(), 1);
+    }
+}
