@@ -973,14 +973,34 @@ impl BTree {
         path: &mut Vec<(PageId, usize)>,
         leaf_id: PageId,
     ) -> Result<bool> {
+        self.delete_at_leaf_with_overflow(pages, alloc, txn_id, key, path, leaf_id)
+            .map(|(deleted, _)| deleted)
+    }
+
+    /// Delete from an already resolved leaf and return the retired overflow head.
+    /// `path` must lead to `leaf_id` in this tree. No mutation may change that
+    /// path between resolving it and calling this method.
+    #[allow(clippy::ptr_arg)]
+    pub fn delete_at_leaf_with_overflow(
+        &mut self,
+        pages: &mut FxHashMap<PageId, Page>,
+        alloc: &mut PageAllocator,
+        txn_id: TxnId,
+        key: &[u8],
+        path: &mut Vec<(PageId, usize)>,
+        leaf_id: PageId,
+    ) -> Result<(bool, Option<PageId>)> {
         self.clear_lil_caches();
 
-        let found_idx = {
+        let (found_idx, overflow_head) = {
             let page = pages.get(&leaf_id).unwrap();
-            leaf_node::search(page, key)
-        };
-        let Ok(found_idx) = found_idx else {
-            return Ok(false);
+            let Ok(index) = leaf_node::search(page, key) else {
+                return Ok((false, None));
+            };
+            let cell = leaf_node::read_cell(page, index);
+            let head = (cell.val_type == ValueType::Overflow)
+                .then(|| leaf_node::OverflowRef::from_bytes(cell.value).first_page);
+            (index, head)
         };
 
         let new_leaf_id = cow_page(pages, alloc, leaf_id, txn_id);
@@ -995,7 +1015,7 @@ impl BTree {
             self.root = propagate_cow_up(pages, alloc, txn_id, path, new_leaf_id);
             self.entry_count -= 1;
             self.last_delete = Some((path.clone(), new_leaf_id));
-            return Ok(true);
+            return Ok((true, overflow_head));
         }
 
         alloc.free(new_leaf_id);
@@ -1004,7 +1024,7 @@ impl BTree {
         self.root = propagate_remove_up(pages, alloc, txn_id, path, &mut self.depth);
         self.entry_count -= 1;
         self.last_delete = None;
-        Ok(true)
+        Ok((true, overflow_head))
     }
 
     /// Walk root to leaf for `key`. Returns (path, leaf_page_id).
