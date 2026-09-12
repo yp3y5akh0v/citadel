@@ -1021,3 +1021,72 @@ fn build_output_columns_aliased_expr() {
     assert_eq!(out[0].name, "renamed");
     assert_eq!(out[0].data_type, DataType::Integer);
 }
+
+#[test]
+fn fk_index_scan_budget_excludes_the_next_parent() {
+    let db = citadel::DatabaseBuilder::new("")
+        .passphrase(b"fk-prefix-budget")
+        .argon2_profile(citadel::Argon2Profile::Iot)
+        .create_in_memory()
+        .unwrap();
+    let conn = crate::Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE parent (id INTEGER NOT NULL PRIMARY KEY)")
+        .unwrap();
+    conn.execute("CREATE TABLE child (id INTEGER NOT NULL PRIMARY KEY, p INTEGER REFERENCES parent(id) ON DELETE CASCADE)")
+        .unwrap();
+    conn.execute("CREATE UNIQUE INDEX child_parent ON child (p)")
+        .unwrap();
+    conn.execute("DROP INDEX __fk_child_0").unwrap();
+    conn.execute("INSERT INTO parent VALUES (1), (2)").unwrap();
+    conn.execute("INSERT INTO child VALUES (10, 1), (20, 2)")
+        .unwrap();
+
+    let schema = crate::schema::SchemaManager::load(&db).unwrap();
+    let child = schema.get("child").unwrap();
+    let index = find_cascading_idx(child, &child.foreign_keys[0]).unwrap();
+    assert!(index.unique);
+    let parent_key = encode_composite_key(&[i(1)]);
+    let child_key = encode_composite_key(&[i(10)]);
+    let mut wtx = db.begin_write().unwrap();
+
+    // A UNIQUE FK index stores the child's primary key as its value. Only
+    // this parent's matching value may consume the exact allowance.
+    let budget = citadel_txn::ReadBudget::new(child_key.len(), child_key.len());
+    wtx.set_read_budget(Some(budget.clone()));
+    let mut hits = FkChildHits::default();
+    scan_fk_index_keys(&mut wtx, child, index, &parent_key, &mut hits).unwrap();
+    let entries = hits.entries().collect::<Vec<_>>();
+    assert_eq!(entries, vec![(parent_key.as_slice(), child_key.as_slice())]);
+    assert_eq!(budget.remaining(), 0);
+
+    // A matching value remains subject to the budget.
+    wtx.set_read_budget(Some(citadel_txn::ReadBudget::new(
+        child_key.len(),
+        child_key.len() - 1,
+    )));
+    assert!(matches!(
+        scan_fk_index_keys(
+            &mut wtx,
+            child,
+            index,
+            &parent_key,
+            &mut FkChildHits::default()
+        ),
+        Err(SqlError::Storage(
+            citadel_core::Error::ReadBudgetExceeded { .. }
+        ))
+    ));
+
+    // An absent prefix before both entries must spend nothing.
+    wtx.set_read_budget(Some(citadel_txn::ReadBudget::new(0, 0)));
+    let mut hits = FkChildHits::default();
+    scan_fk_index_keys(
+        &mut wtx,
+        child,
+        index,
+        &encode_composite_key(&[i(0)]),
+        &mut hits,
+    )
+    .unwrap();
+    assert!(hits.is_empty());
+}

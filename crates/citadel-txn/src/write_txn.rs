@@ -776,19 +776,16 @@ impl<'db> WriteTxn<'db> {
             match cell.val_type {
                 ValueType::Tombstone => {}
                 ValueType::Inline => {
-                    let entry = cursor.current_ref_lazy(&mut view).unwrap();
                     if let Some(budget) = &budget {
-                        budget.try_charge(entry.value.len())?;
+                        budget.try_charge(cell.value.len())?;
                     }
-                    if !f(entry.key, entry.value)? {
+                    if !f(cell.key, cell.value)? {
                         break;
                     }
                 }
                 ValueType::Overflow => {
-                    let (key, oref) = {
-                        let c = cursor.current_ref_lazy(&mut view).unwrap();
-                        (c.key.to_vec(), OverflowRef::from_bytes(c.value))
-                    };
+                    let key = cell.key.to_vec();
+                    let oref = OverflowRef::from_bytes(cell.value);
                     let materialized = overflow_io::read_chain_value_with_budget(
                         &mut view,
                         &oref,
