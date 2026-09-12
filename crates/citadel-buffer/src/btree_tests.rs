@@ -1227,6 +1227,111 @@ mod rightmost_append_split {
         dense_sequential(Route::IfAbsentAtLeaf, true);
     }
 
+    fn assert_append_cache(tree: &BTree, pages: &FxHashMap<PageId, Page>, next: &[u8]) {
+        let expected = tree.walk_to_leaf(pages, next).unwrap();
+        assert_eq!(tree.last_insert.as_ref(), Some(&expected));
+        assert!(tree.lil_would_hit(pages, next));
+        assert!(tree.last_delete.is_none());
+    }
+
+    #[test]
+    fn splits_retain_exact_append_path_across_routes_and_cow() {
+        for route in [
+            Route::Insert,
+            Route::IfAbsent,
+            Route::OrFetch,
+            Route::Lil,
+            Route::AtLeaf,
+            Route::IfAbsentAtLeaf,
+        ] {
+            for cold in [false, true] {
+                let (mut pages, mut alloc, mut tree) = new_tree();
+                let mut expected = Expected::new();
+                for id in 0..32 {
+                    let key = wide_key(id);
+                    let value = payload(id, 1_024);
+                    insert_new(
+                        &mut tree,
+                        &mut pages,
+                        &mut alloc,
+                        TxnId(1),
+                        &key,
+                        &value,
+                        route,
+                        cold,
+                    );
+                    expected.insert(key, (ValueType::Inline, value));
+                    assert_append_cache(&tree, &pages, &wide_key(id + 1));
+                }
+                let snapshot = tree.clone();
+                let original = expected.clone();
+                for id in 32..96 {
+                    let key = wide_key(id);
+                    let value = payload(id, 1_024);
+                    insert_new(
+                        &mut tree,
+                        &mut pages,
+                        &mut alloc,
+                        TxnId(2),
+                        &key,
+                        &value,
+                        route,
+                        cold,
+                    );
+                    expected.insert(key, (ValueType::Inline, value));
+                    assert_append_cache(&tree, &pages, &wide_key(id + 1));
+                }
+                assert!(tree.depth >= 4, "fixture must split branches and roots");
+                assert_contents(&snapshot, &pages, &original);
+                assert_contents(&tree, &pages, &expected);
+
+                // The retained path must also survive a new CoW epoch when it
+                // is consumed directly by the public fast route.
+                let next = wide_key(96);
+                assert_eq!(
+                    tree.try_lil_insert(
+                        &mut pages,
+                        &mut alloc,
+                        TxnId(3),
+                        &next,
+                        ValueType::Inline,
+                        b"after split",
+                    )
+                    .unwrap(),
+                    Some(true)
+                );
+                expected.insert(next, (ValueType::Inline, b"after split".to_vec()));
+                assert_append_cache(&tree, &pages, &wide_key(97));
+                assert_contents(&tree, &pages, &expected);
+                assert_contents(&snapshot, &pages, &original);
+
+                // Deletes and external CoW rerooting still invalidate the
+                // append cache, including paths retained from a split.
+                assert!(tree
+                    .delete(&mut pages, &mut alloc, TxnId(3), &wide_key(96))
+                    .unwrap());
+                assert!(tree.last_insert.is_none());
+                expected.remove(&wide_key(96));
+                insert_new(
+                    &mut tree,
+                    &mut pages,
+                    &mut alloc,
+                    TxnId(3),
+                    &wide_key(97),
+                    b"reprimed",
+                    route,
+                    false,
+                );
+                expected.insert(wide_key(97), (ValueType::Inline, b"reprimed".to_vec()));
+                assert_append_cache(&tree, &pages, &wide_key(98));
+                tree.reroot_after_external_cow(tree.root);
+                assert!(tree.last_insert.is_none());
+                assert!(tree.last_delete.is_none());
+                assert_contents(&tree, &pages, &expected);
+            }
+        }
+    }
+
     #[test]
     fn deep_append_and_deletion_preserve_cow_snapshot() {
         for route in [Route::Insert, Route::IfAbsent, Route::OrFetch] {
@@ -1357,6 +1462,7 @@ mod rightmost_append_split {
                     )
                     .unwrap());
             }
+            assert!(tree.last_insert.is_none());
             expected.insert(last_key.clone(), (ValueType::Inline, grown));
             assert_contents(&tree, &pages, &expected);
             assert_contents(&snapshot, &pages, &original);
@@ -1456,6 +1562,7 @@ mod rightmost_append_split {
                     .is_none()),
                 _ => unreachable!(),
             }
+            assert!(tree.last_insert.is_none());
             expected.insert(last_key, (ValueType::Inline, grown));
             // The existing APIs count tombstone revival as an insertion;
             // verify physical rows here to isolate split classification.
@@ -1562,6 +1669,7 @@ mod rightmost_append_split {
             );
             expected.insert(key(id), (ValueType::Inline, value));
             assert_contents(&tree, &pages, &expected);
+            assert!(tree.last_insert.is_none());
             let leaves = leaf_ids(&tree, &pages);
             assert_eq!(leaves.len(), 3);
             assert!(

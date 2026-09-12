@@ -209,13 +209,15 @@ impl BTree {
             pages,
             alloc,
             txn_id,
-            &cached_path,
+            &mut cached_path,
             cow_id,
             &sep_key,
             right_id,
             &mut self.depth,
+            true,
         );
-        self.clear_lil_caches();
+        self.last_delete = None;
+        self.last_insert = Some((cached_path, right_id));
         self.entry_count += 1;
         Ok(Some(true))
     }
@@ -358,13 +360,15 @@ impl BTree {
                     pages,
                     alloc,
                     txn_id,
-                    &cached_path,
+                    &mut cached_path,
                     cow_id,
                     &sep_key,
                     right_id,
                     &mut self.depth,
+                    true,
                 );
-                self.clear_lil_caches();
+                self.last_delete = None;
+                self.last_insert = Some((cached_path, right_id));
                 self.entry_count += 1;
                 return Ok(true);
             }
@@ -386,7 +390,7 @@ impl BTree {
         key: &[u8],
         val_type: ValueType,
         value: &[u8],
-        path: Vec<(PageId, usize)>,
+        mut path: Vec<(PageId, usize)>,
         leaf_id: PageId,
     ) -> Result<(bool, Option<PageId>)> {
         let (existing_idx, replaced_overflow, is_append) = {
@@ -468,12 +472,16 @@ impl BTree {
             pages,
             alloc,
             txn_id,
-            &path,
+            &mut path,
             new_leaf_id,
             &sep_key,
             right_id,
             &mut self.depth,
+            append_rightmost,
         );
+        if append_rightmost {
+            self.last_insert = Some((path, right_id));
+        }
 
         if !key_exists {
             self.entry_count += 1;
@@ -530,13 +538,15 @@ impl BTree {
                     pages,
                     alloc,
                     txn_id,
-                    &cached_path,
+                    &mut cached_path,
                     cow_id,
                     &sep_key,
                     right_id,
                     &mut self.depth,
+                    true,
                 );
-                self.clear_lil_caches();
+                self.last_delete = None;
+                self.last_insert = Some((cached_path, right_id));
                 self.entry_count += 1;
                 return Ok(None);
             }
@@ -544,7 +554,23 @@ impl BTree {
         }
 
         let (path, leaf_id) = self.walk_to_leaf(pages, key)?;
+        self.insert_or_fetch_at_leaf(pages, alloc, txn_id, key, val_type, value, path, leaf_id)
+    }
 
+    /// Insert or return the existing cell using an already loaded search path.
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    pub fn insert_or_fetch_at_leaf(
+        &mut self,
+        pages: &mut FxHashMap<PageId, Page>,
+        alloc: &mut PageAllocator,
+        txn_id: TxnId,
+        key: &[u8],
+        val_type: ValueType,
+        value: &[u8],
+        mut path: Vec<(PageId, usize)>,
+        leaf_id: PageId,
+    ) -> Result<Option<(ValueType, Vec<u8>)>> {
         let (existing_value, is_append) = {
             let page = pages.get(&leaf_id).unwrap();
             match leaf_node::search(page, key) {
@@ -616,12 +642,16 @@ impl BTree {
             pages,
             alloc,
             txn_id,
-            &path,
+            &mut path,
             new_leaf_id,
             &sep_key,
             right_id,
             &mut self.depth,
+            append_rightmost,
         );
+        if append_rightmost {
+            self.last_insert = Some((path, right_id));
+        }
         self.entry_count += 1;
         Ok(None)
     }
@@ -673,13 +703,15 @@ impl BTree {
                     pages,
                     alloc,
                     txn_id,
-                    &cached_path,
+                    &mut cached_path,
                     cow_id,
                     &sep_key,
                     right_id,
                     &mut self.depth,
+                    true,
                 );
-                self.clear_lil_caches();
+                self.last_delete = None;
+                self.last_insert = Some((cached_path, right_id));
                 self.entry_count += 1;
                 return Ok(true);
             }
@@ -700,7 +732,7 @@ impl BTree {
         key: &[u8],
         val_type: ValueType,
         value: &[u8],
-        path: Vec<(PageId, usize)>,
+        mut path: Vec<(PageId, usize)>,
         leaf_id: PageId,
     ) -> Result<bool> {
         let (exists, is_append) = {
@@ -770,12 +802,16 @@ impl BTree {
             pages,
             alloc,
             txn_id,
-            &path,
+            &mut path,
             new_leaf_id,
             &sep_key,
             right_id,
             &mut self.depth,
+            append_rightmost,
         );
+        if append_rightmost {
+            self.last_insert = Some((path, right_id));
+        }
         self.entry_count += 1;
         Ok(true)
     }
@@ -896,11 +932,12 @@ impl BTree {
                         pages,
                         alloc,
                         txn_id,
-                        &path,
+                        &mut path,
                         cow_leaf,
                         &sep_key,
                         right_id,
                         &mut self.depth,
+                        false,
                     );
                     // Leaf contents and `path` are stale after the split.
                     need_walk = true;
@@ -1144,21 +1181,25 @@ fn split_leaf_with_insert(
     (sep_key, right_id)
 }
 
+/// Propagate a split, optionally retaining the path to its new rightmost leaf.
+/// `retain_rightmost` requires that the input path follows every right child.
 #[allow(clippy::too_many_arguments)]
 fn propagate_split_up(
     pages: &mut FxHashMap<PageId, Page>,
     alloc: &mut PageAllocator,
     txn_id: TxnId,
-    path: &[(PageId, usize)],
+    path: &mut Vec<(PageId, usize)>,
     mut left_child: PageId,
     initial_sep: &[u8],
     mut right_child: PageId,
     depth: &mut u16,
+    retain_rightmost: bool,
 ) -> PageId {
     let mut sep_key = initial_sep.to_vec();
     let mut pending_split = true;
 
-    for &(ancestor_id, child_idx) in path.iter().rev() {
+    for i in (0..path.len()).rev() {
+        let (ancestor_id, child_idx) = path[i];
         let new_ancestor = cow_page(pages, alloc, ancestor_id, txn_id);
 
         if pending_split {
@@ -1168,6 +1209,9 @@ fn propagate_split_up(
             };
 
             if ok {
+                if retain_rightmost {
+                    path[i] = (new_ancestor, child_idx + 1);
+                }
                 pending_split = false;
                 left_child = new_ancestor;
             } else {
@@ -1181,6 +1225,10 @@ fn propagate_split_up(
                     &sep_key,
                     right_child,
                 );
+                if retain_rightmost {
+                    let right_index = pages.get(&new_right).unwrap().num_cells() as usize;
+                    path[i] = (new_right, right_index);
+                }
                 left_child = new_ancestor;
                 sep_key = new_sep;
                 right_child = new_right;
@@ -1188,6 +1236,9 @@ fn propagate_split_up(
         } else {
             let page = pages.get_mut(&new_ancestor).unwrap();
             update_branch_child(page, child_idx, left_child);
+            if retain_rightmost {
+                path[i] = (new_ancestor, child_idx);
+            }
             left_child = new_ancestor;
         }
     }
@@ -1200,6 +1251,9 @@ fn propagate_split_up(
         new_root.set_right_child(right_child);
         pages.insert(new_root_id, new_root);
         *depth += 1;
+        if retain_rightmost {
+            path.insert(0, (new_root_id, 1));
+        }
         new_root_id
     } else {
         left_child
