@@ -2361,9 +2361,6 @@ impl<'db> WriteTxn<'db> {
         path.clear();
         let mut current = root;
         loop {
-            if path.iter().any(|&(ancestor, _)| ancestor == current) {
-                return Err(Error::DatabaseCorrupted);
-            }
             let page = match pages.entry(current) {
                 std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
                 std::collections::hash_map::Entry::Vacant(e) => {
@@ -2374,6 +2371,11 @@ impl<'db> WriteTxn<'db> {
             match page.page_type() {
                 Some(PageType::Leaf) => return Ok(current),
                 Some(PageType::Branch) => {
+                    // Only branches enter path, and loaded pages stay unchanged
+                    // during this private descent. A leaf cannot repeat an ancestor.
+                    if path.iter().any(|&(ancestor, _)| ancestor == current) {
+                        return Err(Error::DatabaseCorrupted);
+                    }
                     let idx = branch_node::search_child_index(page, key);
                     let child = branch_node::get_child(page, idx);
                     path.push((current, idx));
