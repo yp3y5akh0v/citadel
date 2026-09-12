@@ -31,9 +31,7 @@ pub fn encode_key_value(value: &Value) -> Vec<u8> {
 /// Encode a composite key (multiple values concatenated).
 pub fn encode_composite_key(values: &[Value]) -> Vec<u8> {
     let mut buf = Vec::new();
-    for v in values {
-        buf.extend_from_slice(&encode_key_value(v));
-    }
+    encode_composite_key_into(values, &mut buf);
     buf
 }
 
