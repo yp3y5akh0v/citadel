@@ -1,6 +1,6 @@
 //! Leaf node ops. Cell: `[key_len:u16][val_len:u32][key][val_type:u8][value]`
 
-use crate::page::{checked_cell_offsets, validate_cell_layout, CellDecodeError, CellSpan, Page};
+use crate::page::{checked_cell_offsets, CellDecodeError, CellLayout, CellSpan, Page};
 use citadel_core::types::{PageId, PageType, ValueType};
 use citadel_core::{BODY_SIZE, MAX_VALUE_SIZE};
 
@@ -77,7 +77,7 @@ fn decode_cells_checked<const COLLECT: bool>(
 
     let offsets = checked_cell_offsets(page)?;
     let mut cells = Vec::with_capacity(if COLLECT { offsets.len() } else { 0 });
-    let mut spans = Vec::with_capacity(offsets.len());
+    let mut layout = CellLayout::new(&offsets);
     let mut previous_key: Option<&[u8]> = None;
     let mut bad_key_order = None;
     let mut bad_overflow = None;
@@ -120,7 +120,7 @@ fn decode_cells_checked<const COLLECT: bool>(
                 "leaf cell {index} has invalid value type {raw_type}"
             ))
         })?;
-        spans.push(CellSpan {
+        layout.push(CellSpan {
             index,
             start: offset,
             end,
@@ -141,7 +141,7 @@ fn decode_cells_checked<const COLLECT: bool>(
             cells.push(cell);
         }
     }
-    validate_cell_layout(page, &mut spans)?;
+    layout.finish(page)?;
 
     // Aggregate layout errors precede ordering and overflow-reference errors.
     if let Some(index) = bad_key_order {

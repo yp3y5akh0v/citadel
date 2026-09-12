@@ -7,7 +7,7 @@
 //! - cell[i].child handles keys where key[i-1] <= k < key[i] (key[-1] = -∞)
 //! - right_child handles keys where key[n-1] <= k
 
-use crate::page::{checked_cell_offsets, validate_cell_layout, CellDecodeError, CellSpan, Page};
+use crate::page::{checked_cell_offsets, CellDecodeError, CellLayout, CellSpan, Page};
 use citadel_core::types::{PageId, PageType};
 use citadel_core::BODY_SIZE;
 
@@ -57,7 +57,7 @@ fn decode_cells_checked<const COLLECT: bool>(
 
     let offsets = checked_cell_offsets(page)?;
     let mut cells = Vec::with_capacity(if COLLECT { offsets.len() } else { 0 });
-    let mut spans = Vec::with_capacity(offsets.len());
+    let mut layout = CellLayout::new(&offsets);
     let mut children = Vec::with_capacity(offsets.len() + 1);
     let mut previous_key: Option<&[u8]> = None;
     let mut bad_key_order = None;
@@ -85,7 +85,7 @@ fn decode_cells_checked<const COLLECT: bool>(
                 "branch cell {index} key ends at {end}, beyond page body {BODY_SIZE}"
             )));
         }
-        spans.push(CellSpan {
+        layout.push(CellSpan {
             index,
             start: offset,
             end,
@@ -103,7 +103,7 @@ fn decode_cells_checked<const COLLECT: bool>(
             cells.push(cell);
         }
     }
-    validate_cell_layout(page, &mut spans)?;
+    layout.finish(page)?;
 
     // Aggregate layout errors precede separator and child-pointer errors.
     if let Some(index) = bad_key_order {

@@ -34,10 +34,45 @@ pub(crate) struct CellSpan {
     pub end: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CellOffsetOrder {
+    Ascending,
+    Descending,
+    Unordered,
+}
+
+/// Borrowed pointer offsets whose complete array has already passed validation.
+pub(crate) struct CheckedCellOffsets<'a> {
+    offsets: std::slice::Iter<'a, [u8; 2]>,
+    order: CellOffsetOrder,
+}
+
+impl CheckedCellOffsets<'_> {
+    pub(crate) fn order(&self) -> CellOffsetOrder {
+        self.order
+    }
+}
+
+impl Iterator for CheckedCellOffsets<'_> {
+    type Item = usize;
+
+    #[inline]
+    fn next(&mut self) -> Option<usize> {
+        self.offsets
+            .next()
+            .map(|pointer| u16::from_le_bytes(*pointer) as usize)
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.offsets.size_hint()
+    }
+}
+
+impl ExactSizeIterator for CheckedCellOffsets<'_> {}
+
 /// Validate the entire cell-pointer array before exposing borrowed offsets.
-pub(crate) fn checked_cell_offsets(
-    page: &Page,
-) -> Result<impl ExactSizeIterator<Item = usize> + '_, CellDecodeError> {
+pub(crate) fn checked_cell_offsets(page: &Page) -> Result<CheckedCellOffsets<'_>, CellDecodeError> {
     let count = page.num_cells() as usize;
     let pointer_bytes = count.checked_mul(2).ok_or_else(|| {
         CellDecodeError::new(format!(
@@ -62,19 +97,121 @@ pub(crate) fn checked_cell_offsets(
         )));
     }
 
-    let offsets = page.data[PAGE_HEADER_SIZE..pointer_end]
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pointer| u16::from_le_bytes(*pointer) as usize);
-    for (index, offset) in offsets.clone().enumerate() {
+    let pointers = page.data[PAGE_HEADER_SIZE..pointer_end].as_chunks::<2>().0;
+    let mut ascending = true;
+    let mut descending = true;
+    let mut previous = None;
+    for (index, pointer) in pointers.iter().enumerate() {
+        let offset = u16::from_le_bytes(*pointer) as usize;
         if offset < cell_area_start || offset >= BODY_SIZE {
             return Err(CellDecodeError::new(format!(
                 "cell {index} offset {offset} lies outside cell area {cell_area_start}..{BODY_SIZE}"
             )));
         }
+        if let Some(previous) = previous {
+            ascending &= previous < offset;
+            descending &= previous > offset;
+        }
+        previous = Some(offset);
     }
-    Ok(offsets)
+    let order = if ascending {
+        CellOffsetOrder::Ascending
+    } else if descending {
+        CellOffsetOrder::Descending
+    } else {
+        CellOffsetOrder::Unordered
+    };
+    Ok(CheckedCellOffsets {
+        offsets: pointers.iter(),
+        order,
+    })
+}
+
+/// Accumulate layout evidence while the shared cell parser visits logical order.
+/// Ordered pointers need only adjacent spans; arbitrary or duplicate pointers
+/// retain the existing sorted-span validation.
+pub(crate) enum CellLayout {
+    Ordered {
+        descending: bool,
+        cell_count: usize,
+        cell_bytes: Option<usize>,
+        previous: Option<CellSpan>,
+        overlap: Option<(CellSpan, CellSpan)>,
+    },
+    Unordered(Vec<CellSpan>),
+}
+
+impl CellLayout {
+    pub(crate) fn new(offsets: &CheckedCellOffsets<'_>) -> Self {
+        match offsets.order() {
+            CellOffsetOrder::Ascending | CellOffsetOrder::Descending => Self::Ordered {
+                descending: offsets.order() == CellOffsetOrder::Descending,
+                cell_count: offsets.len(),
+                cell_bytes: Some(0),
+                previous: None,
+                overlap: None,
+            },
+            CellOffsetOrder::Unordered => Self::Unordered(Vec::with_capacity(offsets.len())),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn push(&mut self, span: CellSpan) {
+        match self {
+            Self::Ordered {
+                descending,
+                cell_bytes,
+                previous,
+                overlap,
+                ..
+            } => {
+                *cell_bytes = cell_bytes.and_then(|total| total.checked_add(span.end - span.start));
+                if let Some(previous) = *previous {
+                    let (lower, upper) = if *descending {
+                        (span, previous)
+                    } else {
+                        (previous, span)
+                    };
+                    if spans_overlap(lower, upper) && (*descending || overlap.is_none()) {
+                        // Descending traversal encounters lower physical pairs later.
+                        // Retain the last overlap there, and the first when ascending.
+                        *overlap = Some((lower, upper));
+                    }
+                }
+                *previous = Some(span);
+            }
+            Self::Unordered(spans) => spans.push(span),
+        }
+    }
+
+    pub(crate) fn finish(self, page: &Page) -> Result<(), CellDecodeError> {
+        match self {
+            Self::Ordered {
+                cell_count,
+                cell_bytes,
+                overlap,
+                ..
+            } => {
+                if let Some((lower, upper)) = overlap {
+                    return Err(overlap_error(lower, upper));
+                }
+                validate_cell_accounting(page, cell_count, cell_bytes)
+            }
+            Self::Unordered(mut spans) => validate_cell_layout(page, &mut spans),
+        }
+    }
+}
+
+#[inline]
+fn spans_overlap(lower: CellSpan, upper: CellSpan) -> bool {
+    lower.end > upper.start
+}
+
+fn overlap_error(lower: CellSpan, upper: CellSpan) -> CellDecodeError {
+    CellDecodeError::new(format!(
+        "cells {} and {} overlap at byte {}",
+        lower.index, upper.index, upper.start
+    ))
 }
 
 /// Validate relationships common to every slotted-page cell format: live cells may
@@ -84,22 +221,29 @@ pub(crate) fn validate_cell_layout(
     spans: &mut [CellSpan],
 ) -> Result<(), CellDecodeError> {
     spans.sort_unstable_by_key(|span| span.start);
-    if let Some(pair) = spans.windows(2).find(|pair| pair[0].end > pair[1].start) {
-        return Err(CellDecodeError::new(format!(
-            "cells {} and {} overlap at byte {}",
-            pair[0].index, pair[1].index, pair[1].start
-        )));
+    if let Some(pair) = spans
+        .windows(2)
+        .find(|pair| spans_overlap(pair[0], pair[1]))
+    {
+        return Err(overlap_error(pair[0], pair[1]));
     }
 
-    let pointer_bytes = spans
-        .len()
+    let cell_bytes = spans.iter().try_fold(0usize, |total, span| {
+        total.checked_add(span.end - span.start)
+    });
+    validate_cell_accounting(page, spans.len(), cell_bytes)
+}
+
+fn validate_cell_accounting(
+    page: &Page,
+    cell_count: usize,
+    cell_bytes: Option<usize>,
+) -> Result<(), CellDecodeError> {
+    let pointer_bytes = cell_count
         .checked_mul(2)
         .ok_or_else(|| CellDecodeError::new("free-space pointer accounting overflow"))?;
-    let cell_bytes = spans.iter().try_fold(0usize, |total, span| {
-        total
-            .checked_add(span.end - span.start)
-            .ok_or_else(|| CellDecodeError::new("free-space cell accounting overflow"))
-    })?;
+    let cell_bytes =
+        cell_bytes.ok_or_else(|| CellDecodeError::new("free-space cell accounting overflow"))?;
     let expected = USABLE_SIZE
         .checked_sub(pointer_bytes)
         .and_then(|space| space.checked_sub(cell_bytes))
