@@ -395,36 +395,14 @@ pub(super) fn exec_insert(
         }
 
         for fk in &table_schema.foreign_keys {
-            let any_null = fk.columns.iter().any(|&ci| row[ci as usize].is_null());
-            if any_null {
-                continue; // MATCH SIMPLE: skip if any FK col is NULL
-            }
-            let fk_vals: Vec<Value> = fk
-                .columns
-                .iter()
-                .map(|&ci| row[ci as usize].clone())
-                .collect();
-            fk_key_buf.clear();
-            encode_composite_key_into(&fk_vals, &mut fk_key_buf);
-            if fk.deferrable && fk.initially_deferred {
-                let name = fk.name.as_deref().unwrap_or(&fk.foreign_table).to_string();
-                wtx.defer_fk_check(citadel_txn::write_txn::DeferredFkCheck {
-                    fk_name: name,
-                    foreign_table: fk.foreign_table.as_bytes().to_vec(),
-                    parent_key: fk_key_buf.clone(),
-                });
-                continue;
-            }
-            if !wtx.fk_check_cached(fk.foreign_table.as_bytes(), &fk_key_buf) {
-                let found = wtx
-                    .table_get(fk.foreign_table.as_bytes(), &fk_key_buf)
-                    .map_err(SqlError::Storage)?;
-                if found.is_none() {
-                    let name = fk.name.as_deref().unwrap_or(&fk.foreign_table);
-                    return Err(SqlError::ForeignKeyViolation(name.to_string()));
-                }
-                wtx.mark_fk_verified(fk.foreign_table.as_bytes(), &fk_key_buf);
-            }
+            super::fk::check_row_reference(
+                &mut wtx,
+                schema,
+                table_schema,
+                fk,
+                &row,
+                &mut fk_key_buf,
+            )?;
         }
 
         if has_before_insert_triggers {
@@ -526,6 +504,7 @@ pub(super) fn exec_insert(
                 }
                 let outcome = apply_insert_with_conflict(
                     &mut wtx,
+                    schema,
                     table_schema,
                     &key_buf,
                     &value_buf,
@@ -641,12 +620,12 @@ pub(super) fn exec_insert(
             &rows,
             wtx.cancel_token(),
         )?;
-        super::helpers::drain_deferred_fk_checks(&mut wtx)?;
+        super::helpers::drain_deferred_fk_checks(&mut wtx, schema)?;
         super::commit_with_ann_publication(wtx, schema)?;
         return Ok(ExecutionResult::Query(qr));
     }
 
-    super::helpers::drain_deferred_fk_checks(&mut wtx)?;
+    super::helpers::drain_deferred_fk_checks(&mut wtx, schema)?;
     super::commit_with_ann_publication(wtx, schema)?;
     Ok(ExecutionResult::RowsAffected(count))
 }
@@ -2179,34 +2158,14 @@ fn exec_insert_in_txn_impl(
 
         if has_fks {
             for fk in &table_schema.foreign_keys {
-                let any_null = fk.columns.iter().any(|&ci| bufs.row[ci as usize].is_null());
-                if any_null {
-                    continue;
-                }
-                crate::encoding::encode_composite_key_from_indices(
-                    &fk.columns,
+                super::fk::check_row_reference(
+                    wtx,
+                    schema,
+                    table_schema,
+                    fk,
                     &bufs.row,
                     &mut bufs.fk_key_buf,
-                );
-                if fk.deferrable && fk.initially_deferred {
-                    let name = fk.name.as_deref().unwrap_or(&fk.foreign_table).to_string();
-                    wtx.defer_fk_check(citadel_txn::write_txn::DeferredFkCheck {
-                        fk_name: name,
-                        foreign_table: fk.foreign_table.as_bytes().to_vec(),
-                        parent_key: bufs.fk_key_buf.clone(),
-                    });
-                    continue;
-                }
-                if !wtx.fk_check_cached(fk.foreign_table.as_bytes(), &bufs.fk_key_buf) {
-                    let found = wtx
-                        .table_get(fk.foreign_table.as_bytes(), &bufs.fk_key_buf)
-                        .map_err(SqlError::Storage)?;
-                    if found.is_none() {
-                        let name = fk.name.as_deref().unwrap_or(&fk.foreign_table);
-                        return Err(SqlError::ForeignKeyViolation(name.to_string()));
-                    }
-                    wtx.mark_fk_verified(fk.foreign_table.as_bytes(), &bufs.fk_key_buf);
-                }
+                )?;
             }
         }
 
@@ -2336,6 +2295,7 @@ fn exec_insert_in_txn_impl(
                 }
                 let outcome = apply_insert_with_conflict(
                     wtx,
+                    schema,
                     table_schema,
                     &bufs.key_buf,
                     &bufs.value_buf,
@@ -3071,6 +3031,7 @@ pub(super) enum InsertRowOutcome {
 #[inline]
 pub(super) fn apply_insert_with_conflict(
     wtx: &mut WriteTxn<'_>,
+    schema: &SchemaManager,
     table_schema: &TableSchema,
     key_buf: &[u8],
     value_buf: &[u8],
@@ -3169,6 +3130,7 @@ pub(super) fn apply_insert_with_conflict(
                                 fetch_unique_index_pk(wtx, table_schema, conflicting_idx, row)?;
                             apply_do_update(
                                 wtx,
+                                schema,
                                 table_schema,
                                 &existing_pk,
                                 row,
@@ -3209,6 +3171,7 @@ pub(super) fn apply_insert_with_conflict(
                         decode_full_row_with_cancel(table_schema, key_buf, &old_bytes, cancel)?;
                     apply_do_update_with_old_row(
                         wtx,
+                        schema,
                         table_schema,
                         key_buf,
                         &old_row,
@@ -3488,6 +3451,7 @@ fn fetch_unique_index_pk(
 #[allow(clippy::too_many_arguments)]
 fn apply_do_update(
     wtx: &mut WriteTxn<'_>,
+    schema: &SchemaManager,
     table_schema: &TableSchema,
     pk_key: &[u8],
     proposed_row: &[Value],
@@ -3504,6 +3468,7 @@ fn apply_do_update(
     let old_row = decode_full_row_with_cancel(table_schema, pk_key, &old_value, cancel)?;
     apply_do_update_with_old_row(
         wtx,
+        schema,
         table_schema,
         pk_key,
         &old_row,
@@ -3519,6 +3484,7 @@ fn apply_do_update(
 #[allow(clippy::too_many_arguments)]
 fn apply_do_update_with_old_row(
     wtx: &mut WriteTxn<'_>,
+    schema: &SchemaManager,
     table_schema: &TableSchema,
     old_pk_key: &[u8],
     old_row: &[Value],
@@ -3608,42 +3574,15 @@ fn apply_do_update_with_old_row(
             }
         }
     }
+    let mut fk_key = Vec::new();
     for fk in &table_schema.foreign_keys {
-        let changed = fk
-            .columns
-            .iter()
-            .any(|&ci| old_row[ci as usize] != new_row[ci as usize]);
-        if !changed {
-            continue;
-        }
-        let any_null = fk.columns.iter().any(|&ci| new_row[ci as usize].is_null());
-        if any_null {
-            continue;
-        }
-        let fk_vals: Vec<Value> = fk
-            .columns
-            .iter()
-            .map(|&ci| new_row[ci as usize].clone())
-            .collect();
-        let fk_key = crate::encoding::encode_composite_key(&fk_vals);
-        if fk.deferrable && fk.initially_deferred {
-            let name = fk.name.as_deref().unwrap_or(&fk.foreign_table).to_string();
-            wtx.defer_fk_check(citadel_txn::write_txn::DeferredFkCheck {
-                fk_name: name,
-                foreign_table: fk.foreign_table.as_bytes().to_vec(),
-                parent_key: fk_key,
-            });
-            continue;
-        }
-        if !wtx.fk_check_cached(fk.foreign_table.as_bytes(), &fk_key) {
-            let found = wtx
-                .table_get(fk.foreign_table.as_bytes(), &fk_key)
-                .map_err(SqlError::Storage)?;
-            if found.is_none() {
-                let name = fk.name.as_deref().unwrap_or(&fk.foreign_table);
-                return Err(SqlError::ForeignKeyViolation(name.to_string()));
-            }
-            wtx.mark_fk_verified(fk.foreign_table.as_bytes(), &fk_key);
+        if pk_changed
+            || fk
+                .columns
+                .iter()
+                .any(|&ci| old_row[ci as usize] != new_row[ci as usize])
+        {
+            super::fk::check_row_reference(wtx, schema, table_schema, fk, &new_row, &mut fk_key)?;
         }
     }
 
@@ -4223,7 +4162,10 @@ impl CompiledInsert {
                 && generated_fast_evals
                     .iter()
                     .all(|fe| !matches!(fe, FastGenEval::None));
-            let trivial_fast_program = if is_trivial_fast_eligible {
+            let trivial_fast_program = if is_trivial_fast_eligible
+                && ts.foreign_keys.iter().all(|fk| {
+                    fk.foreign_table != ts.name && super::fk::references_primary_key(schema, fk)
+                }) {
                 build_trivial_fast_program(
                     bind_plan.as_ref().unwrap(),
                     phys_count,

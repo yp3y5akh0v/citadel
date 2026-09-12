@@ -1025,7 +1025,8 @@ impl<'a> ConnectionInner<'a> {
 
             let commit = match self.active_txn.take() {
                 ActiveTxn::Write(mut wtx) => {
-                    match crate::executor::helpers::drain_deferred_fk_checks(&mut wtx) {
+                    match crate::executor::helpers::drain_deferred_fk_checks(&mut wtx, &self.schema)
+                    {
                         Ok(()) => {
                             executor::commit_with_ann_publication(wtx, &self.schema).map(|_| ())
                         }
@@ -1280,7 +1281,8 @@ impl<'a> ConnectionInner<'a> {
             }
             let result = match self.active_txn.take() {
                 ActiveTxn::Write(mut wtx) => {
-                    match crate::executor::helpers::drain_deferred_fk_checks(&mut wtx) {
+                    match crate::executor::helpers::drain_deferred_fk_checks(&mut wtx, &self.schema)
+                    {
                         Ok(()) => {
                             executor::commit_with_ann_publication(wtx, &self.schema).map(|_| values)
                         }
@@ -1644,7 +1646,10 @@ impl<'a> ConnectionInner<'a> {
                 let outcome = match self.active_txn.take() {
                     ActiveTxn::None => return Err(SqlError::NoActiveTransaction),
                     ActiveTxn::Write(mut wtx) => {
-                        match crate::executor::helpers::drain_deferred_fk_checks(&mut wtx) {
+                        match crate::executor::helpers::drain_deferred_fk_checks(
+                            &mut wtx,
+                            &self.schema,
+                        ) {
                             Ok(()) => {
                                 executor::commit_with_ann_publication(wtx, &self.schema).map(|_| ())
                             }

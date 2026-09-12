@@ -111,7 +111,7 @@ pub(super) fn validate_foreign_keys(
             && parent
                 .indices
                 .iter()
-                .any(|idx| idx.unique && idx.columns_vec() == ref_col_indices);
+                .any(|idx| idx.unique && idx.is_full_column_btree(&ref_col_indices));
 
         if !is_pk && !has_unique {
             return Err(SqlError::Unsupported(format!(
@@ -123,9 +123,8 @@ pub(super) fn validate_foreign_keys(
     Ok(())
 }
 
-/// Create auto-indexes from inline `UNIQUE` constraints parsed from CREATE TABLE.
-pub(super) fn create_unique_auto_indices(
-    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+/// Add inline UNIQUE definitions before validating self-referencing foreign keys.
+fn add_unique_auto_indices(
     mut table_schema: TableSchema,
     stmt: &CreateTableStmt,
 ) -> Result<TableSchema> {
@@ -148,7 +147,7 @@ pub(super) fn create_unique_auto_indices(
         if table_schema
             .indices
             .iter()
-            .any(|idx| idx.unique && idx.columns_vec() == col_idxs)
+            .any(|idx| idx.unique && idx.is_full_column_btree(&col_idxs))
         {
             continue;
         }
@@ -166,8 +165,6 @@ pub(super) fn create_unique_auto_indices(
             return Err(SqlError::IndexAlreadyExists(idx_name));
         }
 
-        let idx_table = TableSchema::index_table_name(&table_schema.name, &idx_name);
-        wtx.create_table(&idx_table).map_err(SqlError::Storage)?;
         let collations: Vec<crate::types::Collation> = col_idxs
             .iter()
             .map(|&i| table_schema.columns[i as usize].collation)
@@ -183,6 +180,17 @@ pub(super) fn create_unique_auto_indices(
         ));
     }
     Ok(table_schema)
+}
+
+fn create_unique_index_tables(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    table_schema: &TableSchema,
+) -> Result<()> {
+    for index in &table_schema.indices {
+        let name = TableSchema::index_table_name(&table_schema.name, &index.name);
+        wtx.create_table(&name).map_err(SqlError::Storage)?;
+    }
+    Ok(())
 }
 
 /// Create auto-index on child FK columns. Returns updated schema with new indices.
@@ -205,11 +213,11 @@ pub(super) fn create_fk_auto_indices(
         .collect();
 
     for (cols, idx_name) in fks {
-        // Skip if an index already covers these columns
+        // The FK probe needs all rows and the exact ordered column key.
         let already_covered = table_schema
             .indices
             .iter()
-            .any(|idx| idx.columns_vec() == cols);
+            .any(|idx| idx.is_full_column_btree(&cols));
         if already_covered {
             continue;
         }
@@ -360,6 +368,7 @@ pub(super) fn exec_create_table(
         table_schema.flags |= crate::types::TABLE_FLAG_STRICT;
     }
 
+    let table_schema = add_unique_auto_indices(table_schema, stmt)?;
     validate_foreign_keys(schema, &table_schema, &table_schema.foreign_keys)?;
 
     let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
@@ -367,7 +376,7 @@ pub(super) fn exec_create_table(
     wtx.create_table(lower_name.as_bytes())
         .map_err(SqlError::Storage)?;
 
-    let table_schema = create_unique_auto_indices(&mut wtx, table_schema, stmt)?;
+    create_unique_index_tables(&mut wtx, &table_schema)?;
     let table_schema = create_fk_auto_indices(&mut wtx, table_schema)?;
 
     SchemaManager::save_schema(&mut wtx, &table_schema)?;
@@ -540,13 +549,14 @@ pub(super) fn exec_create_table_in_txn(
         table_schema.flags |= crate::types::TABLE_FLAG_STRICT;
     }
 
+    let table_schema = add_unique_auto_indices(table_schema, stmt)?;
     validate_foreign_keys(schema, &table_schema, &table_schema.foreign_keys)?;
 
     SchemaManager::ensure_schema_table(wtx)?;
     wtx.create_table(lower_name.as_bytes())
         .map_err(SqlError::Storage)?;
 
-    let table_schema = create_unique_auto_indices(wtx, table_schema, stmt)?;
+    create_unique_index_tables(wtx, &table_schema)?;
     let table_schema = create_fk_auto_indices(wtx, table_schema)?;
 
     SchemaManager::save_schema(wtx, &table_schema)?;
@@ -850,15 +860,14 @@ fn ensure_drop_index_keeps_fk_backing(table_schema: &TableSchema, idx_lower: &st
     let Some(dropped) = table_schema.index_by_name(idx_lower) else {
         return Ok(());
     };
-    let dropped_cols = dropped.columns_vec();
     for fk in &table_schema.foreign_keys {
-        if dropped_cols != fk.columns {
+        if !dropped.is_full_column_btree(&fk.columns) {
             continue;
         }
         let other_covers = table_schema
             .indices
             .iter()
-            .any(|i| i.name != idx_lower && i.columns_vec() == fk.columns);
+            .any(|i| i.name != idx_lower && i.is_full_column_btree(&fk.columns));
         if !other_covers {
             return Err(SqlError::Unsupported(format!(
                 "cannot drop index '{}': required to enforce a foreign key on '{}'",
@@ -1483,7 +1492,7 @@ pub(super) fn alter_rename_column(
         }
     }
 
-    // Update self-referencing FK referred_columns (cross-table FKs resolve by name at load)
+    // Update self-referencing FK referred_columns.
     for fk in &mut new_schema.foreign_keys {
         if fk.foreign_table == table_name {
             for rc in &mut fk.referred_columns {
@@ -1506,8 +1515,29 @@ pub(super) fn alter_rename_column(
         }
     }
 
+    let child_tables: rustc_hash::FxHashSet<String> = schema
+        .child_fks_for(table_name)
+        .into_iter()
+        .filter(|(child, _)| *child != table_name)
+        .map(|(child, _)| child.to_string())
+        .collect();
+    for child_table in child_tables {
+        let mut child = schema.get(&child_table).unwrap().clone();
+        for fk in &mut child.foreign_keys {
+            if fk.foreign_table == table_name {
+                for column in &mut fk.referred_columns {
+                    if *column == old_lower {
+                        *column = new_lower.clone();
+                    }
+                }
+            }
+        }
+        SchemaManager::save_schema(wtx, &child)?;
+        schema.register(child);
+    }
     SchemaManager::save_schema(wtx, &new_schema)?;
     schema.register(new_schema);
+    super::fk::rename_pending_column(wtx, table_name, &old_lower, &new_lower);
     Ok(())
 }
 
@@ -1585,6 +1615,7 @@ pub(super) fn alter_rename_table(
     SchemaManager::save_schema(wtx, &new_schema)?;
     schema.remove(old_name);
     schema.register(new_schema);
+    super::fk::rename_pending_table(wtx, old_name, &new_lower);
     Ok(())
 }
 
