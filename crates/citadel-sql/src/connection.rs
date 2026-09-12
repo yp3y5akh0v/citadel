@@ -503,14 +503,36 @@ struct SavepointSnapshot {
 struct SessionTimezone {
     name: String,
     zone: jiff::tz::TimeZone,
+    // A date belongs to both an exact instant and this zone. Keeping the entry
+    // here also keeps it valid when transaction/savepoint state clones the zone.
+    date_cache: Option<(i64, jiff::civil::Date)>,
 }
 
 impl SessionTimezone {
-    fn utc() -> Self {
+    fn new(name: String, zone: jiff::tz::TimeZone) -> Self {
         Self {
-            name: "UTC".to_owned(),
-            zone: jiff::tz::TimeZone::UTC,
+            name,
+            zone,
+            date_cache: None,
         }
+    }
+
+    fn utc() -> Self {
+        Self::new("UTC".to_owned(), jiff::tz::TimeZone::UTC)
+    }
+
+    fn date_at(&mut self, timestamp: i64) -> jiff::civil::Date {
+        if let Some((cached_timestamp, date)) = self.date_cache {
+            if cached_timestamp == timestamp {
+                return date;
+            }
+        }
+        let date = jiff::Timestamp::from_microsecond(timestamp)
+            .expect("SQL statement clock must be a valid timestamp")
+            .to_zoned(self.zone.clone())
+            .date();
+        self.date_cache = Some((timestamp, date));
+        date
     }
 }
 
@@ -894,11 +916,8 @@ impl<'a> ConnectionInner<'a> {
         self.active_txn.is_active()
     }
 
-    fn jsonpath_session_context(&self, timestamp: i64) -> crate::json::JsonPathSessionContext {
-        let date = jiff::Timestamp::from_microsecond(timestamp)
-            .expect("SQL statement clock must be a valid timestamp")
-            .to_zoned(self.session_timezone.zone.clone())
-            .date();
+    fn jsonpath_session_context(&mut self, timestamp: i64) -> crate::json::JsonPathSessionContext {
+        let date = self.session_timezone.date_at(timestamp);
         crate::json::JsonPathSessionContext {
             timezone: self.session_timezone.zone.clone(),
             date,
@@ -911,14 +930,13 @@ impl<'a> ConnectionInner<'a> {
         }
         let timezone = match value {
             TimezoneValue::Default | TimezoneValue::Local => SessionTimezone::utc(),
-            TimezoneValue::Named(tz) => SessionTimezone {
-                name: tz.trim().to_owned(),
-                zone: crate::datetime::resolve_timezone(tz)?,
-            },
-            TimezoneValue::OffsetSeconds(seconds) => SessionTimezone {
-                name: crate::datetime::format_timezone_offset(*seconds),
-                zone: crate::datetime::fixed_timezone(*seconds)?,
-            },
+            TimezoneValue::Named(tz) => {
+                SessionTimezone::new(tz.trim().to_owned(), crate::datetime::resolve_timezone(tz)?)
+            }
+            TimezoneValue::OffsetSeconds(seconds) => SessionTimezone::new(
+                crate::datetime::format_timezone_offset(*seconds),
+                crate::datetime::fixed_timezone(*seconds)?,
+            ),
         };
         let evaluation_noop = timezone.zone == self.session_timezone.zone;
         if self.schema.legacy_volatile_definition().is_some() {
@@ -1905,6 +1923,217 @@ mod tests {
             .argon2_profile(Argon2Profile::Iot)
             .create()
             .unwrap()
+    }
+
+    #[test]
+    fn session_timezone_date_cache_tracks_exact_instants_and_local_midnight() {
+        use jiff::civil::date;
+
+        for (zone_name, instants) in [
+            (
+                "UTC",
+                vec![
+                    ("2023-12-31T23:59:59.999999Z", date(2023, 12, 31)),
+                    ("2024-01-01T00:00:00Z", date(2024, 1, 1)),
+                ],
+            ),
+            (
+                "+05:30",
+                vec![
+                    ("2023-12-31T18:29:59.999999Z", date(2023, 12, 31)),
+                    ("2023-12-31T18:30:00Z", date(2024, 1, 1)),
+                ],
+            ),
+            (
+                "America/New_York",
+                vec![
+                    ("2024-01-15T04:30:00Z", date(2024, 1, 14)),
+                    ("2024-07-15T04:30:00Z", date(2024, 7, 15)),
+                    ("2024-03-10T04:59:59.999999Z", date(2024, 3, 9)),
+                    ("2024-03-10T05:00:00Z", date(2024, 3, 10)),
+                    ("2024-11-03T03:59:59.999999Z", date(2024, 11, 2)),
+                    ("2024-11-03T04:00:00Z", date(2024, 11, 3)),
+                ],
+            ),
+        ] {
+            let mut timezone = SessionTimezone::new(
+                zone_name.to_owned(),
+                crate::datetime::resolve_timezone(zone_name).unwrap(),
+            );
+            assert_eq!(timezone.date_cache, None);
+            for (instant, expected) in instants {
+                let timestamp = crate::datetime::parse_timestamp(instant).unwrap();
+                assert_eq!(
+                    timezone.date_at(timestamp),
+                    expected,
+                    "{zone_name}: {instant}"
+                );
+                assert_eq!(timezone.date_cache, Some((timestamp, expected)));
+                assert_eq!(timezone.date_at(timestamp), expected);
+                // A transaction/savepoint copy owns the same immutable zone.
+                let mut restored = timezone.clone();
+                assert_eq!(restored.date_cache, timezone.date_cache);
+                assert_eq!(restored.date_at(timestamp), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn jsonpath_date_cache_follows_timezone_and_savepoint_restoration() {
+        use jiff::civil::date;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("CREATE TABLE clock_items (id INTEGER PRIMARY KEY, n INTEGER)")
+            .unwrap();
+        conn.execute("INSERT INTO clock_items VALUES (1, 0)")
+            .unwrap();
+        let update = conn
+            .prepare("UPDATE clock_items SET n = n + 1 WHERE id = 1")
+            .unwrap();
+        conn.execute("SET TIME ZONE '+05:30'").unwrap();
+        conn.execute("BEGIN").unwrap();
+        let timestamp = crate::datetime::parse_timestamp("2024-01-01T00:30:00Z").unwrap();
+        conn.inner.borrow_mut().txn_start_ts = Some(timestamp);
+        for _ in 0..3 {
+            assert_eq!(update.execute(&[]).unwrap(), 1);
+            assert_eq!(
+                conn.inner.borrow().session_timezone.date_cache,
+                Some((timestamp, date(2024, 1, 1)))
+            );
+        }
+
+        conn.set_session_timezone("-07:00").unwrap();
+        assert_eq!(conn.inner.borrow().session_timezone.date_cache, None);
+        update.execute(&[]).unwrap();
+        let saved_date = Some((timestamp, date(2023, 12, 31)));
+        assert_eq!(conn.inner.borrow().session_timezone.date_cache, saved_date);
+        assert!(conn.set_session_timezone("Definitely/Not_A_Zone").is_err());
+        assert_eq!(conn.inner.borrow().session_timezone.date_cache, saved_date);
+
+        conn.execute("SAVEPOINT before_local").unwrap();
+        conn.execute("SET LOCAL TIME ZONE '+10:00'").unwrap();
+        assert_eq!(conn.inner.borrow().session_timezone.date_cache, None);
+        update.execute(&[]).unwrap();
+        assert_eq!(
+            conn.inner.borrow().session_timezone.date_cache,
+            Some((timestamp, date(2024, 1, 1)))
+        );
+        conn.execute("ROLLBACK TO before_local").unwrap();
+        assert_eq!(conn.session_timezone(), "-07:00");
+        assert_eq!(conn.inner.borrow().session_timezone.date_cache, saved_date);
+        update.execute(&[]).unwrap();
+        assert_eq!(conn.inner.borrow().session_timezone.date_cache, saved_date);
+
+        conn.execute("SET LOCAL TIME ZONE '+10:00'").unwrap();
+        update.execute(&[]).unwrap();
+        assert_eq!(
+            conn.inner.borrow().session_timezone.date_cache,
+            Some((timestamp, date(2024, 1, 1)))
+        );
+        conn.execute("COMMIT").unwrap();
+        assert_eq!(conn.txn_start_ts(), None);
+        assert_eq!(conn.session_timezone(), "-07:00");
+        // Compare with the statement's own clock so the autocommit assertion
+        // does not depend on elapsed time or the wall clock's current value.
+        let autocommit = conn
+            .prepare(
+                "UPDATE clock_items SET n = n + 1 WHERE id = 1 RETURNING STATEMENT_TIMESTAMP()",
+            )
+            .unwrap()
+            .query_collect(&[])
+            .unwrap();
+        let Value::Timestamp(statement_timestamp) = &autocommit.rows[0][0] else {
+            panic!("expected the autocommit statement timestamp");
+        };
+        {
+            let inner = conn.inner.borrow();
+            let (cached_timestamp, actual_date) = inner.session_timezone.date_cache.unwrap();
+            assert_eq!(cached_timestamp, *statement_timestamp);
+            assert_eq!(
+                actual_date,
+                jiff::Timestamp::from_microsecond(*statement_timestamp)
+                    .unwrap()
+                    .to_zoned(inner.session_timezone.zone.clone())
+                    .date()
+            );
+        }
+
+        conn.execute("BEGIN").unwrap();
+        let next_timestamp = crate::datetime::parse_timestamp("2024-07-01T06:30:00Z").unwrap();
+        conn.inner.borrow_mut().txn_start_ts = Some(next_timestamp);
+        update.execute(&[]).unwrap();
+        assert_eq!(
+            conn.inner.borrow().session_timezone.date_cache,
+            Some((next_timestamp, date(2024, 6, 30)))
+        );
+        conn.execute("SET LOCAL TIME ZONE UTC").unwrap();
+        update.execute(&[]).unwrap();
+        assert_eq!(
+            conn.inner.borrow().session_timezone.date_cache,
+            Some((next_timestamp, date(2024, 7, 1)))
+        );
+        conn.execute("ROLLBACK").unwrap();
+        assert_eq!(conn.txn_start_ts(), None);
+        assert_eq!(conn.session_timezone(), "-07:00");
+    }
+
+    #[test]
+    fn prepared_jsonpath_date_cache_uses_transaction_date_across_dst_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        conn.set_session_timezone("America/New_York").unwrap();
+        let prepared = conn
+            .prepare(
+                "SELECT CAST(JSONB_PATH_QUERY_FIRST_TZ(\
+                CAST('\"12:00:00\"' AS JSONB), '$.time_tz().string()') AS TEXT), \
+                CURRENT_TIMESTAMP, LOCALTIMESTAMP, CURRENT_DATE, CURRENT_TIME",
+            )
+            .unwrap();
+        for (instant, expected_time, expected_local) in [
+            (
+                "2024-03-10T04:59:59.999999Z",
+                "\"12:00:00-05:00\"",
+                "2024-03-09 23:59:59.999999",
+            ),
+            (
+                "2024-03-10T05:00:00Z",
+                "\"12:00:00-04:00\"",
+                "2024-03-10 00:00:00",
+            ),
+            (
+                "2024-11-03T03:59:59.999999Z",
+                "\"12:00:00-04:00\"",
+                "2024-11-02 23:59:59.999999",
+            ),
+            (
+                "2024-11-03T04:00:00Z",
+                "\"12:00:00-05:00\"",
+                "2024-11-03 00:00:00",
+            ),
+        ] {
+            conn.execute("BEGIN READ ONLY").unwrap();
+            let timestamp = crate::datetime::parse_timestamp(instant).unwrap();
+            let local_timestamp = crate::datetime::parse_timestamp(expected_local).unwrap();
+            let (local_date, local_time) = crate::datetime::ts_split(local_timestamp);
+            conn.inner.borrow_mut().txn_start_ts = Some(timestamp);
+            for _ in 0..2 {
+                assert_eq!(
+                    prepared.query_collect(&[]).unwrap().rows,
+                    vec![vec![
+                        Value::Text(expected_time.into()),
+                        Value::Timestamp(timestamp),
+                        Value::Timestamp(local_timestamp),
+                        Value::Date(local_date),
+                        Value::Time(local_time),
+                    ]],
+                    "{instant}"
+                );
+            }
+            conn.execute("COMMIT").unwrap();
+        }
     }
 
     fn install_sorting_insert_trigger(conn: &Connection<'_>) {
