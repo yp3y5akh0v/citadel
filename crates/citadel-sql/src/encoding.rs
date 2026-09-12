@@ -1016,6 +1016,33 @@ pub(crate) fn decode_row_push(data: &[u8], expected: usize, out: &mut Vec<Value>
     Ok(true)
 }
 
+/// Whether a stored row can be copied without coercing or filling any cells.
+/// Uses borrowed decoding for scalar cells; compound values take the ordinary
+/// decoder so their dimensions and nested representation are checked there.
+pub(crate) fn row_matches_layout(data: &[u8], layout: &[(DataType, bool)]) -> Result<bool> {
+    let (version, col_count, bitmap, mut pos) = parse_row_header(data)?;
+    if col_count != layout.len() {
+        return Ok(false);
+    }
+    for (index, &(data_type, nullable)) in layout.iter().enumerate() {
+        if bitmap[index / 8] & (1 << (index % 8)) != 0 {
+            if !nullable {
+                return Ok(false);
+            }
+            continue;
+        }
+        let (tag, body, next) = read_cell(data, pos, version)?;
+        if tag != data_type.type_tag()
+            || matches!(data_type, DataType::Array | DataType::Vector { .. })
+        {
+            return Ok(false);
+        }
+        decode_value_raw(tag, body)?;
+        pos = next;
+    }
+    Ok(true)
+}
+
 /// Returns the number of non-PK columns stored in a row value blob.
 #[inline]
 pub fn row_non_pk_count(data: &[u8]) -> usize {

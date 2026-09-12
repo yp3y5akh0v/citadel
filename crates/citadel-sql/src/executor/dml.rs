@@ -113,6 +113,12 @@ pub(super) fn exec_insert(
     params: &[Value],
 ) -> Result<ExecutionResult> {
     let empty_ctes = CteContext::default();
+    if let Some(plan) = super::insert_copy::CopyPlan::new(schema, stmt, &empty_ctes) {
+        let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
+        let result = plan.execute(&mut wtx, schema)?;
+        super::commit_with_ann_publication(wtx, schema)?;
+        return Ok(result);
+    }
     let materialized;
     let stmt = if insert_has_subquery(stmt) {
         materialized = materialize_insert(stmt, &mut |sub| {
@@ -1738,6 +1744,9 @@ fn exec_insert_in_txn_impl(
     cache: Option<&InsertCache>,
     outer_ctes: &CteContext,
 ) -> Result<ExecutionResult> {
+    if let Some(plan) = super::insert_copy::CopyPlan::new(schema, stmt, outer_ctes) {
+        return plan.execute(wtx, schema);
+    }
     let empty_ctes = CteContext::default();
     let materialized;
     let has_sub = match cache {
