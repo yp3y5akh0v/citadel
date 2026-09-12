@@ -145,10 +145,10 @@ impl DatabaseBuilder {
         self
     }
 
-    /// Zero-fill freed B+ tree pages once they are past all readers, so a
-    /// passphrase holder with disk access cannot recover deleted-row residue
-    /// from stale pages. Off by default (a small write cost on delete-heavy
-    /// workloads).
+    /// Zero-fill freed B+ tree pages during later commits, once readers and
+    /// committed recovery generations no longer need them. This removes
+    /// deleted-row residue from those stale pages. Off by default (a small
+    /// write cost on delete-heavy workloads).
     pub fn enable_secure_delete(mut self, enable: bool) -> Self {
         self.secure_delete = enable;
         self

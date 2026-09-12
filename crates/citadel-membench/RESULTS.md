@@ -132,7 +132,8 @@ Scope of the guarantee: content is cryptographically unrecoverable; per-atom met
 encryption (a deployment concern); on wear-leveled flash the survivor is a wrapped
 random key, not guaranteed physical NAND destruction; pre-forget backups retain the
 key. Stale copy-on-write pages are handled by an opt-in secure-delete that zeroes
-reader-safe freed pages before commit.
+freed pages during later commits, after readers and committed recovery generations
+no longer need them.
 
 ## Provenance (serialized into every report)
 
