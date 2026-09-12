@@ -3012,10 +3012,7 @@ pub(super) fn scan_fk_index_keys(
     };
     let mut candidates = FkChildHits::default();
     let target = if folded { &mut candidates } else { &mut *out };
-    wtx.table_scan_from(&idx_table, prefix, |key, value| {
-        if !key.starts_with(prefix) {
-            return Ok(false);
-        }
+    wtx.table_scan_prefix(&idx_table, prefix, |key, value| {
         let owned_pk = (cascading_idx.unique && !value.is_empty()).then_some(value);
         target.push(key, owned_pk, prefix.len() as u32);
         Ok(true)

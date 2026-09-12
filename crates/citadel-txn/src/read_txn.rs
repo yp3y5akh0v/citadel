@@ -767,31 +767,27 @@ impl<'db> ReadTxn<'db> {
             snapshot_txn_id: self.snapshot.txn_id,
         };
         let mut cursor = Cursor::seek_lazy(&mut view, root, start_key)?;
-        while let Some(c) = cursor.current_ref_lazy(&mut view) {
+        while let Some(cell) = cursor.current_ref_lazy(&mut view) {
             if let Some(t) = cancel.as_ref() {
                 t.check()?;
             }
-            if prefix.is_some_and(|prefix| !c.key.starts_with(prefix)) {
+            if prefix.is_some_and(|prefix| !cell.key.starts_with(prefix)) {
                 break;
             }
             count.rows += 1;
-            let kind = c.val_type;
-            match kind {
+            match cell.val_type {
                 ValueType::Tombstone => {}
                 ValueType::Inline => {
-                    let entry = cursor.current_ref_lazy(&mut view).unwrap();
                     if let Some(budget) = &budget {
-                        budget.try_charge(entry.value.len())?;
+                        budget.try_charge(cell.value.len())?;
                     }
-                    if !f(entry.key, entry.value)? {
+                    if !f(cell.key, cell.value)? {
                         break;
                     }
                 }
                 ValueType::Overflow => {
-                    let (key, oref) = {
-                        let c = cursor.current_ref_lazy(&mut view).unwrap();
-                        (c.key.to_vec(), OverflowRef::from_bytes(c.value))
-                    };
+                    let key = cell.key.to_vec();
+                    let oref = OverflowRef::from_bytes(cell.value);
                     let materialized = overflow_io::read_chain_value_with_budget(
                         &mut view,
                         &oref,
