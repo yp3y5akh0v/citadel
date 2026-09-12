@@ -750,13 +750,12 @@ impl TxnManager {
     }
 
     fn read_validated_page(&self, page_id: PageId) -> Result<Page> {
-        citadel_buffer::pool::read_and_validate(
+        citadel_buffer::pool::read_and_validate_with_hmac(
             &*self.io,
             page_id,
             page_offset(page_id),
             &self.dek,
-            &self.mac_key,
-            self.epoch,
+            &self.hmac_state,
         )
     }
 
@@ -2558,26 +2557,13 @@ impl TxnManager {
     }
 
     pub fn read_page_from_disk(&self, page_id: PageId) -> Result<Page> {
-        let offset = page_offset(page_id);
-        let mut encrypted = [0u8; PAGE_SIZE];
-        self.io.read_page(offset, &mut encrypted)?;
-
-        let mut body = [0u8; BODY_SIZE];
-        page_cipher::decrypt_page(
-            &self.dek,
-            &self.mac_key,
+        citadel_buffer::pool::read_and_decrypt_with_hmac(
+            &*self.io,
             page_id,
-            self.epoch,
-            &encrypted,
-            &mut body,
-        )?;
-
-        let page = Page::from_bytes(body);
-        if !page.verify_checksum() {
-            return Err(Error::ChecksumMismatch(page_id));
-        }
-
-        Ok(page)
+            page_offset(page_id),
+            &self.dek,
+            &self.hmac_state,
+        )
     }
 }
 

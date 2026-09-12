@@ -59,17 +59,37 @@ pub fn decrypt_page(
     data: &[u8; PAGE_SIZE],
     body: &mut [u8; BODY_SIZE],
 ) -> citadel_core::Result<()> {
-    let iv = &data[..IV_SIZE];
+    decrypt_page_using(dek, page_id, data, body, |iv, ciphertext| {
+        compute_mac(mac_key, encryption_epoch, page_id, iv, ciphertext)
+    })
+}
+
+/// Decrypt using HMAC state bound to the page MAC key and encryption epoch.
+/// Every page is fully authenticated before the output buffer is modified.
+pub fn decrypt_page_with_hmac(
+    dek: &[u8; DEK_SIZE],
+    hmac_state: &HmacState,
+    page_id: PageId,
+    data: &[u8; PAGE_SIZE],
+    body: &mut [u8; BODY_SIZE],
+) -> citadel_core::Result<()> {
+    decrypt_page_using(dek, page_id, data, body, |iv, ciphertext| {
+        hmac_state.compute_mac(page_id, iv, ciphertext)
+    })
+}
+
+#[inline]
+fn decrypt_page_using(
+    dek: &[u8; DEK_SIZE],
+    page_id: PageId,
+    data: &[u8; PAGE_SIZE],
+    body: &mut [u8; BODY_SIZE],
+    compute: impl FnOnce(&[u8; IV_SIZE], &[u8]) -> [u8; MAC_SIZE],
+) -> citadel_core::Result<()> {
+    let iv: &[u8; IV_SIZE] = data[..IV_SIZE].try_into().unwrap();
     let ciphertext = &data[IV_SIZE..IV_SIZE + BODY_SIZE];
     let stored_mac = &data[IV_SIZE + BODY_SIZE..];
-
-    let computed_mac = compute_mac(
-        mac_key,
-        encryption_epoch,
-        page_id,
-        iv.try_into().unwrap(),
-        ciphertext,
-    );
+    let computed_mac = compute(iv, ciphertext);
 
     if stored_mac.ct_eq(&computed_mac).into() {
         body.copy_from_slice(ciphertext);

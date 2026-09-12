@@ -3957,3 +3957,123 @@ fn manager_list_tables_pins_its_snapshot_while_commits_recycle_pages() {
 fn manager_table_root_pins_its_snapshot_while_commits_recycle_pages() {
     assert_manager_catalog_walk_pins_snapshot("table_root");
 }
+
+#[test]
+fn cached_hmac_manager_loads_keep_raw_and_validated_boundaries() {
+    for (dek, mac_key, epoch) in [
+        ([0x12; DEK_SIZE], [0x34; MAC_KEY_SIZE], 0),
+        ([0x56; DEK_SIZE], [0x78; MAC_KEY_SIZE], u32::MAX),
+    ] {
+        let io = MemIO::new(1024 * 1024);
+        let manager = TxnManager::create(
+            Box::new(io.share()),
+            dek,
+            mac_key,
+            epoch,
+            0x1234,
+            compute_dek_id(&mac_key, &dek),
+            4,
+        )
+        .unwrap();
+        let page_id = manager.current_slot().tree_root;
+        let offset = page_offset(page_id);
+        let original = manager.read_page_from_disk(page_id).unwrap();
+        assert_eq!(
+            manager.fetch_page_owned(page_id).unwrap().as_bytes(),
+            original.as_bytes()
+        );
+        assert_eq!(
+            manager.fetch_page(page_id).unwrap().as_bytes(),
+            original.as_bytes()
+        );
+        drop(manager);
+
+        // Reopen constructs another state with the same exact key/epoch.
+        let manager = TxnManager::open(Box::new(io.share()), dek, mac_key, epoch, 4).unwrap();
+        assert_eq!(
+            manager.fetch_page_owned(page_id).unwrap().as_bytes(),
+            original.as_bytes()
+        );
+        assert_eq!(
+            manager.fetch_page(page_id).unwrap().as_bytes(),
+            original.as_bytes()
+        );
+        manager.pool.lock().clear();
+
+        let mut malformed = original.clone();
+        malformed.set_num_cells(u16::MAX);
+        malformed.update_checksum();
+        let mut encrypted = [0; PAGE_SIZE];
+        page_cipher::encrypt_page_with_iv(
+            &dek,
+            &mac_key,
+            page_id,
+            epoch,
+            malformed.as_bytes(),
+            &[0x83; citadel_core::IV_SIZE],
+            &mut encrypted,
+        );
+        io.write_page(offset, &encrypted).unwrap();
+        assert_eq!(
+            manager.read_page_from_disk(page_id).unwrap().as_bytes(),
+            malformed.as_bytes()
+        );
+        assert!(matches!(
+            manager.fetch_page_owned(page_id),
+            Err(Error::DatabaseCorrupted)
+        ));
+        assert!(matches!(
+            manager.fetch_page(page_id),
+            Err(Error::DatabaseCorrupted)
+        ));
+        assert!(!manager.pool.lock().is_cached(page_id));
+
+        malformed.as_bytes_mut()[BODY_SIZE - 1] ^= 1;
+        page_cipher::encrypt_page_with_iv(
+            &dek,
+            &mac_key,
+            page_id,
+            epoch,
+            malformed.as_bytes(),
+            &[0x83; citadel_core::IV_SIZE],
+            &mut encrypted,
+        );
+        io.write_page(offset, &encrypted).unwrap();
+        assert!(matches!(manager.read_page_from_disk(page_id),
+            Err(Error::ChecksumMismatch(id)) if id == page_id));
+        assert!(matches!(manager.fetch_page_owned(page_id),
+            Err(Error::ChecksumMismatch(id)) if id == page_id));
+        assert!(matches!(manager.fetch_page(page_id),
+            Err(Error::ChecksumMismatch(id)) if id == page_id));
+        assert!(!manager.pool.lock().is_cached(page_id));
+
+        encrypted[citadel_core::IV_SIZE + 100] ^= 1;
+        io.write_page(offset, &encrypted).unwrap();
+        assert!(matches!(manager.read_page_from_disk(page_id),
+            Err(Error::PageTampered(id)) if id == page_id));
+        assert!(matches!(manager.fetch_page_owned(page_id),
+            Err(Error::PageTampered(id)) if id == page_id));
+        assert!(matches!(manager.fetch_page(page_id),
+            Err(Error::PageTampered(id)) if id == page_id));
+        assert!(!manager.pool.lock().is_cached(page_id));
+
+        page_cipher::encrypt_page_with_iv(
+            &dek,
+            &mac_key,
+            page_id,
+            epoch,
+            original.as_bytes(),
+            &[0x83; citadel_core::IV_SIZE],
+            &mut encrypted,
+        );
+        io.write_page(offset, &encrypted).unwrap();
+        assert_eq!(
+            manager.fetch_page_owned(page_id).unwrap().as_bytes(),
+            original.as_bytes()
+        );
+        assert_eq!(
+            manager.fetch_page(page_id).unwrap().as_bytes(),
+            original.as_bytes()
+        );
+    }
+}
