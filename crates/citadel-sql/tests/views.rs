@@ -1330,3 +1330,89 @@ fn view_new_data_visible() {
     let qr = conn.query("SELECT COUNT(*) FROM v").unwrap();
     assert_eq!(qr.rows[0][0], Value::Integer(4));
 }
+
+fn setup_view_cte_scope(conn: &Connection) {
+    setup_users(conn);
+    conn.execute("CREATE VIEW simple_scope AS SELECT * FROM users WHERE age >= 30")
+        .unwrap();
+    conn.execute("CREATE VIEW explicit_scope AS SELECT id, name FROM users WHERE age >= 30")
+        .unwrap();
+}
+
+fn assert_view_cte_scope(conn: &Connection, expected: Vec<Vec<Value>>) {
+    for sql in [
+        "WITH users AS (SELECT 99 AS id, 'caller' AS name, 'x' AS email, 99 AS age) \
+         SELECT id, name FROM explicit_scope ORDER BY id",
+        "WITH users AS (SELECT 99 AS id, 'caller' AS name, 'x' AS email, 99 AS age) \
+         SELECT id, name FROM simple_scope ORDER BY id",
+        "WITH UsErS AS (SELECT 99 AS id, 'caller' AS name, 'x' AS email, 99 AS age) \
+         SELECT s.id, s.name FROM simple_scope s ORDER BY s.id",
+    ] {
+        assert_eq!(conn.query(sql).unwrap().rows, expected, "{sql}");
+        let prepared = conn.prepare(sql).unwrap();
+        for _ in 0..2 {
+            assert_eq!(prepared.query_collect(&[]).unwrap().rows, expected, "{sql}");
+        }
+    }
+    // Materializing the view must not erase CTEs used by outer expressions.
+    let sql = "WITH users AS (SELECT 99 AS id, 'caller' AS name, 'x' AS email, 99 AS age), \
+               wanted AS (SELECT 1 AS id) \
+               SELECT s.id, s.name FROM simple_scope s \
+               WHERE s.id IN (SELECT id FROM wanted) ORDER BY s.id";
+    assert_eq!(conn.query(sql).unwrap().rows, vec![expected[0].clone()]);
+}
+
+#[test]
+fn view_fusion_preserves_definition_scope_with_caller_cte() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    setup_view_cte_scope(&conn);
+    assert_view_cte_scope(
+        &conn,
+        vec![
+            vec![Value::Integer(1), Value::Text("Alice".into())],
+            vec![Value::Integer(3), Value::Text("Charlie".into())],
+        ],
+    );
+}
+
+#[test]
+fn view_fusion_preserves_definition_scope_in_write_transaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    setup_view_cte_scope(&conn);
+    conn.execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO users VALUES (4, 'Dora', 'd@t.com', 40)")
+        .unwrap();
+    assert_view_cte_scope(
+        &conn,
+        vec![
+            vec![Value::Integer(1), Value::Text("Alice".into())],
+            vec![Value::Integer(3), Value::Text("Charlie".into())],
+            vec![Value::Integer(4), Value::Text("Dora".into())],
+        ],
+    );
+    conn.execute("ROLLBACK").unwrap();
+    assert_eq!(
+        conn.query("SELECT COUNT(*) FROM users").unwrap().rows,
+        vec![vec![Value::Integer(3)]]
+    );
+}
+
+#[test]
+fn view_fusion_explain_declines_only_colliding_cte_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    setup_view_cte_scope(&conn);
+    for (name, materialized) in [("UsErS", true), ("unrelated", false)] {
+        let sql = format!("EXPLAIN WITH {name} AS (SELECT 99 AS id) SELECT id FROM simple_scope");
+        let rows = conn.query(&sql).unwrap().rows;
+        let scan_view = rows.iter().flatten().any(
+            |value| matches!(value, Value::Text(line) if line.contains("SCAN VIEW simple_scope")),
+        );
+        assert_eq!(scan_view, materialized, "{sql}: {rows:?}");
+    }
+}

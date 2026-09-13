@@ -312,7 +312,9 @@ pub(super) fn explain_select_cte(
     }
 
     if let Some(view_def) = schema.get_view(&lower_from) {
-        if let Ok(Some(fused)) = super::try_fuse_view(stmt, schema, view_def) {
+        if let Ok(Some(fused)) =
+            super::try_fuse_view(stmt, schema, view_def, cte_names.iter().copied())
+        {
             // Fused — explain against real table
             return explain_select_cte(&mut ctx.reborrow(), &fused, cte_names);
         }

@@ -108,10 +108,11 @@ pub(super) fn apply_view_aliases(qr: &mut QueryResult, aliases: &[String]) {
 }
 
 /// Merge a simple view into the outer query, replacing FROM with the real table.
-pub(super) fn try_fuse_view(
+pub(super) fn try_fuse_view<'a>(
     outer: &SelectStmt,
     schema: &SchemaManager,
     view_def: &ViewDef,
+    cte_names: impl IntoIterator<Item = &'a str>,
 ) -> Result<Option<SelectStmt>> {
     let stmt = crate::parser::parse_sql(&view_def.sql)?;
     let sq = match stmt {
@@ -160,6 +161,16 @@ pub(super) fn try_fuse_view(
 
     let real_table = inner.from.to_ascii_lowercase();
     if schema.get(&real_table).is_none() {
+        return Ok(None);
+    }
+
+    // View definitions resolve outside the caller's CTE namespace. A fused
+    // scan keeps that namespace for the outer expressions, so materialize
+    // when it would redirect the view's physical base table to a caller CTE.
+    if cte_names
+        .into_iter()
+        .any(|name| name.eq_ignore_ascii_case(&real_table))
+    {
         return Ok(None);
     }
 
