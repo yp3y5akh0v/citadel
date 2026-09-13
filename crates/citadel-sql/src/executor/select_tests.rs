@@ -1926,3 +1926,122 @@ fn jsonb_contains_missing_default_can_cancel_inside_materialization() {
         vec![vec![Value::Integer(1024)]]
     );
 }
+
+#[test]
+fn raw_aggregate_defaults_require_statement_constant_admission() {
+    let mut table = TableSchema::new(
+        "t".into(),
+        cols(&[("id", DataType::Integer), ("n", DataType::Real)]),
+        vec![0],
+        vec![],
+        vec![],
+        vec![],
+    );
+    table.columns[1].default_expr = Some(Expr::Function {
+        name: "RANDOM".into(),
+        args: vec![],
+        distinct: false,
+    });
+    // This asserts the evaluation-frequency contract without depending on RNG
+    // values or adding a production counter: a missing volatile default must
+    // remain in the per-row materializer, not the raw aggregate's cached value.
+    for sql in [
+        "SELECT SUM(n) FROM t",
+        "SELECT COUNT(n) FROM t",
+        "SELECT AVG(n) FROM t",
+    ] {
+        assert!(
+            StreamAggPlan::try_new(&agg_select_stmt(sql), &table)
+                .unwrap()
+                .is_none(),
+            "{sql}"
+        );
+    }
+    assert!(
+        StreamAggPlan::try_new(&agg_select_stmt("SELECT COUNT(*) FROM t"), &table)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn coercing_missing_defaults_preserves_explicit_cast_cancellation() {
+    let db = citadel::DatabaseBuilder::new("")
+        .passphrase(b"lazy-default-cancel")
+        .argon2_profile(citadel::Argon2Profile::Iot)
+        .create_in_memory()
+        .unwrap();
+    let conn = crate::Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES(1)").unwrap();
+    let payload = serde_json::to_string(&vec!["a"; 1024]).unwrap();
+    conn.execute(&format!(
+        "ALTER TABLE t ADD COLUMN doc JSONB DEFAULT CAST(CAST('{payload}' AS JSONB) AS TEXT)"
+    ))
+    .unwrap();
+    let prepared = conn.prepare("SELECT doc FROM t").unwrap();
+    for begin in [None, Some("BEGIN READ ONLY"), Some("BEGIN")] {
+        let token = citadel::CancelToken::new();
+        db.set_cancel(Some(token.clone()));
+        if let Some(begin) = begin {
+            conn.execute(begin).unwrap();
+        }
+        let result = {
+            let _hook = crate::json::cancel_json_after(token.clone(), 32);
+            prepared.query_collect(&[])
+        };
+        db.set_cancel(None);
+        if begin.is_some() {
+            conn.execute("ROLLBACK").unwrap();
+        }
+        assert!(
+            matches!(result, Err(SqlError::Storage(citadel::Error::Interrupted))),
+            "{result:?}"
+        );
+        assert!(token.is_cancelled());
+    }
+    assert_eq!(
+        prepared.query_collect(&[]).unwrap().rows[0][0].data_type(),
+        DataType::Jsonb
+    );
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn compiled_select_defaults_reuse_selective_plans_for_point_and_fallback() {
+    let db = citadel::DatabaseBuilder::new("")
+        .passphrase(b"compiled-lazy-defaults")
+        .argon2_profile(citadel::Argon2Profile::Iot)
+        .create_in_memory()
+        .unwrap();
+    let conn = crate::Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES(1),(2)").unwrap();
+    conn.execute("ALTER TABLE t ADD COLUMN unused JSONB DEFAULT 'invalid json'")
+        .unwrap();
+    conn.execute("ALTER TABLE t ADD COLUMN value REAL DEFAULT 7")
+        .unwrap();
+    let schema = SchemaManager::load(&db).unwrap();
+    for (predicate, point) in [("id=$1", true), ("id >= $1 AND id < 2", false)] {
+        let sql = format!("SELECT id,value,value AS again FROM t WHERE {predicate}");
+        let lane = build_select_lane(&schema, &agg_select_stmt(&sql))
+            .expect("defaulted schema retains compiled lane");
+        assert_eq!(matches!(lane, CompiledSelectLane::Point(_)), point);
+        // Resolve and bind the same compiled decode plan repeatedly. A NULL
+        // point key takes the ordinary scan fallback and must not materialize
+        // either default for rows rejected by its predicate.
+        for (parameter, expected) in [
+            (i(1), vec![vec![i(1), Value::Real(7.0), Value::Real(7.0)]]),
+            (Value::Null, vec![]),
+            (i(1), vec![vec![i(1), Value::Real(7.0), Value::Real(7.0)]]),
+        ] {
+            crate::eval::with_scoped_params(&[parameter], || {
+                let actual = lane.run(&mut db.begin_read()).unwrap();
+                assert_eq!(actual.rows, expected, "{sql}");
+            });
+        }
+    }
+}

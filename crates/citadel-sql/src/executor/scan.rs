@@ -385,9 +385,14 @@ pub(super) enum RangeCheck {
     ExceedsUpper,
 }
 
-struct SelectScanDecoder<'a> {
-    output: SelectRowDecoder<'a>,
+/// Owned expression/decode metadata, reusable for a compiled schema generation.
+pub(super) struct SelectScanDecodePlan {
+    output: PartialDecodeCtx,
     predicate: Option<PredicateDecode>,
+}
+
+pub(super) struct SelectScanDecoder<'a> {
+    plan: &'a SelectScanDecodePlan,
     where_clause: Option<&'a Expr>,
     col_map: &'a ColumnMap,
 }
@@ -397,13 +402,18 @@ struct PredicateDecode {
     remaining: PartialDecodeCtx,
 }
 
-impl<'a> SelectScanDecoder<'a> {
-    fn new(
-        schema: &'a TableSchema,
-        stmt: &'a SelectStmt,
+impl SelectScanDecodePlan {
+    pub(super) fn new(
+        schema: &TableSchema,
+        stmt: &SelectStmt,
         cancel: Option<&citadel::CancelToken>,
     ) -> Result<Option<Self>> {
-        if !schema.has_virtual_columns() {
+        if !schema.has_virtual_columns()
+            && !schema
+                .columns
+                .iter()
+                .any(|column| column.default_expr.is_some())
+        {
             return Ok(None);
         }
         let output = SelectRowDecoder::new(schema, stmt, cancel)?;
@@ -420,14 +430,25 @@ impl<'a> SelectScanDecoder<'a> {
                 Ok::<_, SqlError>(PredicateDecode { input, remaining })
             })
             .transpose()?;
-        Ok(Some(Self {
-            output,
-            predicate,
-            where_clause: stmt.where_clause.as_ref(),
-            col_map: schema.column_map(),
-        }))
+        Ok(output
+            .into_partial()
+            .map(|output| Self { output, predicate }))
     }
 
+    pub(super) fn bind<'a>(
+        &'a self,
+        schema: &'a TableSchema,
+        where_clause: Option<&'a Expr>,
+    ) -> SelectScanDecoder<'a> {
+        SelectScanDecoder {
+            plan: self,
+            where_clause,
+            col_map: schema.column_map(),
+        }
+    }
+}
+
+impl SelectScanDecoder<'_> {
     fn read(
         &self,
         key: &[u8],
@@ -437,6 +458,7 @@ impl<'a> SelectScanDecoder<'a> {
     ) -> Result<Option<Vec<Value>>> {
         if let Some(expr) = filter {
             let predicate = self
+                .plan
                 .predicate
                 .as_ref()
                 .expect("scan filter has a decode plan");
@@ -452,11 +474,14 @@ impl<'a> SelectScanDecoder<'a> {
                 .decode_additional_into_with_cancel(key, value, &mut row, cancel)?;
             return Ok(Some(row));
         }
-        self.output.decode(key, value, cancel).map(Some)
+        self.plan
+            .output
+            .decode_with_cancel(key, value, cancel)
+            .map(Some)
     }
 }
 
-fn read_scan_row(
+pub(super) fn read_scan_row(
     schema: &TableSchema,
     key: &[u8],
     value: &[u8],
@@ -494,7 +519,10 @@ fn scan_step(
     cancel: Option<&citadel::CancelToken>,
 ) -> Result<Option<Vec<Value>>> {
     let decode_output = || match projection {
-        Some(projection) => projection.output.decode(key, value, cancel),
+        Some(projection) => projection
+            .plan
+            .output
+            .decode_with_cancel(key, value, cancel),
         None => decode_full_row_with_cancel(schema, key, value, cancel),
     };
     if let Some(pred) = simple_pred {
@@ -586,7 +614,10 @@ pub(super) fn collect_select_rows_with_read(
     limit: Option<usize>,
 ) -> Result<(Vec<Vec<Value>>, bool)> {
     let cancel = rtx.cancel_token().cloned();
-    let projection = SelectScanDecoder::new(table_schema, stmt, cancel.as_ref())?;
+    let decode_plan = SelectScanDecodePlan::new(table_schema, stmt, cancel.as_ref())?;
+    let projection = decode_plan
+        .as_ref()
+        .map(|plan| plan.bind(table_schema, stmt.where_clause.as_ref()));
     let plan = planner::plan_select_inverted(table_schema, &stmt.where_clause);
     collect_rows_with_read_decoded(
         rtx,
@@ -598,7 +629,7 @@ pub(super) fn collect_select_rows_with_read(
     )
 }
 
-fn collect_rows_with_read_decoded(
+pub(super) fn collect_rows_with_read_decoded(
     rtx: &mut ReadTxn<'_>,
     table_schema: &TableSchema,
     where_clause: &Option<Expr>,
@@ -964,7 +995,10 @@ pub(super) fn collect_select_rows_write(
     limit: Option<usize>,
 ) -> Result<(Vec<Vec<Value>>, bool)> {
     let cancel = wtx.cancel_token().cloned();
-    let projection = SelectScanDecoder::new(table_schema, stmt, cancel.as_ref())?;
+    let decode_plan = SelectScanDecodePlan::new(table_schema, stmt, cancel.as_ref())?;
+    let projection = decode_plan
+        .as_ref()
+        .map(|plan| plan.bind(table_schema, stmt.where_clause.as_ref()));
     collect_rows_write_decoded(
         wtx,
         table_schema,
@@ -1779,12 +1813,8 @@ pub(super) fn try_between_predicate(expr: &Expr, schema: &TableSchema) -> Option
     } else {
         let nonpk_order = non_pk.iter().position(|&i| i == col_idx)?;
         let nonpk_idx = schema.encoding_positions()[nonpk_order] as usize;
-        let default_expr = schema.columns[col_idx].default_expr.as_ref();
-        if default_expr.is_some_and(|expr| crate::parser::volatile_function_in_expr(expr).is_some())
-        {
-            return None;
-        }
-        let default_val = default_expr.map(eval_const_expr).transpose().ok()?;
+        let default_val =
+            try_cached_column_default(&schema.columns[col_idx], schema.is_strict(), None)?;
         Some(BetweenPredicate {
             is_pk: false,
             pk_pos: 0,
@@ -1896,12 +1926,8 @@ pub(super) fn try_simple_predicate(expr: &Expr, schema: &TableSchema) -> Option<
     } else {
         let nonpk_order = non_pk.iter().position(|&i| i == col_idx)?;
         let nonpk_idx = schema.encoding_positions()[nonpk_order] as usize;
-        let default_expr = schema.columns[col_idx].default_expr.as_ref();
-        if default_expr.is_some_and(|expr| crate::parser::volatile_function_in_expr(expr).is_some())
-        {
-            return None;
-        }
-        let default_val = default_expr.map(eval_const_expr).transpose().ok()?;
+        let default_val =
+            try_cached_column_default(&schema.columns[col_idx], schema.is_strict(), None)?;
         if arithmetic.is_some()
             && default_val.as_ref().is_some_and(|value| {
                 !matches!(

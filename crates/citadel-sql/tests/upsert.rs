@@ -897,35 +897,57 @@ fn upsert_checked_parameters_only_in_conflict_set_and_where_are_bound() {
 }
 
 #[test]
-fn upsert_checked_missing_defaults_preserve_generic_error_priority() {
-    for_checked_upsert_modes(
-        &[
-            "CREATE TABLE plain (id INTEGER PRIMARY KEY, a INTEGER)",
-            "CREATE TABLE indexed (id INTEGER PRIMARY KEY, a INTEGER)",
-            "CREATE INDEX indexed_a ON indexed (a)",
-            "INSERT INTO plain VALUES (1, 7)",
-            "INSERT INTO indexed VALUES (1, 7)",
-            "ALTER TABLE plain ADD COLUMN nullv INTEGER NOT NULL DEFAULT NULL",
-            "ALTER TABLE indexed ADD COLUMN nullv INTEGER NOT NULL DEFAULT NULL",
-            "ALTER TABLE plain ADD COLUMN maxv INTEGER DEFAULT 9223372036854775807",
-            "ALTER TABLE indexed ADD COLUMN maxv INTEGER DEFAULT 9223372036854775807",
-        ],
-        |conn, prepared| {
+fn upsert_checked_stored_null_and_missing_default_preserve_generic_error_priority() {
+    for prepared in [true, false] {
+        for explicit in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = create_db(dir.path());
+            let conn = Connection::open(&db).unwrap();
+            for table in ["plain", "indexed"] {
+                conn.execute(&format!(
+                    "CREATE TABLE {table}(id INTEGER PRIMARY KEY,a INTEGER)"
+                ))
+                .unwrap();
+            }
+            conn.execute("CREATE INDEX indexed_a ON indexed(a)")
+                .unwrap();
+            for table in ["plain", "indexed"] {
+                conn.execute(&format!("INSERT INTO {table} VALUES(1,7)"))
+                    .unwrap();
+                conn.execute(&format!(
+                    "ALTER TABLE {table} ADD COLUMN nullv INTEGER NOT NULL DEFAULT NULL"
+                ))
+                .unwrap();
+                conn.execute(&format!(
+                    "ALTER TABLE {table} ADD COLUMN maxv INTEGER DEFAULT 9223372036854775807"
+                ))
+                .unwrap();
+            }
+            // Persist the old NULL explicitly, while maxv remains physically
+            // missing. This retains the checked self-arithmetic/error-order
+            // hazard without asking materialization to create an invalid NULL.
+            let key = citadel_sql::encoding::encode_composite_key(&[Value::Integer(1)]);
+            let stored = citadel_sql::encoding::encode_row(&[Value::Integer(7), Value::Null]);
+            let mut tx = db.begin_write().unwrap();
+            for table in ["plain", "indexed"] {
+                tx.table_insert(table.as_bytes(), &key, &stored).unwrap();
+            }
+            tx.commit().unwrap();
+            if explicit {
+                conn.execute("BEGIN").unwrap();
+            }
             for table in ["plain", "indexed"] {
                 for overflow in [true, false] {
                     let assignments = if overflow {
-                        "nullv = nullv + 1, maxv = maxv + 1"
+                        "nullv=nullv+1,maxv=maxv+1"
                     } else {
-                        "nullv = nullv + 1"
+                        "nullv=nullv+1"
                     };
-                    let error = execute_checked_upsert(
-                        conn,
-                        prepared,
-                        &format!("INSERT INTO {table} VALUES ($1, $2, $3, $4) ON CONFLICT (id) DO UPDATE SET {assignments}"),
-                        &[Value::Integer(1), Value::Integer(99), Value::Integer(0), Value::Integer(0)],
-                    ).unwrap_err();
-                    // Generic UPSERT evaluates every RHS before checking assigned
-                    // NOT NULL constraints, so the later arithmetic error wins.
+                    let error = execute_checked_upsert(&conn,prepared,
+                        &format!("INSERT INTO {table} VALUES($1,$2,$3,$4) ON CONFLICT(id) DO UPDATE SET {assignments}"),
+                        &[Value::Integer(1),Value::Integer(99),Value::Integer(0),Value::Integer(0)]).unwrap_err();
+                    // Materialization leaves stored NULL alone. Every RHS runs
+                    // before assigned NOT NULL validation, so overflow wins.
                     if overflow {
                         assert!(
                             matches!(error, SqlError::IntegerOverflow),
@@ -933,20 +955,71 @@ fn upsert_checked_missing_defaults_preserve_generic_error_priority() {
                         );
                     } else {
                         assert!(
-                            matches!(error, SqlError::NotNullViolation(ref column) if column == "nullv"),
+                            matches!(error,SqlError::NotNullViolation(ref c) if c=="nullv"),
                             "{table}: {error:?}"
                         );
                     }
                     assert_eq!(
-                        query(conn, &format!("SELECT * FROM {table}")).rows,
+                        query(&conn, &format!("SELECT * FROM {table}")).rows,
                         vec![vec![
                             Value::Integer(1),
                             Value::Integer(7),
                             Value::Null,
-                            Value::Integer(i64::MAX)
+                            Value::Integer(i64::MAX),
                         ]]
                     );
                 }
+            }
+            // The failed statements must leave the explicit transaction usable,
+            // and must not publish even a logically equivalent expanded row.
+            if explicit {
+                conn.execute("COMMIT").unwrap();
+            }
+            let mut read = db.begin_read();
+            for table in ["plain", "indexed"] {
+                assert_eq!(
+                    read.table_get(table.as_bytes(), &key).unwrap().as_deref(),
+                    Some(stored.as_slice())
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn upsert_checked_invalid_missing_default_precedes_conflict_rhs() {
+    for_checked_upsert_modes(
+        &[
+            "CREATE TABLE plain(id INTEGER PRIMARY KEY,a INTEGER)",
+            "CREATE TABLE indexed(id INTEGER PRIMARY KEY,a INTEGER)",
+            "CREATE INDEX indexed_a ON indexed(a)",
+            "INSERT INTO plain VALUES(1,7)",
+            "INSERT INTO indexed VALUES(1,7)",
+            "ALTER TABLE plain ADD COLUMN nullv INTEGER NOT NULL DEFAULT NULL",
+            "ALTER TABLE indexed ADD COLUMN nullv INTEGER NOT NULL DEFAULT NULL",
+            "ALTER TABLE plain ADD COLUMN maxv INTEGER DEFAULT 9223372036854775807",
+            "ALTER TABLE indexed ADD COLUMN maxv INTEGER DEFAULT 9223372036854775807",
+        ],
+        |conn, prepared| {
+            for table in ["plain", "indexed"] {
+                let error=execute_checked_upsert(conn,prepared,
+                &format!("INSERT INTO {table} VALUES($1,$2,$3,$4) ON CONFLICT(id) DO UPDATE SET nullv=nullv+1,maxv=maxv+1"),
+                &[Value::Integer(1),Value::Integer(99),Value::Integer(0),Value::Integer(0)]).unwrap_err();
+                assert!(
+                    matches!(error,SqlError::NotNullViolation(ref c) if c=="nullv"),
+                    "{table}: {error:?}"
+                );
+                assert_eq!(
+                    query(conn, &format!("SELECT id,a FROM {table}")).rows,
+                    vec![vec![Value::Integer(1), Value::Integer(7)]]
+                );
+                assert_eq!(
+                    query(conn, &format!("SELECT maxv FROM {table}")).rows,
+                    vec![vec![Value::Integer(i64::MAX)]]
+                );
+                assert!(
+                    matches!(conn.query(&format!("SELECT nullv FROM {table}")),Err(SqlError::NotNullViolation(ref c)) if c=="nullv")
+                );
             }
         },
     );
@@ -1084,7 +1157,7 @@ fn upsert_checked_repeated_targets_read_old_values_and_keep_earlier_errors() {
 
 #[test]
 fn upsert_checked_cross_type_missing_defaults_match_indexed_semantics() {
-    for (default, expected) in [("7.5", Some(8)), ("-0.5", Some(0)), ("'7'", None)] {
+    for (default, expected) in [("7.5", Some(8)), ("-0.5", Some(1)), ("'7'", None)] {
         let plain_default = format!("ALTER TABLE plain ADD COLUMN v INTEGER DEFAULT {default}");
         let indexed_default = format!("ALTER TABLE indexed ADD COLUMN v INTEGER DEFAULT {default}");
         for_checked_upsert_modes(
@@ -1103,41 +1176,152 @@ fn upsert_checked_cross_type_missing_defaults_match_indexed_semantics() {
                 let mut observed = Vec::new();
                 for table in ["plain", "indexed"] {
                     let result = execute_checked_upsert(
-                        conn,
-                        prepared,
+                        conn, prepared,
                         &format!("INSERT INTO {table} VALUES ($1, $2, $3, 'proposed') ON CONFLICT (id) DO UPDATE SET v = v + 1"),
                         &[Value::Integer(1), Value::Integer(99), Value::Integer(0)],
                     );
-                    let value = if let Some(expected) = expected {
+                    if let Some(expected) = expected {
+                        // Missing defaults coerce before RHS evaluation:
+                        // INTEGER DEFAULT -0.5 becomes 0, then +1 becomes 1.
                         assert_eq!(result.unwrap(), 1);
-                        Value::Integer(expected)
+                        let rows = query(conn, &format!("SELECT * FROM {table}")).rows;
+                        assert_eq!(
+                            rows,
+                            vec![vec![
+                                Value::Integer(1),
+                                Value::Integer(5),
+                                Value::Integer(expected),
+                                Value::Text("keep".into())
+                            ]]
+                        );
+                        observed.push(rows);
                     } else {
-                        // A numeric-looking TEXT default is accepted by ALTER,
-                        // but the generic arithmetic evaluator rejects TEXT + INTEGER.
+                        // Permissive INTEGER rejects TEXT even when it looks
+                        // numeric. The same invalid default also fails reads
+                        // that need v; unrelated columns stay readable.
                         assert!(
                             matches!(result, Err(SqlError::TypeMismatch { .. })),
-                            "got {result:?}"
+                            "{result:?}"
                         );
-                        Value::Text("7".into())
-                    };
-                    let rows = query(conn, &format!("SELECT * FROM {table}")).rows;
-                    assert_eq!(
-                        rows,
-                        vec![vec![
-                            Value::Integer(1),
-                            Value::Integer(5),
-                            value,
-                            Value::Text("keep".into())
-                        ]]
-                    );
-                    if expected.is_some() {
-                        assert!(matches!(rows[0][2], Value::Integer(_)));
+                        assert!(matches!(
+                            conn.query(&format!("SELECT v FROM {table}")),
+                            Err(SqlError::TypeMismatch { .. })
+                        ));
+                        let rows = query(conn, &format!("SELECT id,a,tail FROM {table}")).rows;
+                        assert_eq!(
+                            rows,
+                            vec![vec![
+                                Value::Integer(1),
+                                Value::Integer(5),
+                                Value::Text("keep".into())
+                            ]]
+                        );
+                        observed.push(rows);
                     }
-                    observed.push(rows);
                 }
                 assert_eq!(observed[0], observed[1]);
             },
         );
+    }
+}
+
+#[test]
+fn upsert_checked_legacy_stored_types_preserve_arithmetic_and_error_semantics() {
+    for prepared in [true, false] {
+        for explicit in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = create_db(dir.path());
+            let conn = Connection::open(&db).unwrap();
+            for table in ["plain", "indexed"] {
+                conn.execute(&format!(
+                    "CREATE TABLE {table}(id INTEGER PRIMARY KEY,a INTEGER,v INTEGER,tail TEXT)"
+                ))
+                .unwrap();
+            }
+            conn.execute("CREATE INDEX indexed_a ON indexed(a)")
+                .unwrap();
+            for table in ["plain", "indexed"] {
+                conn.execute(&format!(
+                    "INSERT INTO {table} VALUES(1,5,0,'keep'),(2,5,0,'keep'),(3,5,0,'keep')"
+                ))
+                .unwrap();
+            }
+            let old = [Value::Real(7.5), Value::Real(-0.5), Value::Text("7".into())];
+            let originals: Vec<_> = old
+                .iter()
+                .map(|v| {
+                    citadel_sql::encoding::encode_row(&[
+                        Value::Integer(5),
+                        v.clone(),
+                        Value::Text("keep".into()),
+                    ])
+                })
+                .collect();
+            let keys: Vec<_> = (1..=3)
+                .map(|id| citadel_sql::encoding::encode_composite_key(&[Value::Integer(id)]))
+                .collect();
+            let mut tx = db.begin_write().unwrap();
+            for table in ["plain", "indexed"] {
+                for (key, bytes) in keys.iter().zip(&originals) {
+                    tx.table_insert(table.as_bytes(), key, bytes).unwrap();
+                }
+            }
+            tx.commit().unwrap();
+            if explicit {
+                conn.execute("BEGIN").unwrap();
+            }
+            for table in ["plain", "indexed"] {
+                for (index, expected) in [Some(8), Some(0), None].into_iter().enumerate() {
+                    let result=execute_checked_upsert(&conn,prepared,
+                        &format!("INSERT INTO {table} VALUES($1,$2,$3,'proposed') ON CONFLICT(id) DO UPDATE SET v=v+1"),
+                        &[Value::Integer(index as i64+1),Value::Integer(99),Value::Integer(0)]);
+                    let value = if let Some(expected) = expected {
+                        assert_eq!(result.unwrap(), 1);
+                        Value::Integer(expected)
+                    } else {
+                        assert!(
+                            matches!(result, Err(SqlError::TypeMismatch { .. })),
+                            "{result:?}"
+                        );
+                        old[index].clone()
+                    };
+                    assert_eq!(
+                        query(
+                            &conn,
+                            &format!("SELECT * FROM {table} WHERE id={}", index + 1)
+                        )
+                        .rows,
+                        vec![vec![
+                            Value::Integer(index as i64 + 1),
+                            Value::Integer(5),
+                            value,
+                            Value::Text("keep".into()),
+                        ]]
+                    );
+                }
+            }
+            if explicit {
+                conn.execute("COMMIT").unwrap();
+            }
+            let mut read = db.begin_read();
+            for table in ["plain", "indexed"] {
+                for (index, key) in keys.iter().enumerate() {
+                    let expected = if index == 2 {
+                        originals[index].clone()
+                    } else {
+                        citadel_sql::encoding::encode_row(&[
+                            Value::Integer(5),
+                            Value::Integer(if index == 0 { 8 } else { 0 }),
+                            Value::Text("keep".into()),
+                        ])
+                    };
+                    assert_eq!(
+                        read.table_get(table.as_bytes(), key).unwrap().as_deref(),
+                        Some(expected.as_slice())
+                    );
+                }
+            }
+        }
     }
 }
 

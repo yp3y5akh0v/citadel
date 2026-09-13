@@ -394,7 +394,7 @@ fn streamed_groups_do_not_pre_evaluate_unsafe_or_unreferenced_defaults() {
 }
 
 #[test]
-fn streamed_aggregates_reject_mixed_numeric_and_interval_defaults() {
+fn streamed_aggregates_reject_legacy_mixed_numeric_and_interval_storage() {
     for (missing_id, stored_id) in [(1, 2), (2, 1)] {
         let db = database();
         let conn = Connection::open(&db).unwrap();
@@ -406,6 +406,23 @@ fn streamed_aggregates_reject_mixed_numeric_and_interval_defaults() {
         .unwrap();
         conn.execute("ALTER TABLE items ADD COLUMN v INTERVAL DEFAULT 1")
             .unwrap();
+        // Preserve the old mixed-storage error contract explicitly. Missing
+        // defaults now coerce INTEGER 1 to INTERVAL just as INSERT does; old
+        // databases may still contain a physically stored INTEGER in this slot.
+        let mut legacy = conn
+            .query(&format!("SELECT g,d FROM items WHERE id={missing_id}"))
+            .unwrap()
+            .rows
+            .remove(0);
+        legacy.push(Value::Integer(1));
+        let mut wtx = db.begin_write().unwrap();
+        wtx.table_insert(
+            b"items",
+            &citadel_sql::encoding::encode_composite_key(&[Value::Integer(missing_id)]),
+            &citadel_sql::encoding::encode_row(&legacy),
+        )
+        .unwrap();
+        wtx.commit().unwrap();
         conn.execute(&format!(
             "INSERT INTO items VALUES ({stored_id}, 7, DATE '2023-01-01', INTERVAL '1 day')"
         ))

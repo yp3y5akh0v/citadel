@@ -430,6 +430,97 @@ fn coerce_for_type(value: Value, data_type: DataType, strict: bool) -> Result<Va
     })
 }
 
+/// A missing physical column uses the same coercion and nullability policy as
+/// an omitted INSERT value. Existing stored values, including NULL, bypass this.
+pub(super) fn eval_column_default_with_cancel(
+    column: &ColumnDef,
+    strict: bool,
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<Option<Value>> {
+    column
+        .default_expr
+        .as_ref()
+        .map(|expr| {
+            eval_default_value(
+                expr,
+                column.data_type,
+                column.nullable,
+                &column.name,
+                strict,
+                cancel,
+            )
+        })
+        .transpose()
+}
+
+fn eval_default_value(
+    expr: &Expr,
+    data_type: DataType,
+    nullable: bool,
+    name: &str,
+    strict: bool,
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<Value> {
+    let value = coerce_for_type(
+        eval_const_expr_with_cancel(expr, cancel)?,
+        data_type,
+        strict,
+    )?;
+    check_cancel(cancel)?;
+    if value.is_null() && !nullable {
+        return Err(SqlError::NotNullViolation(name.to_owned()));
+    }
+    Ok(value)
+}
+
+/// Raw scan plans may reuse a default only after a positive statement-constant
+/// proof. An evaluation error declines the plan: a stored value or an empty scan
+/// must not fail because it never needs the default.
+pub(super) fn try_cached_column_default(
+    column: &ColumnDef,
+    strict: bool,
+    cancel: Option<&citadel::CancelToken>,
+) -> Option<Option<Value>> {
+    if column
+        .default_expr
+        .as_ref()
+        .is_some_and(|expr| !crate::eval::is_statement_constant(expr))
+    {
+        return None;
+    }
+    eval_column_default_with_cancel(column, strict, cancel).ok()
+}
+
+/// Only the metadata needed after a partial decoder outlives its schema borrow.
+struct ColumnDefault {
+    expr: Expr,
+    data_type: DataType,
+    nullable: bool,
+    name: String,
+}
+
+impl ColumnDefault {
+    fn new(column: &ColumnDef) -> Option<Self> {
+        Some(Self {
+            expr: column.default_expr.clone()?,
+            data_type: column.data_type,
+            nullable: column.nullable,
+            name: column.name.clone(),
+        })
+    }
+
+    fn evaluate(&self, strict: bool, cancel: Option<&citadel::CancelToken>) -> Result<Value> {
+        eval_default_value(
+            &self.expr,
+            self.data_type,
+            self.nullable,
+            &self.name,
+            strict,
+            cancel,
+        )
+    }
+}
+
 #[derive(Clone)]
 pub(super) enum FastGenEval {
     None,
@@ -583,7 +674,12 @@ impl<'a> SelectRowDecoder<'a> {
         stmt: &SelectStmt,
         cancel: Option<&citadel::CancelToken>,
     ) -> Result<Self> {
-        let partial = if schema.has_virtual_columns() {
+        let partial = if schema.has_virtual_columns()
+            || schema
+                .columns
+                .iter()
+                .any(|column| column.default_expr.is_some())
+        {
             let mut needed = Vec::new();
             for column in &stmt.columns {
                 match column {
@@ -631,6 +727,10 @@ impl<'a> SelectRowDecoder<'a> {
         }
     }
 
+    pub(super) fn into_partial(self) -> Option<PartialDecodeCtx> {
+        self.partial
+    }
+
     pub(super) fn remaining_after(&self, decoded: &PartialDecodeCtx) -> PartialDecodeCtx {
         let needed = match &self.partial {
             Some(ctx) => ctx.reset_cols.clone(),
@@ -650,8 +750,8 @@ pub(super) struct PartialDecodeCtx {
     remaining_pk: Vec<(usize, usize)>,
     remaining_nonpk_targets: Vec<usize>,
     remaining_nonpk_schema: Vec<usize>,
-    nonpk_defaults: Vec<(usize, usize, Expr)>,
-    remaining_defaults: Vec<(usize, usize, Expr)>,
+    nonpk_defaults: Vec<(usize, usize, ColumnDefault)>,
+    remaining_defaults: Vec<(usize, usize, ColumnDefault)>,
     virtuals_to_eval: Vec<(usize, Expr, DataType, bool, FastGenEval)>,
     col_map: ColumnMap,
     /// Columns this ctx writes; the only ones a reused buffer must clear.
@@ -762,8 +862,8 @@ impl PartialDecodeCtx {
 
         let mut nonpk_defaults = Vec::new();
         for (&phys_pos, &schema_col) in nonpk_targets.iter().zip(nonpk_schema.iter()) {
-            if let Some(ref expr) = schema.columns[schema_col].default_expr {
-                nonpk_defaults.push((phys_pos, schema_col, expr.clone()));
+            if let Some(default) = ColumnDefault::new(&schema.columns[schema_col]) {
+                nonpk_defaults.push((phys_pos, schema_col, default));
             }
         }
         let mut remaining_defaults = Vec::new();
@@ -771,8 +871,8 @@ impl PartialDecodeCtx {
             .iter()
             .zip(remaining_nonpk_schema.iter())
         {
-            if let Some(ref expr) = schema.columns[schema_col].default_expr {
-                remaining_defaults.push((phys_pos, schema_col, expr.clone()));
+            if let Some(default) = ColumnDefault::new(&schema.columns[schema_col]) {
+                remaining_defaults.push((phys_pos, schema_col, default));
             }
         }
 
@@ -890,7 +990,7 @@ impl PartialDecodeCtx {
             let stored = row_non_pk_count(value);
             for (nonpk_idx, schema_col, default) in &self.nonpk_defaults {
                 if *nonpk_idx >= stored {
-                    row[*schema_col] = eval_const_expr_with_cancel(default, cancel)?;
+                    row[*schema_col] = default.evaluate(self.strict, cancel)?;
                 }
             }
         }
@@ -925,7 +1025,7 @@ impl PartialDecodeCtx {
             let stored = row_non_pk_count(value);
             for (nonpk_idx, schema_col, default) in &self.remaining_defaults {
                 if *nonpk_idx >= stored {
-                    row[*schema_col] = eval_const_expr_with_cancel(default, cancel)?;
+                    row[*schema_col] = default.evaluate(self.strict, cancel)?;
                 }
             }
         }
@@ -1148,8 +1248,12 @@ pub(crate) fn decode_full_row_into_with_cancel(
     if stored_count < mapping.len() {
         for &logical_idx in mapping.iter().skip(stored_count) {
             if logical_idx != usize::MAX {
-                if let Some(ref expr) = schema.columns[logical_idx].default_expr {
-                    row[logical_idx] = eval_const_expr_with_cancel(expr, cancel)?;
+                if let Some(value) = eval_column_default_with_cancel(
+                    &schema.columns[logical_idx],
+                    schema.is_strict(),
+                    cancel,
+                )? {
+                    row[logical_idx] = value;
                 }
             }
         }

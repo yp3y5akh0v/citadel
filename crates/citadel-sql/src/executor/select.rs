@@ -2425,25 +2425,27 @@ impl StreamAggPlan {
         let num_pk_cols = table_schema.primary_key_columns.len();
 
         let mapping = table_schema.decode_col_mapping();
-        let nonpk_agg_defaults: Vec<Option<Value>> = raw_targets
+        let Some(nonpk_agg_defaults) = raw_targets
             .iter()
-            .map(|t| -> Result<Option<Value>> {
-                Ok(match t {
-                    RawAggTarget::NonPk(phys_idx) => {
-                        let schema_col = mapping[*phys_idx];
-                        if schema_col == usize::MAX {
-                            return Ok(None);
-                        }
-                        table_schema.columns[schema_col]
-                            .default_expr
-                            .as_ref()
-                            .map(|expr| eval_const_expr_with_cancel(expr, cancel))
-                            .transpose()?
+            .map(|target| match target {
+                RawAggTarget::NonPk(physical) => {
+                    let column = mapping[*physical];
+                    if column == usize::MAX {
+                        Some(None)
+                    } else {
+                        try_cached_column_default(
+                            &table_schema.columns[column],
+                            table_schema.is_strict(),
+                            cancel,
+                        )
                     }
-                    _ => None,
-                })
+                }
+                _ => Some(None),
             })
-            .collect::<Result<_>>()?;
+            .collect::<Option<Vec<Option<Value>>>>()
+        else {
+            return Ok(None);
+        };
 
         // Raw-bytes predicate is only safe when every agg is CountStar.
         let all_count_star = ops.iter().all(|(op, _)| matches!(op, StreamAgg::CountStar));
@@ -2683,12 +2685,8 @@ impl StreamGroupByPlan {
 
         let non_pk = schema.non_pk_indices();
         let enc_pos = schema.encoding_positions();
-        let nonpk_default = |col_idx: usize| -> Option<Option<Value>> {
-            let expr = schema.columns[col_idx].default_expr.as_ref();
-            if expr.is_some_and(|expr| volatile_function_in_expr(expr).is_some()) {
-                return None;
-            }
-            expr.map(eval_const_expr).transpose().ok()
+        let nonpk_default = |col_idx: usize| {
+            try_cached_column_default(&schema.columns[col_idx], schema.is_strict(), None)
         };
         let group_target = if let Some(pk_pos) = schema
             .primary_key_columns
@@ -4539,6 +4537,7 @@ struct PkPointPlan {
     columns: Vec<String>,
     where_expr: Expr,
     pk_sources: Vec<PointSource>,
+    decode_plan: Option<Box<SelectScanDecodePlan>>,
 }
 
 /// Single-table WHERE-only SELECT; planning still runs per execute.
@@ -4549,6 +4548,7 @@ struct SimpleScanPlan {
     where_expr: Option<Expr>,
     /// Schema columns the projection and WHERE read; the covered-index gate.
     needed: Vec<usize>,
+    decode_plan: Option<Box<SelectScanDecodePlan>>,
 }
 
 enum PointSource {
@@ -4682,7 +4682,7 @@ fn build_select_lane(schema: &SchemaManager, sel: &SelectStmt) -> Option<Compile
         return None;
     }
     let table_schema = schema.get(&lower)?;
-    // Virtual columns are stored as NULL placeholders the raw decode keeps.
+    // Virtual columns retain the existing general-executor admission.
     if table_schema.has_virtual_columns() {
         return None;
     }
@@ -4690,6 +4690,9 @@ fn build_select_lane(schema: &SchemaManager, sel: &SelectStmt) -> Option<Compile
     let where_expr = sel.where_clause.as_ref()?;
     let proj = build_stream_proj(&sel.columns, table_schema)?;
     let columns = projection_column_names(&sel.columns, &table_schema.columns);
+    let decode_plan = SelectScanDecodePlan::new(table_schema, sel, None)
+        .ok()?
+        .map(Box::new);
     if let Some(pk_sources) = detect_pk_point_sources(where_expr, table_schema) {
         return Some(CompiledSelectLane::Point(PkPointPlan {
             table_lower: table_schema.name.clone(),
@@ -4698,6 +4701,7 @@ fn build_select_lane(schema: &SchemaManager, sel: &SelectStmt) -> Option<Compile
             columns,
             where_expr: where_expr.clone(),
             pk_sources,
+            decode_plan,
         }));
     }
     let mut needed: Vec<usize> = match &proj {
@@ -4717,6 +4721,7 @@ fn build_select_lane(schema: &SchemaManager, sel: &SelectStmt) -> Option<Compile
         columns,
         where_expr: Some(where_expr.clone()),
         needed,
+        decode_plan,
     }))
 }
 
@@ -4780,12 +4785,17 @@ impl SimpleScanPlan {
                 rows: out,
             });
         }
-        let (rows, filtered) = super::scan::collect_rows_with_read_planned(
+        let decoder = self
+            .decode_plan
+            .as_ref()
+            .map(|plan| plan.bind(&self.table_schema, self.where_expr.as_ref()));
+        let (rows, filtered) = super::scan::collect_rows_with_read_decoded(
             rtx,
             &self.table_schema,
             &self.where_expr,
             None,
             plan,
+            decoder.as_ref(),
         )?;
         let mut out = Vec::with_capacity(rows.len());
         for mut row in rows {
@@ -4812,13 +4822,18 @@ impl PkPointPlan {
     fn run(&self, rtx: &mut ReadTxn<'_>) -> Result<QueryResult> {
         let cancel = rtx.cancel_token().cloned();
         let cancel = cancel.as_ref();
+        let decoder = self
+            .decode_plan
+            .as_ref()
+            .map(|plan| plan.bind(&self.table_schema, Some(&self.where_expr)));
         let Some(key) = resolve_point_key(&self.pk_sources, &self.table_schema)? else {
-            let (candidates, _) = super::scan::collect_rows_with_read_planned(
+            let (candidates, _) = super::scan::collect_rows_with_read_decoded(
                 rtx,
                 &self.table_schema,
                 &Some(self.where_expr.clone()),
                 None,
                 crate::planner::ScanPlan::SeqScan,
+                decoder.as_ref(),
             )?;
             let rows = candidates
                 .into_iter()
@@ -4833,19 +4848,17 @@ impl PkPointPlan {
             .table_get(self.table_lower.as_bytes(), &key)
             .map_err(SqlError::Storage)?
         {
-            Some(value) => {
-                let mut row =
-                    decode_full_row_with_cancel(&self.table_schema, &key, &value, cancel)?;
-                let col_map = self.table_schema.column_map();
-                match eval_expr(
-                    &self.where_expr,
-                    &EvalCtx::new(col_map, &row).with_cancel(cancel),
-                ) {
-                    Ok(v) if is_truthy(&v) => vec![self.proj.project_decoded(&mut row, cancel)?],
-                    Ok(_) => Vec::new(),
-                    Err(e) => return Err(e),
-                }
-            }
+            Some(value) => match super::scan::read_scan_row(
+                &self.table_schema,
+                &key,
+                &value,
+                Some(&self.where_expr),
+                decoder.as_ref(),
+                cancel,
+            )? {
+                Some(mut row) => vec![self.proj.project_decoded(&mut row, cancel)?],
+                None => Vec::new(),
+            },
             None => Vec::new(),
         };
         Ok(QueryResult {
@@ -5749,12 +5762,24 @@ fn execute_cached_join_with_read(
             .table_get(outer_schema.name.as_bytes(), &key)
             .map_err(SqlError::Storage)?
         {
-            Some(value) => vec![decode_full_row_with_cancel(
-                outer_schema,
-                &key,
-                &value,
-                cancel,
-            )?],
+            Some(value) => {
+                let row = if outer_schema.has_virtual_columns()
+                    || outer_schema
+                        .columns
+                        .iter()
+                        .any(|column| column.default_expr.is_some())
+                {
+                    PartialDecodeCtx::new_with_cancel(
+                        outer_schema,
+                        &plan.needed_per_table[0],
+                        cancel,
+                    )?
+                    .decode_with_cancel(&key, &value, cancel)?
+                } else {
+                    decode_full_row_with_cancel(outer_schema, &key, &value, cancel)?
+                };
+                vec![row]
+            }
             None => Vec::new(),
         }
     } else {
