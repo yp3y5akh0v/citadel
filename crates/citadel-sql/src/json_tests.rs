@@ -702,3 +702,113 @@ fn evaluator_threads_cancellation_into_json_has_key_functions() {
     ));
     assert!(token.is_cancelled());
 }
+
+fn assert_jsonb_public_header_error(bytes: &[u8], expected: &str) {
+    type ReaderProbe = fn(&[u8]) -> Result<()>;
+    let probes: [(&str, ReaderProbe); 4] = [
+        ("header", |bytes| read_header(bytes).map(|_| ())),
+        ("skip", |bytes| skip_value(bytes).map(|_| ())),
+        ("scalar text", |bytes| read_scalar_text(bytes).map(|_| ())),
+        ("full text", |bytes| decode_to_text(bytes).map(|_| ())),
+    ];
+    for (name, probe) in probes {
+        let outcome = std::panic::catch_unwind(|| probe(bytes));
+        assert!(outcome.is_ok(), "{name} panicked for header {bytes:?}");
+        let error = outcome.unwrap().unwrap_err();
+        assert!(
+            matches!(error, SqlError::InvalidValue(message) if message == expected),
+            "{name} returned the wrong error for {bytes:?}"
+        );
+    }
+}
+
+#[test]
+fn jsonb_u64_payload_lengths_cannot_wrap_public_reader_bounds() {
+    for kind in [JsonbType::String, JsonbType::Array, JsonbType::Object] {
+        for declared in [u64::MAX, u64::MAX - 8, u64::MAX - 9, 1_u64 << 32] {
+            let mut bytes = vec![header_byte(kind, SIZE_CLASS_U64)];
+            bytes.extend_from_slice(&declared.to_le_bytes());
+            assert_jsonb_public_header_error(&bytes, "JSONB payload truncated");
+        }
+    }
+}
+
+#[test]
+fn jsonb_u64_payload_length_cannot_truncate_to_valid_32_bit_value() {
+    // On 32-bit targets the old cast turns this into three and accepts it.
+    // On 64-bit targets it is a normal oversized-payload rejection control.
+    let mut bytes = vec![header_byte(JsonbType::String, SIZE_CLASS_U64)];
+    bytes.extend_from_slice(&((1_u64 << 32) + 3).to_le_bytes());
+    bytes.extend_from_slice(b"abc");
+    assert_jsonb_public_header_error(&bytes, "JSONB payload truncated");
+}
+
+#[test]
+fn jsonb_all_length_widths_preserve_exact_bounds_and_truncation_errors() {
+    let headers = [
+        vec![header_byte(JsonbType::String, 3)],
+        vec![header_byte(JsonbType::String, SIZE_CLASS_U8), 3],
+        vec![header_byte(JsonbType::String, SIZE_CLASS_U16), 3, 0],
+        vec![header_byte(JsonbType::String, SIZE_CLASS_U32), 3, 0, 0, 0],
+        vec![
+            header_byte(JsonbType::String, SIZE_CLASS_U64),
+            3,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ],
+    ];
+    for header in headers {
+        let mut bytes = header.clone();
+        bytes.extend_from_slice("雪".as_bytes());
+        assert_eq!(
+            read_header(&bytes).unwrap(),
+            (JsonbType::String, header.len(), 3)
+        );
+        assert_eq!(skip_value(&bytes).unwrap(), bytes.len());
+        assert_eq!(read_scalar_text(&bytes).unwrap().as_deref(), Some("雪"));
+        assert_eq!(decode_to_text(&bytes).unwrap(), "\"雪\"");
+        for length in 0..bytes.len() {
+            let expected = if length == 0 {
+                "empty JSONB"
+            } else if length < header.len() {
+                "truncated JSONB header"
+            } else {
+                "JSONB payload truncated"
+            };
+            assert_jsonb_public_header_error(&bytes[..length], expected);
+        }
+        let first_end = bytes.len();
+        bytes.push(0xff);
+        assert_eq!(skip_value(&bytes).unwrap(), first_end);
+        assert_eq!(read_scalar_text(&bytes).unwrap().as_deref(), Some("雪"));
+    }
+}
+
+#[test]
+fn jsonb_fixed_payloads_ignore_declared_length_before_host_width_conversion() {
+    for (kind, payload, text) in [
+        (JsonbType::Null, Vec::new(), None),
+        (JsonbType::True, Vec::new(), Some("true")),
+        (JsonbType::False, Vec::new(), Some("false")),
+        (
+            JsonbType::Integer,
+            42_i64.to_le_bytes().to_vec(),
+            Some("42"),
+        ),
+        (JsonbType::Real, 2.5_f64.to_le_bytes().to_vec(), Some("2.5")),
+    ] {
+        // This noncanonical length field was always ignored for fixed types.
+        // Rejecting it before the override would change valid public behavior.
+        let mut bytes = vec![header_byte(kind, SIZE_CLASS_U64)];
+        bytes.extend_from_slice(&u64::MAX.to_le_bytes());
+        bytes.extend_from_slice(&payload);
+        assert_eq!(read_header(&bytes).unwrap(), (kind, 9, payload.len()));
+        assert_eq!(skip_value(&bytes).unwrap(), bytes.len());
+        assert_eq!(read_scalar_text(&bytes).unwrap().as_deref(), text);
+    }
+}
