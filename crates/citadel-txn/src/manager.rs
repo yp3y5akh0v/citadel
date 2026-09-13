@@ -12,6 +12,7 @@ use std::sync::{Arc, OnceLock};
 
 use citadel_buffer::allocator::PageAllocator;
 use citadel_buffer::btree::BTree;
+use citadel_buffer::cursor::{MutablePageMap, PageMap};
 use citadel_buffer::pool::BufferPool;
 use citadel_core::types::{PageId, PageType, TxnId};
 use citadel_core::{
@@ -28,6 +29,7 @@ use citadel_page::page::Page;
 
 use crate::catalog::{ResolvedCatalog, TableDescriptor};
 use crate::integrity::{self, IntegrityReport};
+use crate::owned_pages::OwnedPages;
 use crate::pending_free;
 use crate::read_txn::ReadTxn;
 use crate::write_txn::WriteTxn;
@@ -389,7 +391,7 @@ struct ManagerState {
     /// zero-filled. RAM-only; a reopen re-zeroes once, which is harmless.
     zeroed_up_to: TxnId,
     zeroed_chain_up_to: TxnId,
-    recycled_pages: Option<FxHashMap<PageId, Page>>,
+    recycled_pages: Option<OwnedPages>,
 }
 
 /// A stable on-disk commit-slot snapshot held while writers are excluded.
@@ -894,7 +896,7 @@ impl TxnManager {
         &self,
         base_txn_id: TxnId,
         txn_id: TxnId,
-        pages: &mut FxHashMap<PageId, Page>,
+        pages: &mut OwnedPages,
         alloc: &mut PageAllocator,
         tree: &BTree,
         old_slot: &CommitSlot,
@@ -908,7 +910,7 @@ impl TxnManager {
         // owned by this transaction (new/COW pages carry a txn id at or above
         // its base id) are dirty; cached older pages must not turn an equal
         // CRDT comparison or other read-only writer into a physical commit.
-        let has_dirty_pages = pages.values().any(|page| page.txn_id() >= base_txn_id);
+        let has_dirty_pages = pages.iter().any(|(_, page)| page.txn_id() >= base_txn_id);
         let is_noop = !force_commit
             && !has_dirty_pages
             && alloc.freed_this_txn().is_empty()
@@ -966,7 +968,7 @@ impl TxnManager {
 
         // Freed pages are unreachable via tree; don't encrypt+write them.
         for &page_id in &freed_this_txn {
-            pages.remove(&page_id);
+            pages.remove_page(&page_id);
         }
 
         // Data-page reuse respects readers; metadata needs only recovery-slot
@@ -988,6 +990,20 @@ impl TxnManager {
                 &mut retired_chain_pages,
             )?
         };
+
+        // Reclamation above can stage metadata pages. Select the final dirty
+        // set through immutable access before any Arc-backed page mutation;
+        // clean snapshot pages must keep their shared allocations and bytes.
+        let mut dirty_page_info: Vec<(u64, PageId)> = Vec::with_capacity(pages.len());
+        let mut max_offset = 0u64;
+        for (_, page) in pages.iter() {
+            if page.txn_id() >= base_txn_id {
+                let page_id = page.page_id();
+                let offset = page_offset(page_id);
+                max_offset = max_offset.max(offset);
+                dirty_page_info.push((offset, page_id));
+            }
+        }
 
         let merkle_root_hash = if self.sync_mode != citadel_core::types::SyncMode::Off
             && old_slot.merkle_scheme == citadel_io::file_manager::MerkleScheme::LogicalOverflowV1
@@ -1019,30 +1035,20 @@ impl TxnManager {
             // the payload, so an incremental rewrite cannot safely promote
             // the slot to the logical-overflow scheme. Zero dirty tree hashes
             // and keep the slot untrusted until a full compaction rebuild.
-            for page in pages.values_mut() {
-                if page.txn_id() >= base_txn_id
-                    && matches!(
-                        page.page_type(),
-                        Some(citadel_core::types::PageType::Leaf)
-                            | Some(citadel_core::types::PageType::Branch)
-                    )
-                {
+            for &(_, page_id) in &dirty_page_info {
+                let page = pages.get_page_mut(&page_id).unwrap();
+                if matches!(
+                    page.page_type(),
+                    Some(PageType::Leaf) | Some(PageType::Branch)
+                ) {
                     page.set_merkle_hash(&[0u8; citadel_core::MERKLE_HASH_SIZE]);
                 }
             }
             [0u8; citadel_core::MERKLE_HASH_SIZE]
         };
 
-        let mut dirty_page_info: Vec<(u64, PageId)> = Vec::with_capacity(pages.len());
-        let mut max_offset = 0u64;
-        for page in pages.values_mut() {
-            if page.txn_id() >= base_txn_id {
-                page.update_checksum();
-                let page_id = page.page_id();
-                let offset = page_offset(page_id);
-                max_offset = max_offset.max(offset);
-                dirty_page_info.push((offset, page_id));
-            }
+        for &(_, page_id) in &dirty_page_info {
+            pages.get_page_mut(&page_id).unwrap().update_checksum();
         }
         let mut new_file_size = cached_file_size;
         if !dirty_page_info.is_empty() {
@@ -1080,7 +1086,7 @@ impl TxnManager {
                 // The destination is a page-sized array by type, so the length is a
                 // guarantee rather than a runtime check inside the encrypt loop.
                 let encrypt_one = |(dst, &(_, page_id)): (&mut [u8; PAGE_SIZE], &(u64, PageId))| {
-                    let page = &pages[&page_id];
+                    let page = pages.get_page(&page_id).unwrap();
                     page_cipher::encrypt_page_with_hmac(
                         &self.dek,
                         hmac_state,
@@ -1225,11 +1231,15 @@ impl TxnManager {
             }
             for &(_, page_id) in &dirty_page_info {
                 pool.invalidate(page_id);
-                if let Some(page) = pages.remove(&page_id) {
-                    pool.insert_if_absent(page_id, Arc::new(page));
+                if let Some(page) = pages.remove_shared(&page_id) {
+                    pool.insert_if_absent(page_id, page);
                 }
             }
         }
+
+        // Drop remaining clean/obsolete owners outside the pool and state
+        // locks. Recycle only empty buckets after successful publication.
+        pages.clear();
 
         let generation = {
             let mut state = self.state.lock();
@@ -2483,7 +2493,7 @@ impl TxnManager {
 
     fn load_pending_free_chain(
         &self,
-        pages: &FxHashMap<PageId, Page>,
+        pages: &OwnedPages,
         root: PageId,
         high_water_mark: u32,
         slot_txn: TxnId,
@@ -2501,7 +2511,7 @@ impl TxnManager {
                 if page_id.as_u32() >= high_water_mark {
                     return Err(Error::PageOutOfBounds(page_id));
                 }
-                let page = match pages.get(&page_id) {
+                let page = match pages.get_page(&page_id) {
                     Some(page) => PendingFreePage::Borrowed(page),
                     None => PendingFreePage::Cached(self.fetch_page(page_id)?),
                 };
@@ -2513,7 +2523,10 @@ impl TxnManager {
         )
     }
 
-    pub(crate) fn fetch_page_owned(&self, page_id: PageId) -> Result<Page> {
+    /// Acquire a writer source without changing cold-miss pool admission.
+    /// Cached pages stay shared; a cold page is authenticated and validated
+    /// into a private Arc, then published only if a later commit owns it.
+    pub(crate) fn fetch_write_page(&self, page_id: PageId) -> Result<Arc<Page>> {
         // Single-writer exclusion keeps these committed bounds stable. Copy
         // only the scalar bounds; writer-owned/savepoint pages never load here.
         let (high_water_mark, committed_txn_id) = {
@@ -2532,14 +2545,14 @@ impl TxnManager {
                 if arc.page_id() != page_id || arc.txn_id() > committed_txn_id {
                     return Err(Error::DatabaseCorrupted);
                 }
-                return Ok((*arc).clone());
+                return Ok(arc);
             }
         }
         let page = self.read_validated_page(page_id)?;
         if page.txn_id() > committed_txn_id {
             return Err(Error::DatabaseCorrupted);
         }
-        Ok(page)
+        Ok(Arc::new(page))
     }
 
     pub(crate) fn fetch_merkle_hash(

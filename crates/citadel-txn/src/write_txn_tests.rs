@@ -1,4 +1,5 @@
 use crate::manager::tests::create_test_manager;
+use citadel_buffer::cursor::PageMap;
 use citadel_core::types::PageId;
 
 #[test]
@@ -321,7 +322,8 @@ fn snapshot_drops_post_snapshot_pages() {
         let k = format!("k{i:03}");
         wtx.insert(k.as_bytes(), b"x").unwrap();
     }
-    let pre_pages: std::collections::HashSet<PageId> = wtx.pages.keys().copied().collect();
+    let pre_pages: std::collections::HashSet<PageId> =
+        wtx.pages.iter().map(|(id, _)| id).copied().collect();
     let snap = wtx.begin_savepoint();
 
     for i in 20..200u32 {
@@ -330,7 +332,7 @@ fn snapshot_drops_post_snapshot_pages() {
     }
 
     wtx.restore_snapshot(snap);
-    for &page_id in wtx.pages.keys() {
+    for &page_id in wtx.pages.iter().map(|(id, _)| id) {
         assert!(
             pre_pages.contains(&page_id),
             "post-savepoint page {page_id:?} leaked"
@@ -1461,7 +1463,7 @@ fn exercise_callback_split_overflow_and_savepoint(route: CallbackWriteRoute) {
     writer.ensure_table(b"deep").unwrap();
     let root = writer.named_trees[b"deep".as_slice()].root;
     assert!(writer.named_trees[b"deep".as_slice()].depth >= 3);
-    assert!(!writer.pages.contains_key(&root));
+    assert!(writer.pages.get_page(&root).is_none());
     replace_existing(&mut writer, &key(0), &original, &grown, route);
     let root = writer.named_trees[b"deep".as_slice()].root;
     let first =
@@ -2131,8 +2133,8 @@ fn table_contains_key_uses_the_live_write_view_without_materializing_values() {
     assert!(!writer.mutated_since(marker));
     assert!(writer
         .pages
-        .values()
-        .all(|page| page.page_type() != Some(PageType::Overflow)));
+        .iter()
+        .all(|(_, page)| page.page_type() != Some(PageType::Overflow)));
 
     writer.table_delete(b"contains", b"inline").unwrap();
     writer
@@ -2204,7 +2206,7 @@ fn update_with_hint_survives_overflow_staging_map_growth_and_frees_each_chain_on
     let mut old_chain = Vec::new();
     while next != PageId(0) {
         old_chain.push(next);
-        next = overflow::next_page(&writer.pages[&next]);
+        next = overflow::next_page(writer.pages.get_page(&next).unwrap());
     }
     assert!(old_chain.len() > capacity);
     let second = vec![0x5a; large.len() + 17];
@@ -2601,6 +2603,7 @@ mod shared_write_scan {
     use crate::manager::TxnManager;
     use crate::write_txn::WriteTxn;
     use crate::ReadBudget;
+    use citadel_buffer::cursor::PageMap;
     use citadel_core::{CancelToken, Error};
     use std::panic::{catch_unwind, AssertUnwindSafe};
 
@@ -2653,14 +2656,14 @@ mod shared_write_scan {
         let expected = seed(&manager);
         let mut writer = manager.begin_write().unwrap();
         writer.ensure_table(b"scan").unwrap();
-        let before: Vec<_> = writer.pages.keys().copied().collect();
+        let before: Vec<_> = writer.pages.iter().map(|(id, _)| id).copied().collect();
         let total = expected.iter().map(|(_, value)| value.len()).sum();
         let budget = ReadBudget::new(24_000, total);
         writer.set_read_budget(Some(budget.clone()));
         assert_eq!(rows(&mut writer), expected);
         assert_eq!(budget.remaining(), 0);
         assert_eq!(writer.pages.len(), before.len());
-        assert!(before.iter().all(|id| writer.pages.contains_key(id)));
+        assert!(before.iter().all(|id| writer.pages.get_page(id).is_some()));
         assert!(writer.alloc.allocated_this_txn().is_empty());
         writer.set_read_budget(None);
         writer.commit().unwrap();
@@ -2779,4 +2782,109 @@ mod shared_write_scan {
         writer.set_read_budget(None);
         writer.commit().unwrap();
     }
+}
+
+#[test]
+fn writer_shares_clean_pages_and_transfers_dirty_allocation_at_commit() {
+    use crate::manager::tests::create_test_manager_with_sync;
+    use citadel_core::types::SyncMode;
+    use std::sync::Arc;
+
+    for sync_mode in [SyncMode::Off, SyncMode::Full] {
+        let manager = create_test_manager_with_sync(sync_mode);
+        let mut seed = manager.begin_write().unwrap();
+        for table in [b"changed".as_slice(), b"clean"] {
+            seed.create_table(table).unwrap();
+            seed.table_insert(table, b"key", b"original").unwrap();
+        }
+        seed.commit().unwrap();
+        let mut old_reader = manager.begin_read();
+        let clean_root = manager.table_root(b"clean").unwrap().unwrap();
+        let clean = manager.fetch_page(clean_root).unwrap();
+        let clean_bytes = clean.as_bytes().to_vec();
+
+        let mut writer = manager.begin_write().unwrap();
+        assert_eq!(
+            writer.table_get(b"clean", b"key").unwrap().as_deref(),
+            Some(b"original".as_slice())
+        );
+        assert!(Arc::ptr_eq(
+            &clean,
+            writer.pages.get_shared(&clean_root).unwrap()
+        ));
+        let replacement = vec![0x57; 32_768];
+        writer
+            .table_insert(b"changed", b"key", &replacement)
+            .unwrap();
+        let changed_root = writer.named_trees[b"changed".as_slice()].root;
+        let dirty = writer.pages.get_shared(&changed_root).unwrap();
+        assert_eq!(Arc::strong_count(dirty), 1);
+        let dirty_pointer = Arc::as_ptr(dirty);
+        writer.commit().unwrap();
+
+        let published = manager.fetch_page(changed_root).unwrap();
+        assert_eq!(Arc::as_ptr(&published), dirty_pointer);
+        assert!(Arc::ptr_eq(
+            &clean,
+            &manager.fetch_page(clean_root).unwrap()
+        ));
+        assert_eq!(clean.as_bytes().as_slice(), clean_bytes.as_slice());
+        assert_eq!(
+            old_reader.table_get(b"changed", b"key").unwrap().as_deref(),
+            Some(b"original".as_slice())
+        );
+        assert_eq!(
+            manager.begin_read().table_get(b"changed", b"key").unwrap(),
+            Some(replacement)
+        );
+        assert!(manager.integrity_check().unwrap().is_ok());
+    }
+}
+
+#[test]
+fn unique_writer_page_still_cows_after_reused_savepoint() {
+    use std::sync::Arc;
+
+    let manager = create_test_manager();
+    let mut writer = manager.begin_write().unwrap();
+    writer.create_table(b"versions").unwrap();
+    writer.table_insert(b"versions", b"key", b"before").unwrap();
+    let original_root = writer.named_trees[b"versions".as_slice()].root;
+    let original_pointer = Arc::as_ptr(writer.pages.get_shared(&original_root).unwrap());
+    assert_eq!(
+        Arc::strong_count(writer.pages.get_shared(&original_root).unwrap()),
+        1
+    );
+    let savepoint = writer.begin_savepoint();
+    for replacement in [b"after-one".as_slice(), b"after-two"] {
+        writer
+            .table_insert(b"versions", b"key", replacement)
+            .unwrap();
+        let replaced_root = writer.named_trees[b"versions".as_slice()].root;
+        assert_ne!(replaced_root, original_root);
+        assert_eq!(
+            Arc::as_ptr(writer.pages.get_shared(&original_root).unwrap()),
+            original_pointer
+        );
+        writer.restore_snapshot(savepoint.clone());
+        assert!(writer.pages.get_page(&replaced_root).is_none());
+        assert_eq!(
+            writer.table_get(b"versions", b"key").unwrap().as_deref(),
+            Some(b"before".as_slice())
+        );
+        assert_eq!(
+            writer.named_trees[b"versions".as_slice()].root,
+            original_root
+        );
+    }
+    writer.commit().unwrap();
+    assert_eq!(
+        manager
+            .begin_read()
+            .table_get(b"versions", b"key")
+            .unwrap()
+            .as_deref(),
+        Some(b"before".as_slice())
+    );
+    assert!(manager.integrity_check().unwrap().is_ok());
 }

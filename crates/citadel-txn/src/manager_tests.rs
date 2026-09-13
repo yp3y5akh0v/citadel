@@ -356,11 +356,22 @@ fn aborted_or_failed_commits_do_not_evict_committed_pages() {
         .unwrap();
         commit_insert(&manager, b"key", b"original");
         let before = manager.current_slot();
+        let committed_page = manager.fetch_page(before.tree_root).unwrap();
+        let committed_bytes = committed_page.as_bytes().to_vec();
         assert!(manager.pool.lock().is_cached(before.tree_root));
 
         let mut aborted = manager.begin_write().unwrap();
         aborted.insert(b"key", b"aborted").unwrap();
         aborted.abort();
+        assert!(manager.state.lock().recycled_pages.is_none());
+        assert!(Arc::ptr_eq(
+            &committed_page,
+            &manager.fetch_page(before.tree_root).unwrap()
+        ));
+        assert_eq!(
+            committed_page.as_bytes().as_slice(),
+            committed_bytes.as_slice()
+        );
         assert!(manager.pool.lock().is_cached(before.tree_root));
 
         let mut failed = manager.begin_write().unwrap();
@@ -368,6 +379,15 @@ fn aborted_or_failed_commits_do_not_evict_committed_pages() {
         writes_left.store(0, Ordering::SeqCst);
         assert!(matches!(failed.commit(), Err(Error::Io(_))));
         assert_eq!(manager.current_slot(), before);
+        assert!(manager.state.lock().recycled_pages.is_none());
+        assert!(Arc::ptr_eq(
+            &committed_page,
+            &manager.fetch_page(before.tree_root).unwrap()
+        ));
+        assert_eq!(
+            committed_page.as_bytes().as_slice(),
+            committed_bytes.as_slice()
+        );
         assert!(manager.pool.lock().is_cached(before.tree_root));
         assert_eq!(
             manager.begin_read().get(b"key").unwrap().as_deref(),
@@ -3751,7 +3771,7 @@ fn catalog_readers_reject_an_authenticated_malformed_page_without_panicking() {
     writer.commit().unwrap();
 
     let catalog_root = mgr.current_slot().catalog_root;
-    let mut malformed = mgr.fetch_page_owned(catalog_root).unwrap();
+    let mut malformed = Arc::unwrap_or_clone(mgr.fetch_write_page(catalog_root).unwrap());
     malformed.set_num_cells(u16::MAX);
     malformed.update_checksum();
 
@@ -3795,7 +3815,7 @@ fn catalog_lookup_rejects_an_authenticated_cross_page_cycle() {
     assert_ne!(catalog_root, second_page);
 
     let rewrite_as_branch = |page_id, right_child| {
-        let mut page = mgr.fetch_page_owned(page_id).unwrap();
+        let mut page = Arc::unwrap_or_clone(mgr.fetch_write_page(page_id).unwrap());
         page.set_page_type(PageType::Branch);
         page.rebuild_cells(&[]);
         page.set_right_child(right_child);
@@ -3979,7 +3999,7 @@ fn cached_hmac_manager_loads_keep_raw_and_validated_boundaries() {
         let offset = page_offset(page_id);
         let original = manager.read_page_from_disk(page_id).unwrap();
         assert_eq!(
-            manager.fetch_page_owned(page_id).unwrap().as_bytes(),
+            manager.fetch_write_page(page_id).unwrap().as_bytes(),
             original.as_bytes()
         );
         assert_eq!(
@@ -3991,7 +4011,7 @@ fn cached_hmac_manager_loads_keep_raw_and_validated_boundaries() {
         // Reopen constructs another state with the same exact key/epoch.
         let manager = TxnManager::open(Box::new(io.share()), dek, mac_key, epoch, 4).unwrap();
         assert_eq!(
-            manager.fetch_page_owned(page_id).unwrap().as_bytes(),
+            manager.fetch_write_page(page_id).unwrap().as_bytes(),
             original.as_bytes()
         );
         assert_eq!(
@@ -4019,7 +4039,7 @@ fn cached_hmac_manager_loads_keep_raw_and_validated_boundaries() {
             malformed.as_bytes()
         );
         assert!(matches!(
-            manager.fetch_page_owned(page_id),
+            manager.fetch_write_page(page_id),
             Err(Error::DatabaseCorrupted)
         ));
         assert!(matches!(
@@ -4041,7 +4061,7 @@ fn cached_hmac_manager_loads_keep_raw_and_validated_boundaries() {
         io.write_page(offset, &encrypted).unwrap();
         assert!(matches!(manager.read_page_from_disk(page_id),
             Err(Error::ChecksumMismatch(id)) if id == page_id));
-        assert!(matches!(manager.fetch_page_owned(page_id),
+        assert!(matches!(manager.fetch_write_page(page_id),
             Err(Error::ChecksumMismatch(id)) if id == page_id));
         assert!(matches!(manager.fetch_page(page_id),
             Err(Error::ChecksumMismatch(id)) if id == page_id));
@@ -4051,7 +4071,7 @@ fn cached_hmac_manager_loads_keep_raw_and_validated_boundaries() {
         io.write_page(offset, &encrypted).unwrap();
         assert!(matches!(manager.read_page_from_disk(page_id),
             Err(Error::PageTampered(id)) if id == page_id));
-        assert!(matches!(manager.fetch_page_owned(page_id),
+        assert!(matches!(manager.fetch_write_page(page_id),
             Err(Error::PageTampered(id)) if id == page_id));
         assert!(matches!(manager.fetch_page(page_id),
             Err(Error::PageTampered(id)) if id == page_id));
@@ -4068,7 +4088,7 @@ fn cached_hmac_manager_loads_keep_raw_and_validated_boundaries() {
         );
         io.write_page(offset, &encrypted).unwrap();
         assert_eq!(
-            manager.fetch_page_owned(page_id).unwrap().as_bytes(),
+            manager.fetch_write_page(page_id).unwrap().as_bytes(),
             original.as_bytes()
         );
         assert_eq!(
@@ -4076,4 +4096,57 @@ fn cached_hmac_manager_loads_keep_raw_and_validated_boundaries() {
             original.as_bytes()
         );
     }
+}
+
+#[test]
+fn writer_loader_shares_hits_keeps_cold_misses_private_and_recycles_only_empty_maps() {
+    let manager = create_test_manager();
+    commit_insert(&manager, b"key", b"original");
+    let root = manager.current_slot().tree_root;
+    {
+        let state = manager.state.lock();
+        let recycled = state.recycled_pages.as_ref().unwrap();
+        assert_eq!(recycled.len(), 0);
+        assert!(recycled.capacity() > 0);
+    }
+    manager.pool.lock().invalidate(root);
+    let private = manager.fetch_write_page(root).unwrap();
+    assert!(!manager.pool.lock().is_cached(root));
+    let cached = manager.fetch_page(root).unwrap();
+    assert!(!Arc::ptr_eq(&private, &cached));
+    assert_eq!(private.as_bytes(), cached.as_bytes());
+    assert!(Arc::ptr_eq(
+        &cached,
+        &manager.fetch_write_page(root).unwrap()
+    ));
+    drop(private);
+    let strong_count = Arc::strong_count(&cached);
+
+    let generation = manager.commit_generation.load(Ordering::Acquire);
+    let mut noop = manager.begin_write().unwrap();
+    assert_eq!(
+        noop.get(b"key").unwrap().as_deref(),
+        Some(b"original".as_slice())
+    );
+    assert!(Arc::strong_count(&cached) > strong_count);
+    noop.commit().unwrap();
+    assert_eq!(
+        manager.commit_generation.load(Ordering::Acquire),
+        generation
+    );
+    assert!(manager.state.lock().recycled_pages.is_none());
+    assert_eq!(Arc::strong_count(&cached), strong_count);
+
+    commit_insert(&manager, b"key", b"committed");
+    assert_eq!(
+        manager.state.lock().recycled_pages.as_ref().unwrap().len(),
+        0
+    );
+    let mut aborted = manager.begin_write().unwrap();
+    assert_eq!(
+        aborted.get(b"key").unwrap().as_deref(),
+        Some(b"committed".as_slice())
+    );
+    aborted.abort();
+    assert!(manager.state.lock().recycled_pages.is_none());
 }

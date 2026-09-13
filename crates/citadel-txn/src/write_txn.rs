@@ -16,12 +16,13 @@ use std::sync::Arc;
 
 use citadel_buffer::allocator::{AllocCheckpoint, PageAllocator};
 use citadel_buffer::btree::{self, BTree, LeafEntryHint, UpsertAction, UpsertOutcome};
-use citadel_buffer::cursor::{Cursor, DescentGuard, PageLoader, PageMap};
+use citadel_buffer::cursor::{Cursor, DescentGuard, MutablePageMap, PageLoader, PageMap};
 
 use crate::catalog::TableDescriptor;
 use crate::manager::TxnManager;
 use crate::merkle;
 use crate::overflow_io;
+use crate::owned_pages::OwnedPages;
 use crate::read_txn::ScanCount;
 use crate::ReadBudget;
 
@@ -124,22 +125,20 @@ impl WriteFailure {
 }
 
 struct WritePages<'a> {
-    pages: &'a mut FxHashMap<PageId, Page>,
+    pages: &'a mut OwnedPages,
     manager: &'a TxnManager,
 }
 
 impl PageMap for WritePages<'_> {
     fn get_page(&self, id: &PageId) -> Option<&Page> {
-        self.pages.get(id)
+        self.pages.get_page(id)
     }
 }
 
 impl PageLoader for WritePages<'_> {
     fn ensure_loaded(&mut self, id: PageId) -> Result<()> {
-        if !self.pages.contains_key(&id) {
-            let page = self.manager.fetch_page_owned(id)?;
-            self.pages.insert(id, page);
-        }
+        self.pages
+            .get_or_try_insert_shared(id, || self.manager.fetch_write_page(id))?;
         Ok(())
     }
 }
@@ -153,7 +152,7 @@ enum WriteScanPage<'a> {
 }
 
 struct WriteScanPages<'a> {
-    owned: &'a FxHashMap<PageId, Page>,
+    owned: &'a OwnedPages,
     loaded: FxHashMap<PageId, WriteScanPage<'a>>,
     manager: &'a TxnManager,
     high_water_mark: u32,
@@ -172,7 +171,7 @@ impl PageMap for WriteScanPages<'_> {
 impl PageLoader for WriteScanPages<'_> {
     fn ensure_loaded(&mut self, id: PageId) -> Result<()> {
         if let std::collections::hash_map::Entry::Vacant(entry) = self.loaded.entry(id) {
-            let page = match self.owned.get(&id) {
+            let page = match self.owned.get_page(&id) {
                 Some(page) => WriteScanPage::Borrowed(page),
                 None => WriteScanPage::Shared(self.manager.fetch_reachable_page(
                     id,
@@ -202,7 +201,7 @@ pub struct WriteTxn<'a> {
     base_txn_id: TxnId,
     txn_id: TxnId,
     old_slot: Arc<CommitSlot>,
-    pages: FxHashMap<PageId, Page>,
+    pages: OwnedPages,
     tree: BTree,
     alloc: PageAllocator,
     committed: bool,
@@ -249,7 +248,7 @@ impl<'db> WriteTxn<'db> {
         snapshot: Arc<CommitSlot>,
         tree: BTree,
         alloc: PageAllocator,
-        recycled_pages: Option<FxHashMap<PageId, Page>>,
+        recycled_pages: Option<OwnedPages>,
     ) -> Self {
         // Recycling reuses only the map's allocation: entries are keyed by
         // page ids that CoW retires every txn, so contents are always stale.
@@ -258,7 +257,7 @@ impl<'db> WriteTxn<'db> {
                 m.clear();
                 m
             }
-            None => FxHashMap::with_capacity_and_hasher(16, Default::default()),
+            None => OwnedPages::with_capacity(16),
         };
         Self {
             manager,
@@ -541,14 +540,9 @@ impl<'db> WriteTxn<'db> {
             .get(table)
             .expect("ensure_table installed the requested tree")
             .root;
-        if !self.pages.contains_key(&root) {
-            let page = self.manager.fetch_page_owned(root)?;
-            self.pages.insert(root, page);
-        }
         let root_txn = self
             .pages
-            .get(&root)
-            .expect("root page was loaded into the write view")
+            .get_or_try_insert_shared(root, || self.manager.fetch_write_page(root))?
             .txn_id();
         self.check_cancel()?;
         Ok(Some((root, root_txn)))
@@ -611,7 +605,7 @@ impl<'db> WriteTxn<'db> {
     #[allow(clippy::too_many_arguments)]
     fn insert_into_tree(
         tree: &mut BTree,
-        pages: &mut FxHashMap<PageId, Page>,
+        pages: &mut OwnedPages,
         alloc: &mut PageAllocator,
         txn_id: TxnId,
         key: &[u8],
@@ -641,7 +635,7 @@ impl<'db> WriteTxn<'db> {
     /// denotes a proven inline append through the tree's existing rightmost path.
     fn load_insert_leaf(
         tree: &BTree,
-        pages: &mut FxHashMap<PageId, Page>,
+        pages: &mut OwnedPages,
         manager: &TxnManager,
         key: &[u8],
         value: &[u8],
@@ -657,7 +651,7 @@ impl<'db> WriteTxn<'db> {
     /// still resolve all fallible reads before allocating their chain.
     fn try_inline_append(
         tree: &mut BTree,
-        pages: &mut FxHashMap<PageId, Page>,
+        pages: &mut OwnedPages,
         alloc: &mut PageAllocator,
         txn_id: TxnId,
         key: &[u8],
@@ -676,7 +670,7 @@ impl<'db> WriteTxn<'db> {
 
     fn load_leaf(
         tree: &BTree,
-        pages: &mut FxHashMap<PageId, Page>,
+        pages: &mut OwnedPages,
         manager: &TxnManager,
         key: &[u8],
     ) -> Result<LoadedLeaf> {
@@ -691,7 +685,7 @@ impl<'db> WriteTxn<'db> {
     /// Keep a match only for the detached callback operation which owns this
     /// loaded path. Staging may rehash the map but cannot edit the source leaf.
     fn search_loaded_leaf<'p>(
-        pages: &'p FxHashMap<PageId, Page>,
+        pages: &'p OwnedPages,
         leaf: &mut Option<LoadedLeaf>,
         key: &[u8],
     ) -> Result<Option<(ValueType, &'p [u8])>> {
@@ -984,7 +978,7 @@ impl<'db> WriteTxn<'db> {
         let page_id = self.alloc.allocate();
         let mut leaf = Page::new(page_id, PageType::Leaf, self.txn_id);
         leaf.update_checksum();
-        self.pages.insert(page_id, leaf);
+        self.pages.insert_page(page_id, leaf);
 
         let new_tree = BTree::from_existing(page_id, 1, 0);
         self.named_trees.insert(name.to_vec(), new_tree);
@@ -1530,7 +1524,7 @@ impl<'db> WriteTxn<'db> {
             let leaf_id =
                 Self::descend_to_leaf(&mut self.pages, self.manager, root, pairs[pair_index].0)?;
             let last_key = {
-                let page = self.pages.get(&leaf_id).unwrap();
+                let page = self.pages.get_page(&leaf_id).unwrap();
                 let cell_count = page.num_cells();
                 (cell_count > 0).then(|| {
                     citadel_page::leaf_node::read_cell(page, cell_count - 1)
@@ -1705,7 +1699,7 @@ impl<'db> WriteTxn<'db> {
                 view.ensure_loaded(leaf_id)?;
 
                 let val_type = {
-                    let page = view.pages.get(&leaf_id).unwrap();
+                    let page = view.pages.get_page(&leaf_id).unwrap();
                     citadel_page::leaf_node::read_cell(page, cursor.cell_index()).val_type
                 };
                 if val_type == ValueType::Tombstone {
@@ -1717,7 +1711,7 @@ impl<'db> WriteTxn<'db> {
                     let new_id = btree::cow_page(view.pages, alloc, leaf_id, txn_id);
                     if new_id != leaf_id {
                         let cell = citadel_page::leaf_node::read_cell(
-                            view.pages.get(&new_id).unwrap(),
+                            view.pages.get_page(&new_id).unwrap(),
                             cursor.cell_index(),
                         );
                         let key_for_walk = cell.key.to_vec();
@@ -1734,7 +1728,7 @@ impl<'db> WriteTxn<'db> {
                     // The ref is overwritten in place, so cell indices are
                     // unaffected.
                     let (key, oref) = {
-                        let page = view.pages.get(&cow_leaf).unwrap();
+                        let page = view.pages.get_page(&cow_leaf).unwrap();
                         let cell = citadel_page::leaf_node::read_cell(page, cursor.cell_index());
                         (cell.key.to_vec(), OverflowRef::from_bytes(cell.value))
                     };
@@ -1754,7 +1748,7 @@ impl<'db> WriteTxn<'db> {
                                 || alloc.allocate_nonzero(),
                                 |pid, page| {
                                     payload_digest.update(overflow::read_data(&page));
-                                    view.pages.insert(pid, page);
+                                    view.pages.insert_page(pid, page);
                                 },
                                 cancel.as_ref(),
                             );
@@ -1767,14 +1761,14 @@ impl<'db> WriteTxn<'db> {
                             };
                             let payload_digest = payload_digest.finalize();
                             view.pages
-                                .get_mut(&first)
+                                .get_page_mut(&first)
                                 .expect("new overflow head is staged")
                                 .set_merkle_hash(&payload_digest);
                             let new_ref = OverflowRef {
                                 first_page: first,
                                 total_len: scratch.len() as u32,
                             };
-                            let page = view.pages.get_mut(&cow_leaf).unwrap();
+                            let page = view.pages.get_page_mut(&cow_leaf).unwrap();
                             let replaced = citadel_page::leaf_node::update_value_in_place(
                                 page,
                                 cursor.cell_index(),
@@ -1801,7 +1795,7 @@ impl<'db> WriteTxn<'db> {
                     continue;
                 }
 
-                let page = view.pages.get_mut(&cow_leaf).unwrap();
+                let page = view.pages.get_page_mut(&cow_leaf).unwrap();
                 let ci = cursor.cell_index();
                 let cell_off = page.cell_offset(ci) as usize;
                 let key_len =
@@ -1933,7 +1927,7 @@ impl<'db> WriteTxn<'db> {
         let new_root = self.alloc.allocate();
         let mut leaf = Page::new(new_root, PageType::Leaf, self.txn_id);
         leaf.update_checksum();
-        self.pages.insert(new_root, leaf);
+        self.pages.insert_page(new_root, leaf);
 
         self.named_trees
             .insert(table.to_vec(), BTree::from_existing(new_root, 1, 0));
@@ -2022,7 +2016,7 @@ impl<'db> WriteTxn<'db> {
     pub fn restore_snapshot(&mut self, snap: WriteTxnSnapshot) {
         let pre_savepoint_alloc_len = snap.alloc_checkpoint.allocated_this_txn_len();
         for &page_id in self.alloc.allocated_since(pre_savepoint_alloc_len) {
-            self.pages.remove(&page_id);
+            self.pages.remove_page(&page_id);
         }
         self.tree = snap.tree;
         self.alloc.restore(snap.alloc_checkpoint);
@@ -2095,7 +2089,7 @@ impl<'db> WriteTxn<'db> {
             || alloc.allocate_nonzero(),
             |pid, page| {
                 payload_digest.update(overflow::read_data(&page));
-                pages.insert(pid, page);
+                pages.insert_page(pid, page);
             },
             cancel.as_ref(),
         );
@@ -2110,7 +2104,7 @@ impl<'db> WriteTxn<'db> {
         };
         let payload_digest = payload_digest.finalize();
         pages
-            .get_mut(&first)
+            .get_page_mut(&first)
             .expect("new overflow head is staged")
             .set_merkle_hash(&payload_digest);
         let oref = OverflowRef {
@@ -2187,7 +2181,7 @@ impl<'db> WriteTxn<'db> {
             let page_id = self.alloc.allocate();
             let mut leaf = Page::new(page_id, PageType::Leaf, self.txn_id);
             leaf.update_checksum();
-            self.pages.insert(page_id, leaf);
+            self.pages.insert_page(page_id, leaf);
             self.catalog = Some(BTree::from_existing(page_id, 1, 0));
             self.catalog_dirty = true;
         }
@@ -2201,11 +2195,9 @@ impl<'db> WriteTxn<'db> {
         let mut descent = DescentGuard::new(root);
         loop {
             self.check_cancel()?;
-            if !self.pages.contains_key(&current) {
-                let page = self.manager.fetch_page_owned(current)?;
-                self.pages.insert(current, page);
-            }
-            let page = self.pages.get(&current).unwrap();
+            let page = self
+                .pages
+                .get_or_try_insert_shared(current, || self.manager.fetch_write_page(current))?;
             match page.page_type() {
                 Some(PageType::Leaf) => break,
                 Some(PageType::Branch) => {
@@ -2394,11 +2386,9 @@ impl<'db> WriteTxn<'db> {
                 return Err(Error::DatabaseCorrupted);
             }
             tree_pages.push(current);
-            if !self.pages.contains_key(&current) {
-                let page = self.manager.fetch_page_owned(current)?;
-                self.pages.insert(current, page);
-            }
-            let page = self.pages.get(&current).unwrap();
+            let page = self
+                .pages
+                .get_or_try_insert_shared(current, || self.manager.fetch_write_page(current))?;
             match page.page_type() {
                 Some(PageType::Branch) => {
                     for i in 0..page.num_cells() as usize {
@@ -2489,11 +2479,9 @@ impl<'db> WriteTxn<'db> {
                 return Err(Error::DatabaseCorrupted);
             }
             self.check_cancel()?;
-            if !self.pages.contains_key(&current) {
-                let page = self.manager.fetch_page_owned(current)?;
-                self.pages.insert(current, page);
-            }
-            let page = self.pages.get(&current).unwrap();
+            let page = self
+                .pages
+                .get_or_try_insert_shared(current, || self.manager.fetch_write_page(current))?;
             match page.page_type() {
                 Some(PageType::Branch) => {
                     for i in 0..page.num_cells() as usize {
@@ -2519,7 +2507,7 @@ impl<'db> WriteTxn<'db> {
     }
 
     fn descend_to_leaf(
-        pages: &mut FxHashMap<PageId, Page>,
+        pages: &mut OwnedPages,
         manager: &TxnManager,
         root: PageId,
         key: &[u8],
@@ -2527,13 +2515,8 @@ impl<'db> WriteTxn<'db> {
         let mut current = root;
         let mut descent = DescentGuard::new(root);
         loop {
-            let page = match pages.entry(current) {
-                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    let page = manager.fetch_page_owned(current)?;
-                    e.insert(page)
-                }
-            };
+            let page =
+                pages.get_or_try_insert_shared(current, || manager.fetch_write_page(current))?;
             match page.page_type() {
                 Some(PageType::Leaf) => return Ok(current),
                 Some(PageType::Branch) => {
@@ -2548,7 +2531,7 @@ impl<'db> WriteTxn<'db> {
     }
 
     fn walk_loading(
-        pages: &mut FxHashMap<PageId, Page>,
+        pages: &mut OwnedPages,
         manager: &TxnManager,
         root: PageId,
         key: &[u8],
@@ -2559,7 +2542,7 @@ impl<'db> WriteTxn<'db> {
     }
 
     fn walk_loading_into(
-        pages: &mut FxHashMap<PageId, Page>,
+        pages: &mut OwnedPages,
         manager: &TxnManager,
         root: PageId,
         key: &[u8],
@@ -2568,13 +2551,8 @@ impl<'db> WriteTxn<'db> {
         path.clear();
         let mut current = root;
         loop {
-            let page = match pages.entry(current) {
-                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    let page = manager.fetch_page_owned(current)?;
-                    e.insert(page)
-                }
-            };
+            let page =
+                pages.get_or_try_insert_shared(current, || manager.fetch_write_page(current))?;
             match page.page_type() {
                 Some(PageType::Leaf) => return Ok(current),
                 Some(PageType::Branch) => {
@@ -2604,11 +2582,9 @@ impl<'db> WriteTxn<'db> {
             if let Some(t) = self.cancel.as_ref() {
                 t.check()?;
             }
-            if !self.pages.contains_key(&current) {
-                let page = self.manager.fetch_page_owned(current)?;
-                self.pages.insert(current, page);
-            }
-            let page = self.pages.get(&current).unwrap();
+            let page = self
+                .pages
+                .get_or_try_insert_shared(current, || self.manager.fetch_write_page(current))?;
             match page.page_type() {
                 Some(PageType::Branch) => {
                     let num_cells = page.num_cells() as usize;
