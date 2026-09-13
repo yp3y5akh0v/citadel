@@ -211,7 +211,8 @@ pub(super) fn exec_select_with_read(
     }
 
     if let Some(view_def) = schema.get_view(&lower_name) {
-        if let Some(fused) = try_fuse_view(stmt, schema, view_def)? {
+        if let Some(fused) = try_fuse_view(stmt, schema, view_def, ctes.keys().map(String::as_str))?
+        {
             return exec_select_with_read(rtx, schema, &fused, ctes);
         }
         let view_qr = exec_view_with_read(rtx, schema, view_def)?;

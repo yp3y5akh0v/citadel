@@ -2089,7 +2089,8 @@ pub(super) fn exec_select_in_txn(
     }
 
     if let Some(view_def) = schema.get_view(&lower_name) {
-        if let Some(fused) = try_fuse_view(stmt, schema, view_def)? {
+        if let Some(fused) = try_fuse_view(stmt, schema, view_def, ctes.keys().map(String::as_str))?
+        {
             return super::exec_select_in_txn(wtx, schema, &fused, ctes);
         }
         let view_qr = exec_view_write(wtx, schema, view_def)?;
