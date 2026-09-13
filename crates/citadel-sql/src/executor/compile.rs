@@ -54,6 +54,13 @@ pub(crate) trait CompiledPlan: Send + Sync {
         true
     }
 
+    /// Positive proof that every execution and fallback is independent of
+    /// temporal/JSONPath session context. Scoped parameters and statement
+    /// guards are separate and must still run. Unknown plans require context.
+    fn can_skip_session_context(&self) -> bool {
+        false
+    }
+
     /// `false` when the plan never reads the txn clock (no NOW(),
     /// CURRENT_TIMESTAMP, etc.). Lets the caller skip the
     /// `with_txn_clock` thread-local wrapper.

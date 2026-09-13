@@ -1376,3 +1376,58 @@ fn truncate_returning_checks_the_requested_fk_name_before_alias_resolution() {
     );
     assert!(!writer.mutated_since(marker));
 }
+
+#[test]
+fn update_context_proof_checks_nested_and_hidden_expressions() {
+    for sql in [
+        "a + $1",
+        "COALESCE(a, $1)",
+        "CASE WHEN a IS NULL THEN $1 ELSE a END",
+        "DATE('2024-01-01')",
+        "CAST($1 AS TIMESTAMP)",
+        "JSONB_PATH_EXISTS(j, '$.a')",
+    ] {
+        let expr = crate::parser::parse_sql_expr(sql).unwrap();
+        assert!(update_expr_context_free(&expr), "{sql}");
+    }
+    for sql in [
+        "CURRENT_DATE",
+        "CURRENT_TIME",
+        "CURRENT_TIMESTAMP",
+        "LOCALTIMESTAMP",
+        "STATEMENT_TIMESTAMP()",
+        "CLOCK_TIMESTAMP()",
+        "DATE($1)",
+        "TIME(a)",
+        "DATETIME('n' || 'ow')",
+        "COALESCE(a, CURRENT_DATE)",
+        "JSONB_PATH_EXISTS(j, $1)",
+        "JSONB_PATH_EXISTS_TZ(j, '$.a')",
+        "j @? '$.time_tz()'",
+        "(SELECT 1) COLLATE NOCASE",
+    ] {
+        let expr = crate::parser::parse_sql_expr(sql).unwrap();
+        assert!(!update_expr_context_free(&expr), "{sql}");
+    }
+    let mut table = schema(
+        "t",
+        vec![
+            col("id", DataType::Integer, false),
+            col("a", DataType::Integer, true),
+        ],
+        vec![0],
+    );
+    let Statement::Update(stmt) =
+        crate::parser::parse_sql("UPDATE t SET a=a+$1 WHERE id=$2").unwrap()
+    else {
+        panic!("expected UPDATE");
+    };
+    assert!(update_schema_and_expressions_context_free(&table, &stmt));
+    table.columns[1].default_expr = Some(crate::parser::parse_sql_expr("DATE($1)").unwrap());
+    assert!(!update_schema_and_expressions_context_free(&table, &stmt));
+    table.columns[1].default_expr = None;
+    // Legacy catalog expressions also fail the temporal proof, even though
+    // current persistent-expression DDL rejects this generated definition.
+    table.columns[1].generated_expr = Some(crate::parser::parse_sql_expr("CURRENT_DATE").unwrap());
+    assert!(!update_schema_and_expressions_context_free(&table, &stmt));
+}
