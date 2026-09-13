@@ -4150,3 +4150,42 @@ fn writer_loader_shares_hits_keeps_cold_misses_private_and_recycles_only_empty_m
     aborted.abort();
     assert!(manager.state.lock().recycled_pages.is_none());
 }
+
+#[test]
+fn shared_manager_load_survives_failed_cache_admission_without_losing_ownership() {
+    let manager = create_test_manager();
+    commit_insert(&manager, b"key", b"original");
+    let slot = manager.current_slot();
+    let root = slot.tree_root;
+    let expected = manager.read_page_from_disk(root).unwrap();
+    let blocker = PageId(slot.high_water_mark);
+    {
+        let mut pool = manager.pool.lock();
+        *pool = BufferPool::new(1);
+        // A dirty resident cannot be evicted. It is only a pool fixture and
+        // is never presented as a reachable database page or flushed to disk.
+        pool.insert_new(blocker, Page::new(blocker, PageType::Leaf, slot.txn_id))
+            .unwrap();
+    }
+    let private = manager.fetch_write_page(root).unwrap();
+    let uncached = manager.fetch_page(root).unwrap();
+    assert_eq!(Arc::strong_count(&private), 1);
+    assert_eq!(Arc::strong_count(&uncached), 1);
+    assert!(!Arc::ptr_eq(&private, &uncached));
+    {
+        let mut pool = manager.pool.lock();
+        assert!(!pool.is_cached(root));
+        assert!(pool.is_cached(blocker));
+        assert_eq!(pool.dirty_count(), 1);
+        pool.clear();
+    }
+
+    let admitted = manager.fetch_page(root).unwrap();
+    let cached = manager.fetch_page(root).unwrap();
+    assert!(Arc::ptr_eq(&admitted, &cached));
+    assert!(!Arc::ptr_eq(&uncached, &admitted));
+    manager.pool.lock().clear();
+    for page in [private, uncached, admitted, cached] {
+        assert_eq!(page.as_bytes(), expected.as_bytes());
+    }
+}

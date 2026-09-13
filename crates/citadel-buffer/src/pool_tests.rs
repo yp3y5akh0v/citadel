@@ -378,12 +378,15 @@ fn loaders_preserve_nonempty_leaf_and_branch_bytes() {
             read_and_validate(&io, id, offset, &dek, &mac_key, epoch),
             read_and_validate_with_hmac(&io, id, offset, &dek, &state),
         ];
+        let shared = read_and_validate_shared_with_hmac(&io, id, offset, &dek, &state).unwrap();
         // Returned pages own their complete bytes after the encrypted source
         // disappears, including payload, pointer array and unused free space.
         io.pages.lock().remove(&offset);
         for result in loaded {
             assert_eq!(result.unwrap().as_bytes(), page.as_bytes());
         }
+        assert_eq!(shared.as_bytes(), page.as_bytes());
+        assert_eq!(Arc::strong_count(&shared), 1);
     }
 }
 
@@ -420,4 +423,113 @@ fn load_kernel_returns_read_or_decrypt_error_before_page_validation() {
     }
     check::<false>();
     check::<true>();
+}
+
+#[test]
+fn shared_load_kernel_uses_its_returned_allocation_and_preserves_error_order() {
+    let io = MockIO::new();
+    let id = PageId(14);
+    let offset = page_offset(id);
+    let entered = std::cell::Cell::new(false);
+    let result = read_shared_with_decrypt(&io, id, offset, |_, _| {
+        entered.set(true);
+        Ok(())
+    });
+    assert!(matches!(result, Err(Error::Io(error))
+        if error.kind() == std::io::ErrorKind::NotFound));
+    assert!(!entered.get());
+
+    io.write_page(offset, &[0; PAGE_SIZE]).unwrap();
+    let result = read_shared_with_decrypt(&io, id, offset, |_, body| {
+        body.fill(0xff);
+        Err(Error::PageTampered(id))
+    });
+    assert!(matches!(result, Err(Error::PageTampered(actual)) if actual == id));
+
+    // A failure that wrote private plaintext must not affect the next owner.
+    // The successful callback's exact destination is the returned Arc payload,
+    // rather than a temporary Page copied into an Arc after validation.
+    let expected = Page::new(id, PageType::Leaf, TxnId(3));
+    let destination = std::cell::Cell::new(std::ptr::null());
+    let shared = read_shared_with_decrypt(&io, id, offset, |_, body| {
+        assert!(body.iter().all(|&byte| byte == 0));
+        destination.set(body.as_ptr());
+        body.copy_from_slice(expected.as_bytes());
+        Ok(())
+    })
+    .unwrap();
+    io.pages.lock().clear();
+    assert_eq!(destination.get(), shared.as_bytes().as_ptr());
+    assert_eq!(shared.as_bytes(), expected.as_bytes());
+    assert_eq!(Arc::strong_count(&shared), 1);
+    assert_eq!(Arc::weak_count(&shared), 0);
+}
+
+#[test]
+fn shared_hmac_loads_bind_keys_epochs_and_keep_failed_pages_private() {
+    use citadel_core::types::ValueType;
+    use citadel_page::leaf_node;
+
+    let io = MockIO::new();
+    let id = PageId(15);
+    let offset = page_offset(id);
+    for (dek, mac_key, epoch) in [
+        ([0x12; DEK_SIZE], [0x34; MAC_KEY_SIZE], 0),
+        ([0x56; DEK_SIZE], [0x78; MAC_KEY_SIZE], u32::MAX),
+    ] {
+        let state = page_cipher::HmacState::new(&mac_key, epoch);
+        let mut original = Page::new(id, PageType::Leaf, TxnId(4));
+        assert!(leaf_node::insert(
+            &mut original,
+            b"key",
+            ValueType::Inline,
+            &[0xa5; 1537],
+        ));
+        original.update_checksum();
+        write_encrypted_page(&io, &original, &dek, &mac_key, epoch);
+        let retained = read_and_validate_shared_with_hmac(&io, id, offset, &dek, &state).unwrap();
+
+        for wrong_state in [
+            page_cipher::HmacState::new(&[0x91; MAC_KEY_SIZE], epoch),
+            page_cipher::HmacState::new(&mac_key, epoch.wrapping_add(1)),
+        ] {
+            assert!(matches!(
+                read_and_validate_shared_with_hmac(&io, id, offset, &dek, &wrong_state),
+                Err(Error::PageTampered(actual)) if actual == id
+            ));
+        }
+        assert!(matches!(
+            read_and_validate_shared_with_hmac(&io, id, offset, &[0x92; DEK_SIZE], &state),
+            Err(Error::ChecksumMismatch(actual)) if actual == id
+        ));
+
+        let mut bad = original.clone();
+        bad.as_bytes_mut()[BODY_SIZE - 1] ^= 1;
+        write_encrypted_page(&io, &bad, &dek, &mac_key, epoch);
+        assert!(matches!(
+            read_and_validate_shared_with_hmac(&io, id, offset, &dek, &state),
+            Err(Error::ChecksumMismatch(actual)) if actual == id
+        ));
+        bad.set_num_cells(u16::MAX);
+        bad.update_checksum();
+        write_encrypted_page(&io, &bad, &dek, &mac_key, epoch);
+        assert!(matches!(
+            read_and_validate_shared_with_hmac(&io, id, offset, &dek, &state),
+            Err(Error::DatabaseCorrupted)
+        ));
+        io.pages.lock().get_mut(&offset).unwrap()[100] ^= 1;
+        assert!(matches!(
+            read_and_validate_shared_with_hmac(&io, id, offset, &dek, &state),
+            Err(Error::PageTampered(actual)) if actual == id
+        ));
+
+        write_encrypted_page(&io, &original, &dek, &mac_key, epoch);
+        let repaired = read_and_validate_shared_with_hmac(&io, id, offset, &dek, &state).unwrap();
+        io.pages.lock().clear();
+        assert!(!Arc::ptr_eq(&retained, &repaired));
+        for page in [retained, repaired] {
+            assert_eq!(Arc::strong_count(&page), 1);
+            assert_eq!(page.as_bytes(), original.as_bytes());
+        }
+    }
 }
