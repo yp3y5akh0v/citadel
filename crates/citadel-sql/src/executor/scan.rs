@@ -487,7 +487,7 @@ fn scan_step(
     compiled: Option<&CompiledExpr>,
     simple_pred: Option<&SimplePredicate>,
     between_pred: Option<&BetweenPredicate>,
-    jsonb_pred: Option<&JsonbContainsPredicate>,
+    jsonb_pred: Option<&JsonbContainsPredicate<'_>>,
     col_map: Option<&ColumnMap>,
     partial_ctx: Option<&PartialDecodeCtx>,
     projection: Option<&SelectScanDecoder<'_>>,
@@ -512,10 +512,13 @@ fn scan_step(
         };
     }
     if let Some(pred) = jsonb_pred {
-        return if pred.matches_raw(key, value, cancel)? {
-            decode_output().map(Some)
-        } else {
-            Ok(None)
+        return match pred.matches_raw(value, cancel)? {
+            Some(true) => decode_output().map(Some),
+            Some(false) => Ok(None),
+            // Missing or differently typed stored values need the same
+            // default/virtual materialization and operator semantics as an
+            // ordinary scan. Keep that work in the existing row evaluator.
+            None => read_scan_row(schema, key, value, Some(pred.expr), projection, cancel),
         };
     }
     if let Some(projection) = projection {
@@ -1928,31 +1931,34 @@ pub(super) fn try_simple_predicate(expr: &Expr, schema: &TableSchema) -> Option<
     }
 }
 
-pub(super) struct JsonbContainsPredicate {
+pub(super) struct JsonbContainsPredicate<'a> {
     nonpk_idx: usize,
     literal: std::sync::Arc<[u8]>,
+    expr: &'a Expr,
 }
 
-impl JsonbContainsPredicate {
+impl JsonbContainsPredicate<'_> {
+    /// None requests ordinary row materialization; it is not SQL NULL.
     pub(super) fn matches_raw(
         &self,
-        _key: &[u8],
         value: &[u8],
         cancel: Option<&citadel::CancelToken>,
-    ) -> Result<bool> {
+    ) -> Result<Option<bool>> {
         match decode_stored_column_raw(value, self.nonpk_idx)? {
             Some(RawColumn::Jsonb(bytes)) => {
                 crate::json::jsonb_contains_bytes_with_cancel(bytes, &self.literal, cancel)
+                    .map(Some)
             }
-            _ => Ok(false),
+            Some(RawColumn::Null) => Ok(Some(false)),
+            _ => Ok(None),
         }
     }
 }
 
-pub(super) fn try_jsonb_contains_predicate(
-    expr: &Expr,
+pub(super) fn try_jsonb_contains_predicate<'a>(
+    expr: &'a Expr,
     schema: &TableSchema,
-) -> Option<JsonbContainsPredicate> {
+) -> Option<JsonbContainsPredicate<'a>> {
     let (col_name, lit_expr) = match expr {
         Expr::BinaryOp {
             left,
@@ -1976,11 +1982,20 @@ pub(super) fn try_jsonb_contains_predicate(
     }
     let nonpk_order = schema.non_pk_indices().iter().position(|&i| i == col_idx)?;
     let nonpk_idx = schema.encoding_positions()[nonpk_order] as usize;
+    // Successful evaluation without a row alone does not prove that an
+    // expression may be evaluated once. Reuse the planner's shared proof.
+    if !crate::eval::is_statement_constant(lit_expr) {
+        return None;
+    }
     let literal = match eval_const_expr(lit_expr).ok()? {
         Value::Jsonb(b) => b,
         _ => return None,
     };
-    Some(JsonbContainsPredicate { nonpk_idx, literal })
+    Some(JsonbContainsPredicate {
+        nonpk_idx,
+        literal,
+        expr,
+    })
 }
 
 pub(super) fn flip_cmp_op(op: BinOp) -> Option<BinOp> {

@@ -1838,3 +1838,91 @@ mod plain_projection_scan {
         ));
     }
 }
+
+#[test]
+fn jsonb_contains_raw_admission_requires_statement_constant_rhs() {
+    let table = TableSchema::new(
+        "items".into(),
+        cols(&[("id", DataType::Integer), ("doc", DataType::Jsonb)]),
+        vec![0],
+        vec![],
+        vec![],
+        vec![],
+    );
+    for expression in [
+        "JSONB_BUILD_OBJECT('x',RANDOM())",
+        "JSONB_BUILD_OBJECT('x',id)",
+    ] {
+        let select = agg_select_stmt(&format!("SELECT id FROM items WHERE doc @> {expression}"));
+        assert!(
+            super::super::scan::try_jsonb_contains_predicate(
+                select.where_clause.as_ref().unwrap(),
+                &table
+            )
+            .is_none(),
+            "{expression}"
+        );
+    }
+    let select = agg_select_stmt("SELECT id FROM items WHERE doc @> $1::jsonb");
+    crate::eval::with_scoped_params(&[Value::Text("{\"x\":1}".into())], || {
+        assert!(super::super::scan::try_jsonb_contains_predicate(
+            select.where_clause.as_ref().unwrap(),
+            &table
+        )
+        .is_some());
+    });
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn jsonb_contains_missing_default_can_cancel_inside_materialization() {
+    use crate::connection::Connection;
+    let dir = tempfile::tempdir().unwrap();
+    let db = citadel::DatabaseBuilder::new(dir.path().join("containment-cancel.db"))
+        .passphrase(b"x")
+        .argon2_profile(citadel::Argon2Profile::Iot)
+        .create()
+        .unwrap();
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO items VALUES(1)").unwrap();
+    let payload = serde_json::to_string(&vec!["a"; 1024]).unwrap();
+    conn.execute(&format!(
+        "ALTER TABLE items ADD COLUMN doc JSONB DEFAULT CAST('{payload}' AS JSONB)"
+    ))
+    .unwrap();
+    let prepared = conn
+        .prepare("SELECT id FROM items WHERE doc @> $1::jsonb")
+        .unwrap();
+    let parameters = [crate::json::text_to_jsonb("\"missing\"").unwrap()];
+    for begin in [None, Some("BEGIN READ ONLY"), Some("BEGIN")] {
+        let token = citadel::CancelToken::new();
+        db.set_cancel(Some(token.clone()));
+        if let Some(begin) = begin {
+            conn.execute(begin).unwrap();
+        }
+        let result = {
+            let _hook = crate::json::cancel_json_after(token.clone(), 32);
+            prepared.query_collect(&parameters)
+        };
+        db.set_cancel(None);
+        if begin.is_some() {
+            conn.execute("ROLLBACK").unwrap();
+        }
+        assert!(
+            matches!(result, Err(SqlError::Storage(citadel::Error::Interrupted))),
+            "{result:?}"
+        );
+        assert!(token.is_cancelled());
+    }
+    // Do not fill this plan's result memo before all three cancellation lanes
+    // have executed the missing-column materializer.
+    assert!(prepared.query_collect(&parameters).unwrap().rows.is_empty());
+    assert_eq!(
+        conn.query("SELECT JSONB_ARRAY_LENGTH(doc) FROM items")
+            .unwrap()
+            .rows,
+        vec![vec![Value::Integer(1024)]]
+    );
+}
