@@ -209,9 +209,14 @@ impl BTree {
             None => return Ok(None),
         };
         let (hit, needs_cow) = {
-            let page = pages
-                .get(&cached_leaf)
-                .ok_or(Error::PageOutOfBounds(cached_leaf))?;
+            let Some(page) = pages.get(&cached_leaf) else {
+                self.last_insert = None;
+                return Ok(None);
+            };
+            if !matches!(page.page_type(), Some(PageType::Leaf)) {
+                self.last_insert = None;
+                return Ok(None);
+            }
             let n = page.num_cells();
             let h = n > 0 && key > leaf_node::read_cell(page, n - 1).key;
             let nc = page.txn_id() != txn_id;

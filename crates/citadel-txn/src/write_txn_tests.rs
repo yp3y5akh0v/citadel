@@ -2246,3 +2246,123 @@ fn update_with_hint_survives_overflow_staging_map_growth_and_frees_each_chain_on
     }
     assert!(reopened.integrity_check().unwrap().is_ok());
 }
+
+mod eager_inline_append {
+    use crate::manager::tests::create_test_manager;
+    use crate::write_txn::{InsertOutcome, WriteTxn};
+    use citadel_core::{CancelToken, Error, Result, MAX_KEY_SIZE};
+
+    fn insert(writer: &mut WriteTxn<'_>, route: u8, key: &[u8], value: &[u8]) -> Result<bool> {
+        match route {
+            0 => writer.insert(key, value),
+            1 => writer.table_insert(b"append", key, value),
+            2 => writer.table_insert_if_absent(b"append", key, value),
+            3 => writer
+                .table_insert_or_fetch(b"append", key, value)
+                .map(|outcome| matches!(outcome, InsertOutcome::Inserted)),
+            _ => unreachable!(),
+        }
+    }
+
+    fn get(writer: &mut WriteTxn<'_>, route: u8, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        if route == 0 {
+            writer.get(key)
+        } else {
+            writer.table_get(b"append", key)
+        }
+    }
+
+    #[test]
+    fn routes_preserve_duplicates_splits_and_restored_append_paths() {
+        for route in 0..4 {
+            let manager = create_test_manager();
+            let value = vec![b'x'; 1024];
+            let mut seed = manager.begin_write().unwrap();
+            if route != 0 {
+                seed.create_table(b"append").unwrap();
+            }
+            for id in 0..32u32 {
+                assert!(insert(&mut seed, route, &id.to_be_bytes(), &value).unwrap());
+            }
+            seed.commit().unwrap();
+            let mut old = manager.begin_read();
+            let mut writer = manager.begin_write().unwrap();
+            assert!(insert(&mut writer, route, &32u32.to_be_bytes(), &value).unwrap());
+            let savepoint = writer.begin_savepoint();
+            for id in 33..96u32 {
+                assert!(insert(&mut writer, route, &id.to_be_bytes(), &value).unwrap());
+            }
+            // Equality and an interior key must miss the strict-rightmost lane.
+            for id in [95u32, 5] {
+                assert!(!insert(&mut writer, route, &id.to_be_bytes(), b"replacement").unwrap());
+                let expected = if route < 2 {
+                    b"replacement".to_vec()
+                } else {
+                    value.clone()
+                };
+                assert_eq!(
+                    get(&mut writer, route, &id.to_be_bytes()).unwrap(),
+                    Some(expected)
+                );
+            }
+            writer.restore_snapshot(savepoint);
+            assert!(insert(&mut writer, route, &33u32.to_be_bytes(), b"retained").unwrap());
+            assert_eq!(get(&mut writer, route, &95u32.to_be_bytes()).unwrap(), None);
+            assert_eq!(
+                get(&mut writer, route, &5u32.to_be_bytes()).unwrap(),
+                Some(value.clone())
+            );
+            writer.commit().unwrap();
+            let old_missing = if route == 0 {
+                old.get(&32u32.to_be_bytes())
+            } else {
+                old.table_get(b"append", &32u32.to_be_bytes())
+            };
+            assert_eq!(old_missing.unwrap(), None);
+            let mut current = manager.begin_read();
+            let retained = if route == 0 {
+                current.get(&33u32.to_be_bytes())
+            } else {
+                current.table_get(b"append", &33u32.to_be_bytes())
+            };
+            assert_eq!(retained.unwrap(), Some(b"retained".to_vec()));
+        }
+    }
+
+    #[test]
+    fn warm_append_routes_admit_keys_and_cancellation_before_mutating() {
+        for route in 0..4 {
+            let manager = create_test_manager();
+            let mut writer = manager.begin_write().unwrap();
+            if route != 0 {
+                writer.create_table(b"append").unwrap();
+            }
+            assert!(insert(&mut writer, route, b"a", b"first").unwrap());
+            let marker = writer.mutation_marker();
+            let allocations = writer.alloc.allocated_this_txn().len();
+            assert!(matches!(
+                insert(
+                    &mut writer,
+                    route,
+                    &vec![b'z'; MAX_KEY_SIZE + 1],
+                    b"invalid"
+                ),
+                Err(Error::KeyTooLarge { .. })
+            ));
+            let token = CancelToken::new();
+            token.cancel();
+            writer.set_cancel(Some(token));
+            assert!(matches!(
+                insert(&mut writer, route, b"b", b"cancelled"),
+                Err(Error::Interrupted)
+            ));
+            writer.set_cancel(None);
+            assert!(!writer.mutated_since(marker));
+            assert!(!writer.is_poisoned());
+            assert_eq!(writer.alloc.allocated_this_txn().len(), allocations);
+            assert_eq!(get(&mut writer, route, b"b").unwrap(), None);
+            assert!(insert(&mut writer, route, b"b", b"accepted").unwrap());
+            writer.commit().unwrap();
+        }
+    }
+}

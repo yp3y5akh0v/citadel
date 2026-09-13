@@ -528,7 +528,23 @@ impl<'db> WriteTxn<'db> {
     pub fn insert(&mut self, key: &[u8], value: &[u8]) -> Result<bool> {
         self.check_cancel()?;
         Self::validate_key_value(key, value)?;
-        let leaf = Self::load_insert_leaf(&self.tree, &mut self.pages, self.manager, key, value)?;
+        if let Some(inserted) = Self::try_inline_append(
+            &mut self.tree,
+            &mut self.pages,
+            &mut self.alloc,
+            self.txn_id,
+            key,
+            value,
+            &mut self.failure,
+        )? {
+            return self.finish_mutation(inserted, true);
+        }
+        let leaf = Some(Self::load_leaf(
+            &self.tree,
+            &mut self.pages,
+            self.manager,
+            key,
+        )?);
         let (val_type, val_payload) = self.stage_value(value)?;
         let inserted = Self::insert_into_tree(
             &mut self.tree,
@@ -591,12 +607,43 @@ impl<'db> WriteTxn<'db> {
         if value.len() <= MAX_INLINE_VALUE_SIZE && tree.lil_would_hit(pages, key) {
             return Ok(None);
         }
+        Self::load_leaf(tree, pages, manager, key).map(Some)
+    }
+
+    /// Inline values are already staged by borrowing the caller's bytes. Try
+    /// the append cache once before loading a fallback path; overflow values
+    /// still resolve all fallible reads before allocating their chain.
+    fn try_inline_append(
+        tree: &mut BTree,
+        pages: &mut FxHashMap<PageId, Page>,
+        alloc: &mut PageAllocator,
+        txn_id: TxnId,
+        key: &[u8],
+        value: &[u8],
+        failure: &mut Option<WriteFailure>,
+    ) -> Result<Option<bool>> {
+        if value.len() > MAX_INLINE_VALUE_SIZE {
+            return Ok(None);
+        }
+        let result = tree.try_lil_insert(pages, alloc, txn_id, key, ValueType::Inline, value);
+        if let Err(err) = &result {
+            Self::record_failure(failure, err);
+        }
+        result
+    }
+
+    fn load_leaf(
+        tree: &BTree,
+        pages: &mut FxHashMap<PageId, Page>,
+        manager: &TxnManager,
+        key: &[u8],
+    ) -> Result<LoadedLeaf> {
         let (path, id) = Self::walk_loading(pages, manager, tree.root, key)?;
-        Ok(Some(LoadedLeaf {
+        Ok(LoadedLeaf {
             path,
             id,
             hint: None,
-        }))
+        })
     }
 
     pub fn delete(&mut self, key: &[u8]) -> Result<bool> {
@@ -1015,14 +1062,19 @@ impl<'db> WriteTxn<'db> {
     /// Stage `value` and insert through the split-safe tree path, freeing any
     /// replaced overflow chain. Table must already be ensured.
     fn stage_and_insert(&mut self, table: &[u8], key: &[u8], value: &[u8]) -> Result<bool> {
-        let leaf = Self::load_insert_leaf(
-            &self.named_trees[table],
+        if let Some(inserted) = Self::try_inline_append(
+            self.named_trees.get_mut(table).unwrap(),
             &mut self.pages,
-            self.manager,
+            &mut self.alloc,
+            self.txn_id,
             key,
             value,
-        )?;
-        self.stage_and_insert_at_leaf(table, key, value, leaf)
+            &mut self.failure,
+        )? {
+            return Ok(inserted);
+        }
+        let leaf = Self::load_leaf(&self.named_trees[table], &mut self.pages, self.manager, key)?;
+        self.stage_and_insert_at_leaf(table, key, value, Some(leaf))
     }
 
     fn stage_and_insert_at_leaf(
@@ -1068,38 +1120,31 @@ impl<'db> WriteTxn<'db> {
         // can fail or be cancelled; staging first would leave allocated
         // overflow pages in an otherwise committable transaction.
         self.ensure_table(table)?;
-        let leaf = Self::load_insert_leaf(
-            &self.named_trees[table],
+        if let Some(inserted) = Self::try_inline_append(
+            self.named_trees.get_mut(table).unwrap(),
             &mut self.pages,
-            self.manager,
+            &mut self.alloc,
+            self.txn_id,
             key,
             value,
-        )?;
+            &mut self.failure,
+        )? {
+            return self.finish_mutation(inserted, inserted);
+        }
+        let leaf = Self::load_leaf(&self.named_trees[table], &mut self.pages, self.manager, key)?;
         let (val_type, val_payload) = self.stage_value(value)?;
         let val_bytes = val_payload.as_ref();
         let tree = self.named_trees.get_mut(table).unwrap();
-        let inserted = match leaf {
-            Some(LoadedLeaf { path, id, .. }) => tree.insert_if_absent_at_leaf(
-                &mut self.pages,
-                &mut self.alloc,
-                self.txn_id,
-                key,
-                val_type,
-                val_bytes,
-                path,
-                id,
-            ),
-            None => tree
-                .try_lil_insert(
-                    &mut self.pages,
-                    &mut self.alloc,
-                    self.txn_id,
-                    key,
-                    val_type,
-                    val_bytes,
-                )
-                .map(|inserted| inserted.expect("staging preserves the loaded append path")),
-        };
+        let inserted = tree.insert_if_absent_at_leaf(
+            &mut self.pages,
+            &mut self.alloc,
+            self.txn_id,
+            key,
+            val_type,
+            val_bytes,
+            leaf.path,
+            leaf.id,
+        );
         let inserted = match inserted {
             Ok(inserted) => inserted,
             Err(err) => return self.fail(err),
@@ -1283,13 +1328,20 @@ impl<'db> WriteTxn<'db> {
         }
         // Load every fallible tree path before staging an overflow chain. A
         // failed cold-page walk must not leave allocated pages behind.
-        let leaf = Self::load_insert_leaf(
-            &self.named_trees[table],
+        if Self::try_inline_append(
+            self.named_trees.get_mut(table).unwrap(),
             &mut self.pages,
-            self.manager,
+            &mut self.alloc,
+            self.txn_id,
             key,
             value,
-        )?;
+            &mut self.failure,
+        )?
+        .is_some()
+        {
+            return self.finish_mutation(InsertOutcome::Inserted, true);
+        }
+        let leaf = Self::load_leaf(&self.named_trees[table], &mut self.pages, self.manager, key)?;
         let (val_type, val_payload) = self.stage_value(value)?;
         let val_bytes = val_payload.as_ref();
 
@@ -1309,16 +1361,9 @@ impl<'db> WriteTxn<'db> {
         let manager = *manager;
         let txn_id = *txn_id;
 
-        let outcome = match leaf {
-            Some(LoadedLeaf { path, id, .. }) => tree
-                .insert_or_fetch_at_leaf(pages, alloc, txn_id, key, val_type, val_bytes, path, id),
-            None => tree
-                .try_lil_insert(pages, alloc, txn_id, key, val_type, val_bytes)
-                .map(|inserted| {
-                    inserted.expect("staging preserves the loaded append path");
-                    None
-                }),
-        };
+        let outcome = tree.insert_or_fetch_at_leaf(
+            pages, alloc, txn_id, key, val_type, val_bytes, leaf.path, leaf.id,
+        );
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(err) => return Self::fail_with(failure, err),
