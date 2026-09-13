@@ -193,6 +193,7 @@ impl BTree {
 
     /// Combined LIL check + insert. Returns `Some(was_new)` on hit, `None` on
     /// miss.
+    #[inline]
     pub fn try_lil_insert(
         &mut self,
         pages: &mut impl MutablePageMap,
@@ -223,6 +224,37 @@ impl BTree {
         if !hit {
             return Ok(None);
         }
+        self.insert_cached_append(
+            pages,
+            alloc,
+            txn_id,
+            cached_leaf,
+            needs_cow,
+            leaf_node::LeafCell {
+                key,
+                val_type,
+                value,
+            },
+        );
+        Ok(Some(true))
+    }
+
+    /// Mutation work after this call's single admission check. Keep it separate
+    /// so a cache miss need not enter the append/split working frame.
+    fn insert_cached_append(
+        &mut self,
+        pages: &mut impl MutablePageMap,
+        alloc: &mut PageAllocator,
+        txn_id: TxnId,
+        cached_leaf: PageId,
+        needs_cow: bool,
+        cell: leaf_node::LeafCell<'_>,
+    ) {
+        let leaf_node::LeafCell {
+            key,
+            val_type,
+            value,
+        } = cell;
         let mut cached_path = self.last_insert.take().unwrap().0;
         let cow_id = if needs_cow {
             cow_page(pages, alloc, cached_leaf, txn_id)
@@ -240,7 +272,7 @@ impl BTree {
             self.entry_count += 1;
             self.last_delete = None;
             self.last_insert = Some((cached_path, cow_id));
-            return Ok(Some(true));
+            return;
         }
         let (sep_key, right_id) =
             split_leaf_with_insert(pages, alloc, txn_id, cow_id, key, val_type, value, true);
@@ -258,7 +290,6 @@ impl BTree {
         self.last_delete = None;
         self.last_insert = Some((cached_path, right_id));
         self.entry_count += 1;
-        Ok(Some(true))
     }
 
     /// LIL fast-path delete. Returns `Some((deleted, overflow_head))` on
