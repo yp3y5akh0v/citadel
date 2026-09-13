@@ -7,6 +7,7 @@ fn create_test_file() -> (tempfile::TempDir, File) {
         .read(true)
         .write(true)
         .create(true)
+        .truncate(true)
         .open(&path)
         .unwrap();
     (dir, file)
@@ -99,4 +100,88 @@ fn fsync_works() {
     let page = [0xAB; PAGE_SIZE];
     io.write_page(0, &page).unwrap();
     io.fsync().unwrap();
+}
+
+fn expect_invalid_range(result: Result<()>) {
+    assert!(matches!(result, Err(Error::Io(error))
+        if error.kind() == io::ErrorKind::InvalidInput));
+}
+
+#[test]
+fn kernel_range_conversion_checks_boundaries_without_large_allocations() {
+    assert_eq!(checked_io_length(0, PAGE_SIZE).unwrap(), PAGE_SIZE as u32);
+    assert_eq!(
+        checked_offset_end(i64::MAX as u64, 0).unwrap(),
+        i64::MAX as u64
+    );
+    assert!(checked_offset_end(i64::MAX as u64, 1).is_err());
+    assert!(checked_offset_end(u64::MAX, 0).is_err());
+    assert!(checked_offset_end(u64::MAX, PAGE_SIZE).is_err());
+    assert_eq!(
+        checked_page_batch_end([0, 7].into_iter()).unwrap(),
+        PAGE_SIZE as u64 + 7
+    );
+    assert_eq!(checked_file_length(0).unwrap(), 0);
+    assert!(checked_file_length(u64::MAX).is_err());
+    #[cfg(target_pointer_width = "64")]
+    assert!(checked_io_length(0, u32::MAX as usize + 1).is_err());
+}
+
+#[test]
+fn invalid_kernel_ranges_do_not_use_the_shared_file_cursor_or_touch_buffers() {
+    let (_dir, file) = create_test_file();
+    let io = UringPageIO::try_new(file).unwrap();
+    let original = [0x37; PAGE_SIZE];
+    io.write_page(0, &original).unwrap();
+    let size = io.file_size().unwrap();
+    for offset in [u64::MAX, i64::MAX as u64] {
+        let mut page = [0xa5; PAGE_SIZE];
+        expect_invalid_range(io.read_page(offset, &mut page));
+        assert_eq!(page, [0xa5; PAGE_SIZE]);
+        expect_invalid_range(io.write_page(offset, &[0x99; PAGE_SIZE]));
+        let mut bytes = [0x6a; 2];
+        expect_invalid_range(io.read_at(offset, &mut bytes));
+        assert_eq!(bytes, [0x6a; 2]);
+        expect_invalid_range(io.write_at(offset, &[0xcc; 2]));
+    }
+    expect_invalid_range(io.read_at(u64::MAX, &mut []));
+    expect_invalid_range(io.write_at(u64::MAX, &[]));
+    expect_invalid_range(io.truncate(u64::MAX));
+    assert_eq!(io.file_size().unwrap(), size);
+    let mut got = [0; PAGE_SIZE];
+    io.read_page(0, &mut got).unwrap();
+    assert_eq!(got, original);
+}
+
+#[test]
+fn invalid_later_batch_offset_is_rejected_before_any_page_changes() {
+    let (_dir, file) = create_test_file();
+    let io = UringPageIO::try_new(file).unwrap();
+    let original = [0x37; PAGE_SIZE];
+    let replacement = [0x99; PAGE_SIZE];
+    io.write_page(0, &original).unwrap();
+    let size = io.file_size().unwrap();
+    expect_invalid_range(io.write_pages(&[(0, replacement), (u64::MAX, replacement)]));
+    expect_invalid_range(io.write_pages_ref(&[(0, &replacement), (u64::MAX, &replacement)]));
+    expect_invalid_range(io.flush_pages(&[(0, replacement), (u64::MAX, replacement)]));
+    assert_eq!(io.file_size().unwrap(), size);
+    let mut got = [0; PAGE_SIZE];
+    io.read_page(0, &mut got).unwrap();
+    assert_eq!(got, original);
+}
+
+#[test]
+fn invalid_metadata_range_is_rejected_before_slot_publication() {
+    let (_dir, file) = create_test_file();
+    let io = UringPageIO::try_new(file).unwrap();
+    let original = [0x37; PAGE_SIZE];
+    io.write_page(0, &original).unwrap();
+    let size = io.file_size().unwrap();
+    expect_invalid_range(io.write_commit_meta(u64::MAX, 1, 8, &[0x99; 8]));
+    expect_invalid_range(io.write_commit_meta(0, 1, u64::MAX, &[0x99; 8]));
+    expect_invalid_range(io.write_commit_meta(0, 1, u64::MAX, &[]));
+    assert_eq!(io.file_size().unwrap(), size);
+    let mut got = [0; PAGE_SIZE];
+    io.read_page(0, &mut got).unwrap();
+    assert_eq!(got, original);
 }
