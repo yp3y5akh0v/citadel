@@ -5,6 +5,12 @@ Cryptographic primitives for the [Citadel](https://github.com/yp3y5akh0v/citadel
 Key files and key backups accept the authenticated legacy cipher identifier `1` as
 AES-256-CTR. New files use the canonical identifier `0`.
 
+Page and blob CTR paths use only AES's forward block operation for both
+encryption and decryption, avoiding unused inverse key schedules. These paths
+still authenticate before decrypting, with unchanged ciphertext formats and
+cipher identifiers. AES Key Wrap retains the full AES cipher for wrapping and
+unwrapping.
+
 This crate is part of the Citadel workspace. Depend on the main [`citadeldb`](https://crates.io/crates/citadeldb) crate instead.
 
 ## License

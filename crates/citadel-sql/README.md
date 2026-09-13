@@ -6,6 +6,23 @@ Current date/time functions use the connection's session zone and transaction-st
 `STATEMENT_TIMESTAMP()` is statement-stable and `CLOCK_TIMESTAMP()` reads the wall clock.
 `SET TIME ZONE` accepts IANA names, fixed offsets, numeric hours, intervals, `LOCAL`, and `DEFAULT`.
 
+## Storage and metadata limits
+
+Stored rows support at most **32,767 physical non-primary-key slots**, including
+preserved `DROP COLUMN` holes and the NULL slots of `VIRTUAL` generated columns.
+Trigger transition tables also encode the base table's primary-key columns in
+their rows, so all transition columns count toward that same limit. Relation
+schema metadata supports up to 65,535 logical columns.
+
+`DEFAULT` and `CHECK` expressions must serialize to at most **65,535 UTF-8 bytes**,
+including SQL quotes and escaping. Metadata lengths and counts are checked before
+catalog persistence; the metadata types also expose fallible `try_serialize()`
+methods. Loading truncated required metadata returns an error.
+
+A failed mutating statement can leave an explicit transaction requiring rollback
+if it already changed storage. Restore a preceding savepoint or roll back the
+transaction before continuing.
+
 This crate is part of the Citadel workspace. Depend on the main [`citadeldb`](https://crates.io/crates/citadeldb) crate instead.
 
 ## License

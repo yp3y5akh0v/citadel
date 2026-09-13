@@ -169,23 +169,25 @@ test('ratios use unrounded mean-of-two medians and times use three significant d
 test('public data contains all 129 IDs with valid samples and public source provenance', () => {
   assert.equal(DATA.schema_version, 1);
   assert.equal(DATA.measurement.passes, 2);
-  assert.equal(DATA.measurement.samples_per_pass, 100);
-  assert.deepEqual(Object.keys(DATA.sources).sort(), ['baseline', 'post_fix_fts', 'post_fix_update', 'post_fix_window']);
-  for (const name of ['baseline', 'post_fix_fts', 'post_fix_window', 'post_fix_update']) {
+  assert.equal(DATA.measurement.samples_per_pass, 30);
+  assert.deepEqual(Object.keys(DATA.sources).sort(), ['complete_6b41d0c3', 'selected_0f9362cf', 'selected_ea8827d7']);
+  for (const name of ['complete_6b41d0c3', 'selected_0f9362cf', 'selected_ea8827d7']) {
     const source = DATA.sources[name];
     assert.deepEqual(Object.keys(source).sort(), ['executable_sha256', 'revision']);
     assert.match(source.revision, /^[a-f0-9]{40}$/);
     assert.match(source.executable_sha256, /^[a-f0-9]{64}$/);
   }
-  assert.deepEqual(DATA.execution.filter(row => row.source === 'post_fix_update')
+  assert.deepEqual(DATA.execution.filter(row => row.source === 'selected_ea8827d7')
     .map(row => row.name).sort(), [
-    'update', 'update_gen_propagate', 'update_returning',
-    'upsert_counter', 'upsert_mixed', 'upsert_returning',
+    'covered_range', 'fk_cascade', 'insert', 'insert_select', 'scan',
+    'upsert_all_new', 'upsert_dedup', 'upsert_returning',
   ]);
+  assert.deepEqual(DATA.execution.filter(row => row.source === 'selected_0f9362cf')
+    .map(row => row.name).sort(), ['update', 'update_gen_propagate', 'update_returning']);
   assert.doesNotMatch(DATA_TEXT, /[A-Z]:[\\/]|\/(?:Users|home)\/|notes[\\/]|\.exe\b|source[\\/]repos/i);
   assert.doesNotMatch(DATA_TEXT, /</, 'embedded JSON cannot contain HTML tag delimiters');
   const names = new Set();
-  const sourceIds = { baseline: 0, post_fix_fts: 0, post_fix_window: 0, post_fix_update: 0 };
+  const sourceIds = { complete_6b41d0c3: 0, selected_ea8827d7: 0, selected_0f9362cf: 0 };
   for (const [category, expectedNames] of Object.entries(INVENTORY)) {
     assert.deepEqual(DATA[category].map(row => row.name).sort(), expectedNames);
     for (const row of DATA[category]) {
@@ -196,7 +198,19 @@ test('public data contains all 129 IDs with valid samples and public source prov
         : category === 'index' ? [row.name === 'fts_index' ? 'fts_index' : 'gin_index', 'seq_scan']
           : ['citadel', 'sqlite'];
       assert.deepEqual(Object.keys(row.samples_ns).sort(), expectedArms);
-      for (const samples of Object.values(row.samples_ns)) {
+      const cohort = DATA.cohorts[row.provenance.cohort];
+      assert.equal(cohort.source, row.source, row.name);
+      assert.match(cohort.reference.revision, /^[a-f0-9]{40}$/);
+      assert.match(cohort.reference.executable_sha256, /^[a-f0-9]{64}$/);
+      assert.deepEqual(cohort.jobs.map(job => job.role), ['reference', 'candidate', 'candidate', 'reference']);
+      for (const [arm, samples] of Object.entries(row.samples_ns)) {
+        const evidence = row.provenance.arms[arm];
+        assert.equal(evidence.runs.length, 4, row.name);
+        assert.deepEqual(evidence.runs.slice(1, 3).map(run => run.median_ns), samples);
+        for (const run of evidence.runs) {
+          assert.ok(run.median_ci95_ns[0] > 0 && run.median_ci95_ns[0] <= run.median_ns
+            && run.median_ns <= run.median_ci95_ns[1], row.name);
+        }
         assert.equal(samples.length, 2, row.name);
         assert.ok(samples.every(value => typeof value === 'number' && Number.isFinite(value) && value > 0), row.name);
         sourceIds[row.source]++;
@@ -204,7 +218,7 @@ test('public data contains all 129 IDs with valid samples and public source prov
     }
   }
   assert.equal(names.size, 68);
-  assert.deepEqual(sourceIds, { baseline: 103, post_fix_fts: 10, post_fix_window: 4, post_fix_update: 12 });
+  assert.deepEqual(sourceIds, { complete_6b41d0c3: 107, selected_ea8827d7: 16, selected_0f9362cf: 6 });
   assert.deepEqual(DATA.configuration, {
     citadel: { sync: 'Off', page_size: 8208, cached_body_bytes: 8160, cache_pages: 4096 },
     sqlite: { journal_mode: 'MEMORY', synchronous: 'OFF', page_size: 8192, cache_pages: 4096 },
