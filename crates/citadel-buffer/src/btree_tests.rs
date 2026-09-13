@@ -2240,3 +2240,135 @@ fn default_hasher_page_map_preserves_split_cow_and_removal() {
         );
     }
 }
+
+#[test]
+fn lil_admission_checks_once_and_misses_do_not_enter_page_mutation() {
+    use std::cell::Cell;
+
+    struct ObservedPages {
+        pages: FxHashMap<PageId, Page>,
+        reads: Cell<usize>,
+        writes: usize,
+    }
+    impl PageMap for ObservedPages {
+        fn get_page(&self, id: &PageId) -> Option<&Page> {
+            self.reads.set(self.reads.get() + 1);
+            self.pages.get(id)
+        }
+    }
+    impl MutablePageMap for ObservedPages {
+        fn get_page_mut(&mut self, id: &PageId) -> Option<&mut Page> {
+            self.writes += 1;
+            self.pages.get_mut(id)
+        }
+        fn insert_page(&mut self, id: PageId, page: Page) {
+            self.writes += 1;
+            self.pages.insert(id, page);
+        }
+        fn remove_page(&mut self, id: &PageId) {
+            self.writes += 1;
+            self.pages.remove(id);
+        }
+    }
+
+    for value_type in [ValueType::Inline, ValueType::Tombstone] {
+        let (mut raw_pages, mut alloc, mut tree) = new_tree();
+        tree.insert(&mut raw_pages, &mut alloc, TxnId(1), b"m", value_type, b"")
+            .unwrap();
+        let root = tree.root;
+        let before = raw_pages[&root].as_bytes().to_vec();
+        let cached = tree.last_insert.clone();
+        let mut pages = ObservedPages {
+            pages: raw_pages,
+            reads: Cell::new(0),
+            writes: 0,
+        };
+
+        tree.clear_lil_caches();
+        assert_eq!(
+            tree.try_lil_insert(
+                &mut pages,
+                &mut alloc,
+                TxnId(1),
+                b"z",
+                ValueType::Inline,
+                b"new"
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(pages.reads.get(), 0);
+        tree.last_insert = cached;
+        for key in [b"a", b"m"] {
+            pages.reads.set(0);
+            assert_eq!(
+                tree.try_lil_insert(
+                    &mut pages,
+                    &mut alloc,
+                    TxnId(1),
+                    key,
+                    ValueType::Inline,
+                    b"new"
+                )
+                .unwrap(),
+                None
+            );
+            assert_eq!(pages.reads.get(), 1);
+            assert_eq!(pages.writes, 0);
+            assert_eq!(pages.pages[&root].as_bytes().as_slice(), before.as_slice());
+            assert!(tree.last_insert.is_some());
+        }
+        pages.reads.set(0);
+        assert_eq!(
+            tree.try_lil_insert(
+                &mut pages,
+                &mut alloc,
+                TxnId(1),
+                b"z",
+                ValueType::Inline,
+                b"new"
+            )
+            .unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            pages.reads.get(),
+            1,
+            "successful admission must not repeat its lookup"
+        );
+        assert_eq!(pages.writes, 1);
+        assert_eq!(tree.entry_count, 2);
+
+        // The same cached physical ID may disappear or now name a non-leaf.
+        // Admission must clear that stale cache before any cell mutation.
+        for replacement in [None, Some(Page::new(root, PageType::Branch, TxnId(2)))] {
+            match replacement {
+                Some(page) => {
+                    pages.pages.insert(root, page);
+                }
+                None => {
+                    pages.pages.remove(&root);
+                }
+            }
+            tree.last_insert = Some((Vec::new(), root));
+            pages.reads.set(0);
+            pages.writes = 0;
+            assert_eq!(
+                tree.try_lil_insert(
+                    &mut pages,
+                    &mut alloc,
+                    TxnId(2),
+                    b"zz",
+                    ValueType::Inline,
+                    b"new"
+                )
+                .unwrap(),
+                None
+            );
+            assert!(tree.last_insert.is_none());
+            assert_eq!(pages.reads.get(), 1);
+            assert_eq!(pages.writes, 0);
+            assert_eq!(tree.entry_count, 2);
+        }
+    }
+}
