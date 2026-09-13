@@ -144,6 +144,48 @@ impl PageLoader for WritePages<'_> {
     }
 }
 
+// A read-only scan pins committed pages by Arc, while borrowing pages already
+// owned by this writer. One local map keeps cursor lookups independent of page
+// ownership and is dropped before the next mutation or savepoint operation.
+enum WriteScanPage<'a> {
+    Borrowed(&'a Page),
+    Shared(Arc<Page>),
+}
+
+struct WriteScanPages<'a> {
+    owned: &'a FxHashMap<PageId, Page>,
+    loaded: FxHashMap<PageId, WriteScanPage<'a>>,
+    manager: &'a TxnManager,
+    high_water_mark: u32,
+    snapshot_txn_id: TxnId,
+}
+
+impl PageMap for WriteScanPages<'_> {
+    fn get_page(&self, id: &PageId) -> Option<&Page> {
+        self.loaded.get(id).map(|page| match page {
+            WriteScanPage::Borrowed(page) => *page,
+            WriteScanPage::Shared(page) => page.as_ref(),
+        })
+    }
+}
+
+impl PageLoader for WriteScanPages<'_> {
+    fn ensure_loaded(&mut self, id: PageId) -> Result<()> {
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.loaded.entry(id) {
+            let page = match self.owned.get(&id) {
+                Some(page) => WriteScanPage::Borrowed(page),
+                None => WriteScanPage::Shared(self.manager.fetch_reachable_page(
+                    id,
+                    self.high_water_mark,
+                    self.snapshot_txn_id,
+                )?),
+            };
+            entry.insert(page);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DeferredFkCheck {
     /// Physical identity of the child whose final reference must be checked.
@@ -817,9 +859,12 @@ impl<'db> WriteTxn<'db> {
         let cancel = self.cancel.clone();
         let budget = self.read_budget.clone();
         let mut count = ScanCount::new(self.manager);
-        let mut view = WritePages {
-            pages: &mut self.pages,
+        let mut view = WriteScanPages {
+            owned: &self.pages,
+            loaded: FxHashMap::default(),
             manager: self.manager,
+            high_water_mark: self.old_slot.high_water_mark,
+            snapshot_txn_id: self.old_slot.txn_id,
         };
         let mut cursor = Cursor::seek_lazy(&mut view, root, start_key)?;
         while let Some(cell) = cursor.current_ref_lazy(&mut view) {

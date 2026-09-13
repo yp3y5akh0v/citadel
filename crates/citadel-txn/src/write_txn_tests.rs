@@ -2366,3 +2366,188 @@ mod eager_inline_append {
         }
     }
 }
+
+mod shared_write_scan {
+    use crate::manager::tests::{test_keys, MemIO};
+    use crate::manager::TxnManager;
+    use crate::write_txn::WriteTxn;
+    use crate::ReadBudget;
+    use citadel_core::{CancelToken, Error};
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    fn manager() -> TxnManager {
+        let (dek, mac_key, dek_id) = test_keys();
+        TxnManager::create(
+            Box::new(MemIO::new(1024 * 1024)),
+            dek,
+            mac_key,
+            1,
+            0x1234,
+            dek_id,
+            4,
+        )
+        .unwrap()
+    }
+
+    fn rows(writer: &mut WriteTxn<'_>) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut result = Vec::new();
+        writer
+            .table_scan_from(b"scan", b"", |key, value| {
+                result.push((key.to_vec(), value.to_vec()));
+                Ok(true)
+            })
+            .unwrap();
+        result
+    }
+
+    fn seed(manager: &TxnManager) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let expected: Vec<_> = (0..40u32)
+            .map(|id| {
+                (
+                    id.to_be_bytes().to_vec(),
+                    vec![id as u8; if id == 16 { 24_000 } else { 1024 }],
+                )
+            })
+            .collect();
+        let mut writer = manager.begin_write().unwrap();
+        writer.create_table(b"scan").unwrap();
+        for (key, value) in &expected {
+            writer.table_insert(b"scan", key, value).unwrap();
+        }
+        writer.commit().unwrap();
+        expected
+    }
+
+    #[test]
+    fn committed_pages_and_overflow_are_not_cloned_into_the_writer_map() {
+        let manager = manager();
+        let expected = seed(&manager);
+        let mut writer = manager.begin_write().unwrap();
+        writer.ensure_table(b"scan").unwrap();
+        let before: Vec<_> = writer.pages.keys().copied().collect();
+        let total = expected.iter().map(|(_, value)| value.len()).sum();
+        let budget = ReadBudget::new(24_000, total);
+        writer.set_read_budget(Some(budget.clone()));
+        assert_eq!(rows(&mut writer), expected);
+        assert_eq!(budget.remaining(), 0);
+        assert_eq!(writer.pages.len(), before.len());
+        assert!(before.iter().all(|id| writer.pages.contains_key(id)));
+        assert!(writer.alloc.allocated_this_txn().is_empty());
+        writer.set_read_budget(None);
+        writer.commit().unwrap();
+    }
+
+    #[test]
+    fn scans_prefer_owned_pages_and_follow_restored_savepoint_roots() {
+        let manager = manager();
+        let expected = seed(&manager);
+        let mut old = manager.begin_read();
+        let mut writer = manager.begin_write().unwrap();
+        writer
+            .table_insert(b"scan", &2u32.to_be_bytes(), b"changed")
+            .unwrap();
+        writer.table_delete(b"scan", &3u32.to_be_bytes()).unwrap();
+        writer
+            .table_insert(b"scan", &40u32.to_be_bytes(), b"new")
+            .unwrap();
+        let mut changed = expected.clone();
+        changed[2].1 = b"changed".to_vec();
+        changed.remove(3);
+        changed.push((40u32.to_be_bytes().to_vec(), b"new".to_vec()));
+        let savepoint = writer.begin_savepoint();
+        writer
+            .table_insert(b"scan", &16u32.to_be_bytes(), b"shrunk")
+            .unwrap();
+        writer
+            .table_insert(b"scan", &41u32.to_be_bytes(), &vec![b'y'; 25_000])
+            .unwrap();
+        let mut speculative = changed.clone();
+        speculative
+            .iter_mut()
+            .find(|(key, _)| key.as_slice() == 16u32.to_be_bytes())
+            .unwrap()
+            .1 = b"shrunk".to_vec();
+        speculative.push((41u32.to_be_bytes().to_vec(), vec![b'y'; 25_000]));
+        let owned_count = writer.pages.len();
+        assert_eq!(rows(&mut writer), speculative);
+        assert_eq!(writer.pages.len(), owned_count);
+        writer.restore_snapshot(savepoint);
+        assert_eq!(rows(&mut writer), changed);
+        writer.commit().unwrap();
+        let mut old_rows = Vec::new();
+        old.table_scan_from(b"scan", b"", |key, value| {
+            old_rows.push((key.to_vec(), value.to_vec()));
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!(old_rows, expected);
+        let mut current = manager.begin_write().unwrap();
+        assert_eq!(rows(&mut current), changed);
+        current.abort();
+    }
+
+    #[test]
+    fn callback_error_panic_and_cancellation_release_only_scan_local_pages() {
+        let manager = manager();
+        let expected = seed(&manager);
+        let mut writer = manager.begin_write().unwrap();
+        writer.ensure_table(b"scan").unwrap();
+        let owned_count = writer.pages.len();
+        assert!(matches!(
+            writer.table_scan_from(b"scan", b"", |_, _| Err(Error::DatabaseCorrupted)),
+            Err(Error::DatabaseCorrupted)
+        ));
+        assert!(catch_unwind(AssertUnwindSafe(|| {
+            let _ = writer.table_scan_from(b"scan", b"", |_, _| panic!("scan callback"));
+        }))
+        .is_err());
+        let token = CancelToken::new();
+        writer.set_cancel(Some(token.clone()));
+        let budget = ReadBudget::new(24_000, 25_000);
+        writer.set_read_budget(Some(budget.clone()));
+        let mut called = 0;
+        assert!(matches!(
+            writer.table_scan_from(b"scan", b"", |_, _| {
+                called += 1;
+                token.cancel();
+                Ok(true)
+            }),
+            Err(Error::Interrupted)
+        ));
+        assert_eq!(called, 1);
+        assert_eq!(budget.remaining(), 25_000 - 1024);
+        assert_eq!(writer.pages.len(), owned_count);
+        assert!(!writer.is_poisoned());
+        writer.set_cancel(None);
+        writer.set_read_budget(None);
+        assert_eq!(rows(&mut writer), expected);
+        writer.commit().unwrap();
+    }
+
+    #[test]
+    fn committed_prefix_boundary_preserves_exact_value_admission() {
+        let manager = manager();
+        let mut seed = manager.begin_write().unwrap();
+        seed.create_table(b"scan").unwrap();
+        seed.table_insert(b"scan", b"aa", b"ok").unwrap();
+        seed.table_insert(b"scan", b"ba", &vec![b'x'; 24_000])
+            .unwrap();
+        seed.commit().unwrap();
+        let mut writer = manager.begin_write().unwrap();
+        let budget = ReadBudget::new(2, 2);
+        writer.set_read_budget(Some(budget.clone()));
+        let mut count = 0;
+        writer
+            .table_scan_prefix(b"scan", b"a", |key, value| {
+                assert_eq!(key, b"aa");
+                assert_eq!(value, b"ok");
+                count += 1;
+                Ok(true)
+            })
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(budget.remaining(), 0);
+        writer.set_read_budget(None);
+        writer.commit().unwrap();
+    }
+}
