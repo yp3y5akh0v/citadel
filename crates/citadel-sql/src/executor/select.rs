@@ -5614,6 +5614,9 @@ fn build_join_plan_static(schema: &SchemaManager, sel: &SelectStmt) -> Option<Jo
     }
     let from_lower = sel.from.to_ascii_lowercase();
     let from_schema = schema.get(&from_lower)?.clone();
+    if !super::result_cache::is_table_materialization_cacheable(schema, &from_schema) {
+        return None;
+    }
 
     let mut table_lowers = vec![from_lower];
     let mut table_schemas = vec![Arc::new(from_schema.clone())];
@@ -5625,6 +5628,9 @@ fn build_join_plan_static(schema: &SchemaManager, sel: &SelectStmt) -> Option<Jo
     for join in &sel.joins {
         let lname = join.table.name.to_ascii_lowercase();
         let inner_schema = schema.get(&lname)?.clone();
+        if !super::result_cache::is_table_materialization_cacheable(schema, &inner_schema) {
+            return None;
+        }
         table_lowers.push(lname);
         inner_schemas.push(inner_schema);
     }
@@ -5882,6 +5888,9 @@ fn compound_branch_plan(schema: &SchemaManager, body: &QueryBody) -> Option<Bran
 
     let table_lower = sel.from.to_ascii_lowercase();
     let table_schema = schema.get(&table_lower)?.clone();
+    if !super::result_cache::is_table_materialization_cacheable(schema, &table_schema) {
+        return None;
+    }
     let needed_cols = resolve_branch_needed_cols(&sel.columns, &table_schema.columns)?;
 
     Some(BranchPlan {

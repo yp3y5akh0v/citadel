@@ -276,3 +276,109 @@ fn cache_budget_counts_nested_array_contents_at_the_boundary() {
     let mut short = required - 1;
     assert!(!value_fits(&value, &mut short));
 }
+
+#[test]
+fn cacheability_includes_lazy_schema_defaults() {
+    for (expression, expected) in [
+        ("42", true),
+        ("$1", false),
+        ("COALESCE($1, 42)", false),
+        ("DATE('2024-01-01')", true),
+        ("CURRENT_DATE", false),
+        ("CLOCK_TIMESTAMP()", false),
+        ("DATE(CAST('now' AS TEXT))", false),
+        ("DATE($1)", false),
+        ("RANDOM()", false),
+        (
+            r#"JSONB_PATH_QUERY_FIRST_TZ('"12:00:00"'::JSONB, '$.time_tz()')"#,
+            false,
+        ),
+        (
+            r#"JSONB_PATH_QUERY_FIRST('"2023-08-15T12:34:56+05:30"'::JSONB, '$.time_tz()')"#,
+            false,
+        ),
+        (r#"JSONB_PATH_QUERY_FIRST('{"n":1}'::JSONB, '$.n')"#, true),
+    ] {
+        let mut schema = schema_with_t();
+        let mut table = schema.get("t").unwrap().clone();
+        let query = parse_query(&format!("SELECT {expression}"));
+        let crate::parser::QueryBody::Select(select) = query.body else {
+            unreachable!()
+        };
+        let crate::parser::SelectColumn::Expr { expr, .. } = &select.columns[0] else {
+            unreachable!()
+        };
+        table.columns[1].default_expr = Some(expr.clone());
+        schema.register(table);
+        assert_eq!(
+            cacheable(&schema, "SELECT v FROM t"),
+            expected,
+            "{expression}"
+        );
+    }
+}
+
+#[test]
+fn self_referencing_schema_default_is_not_recursed_during_cache_admission() {
+    let mut schema = schema_with_t();
+    let mut table = schema.get("t").unwrap().clone();
+    let query = parse_query("SELECT ((SELECT v FROM t) COLLATE BINARY)");
+    let crate::parser::QueryBody::Select(select) = query.body else {
+        unreachable!()
+    };
+    let crate::parser::SelectColumn::Expr { expr, .. } = &select.columns[0] else {
+        unreachable!()
+    };
+    table.columns[1].default_expr = Some(expr.clone());
+    schema.register(table);
+    assert!(!cacheable(&schema, "SELECT v FROM t"));
+}
+
+#[test]
+fn cacheability_keeps_cte_names_in_their_query_scope() {
+    let mut schema = schema_with_t();
+    let mut table = schema.get("t").unwrap().clone();
+    table.columns[1].default_expr = Some(crate::parser::parse_sql_expr("CURRENT_DATE").unwrap());
+    schema.register(table);
+    for sql in [
+        "SELECT t.v FROM (WITH t AS (SELECT 1 AS id) SELECT id FROM t) a JOIN t ON a.id=t.id",
+        "WITH t AS (SELECT v FROM t) SELECT v FROM t",
+        "WITH RECURSIVE t(v) AS (SELECT v FROM t UNION ALL SELECT v FROM t WHERE 0) SELECT v FROM t",
+        "SELECT t.v FROM (WITH t AS (SELECT 1 AS id) SELECT id FROM t) a, t",
+    ] {
+        assert!(!cacheable(&schema, sql), "{sql}");
+    }
+    for sql in [
+        "WITH t AS (SELECT 1 AS v) SELECT v FROM t",
+        "WITH t AS (SELECT 1 AS v) SELECT a.v FROM (WITH t AS (SELECT 2 AS v) SELECT v FROM t) a JOIN t ON a.v=t.v",
+        "WITH RECURSIVE t(v) AS (SELECT 1 UNION ALL SELECT v+1 FROM t WHERE v<3) SELECT v FROM t",
+    ] {
+        assert!(cacheable(&schema, sql), "{sql}");
+    }
+}
+
+#[test]
+fn cacheability_resolves_views_without_the_callers_cte_namespace() {
+    let mut schema = schema_with_t();
+    let mut table = schema.get("t").unwrap().clone();
+    table.columns[1].default_expr = Some(crate::parser::parse_sql_expr("CURRENT_DATE").unwrap());
+    schema.register(table);
+    schema.register_view(crate::types::ViewDef {
+        name: "contextual_view".into(),
+        sql: "SELECT id, v FROM t".into(),
+        column_aliases: Vec::new(),
+    });
+    assert!(!cacheable(
+        &schema,
+        "WITH t AS (SELECT 1 AS id) SELECT v FROM contextual_view"
+    ));
+    schema.register_view(crate::types::ViewDef {
+        name: "pure_view".into(),
+        sql: "SELECT 1 AS x".into(),
+        column_aliases: Vec::new(),
+    });
+    assert!(cacheable(
+        &schema,
+        "WITH t AS (SELECT 1 AS v) SELECT a.x, t.v FROM pure_view a JOIN t ON a.x=t.v"
+    ));
+}

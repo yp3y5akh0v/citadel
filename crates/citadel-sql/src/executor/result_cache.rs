@@ -9,11 +9,11 @@
 use rustc_hash::FxHashSet;
 
 use crate::parser::{
-    BinOp, CteDefinition, Expr, QueryBody, SelectColumn, SelectQuery, SelectStmt, Statement,
-    WindowFrameBound,
+    BinOp, CompoundSelect, Expr, QueryBody, SelectColumn, SelectQuery, SelectStmt, SetOp,
+    Statement, WindowFrameBound,
 };
 use crate::schema::SchemaManager;
-use crate::types::{QueryResult, Value};
+use crate::types::{QueryResult, TableSchema, Value};
 
 /// Upper bound on a cached entry (result rows + key params): large results
 /// cost as much to clone as to recompute and would pin memory.
@@ -178,12 +178,7 @@ fn value_fits(root: &Value, remaining: &mut usize) -> bool {
 /// only when the statement is a pure read whose result is a function of
 /// (statement, params, commit generation).
 pub(super) fn is_result_cacheable(schema: &SchemaManager, sq: &SelectQuery) -> bool {
-    let mut ctx = WalkCtx {
-        schema,
-        seen_views: FxHashSet::default(),
-        cte_names: FxHashSet::default(),
-    };
-    cacheable_query(&mut ctx, sq)
+    cacheable_query(&mut WalkCtx::new(schema), sq)
 }
 
 struct WalkCtx<'a> {
@@ -192,20 +187,81 @@ struct WalkCtx<'a> {
     cte_names: FxHashSet<String>,
 }
 
-fn cacheable_query(ctx: &mut WalkCtx<'_>, sq: &SelectQuery) -> bool {
-    for cte in &sq.ctes {
-        if !cacheable_cte(ctx, cte) {
-            return false;
+impl<'a> WalkCtx<'a> {
+    fn new(schema: &'a SchemaManager) -> Self {
+        Self {
+            schema,
+            seen_views: FxHashSet::default(),
+            cte_names: FxHashSet::default(),
         }
     }
-    cacheable_body(ctx, &sq.body)
 }
 
-fn cacheable_cte(ctx: &mut WalkCtx<'_>, cte: &CteDefinition) -> bool {
-    // Register the name first (recursive CTEs self-reference). Flat scoping
-    // is over-broad only toward shadowing, where both resolutions are pure.
-    ctx.cte_names.insert(cte.name.to_ascii_lowercase());
-    cacheable_body(ctx, &cte.body)
+/// Retained decoded rows and contextless read paths need the same proof as
+/// result memoization: missing stored columns can evaluate schema defaults,
+/// and virtual columns can evaluate generated expressions while decoding.
+pub(super) fn is_table_materialization_cacheable(
+    schema: &SchemaManager,
+    table: &TableSchema,
+) -> bool {
+    cacheable_table_materialization(&mut WalkCtx::new(schema), table)
+}
+
+fn cacheable_table_materialization(ctx: &mut WalkCtx<'_>, table: &TableSchema) -> bool {
+    table.columns.iter().all(|column| {
+        column
+            .default_expr
+            .as_ref()
+            .is_none_or_cacheable(ctx, cacheable_schema_expr)
+            && column
+                .generated_expr
+                .as_ref()
+                .is_none_or_cacheable(ctx, cacheable_schema_expr)
+    })
+}
+
+// Hidden schema evaluation has no subquery executor. Decline syntactically
+// accepted defaults containing subqueries instead of recursively walking a
+// self-referencing table definition while proving read-path independence.
+// Hidden parameters use scoped TLS, and decoded-row caches have no parameter
+// key, so ordinary result-cache parameter admission is not sufficient here.
+fn cacheable_schema_expr(ctx: &mut WalkCtx<'_>, expr: &Expr) -> bool {
+    !crate::parser::has_subquery(expr)
+        && !crate::parser::expr_uses_parameters(expr)
+        && cacheable_expr(ctx, expr)
+}
+
+fn cacheable_query(ctx: &mut WalkCtx<'_>, sq: &SelectQuery) -> bool {
+    // Match the materializer's lexical scope and registration order: a
+    // recursive UNION anchor sees the outer scope, then its recursive arm
+    // sees self. Ordinary CTE bodies never see their own newly defined name.
+    let mut introduced = Vec::new();
+    let cacheable = sq.ctes.iter().all(|cte| {
+        let recursive =
+            if sq.recursive && super::cte::cte_body_references_self(&cte.body, &cte.name) {
+                match &cte.body {
+                    QueryBody::Compound(comp) if matches!(comp.op, SetOp::Union) => Some(comp),
+                    _ => return false,
+                }
+            } else {
+                None
+            };
+        let before_registration = recursive.map_or(&cte.body, |comp| comp.left.as_ref());
+        if !cacheable_body(ctx, before_registration) {
+            return false;
+        }
+        let name = cte.name.to_ascii_lowercase();
+        if ctx.cte_names.insert(name.clone()) {
+            introduced.push(name);
+        }
+        recursive.is_none_or(|comp| {
+            cacheable_body(ctx, &comp.right) && cacheable_compound_tail(ctx, comp)
+        })
+    }) && cacheable_body(ctx, &sq.body);
+    for name in introduced {
+        ctx.cte_names.remove(&name);
+    }
+    cacheable
 }
 
 fn cacheable_body(ctx: &mut WalkCtx<'_>, body: &QueryBody) -> bool {
@@ -214,19 +270,25 @@ fn cacheable_body(ctx: &mut WalkCtx<'_>, body: &QueryBody) -> bool {
         QueryBody::Compound(comp) => {
             cacheable_body(ctx, &comp.left)
                 && cacheable_body(ctx, &comp.right)
-                && comp.order_by.iter().all(|o| cacheable_expr(ctx, &o.expr))
-                && comp
-                    .limit
-                    .as_ref()
-                    .is_none_or_cacheable(ctx, cacheable_expr)
-                && comp
-                    .offset
-                    .as_ref()
-                    .is_none_or_cacheable(ctx, cacheable_expr)
+                && cacheable_compound_tail(ctx, comp)
         }
         // DML bodies (WITH ... INSERT/UPDATE/DELETE) mutate state.
         QueryBody::Insert(_) | QueryBody::Update(_) | QueryBody::Delete(_) => false,
     }
+}
+
+fn cacheable_compound_tail(ctx: &mut WalkCtx<'_>, comp: &CompoundSelect) -> bool {
+    comp.order_by
+        .iter()
+        .all(|item| cacheable_expr(ctx, &item.expr))
+        && comp
+            .limit
+            .as_ref()
+            .is_none_or_cacheable(ctx, cacheable_expr)
+        && comp
+            .offset
+            .as_ref()
+            .is_none_or_cacheable(ctx, cacheable_expr)
 }
 
 fn cacheable_select(ctx: &mut WalkCtx<'_>, sel: &SelectStmt) -> bool {
@@ -308,12 +370,7 @@ fn cacheable_table_ref(ctx: &mut WalkCtx<'_>, name: &str) -> bool {
         return false;
     }
     if let Some(ts) = ctx.schema.get(&lower) {
-        // A volatile generated expr (possible in on-disk schemas predating
-        // CREATE-time validation) evaluates on read and breaks purity.
-        return ts.columns.iter().all(|c| match &c.generated_expr {
-            Some(expr) => cacheable_expr(ctx, expr),
-            None => true,
-        });
+        return cacheable_table_materialization(ctx, ts);
     }
     if let Some(view) = ctx.schema.get_view(&lower) {
         if !ctx.seen_views.insert(lower) {
@@ -321,10 +378,15 @@ fn cacheable_table_ref(ctx: &mut WalkCtx<'_>, name: &str) -> bool {
             // let execution surface the error uncached).
             return true;
         }
-        return match crate::parser::parse_sql(&view.sql) {
+        // A stored view definition resolves independently of the caller's
+        // CTE namespace. Keep cycle tracking shared across those scopes.
+        let outer_ctes = std::mem::take(&mut ctx.cte_names);
+        let cacheable = match crate::parser::parse_sql(&view.sql) {
             Ok(Statement::Select(view_sq)) => cacheable_query(ctx, &view_sq),
             _ => false,
         };
+        ctx.cte_names = outer_ctes;
+        return cacheable;
     }
     if ctx.schema.get_matview(&lower).is_some() {
         // Matview reads hit its materialized backing table; refreshes commit
