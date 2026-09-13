@@ -2822,10 +2822,20 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
             }
             let stride = match &evaluated[0] {
                 Value::Interval {
-                    months: _,
+                    months,
                     days,
                     micros,
-                } => *days as i64 * crate::datetime::MICROS_PER_DAY + *micros,
+                } => {
+                    if *months != 0 {
+                        return Err(SqlError::Unsupported(
+                            "DATE_BIN stride cannot contain months or years".into(),
+                        ));
+                    }
+                    // Interval components and a valid final bin can exceed an
+                    // i64 intermediate. Their complete range fits in i128.
+                    i128::from(*days) * i128::from(crate::datetime::MICROS_PER_DAY)
+                        + i128::from(*micros)
+                }
                 _ => {
                     return Err(SqlError::TypeMismatch {
                         expected: "INTERVAL stride".into(),
@@ -2847,9 +2857,26 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
                     })
                 }
             };
-            let diff = src - origin;
-            let binned = origin + (diff.div_euclid(stride)) * stride;
-            Ok(Value::Timestamp(binned))
+            if crate::datetime::is_infinity_ts(src) {
+                return Ok(Value::Timestamp(src));
+            }
+            if crate::datetime::is_infinity_ts(origin) {
+                return Err(SqlError::InvalidValue(
+                    "DATE_BIN origin must be finite".into(),
+                ));
+            }
+            let source = i128::from(src);
+            // Euclidean remainder rounds towards the beginning of the bin,
+            // including when the origin is later than the source. Subtracting
+            // the remainder avoids multiplying a potentially large quotient.
+            let binned = source - (source - i128::from(origin)).rem_euclid(stride);
+            // The endpoints are reserved infinity sentinels, not finite bins.
+            if binned <= i128::from(i64::MIN) || binned >= i128::from(i64::MAX) {
+                return Err(SqlError::InvalidValue(
+                    "DATE_BIN result is out of timestamp range".into(),
+                ));
+            }
+            Ok(Value::Timestamp(binned as i64))
         }
         "AGE" => {
             if evaluated.len() == 1 {
