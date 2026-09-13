@@ -1237,6 +1237,43 @@ fn date_trunc_timestamp(unit: &str, ts: i64) -> Result<i64> {
     }
 }
 
+/// Truncate the local civil fields of an instant in an explicit SQL timezone.
+/// Subday units preserve the input offset (including either occurrence of a
+/// folded hour). Calendar units resolve the truncated local date anew, using
+/// the same compatible gap/fold policy as parsing civil timestamps in a zone.
+pub(crate) fn date_trunc_timestamp_in_zone(unit: &str, ts: i64, zone: &str) -> Result<i64> {
+    let zone = resolve_timezone(zone)?;
+    let unit = unit.trim().to_ascii_lowercase();
+    if is_infinity_ts(ts) {
+        return date_trunc_timestamp(&unit, ts);
+    }
+    let zoned = JTimestamp::from_microsecond(ts)
+        .map_err(|error| SqlError::InvalidValue(format!("ts: {error}")))?
+        .to_zoned(zone.clone());
+    let offset = i64::from(zoned.offset().seconds()) * MICROS_PER_SEC;
+    let local = ts
+        .checked_add(offset)
+        .ok_or_else(|| SqlError::InvalidValue("date_trunc local timestamp overflow".into()))?;
+    // Keep one implementation of every unit's civil truncation rules.
+    let truncated = date_trunc_timestamp(&unit, local)?;
+    if matches!(
+        unit.as_str(),
+        "microseconds" | "milliseconds" | "second" | "minute" | "hour"
+    ) {
+        return truncated
+            .checked_sub(offset)
+            .ok_or_else(|| SqlError::InvalidValue("date_trunc timestamp overflow".into()));
+    }
+    let civil = JTimestamp::from_microsecond(truncated)
+        .map_err(|error| SqlError::InvalidValue(error.to_string()))?
+        .to_zoned(TimeZone::UTC)
+        .datetime();
+    civil
+        .to_zoned(zone)
+        .map(|rounded| rounded.timestamp().as_microsecond())
+        .map_err(|error| SqlError::InvalidValue(error.to_string()))
+}
+
 fn date_trunc_time(unit: &str, micros: i64) -> Result<i64> {
     match unit {
         "microseconds" => Ok(micros),
