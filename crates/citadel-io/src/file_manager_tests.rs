@@ -846,3 +846,62 @@ fn growth_chunk_sizes() {
         10 * GROWTH_THRESHOLD_1GB / 100
     );
 }
+
+#[test]
+fn file_growth_rejects_wrapped_page_ends_and_preserves_existing_bytes() {
+    use crate::memory_io::MemoryPageIO;
+    let io = MemoryPageIO::new();
+    io.write_at(0, b"retained").unwrap();
+    let before = io.file_size().unwrap();
+    assert!(
+        matches!(ensure_file_size(&io, u64::MAX), Err(Error::Io(error))
+        if error.kind() == std::io::ErrorKind::InvalidInput)
+    );
+    assert_eq!(io.file_size().unwrap(), before);
+    let mut got = [0; 8];
+    io.read_at(0, &mut got).unwrap();
+    assert_eq!(&got, b"retained");
+}
+
+#[test]
+fn optional_file_growth_headroom_does_not_wrap_at_the_offset_limit() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct SizingIO(AtomicU64);
+    impl PageIO for SizingIO {
+        fn read_page(&self, _: u64, _: &mut [u8; PAGE_SIZE]) -> Result<()> {
+            unreachable!()
+        }
+        fn write_page(&self, _: u64, _: &[u8; PAGE_SIZE]) -> Result<()> {
+            unreachable!()
+        }
+        fn read_at(&self, _: u64, _: &mut [u8]) -> Result<()> {
+            unreachable!()
+        }
+        fn write_at(&self, _: u64, _: &[u8]) -> Result<()> {
+            unreachable!()
+        }
+        fn fsync(&self) -> Result<()> {
+            unreachable!()
+        }
+        fn file_size(&self) -> Result<u64> {
+            Ok(self.0.load(Ordering::Relaxed))
+        }
+        fn truncate(&self, size: u64) -> Result<()> {
+            self.0.store(size, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    // A streaming backend can expose large positions without mapping or
+    // allocating that many bytes. The public sizing helper retains u64 scope.
+    let io = SizingIO(AtomicU64::new(u64::MAX - 1));
+    ensure_file_size(&io, u64::MAX - PAGE_SIZE as u64).unwrap();
+    assert_eq!(io.file_size().unwrap(), u64::MAX);
+    ensure_file_size(&io, 0).unwrap();
+    assert_eq!(io.file_size().unwrap(), u64::MAX);
+
+    let ordinary = SizingIO(AtomicU64::new(0));
+    ensure_file_size(&ordinary, 0).unwrap();
+    assert_eq!(ordinary.file_size().unwrap(), GROWTH_CHUNK_1MB);
+}
