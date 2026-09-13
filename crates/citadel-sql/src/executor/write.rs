@@ -712,12 +712,41 @@ struct UpdateValue<'a> {
 }
 
 impl<'a> UpdateValue<'a> {
-    fn fixed(bytes: &'a mut [u8], layout: &'a mut RowLayout) -> Self {
+    /// A schema fixed-width proof does not describe legacy stored types.
+    /// Check every destination before the first patch, retaining the parsed
+    /// locations for normal rows. Mismatches use the existing deferred rewrite
+    /// lane so the range callback never changes a row it reports unmodified.
+    fn for_range<'c>(
+        bytes: &'a mut [u8],
+        expanded: &'a mut Option<Vec<u8>>,
+        layout: &'a mut RowLayout,
+        columns: impl IntoIterator<Item = (usize, &'c ColumnDef)>,
+    ) -> Result<Self> {
         layout.reset();
-        Self {
-            storage: UpdateStorage::Fixed(bytes),
-            layout,
+        if expanded.is_none() {
+            for (physical, column) in columns {
+                let matches = match layout.column(bytes, physical)? {
+                    RawColumn::Null => column.nullable,
+                    RawColumn::Integer(_) => column.data_type == DataType::Integer,
+                    RawColumn::Real(_) => column.data_type == DataType::Real,
+                    RawColumn::Boolean(_) => column.data_type == DataType::Boolean,
+                    RawColumn::Date(_) => column.data_type == DataType::Date,
+                    RawColumn::Time(_) => column.data_type == DataType::Time,
+                    RawColumn::Timestamp(_) => column.data_type == DataType::Timestamp,
+                    RawColumn::Interval { .. } => column.data_type == DataType::Interval,
+                    _ => false,
+                };
+                if !matches {
+                    *expanded = Some(bytes.to_vec());
+                    break;
+                }
+            }
         }
+        let storage = match expanded.as_mut() {
+            Some(bytes) => UpdateStorage::Growable(bytes),
+            None => UpdateStorage::Fixed(bytes),
+        };
+        Ok(Self { storage, layout })
     }
 
     fn growable(bytes: &'a mut Vec<u8>, layout: &'a mut RowLayout) -> Self {
@@ -1460,10 +1489,19 @@ fn exec_compiled_range_update(
                 }
             }
             let mut expanded = bufs.materializer.expand(schema, key, value, cancel)?;
-            let mut value = match expanded.as_mut() {
-                Some(bytes) => UpdateValue::growable(bytes, &mut bufs.row_layout),
-                None => UpdateValue::fixed(value, &mut bufs.row_layout),
-            };
+            let mut value = UpdateValue::for_range(
+                value,
+                &mut expanded,
+                &mut bufs.row_layout,
+                fast.targets
+                    .iter()
+                    .map(|target| (target.phys_idx, &target.col))
+                    .chain(
+                        fast.gen_targets
+                            .iter()
+                            .map(|target| (target.phys_idx, &target.col)),
+                    ),
+            )?;
             patch_compiled_update_value(
                 &mut value,
                 fast,
@@ -1735,10 +1773,19 @@ pub(super) fn exec_update(
                         }
                     }
                     let mut expanded = materializer.expand(table_schema, key, value, cancel)?;
-                    let mut value = match expanded.as_mut() {
-                        Some(bytes) => UpdateValue::growable(bytes, &mut row_layout),
-                        None => UpdateValue::fixed(value, &mut row_layout),
-                    };
+                    let mut value = UpdateValue::for_range(
+                        value,
+                        &mut expanded,
+                        &mut row_layout,
+                        targets
+                            .iter()
+                            .map(|target| (target.phys_idx, &target.col))
+                            .chain(
+                                gen_targets
+                                    .iter()
+                                    .map(|target| (target.phys_idx, &target.col)),
+                            ),
+                    )?;
                     for target in &targets {
                         partial_row[target.schema_idx] = value.column(target.phys_idx)?.to_value();
                     }
@@ -2864,10 +2911,19 @@ fn try_fast_update_in_txn(
                     }
                 }
                 let mut expanded = materializer.expand(table_schema, key, value, cancel)?;
-                let mut value = match expanded.as_mut() {
-                    Some(bytes) => UpdateValue::growable(bytes, &mut row_layout),
-                    None => UpdateValue::fixed(value, &mut row_layout),
-                };
+                let mut value = UpdateValue::for_range(
+                    value,
+                    &mut expanded,
+                    &mut row_layout,
+                    targets
+                        .iter()
+                        .map(|target| (target.phys_idx, &target.col))
+                        .chain(
+                            gen_targets
+                                .iter()
+                                .map(|target| (target.phys_idx, &target.col)),
+                        ),
+                )?;
                 for target in &targets {
                     partial_row[target.schema_idx] = value.column(target.phys_idx)?.to_value();
                 }
