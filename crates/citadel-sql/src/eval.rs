@@ -2800,7 +2800,8 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
                 if let Value::Text(tz) = &evaluated[2] {
                     if !tz.eq_ignore_ascii_case("UTC") {
                         if let Value::Timestamp(ts) = &evaluated[1] {
-                            return date_trunc_in_zone(&unit, *ts, tz);
+                            return crate::datetime::date_trunc_timestamp_in_zone(&unit, *ts, tz)
+                                .map(Value::Timestamp);
                         }
                     }
                 }
@@ -3819,27 +3820,6 @@ fn real_sec_arg(v: &Value) -> Result<(u8, u32)> {
             got: v.data_type().to_string(),
         }),
     }
-}
-
-/// DATE_TRUNC with a non-UTC IANA zone: convert → truncate in that zone → convert back to UTC.
-fn date_trunc_in_zone(unit: &str, ts_utc: i64, tz: &str) -> Result<Value> {
-    use jiff::{tz::TimeZone, Timestamp as JTimestamp};
-    let zone = TimeZone::get(tz).map_err(|e| SqlError::InvalidTimezone(format!("{tz}: {e}")))?;
-    let ts = JTimestamp::from_microsecond(ts_utc)
-        .map_err(|e| SqlError::InvalidValue(format!("ts: {e}")))?;
-    let zoned = ts.to_zoned(zone.clone());
-    let unit_lower = unit.to_ascii_lowercase();
-    let rounded = match unit_lower.as_str() {
-        "microseconds" => return Ok(Value::Timestamp(ts_utc)),
-        "second" => zoned
-            .start_of_day()
-            .map_err(|e| SqlError::InvalidValue(format!("{e}")))?,
-        _ => {
-            let naive_ts = zoned.timestamp().as_microsecond();
-            return crate::datetime::date_trunc(unit, &Value::Timestamp(naive_ts));
-        }
-    };
-    Ok(Value::Timestamp(rounded.timestamp().as_microsecond()))
 }
 
 /// For functions with optional trailing arguments, whose callee validates the upper bound.
