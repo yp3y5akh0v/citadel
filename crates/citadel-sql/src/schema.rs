@@ -650,8 +650,8 @@ impl SchemaManager {
         wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
         trig: &crate::types::TriggerDef,
     ) -> Result<()> {
+        let data = trig.try_serialize()?;
         Self::ensure_triggers_table(wtx)?;
-        let data = trig.serialize();
         let lower = trig.name.to_ascii_lowercase();
         wtx.table_insert(TRIGGERS_TABLE, lower.as_bytes(), &data)
             .map_err(crate::error::SqlError::from)?;
@@ -671,7 +671,7 @@ impl SchemaManager {
 
     pub fn save_view(wtx: &mut citadel_txn::write_txn::WriteTxn<'_>, view: &ViewDef) -> Result<()> {
         let lower = view.name.to_ascii_lowercase();
-        let data = view.serialize();
+        let data = view.try_serialize()?;
         wtx.table_insert(VIEWS_TABLE, lower.as_bytes(), &data)?;
         Ok(())
     }
@@ -734,9 +734,9 @@ impl SchemaManager {
         wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
         mv: &crate::types::MatviewDef,
     ) -> Result<()> {
+        let data = mv.try_serialize()?;
         Self::ensure_matviews_table(wtx)?;
         let lower = mv.name.to_ascii_lowercase();
-        let data = mv.serialize();
         wtx.table_insert(MATVIEWS_TABLE, lower.as_bytes(), &data)?;
         Ok(())
     }
@@ -791,9 +791,8 @@ impl SchemaManager {
         wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
         schema: &TableSchema,
     ) -> Result<()> {
-        schema.validate_storage_layout()?;
         let lower = schema.name.to_ascii_lowercase();
-        let data = schema.serialize();
+        let data = schema.try_serialize()?;
         wtx.table_insert(SCHEMA_TABLE, lower.as_bytes(), &data)?;
         Ok(())
     }

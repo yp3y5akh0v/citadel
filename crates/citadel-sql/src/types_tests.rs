@@ -902,3 +902,238 @@ fn schema_count_boundary_revalidates_holes_after_public_field_mutation() {
     );
     assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| schema.serialize())).is_err());
 }
+
+#[test]
+fn metadata_decoders_reject_truncated_records_without_panicking() {
+    use crate::parser::{
+        GeneratedKind, ReferentialAction, TriggerEvent, TriggerGranularity, TriggerTiming,
+    };
+    let mut columns = vec![
+        col("id", DataType::Integer, false, 0),
+        col("v", DataType::Text, true, 1),
+    ];
+    columns[1].default_sql = Some("'ok'".into());
+    columns[1].check_sql = Some("v <> ''".into());
+    columns[1].check_name = Some("nonempty".into());
+    let mut generated = col("g", DataType::Integer, true, 2);
+    generated.generated_kind = Some(GeneratedKind::Stored);
+    generated.generated_sql = Some("id + 1".into());
+    columns.push(generated);
+    let mut table = TableSchema::new(
+        "child".into(),
+        columns,
+        vec![0],
+        vec![IndexDef {
+            name: "expression_idx".into(),
+            keys: vec![IndexKey::Expr {
+                expr: crate::parser::parse_sql_expr("id + 1").unwrap(),
+                original_sql: "id + 1".into(),
+            }],
+            unique: false,
+            predicate_sql: Some("id > 0".into()),
+            predicate_expr: None,
+            kind: IndexKind::BTree,
+            ann_filter_cols: vec![],
+        }],
+        vec![TableCheckDef {
+            name: Some("positive".into()),
+            expr: crate::parser::parse_sql_expr("id >= 0").unwrap(),
+            sql: "id >= 0".into(),
+        }],
+        vec![ForeignKeySchemaEntry {
+            name: Some("parent_fk".into()),
+            columns: vec![0],
+            foreign_table: "parent".into(),
+            referred_columns: vec!["id".into()],
+            on_delete: ReferentialAction::Cascade,
+            on_update: ReferentialAction::Restrict,
+            deferrable: true,
+            initially_deferred: true,
+        }],
+    );
+    table.flags = 0x81;
+    let view = ViewDef {
+        name: "v".into(),
+        sql: "SELECT 1".into(),
+        column_aliases: vec!["n".into()],
+    };
+    let matview = MatviewDef {
+        name: "mv".into(),
+        select_sql: "SELECT 1".into(),
+        backing_table: "mv".into(),
+        with_data: true,
+        created_at_micros: -123,
+    };
+    let trigger = TriggerDef {
+        name: "tr".into(),
+        timing: TriggerTiming::After,
+        events: vec![TriggerEvent::Update(vec!["v".into()])],
+        target: "child".into(),
+        granularity: TriggerGranularity::ForEachStatement,
+        referencing: Some(crate::parser::TransitionTables {
+            new_table_alias: Some("new_rows".into()),
+            old_table_alias: Some("old_rows".into()),
+        }),
+        when_sql: Some("1 = 1".into()),
+        body_sql: "SELECT 1".into(),
+        enabled: true,
+        created_at_micros: 123,
+    };
+    type Decode = fn(&[u8]) -> crate::error::Result<()>;
+    let records: [(&str, Vec<u8>, Decode); 4] = [
+        ("table", table.serialize(), |b| {
+            TableSchema::deserialize(b).map(|_| ())
+        }),
+        ("view", view.serialize(), |b| {
+            ViewDef::deserialize(b).map(|_| ())
+        }),
+        ("matview", matview.serialize(), |b| {
+            MatviewDef::deserialize(b).map(|_| ())
+        }),
+        ("trigger", trigger.serialize(), |b| {
+            TriggerDef::deserialize(b).map(|_| ())
+        }),
+    ];
+    for (name, bytes, decode) in records {
+        decode(&bytes).unwrap();
+        for end in 0..bytes.len() {
+            assert!(
+                decode(&bytes[..end]).is_err(),
+                "{name} accepted prefix {end}/{}",
+                bytes.len()
+            );
+        }
+    }
+    let back = TableSchema::deserialize(&table.serialize()).unwrap();
+    assert_eq!(back.flags, 0x81);
+    assert_eq!(back.columns[1].default_sql.as_deref(), Some("'ok'"));
+    assert_eq!(back.check_constraints.len(), 1);
+    assert!(back.foreign_keys[0].initially_deferred);
+}
+
+#[test]
+fn metadata_declared_lengths_are_checked_before_slicing_or_allocating() {
+    // Empty name followed by a four-byte SQL length with no payload.
+    let huge_sql = [1, 0, 0, 255, 255, 255, 255];
+    assert!(ViewDef::deserialize(&huge_sql).is_err());
+    assert!(MatviewDef::deserialize(&huge_sql).is_err());
+    assert!(TableSchema::deserialize(&[SCHEMA_VERSION, 255, 255]).is_err());
+    assert!(TriggerDef::deserialize(&[1, 255, 255]).is_err());
+
+    let view = ViewDef {
+        name: "v".into(),
+        sql: "SELECT 1".into(),
+        column_aliases: vec![],
+    };
+    let mut bytes = view.serialize();
+    bytes[3] = 0xff;
+    assert_eq!(ViewDef::deserialize(&bytes).unwrap().name, "\u{fffd}");
+    bytes[0] = 255;
+    assert!(
+        matches!(ViewDef::deserialize(&bytes), Err(crate::error::SqlError::InvalidValue(ref message)) if message == "invalid view definition version")
+    );
+}
+
+#[test]
+fn schema_required_sections_follow_version_and_old_trailing_bytes_remain_compatible() {
+    // Independent minimal wire records: no columns, PKs, indexes, or constraints.
+    // The old explicit v1/v2 fixtures also cover nonempty column/PK lists.
+    for version in 1..=SCHEMA_VERSION {
+        let mut bytes = vec![version, 0, 0, 0, 0, 0, 0];
+        if version >= 2 {
+            bytes.extend_from_slice(&[0, 0]);
+        }
+        if version >= 3 {
+            bytes.extend_from_slice(&[0, 0, 0, 0]);
+        }
+        if version >= 4 {
+            bytes.extend_from_slice(&[0, 0]);
+        }
+        // Historical flags introduction is not encoded by a separate gate.
+        // Preserve omission for older records; current v14 always writes it.
+        if version >= 14 {
+            bytes.push(0x81);
+        }
+        let schema = TableSchema::deserialize(&bytes).unwrap();
+        assert_eq!(schema.flags, if version >= 14 { 0x81 } else { 0 });
+        if version >= 2 {
+            assert!(
+                TableSchema::deserialize(&bytes[..8]).is_err(),
+                "version {version} lost required index count"
+            );
+        }
+        if version < 7 {
+            bytes.extend_from_slice(&[255, 254]);
+            assert!(
+                TableSchema::deserialize(&bytes).is_ok(),
+                "version {version} rejected trailing extension"
+            );
+        }
+    }
+}
+
+#[test]
+fn metadata_fallible_serialization_checks_utf8_bytes_and_counts() {
+    let max_name = format!("{}a", "é".repeat(32767));
+    assert_eq!(max_name.len(), u16::MAX as usize);
+    let mut table = TableSchema::new(
+        "t".into(),
+        vec![col(&max_name, DataType::Text, true, 0)],
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+    );
+    table.columns[0].default_sql = Some(format!("'{}'", "x".repeat(65533)));
+    let bytes = table.try_serialize().unwrap();
+    assert_eq!(bytes, table.serialize());
+    let restored = TableSchema::deserialize(&bytes).unwrap();
+    assert_eq!(restored.columns[0].name, max_name);
+    assert_eq!(
+        restored.columns[0].default_sql,
+        table.columns[0].default_sql
+    );
+    table.columns[0].default_sql = Some(format!("'{}'", "x".repeat(65534)));
+    assert!(table.try_serialize().is_err());
+    table.columns[0].default_sql = None;
+    table.columns[0].name.push('b');
+    assert!(table.try_serialize().is_err());
+
+    let mut view = ViewDef {
+        name: "v".into(),
+        sql: "SELECT 1".into(),
+        column_aliases: vec![max_name.clone()],
+    };
+    assert!(view.try_serialize().is_ok());
+    view.column_aliases[0].push('b');
+    assert!(view.try_serialize().is_err());
+    view.column_aliases = vec![String::new(); 65536];
+    assert!(view.try_serialize().is_err());
+    let mut mv = MatviewDef {
+        name: "mv".into(),
+        select_sql: "SELECT 1".into(),
+        backing_table: max_name.clone(),
+        with_data: false,
+        created_at_micros: 0,
+    };
+    assert!(mv.try_serialize().is_ok());
+    mv.backing_table.push('b');
+    assert!(mv.try_serialize().is_err());
+    let mut trigger = TriggerDef {
+        name: "tr".into(),
+        timing: crate::parser::TriggerTiming::After,
+        events: vec![crate::parser::TriggerEvent::Insert],
+        target: max_name,
+        granularity: crate::parser::TriggerGranularity::ForEachRow,
+        referencing: None,
+        when_sql: None,
+        body_sql: "SELECT 1".into(),
+        enabled: true,
+        created_at_micros: 0,
+    };
+    assert!(trigger.try_serialize().is_ok());
+    trigger.target.push('b');
+    assert!(trigger.try_serialize().is_err());
+    #[cfg(target_pointer_width = "64")]
+    assert!(wire_u32_len(u32::MAX as usize + 1).is_err());
+}
