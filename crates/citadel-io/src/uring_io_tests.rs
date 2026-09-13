@@ -185,3 +185,186 @@ fn invalid_metadata_range_is_rejected_before_slot_publication() {
     io.read_page(0, &mut got).unwrap();
     assert_eq!(got, original);
 }
+
+mod retirement {
+    use super::*;
+    use std::collections::VecDeque;
+
+    enum Step {
+        Wait(std::result::Result<usize, i32>),
+        Complete(u64, i32),
+    }
+    struct ScriptedDriver(VecDeque<Step>);
+    impl CompletionDriver for ScriptedDriver {
+        fn next_completion(&mut self) -> Option<(u64, i32)> {
+            if matches!(self.0.front(), Some(Step::Complete(..))) {
+                let Some(Step::Complete(id, result)) = self.0.pop_front() else {
+                    unreachable!()
+                };
+                Some((id, result))
+            } else {
+                None
+            }
+        }
+        fn submit_and_wait_one(&mut self) -> io::Result<usize> {
+            let Some(Step::Wait(result)) = self.0.pop_front() else {
+                panic!("retirement must consume the expected wait/completion sequence")
+            };
+            result.map_err(io::Error::from_raw_os_error)
+        }
+    }
+    fn published(count: usize, length: Option<usize>) -> PendingRequests {
+        let mut pending = PendingRequests::new(length);
+        pending.published = count;
+        pending
+    }
+
+    #[test]
+    fn first_error_waits_for_delayed_out_of_order_completions_and_partial_submissions() {
+        let mut driver = ScriptedDriver(VecDeque::from([
+            Step::Wait(Ok(1)),
+            Step::Complete(0, -libc::EBADF),
+            Step::Wait(Err(libc::EAGAIN)),
+            Step::Wait(Ok(1)),
+            Step::Complete(2, PAGE_SIZE as i32),
+            Step::Wait(Err(libc::EINTR)),
+            Step::Wait(Err(libc::EBUSY)),
+            Step::Wait(Ok(1)),
+            Step::Complete(1, 0),
+        ]));
+        let error = complete_pending(&mut driver, published(3, Some(PAGE_SIZE))).unwrap_err();
+        assert!(matches!(error, Error::Io(error) if error.raw_os_error() == Some(libc::EBADF)));
+        assert!(driver.0.is_empty(), "return must follow every terminal CQE");
+    }
+
+    #[test]
+    fn short_write_is_returned_only_after_the_other_request_completes() {
+        let mut driver = ScriptedDriver(VecDeque::from([
+            Step::Wait(Ok(2)),
+            Step::Complete(1, PAGE_SIZE as i32 - 1),
+            Step::Wait(Ok(0)),
+            Step::Complete(0, PAGE_SIZE as i32),
+        ]));
+        let error = complete_pending(&mut driver, published(2, Some(PAGE_SIZE))).unwrap_err();
+        assert!(matches!(error, Error::Io(error) if error.kind() == io::ErrorKind::WriteZero));
+        assert!(driver.0.is_empty());
+    }
+
+    #[test]
+    fn enter_error_can_return_when_all_published_requests_have_retired() {
+        let mut driver = ScriptedDriver(VecDeque::from([
+            Step::Wait(Err(libc::EBADF)),
+            Step::Complete(0, 17),
+        ]));
+        let error = complete_pending(&mut driver, published(1, None)).unwrap_err();
+        assert!(matches!(error, Error::Io(error) if error.raw_os_error() == Some(libc::EBADF)));
+        assert!(driver.0.is_empty());
+        let mut driver = ScriptedDriver(VecDeque::from([Step::Wait(Ok(1)), Step::Complete(0, 7)]));
+        assert_eq!(
+            complete_pending(&mut driver, published(1, None)).unwrap(),
+            7
+        );
+    }
+
+    #[test]
+    fn unretired_buffers_never_escape_through_unwind_or_invalid_driver_state() {
+        const CHILD: &str = "CITADEL_TEST_PENDING_IO_CHILD";
+        if let Ok(scenario) = std::env::var(CHILD) {
+            // Deliberately aborting children must not emit a core dump.
+            let limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            unsafe {
+                libc::setrlimit(libc::RLIMIT_CORE, &limit);
+            }
+            if scenario == "unwind" {
+                let _guard = published(1, None);
+                panic!("simulated unwind after SQ publication");
+            }
+            let steps = match scenario.as_str() {
+                "duplicate" => vec![Step::Complete(0, 0), Step::Complete(0, 0)],
+                "foreign" => vec![Step::Complete(7, 0)],
+                "driver" => vec![Step::Wait(Err(libc::EBADR))],
+                _ => panic!("unknown child scenario"),
+            };
+            let mut driver = ScriptedDriver(steps.into());
+            let _ = complete_pending(&mut driver, published(2, None));
+            panic!("an unsafe return was allowed");
+        }
+        use std::os::unix::process::ExitStatusExt;
+        for scenario in ["unwind", "duplicate", "foreign", "driver"] {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "uring_io::tests::retirement::unretired_buffers_never_escape_through_unwind_or_invalid_driver_state", "--nocapture"])
+                .env(CHILD, scenario)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status().unwrap();
+            assert_eq!(status.signal(), Some(libc::SIGABRT), "{scenario}");
+        }
+    }
+}
+
+#[test]
+fn readonly_multioperation_failures_drain_the_ring_before_it_is_reused() {
+    let (dir, mut file) = create_test_file();
+    use std::io::Write;
+    let original = [0x37; PAGE_SIZE];
+    for _ in 0..8 {
+        file.write_all(&original).unwrap();
+    }
+    drop(file);
+    let readonly = File::open(dir.path().join("test.db")).unwrap();
+    let io = UringPageIO::try_new(readonly).unwrap();
+    let replacement = [0x99; PAGE_SIZE];
+    let pages: Vec<_> = (0..8)
+        .map(|index| (index as u64 * PAGE_SIZE as u64, replacement))
+        .collect();
+    let refs: Vec<_> = pages.iter().map(|(offset, page)| (*offset, page)).collect();
+    for use_refs in [false, true] {
+        let result = if use_refs {
+            io.write_pages_ref(&refs)
+        } else {
+            io.write_pages(&pages)
+        };
+        assert!(
+            matches!(result, Err(Error::Io(error)) if error.raw_os_error() == Some(libc::EBADF))
+        );
+        let mut ring = io.ring.lock();
+        assert!(ring.submission().is_empty());
+        assert!(ring.completion().next().is_none());
+    }
+    let mut got = [0; PAGE_SIZE];
+    io.read_page(0, &mut got).unwrap();
+    assert_eq!(got, original);
+    io.read_page(7 * PAGE_SIZE as u64, &mut got).unwrap();
+    assert_eq!(got, original);
+}
+
+#[test]
+fn multiple_write_chunks_retire_before_buffers_are_reused() {
+    let (_dir, file) = create_test_file();
+    let io = UringPageIO::try_new(file).unwrap();
+    let mut pages: Vec<_> = (0..300)
+        .map(|index| (index as u64 * PAGE_SIZE as u64, [index as u8; PAGE_SIZE]))
+        .collect();
+    io.write_pages(&pages).unwrap();
+    for index in [0, 254, 255, 256, 299] {
+        let mut got = [0; PAGE_SIZE];
+        io.read_page(pages[index].0, &mut got).unwrap();
+        assert_eq!(got, pages[index].1);
+    }
+    for (_, page) in &mut pages {
+        page.fill(0x69);
+    }
+    let refs: Vec<_> = pages.iter().map(|(offset, page)| (*offset, page)).collect();
+    io.write_pages_ref(&refs).unwrap();
+    for index in [0, 254, 255, 256, 299] {
+        let mut got = [0; PAGE_SIZE];
+        io.read_page(pages[index].0, &mut got).unwrap();
+        assert_eq!(got, pages[index].1);
+    }
+    let mut ring = io.ring.lock();
+    assert!(ring.submission().is_empty());
+    assert!(ring.completion().next().is_none());
+}

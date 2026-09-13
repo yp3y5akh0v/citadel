@@ -8,8 +8,13 @@ use io_uring::{opcode, types, IoUring};
 use crate::traits::PageIO;
 use citadel_core::{Error, Result, PAGE_SIZE};
 
-/// io_uring-backed page I/O for Linux. `flush_pages()` batches all dirty-page
-/// writes + fsync into a single submission.
+/// io_uring-backed page I/O for Linux. Dirty pages are written in bounded
+/// batches; `flush_pages()` completes them before submitting fsync.
+///
+/// Ordinary I/O failures are returned only after every published operation has
+/// completed. If an unrecoverable ring-driver failure prevents proving that
+/// borrowed buffers are no longer in use, the process aborts rather than return
+/// or unwind and expose those buffers to a use-after-free.
 pub struct UringPageIO {
     ring: Mutex<IoUring>,
     fd: RawFd,
@@ -46,50 +51,54 @@ impl UringPageIO {
         }
     }
 
-    /// Drain `expected` completions, requiring each to have transferred
-    /// exactly `expected_len` bytes - a short (torn) write must fail the
-    /// batch just like the single-op paths reject `n < len`.
-    fn drain_cqes(ring: &mut IoUring, expected: usize, expected_len: usize) -> Result<()> {
-        let mut completed = 0;
-        while completed < expected {
-            let result = ring.completion().next().map(|cqe| cqe.result());
-            if let Some(r) = result {
-                if r < 0 {
-                    while ring.completion().next().is_some() {}
-                    return Err(Error::Io(io::Error::from_raw_os_error(-r)));
-                }
-                if (r as usize) < expected_len {
-                    while ring.completion().next().is_some() {}
-                    return Err(Error::Io(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "short write",
-                    )));
-                }
-                completed += 1;
-            }
-        }
-        Ok(())
-    }
-
     fn submit_one(&self, sqe: io_uring::squeue::Entry) -> Result<i32> {
         let mut ring = self.ring.lock();
-
-        unsafe {
-            ring.submission().push(&sqe).map_err(|_| sq_full_err())?;
+        require_idle_ring(&mut ring);
+        let mut pending = PendingRequests::new(None);
+        {
+            let mut queue = ring.submission();
+            unsafe {
+                queue.push(&sqe.user_data(0)).map_err(|_| sq_full_err())?;
+            }
+            // Track the borrowed operation before the queue guard publishes it.
+            pending.published += 1;
         }
+        complete_pending(&mut *ring, pending)
+    }
 
-        ring.submit_and_wait(1)?;
-
-        let cqe = ring
-            .completion()
-            .next()
-            .ok_or_else(|| Error::Io(io::Error::other("missing completion")))?;
-
-        let result = cqe.result();
-        if result < 0 {
-            return Err(Error::Io(io::Error::from_raw_os_error(-result)));
+    fn write_batch<'a>(
+        &self,
+        pages: impl Iterator<Item = (u64, &'a [u8; PAGE_SIZE])> + Clone,
+    ) -> Result<()> {
+        let max_end = checked_page_batch_end(pages.clone().map(|(offset, _)| offset))?;
+        if max_end > self.file_size()? {
+            self.truncate(max_end)?;
         }
-        Ok(result)
+        let mut ring = self.ring.lock();
+        require_idle_ring(&mut ring);
+        let capacity = ring.submission().capacity().min(MAX_PENDING);
+        let batch_size = capacity.saturating_sub(1).max(1);
+        let mut pages = pages.peekable();
+        while pages.peek().is_some() {
+            let mut pending = PendingRequests::new(Some(PAGE_SIZE));
+            {
+                let mut queue = ring.submission();
+                for (offset, buf) in pages.by_ref().take(batch_size) {
+                    let sqe =
+                        opcode::Write::new(types::Fd(self.fd), buf.as_ptr(), PAGE_SIZE as u32)
+                            .offset(offset)
+                            .build()
+                            .user_data(pending.published as u64);
+                    if unsafe { queue.push(&sqe) }.is_err() {
+                        pending.record_error(sq_full_err());
+                        break;
+                    }
+                    pending.published += 1;
+                }
+            }
+            complete_pending(&mut *ring, pending)?;
+        }
+        Ok(())
     }
 }
 
@@ -168,66 +177,14 @@ impl PageIO for UringPageIO {
         if pages.is_empty() {
             return Ok(());
         }
-
-        let max_end = checked_page_batch_end(pages.iter().map(|(offset, _)| *offset))?;
-        if max_end > self.file_size()? {
-            self.truncate(max_end)?;
-        }
-
-        let mut ring = self.ring.lock();
-        let sq_cap = ring.submission().capacity();
-        let batch_size = sq_cap.saturating_sub(1).max(1);
-
-        for chunk in pages.chunks(batch_size) {
-            for (i, (offset, buf)) in chunk.iter().enumerate() {
-                let sqe = opcode::Write::new(types::Fd(self.fd), buf.as_ptr(), PAGE_SIZE as u32)
-                    .offset(*offset)
-                    .build()
-                    .user_data(i as u64);
-
-                unsafe {
-                    ring.submission().push(&sqe).map_err(|_| sq_full_err())?;
-                }
-            }
-
-            ring.submit_and_wait(chunk.len())?;
-            Self::drain_cqes(&mut ring, chunk.len(), PAGE_SIZE)?;
-        }
-
-        Ok(())
+        self.write_batch(pages.iter().map(|(offset, page)| (*offset, page)))
     }
 
     fn write_pages_ref(&self, pages: &[(u64, &[u8; PAGE_SIZE])]) -> Result<()> {
         if pages.is_empty() {
             return Ok(());
         }
-
-        let max_end = checked_page_batch_end(pages.iter().map(|(offset, _)| *offset))?;
-        if max_end > self.file_size()? {
-            self.truncate(max_end)?;
-        }
-
-        let mut ring = self.ring.lock();
-        let sq_cap = ring.submission().capacity();
-        let batch_size = sq_cap.saturating_sub(1).max(1);
-
-        for chunk in pages.chunks(batch_size) {
-            for (i, (offset, buf)) in chunk.iter().enumerate() {
-                let sqe = opcode::Write::new(types::Fd(self.fd), buf.as_ptr(), PAGE_SIZE as u32)
-                    .offset(*offset)
-                    .build()
-                    .user_data(i as u64);
-
-                unsafe {
-                    ring.submission().push(&sqe).map_err(|_| sq_full_err())?;
-                }
-            }
-
-            ring.submit_and_wait(chunk.len())?;
-            Self::drain_cqes(&mut ring, chunk.len(), PAGE_SIZE)?;
-        }
-
-        Ok(())
+        self.write_batch(pages.iter().copied())
     }
 
     fn write_commit_meta(
@@ -248,6 +205,150 @@ impl PageIO for UringPageIO {
     fn flush_pages(&self, pages: &[(u64, [u8; PAGE_SIZE])]) -> Result<()> {
         self.write_pages(pages)?;
         self.fsync()
+    }
+}
+
+fn require_idle_ring(ring: &mut IoUring) {
+    if !ring.submission().is_empty() || ring.completion().next().is_some() {
+        abort_pending_io();
+    }
+}
+
+const MAX_PENDING: usize = 256;
+
+/// The guard covers queued as well as submitted operations. Closing an io_uring
+/// is not a synchronous cancellation fence, so unwinding with pending borrowed
+/// buffers is unsound. Normal CQE errors are retained until all requests retire.
+struct PendingRequests {
+    published: usize,
+    completed: usize,
+    seen: [bool; MAX_PENDING],
+    expected_write_len: Option<usize>,
+    first_result: i32,
+    error: Option<Error>,
+}
+
+impl PendingRequests {
+    fn new(expected_write_len: Option<usize>) -> Self {
+        Self {
+            published: 0,
+            completed: 0,
+            seen: [false; MAX_PENDING],
+            expected_write_len,
+            first_result: 0,
+            error: None,
+        }
+    }
+
+    fn record_error(&mut self, error: Error) {
+        if self.error.is_none() {
+            self.error = Some(error);
+        }
+    }
+
+    fn record_completion(&mut self, id: u64, result: i32) {
+        let Ok(index) = usize::try_from(id) else {
+            abort_pending_io();
+        };
+        if index >= self.published || index >= MAX_PENDING || self.seen[index] {
+            abort_pending_io();
+        }
+        self.seen[index] = true;
+        self.completed += 1;
+        if index == 0 {
+            self.first_result = result;
+        }
+        if result < 0 {
+            let Some(code) = result.checked_neg() else {
+                abort_pending_io();
+            };
+            self.record_error(Error::Io(io::Error::from_raw_os_error(code)));
+        } else if self
+            .expected_write_len
+            .is_some_and(|length| (result as usize) < length)
+        {
+            self.record_error(Error::Io(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "short write",
+            )));
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        self.completed == self.published
+    }
+}
+
+impl Drop for PendingRequests {
+    fn drop(&mut self) {
+        if !self.is_complete() {
+            abort_pending_io();
+        }
+    }
+}
+
+#[cold]
+fn abort_pending_io() -> ! {
+    // Do not panic: unwinding could release buffers still referenced by SQEs.
+    std::process::abort()
+}
+
+/// A small adapter allows deterministic tests to drive the exact production
+/// retirement loop, including partial submission and delayed error completions.
+trait CompletionDriver {
+    fn next_completion(&mut self) -> Option<(u64, i32)>;
+    fn submit_and_wait_one(&mut self) -> io::Result<usize>;
+}
+
+impl CompletionDriver for IoUring {
+    fn next_completion(&mut self) -> Option<(u64, i32)> {
+        self.completion()
+            .next()
+            .map(|cqe| (cqe.user_data(), cqe.result()))
+    }
+
+    fn submit_and_wait_one(&mut self) -> io::Result<usize> {
+        self.submit_and_wait(1)
+    }
+}
+
+fn complete_pending(
+    driver: &mut impl CompletionDriver,
+    mut pending: PendingRequests,
+) -> Result<i32> {
+    loop {
+        while let Some((id, result)) = driver.next_completion() {
+            pending.record_completion(id, result);
+        }
+        if pending.is_complete() {
+            return match pending.error.take() {
+                Some(error) => Err(error),
+                None => Ok(pending.first_result),
+            };
+        }
+        // A failed SQE may stop submission before the rest of the SQ is
+        // consumed. Waiting for the whole batch can then deadlock; waiting for
+        // one CQE resubmits remaining SQEs and advances each terminal result.
+        if let Err(error) = driver.submit_and_wait_one() {
+            match error.raw_os_error() {
+                // io_uring_enter(2): interrupted wait; transient resource
+                // shortage; CQ overflow/backpressure. Drain before retrying.
+                Some(libc::EINTR | libc::EAGAIN | libc::EBUSY) => {
+                    std::thread::yield_now();
+                }
+                _ => {
+                    pending.record_error(error.into());
+                    // An enter error can race final completions. Returning is
+                    // safe only if every published identity is now retired.
+                    while let Some((id, result)) = driver.next_completion() {
+                        pending.record_completion(id, result);
+                    }
+                    if !pending.is_complete() {
+                        abort_pending_io();
+                    }
+                }
+            }
+        }
     }
 }
 
