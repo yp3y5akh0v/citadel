@@ -368,3 +368,75 @@ fn multiple_write_chunks_retire_before_buffers_are_reused() {
     assert!(ring.submission().is_empty());
     assert!(ring.completion().next().is_none());
 }
+
+#[test]
+fn explicit_truncate_waits_for_the_ring_owner() {
+    use std::sync::{mpsc, Arc};
+    use std::time::Duration;
+
+    let (_dir, file) = create_test_file();
+    let io = Arc::new(UringPageIO::try_new(file).unwrap());
+    io.truncate(PAGE_SIZE as u64).unwrap();
+    let guard = io.ring.lock();
+    let (started_tx, started_rx) = mpsc::sync_channel(0);
+    let (done_tx, done_rx) = mpsc::channel();
+    let worker_io = Arc::clone(&io);
+    let worker = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        done_tx.send(worker_io.truncate(0)).unwrap();
+    });
+    started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let early = done_rx.recv_timeout(Duration::from_millis(50));
+    // Always release before assertions/join, including on a pre-fix failure.
+    drop(guard);
+    let completed_early = early.is_ok();
+    match early {
+        Ok(result) => result.unwrap(),
+        Err(mpsc::RecvTimeoutError::Timeout) => done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap(),
+        Err(error) => panic!("truncate worker disconnected: {error}"),
+    }
+    worker.join().unwrap();
+    assert!(!completed_early, "truncate bypassed the active ring owner");
+    assert_eq!(io.file_size().unwrap(), 0);
+    io.write_page(0, &[0x63; PAGE_SIZE]).unwrap();
+    let mut got = [0; PAGE_SIZE];
+    io.read_page(0, &mut got).unwrap();
+    assert_eq!(got, [0x63; PAGE_SIZE]);
+}
+
+#[test]
+fn concurrent_unequal_batches_preserve_both_ranges_and_allow_reuse() {
+    use std::sync::{Arc, Barrier};
+    let (_dir, file) = create_test_file();
+    let io = Arc::new(UringPageIO::try_new(file).unwrap());
+    let far_offset = 3 * PAGE_SIZE as u64;
+    for _ in 0..32 {
+        io.truncate(0).unwrap();
+        let start = Arc::new(Barrier::new(2));
+        let near_io = Arc::clone(&io);
+        let near_start = Arc::clone(&start);
+        let near = std::thread::spawn(move || {
+            near_start.wait();
+            near_io.write_pages(&[(0, [0x37; PAGE_SIZE])])
+        });
+        let far_io = Arc::clone(&io);
+        let far = std::thread::spawn(move || {
+            start.wait();
+            far_io.write_pages_ref(&[(far_offset, &[0x69; PAGE_SIZE])])
+        });
+        // Join both before propagating either operation error.
+        let near_result = near.join();
+        let far_result = far.join();
+        near_result.unwrap().unwrap();
+        far_result.unwrap().unwrap();
+        assert!(io.file_size().unwrap() >= far_offset + PAGE_SIZE as u64);
+        let mut got = [0; PAGE_SIZE];
+        io.read_page(0, &mut got).unwrap();
+        assert_eq!(got, [0x37; PAGE_SIZE]);
+        io.read_page(far_offset, &mut got).unwrap();
+        assert_eq!(got, [0x69; PAGE_SIZE]);
+    }
+}

@@ -51,6 +51,15 @@ impl UringPageIO {
         }
     }
 
+    /// Caller holds the ring lock, including across any preceding size check.
+    /// Kept separate from PageIO::truncate to avoid recursive mutex acquisition.
+    fn truncate_file(&self, length: libc::off_t) -> Result<()> {
+        if unsafe { libc::ftruncate(self.fd, length) } < 0 {
+            return Err(Error::Io(io::Error::last_os_error()));
+        }
+        Ok(())
+    }
+
     fn submit_one(&self, sqe: io_uring::squeue::Entry) -> Result<i32> {
         let mut ring = self.ring.lock();
         require_idle_ring(&mut ring);
@@ -71,11 +80,13 @@ impl UringPageIO {
         pages: impl Iterator<Item = (u64, &'a [u8; PAGE_SIZE])> + Clone,
     ) -> Result<()> {
         let max_end = checked_page_batch_end(pages.clone().map(|(offset, _)| offset))?;
-        if max_end > self.file_size()? {
-            self.truncate(max_end)?;
-        }
         let mut ring = self.ring.lock();
         require_idle_ring(&mut ring);
+        // Sizing and writes form one serialized operation. A smaller batch
+        // must not truncate away a larger batch using a stale size observation.
+        if max_end > self.file_size()? {
+            self.truncate_file(checked_file_length(max_end)?)?;
+        }
         let capacity = ring.submission().capacity().min(MAX_PENDING);
         let batch_size = capacity.saturating_sub(1).max(1);
         let mut pages = pages.peekable();
@@ -167,10 +178,8 @@ impl PageIO for UringPageIO {
 
     fn truncate(&self, size: u64) -> Result<()> {
         let length = checked_file_length(size)?;
-        if unsafe { libc::ftruncate(self.fd, length) } < 0 {
-            return Err(Error::Io(io::Error::last_os_error()));
-        }
-        Ok(())
+        let _ring = self.ring.lock();
+        self.truncate_file(length)
     }
 
     fn write_pages(&self, pages: &[(u64, [u8; PAGE_SIZE])]) -> Result<()> {
