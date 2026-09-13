@@ -5345,6 +5345,12 @@ fn stream_scan_setup(
     };
     let lower = sel.from.to_ascii_lowercase();
     let table_schema = schema.get(&lower)?.clone();
+    // These prepared collect/stream paths run outside the connection's scoped
+    // clocks and timezone. Hidden schema expressions must be independent too;
+    // otherwise use the ordinary buffered executor with its complete context.
+    if !super::result_cache::is_table_materialization_cacheable(schema, &table_schema) {
+        return None;
+    }
     let proj = plain_scan_projection(sel, &table_schema)?;
     let columns = projection_column_names(&sel.columns, &table_schema.columns);
     Some((table_schema.name.clone(), table_schema, proj, columns))
