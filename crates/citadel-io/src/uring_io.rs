@@ -83,7 +83,7 @@ impl UringPageIO {
         let cqe = ring
             .completion()
             .next()
-            .ok_or_else(|| Error::Io(io::Error::new(io::ErrorKind::Other, "missing completion")))?;
+            .ok_or_else(|| Error::Io(io::Error::other("missing completion")))?;
 
         let result = cqe.result();
         if result < 0 {
@@ -103,35 +103,16 @@ impl Drop for UringPageIO {
 
 impl PageIO for UringPageIO {
     fn read_page(&self, offset: u64, buf: &mut [u8; PAGE_SIZE]) -> Result<()> {
-        let sqe = opcode::Read::new(types::Fd(self.fd), buf.as_mut_ptr(), PAGE_SIZE as u32)
-            .offset(offset)
-            .build();
-        let n = self.submit_one(sqe)? as usize;
-        if n < PAGE_SIZE {
-            return Err(Error::Io(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "short read",
-            )));
-        }
-        Ok(())
+        self.read_at(offset, buf)
     }
 
     fn write_page(&self, offset: u64, buf: &[u8; PAGE_SIZE]) -> Result<()> {
-        let sqe = opcode::Write::new(types::Fd(self.fd), buf.as_ptr(), PAGE_SIZE as u32)
-            .offset(offset)
-            .build();
-        let n = self.submit_one(sqe)? as usize;
-        if n < PAGE_SIZE {
-            return Err(Error::Io(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "short write",
-            )));
-        }
-        Ok(())
+        self.write_at(offset, buf)
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
-        let sqe = opcode::Read::new(types::Fd(self.fd), buf.as_mut_ptr(), buf.len() as u32)
+        let length = checked_io_length(offset, buf.len())?;
+        let sqe = opcode::Read::new(types::Fd(self.fd), buf.as_mut_ptr(), length)
             .offset(offset)
             .build();
         let n = self.submit_one(sqe)? as usize;
@@ -145,7 +126,8 @@ impl PageIO for UringPageIO {
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
-        let sqe = opcode::Write::new(types::Fd(self.fd), buf.as_ptr(), buf.len() as u32)
+        let length = checked_io_length(offset, buf.len())?;
+        let sqe = opcode::Write::new(types::Fd(self.fd), buf.as_ptr(), length)
             .offset(offset)
             .build();
         let n = self.submit_one(sqe)? as usize;
@@ -175,7 +157,8 @@ impl PageIO for UringPageIO {
     }
 
     fn truncate(&self, size: u64) -> Result<()> {
-        if unsafe { libc::ftruncate(self.fd, size as libc::off_t) } < 0 {
+        let length = checked_file_length(size)?;
+        if unsafe { libc::ftruncate(self.fd, length) } < 0 {
             return Err(Error::Io(io::Error::last_os_error()));
         }
         Ok(())
@@ -186,11 +169,7 @@ impl PageIO for UringPageIO {
             return Ok(());
         }
 
-        let max_end = pages
-            .iter()
-            .map(|(offset, _)| offset + PAGE_SIZE as u64)
-            .max()
-            .unwrap();
+        let max_end = checked_page_batch_end(pages.iter().map(|(offset, _)| *offset))?;
         if max_end > self.file_size()? {
             self.truncate(max_end)?;
         }
@@ -223,11 +202,7 @@ impl PageIO for UringPageIO {
             return Ok(());
         }
 
-        let max_end = pages
-            .iter()
-            .map(|(offset, _)| offset + PAGE_SIZE as u64)
-            .max()
-            .unwrap();
+        let max_end = checked_page_batch_end(pages.iter().map(|(offset, _)| *offset))?;
         if max_end > self.file_size()? {
             self.truncate(max_end)?;
         }
@@ -255,17 +230,62 @@ impl PageIO for UringPageIO {
         Ok(())
     }
 
+    fn write_commit_meta(
+        &self,
+        god_offset: u64,
+        god_byte: u8,
+        slot_offset: u64,
+        slot_buf: &[u8],
+    ) -> Result<()> {
+        // Admit the entire operation before its first write, retaining the
+        // required slot-before-god-byte publication order.
+        checked_io_length(slot_offset, slot_buf.len())?;
+        checked_io_length(god_offset, 1)?;
+        self.write_at(slot_offset, slot_buf)?;
+        self.write_at(god_offset, &[god_byte])
+    }
+
     fn flush_pages(&self, pages: &[(u64, [u8; PAGE_SIZE])]) -> Result<()> {
         self.write_pages(pages)?;
         self.fsync()
     }
 }
 
-fn sq_full_err() -> Error {
+fn invalid_range() -> Error {
     Error::Io(io::Error::new(
-        io::ErrorKind::Other,
-        "submission queue full",
+        io::ErrorKind::InvalidInput,
+        "I/O range exceeds the kernel offset or transfer-length limit",
     ))
+}
+
+/// io_uring offsets are signed kernel file positions. In particular, all-one
+/// bits request the shared file cursor; PageIO always requires an exact offset.
+fn checked_offset_end(offset: u64, length: usize) -> Result<u64> {
+    let length = u64::try_from(length).map_err(|_| invalid_range())?;
+    let end = offset.checked_add(length).ok_or_else(invalid_range)?;
+    if end > i64::MAX as u64 {
+        return Err(invalid_range());
+    }
+    Ok(end)
+}
+
+fn checked_io_length(offset: u64, length: usize) -> Result<u32> {
+    checked_offset_end(offset, length)?;
+    u32::try_from(length).map_err(|_| invalid_range())
+}
+
+fn checked_file_length(length: u64) -> Result<libc::off_t> {
+    libc::off_t::try_from(length).map_err(|_| invalid_range())
+}
+
+fn checked_page_batch_end(mut offsets: impl Iterator<Item = u64>) -> Result<u64> {
+    offsets.try_fold(0, |end, offset| {
+        checked_offset_end(offset, PAGE_SIZE).map(|page_end| end.max(page_end))
+    })
+}
+
+fn sq_full_err() -> Error {
+    Error::Io(io::Error::other("submission queue full"))
 }
 
 #[cfg(test)]
