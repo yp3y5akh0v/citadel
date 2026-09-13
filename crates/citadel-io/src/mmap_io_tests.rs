@@ -229,3 +229,69 @@ fn write_pages_ref_round_trips() {
     io.read_page(PAGE_SIZE as u64 * 3, &mut got).unwrap();
     assert_eq!(got, b);
 }
+
+#[test]
+fn truncate_to_zero_keeps_empty_io_and_later_growth_usable() {
+    let dir = tempfile::tempdir().unwrap();
+    let io = MmapPageIO::try_new(open_new_file(&dir, "zero.db")).unwrap();
+    io.write_at(0, &[0x77; 32]).unwrap();
+    io.truncate(0).unwrap();
+    assert_eq!(io.file_size().unwrap(), 0);
+    assert_eq!(io.inner.read().size, 0);
+    io.read_at(0, &mut []).unwrap();
+    let mut sentinel = [0xa5];
+    assert!(matches!(io.read_at(0, &mut sentinel), Err(Error::Io(error))
+        if error.kind() == io::ErrorKind::UnexpectedEof));
+    assert_eq!(sentinel, [0xa5]);
+    assert!(io.read_at(1, &mut []).is_err());
+    io.write_at(0, &[]).unwrap();
+    io.write_pages(&[]).unwrap();
+    io.write_pages_ref(&[]).unwrap();
+    io.fsync().unwrap();
+    io.truncate(0).unwrap();
+    assert_eq!(io.file_size().unwrap(), 0);
+
+    io.write_at(7, &[]).unwrap();
+    assert_eq!(io.file_size().unwrap(), 7);
+    let mut gap = [0xff; 7];
+    io.read_at(0, &mut gap).unwrap();
+    assert_eq!(gap, [0; 7]);
+    io.truncate(0).unwrap();
+    io.write_commit_meta(0, 1, 8, &[0x42; 4]).unwrap();
+    let mut metadata = [0xff; 12];
+    io.read_at(0, &mut metadata).unwrap();
+    assert_eq!(metadata, [1, 0, 0, 0, 0, 0, 0, 0, 0x42, 0x42, 0x42, 0x42]);
+
+    io.truncate(0).unwrap();
+    let page = [0x39; PAGE_SIZE];
+    io.write_pages_ref(&[(PAGE_SIZE as u64, &page)]).unwrap();
+    io.fsync().unwrap();
+    drop(io);
+    let reopened = MmapPageIO::try_new(open_new_file(&dir, "zero.db")).unwrap();
+    let mut got = [0xff; PAGE_SIZE];
+    reopened.read_page(0, &mut got).unwrap();
+    assert_eq!(got, [0; PAGE_SIZE]);
+    reopened.read_page(PAGE_SIZE as u64, &mut got).unwrap();
+    assert_eq!(got, page);
+}
+
+#[test]
+fn truncate_zero_from_degraded_mapping_truncates_the_real_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let io = MmapPageIO::try_new(open_new_file(&dir, "degraded-zero.db")).unwrap();
+    io.write_at(0, &[0x61; 32]).unwrap();
+    io.fsync().unwrap();
+    {
+        let mut inner = io.inner.write();
+        inner.mmap = MmapOptions::new().len(1).map_anon().unwrap();
+        inner.size = 0;
+    }
+    assert!(io.file_size().unwrap() > 0);
+    io.truncate(0).unwrap();
+    assert_eq!(io.file_size().unwrap(), 0);
+    io.fsync().unwrap();
+    io.write_at(0, b"recovered").unwrap();
+    let mut got = [0; 9];
+    io.read_at(0, &mut got).unwrap();
+    assert_eq!(&got, b"recovered");
+}
