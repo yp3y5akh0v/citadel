@@ -4216,7 +4216,10 @@ impl CompiledInsert {
                 || on_conflict.is_some()
                 || stmt.returning.is_some()
                 || insert_has_subquery(stmt)
-                || super::helpers::any_partial_index(ts);
+                || super::helpers::any_partial_index(ts)
+                // Generic fallback can evaluate trigger bodies, expression
+                // indices or decoded FK parents outside the direct bind plan.
+                || (!is_trivial_fast && schema.may_read_scoped_parameters());
             Some(InsertCache {
                 col_indices,
                 has_subquery: insert_has_subquery(stmt),
