@@ -2888,3 +2888,141 @@ fn unique_writer_page_still_cows_after_reused_savepoint() {
     );
     assert!(manager.integrity_check().unwrap().is_ok());
 }
+
+#[test]
+fn index_inserts_preserve_unchanged_owned_branches_savepoints_and_full_merkle() {
+    use crate::manager::tests::{test_keys, MemIO};
+    use crate::manager::TxnManager;
+    use citadel_core::types::SyncMode;
+    use citadel_core::MAX_INLINE_VALUE_SIZE;
+    use std::sync::Arc;
+
+    const ROWS: u32 = 384;
+    let key = |index: u32| {
+        let mut key = vec![b'k'; 512];
+        key[..4].copy_from_slice(&index.to_be_bytes());
+        key
+    };
+    let original = vec![b'o'; 256];
+    let changed = vec![b'c'; 256];
+    let grown = vec![b'g'; MAX_INLINE_VALUE_SIZE];
+    for sync_mode in [SyncMode::Off, SyncMode::Full] {
+        let (dek, mac_key, dek_id) = test_keys();
+        let io = MemIO::new(1024 * 1024);
+        let manager = TxnManager::create_with_sync(
+            Box::new(io.share()),
+            dek,
+            mac_key,
+            1,
+            0x1234,
+            dek_id,
+            32,
+            sync_mode,
+        )
+        .unwrap();
+        let mut seed = manager.begin_write().unwrap();
+        seed.create_table(b"index").unwrap();
+        for index in 0..ROWS {
+            assert!(seed
+                .table_insert_index(b"index", &key(index), &original)
+                .unwrap());
+        }
+        assert!(seed.named_trees[b"index".as_slice()].depth >= 3);
+        seed.commit().unwrap();
+        let original_root = manager.table_root(b"index").unwrap().unwrap();
+        let held_original_root = manager.fetch_page(original_root).unwrap();
+        let original_root_bytes = held_original_root.as_bytes().to_vec();
+        let mut old_reader = manager.begin_read();
+        let mut writer = manager.begin_write().unwrap();
+        assert!(!writer
+            .table_insert_index(b"index", &key(0), &changed)
+            .unwrap());
+        let root = writer.named_trees[b"index".as_slice()].root;
+        assert_ne!(root, original_root, "first write needs physical CoW");
+        let (path, first) =
+            super::WriteTxn::walk_loading(&mut writer.pages, &manager, root, &key(0)).unwrap();
+        assert!(path.len() >= 2);
+        let second =
+            super::WriteTxn::descend_to_leaf(&mut writer.pages, &manager, root, &key(1)).unwrap();
+        let tenth =
+            super::WriteTxn::descend_to_leaf(&mut writer.pages, &manager, root, &key(9)).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first, tenth, "fixture requires a densely packed leaf");
+        let held_branches: Vec<_> = path
+            .iter()
+            .map(|(id, _)| (*id, writer.pages.get_shared(id).unwrap().clone()))
+            .collect();
+        assert!(!writer
+            .table_insert_index(b"index", &key(1), &changed)
+            .unwrap());
+        assert_eq!(writer.named_trees[b"index".as_slice()].root, root);
+        for (id, held) in &held_branches {
+            assert!(
+                Arc::ptr_eq(held, writer.pages.get_shared(id).unwrap()),
+                "unchanged current branch was cloned during mutable acquisition"
+            );
+        }
+        let saved = writer.begin_savepoint();
+        assert!(!writer
+            .table_insert_index(b"index", &key(2), &changed)
+            .unwrap());
+        assert_ne!(writer.named_trees[b"index".as_slice()].root, root);
+        writer.restore_snapshot(saved);
+        assert_eq!(writer.named_trees[b"index".as_slice()].root, root);
+        assert_eq!(
+            writer.table_get(b"index", &key(2)).unwrap(),
+            Some(original.clone())
+        );
+        assert!(!writer
+            .table_insert_index(b"index", &key(0), &grown)
+            .unwrap());
+        let final_root = writer.named_trees[b"index".as_slice()].root;
+        let first =
+            super::WriteTxn::descend_to_leaf(&mut writer.pages, &manager, final_root, &key(0))
+                .unwrap();
+        let tenth =
+            super::WriteTxn::descend_to_leaf(&mut writer.pages, &manager, final_root, &key(9))
+                .unwrap();
+        assert_ne!(
+            first, tenth,
+            "growth must exercise split propagation after restore"
+        );
+        writer.commit().unwrap();
+        assert_eq!(
+            held_original_root.as_bytes().as_slice(),
+            original_root_bytes
+        );
+        for index in 0..ROWS {
+            assert_eq!(
+                old_reader.table_get(b"index", &key(index)).unwrap(),
+                Some(original.clone())
+            );
+        }
+        drop(old_reader);
+        let report = manager.integrity_check().unwrap();
+        assert!(report.is_ok(), "{report:?}");
+        if sync_mode == SyncMode::Full {
+            let published = manager.fetch_page(final_root).unwrap();
+            assert_ne!(published.merkle_hash(), [0; citadel_core::MERKLE_HASH_SIZE]);
+            assert_ne!(published.merkle_hash(), held_original_root.merkle_hash());
+        }
+        drop(held_branches);
+        drop(held_original_root);
+        drop(manager);
+        let reopened = TxnManager::open(Box::new(io), dek, mac_key, 1, 32).unwrap();
+        let mut reader = reopened.begin_read();
+        for index in 0..ROWS {
+            let expected = match index {
+                0 => &grown,
+                1 => &changed,
+                _ => &original,
+            };
+            assert_eq!(
+                reader.table_get(b"index", &key(index)).unwrap().as_deref(),
+                Some(expected.as_slice())
+            );
+        }
+        let report = reopened.integrity_check().unwrap();
+        assert!(report.is_ok(), "{report:?}");
+    }
+}
