@@ -1847,3 +1847,52 @@ fn split_spans_refresh_in_middle_of_script() {
     assert!(s[spans[1].0..spans[1].1].trim().starts_with("REFRESH"));
     assert!(s[spans[2].0..spans[2].1].contains("SELECT * FROM mv"));
 }
+
+#[test]
+fn has_subquery_follows_collation_and_window_expression_wrappers() {
+    for sql in [
+        "(SELECT 1) COLLATE BINARY",
+        "COALESCE(((SELECT 1) COLLATE BINARY), 0)",
+        "FIRST_VALUE((SELECT 1)) OVER ()",
+        "SUM(1) OVER (PARTITION BY (SELECT 1))",
+        "SUM(1) OVER (ORDER BY (SELECT 1))",
+        "1 = ANY (SELECT 1)",
+        "ARRAY[(SELECT 1)]",
+        "CAST((SELECT 1) AS INTEGER)",
+    ] {
+        let expression = parse_sql_expr(sql).unwrap();
+        assert!(has_subquery(&expression), "{sql}");
+    }
+    for sql in [
+        "'plain' COLLATE BINARY",
+        "COALESCE($1, 0)",
+        "FIRST_VALUE(v) OVER (ORDER BY id)",
+        "SUM(v) OVER (PARTITION BY id ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)",
+        "1 = ANY (ARRAY[1, 2])",
+        "ARRAY[1, 2]",
+        "CAST(1 AS INTEGER)",
+    ] {
+        let expression = parse_sql_expr(sql).unwrap();
+        assert!(!has_subquery(&expression), "{sql}");
+    }
+}
+
+#[test]
+fn has_subquery_follows_both_window_frame_bounds() {
+    let subquery = parse_sql_expr("(SELECT 1)").unwrap();
+    for use_start in [false, true] {
+        let mut expression =
+            parse_sql_expr("SUM(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING)")
+                .unwrap();
+        let Expr::WindowFunction { spec, .. } = &mut expression else {
+            unreachable!()
+        };
+        let frame = spec.frame.as_mut().unwrap();
+        if use_start {
+            frame.start = WindowFrameBound::Preceding(Box::new(subquery.clone()));
+        } else {
+            frame.end = WindowFrameBound::Following(Box::new(subquery.clone()));
+        }
+        assert!(has_subquery(&expression), "start bound: {use_start}");
+    }
+}
