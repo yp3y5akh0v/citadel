@@ -484,6 +484,8 @@ pub(crate) struct CacheEntry {
     pub(crate) schema_gen: u64,
     pub(crate) param_count: usize,
     pub(crate) compiled: Option<Arc<dyn executor::CompiledPlan>>,
+    // Lazily proved only for literal normalization, valid for schema_gen.
+    literal_bindings_safe: Option<bool>,
 }
 
 struct SavepointEntry {
@@ -994,16 +996,21 @@ impl<'a> ConnectionInner<'a> {
         if matches!(sql.as_bytes().first(), Some(b'I' | b'i')) {
             if let Some((normalized_key, extracted)) = try_normalize_insert(sql) {
                 let gen = self.schema.generation();
-                let stmt = if let Some(entry) = self.stmt_cache.get(&normalized_key) {
+                let stmt = if let Some(entry) = self.stmt_cache.get_mut(&normalized_key) {
                     if entry.schema_gen == gen {
-                        Arc::clone(&entry.stmt)
+                        let safe = *entry
+                            .literal_bindings_safe
+                            .get_or_insert_with(|| !self.schema.may_read_scoped_parameters());
+                        safe.then(|| Arc::clone(&entry.stmt))
                     } else {
                         self.parse_and_cache(normalized_key, gen)?
                     }
                 } else {
                     self.parse_and_cache(normalized_key, gen)?
                 };
-                return self.dispatch(db, &stmt, &extracted);
+                if let Some(stmt) = stmt {
+                    return self.dispatch(db, &stmt, &extracted);
+                }
             }
         }
         self.execute_params_impl(db, sql, &[])
@@ -1362,9 +1369,10 @@ impl<'a> ConnectionInner<'a> {
         &mut self,
         normalized_key: String,
         gen: u64,
-    ) -> Result<Arc<Statement>> {
+    ) -> Result<Option<Arc<Statement>>> {
         let stmt = Arc::new(parser::parse_sql(&normalized_key)?);
         let param_count = parser::count_params(&stmt);
+        let literal_bindings_safe = !self.schema.may_read_scoped_parameters();
         self.stmt_cache.put(
             normalized_key,
             CacheEntry {
@@ -1372,9 +1380,10 @@ impl<'a> ConnectionInner<'a> {
                 schema_gen: gen,
                 param_count,
                 compiled: None,
+                literal_bindings_safe: Some(literal_bindings_safe),
             },
         );
-        Ok(stmt)
+        Ok(literal_bindings_safe.then_some(stmt))
     }
 
     pub(crate) fn get_or_parse(&mut self, sql: &str) -> Result<(Arc<Statement>, usize)> {
@@ -1408,6 +1417,7 @@ impl<'a> ConnectionInner<'a> {
                     schema_gen: gen,
                     param_count,
                     compiled: None,
+                    literal_bindings_safe: None,
                 },
             );
         }
