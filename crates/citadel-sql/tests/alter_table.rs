@@ -1431,7 +1431,7 @@ fn update_added_default_fixed_width_range_mixes_short_and_full_rows() {
 
 #[test]
 fn update_added_default_cross_type_storage_rewrites_preserve_neighbors() {
-    for default_sql in ["'7'", "'12345678'", "(7 + 0)", "0"] {
+    for default_sql in ["TRUE", "7.0", "(7 + 0)", "0"] {
         let add_default =
             format!("ALTER TABLE t ADD COLUMN d INTEGER NOT NULL DEFAULT {default_sql}");
         for_added_default_update_modes(
@@ -1442,8 +1442,9 @@ fn update_added_default_cross_type_storage_rewrites_preserve_neighbors() {
                 "ALTER TABLE t ADD COLUMN sentinel INTEGER NOT NULL DEFAULT 42",
             ],
             |conn, prepared| {
-                // The default can have a different storage type from the declared
-                // column, including a TEXT payload with the same width as INTEGER.
+                // Defaults normalize through INSERT's existing coercion policy.
+                // Raw legacy TEXT-in-INTEGER neighbor coverage lives in
+                // write_tests::legacy_cross_type_stored_update_rewrites_preserve_neighbors.
                 execute_added_default_update(conn, prepared, "UPDATE t SET d = 9 WHERE id = 1", 1);
                 let first = vec![
                     Value::Integer(1),

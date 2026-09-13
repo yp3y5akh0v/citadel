@@ -134,7 +134,7 @@ impl Ord for Candidate {
 
 pub(super) struct TopKScanPlan {
     sort_target: SortTarget,
-    default_expr: Option<Expr>,
+    sort_column: usize,
     fast_pred: Option<FastPredicate>,
     num_pk_cols: usize,
     pk_is_int: bool,
@@ -304,7 +304,7 @@ impl TopKScanPlan {
 
         Ok(Some(Self {
             sort_target,
-            default_expr: schema.columns[col_idx].default_expr.clone(),
+            sort_column: col_idx,
             fast_pred,
             num_pk_cols: schema.primary_key_columns.len(),
             pk_is_int: schema.primary_key_columns.len() == 1
@@ -387,7 +387,7 @@ impl TopKScanPlan {
                     return false;
                 }
             }
-            let sort_key = match self.read_sort_key(key, value, cancel) {
+            let sort_key = match self.read_sort_key(schema, key, value, cancel) {
                 Ok(key) => key,
                 Err(error) => {
                     scan_err = Some(error);
@@ -433,6 +433,7 @@ impl TopKScanPlan {
 
     fn read_sort_key<'a>(
         &self,
+        schema: &TableSchema,
         key: &'a [u8],
         value: &'a [u8],
         cancel: Option<&CancelToken>,
@@ -448,11 +449,12 @@ impl TopKScanPlan {
             SortTarget::Column(index) => match decode_stored_column_raw(value, index)? {
                 Some(raw) => SortKey::Borrowed(raw),
                 None => SortKey::Owned(
-                    self.default_expr
-                        .as_ref()
-                        .map(|expr| eval_const_expr_with_cancel(expr, cancel))
-                        .transpose()?
-                        .unwrap_or(Value::Null),
+                    eval_column_default_with_cancel(
+                        &schema.columns[self.sort_column],
+                        schema.is_strict(),
+                        cancel,
+                    )?
+                    .unwrap_or(Value::Null),
                 ),
             },
         })

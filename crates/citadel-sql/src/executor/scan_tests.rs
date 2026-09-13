@@ -1144,7 +1144,7 @@ fn arithmetic_predicates_preserve_array_and_vector_decode_errors() {
 }
 
 #[test]
-fn arithmetic_predicates_admit_only_scalar_defaults() {
+fn arithmetic_predicates_coerce_integer_defaults_and_decline_invalid_defaults() {
     let arithmetic = arithmetic_predicate_expr(
         Expr::Column("v".into()),
         BinOp::Add,
@@ -1171,16 +1171,18 @@ fn arithmetic_predicates_admit_only_scalar_defaults() {
                 days: 1,
                 micros: 0,
             },
-            true,
+            false,
         ),
         (Value::Json("{}".into()), false),
         (crate::json::text_to_jsonb("{}").unwrap(), false),
         (Value::Text("1".into()), false),
-        (Value::Boolean(true), false),
+        (Value::Boolean(true), true),
         (Value::Blob(vec![1]), false),
         (Value::Array(vec![i(1)].into()), false),
         (Value::Vector(vec![1.0].into()), false),
     ] {
+        // Admission uses the value after INTEGER coercion. Invalid defaults
+        // decline both raw plans so stored rows need not evaluate them.
         let mut cols = columns(&[("id", DataType::Integer), ("v", DataType::Integer)]);
         cols[1].default_expr = Some(Expr::Literal(default.clone()));
         let table = schema("t", cols, vec![0]);
@@ -1189,8 +1191,9 @@ fn arithmetic_predicates_admit_only_scalar_defaults() {
             admitted,
             "{default:?}"
         );
-        assert!(
+        assert_eq!(
             try_simple_predicate(&direct, &table).is_some(),
+            admitted,
             "{default:?}"
         );
     }
@@ -1202,7 +1205,9 @@ fn nonscalar_arithmetic_defaults_keep_cancellable_generic_evaluation() {
         Value::Json("{\"key\":1}".into()),
         crate::json::text_to_jsonb("{\"key\":1}").unwrap(),
     ] {
-        let mut cols = columns(&[("id", DataType::Integer), ("v", DataType::Integer)]);
+        // Reach the JSON operator with a valid default; assigning JSON to an
+        // INTEGER column now fails coercion before operator evaluation.
+        let mut cols = columns(&[("id", DataType::Integer), ("v", default.data_type())]);
         cols[1].default_expr = Some(Expr::Literal(default));
         let table = schema("t", cols, vec![0]);
         let expr = arithmetic_predicate_expr(
@@ -1420,9 +1425,10 @@ fn select_scan_preserves_defaults_between_filter_and_projection() {
     let key = encode_composite_key(&[i(1)]);
     let value = encode_row(&[]);
     let token = citadel::CancelToken::new();
-    let decoder = SelectScanDecoder::new(&table, &stmt, Some(&token))
+    let decode_plan = SelectScanDecodePlan::new(&table, &stmt, Some(&token))
         .unwrap()
         .unwrap();
+    let decoder = decode_plan.bind(&table, stmt.where_clause.as_ref());
     let _cancel = crate::fts::cancel_tokenize_after(token.clone(), 3);
 
     let row = decoder
