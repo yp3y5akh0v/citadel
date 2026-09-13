@@ -4,14 +4,14 @@
   "title": "Citadel",
   "description": "Encrypted-first embedded database with vector search and agent memory, exposed as MCP tools",
   "websiteUrl": "https://citadeldb.dev",
-  "version": "2.4.0",
+  "version": "2.5.0",
   "repository": { "url": "https://github.com/yp3y5akh0v/citadel", "source": "github", "subfolder": "crates/citadel-mcp" },
   "packages": [
     {
       "registryType": "pypi",
       "registryBaseUrl": "https://pypi.org",
       "identifier": "citadeldb-mcp",
-      "version": "2.4.0",
+      "version": "2.5.0",
       "runtimeHint": "uvx",
       "transport": { "type": "stdio" },
       "environmentVariables": [
