@@ -1661,7 +1661,7 @@ impl RowLayout {
             return Ok(false);
         }
         let (version, _) = self.header.unwrap();
-        patch_cell_in_place(data, location.tag_offset, version, value)
+        Ok(patch_cell_payload(data, location, version, value))
     }
 }
 
@@ -1753,22 +1753,45 @@ fn patch_cell_in_place(
     if old_data_len > data.len() - val_start {
         return Err(SqlError::InvalidValue("truncated column data".into()));
     }
+    Ok(patch_cell_payload(
+        data,
+        CellLocation {
+            tag_offset: offset,
+            body_start: val_start,
+            end: val_start + old_data_len,
+        },
+        version,
+        new_val,
+    ))
+}
+
+/// Patch a cell whose bounds have already been checked for this row framing.
+/// Only equal-size, equal-framing writes preserve the supplied location.
+#[inline]
+fn patch_cell_payload(
+    data: &mut [u8],
+    location: CellLocation,
+    version: RowVersion,
+    new_val: &Value,
+) -> bool {
     let new_data_len = match value_encoded_size_v2(new_val) {
         Some(n) => n,
-        None => return Ok(false),
+        None => return false,
     };
     let new_type_tag = new_val.data_type().type_tag();
     // V2 variable-width cells have a length field that fixed-width cells omit.
     // Equal payload sizes alone cannot make a change between them in-place.
-    if new_data_len != old_data_len
+    // Read the current tag: an earlier in-place patch may have changed it.
+    if new_data_len != location.end - location.body_start
         || (version == RowVersion::V2
-            && fixed_width_size(type_tag).is_some() != fixed_width_size(new_type_tag).is_some())
+            && fixed_width_size(data[location.tag_offset]).is_some()
+                != fixed_width_size(new_type_tag).is_some())
     {
-        return Ok(false);
+        return false;
     }
-    data[offset] = new_type_tag;
-    write_value_payload_v2(new_val, &mut data[val_start..val_start + new_data_len]);
-    Ok(true)
+    data[location.tag_offset] = new_type_tag;
+    write_value_payload_v2(new_val, &mut data[location.body_start..location.end]);
+    true
 }
 
 pub fn decode_pk_integer(key: &[u8]) -> Result<i64> {
