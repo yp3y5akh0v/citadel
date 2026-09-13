@@ -261,6 +261,7 @@ pub(super) fn exec_insert(
     let mut key_buf: Vec<u8> = Vec::with_capacity(64);
     let mut value_buf: Vec<u8> = Vec::with_capacity(256);
     let mut fk_key_buf: Vec<u8> = Vec::with_capacity(64);
+    let mut upsert_value_buf = Vec::new();
 
     let values = match &stmt.source {
         InsertSource::Values(rows) => Some(rows.as_slice()),
@@ -514,6 +515,7 @@ pub(super) fn exec_insert(
                     table_schema,
                     &key_buf,
                     &value_buf,
+                    &mut upsert_value_buf,
                     &row,
                     &pk_values,
                     oc_ref,
@@ -2321,6 +2323,7 @@ fn exec_insert_in_txn_impl(
                     table_schema,
                     &bufs.key_buf,
                     &bufs.value_buf,
+                    &mut bufs.upsert_value_buf,
                     &bufs.row,
                     &bufs.pk_values,
                     oc_ref,
@@ -3057,6 +3060,7 @@ pub(super) fn apply_insert_with_conflict(
     table_schema: &TableSchema,
     key_buf: &[u8],
     value_buf: &[u8],
+    upsert_value_buf: &mut Vec<u8>,
     row: &[Value],
     pk_values: &[Value],
     on_conflict: &CompiledOnConflict,
@@ -3094,6 +3098,7 @@ pub(super) fn apply_insert_with_conflict(
                 table_bytes,
                 key_buf,
                 value_buf,
+                upsert_value_buf,
                 row,
                 assignments,
                 where_clause.as_ref(),
@@ -3319,6 +3324,7 @@ fn apply_do_update_fused(
     table_bytes: &[u8],
     key_buf: &[u8],
     value_buf: &[u8],
+    upsert_value_buf: &mut Vec<u8>,
     proposed_row: &[Value],
     assignments: &[(usize, Expr)],
     where_clause: Option<&Expr>,
@@ -3334,8 +3340,12 @@ fn apply_do_update_fused(
     let has_checks = table_schema.has_checks();
     let captured = RefCell::new(None);
 
-    let outcome =
-        wtx.table_upsert_with_owned::<_, SqlError>(table_bytes, key_buf, value_buf, |old_bytes| {
+    let outcome = wtx.table_upsert_with_owned_buffer::<_, SqlError>(
+        table_bytes,
+        key_buf,
+        value_buf,
+        upsert_value_buf,
+        |old_bytes| {
             if let Some(fps) = fast_paths {
                 return apply_fast_path_patch(
                     table_schema,
@@ -3435,7 +3445,8 @@ fn apply_do_update_fused(
                 }
                 Ok(UpsertAction::Replace(new_value_buf.clone()))
             })
-        })?;
+        },
+    )?;
 
     match outcome {
         UpsertOutcome::Inserted => Ok(InsertRowOutcome::Inserted),

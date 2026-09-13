@@ -781,3 +781,248 @@ fn prepared_mixed_upsert_reuses_inline_patch_buffer_and_preserves_fallbacks() {
     );
     assert!(db.manager().integrity_check().unwrap().is_ok());
 }
+
+#[test]
+fn prepared_text_key_upsert_retains_fused_scratch_across_null_and_savepoint() {
+    use citadel::{Argon2Profile, DatabaseBuilder};
+    let db = DatabaseBuilder::new("")
+        .passphrase(b"text-upsert-buffer")
+        .argon2_profile(Argon2Profile::Iot)
+        .create_in_memory()
+        .unwrap();
+    let conn = crate::Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE ct(k TEXT NOT NULL PRIMARY KEY, c INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO ct VALUES ('hot',5),('nullable',NULL)")
+        .unwrap();
+    let stmt = conn
+        .prepare("INSERT INTO ct VALUES($1,1) ON CONFLICT(k) DO UPDATE SET c=c+1 RETURNING old.k,new.k,old.c,new.c")
+        .unwrap();
+    let hot = Value::Text("hot".into());
+    let nullable = Value::Text("nullable".into());
+    let fresh = Value::Text("fresh".into());
+    INSERT_SCRATCH.with(|slot| {
+        slot.borrow_mut().upsert_value_buf = Vec::with_capacity(64);
+    });
+    let allocation = INSERT_SCRATCH.with(|slot| slot.borrow().upsert_value_buf.as_ptr());
+    let assert_buffer = |expected: &Value| {
+        INSERT_SCRATCH.with(|slot| {
+            let bufs = slot.borrow();
+            assert_eq!(bufs.upsert_value_buf.as_ptr(), allocation);
+            // Contents prove that the general TEXT-key route actually used the
+            // retained buffer; pointer equality alone would also pass if unused.
+            assert_eq!(
+                crate::encoding::decode_columns(&bufs.upsert_value_buf, &[0])
+                    .unwrap()
+                    .as_slice(),
+                std::slice::from_ref(expected)
+            );
+        });
+    };
+    conn.execute("BEGIN").unwrap();
+    conn.execute("SAVEPOINT reusable").unwrap();
+    for _ in 0..2 {
+        for step in 0..3 {
+            assert_eq!(
+                stmt.query_collect(std::slice::from_ref(&hot)).unwrap().rows,
+                [vec![hot.clone(), hot.clone(), i(5 + step), i(6 + step)]]
+            );
+            assert_buffer(&i(6 + step));
+        }
+        assert_eq!(
+            stmt.query_collect(std::slice::from_ref(&nullable))
+                .unwrap()
+                .rows,
+            [vec![
+                nullable.clone(),
+                nullable.clone(),
+                Value::Null,
+                Value::Null
+            ]]
+        );
+        assert_buffer(&Value::Null);
+        assert_eq!(
+            stmt.query_collect(std::slice::from_ref(&fresh))
+                .unwrap()
+                .rows,
+            [vec![Value::Null, fresh.clone(), Value::Null, i(1)]]
+        );
+        assert_buffer(&Value::Null);
+        conn.execute("ROLLBACK TO reusable").unwrap();
+        assert_eq!(
+            conn.query("SELECT k,c FROM ct ORDER BY k").unwrap().rows,
+            [vec![hot.clone(), i(5)], vec![nullable.clone(), Value::Null]]
+        );
+    }
+    conn.execute("RELEASE reusable").unwrap();
+    conn.execute("COMMIT").unwrap();
+    assert!(db.manager().integrity_check().unwrap().is_ok());
+}
+
+#[test]
+fn text_key_upsert_scratch_handles_schema_expansion_and_interpreted_replacement() {
+    use citadel::{Argon2Profile, DatabaseBuilder};
+    let db = DatabaseBuilder::new("")
+        .passphrase(b"text-upsert-expansion")
+        .argon2_profile(Argon2Profile::Iot)
+        .create_in_memory()
+        .unwrap();
+    let conn = crate::Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE ct(k TEXT NOT NULL PRIMARY KEY, c INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO ct VALUES ('hot',5)").unwrap();
+    let arithmetic = conn
+        .prepare("INSERT INTO ct(k,c) VALUES($1,1) ON CONFLICT(k) DO UPDATE SET c=c+1 RETURNING old.c,new.c")
+        .unwrap();
+    conn.execute("ALTER TABLE ct ADD COLUMN d INTEGER DEFAULT 7")
+        .unwrap();
+    let hot = Value::Text("hot".into());
+    conn.execute("BEGIN").unwrap();
+    assert_eq!(
+        arithmetic
+            .query_collect(std::slice::from_ref(&hot))
+            .unwrap()
+            .rows,
+        [vec![i(5), i(6)]]
+    );
+    let expanded_allocation = INSERT_SCRATCH.with(|slot| {
+        let bufs = slot.borrow();
+        assert_eq!(
+            crate::encoding::decode_columns(&bufs.upsert_value_buf, &[0, 1]).unwrap(),
+            [i(6), i(7)]
+        );
+        bufs.upsert_value_buf.as_ptr()
+    });
+    assert_eq!(
+        arithmetic
+            .query_collect(std::slice::from_ref(&hot))
+            .unwrap()
+            .rows,
+        [vec![i(6), i(7)]]
+    );
+    INSERT_SCRATCH.with(|slot| {
+        assert_eq!(slot.borrow().upsert_value_buf.as_ptr(), expanded_allocation);
+    });
+    let replacement = conn
+        .prepare("INSERT INTO ct(k,c) VALUES($1,$2) ON CONFLICT(k) DO UPDATE SET c=excluded.c RETURNING old.c,new.c,d")
+        .unwrap();
+    assert_eq!(
+        replacement
+            .query_collect(&[hot.clone(), Value::Null])
+            .unwrap()
+            .rows,
+        [vec![i(7), Value::Null, i(7)]]
+    );
+    assert_eq!(
+        replacement
+            .query_collect(&[hot.clone(), i(9)])
+            .unwrap()
+            .rows,
+        [vec![Value::Null, i(9), i(7)]]
+    );
+    assert!(conn
+        .prepare("INSERT INTO ct(k,c) VALUES($1,0) ON CONFLICT(k) DO UPDATE SET c=excluded.c WHERE FALSE RETURNING c")
+        .unwrap()
+        .query_collect(std::slice::from_ref(&hot))
+        .unwrap()
+        .rows
+        .is_empty());
+    assert_eq!(
+        arithmetic
+            .query_collect(std::slice::from_ref(&hot))
+            .unwrap()
+            .rows,
+        [vec![i(9), i(10)]]
+    );
+    conn.execute("COMMIT").unwrap();
+    assert_eq!(
+        conn.query("SELECT c,d FROM ct").unwrap().rows,
+        [vec![i(10), i(7)]]
+    );
+    assert!(db.manager().integrity_check().unwrap().is_ok());
+}
+
+#[test]
+fn text_key_upsert_scratch_isolates_nested_triggers_and_returning() {
+    use citadel::{Argon2Profile, DatabaseBuilder};
+    for explicit in [false, true] {
+        let db = DatabaseBuilder::new("")
+            .passphrase(b"text-upsert-trigger")
+            .argon2_profile(Argon2Profile::Iot)
+            .create_in_memory()
+            .unwrap();
+        let conn = crate::Connection::open(&db).unwrap();
+        conn.execute("CREATE TABLE ct(k TEXT NOT NULL PRIMARY KEY, c INTEGER)")
+            .unwrap();
+        conn.execute("CREATE TABLE nested(k TEXT NOT NULL PRIMARY KEY, c INTEGER)")
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE audit(id INTEGER NOT NULL PRIMARY KEY, was INTEGER, now_ INTEGER)",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO ct VALUES ('hot',10)").unwrap();
+        conn.execute("INSERT INTO nested VALUES ('nested',0)")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER capture_ct AFTER UPDATE ON ct FOR EACH ROW BEGIN \
+             INSERT INTO nested VALUES ('nested',1) ON CONFLICT(k) DO UPDATE SET c=c+1; \
+             INSERT INTO audit VALUES (NEW.c,OLD.c,NEW.c); END",
+        )
+        .unwrap();
+        let stmt = conn
+            .prepare("INSERT INTO ct VALUES($1,1),($1,1) ON CONFLICT(k) DO UPDATE SET c=c+1 RETURNING old.c,new.c")
+            .unwrap();
+        let hot = Value::Text("hot".into());
+        if explicit {
+            conn.execute("BEGIN").unwrap();
+        }
+        assert_eq!(
+            stmt.query_collect(std::slice::from_ref(&hot)).unwrap().rows,
+            [vec![i(10), i(11)], vec![i(11), i(12)]]
+        );
+        if explicit {
+            conn.execute("COMMIT").unwrap();
+        }
+        assert_eq!(conn.query("SELECT c FROM ct").unwrap().rows, [vec![i(12)]]);
+        assert_eq!(
+            conn.query("SELECT c FROM nested").unwrap().rows,
+            [vec![i(2)]]
+        );
+        let audit = vec![vec![i(11), i(10), i(11)], vec![i(12), i(11), i(12)]];
+        assert_eq!(
+            conn.query("SELECT * FROM audit ORDER BY id").unwrap().rows,
+            audit
+        );
+
+        // The nested conflict patches its own row before this trigger fails.
+        // Neither it nor the outer UPDATE may become a committed prefix.
+        conn.execute(
+            "CREATE TRIGGER reject_nested AFTER UPDATE ON nested FOR EACH ROW \
+             BEGIN INSERT INTO audit VALUES (11,0,0); END",
+        )
+        .unwrap();
+        if explicit {
+            conn.execute("BEGIN").unwrap();
+        }
+        assert!(matches!(
+            stmt.query_collect(std::slice::from_ref(&hot)),
+            Err(SqlError::DuplicateKey)
+        ));
+        if explicit {
+            assert!(matches!(
+                conn.execute("COMMIT"),
+                Err(SqlError::Storage(citadel_core::Error::TransactionFailed))
+            ));
+        }
+        assert_eq!(conn.query("SELECT c FROM ct").unwrap().rows, [vec![i(12)]]);
+        assert_eq!(
+            conn.query("SELECT c FROM nested").unwrap().rows,
+            [vec![i(2)]]
+        );
+        assert_eq!(
+            conn.query("SELECT * FROM audit ORDER BY id").unwrap().rows,
+            audit
+        );
+        assert!(db.manager().integrity_check().unwrap().is_ok());
+    }
+}
