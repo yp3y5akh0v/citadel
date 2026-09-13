@@ -21,7 +21,7 @@ pub fn read_and_decrypt(
     mac_key: &[u8; MAC_KEY_SIZE],
     encryption_epoch: u32,
 ) -> Result<Page> {
-    read_with_decrypt(io, page_id, offset, |encrypted, body| {
+    read_with_decrypt::<false>(io, page_id, offset, |encrypted, body| {
         page_cipher::decrypt_page(dek, mac_key, page_id, encryption_epoch, encrypted, body)
     })
 }
@@ -35,13 +35,13 @@ pub fn read_and_decrypt_with_hmac(
     dek: &[u8; DEK_SIZE],
     hmac_state: &page_cipher::HmacState,
 ) -> Result<Page> {
-    read_with_decrypt(io, page_id, offset, |encrypted, body| {
+    read_with_decrypt::<false>(io, page_id, offset, |encrypted, body| {
         page_cipher::decrypt_page_with_hmac(dek, hmac_state, page_id, encrypted, body)
     })
 }
 
 #[inline]
-fn read_with_decrypt(
+fn read_with_decrypt<const VALIDATE: bool>(
     io: &dyn PageIO,
     page_id: PageId,
     offset: u64,
@@ -59,6 +59,13 @@ fn read_with_decrypt(
         return Err(Error::ChecksumMismatch(page_id));
     }
 
+    // Validate the decrypted body before returning the large owned page. Both
+    // load modes share authentication/checksum ordering without materializing
+    // another intermediate Result<Page> around the raw loader.
+    if VALIDATE {
+        page.validate_for_read(page_id)?;
+    }
+
     Ok(page)
 }
 
@@ -72,9 +79,9 @@ pub fn read_and_validate(
     mac_key: &[u8; MAC_KEY_SIZE],
     encryption_epoch: u32,
 ) -> Result<Page> {
-    let page = read_and_decrypt(io, page_id, offset, dek, mac_key, encryption_epoch)?;
-    page.validate_for_read(page_id)?;
-    Ok(page)
+    read_with_decrypt::<true>(io, page_id, offset, |encrypted, body| {
+        page_cipher::decrypt_page(dek, mac_key, page_id, encryption_epoch, encrypted, body)
+    })
 }
 
 /// Load a normal source page using an exact key/epoch HMAC state, then validate
@@ -86,9 +93,9 @@ pub fn read_and_validate_with_hmac(
     dek: &[u8; DEK_SIZE],
     hmac_state: &page_cipher::HmacState,
 ) -> Result<Page> {
-    let page = read_and_decrypt_with_hmac(io, page_id, offset, dek, hmac_state)?;
-    page.validate_for_read(page_id)?;
-    Ok(page)
+    read_with_decrypt::<true>(io, page_id, offset, |encrypted, body| {
+        page_cipher::decrypt_page_with_hmac(dek, hmac_state, page_id, encrypted, body)
+    })
 }
 
 /// Buffer pool: caches decrypted pages in memory with SIEVE eviction.
