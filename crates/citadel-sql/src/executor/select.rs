@@ -5344,6 +5344,11 @@ fn stream_scan_setup(
         QueryBody::Select(s) => s,
         _ => return None,
     };
+    // Reject unsupported clauses before cloning schema or checking hidden
+    // materialization expressions. Both prepared collect and stream probe here.
+    if !plain_scan_syntax(sel) {
+        return None;
+    }
     let lower = sel.from.to_ascii_lowercase();
     let table_schema = schema.get(&lower)?.clone();
     // These prepared collect/stream paths run outside the connection's scoped
@@ -5352,24 +5357,27 @@ fn stream_scan_setup(
     if !super::result_cache::is_table_materialization_cacheable(schema, &table_schema) {
         return None;
     }
-    let proj = plain_scan_projection(sel, &table_schema)?;
+    let proj = build_stream_proj(&sel.columns, &table_schema)?;
     let columns = projection_column_names(&sel.columns, &table_schema.columns);
     Some((table_schema.name.clone(), table_schema, proj, columns))
 }
 
+fn plain_scan_syntax(sel: &SelectStmt) -> bool {
+    sel.where_clause.is_none()
+        && sel.order_by.is_empty()
+        && sel.limit.is_none()
+        && sel.offset.is_none()
+        && sel.joins.is_empty()
+        && sel.group_by.is_empty()
+        && sel.having.is_none()
+        && !sel.distinct
+        && sel.from_subquery.is_none()
+        && sel.from_args.is_none()
+        && sel.from_json_table.is_none()
+}
+
 fn plain_scan_projection(sel: &SelectStmt, schema: &TableSchema) -> Option<StreamProj> {
-    if sel.where_clause.is_some()
-        || !sel.order_by.is_empty()
-        || sel.limit.is_some()
-        || sel.offset.is_some()
-        || !sel.joins.is_empty()
-        || !sel.group_by.is_empty()
-        || sel.having.is_some()
-        || sel.distinct
-        || sel.from_subquery.is_some()
-        || sel.from_args.is_some()
-        || sel.from_json_table.is_some()
-    {
+    if !plain_scan_syntax(sel) {
         return None;
     }
     build_stream_proj(&sel.columns, schema)
