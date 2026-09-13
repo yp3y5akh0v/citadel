@@ -1,6 +1,62 @@
 use super::*;
 
 #[test]
+fn rebuilding_schema_caches_preserves_flags_and_dropped_slots() {
+    let mut schema = TableSchema::new(
+        "t".into(),
+        vec![
+            col("id", DataType::Integer, false, 0),
+            col("a", DataType::Text, true, 1),
+        ],
+        vec![0],
+        vec![],
+        vec![],
+        vec![],
+    )
+    .without_column(1);
+    schema.flags = TABLE_FLAG_STRICT | 0x80;
+    schema.columns.push(col("b", DataType::Real, true, 1));
+    let rebuilt = schema.rebuild();
+    assert_eq!(rebuilt.flags, TABLE_FLAG_STRICT | 0x80);
+    assert!(rebuilt.is_strict());
+    assert_eq!(rebuilt.dropped_non_pk_slots(), &[0]);
+    assert_eq!(rebuilt.decode_col_mapping(), &[usize::MAX, 1]);
+    assert_eq!(rebuilt.encoding_positions(), &[1]);
+    let restored = TableSchema::deserialize(&rebuilt.serialize()).unwrap();
+    assert_eq!(restored.flags, rebuilt.flags);
+    assert_eq!(restored.decode_col_mapping(), rebuilt.decode_col_mapping());
+}
+
+#[test]
+fn removing_schema_columns_preserves_flags_and_physical_mapping() {
+    let mut schema = TableSchema::new(
+        "t".into(),
+        vec![
+            col("id", DataType::Integer, false, 0),
+            col("a", DataType::Text, true, 1),
+            col("b", DataType::Real, true, 2),
+        ],
+        vec![0],
+        vec![],
+        vec![],
+        vec![],
+    );
+    schema.flags = TABLE_FLAG_STRICT | 0x80;
+    let reduced = schema.without_column(1);
+    assert_eq!(reduced.flags, schema.flags);
+    assert!(reduced.is_strict());
+    assert_eq!(reduced.dropped_non_pk_slots(), &[0]);
+    assert_eq!(reduced.decode_col_mapping(), &[usize::MAX, 1]);
+    assert_eq!(reduced.encoding_positions(), &[1]);
+    assert_eq!(
+        TableSchema::deserialize(&reduced.serialize())
+            .unwrap()
+            .flags,
+        schema.flags
+    );
+}
+
+#[test]
 fn value_ordering() {
     assert!(Value::Null < Value::Boolean(false));
     assert!(Value::Boolean(false) < Value::Boolean(true));
