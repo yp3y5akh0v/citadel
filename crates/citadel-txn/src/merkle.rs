@@ -8,10 +8,13 @@
 //! The root page's hash serves as a database fingerprint - if two snapshots
 //! have the same root hash, they contain identical data.
 
+#[cfg(test)]
 use rustc_hash::FxHashMap;
 
+use citadel_buffer::cursor::MutablePageMap;
 use citadel_core::types::{PageId, PageType, TxnId, ValueType};
 use citadel_core::{Error, Result, MERKLE_HASH_SIZE};
+#[cfg(test)]
 use citadel_page::page::Page;
 use citadel_page::{branch_node, leaf_node};
 
@@ -94,7 +97,7 @@ where
 }
 
 pub fn compute_tree_merkle(
-    pages: &mut FxHashMap<PageId, Page>,
+    pages: &mut impl MutablePageMap,
     root: PageId,
     base_txn_id: TxnId,
     read_clean_hash: &dyn Fn(PageId) -> Result<[u8; MERKLE_HASH_SIZE]>,
@@ -103,12 +106,12 @@ pub fn compute_tree_merkle(
 }
 
 fn compute_page_merkle(
-    pages: &mut FxHashMap<PageId, Page>,
+    pages: &mut impl MutablePageMap,
     page_id: PageId,
     base_txn_id: TxnId,
     read_clean_hash: &dyn Fn(PageId) -> Result<[u8; MERKLE_HASH_SIZE]>,
 ) -> Result<[u8; MERKLE_HASH_SIZE]> {
-    let page = match pages.get(&page_id) {
+    let page = match pages.get_page(&page_id) {
         Some(page) => page,
         None => return read_clean_hash(page_id),
     };
@@ -125,7 +128,7 @@ fn compute_page_merkle(
                 let cell = leaf_node::read_cell(page, index);
                 (cell.key, cell.val_type, cell.value)
             }),
-            |reference| match pages.get(&reference.first_page) {
+            |reference| match pages.get_page(&reference.first_page) {
                 Some(head) => Ok(head.merkle_hash()),
                 None => read_clean_hash(reference.first_page),
             },
@@ -165,7 +168,7 @@ fn compute_page_merkle(
         _ => [0u8; MERKLE_HASH_SIZE],
     };
 
-    let page = pages.get_mut(&page_id).unwrap();
+    let page = pages.get_page_mut(&page_id).unwrap();
     page.set_merkle_hash(&hash);
 
     Ok(hash)

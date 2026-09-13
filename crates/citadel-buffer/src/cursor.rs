@@ -50,6 +50,17 @@ pub trait PageMap {
     fn get_page(&self, id: &PageId) -> Option<&Page>;
 }
 
+/// Page mutation operations shared by the tree and metadata writers.
+///
+/// Implementations isolate shared memory on mutable access. The caller remains
+/// responsible for transaction-version CoW before changing a physical page.
+pub trait MutablePageMap: PageMap {
+    fn get_page_mut(&mut self, id: &PageId) -> Option<&mut Page>;
+    fn insert_page(&mut self, id: PageId, page: Page);
+    /// Discard a page without requiring its body to be copied out of an owner.
+    fn remove_page(&mut self, id: &PageId);
+}
+
 /// Extends `PageMap` with on-demand page loading for lazy cursor traversal.
 pub trait PageLoader: PageMap {
     fn ensure_loaded(&mut self, id: PageId) -> Result<()>;
@@ -58,6 +69,23 @@ pub trait PageLoader: PageMap {
 impl<S: BuildHasher> PageMap for HashMap<PageId, Page, S> {
     fn get_page(&self, id: &PageId) -> Option<&Page> {
         self.get(id)
+    }
+}
+
+impl<S: BuildHasher> MutablePageMap for HashMap<PageId, Page, S> {
+    #[inline]
+    fn get_page_mut(&mut self, id: &PageId) -> Option<&mut Page> {
+        self.get_mut(id)
+    }
+
+    #[inline]
+    fn insert_page(&mut self, id: PageId, page: Page) {
+        self.insert(id, page);
+    }
+
+    #[inline]
+    fn remove_page(&mut self, id: &PageId) {
+        self.remove(id);
     }
 }
 
