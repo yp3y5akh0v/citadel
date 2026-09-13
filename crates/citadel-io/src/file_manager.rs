@@ -676,13 +676,23 @@ pub fn growth_chunk(current_size: u64) -> u64 {
 }
 
 pub fn ensure_file_size(io: &dyn PageIO, needed_offset: u64) -> Result<()> {
+    let needed_size = needed_offset.checked_add(PAGE_SIZE as u64).ok_or_else(|| {
+        Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "page range exceeds the file offset limit",
+        ))
+    })?;
     let current_size = io.file_size()?;
-    let needed_size = needed_offset + PAGE_SIZE as u64;
     if current_size >= needed_size {
         return Ok(());
     }
     let chunk = growth_chunk(current_size);
-    let new_size = std::cmp::max(needed_size, current_size + chunk);
+    // Extra capacity is optional. Near the offset limit, grow only to the
+    // admitted requirement instead of overflowing the headroom calculation.
+    let new_size = std::cmp::max(
+        needed_size,
+        current_size.checked_add(chunk).unwrap_or(needed_size),
+    );
     io.truncate(new_size)
 }
 
