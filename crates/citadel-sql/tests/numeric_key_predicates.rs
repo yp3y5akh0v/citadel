@@ -396,14 +396,13 @@ fn signed_zero_delete_returning_preserves_rows_columns_and_empty_result_shape() 
             assert_eq!(value.to_bits(), zero.to_bits());
             assert_eq!(row[1], Value::Integer(marker));
         }
-        match conn.execute_params(sql, &[Value::Real(-0.0)]).unwrap() {
-            ExecutionResult::Query(result) if !explicit => {
-                assert_eq!(result.columns, vec!["id", "marker"]);
-                assert!(result.rows.is_empty());
-            }
-            ExecutionResult::RowsAffected(0) if explicit => {}
-            other => panic!("unexpected zero-match RETURNING shape: {other:?}"),
-        }
+        let ExecutionResult::Query(result) =
+            conn.execute_params(sql, &[Value::Real(-0.0)]).unwrap()
+        else {
+            panic!("expected an empty RETURNING result with column metadata");
+        };
+        assert_eq!(result.columns, vec!["id", "marker"]);
+        assert!(result.rows.is_empty());
         assert_markers(&conn, "id = 1.0", &[], &[3]);
         if explicit {
             conn.execute("ROLLBACK").unwrap();
