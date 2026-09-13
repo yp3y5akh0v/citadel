@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use citadel::CancelToken;
@@ -647,17 +648,23 @@ fn object_len_bytes_with_work(bytes: &[u8], work: &mut JsonWork<'_>) -> Result<O
 }
 
 pub fn read_scalar_text(bytes: &[u8]) -> Result<Option<String>> {
+    read_scalar_text_cow(bytes).map(|text| text.map(Cow::into_owned))
+}
+
+/// Borrow already decoded JSONB string payloads; formatting still owns text.
+/// The public String adapter and SQL text extraction share this parser.
+fn read_scalar_text_cow(bytes: &[u8]) -> Result<Option<Cow<'_, str>>> {
     let (ty, payload_start, payload_len) = read_header(bytes)?;
     let payload = &bytes[payload_start..payload_start + payload_len];
     match ty {
         JsonbType::Null => Ok(None),
-        JsonbType::True => Ok(Some("true".into())),
-        JsonbType::False => Ok(Some("false".into())),
+        JsonbType::True => Ok(Some(Cow::Borrowed("true"))),
+        JsonbType::False => Ok(Some(Cow::Borrowed("false"))),
         JsonbType::Integer => {
             let arr: [u8; 8] = payload
                 .try_into()
                 .map_err(|_| SqlError::InvalidValue("JSONB integer payload size".into()))?;
-            Ok(Some(i64::from_le_bytes(arr).to_string()))
+            Ok(Some(Cow::Owned(i64::from_le_bytes(arr).to_string())))
         }
         JsonbType::Real => {
             let arr: [u8; 8] = payload
@@ -666,18 +673,18 @@ pub fn read_scalar_text(bytes: &[u8]) -> Result<Option<String>> {
             let f = f64::from_le_bytes(arr);
             let n = serde_json::Number::from_f64(f)
                 .ok_or_else(|| SqlError::InvalidValue("non-finite JSONB number".into()))?;
-            Ok(Some(n.to_string()))
+            Ok(Some(Cow::Owned(n.to_string())))
         }
         JsonbType::String => {
             let s = std::str::from_utf8(payload)
                 .map_err(|_| SqlError::InvalidValue("JSONB string not UTF-8".into()))?;
-            Ok(Some(s.to_string()))
+            Ok(Some(Cow::Borrowed(s)))
         }
         JsonbType::Array | JsonbType::Object => {
             let v = decode_to_serde(bytes)?;
-            Ok(Some(serde_json::to_string(&v).map_err(|e| {
-                SqlError::InvalidValue(format!("JSON render: {e}"))
-            })?))
+            Ok(Some(Cow::Owned(serde_json::to_string(&v).map_err(
+                |e| SqlError::InvalidValue(format!("JSON render: {e}")),
+            )?)))
         }
     }
 }
@@ -1371,8 +1378,9 @@ pub fn op_get_text(lhs: &Value, key: &Value) -> Result<Value> {
             _ => None,
         };
         return match slice {
-            Some(bytes) => match read_scalar_text(bytes)? {
-                Some(s) => Ok(Value::Text(s.into())),
+            Some(bytes) => match read_scalar_text_cow(bytes)? {
+                Some(Cow::Borrowed(text)) => Ok(Value::Text(text.into())),
+                Some(Cow::Owned(text)) => Ok(Value::Text(text.into())),
                 None => Ok(Value::Null),
             },
             None => Ok(Value::Null),
