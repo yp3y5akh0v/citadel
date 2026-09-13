@@ -856,6 +856,188 @@ fn patch_at_offset_rejects_truncated_payloads_without_mutation() {
     assert_truncated_patch_payload_is_rejected(true);
 }
 
+fn row_for_layout_patch_test(values: &[Value], version: RowVersion) -> Vec<u8> {
+    let encoded = encode_row(values);
+    if version == RowVersion::V2 {
+        return encoded;
+    }
+    let (_, count, bitmap, mut pos) = parse_row_header(&encoded).unwrap();
+    let mut legacy = (count as u16).to_le_bytes().to_vec();
+    legacy.extend_from_slice(bitmap);
+    for value in values {
+        if value.is_null() {
+            continue;
+        }
+        let (tag, body, next) = read_cell(&encoded, pos, RowVersion::V2).unwrap();
+        legacy.push(tag);
+        legacy.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        legacy.extend_from_slice(body);
+        pos = next;
+    }
+    legacy
+}
+
+#[test]
+fn row_layout_patches_match_public_paths_across_successive_type_changes() {
+    for version in [RowVersion::V1, RowVersion::V2] {
+        for (original, replacements) in [
+            (
+                Value::Integer(42),
+                vec![
+                    (Value::Real(-0.0), [true, true]),
+                    (Value::Timestamp(52), [true, true]),
+                    (Value::Time(56), [true, true]),
+                    (Value::Text("12345678".into()), [true, false]),
+                    (Value::Blob(vec![9; 8]), [true, false]),
+                    (Value::Integer(-1), [true, true]),
+                    (Value::Null, [false, false]),
+                    (Value::Date(2), [false, false]),
+                ],
+            ),
+            (
+                Value::Text("éééé".into()),
+                vec![
+                    (Value::Blob(vec![7; 8]), [true, true]),
+                    (Value::Json("\"123456\"".into()), [true, true]),
+                    (Value::Integer(9), [true, false]),
+                    (Value::Text("ññññ".into()), [true, true]),
+                    (Value::Text("longer replacement".into()), [false, false]),
+                    (Value::Null, [false, false]),
+                ],
+            ),
+            (
+                arr(vec![
+                    Value::Integer(1),
+                    Value::Null,
+                    Value::Text("é".into()),
+                ]),
+                vec![
+                    (
+                        arr(vec![
+                            Value::Integer(9),
+                            Value::Null,
+                            Value::Text("ñ".into()),
+                        ]),
+                        [true, true],
+                    ),
+                    (arr(vec![Value::Integer(3)]), [false, false]),
+                    (Value::Null, [false, false]),
+                ],
+            ),
+            (
+                Value::Vector(vec![1.0, 2.0].into()),
+                vec![
+                    (Value::Vector(vec![-0.0, 4.0].into()), [true, true]),
+                    (Value::Vector(vec![5.0].into()), [false, false]),
+                    (Value::Null, [false, false]),
+                ],
+            ),
+        ] {
+            let mut expected = vec![
+                Value::Null,
+                original,
+                Value::Boolean(true),
+                Value::Text("neighbor".into()),
+            ];
+            let mut located = row_for_layout_patch_test(&expected, version);
+            let mut by_column = located.clone();
+            let mut by_offset = located.clone();
+            let mut layout = RowLayout::default();
+            // Prime all locations before any mutation, including the suffix.
+            assert_eq!(layout.column(&located, 3).unwrap().to_value(), expected[3]);
+            for (replacement, admitted) in replacements {
+                let before = located.clone();
+                let (_, offset) = decode_column_with_offset(&by_offset, 1).unwrap();
+                let applied = layout.patch(&mut located, 1, &replacement).unwrap();
+                assert_eq!(applied, admitted[usize::from(version == RowVersion::V2)]);
+                assert_eq!(
+                    applied,
+                    patch_column_in_place(&mut by_column, 1, &replacement).unwrap()
+                );
+                assert_eq!(
+                    applied,
+                    patch_at_offset(&mut by_offset, offset, &replacement).unwrap()
+                );
+                assert_eq!(located, by_column);
+                assert_eq!(located, by_offset);
+                if applied {
+                    expected[1] = replacement;
+                } else {
+                    assert_eq!(located, before, "declined patches must not mutate bytes");
+                }
+                let decoded = decode_row(&located).unwrap();
+                assert_eq!(decoded.len(), expected.len());
+                assert!(decoded.iter().zip(&expected).all(|(a, b)| a.bit_eq(b)));
+                assert!(layout
+                    .column(&located, 1)
+                    .unwrap()
+                    .to_value()
+                    .bit_eq(&expected[1]));
+                assert_eq!(layout.column(&located, 3).unwrap().to_value(), expected[3]);
+            }
+            for target in [0, expected.len()] {
+                let before = located.clone();
+                assert!(!layout
+                    .patch(&mut located, target, &Value::Integer(9))
+                    .unwrap());
+                assert!(!patch_column_in_place(&mut located, target, &Value::Integer(9)).unwrap());
+                assert_eq!(
+                    located, before,
+                    "stored NULL and absent cells need a rebuild"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn row_layout_patch_preserves_truncation_and_null_admission_errors() {
+    for version in [RowVersion::V1, RowVersion::V2] {
+        for value in [Value::Integer(42), Value::Text("12345678".into())] {
+            let mut encoded = row_for_layout_patch_test(std::slice::from_ref(&value), version);
+            let (_, offset) = decode_column_with_offset(&encoded, 0).unwrap();
+            encoded.pop();
+            for path in 0..3 {
+                let mut bytes = encoded.clone();
+                let outcome = match path {
+                    0 => RowLayout::default().patch(&mut bytes, 0, &value),
+                    1 => patch_column_in_place(&mut bytes, 0, &value),
+                    _ => patch_at_offset(&mut bytes, offset, &value),
+                };
+                let Err(SqlError::InvalidValue(message)) = outcome else {
+                    panic!("truncated {version:?} row must fail: {outcome:?}");
+                };
+                // These existing checked parsers intentionally have distinct
+                // diagnostics; sharing the writer must not change either one.
+                assert_eq!(
+                    message,
+                    if path == 0 {
+                        "truncated column value"
+                    } else {
+                        "truncated column data"
+                    }
+                );
+                assert_eq!(bytes, encoded);
+            }
+        }
+    }
+    let mut empty = Vec::new();
+    assert!(!RowLayout::default()
+        .patch(&mut empty, 0, &Value::Null)
+        .unwrap());
+    assert!(!patch_at_offset(&mut empty, 0, &Value::Null).unwrap());
+    assert!(!patch_at_offset(&mut empty, usize::MAX, &Value::Integer(9)).unwrap());
+    assert!(matches!(
+        patch_column_in_place(&mut empty, 0, &Value::Null),
+        Err(SqlError::InvalidValue(message)) if message == "row data too short"
+    ));
+    assert!(matches!(
+        patch_at_offset(&mut empty, 0, &Value::Integer(9)),
+        Err(SqlError::InvalidValue(message)) if message == "truncated column data"
+    ));
+    assert!(empty.is_empty());
+}
+
 #[test]
 fn raw_column_array_decodes() {
     let v = arr(vec![Value::Integer(7), Value::Text("x".into())]);
