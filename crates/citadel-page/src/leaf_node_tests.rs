@@ -250,3 +250,154 @@ fn delete_at_preserves_remaining_cells_and_fragment_accounting() {
         assert_eq!(cells.iter().filter(|cell| cell.key == b"bb").count(), 1);
     }
 }
+
+#[test]
+fn checked_vacancy_hint_preserves_order_and_existing_key_semantics() {
+    let mut empty = Page::new(PageId(7), PageType::Leaf, TxnId(1));
+    assert!(insert_direct_with_hint(
+        &mut empty,
+        0,
+        b"d",
+        ValueType::Inline,
+        b"first"
+    ));
+    assert_eq!(read_cell(&empty, 0).key, b"d");
+
+    let mut original = Page::new(PageId(7), PageType::Leaf, TxnId(1));
+    assert!(insert_direct(
+        &mut original,
+        b"b",
+        ValueType::Inline,
+        b"old"
+    ));
+    assert!(insert_direct(
+        &mut original,
+        b"d",
+        ValueType::Tombstone,
+        b""
+    ));
+    assert!(insert_direct(
+        &mut original,
+        b"f",
+        ValueType::Inline,
+        b"old"
+    ));
+    for key in [b"a", b"b", b"c", b"d", b"e", b"f", b"g"] {
+        for hint in [0, 1, 2, 3, u16::MAX] {
+            let mut expected = original.clone();
+            let mut hinted = original.clone();
+            assert!(insert_direct(
+                &mut expected,
+                key,
+                ValueType::Inline,
+                b"new value"
+            ));
+            assert!(insert_direct_with_hint(
+                &mut hinted,
+                hint,
+                key,
+                ValueType::Inline,
+                b"new value"
+            ));
+            assert_eq!(
+                hinted.as_bytes(),
+                expected.as_bytes(),
+                "key={key:?}, hint={hint}"
+            );
+            let cells = read_cells_checked(&hinted).unwrap();
+            assert_eq!(
+                cells.len(),
+                if matches!(key, b"b" | b"d" | b"f") {
+                    3
+                } else {
+                    4
+                }
+            );
+            let found = cells.iter().find(|cell| cell.key == key).unwrap();
+            assert_eq!(found.val_type, ValueType::Inline);
+            assert_eq!(found.value, b"new value");
+        }
+    }
+}
+
+#[test]
+fn checked_vacancy_hint_compacts_holes_and_preserves_full_page_failure() {
+    let mut packed = Page::new(PageId(7), PageType::Leaf, TxnId(1));
+    let payload = [0x52; 64];
+    let mut count = 0u16;
+    while insert_append_direct(
+        &mut packed,
+        &(count * 2).to_be_bytes(),
+        ValueType::Inline,
+        &payload,
+    ) {
+        count += 1;
+    }
+    assert!(count > 80 && count < 200);
+
+    // A truly full page must stay byte-identical when a new key cannot fit.
+    let before = packed.as_bytes().to_vec();
+    let absent = 3u16.to_be_bytes();
+    let vacancy = search(&packed, &absent).unwrap_err();
+    assert!(!insert_direct_with_hint(
+        &mut packed,
+        vacancy,
+        &absent,
+        ValueType::Inline,
+        &[0; 512]
+    ));
+    assert_eq!(packed.as_bytes().as_slice(), before);
+
+    for index in (0..count).step_by(2) {
+        assert!(delete(&mut packed, &(index * 2).to_be_bytes()));
+    }
+    let larger = [0x61; 384];
+    let total = cell_size(absent.len(), larger.len());
+    assert!(packed.available_space() < total);
+    assert!(packed.free_space() as usize >= total + 2);
+    let vacancy = search(&packed, &absent).unwrap_err();
+    assert!(vacancy > 0 && vacancy < packed.num_cells());
+    let mut expected = packed.clone();
+    assert!(insert_direct(
+        &mut expected,
+        &absent,
+        ValueType::Inline,
+        &larger
+    ));
+    assert!(insert_direct_with_hint(
+        &mut packed,
+        vacancy,
+        &absent,
+        ValueType::Inline,
+        &larger
+    ));
+    assert_eq!(packed.as_bytes(), expected.as_bytes());
+    let cells = read_cells_checked(&packed).unwrap();
+    assert_eq!(cells.len(), count as usize / 2 + 1);
+    for index in (1..count).step_by(2) {
+        let index = search(&packed, &(index * 2).to_be_bytes()).unwrap();
+        assert_eq!(read_cell(&packed, index).value, payload);
+    }
+
+    // A duplicate falls back even with an in-range hint. Keep the existing
+    // low-level contract: replacement can remove its old cell before false.
+    let oversized = vec![0x73; citadel_core::USABLE_SIZE];
+    let mut expected = packed.clone();
+    let mut hinted = packed;
+    assert!(!insert_direct(
+        &mut expected,
+        &absent,
+        ValueType::Inline,
+        &oversized
+    ));
+    assert!(!insert_direct_with_hint(
+        &mut hinted,
+        vacancy,
+        &absent,
+        ValueType::Inline,
+        &oversized
+    ));
+    assert_eq!(hinted.as_bytes(), expected.as_bytes());
+    assert!(search(&hinted, &absent).is_err());
+    read_cells_checked(&hinted).unwrap();
+}

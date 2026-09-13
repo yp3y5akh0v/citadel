@@ -3026,3 +3026,128 @@ fn index_inserts_preserve_unchanged_owned_branches_savepoints_and_full_merkle() 
         assert!(report.is_ok(), "{report:?}");
     }
 }
+
+#[test]
+fn vacant_index_inserts_preserve_overflow_savepoint_snapshot_and_reopen() {
+    use crate::manager::tests::{test_keys, MemIO};
+    use crate::manager::TxnManager;
+    use citadel_core::types::SyncMode;
+    use citadel_core::MAX_INLINE_VALUE_SIZE;
+
+    let key = |id: u32| {
+        let mut bytes = vec![b'k'; 512];
+        bytes[..4].copy_from_slice(&id.to_be_bytes());
+        bytes
+    };
+    let original = vec![0x32; 256];
+    let grown = vec![0x61; MAX_INLINE_VALUE_SIZE];
+    let overflow = vec![0x73; MAX_INLINE_VALUE_SIZE + 8192];
+    for sync in [SyncMode::Off, SyncMode::Full] {
+        let (dek, mac_key, dek_id) = test_keys();
+        let io = MemIO::new(1024 * 1024);
+        let manager = TxnManager::create_with_sync(
+            Box::new(io.share()),
+            dek,
+            mac_key,
+            1,
+            0x1234,
+            dek_id,
+            32,
+            sync,
+        )
+        .unwrap();
+        let mut seed = manager.begin_write().unwrap();
+        seed.create_table(b"index").unwrap();
+        for id in 0..384 {
+            assert!(seed
+                .table_insert_index(b"index", &key(id * 2), &original)
+                .unwrap());
+        }
+        assert!(seed.named_trees[b"index".as_slice()].depth >= 3);
+        seed.commit().unwrap();
+        let old_root = manager.table_root(b"index").unwrap().unwrap();
+        let old_page = manager.fetch_page(old_root).unwrap();
+        let old_bytes = old_page.as_bytes().to_vec();
+        let mut old_reader = manager.begin_read();
+        let mut writer = manager.begin_write().unwrap();
+        let checkpoint = writer.begin_savepoint();
+        assert!(writer
+            .table_insert_index(b"index", &key(1), &overflow)
+            .unwrap());
+        assert_eq!(
+            writer.table_get(b"index", &key(1)).unwrap().as_deref(),
+            Some(overflow.as_slice())
+        );
+        writer.restore_snapshot(checkpoint);
+        assert_eq!(writer.table_get(b"index", &key(1)).unwrap(), None);
+        assert_eq!(writer.table_entry_count(b"index").unwrap(), 384);
+
+        let root = writer.named_trees[b"index".as_slice()].root;
+        let first =
+            super::WriteTxn::descend_to_leaf(&mut writer.pages, &manager, root, &key(0)).unwrap();
+        let tenth =
+            super::WriteTxn::descend_to_leaf(&mut writer.pages, &manager, root, &key(18)).unwrap();
+        assert_eq!(
+            first, tenth,
+            "fixture requires both old keys in one dense leaf"
+        );
+
+        // The old leaf is dense. Interior inline insertion must split it; a
+        // neighboring new overflow value also exercises staging before CoW.
+        assert!(writer
+            .table_insert_index(b"index", &key(1), &grown)
+            .unwrap());
+        assert!(writer
+            .table_insert_index(b"index", &key(3), &overflow)
+            .unwrap());
+        let root = writer.named_trees[b"index".as_slice()].root;
+        let first =
+            super::WriteTxn::descend_to_leaf(&mut writer.pages, &manager, root, &key(0)).unwrap();
+        let tenth =
+            super::WriteTxn::descend_to_leaf(&mut writer.pages, &manager, root, &key(18)).unwrap();
+        assert_ne!(first, tenth, "interior insertion must force a split");
+        assert_eq!(writer.table_entry_count(b"index").unwrap(), 386);
+        writer.commit().unwrap();
+        assert_eq!(old_page.as_bytes().as_slice(), old_bytes);
+        assert_eq!(old_reader.table_get(b"index", &key(1)).unwrap(), None);
+        assert_eq!(old_reader.table_get(b"index", &key(3)).unwrap(), None);
+        for id in 0..384 {
+            assert_eq!(
+                old_reader
+                    .table_get(b"index", &key(id * 2))
+                    .unwrap()
+                    .as_deref(),
+                Some(original.as_slice())
+            );
+        }
+        if sync == SyncMode::Full {
+            let current = manager.fetch_page(root).unwrap();
+            assert_ne!(current.merkle_hash(), [0; citadel_core::MERKLE_HASH_SIZE]);
+            assert_ne!(current.merkle_hash(), old_page.merkle_hash());
+        }
+        drop(old_reader);
+        let report = manager.integrity_check().unwrap();
+        assert!(report.is_ok(), "{report:?}");
+        drop(old_page);
+        drop(manager);
+        let reopened = TxnManager::open(Box::new(io), dek, mac_key, 1, 32).unwrap();
+        let mut read = reopened.begin_read();
+        assert_eq!(read.table_entry_count(b"index").unwrap(), 386);
+        assert_eq!(
+            read.table_get(b"index", &key(1)).unwrap().as_deref(),
+            Some(grown.as_slice())
+        );
+        assert_eq!(
+            read.table_get(b"index", &key(3)).unwrap().as_deref(),
+            Some(overflow.as_slice())
+        );
+        for id in 0..384 {
+            assert_eq!(
+                read.table_get(b"index", &key(id * 2)).unwrap().as_deref(),
+                Some(original.as_slice())
+            );
+        }
+        let report = reopened.integrity_check().unwrap();
+        assert!(report.is_ok(), "{report:?}");
+    }
+}

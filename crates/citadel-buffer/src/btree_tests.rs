@@ -2653,3 +2653,109 @@ mod unchanged_ancestor_tests {
         assert_eq!(tree.entry_count, original.entry_count + 1);
     }
 }
+
+#[test]
+fn missing_at_leaf_routes_preserve_permuted_keys_across_cow_and_splits() {
+    const ROWS: u32 = 96;
+    let key = |id: u32| {
+        let mut bytes = vec![b'k'; 128];
+        bytes[..4].copy_from_slice(&id.to_be_bytes());
+        bytes
+    };
+    let original_value = vec![0x31; 256];
+    let inserted_value = vec![0x52; 768];
+    for route in 0..3 {
+        let (mut pages, mut alloc, mut tree) = new_tree();
+        for id in 0..ROWS {
+            assert!(tree
+                .insert(
+                    &mut pages,
+                    &mut alloc,
+                    TxnId(1),
+                    &key(id * 2),
+                    ValueType::Inline,
+                    &original_value
+                )
+                .unwrap());
+        }
+        assert!(tree.depth >= 2);
+        let old = tree.clone();
+        let old_root = pages[&old.root].as_bytes().to_vec();
+        let old_pages = pages.len();
+        for step in 0..ROWS {
+            // Odd keys fill vacancies among old even keys in permuted order.
+            let id = ((step * 37) % ROWS) * 2 + 1;
+            let k = key(id);
+            let (path, leaf) = tree.walk_to_leaf(&pages, &k).unwrap();
+            assert!(leaf_node::search(&pages[&leaf], &k).is_err());
+            match route {
+                0 => assert_eq!(
+                    tree.insert_at_leaf(
+                        &mut pages,
+                        &mut alloc,
+                        TxnId(2),
+                        &k,
+                        ValueType::Inline,
+                        &inserted_value,
+                        path,
+                        leaf
+                    )
+                    .unwrap(),
+                    (true, None)
+                ),
+                1 => assert!(tree
+                    .insert_if_absent_at_leaf(
+                        &mut pages,
+                        &mut alloc,
+                        TxnId(2),
+                        &k,
+                        ValueType::Inline,
+                        &inserted_value,
+                        path,
+                        leaf
+                    )
+                    .unwrap()),
+                2 => assert!(tree
+                    .insert_or_fetch_at_leaf(
+                        &mut pages,
+                        &mut alloc,
+                        TxnId(2),
+                        &k,
+                        ValueType::Inline,
+                        &inserted_value,
+                        path,
+                        leaf
+                    )
+                    .unwrap()
+                    .is_none()),
+                _ => unreachable!(),
+            }
+        }
+        assert_ne!(tree.root, old.root);
+        assert!(
+            pages.len() > old_pages + old.depth as usize,
+            "insertion must split beyond its first CoW path"
+        );
+        assert_eq!(tree.entry_count, (ROWS * 2) as u64);
+        assert_eq!(pages[&old.root].as_bytes().as_slice(), old_root);
+        for id in 0..ROWS * 2 {
+            let expected = if id % 2 == 0 {
+                &original_value
+            } else {
+                &inserted_value
+            };
+            assert_eq!(
+                tree.search(&pages, &key(id)).unwrap(),
+                Some((ValueType::Inline, expected.clone()))
+            );
+            let old_value = (id % 2 == 0).then(|| (ValueType::Inline, original_value.clone()));
+            assert_eq!(old.search(&pages, &key(id)).unwrap(), old_value);
+        }
+        let mut cursor = crate::cursor::Cursor::first(&pages, tree.root).unwrap();
+        for id in 0..ROWS * 2 {
+            assert_eq!(cursor.current(&pages).unwrap().key, key(id));
+            cursor.next(&pages).unwrap();
+        }
+        assert!(!cursor.is_valid());
+    }
+}

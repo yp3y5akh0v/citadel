@@ -512,7 +512,7 @@ impl BTree {
         leaf_id: PageId,
         hint: Option<LeafEntryHint>,
     ) -> Result<(bool, Option<PageId>)> {
-        let (existing_idx, replaced_overflow, is_append) = {
+        let (position, replaced_overflow, is_append) = {
             let page = pages.get_page(&leaf_id).unwrap();
             let hinted = hint.and_then(|hint| {
                 if hint.leaf_id != leaf_id || hint.index >= page.num_cells() {
@@ -534,22 +534,21 @@ impl BTree {
                     } else {
                         None
                     };
-                    (Some(idx), head, false)
+                    (Ok(idx), head, false)
                 }
-                Err(idx) => (None, None, idx == page.num_cells()),
+                Err(idx) => (Err(idx), None, idx == page.num_cells()),
             }
         };
-        let key_exists = existing_idx.is_some();
+        let key_exists = position.is_ok();
 
         let new_leaf_id = cow_page(pages, alloc, leaf_id, txn_id);
 
         let leaf_ok = {
             let page = pages.get_page_mut(&new_leaf_id).unwrap();
-            // CoW preserves cell indices. Reuse the known match so equal-width
-            // replacements do not fragment the leaf by deleting/reinserting.
-            match existing_idx {
-                Some(idx) => leaf_node::replace_at(page, idx, key, val_type, value),
-                None => leaf_node::insert_direct(page, key, val_type, value),
+            // CoW preserves both matching cells and vacant logical positions.
+            match position {
+                Ok(idx) => leaf_node::replace_at(page, idx, key, val_type, value),
+                Err(idx) => leaf_node::insert_direct_with_hint(page, idx, key, val_type, value),
             }
         };
 
@@ -699,18 +698,18 @@ impl BTree {
         mut path: Vec<(PageId, usize)>,
         leaf_id: PageId,
     ) -> Result<Option<(ValueType, Vec<u8>)>> {
-        let (existing_value, is_append) = {
+        let (existing_value, vacancy, is_append) = {
             let page = pages.get_page(&leaf_id).unwrap();
             match leaf_node::search(page, key) {
                 Ok(idx) => {
                     let cell = leaf_node::read_cell(page, idx);
                     if matches!(cell.val_type, ValueType::Tombstone) {
-                        (None, false)
+                        (None, None, false)
                     } else {
-                        (Some((cell.val_type, cell.value.to_vec())), false)
+                        (Some((cell.val_type, cell.value.to_vec())), None, false)
                     }
                 }
-                Err(idx) => (None, idx == page.num_cells()),
+                Err(idx) => (None, Some(idx), idx == page.num_cells()),
             }
         };
         if let Some(v) = existing_value {
@@ -720,7 +719,10 @@ impl BTree {
         let new_leaf_id = cow_page(pages, alloc, leaf_id, txn_id);
         let leaf_ok = {
             let page = pages.get_page_mut(&new_leaf_id).unwrap();
-            leaf_node::insert_direct(page, key, val_type, value)
+            match vacancy {
+                Some(idx) => leaf_node::insert_direct_with_hint(page, idx, key, val_type, value),
+                None => leaf_node::insert_direct(page, key, val_type, value),
+            }
         };
 
         if leaf_ok {
@@ -860,14 +862,14 @@ impl BTree {
         mut path: Vec<(PageId, usize)>,
         leaf_id: PageId,
     ) -> Result<bool> {
-        let (exists, is_append) = {
+        let (exists, vacancy, is_append) = {
             let page = pages.get_page(&leaf_id).unwrap();
             match leaf_node::search(page, key) {
                 Ok(idx) => {
                     let cell = leaf_node::read_cell(page, idx);
-                    (!matches!(cell.val_type, ValueType::Tombstone), false)
+                    (!matches!(cell.val_type, ValueType::Tombstone), None, false)
                 }
-                Err(idx) => (false, idx == page.num_cells()),
+                Err(idx) => (false, Some(idx), idx == page.num_cells()),
             }
         };
         if exists {
@@ -877,7 +879,10 @@ impl BTree {
         let new_leaf_id = cow_page(pages, alloc, leaf_id, txn_id);
         let leaf_ok = {
             let page = pages.get_page_mut(&new_leaf_id).unwrap();
-            leaf_node::insert_direct(page, key, val_type, value)
+            match vacancy {
+                Some(idx) => leaf_node::insert_direct_with_hint(page, idx, key, val_type, value),
+                None => leaf_node::insert_direct(page, key, val_type, value),
+            }
         };
 
         if leaf_ok {
