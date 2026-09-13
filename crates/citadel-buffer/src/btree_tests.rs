@@ -2203,3 +2203,40 @@ fn unavailable_or_nonleaf_append_hint_falls_back_without_changing_the_tree() {
         );
     }
 }
+
+#[test]
+fn default_hasher_page_map_preserves_split_cow_and_removal() {
+    let mut pages = std::collections::HashMap::<PageId, Page>::new();
+    let mut alloc = PageAllocator::new(0);
+    let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
+    let value = [0x52; 512];
+    for key in 0..64u32 {
+        assert!(tree
+            .insert(
+                &mut pages,
+                &mut alloc,
+                TxnId(1),
+                &key.to_be_bytes(),
+                ValueType::Inline,
+                &value
+            )
+            .unwrap());
+    }
+    assert!(tree.depth > 1);
+    let original = tree.clone();
+    for key in 0..64u32 {
+        assert!(tree
+            .delete(&mut pages, &mut alloc, TxnId(2), &key.to_be_bytes())
+            .unwrap());
+        assert!(tree.search(&pages, &key.to_be_bytes()).unwrap().is_none());
+    }
+    assert_eq!(tree.entry_count, 0);
+    assert_eq!(tree.depth, 1);
+    assert_ne!(tree.root, original.root);
+    for key in 0..64u32 {
+        assert_eq!(
+            original.search(&pages, &key.to_be_bytes()).unwrap(),
+            Some((ValueType::Inline, value.to_vec()))
+        );
+    }
+}

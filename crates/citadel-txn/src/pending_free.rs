@@ -5,6 +5,7 @@
 //! Chain head stored in CommitSlot.pending_free_root.
 
 use citadel_buffer::allocator::PageAllocator;
+use citadel_buffer::cursor::MutablePageMap;
 use citadel_core::types::{PageId, PageType, TxnId};
 use citadel_core::{
     Error, Result, PAGE_HEADER_SIZE, PENDING_FREE_ENTRIES_PER_PAGE, PENDING_FREE_ENTRY_SIZE,
@@ -146,7 +147,7 @@ fn chain_pages_needed(entry_count: usize) -> usize {
 /// pre-allocated structure pages (never reuses old chain pages).
 /// Returns the root PageId of the new chain (PageId::INVALID if empty).
 pub fn write_chain(
-    pages: &mut FxHashMap<PageId, Page>,
+    pages: &mut impl MutablePageMap,
     txn_id: TxnId,
     entries: &[PendingFreeEntry],
     page_ids: &[PageId],
@@ -167,7 +168,7 @@ pub fn write_chain(
 }
 
 fn write_chain_page(
-    pages: &mut FxHashMap<PageId, Page>,
+    pages: &mut impl MutablePageMap,
     txn_id: TxnId,
     page_id: PageId,
     next: PageId,
@@ -182,11 +183,11 @@ fn write_chain_page(
         write_entry_at(&mut page.data, offset, entry);
     }
     page.update_checksum();
-    pages.insert(page_id, page);
+    pages.insert_page(page_id, page);
 }
 
 fn prepend_chain(
-    pages: &mut FxHashMap<PageId, Page>,
+    pages: &mut impl MutablePageMap,
     alloc: &mut PageAllocator,
     txn_id: TxnId,
     entries: &[PendingFreeEntry],
@@ -267,7 +268,7 @@ pub fn process_chain(
 impl ChainSnapshot {
     pub(crate) fn process(
         self,
-        pages: &mut FxHashMap<PageId, Page>,
+        pages: &mut impl MutablePageMap,
         alloc: &mut PageAllocator,
         loan_pool: &mut Vec<PageId>,
         commit: &ChainCommit<'_>,
@@ -277,7 +278,7 @@ impl ChainSnapshot {
 
     pub(crate) fn process_with_metadata(
         self,
-        pages: &mut FxHashMap<PageId, Page>,
+        pages: &mut impl MutablePageMap,
         alloc: &mut PageAllocator,
         loan_pool: &mut Vec<PageId>,
         commit: &ChainCommit<'_>,
@@ -413,7 +414,7 @@ impl ChainSnapshot {
 
     fn replace_consumed_head(
         self,
-        pages: &mut FxHashMap<PageId, Page>,
+        pages: &mut impl MutablePageMap,
         replacement: PageId,
         commit: &ChainCommit<'_>,
         retired_chain_pages: &mut FxHashMap<PageId, TxnId>,
@@ -469,7 +470,7 @@ impl ChainSnapshot {
 
     fn prepend_frees(
         self,
-        pages: &mut FxHashMap<PageId, Page>,
+        pages: &mut impl MutablePageMap,
         alloc: &mut PageAllocator,
         commit: &ChainCommit<'_>,
         retired_chain_pages: &mut FxHashMap<PageId, TxnId>,
