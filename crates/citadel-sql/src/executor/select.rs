@@ -217,7 +217,7 @@ pub(super) fn exec_select_with_read(
         }
         let view_qr = exec_view_with_read(rtx, schema, view_def)?;
         if stmt.joins.is_empty() {
-            let view_schema = build_view_schema(&lower_name, &view_qr);
+            let view_schema = build_view_schema(&lower_name, &view_qr)?;
             let view_ctx = CorrelationCtx {
                 outer_schema: &view_schema,
                 outer_alias: stmt.from_alias.as_deref(),
@@ -3429,7 +3429,7 @@ fn exec_select_lateral_with_io(
 
     let (outer_schema, mut outer_rows) = match new_ctes.get(&from_name.to_ascii_lowercase()) {
         Some(cte) => (
-            super::cte::build_cte_schema(&from_name, cte),
+            super::cte::build_cte_schema(&from_name, cte)?,
             super::clone_cte_rows_with_cancel(&cte.result.rows, cancel)?,
         ),
         None => io.scan_table(schema, &from_name)?,

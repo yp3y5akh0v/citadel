@@ -1332,12 +1332,14 @@ fn body_output_columns(
     for col in projection {
         match col {
             SelectColumn::AllColumns | SelectColumn::AllFromOld | SelectColumn::AllFromNew => {
+                TableSchema::validate_column_count(out.len().checked_add(source.len())?).ok()?;
                 out.extend(source.iter().cloned());
             }
             SelectColumn::Expr { expr, alias } => {
                 let name = alias
                     .clone()
                     .unwrap_or_else(|| super::helpers::expr_display_name(expr));
+                TableSchema::validate_column_count(out.len().checked_add(1)?).ok()?;
                 out.push(super::helpers::projected_column(
                     name,
                     out.len(),
@@ -1383,6 +1385,7 @@ fn select_source_columns(
             &join.table.name,
             alias,
         )?;
+        TableSchema::validate_column_count(out.len().checked_add(joined.len())?).ok()?;
         out.extend(joined);
     }
     for (position, col) in out.iter_mut().enumerate() {
@@ -1410,7 +1413,7 @@ fn relation_columns(
             vec![],
         ),
         None => match ctes.get(&name.to_ascii_lowercase()) {
-            Some(cte) => super::cte::build_cte_schema(alias, cte),
+            Some(cte) => super::cte::build_cte_schema(alias, cte).ok()?,
             None => schema.get(&schema.resolve_temp(name))?.clone(),
         },
     };

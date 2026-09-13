@@ -520,8 +520,6 @@ fn provision_transition_table(
     table_cols: &[crate::types::ColumnDef],
     rows: &[Vec<Value>],
 ) -> Result<()> {
-    wtx.create_table(storage_name.as_bytes())
-        .map_err(SqlError::Storage)?;
     let ts = match schema.get(target_name) {
         Some(t) => crate::types::TableSchema::new(
             storage_name.to_string(),
@@ -540,6 +538,10 @@ fn provision_transition_table(
             vec![],
         ),
     };
+    // Transition rows encode every logical column, including the base PK.
+    ts.validate_storage_layout()?;
+    wtx.create_table(storage_name.as_bytes())
+        .map_err(SqlError::Storage)?;
     schema.register_transition_schema(storage_name.to_string(), ts);
 
     // Bypass the regular INSERT path: no constraints, no triggers, row index = storage key.

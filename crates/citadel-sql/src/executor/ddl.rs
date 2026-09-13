@@ -287,6 +287,7 @@ pub(super) fn exec_create_table(
         }
     }
 
+    TableSchema::validate_column_count(stmt.columns.len())?;
     let columns: Vec<ColumnDef> = stmt
         .columns
         .iter()
@@ -312,6 +313,7 @@ pub(super) fn exec_create_table(
     validate_no_chained_generated(&columns)?;
 
     let primary_key_columns = resolve_primary_key_columns(&columns, &stmt.primary_key)?;
+    crate::encoding::validate_row_column_count(columns.len() - primary_key_columns.len())?;
 
     let check_constraints: Vec<TableCheckDef> = stmt
         .check_constraints
@@ -468,6 +470,7 @@ pub(super) fn exec_create_table_in_txn(
         }
     }
 
+    TableSchema::validate_column_count(stmt.columns.len())?;
     let columns: Vec<ColumnDef> = stmt
         .columns
         .iter()
@@ -493,6 +496,7 @@ pub(super) fn exec_create_table_in_txn(
     validate_no_chained_generated(&columns)?;
 
     let primary_key_columns = resolve_primary_key_columns(&columns, &stmt.primary_key)?;
+    crate::encoding::validate_row_column_count(columns.len() - primary_key_columns.len())?;
 
     let check_constraints: Vec<TableCheckDef> = stmt
         .check_constraints
@@ -1171,8 +1175,7 @@ pub(super) fn alter_table_impl(
     // row data and keep the segment.
     if matches!(
         &stmt.op,
-        AlterTableOp::AddColumn { .. }
-            | AlterTableOp::DropColumn { .. }
+        AlterTableOp::DropColumn { .. }
             | AlterTableOp::RenameColumn { .. }
             | AlterTableOp::RenameTable { .. }
     ) {
@@ -1272,6 +1275,9 @@ pub(super) fn alter_add_column(
         ));
     }
 
+    TableSchema::validate_column_count(table_schema.columns.len() + 1)?;
+    crate::encoding::validate_row_column_count(table_schema.physical_non_pk_count() + 1)?;
+
     if !col_spec.nullable && col_spec.default_expr.is_none() && col_spec.generated_kind.is_none() {
         let count = wtx.table_entry_count(table_name.as_bytes()).unwrap_or(0);
         if count > 0 {
@@ -1343,6 +1349,8 @@ pub(super) fn alter_add_column(
 
     new_schema = new_schema.rebuild();
 
+    // ADD COLUMN admission (including IF NOT EXISTS) precedes any storage change.
+    super::ann_persist::purge_segment(wtx, table_name)?;
     if fk_def.is_some() {
         validate_foreign_keys(schema, &new_schema, &new_schema.foreign_keys)?;
         new_schema = create_fk_auto_indices(wtx, new_schema)?;

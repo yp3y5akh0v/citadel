@@ -773,14 +773,14 @@ pub(super) fn scan_table_with_read_or_view(
     }
     if let Some(vd) = schema.get_view(name) {
         let qr = exec_view_with_read(rtx, schema, vd)?;
-        let vs = build_view_schema(name, &qr);
+        let vs = build_view_schema(name, &qr)?;
         return Ok((vs, qr.result.rows));
     }
     if let Some(vt) = schema.get_virtual(name) {
         // A virtual table invents its columns rather than reading them from a relation, so
         // none of them carries a collation.
         let rows = CteRows::binary(vt.scan(schema, rtx.cancel_token())?);
-        let vs = build_view_schema(name, &rows);
+        let vs = build_view_schema(name, &rows)?;
         return Ok((vs, rows.result.rows));
     }
     Err(SqlError::TableNotFound(name.to_string()))
@@ -809,7 +809,7 @@ pub(super) fn scan_table_write_or_view(
     }
     if let Some(vd) = schema.get_view(name) {
         let qr = exec_view_write(wtx, schema, vd)?;
-        let vs = build_view_schema(name, &qr);
+        let vs = build_view_schema(name, &qr)?;
         return Ok((vs, qr.result.rows));
     }
     Err(SqlError::TableNotFound(name.to_string()))
@@ -823,7 +823,7 @@ pub(super) fn resolve_table_or_cte(
 ) -> Result<(TableSchema, Vec<Vec<Value>>)> {
     let lower = name.to_ascii_lowercase();
     if let Some(cte) = ctes.get(&lower) {
-        let schema = build_cte_schema(&lower, cte);
+        let schema = build_cte_schema(&lower, cte)?;
         Ok((
             schema,
             clone_cte_rows_with_cancel(&cte.result.rows, cancel)?,
