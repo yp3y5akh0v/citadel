@@ -1388,6 +1388,33 @@ impl Clone for TableSchema {
 }
 
 impl TableSchema {
+    /// Schema evaluation can fall back to the statement's scoped parameters.
+    /// Subqueries stay conservative because schema evaluation has no subquery
+    /// executor and a nested query can hide additional dependencies.
+    pub(crate) fn may_read_scoped_parameters(&self) -> bool {
+        fn depends(expr: &Expr) -> bool {
+            crate::parser::expr_uses_parameters(expr) || crate::parser::has_subquery(expr)
+        }
+        self.columns.iter().any(|column| {
+            column
+                .default_expr
+                .iter()
+                .chain(column.generated_expr.iter())
+                .chain(column.check_expr.iter())
+                .any(depends)
+        }) || self
+            .check_constraints
+            .iter()
+            .any(|check| depends(&check.expr))
+            || self.indices.iter().any(|index| {
+                index.predicate_expr.as_ref().is_some_and(depends)
+                    || index.keys.iter().any(|key| match key {
+                        IndexKey::Expr { expr, .. } => depends(expr),
+                        IndexKey::Column { .. } => false,
+                    })
+            })
+    }
+
     /// Describe the first persisted expression whose value can change with the
     /// session time zone or transaction date.
     ///

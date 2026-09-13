@@ -464,6 +464,17 @@ impl SchemaManager {
             || self.tables.contains_key(lower)
     }
 
+    /// A false result proves schema-directed evaluation cannot observe an
+    /// internal literal-binding vector. Scan all tables because FK validation
+    /// can decode referenced rows; enabled trigger bodies remain conservative.
+    /// Callers cache this proof alongside their existing schema generation.
+    pub(crate) fn may_read_scoped_parameters(&self) -> bool {
+        self.all_triggers().any(|trigger| trigger.enabled)
+            || self
+                .all_schemas()
+                .any(TableSchema::may_read_scoped_parameters)
+    }
+
     pub fn generation(&self) -> u64 {
         self.generation
     }
