@@ -995,26 +995,34 @@ pub struct ViewDef {
 const VIEW_DEF_VERSION: u8 = 1;
 
 impl ViewDef {
+    /// Serialize metadata. Panics if a field cannot fit its wire width.
+    /// Use `try_serialize` to report invalid metadata as a SQL error.
     pub fn serialize(&self) -> Vec<u8> {
+        self.try_serialize()
+            .expect("unrepresentable schema metadata")
+    }
+
+    /// Serialize without truncating text lengths or collection counts.
+    pub fn try_serialize(&self) -> crate::error::Result<Vec<u8>> {
         let mut buf = Vec::new();
         buf.push(VIEW_DEF_VERSION);
 
         let name_bytes = self.name.as_bytes();
-        buf.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+        buf.extend_from_slice(&wire_u16_len(name_bytes.len())?.to_le_bytes());
         buf.extend_from_slice(name_bytes);
 
         let sql_bytes = self.sql.as_bytes();
-        buf.extend_from_slice(&(sql_bytes.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&wire_u32_len(sql_bytes.len())?.to_le_bytes());
         buf.extend_from_slice(sql_bytes);
 
-        buf.extend_from_slice(&(self.column_aliases.len() as u16).to_le_bytes());
+        buf.extend_from_slice(&wire_u16_len(self.column_aliases.len())?.to_le_bytes());
         for alias in &self.column_aliases {
             let alias_bytes = alias.as_bytes();
-            buf.extend_from_slice(&(alias_bytes.len() as u16).to_le_bytes());
+            buf.extend_from_slice(&wire_u16_len(alias_bytes.len())?.to_le_bytes());
             buf.extend_from_slice(alias_bytes);
         }
 
-        buf
+        Ok(buf)
     }
 
     pub fn deserialize(data: &[u8]) -> crate::error::Result<Self> {
@@ -1023,27 +1031,19 @@ impl ViewDef {
                 "invalid view definition version".into(),
             ));
         }
-        let mut pos = 1;
+        let mut reader = SchemaReader::new(&data[1..]);
 
-        let name_len = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
-        pos += 2;
-        let name = String::from_utf8_lossy(&data[pos..pos + name_len]).into_owned();
-        pos += name_len;
+        let name_len = reader.u16()? as usize;
+        let name = reader.string(name_len)?;
 
-        let sql_len =
-            u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
-        pos += 4;
-        let sql = String::from_utf8_lossy(&data[pos..pos + sql_len]).into_owned();
-        pos += sql_len;
+        let sql_len = reader.u32()? as usize;
+        let sql = reader.string(sql_len)?;
 
-        let alias_count = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
-        pos += 2;
-        let mut column_aliases = Vec::with_capacity(alias_count);
+        let alias_count = reader.u16()? as usize;
+        let mut column_aliases = Vec::with_capacity(alias_count.min(reader.remaining() / 2));
         for _ in 0..alias_count {
-            let alias_len = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
-            pos += 2;
-            let alias = String::from_utf8_lossy(&data[pos..pos + alias_len]).into_owned();
-            pos += alias_len;
+            let alias_len = reader.u16()? as usize;
+            let alias = reader.string(alias_len)?;
             column_aliases.push(alias);
         }
 
@@ -1072,15 +1072,23 @@ impl MatviewDef {
         name.to_ascii_lowercase()
     }
 
+    /// Serialize metadata. Panics if a field cannot fit its wire width.
+    /// Use `try_serialize` to report invalid metadata as a SQL error.
     pub fn serialize(&self) -> Vec<u8> {
+        self.try_serialize()
+            .expect("unrepresentable schema metadata")
+    }
+
+    /// Serialize without truncating text lengths or collection counts.
+    pub fn try_serialize(&self) -> crate::error::Result<Vec<u8>> {
         let mut buf = Vec::new();
         buf.push(MATVIEW_DEF_VERSION);
-        write_short_str(&mut buf, &self.name);
-        write_long_str(&mut buf, &self.select_sql);
-        write_short_str(&mut buf, &self.backing_table);
+        write_short_str(&mut buf, &self.name)?;
+        write_long_str(&mut buf, &self.select_sql)?;
+        write_short_str(&mut buf, &self.backing_table)?;
         buf.push(if self.with_data { 1 } else { 0 });
         buf.extend_from_slice(&self.created_at_micros.to_le_bytes());
-        buf
+        Ok(buf)
     }
 
     pub fn deserialize(data: &[u8]) -> crate::error::Result<Self> {
@@ -1089,22 +1097,12 @@ impl MatviewDef {
                 "invalid matview definition version".into(),
             ));
         }
-        let mut pos = 1usize;
-        let name = read_short_str(data, &mut pos);
-        let select_sql = read_long_str(data, &mut pos);
-        let backing_table = read_short_str(data, &mut pos);
-        let with_data = data[pos] != 0;
-        pos += 1;
-        let created_at_micros = i64::from_le_bytes([
-            data[pos],
-            data[pos + 1],
-            data[pos + 2],
-            data[pos + 3],
-            data[pos + 4],
-            data[pos + 5],
-            data[pos + 6],
-            data[pos + 7],
-        ]);
+        let mut reader = SchemaReader::new(&data[1..]);
+        let name = reader.short_string()?;
+        let select_sql = reader.long_string()?;
+        let backing_table = reader.short_string()?;
+        let with_data = reader.u8()? != 0;
+        let created_at_micros = reader.i64()?;
         Ok(Self {
             name,
             select_sql,
@@ -1132,33 +1130,41 @@ pub struct TriggerDef {
 const TRIGGER_DEF_VERSION: u8 = 1;
 
 impl TriggerDef {
+    /// Serialize metadata. Panics if a field cannot fit its wire width.
+    /// Use `try_serialize` to report invalid metadata as a SQL error.
     pub fn serialize(&self) -> Vec<u8> {
+        self.try_serialize()
+            .expect("unrepresentable schema metadata")
+    }
+
+    /// Serialize without truncating text lengths or collection counts.
+    pub fn try_serialize(&self) -> crate::error::Result<Vec<u8>> {
         let mut buf = Vec::new();
         buf.push(TRIGGER_DEF_VERSION);
 
-        write_short_str(&mut buf, &self.name);
+        write_short_str(&mut buf, &self.name)?;
         buf.push(match self.timing {
             crate::parser::TriggerTiming::Before => 0,
             crate::parser::TriggerTiming::After => 1,
             crate::parser::TriggerTiming::InsteadOf => 2,
         });
 
-        buf.extend_from_slice(&(self.events.len() as u16).to_le_bytes());
+        buf.extend_from_slice(&wire_u16_len(self.events.len())?.to_le_bytes());
         for ev in &self.events {
             match ev {
                 crate::parser::TriggerEvent::Insert => buf.push(0),
                 crate::parser::TriggerEvent::Delete => buf.push(1),
                 crate::parser::TriggerEvent::Update(cols) => {
                     buf.push(2);
-                    buf.extend_from_slice(&(cols.len() as u16).to_le_bytes());
+                    buf.extend_from_slice(&wire_u16_len(cols.len())?.to_le_bytes());
                     for c in cols {
-                        write_short_str(&mut buf, c);
+                        write_short_str(&mut buf, c)?;
                     }
                 }
             }
         }
 
-        write_short_str(&mut buf, &self.target);
+        write_short_str(&mut buf, &self.target)?;
         buf.push(match self.granularity {
             crate::parser::TriggerGranularity::ForEachRow => 0,
             crate::parser::TriggerGranularity::ForEachStatement => 1,
@@ -1168,8 +1174,8 @@ impl TriggerDef {
             None => buf.push(0),
             Some(r) => {
                 buf.push(1);
-                write_opt_string(&mut buf, &r.new_table_alias);
-                write_opt_string(&mut buf, &r.old_table_alias);
+                write_opt_string(&mut buf, &r.new_table_alias)?;
+                write_opt_string(&mut buf, &r.old_table_alias)?;
             }
         }
 
@@ -1177,15 +1183,15 @@ impl TriggerDef {
             None => buf.push(0),
             Some(s) => {
                 buf.push(1);
-                write_long_str(&mut buf, s);
+                write_long_str(&mut buf, s)?;
             }
         }
 
-        write_long_str(&mut buf, &self.body_sql);
+        write_long_str(&mut buf, &self.body_sql)?;
         buf.push(if self.enabled { 1 } else { 0 });
         buf.extend_from_slice(&self.created_at_micros.to_le_bytes());
 
-        buf
+        Ok(buf)
     }
 
     pub fn deserialize(data: &[u8]) -> crate::error::Result<Self> {
@@ -1194,9 +1200,9 @@ impl TriggerDef {
                 "invalid trigger definition version".into(),
             ));
         }
-        let mut pos = 1;
-        let name = read_short_str(data, &mut pos);
-        let timing = match data[pos] {
+        let mut reader = SchemaReader::new(&data[1..]);
+        let name = reader.short_string()?;
+        let timing = match reader.u8()? {
             0 => crate::parser::TriggerTiming::Before,
             1 => crate::parser::TriggerTiming::After,
             2 => crate::parser::TriggerTiming::InsteadOf,
@@ -1206,23 +1212,19 @@ impl TriggerDef {
                 ))
             }
         };
-        pos += 1;
 
-        let event_count = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
-        pos += 2;
-        let mut events = Vec::with_capacity(event_count);
+        let event_count = reader.u16()? as usize;
+        let mut events = Vec::with_capacity(event_count.min(reader.remaining()));
         for _ in 0..event_count {
-            let tag = data[pos];
-            pos += 1;
+            let tag = reader.u8()?;
             let ev = match tag {
                 0 => crate::parser::TriggerEvent::Insert,
                 1 => crate::parser::TriggerEvent::Delete,
                 2 => {
-                    let cnt = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
-                    pos += 2;
-                    let mut cols = Vec::with_capacity(cnt);
+                    let cnt = reader.u16()? as usize;
+                    let mut cols = Vec::with_capacity(cnt.min(reader.remaining() / 2));
                     for _ in 0..cnt {
-                        cols.push(read_short_str(data, &mut pos));
+                        cols.push(reader.short_string()?);
                     }
                     crate::parser::TriggerEvent::Update(cols)
                 }
@@ -1235,8 +1237,8 @@ impl TriggerDef {
             events.push(ev);
         }
 
-        let target = read_short_str(data, &mut pos);
-        let granularity = match data[pos] {
+        let target = reader.short_string()?;
+        let granularity = match reader.u8()? {
             0 => crate::parser::TriggerGranularity::ForEachRow,
             1 => crate::parser::TriggerGranularity::ForEachStatement,
             _ => {
@@ -1245,42 +1247,27 @@ impl TriggerDef {
                 ))
             }
         };
-        pos += 1;
 
-        let referencing = if data[pos] == 0 {
-            pos += 1;
+        let referencing = if reader.u8()? == 0 {
             None
         } else {
-            pos += 1;
-            let new_table_alias = read_opt_string(data, &mut pos);
-            let old_table_alias = read_opt_string(data, &mut pos);
+            let new_table_alias = reader.optional_string()?;
+            let old_table_alias = reader.optional_string()?;
             Some(crate::parser::TransitionTables {
                 new_table_alias,
                 old_table_alias,
             })
         };
 
-        let when_sql = if data[pos] == 0 {
-            pos += 1;
+        let when_sql = if reader.u8()? == 0 {
             None
         } else {
-            pos += 1;
-            Some(read_long_str(data, &mut pos))
+            Some(reader.long_string()?)
         };
 
-        let body_sql = read_long_str(data, &mut pos);
-        let enabled = data[pos] != 0;
-        pos += 1;
-        let created_at_micros = i64::from_le_bytes([
-            data[pos],
-            data[pos + 1],
-            data[pos + 2],
-            data[pos + 3],
-            data[pos + 4],
-            data[pos + 5],
-            data[pos + 6],
-            data[pos + 7],
-        ]);
+        let body_sql = reader.long_string()?;
+        let enabled = reader.u8()? != 0;
+        let created_at_micros = reader.i64()?;
 
         Ok(Self {
             name,
@@ -1297,33 +1284,111 @@ impl TriggerDef {
     }
 }
 
-fn write_short_str(buf: &mut Vec<u8>, s: &str) {
-    let bytes = s.as_bytes();
-    buf.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
-    buf.extend_from_slice(bytes);
+fn wire_u16_len(len: usize) -> crate::error::Result<u16> {
+    u16::try_from(len).map_err(|_| {
+        crate::error::SqlError::InvalidValue(
+            "schema metadata field exceeds 65535 bytes or entries".into(),
+        )
+    })
 }
 
-fn read_short_str(data: &[u8], pos: &mut usize) -> String {
-    let len = u16::from_le_bytes([data[*pos], data[*pos + 1]]) as usize;
-    *pos += 2;
-    let s = String::from_utf8_lossy(&data[*pos..*pos + len]).into_owned();
-    *pos += len;
-    s
+fn wire_u32_len(len: usize) -> crate::error::Result<u32> {
+    u32::try_from(len).map_err(|_| {
+        crate::error::SqlError::InvalidValue("schema metadata text exceeds 4294967295 bytes".into())
+    })
 }
 
-fn write_long_str(buf: &mut Vec<u8>, s: &str) {
-    let bytes = s.as_bytes();
-    buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-    buf.extend_from_slice(bytes);
+fn write_short_str(buf: &mut Vec<u8>, value: &str) -> crate::error::Result<()> {
+    buf.extend_from_slice(&wire_u16_len(value.len())?.to_le_bytes());
+    buf.extend_from_slice(value.as_bytes());
+    Ok(())
 }
 
-fn read_long_str(data: &[u8], pos: &mut usize) -> String {
-    let len =
-        u32::from_le_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]]) as usize;
-    *pos += 4;
-    let s = String::from_utf8_lossy(&data[*pos..*pos + len]).into_owned();
-    *pos += len;
-    s
+fn write_long_str(buf: &mut Vec<u8>, value: &str) -> crate::error::Result<()> {
+    buf.extend_from_slice(&wire_u32_len(value.len())?.to_le_bytes());
+    buf.extend_from_slice(value.as_bytes());
+    Ok(())
+}
+
+fn write_opt_string(buf: &mut Vec<u8>, value: &Option<String>) -> crate::error::Result<()> {
+    write_short_str(buf, value.as_deref().unwrap_or(""))
+}
+
+/// Bounds all reads before allocating or exposing a field. Record versions decide
+/// which sections exist; this cursor does not silently supply missing metadata.
+struct SchemaReader<'a> {
+    remaining: &'a [u8],
+}
+
+impl<'a> SchemaReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { remaining: bytes }
+    }
+
+    fn remaining(&self) -> usize {
+        self.remaining.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.remaining.is_empty()
+    }
+
+    fn take(&mut self, len: usize) -> crate::error::Result<&'a [u8]> {
+        if len > self.remaining.len() {
+            return Err(crate::error::SqlError::InvalidValue(
+                "truncated schema metadata".into(),
+            ));
+        }
+        let (value, rest) = self.remaining.split_at(len);
+        self.remaining = rest;
+        Ok(value)
+    }
+
+    fn array<const N: usize>(&mut self) -> crate::error::Result<[u8; N]> {
+        Ok(self
+            .take(N)?
+            .try_into()
+            .expect("checked metadata field width"))
+    }
+
+    fn u8(&mut self) -> crate::error::Result<u8> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u16(&mut self) -> crate::error::Result<u16> {
+        Ok(u16::from_le_bytes(self.array()?))
+    }
+
+    fn u32(&mut self) -> crate::error::Result<u32> {
+        Ok(u32::from_le_bytes(self.array()?))
+    }
+
+    fn i64(&mut self) -> crate::error::Result<i64> {
+        Ok(i64::from_le_bytes(self.array()?))
+    }
+
+    fn string(&mut self, len: usize) -> crate::error::Result<String> {
+        Ok(String::from_utf8_lossy(self.take(len)?).into_owned())
+    }
+
+    fn short_string(&mut self) -> crate::error::Result<String> {
+        let len = usize::from(self.u16()?);
+        self.string(len)
+    }
+
+    fn long_string(&mut self) -> crate::error::Result<String> {
+        let len = self.u32()? as usize;
+        self.string(len)
+    }
+
+    fn optional_string(&mut self) -> crate::error::Result<Option<String>> {
+        let len = usize::from(self.u16()?);
+        if len == 0 {
+            Ok(None)
+        } else {
+            self.string(len).map(Some)
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1834,55 +1899,30 @@ impl TableSchema {
 const SCHEMA_VERSION: u8 = 14;
 pub const TABLE_FLAG_STRICT: u8 = 0b0000_0001;
 
-fn write_opt_string(buf: &mut Vec<u8>, s: &Option<String>) {
-    match s {
-        Some(s) => {
-            let bytes = s.as_bytes();
-            buf.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
-            buf.extend_from_slice(bytes);
-        }
-        None => buf.extend_from_slice(&0u16.to_le_bytes()),
-    }
-}
-
-fn read_opt_string(data: &[u8], pos: &mut usize) -> Option<String> {
-    let len = u16::from_le_bytes([data[*pos], data[*pos + 1]]) as usize;
-    *pos += 2;
-    if len == 0 {
-        None
-    } else {
-        let s = String::from_utf8_lossy(&data[*pos..*pos + len]).into_owned();
-        *pos += len;
-        Some(s)
-    }
-}
-
-fn read_string(data: &[u8], pos: &mut usize) -> String {
-    let len = u16::from_le_bytes([data[*pos], data[*pos + 1]]) as usize;
-    *pos += 2;
-    let s = String::from_utf8_lossy(&data[*pos..*pos + len]).into_owned();
-    *pos += len;
-    s
-}
-
 impl TableSchema {
-    /// Serialize a stored schema. Its physical row layout must fit 32767 slots.
-    /// Panics if that precondition or the u16 logical-column count is exceeded.
+    /// Serialize a stored schema. Panics if its physical layout exceeds
+    /// 32767 slots or any metadata field cannot fit its wire width.
+    /// Use `try_serialize` to report invalid metadata as a SQL error.
     pub fn serialize(&self) -> Vec<u8> {
-        self.validate_storage_layout()
-            .expect("unrepresentable stored schema");
+        self.try_serialize()
+            .expect("unrepresentable schema metadata")
+    }
+
+    /// Serialize without truncating text lengths or collection counts.
+    pub fn try_serialize(&self) -> crate::error::Result<Vec<u8>> {
+        self.validate_storage_layout()?;
         let mut buf = Vec::new();
         buf.push(SCHEMA_VERSION);
 
         let name_bytes = self.name.as_bytes();
-        buf.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+        buf.extend_from_slice(&wire_u16_len(name_bytes.len())?.to_le_bytes());
         buf.extend_from_slice(name_bytes);
 
-        buf.extend_from_slice(&(self.columns.len() as u16).to_le_bytes());
+        buf.extend_from_slice(&wire_u16_len(self.columns.len())?.to_le_bytes());
 
         for col in &self.columns {
             let col_name = col.name.as_bytes();
-            buf.extend_from_slice(&(col_name.len() as u16).to_le_bytes());
+            buf.extend_from_slice(&wire_u16_len(col_name.len())?.to_le_bytes());
             buf.extend_from_slice(col_name);
             buf.push(col.data_type.type_tag());
             if let DataType::Vector { dim } = col.data_type {
@@ -1892,17 +1932,17 @@ impl TableSchema {
             buf.extend_from_slice(&col.position.to_le_bytes());
         }
 
-        buf.extend_from_slice(&(self.primary_key_columns.len() as u16).to_le_bytes());
+        buf.extend_from_slice(&wire_u16_len(self.primary_key_columns.len())?.to_le_bytes());
         for &pk_idx in &self.primary_key_columns {
             buf.extend_from_slice(&pk_idx.to_le_bytes());
         }
 
-        buf.extend_from_slice(&(self.indices.len() as u16).to_le_bytes());
+        buf.extend_from_slice(&wire_u16_len(self.indices.len())?.to_le_bytes());
         for idx in &self.indices {
             let idx_name = idx.name.as_bytes();
-            buf.extend_from_slice(&(idx_name.len() as u16).to_le_bytes());
+            buf.extend_from_slice(&wire_u16_len(idx_name.len())?.to_le_bytes());
             buf.extend_from_slice(idx_name);
-            buf.extend_from_slice(&(idx.keys.len() as u16).to_le_bytes());
+            buf.extend_from_slice(&wire_u16_len(idx.keys.len())?.to_le_bytes());
             for key in &idx.keys {
                 let col_idx = match key {
                     IndexKey::Column { idx, .. } => *idx,
@@ -1924,44 +1964,44 @@ impl TableSchema {
             buf.push(flags);
             if let Some(ref sql) = col.default_sql {
                 let bytes = sql.as_bytes();
-                buf.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+                buf.extend_from_slice(&wire_u16_len(bytes.len())?.to_le_bytes());
                 buf.extend_from_slice(bytes);
             }
             if let Some(ref sql) = col.check_sql {
                 let bytes = sql.as_bytes();
-                buf.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+                buf.extend_from_slice(&wire_u16_len(bytes.len())?.to_le_bytes());
                 buf.extend_from_slice(bytes);
-                write_opt_string(&mut buf, &col.check_name);
+                write_opt_string(&mut buf, &col.check_name)?;
             }
         }
 
-        buf.extend_from_slice(&(self.check_constraints.len() as u16).to_le_bytes());
+        buf.extend_from_slice(&wire_u16_len(self.check_constraints.len())?.to_le_bytes());
         for chk in &self.check_constraints {
-            write_opt_string(&mut buf, &chk.name);
+            write_opt_string(&mut buf, &chk.name)?;
             let sql_bytes = chk.sql.as_bytes();
-            buf.extend_from_slice(&(sql_bytes.len() as u16).to_le_bytes());
+            buf.extend_from_slice(&wire_u16_len(sql_bytes.len())?.to_le_bytes());
             buf.extend_from_slice(sql_bytes);
         }
 
-        buf.extend_from_slice(&(self.foreign_keys.len() as u16).to_le_bytes());
+        buf.extend_from_slice(&wire_u16_len(self.foreign_keys.len())?.to_le_bytes());
         for fk in &self.foreign_keys {
-            write_opt_string(&mut buf, &fk.name);
-            buf.extend_from_slice(&(fk.columns.len() as u16).to_le_bytes());
+            write_opt_string(&mut buf, &fk.name)?;
+            buf.extend_from_slice(&wire_u16_len(fk.columns.len())?.to_le_bytes());
             for &col_idx in &fk.columns {
                 buf.extend_from_slice(&col_idx.to_le_bytes());
             }
             let ft_bytes = fk.foreign_table.as_bytes();
-            buf.extend_from_slice(&(ft_bytes.len() as u16).to_le_bytes());
+            buf.extend_from_slice(&wire_u16_len(ft_bytes.len())?.to_le_bytes());
             buf.extend_from_slice(ft_bytes);
-            buf.extend_from_slice(&(fk.referred_columns.len() as u16).to_le_bytes());
+            buf.extend_from_slice(&wire_u16_len(fk.referred_columns.len())?.to_le_bytes());
             for rc in &fk.referred_columns {
                 let rc_bytes = rc.as_bytes();
-                buf.extend_from_slice(&(rc_bytes.len() as u16).to_le_bytes());
+                buf.extend_from_slice(&wire_u16_len(rc_bytes.len())?.to_le_bytes());
                 buf.extend_from_slice(rc_bytes);
             }
         }
 
-        buf.extend_from_slice(&(self.dropped_non_pk_slots.len() as u16).to_le_bytes());
+        buf.extend_from_slice(&wire_u16_len(self.dropped_non_pk_slots.len())?.to_le_bytes());
         for &slot in &self.dropped_non_pk_slots {
             buf.extend_from_slice(&slot.to_le_bytes());
         }
@@ -1976,7 +2016,7 @@ impl TableSchema {
             if kind_tag != 0 {
                 let sql = col.generated_sql.as_deref().unwrap_or("");
                 let bytes = sql.as_bytes();
-                buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                buf.extend_from_slice(&wire_u32_len(bytes.len())?.to_le_bytes());
                 buf.extend_from_slice(bytes);
             }
         }
@@ -1986,7 +2026,7 @@ impl TableSchema {
                 Some(sql) => {
                     buf.push(1);
                     let bytes = sql.as_bytes();
-                    buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                    buf.extend_from_slice(&wire_u32_len(bytes.len())?.to_le_bytes());
                     buf.extend_from_slice(bytes);
                 }
                 None => buf.push(0),
@@ -2013,7 +2053,7 @@ impl TableSchema {
             buf.push(col.collation as u8);
         }
         for idx in &self.indices {
-            let n = idx.keys.len() as u16;
+            let n = wire_u16_len(idx.keys.len())?;
             buf.extend_from_slice(&n.to_le_bytes());
             for key in &idx.keys {
                 let c = match key {
@@ -2045,17 +2085,18 @@ impl TableSchema {
         // v12: per-index expression-key extension. Emit (position, SQL) for each Expr key.
         // v11 readers stop before this section; v12 readers consume it.
         for idx in &self.indices {
-            let expr_count = idx
-                .keys
-                .iter()
-                .filter(|k| matches!(k, IndexKey::Expr { .. }))
-                .count() as u16;
+            let expr_count = wire_u16_len(
+                idx.keys
+                    .iter()
+                    .filter(|k| matches!(k, IndexKey::Expr { .. }))
+                    .count(),
+            )?;
             buf.extend_from_slice(&expr_count.to_le_bytes());
             for (pos, key) in idx.keys.iter().enumerate() {
                 if let IndexKey::Expr { original_sql, .. } = key {
                     buf.extend_from_slice(&(pos as u16).to_le_bytes());
                     let bytes = original_sql.as_bytes();
-                    buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                    buf.extend_from_slice(&wire_u32_len(bytes.len())?.to_le_bytes());
                     buf.extend_from_slice(bytes);
                 }
             }
@@ -2063,18 +2104,16 @@ impl TableSchema {
 
         // v14: per-index ANN filter columns.
         for idx in &self.indices {
-            buf.extend_from_slice(&(idx.ann_filter_cols.len() as u16).to_le_bytes());
+            buf.extend_from_slice(&wire_u16_len(idx.ann_filter_cols.len())?.to_le_bytes());
             for &col in &idx.ann_filter_cols {
                 buf.extend_from_slice(&col.to_le_bytes());
             }
         }
 
-        buf
+        Ok(buf)
     }
 
     pub fn deserialize(data: &[u8]) -> crate::error::Result<Self> {
-        let mut pos = 0;
-
         if data.is_empty()
             || !matches!(
                 data[0],
@@ -2086,37 +2125,28 @@ impl TableSchema {
             ));
         }
         let version = data[0];
-        pos += 1;
+        let mut reader = SchemaReader::new(&data[1..]);
 
-        let name_len = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
-        pos += 2;
-        let name = String::from_utf8_lossy(&data[pos..pos + name_len]).into_owned();
-        pos += name_len;
+        let name_len = reader.u16()? as usize;
+        let name = reader.string(name_len)?;
 
-        let col_count = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
-        pos += 2;
+        let col_count = reader.u16()? as usize;
 
-        let mut columns = Vec::with_capacity(col_count);
+        let mut columns = Vec::with_capacity(col_count.min(reader.remaining() / 6));
         for _ in 0..col_count {
-            let col_name_len = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
-            pos += 2;
-            let col_name = String::from_utf8_lossy(&data[pos..pos + col_name_len]).into_owned();
-            pos += col_name_len;
-            let tag = data[pos];
-            pos += 1;
+            let col_name_len = reader.u16()? as usize;
+            let col_name = reader.string(col_name_len)?;
+            let tag = reader.u8()?;
             let data_type = if tag == 15 {
-                let dim = u16::from_le_bytes([data[pos], data[pos + 1]]);
-                pos += 2;
+                let dim = reader.u16()?;
                 DataType::Vector { dim }
             } else {
                 DataType::from_tag(tag).ok_or_else(|| {
                     crate::error::SqlError::InvalidValue("unknown data type tag".into())
                 })?
             };
-            let nullable = data[pos] != 0;
-            pos += 1;
-            let position = u16::from_le_bytes([data[pos], data[pos + 1]]);
-            pos += 2;
+            let nullable = reader.u8()? != 0;
+            let position = reader.u16()?;
             columns.push(ColumnDef {
                 name: col_name,
                 data_type,
@@ -2135,30 +2165,24 @@ impl TableSchema {
             });
         }
 
-        let pk_count = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
-        pos += 2;
-        let mut primary_key_columns = Vec::with_capacity(pk_count);
+        let pk_count = reader.u16()? as usize;
+        let mut primary_key_columns = Vec::with_capacity(pk_count.min(reader.remaining() / 2));
         for _ in 0..pk_count {
-            let pk_idx = u16::from_le_bytes([data[pos], data[pos + 1]]);
-            pos += 2;
+            let pk_idx = reader.u16()?;
             primary_key_columns.push(pk_idx);
         }
 
-        let indices = if version >= 2 && pos + 2 <= data.len() {
-            let idx_count = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
-            pos += 2;
-            let mut idxs = Vec::with_capacity(idx_count);
+        let indices = if version >= 2 {
+            let idx_count = reader.u16()? as usize;
+            let mut idxs = Vec::with_capacity(idx_count.min(reader.remaining() / 5));
             for _ in 0..idx_count {
-                let idx_name_len = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
-                pos += 2;
-                let idx_name = String::from_utf8_lossy(&data[pos..pos + idx_name_len]).into_owned();
-                pos += idx_name_len;
-                let col_count = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
-                pos += 2;
-                let mut keys: Vec<IndexKey> = Vec::with_capacity(col_count);
+                let idx_name_len = reader.u16()? as usize;
+                let idx_name = reader.string(idx_name_len)?;
+                let col_count = reader.u16()? as usize;
+                let mut keys: Vec<IndexKey> =
+                    Vec::with_capacity(col_count.min(reader.remaining() / 2));
                 for _ in 0..col_count {
-                    let col_idx = u16::from_le_bytes([data[pos], data[pos + 1]]);
-                    pos += 2;
+                    let col_idx = reader.u16()?;
                     // u16::MAX marks an expression key that the v12 section will fill in below.
                     // For v11 indexes (no expression section), this stays as a column placeholder.
                     keys.push(IndexKey::Column {
@@ -2166,8 +2190,7 @@ impl TableSchema {
                         collate: Collation::Binary,
                     });
                 }
-                let unique = data[pos] != 0;
-                pos += 1;
+                let unique = reader.u8()? != 0;
                 idxs.push(IndexDef {
                     name: idx_name,
                     keys,
@@ -2186,12 +2209,11 @@ impl TableSchema {
         let mut check_constraints = Vec::new();
         let mut foreign_keys = Vec::new();
 
-        if version >= 3 && pos < data.len() {
+        if version >= 3 {
             for col in &mut columns {
-                let flags = data[pos];
-                pos += 1;
+                let flags = reader.u8()?;
                 if flags & 1 != 0 {
-                    let sql = read_string(data, &mut pos);
+                    let sql = reader.short_string()?;
                     col.default_expr = Some(crate::parser::parse_sql_expr(&sql).map_err(|_| {
                         crate::error::SqlError::InvalidValue(format!(
                             "cannot parse DEFAULT expression: {sql}"
@@ -2200,22 +2222,21 @@ impl TableSchema {
                     col.default_sql = Some(sql);
                 }
                 if flags & 2 != 0 {
-                    let sql = read_string(data, &mut pos);
+                    let sql = reader.short_string()?;
                     col.check_expr = Some(crate::parser::parse_sql_expr(&sql).map_err(|_| {
                         crate::error::SqlError::InvalidValue(format!(
                             "cannot parse CHECK expression: {sql}"
                         ))
                     })?);
                     col.check_sql = Some(sql);
-                    col.check_name = read_opt_string(data, &mut pos);
+                    col.check_name = reader.optional_string()?;
                 }
             }
 
-            let chk_count = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
-            pos += 2;
+            let chk_count = reader.u16()? as usize;
             for _ in 0..chk_count {
-                let name = read_opt_string(data, &mut pos);
-                let sql = read_string(data, &mut pos);
+                let name = reader.optional_string()?;
+                let sql = reader.short_string()?;
                 let expr = crate::parser::parse_sql_expr(&sql).map_err(|_| {
                     crate::error::SqlError::InvalidValue(format!(
                         "cannot parse CHECK expression: {sql}"
@@ -2224,24 +2245,21 @@ impl TableSchema {
                 check_constraints.push(TableCheckDef { name, expr, sql });
             }
 
-            let fk_count = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
-            pos += 2;
+            let fk_count = reader.u16()? as usize;
             for _ in 0..fk_count {
-                let name = read_opt_string(data, &mut pos);
-                let col_count = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
-                pos += 2;
-                let mut cols = Vec::with_capacity(col_count);
+                let name = reader.optional_string()?;
+                let col_count = reader.u16()? as usize;
+                let mut cols = Vec::with_capacity(col_count.min(reader.remaining() / 2));
                 for _ in 0..col_count {
-                    let col_idx = u16::from_le_bytes([data[pos], data[pos + 1]]);
-                    pos += 2;
+                    let col_idx = reader.u16()?;
                     cols.push(col_idx);
                 }
-                let foreign_table = read_string(data, &mut pos);
-                let ref_count = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
-                pos += 2;
-                let mut referred_columns = Vec::with_capacity(ref_count);
+                let foreign_table = reader.short_string()?;
+                let ref_count = reader.u16()? as usize;
+                let mut referred_columns =
+                    Vec::with_capacity(ref_count.min(reader.remaining() / 2));
                 for _ in 0..ref_count {
-                    referred_columns.push(read_string(data, &mut pos));
+                    referred_columns.push(reader.short_string()?);
                 }
                 foreign_keys.push(ForeignKeySchemaEntry {
                     name,
@@ -2256,29 +2274,19 @@ impl TableSchema {
             }
         }
         let mut dropped_non_pk_slots = Vec::new();
-        if version >= 4 && pos + 2 <= data.len() {
-            let slot_count = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
-            pos += 2;
+        if version >= 4 {
+            let slot_count = reader.u16()? as usize;
             for _ in 0..slot_count {
-                let slot = u16::from_le_bytes([data[pos], data[pos + 1]]);
-                pos += 2;
+                let slot = reader.u16()?;
                 dropped_non_pk_slots.push(slot);
             }
         }
-        if version >= 5 && pos < data.len() {
+        if version >= 5 {
             for col in &mut columns {
-                let kind_tag = data[pos];
-                pos += 1;
+                let kind_tag = reader.u8()?;
                 if kind_tag != 0 {
-                    let len = u32::from_le_bytes([
-                        data[pos],
-                        data[pos + 1],
-                        data[pos + 2],
-                        data[pos + 3],
-                    ]) as usize;
-                    pos += 4;
-                    let sql = String::from_utf8_lossy(&data[pos..pos + len]).into_owned();
-                    pos += len;
+                    let len = reader.u32()? as usize;
+                    let sql = reader.string(len)?;
                     let expr = crate::parser::parse_sql_expr(&sql).map_err(|_| {
                         crate::error::SqlError::InvalidValue(format!(
                             "cannot parse GENERATED expression: {sql}"
@@ -2299,20 +2307,12 @@ impl TableSchema {
             }
         }
         let mut indices = indices;
-        if version >= 6 && pos < data.len() {
+        if version >= 6 {
             for idx in &mut indices {
-                let flag = data[pos];
-                pos += 1;
+                let flag = reader.u8()?;
                 if flag == 1 {
-                    let len = u32::from_le_bytes([
-                        data[pos],
-                        data[pos + 1],
-                        data[pos + 2],
-                        data[pos + 3],
-                    ]) as usize;
-                    pos += 4;
-                    let sql = String::from_utf8_lossy(&data[pos..pos + len]).into_owned();
-                    pos += len;
+                    let len = reader.u32()? as usize;
+                    let sql = reader.string(len)?;
                     let expr = crate::parser::parse_sql_expr(&sql).map_err(|_| {
                         crate::error::SqlError::InvalidValue(format!(
                             "cannot parse partial-index predicate: {sql}"
@@ -2323,24 +2323,18 @@ impl TableSchema {
                 }
             }
             for fk in &mut foreign_keys {
-                fk.on_delete =
-                    crate::parser::ReferentialAction::from_tag(data[pos]).ok_or_else(|| {
+                fk.on_delete = crate::parser::ReferentialAction::from_tag(reader.u8()?)
+                    .ok_or_else(|| {
                         crate::error::SqlError::InvalidValue("unknown FK on_delete tag".into())
                     })?;
-                pos += 1;
-                fk.on_update =
-                    crate::parser::ReferentialAction::from_tag(data[pos]).ok_or_else(|| {
+                fk.on_update = crate::parser::ReferentialAction::from_tag(reader.u8()?)
+                    .ok_or_else(|| {
                         crate::error::SqlError::InvalidValue("unknown FK on_update tag".into())
                     })?;
-                pos += 1;
             }
             if version >= 11 {
                 for fk in &mut foreign_keys {
-                    if pos >= data.len() {
-                        break;
-                    }
-                    let flags = data[pos];
-                    pos += 1;
+                    let flags = reader.u8()?;
                     fk.deferrable = flags & 0b01 != 0;
                     fk.initially_deferred = flags & 0b10 != 0;
                 }
@@ -2350,21 +2344,18 @@ impl TableSchema {
         let mut columns = columns;
         let mut indices = indices;
         let mut flags: u8 = 0;
-        if version >= 7 && pos < data.len() {
+        if version >= 7 {
             for col in &mut columns {
-                col.collation = Collation::from_tag(data[pos]).ok_or_else(|| {
+                col.collation = Collation::from_tag(reader.u8()?).ok_or_else(|| {
                     crate::error::SqlError::InvalidValue("unknown collation tag".into())
                 })?;
-                pos += 1;
             }
             for idx in &mut indices {
-                let n = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
-                pos += 2;
+                let n = reader.u16()? as usize;
                 for i in 0..n {
-                    let collate = Collation::from_tag(data[pos]).ok_or_else(|| {
+                    let collate = Collation::from_tag(reader.u8()?).ok_or_else(|| {
                         crate::error::SqlError::InvalidValue("unknown collation tag".into())
                     })?;
-                    pos += 1;
                     if let Some(IndexKey::Column { collate: c, .. }) = idx.keys.get_mut(i) {
                         *c = collate;
                     }
@@ -2372,49 +2363,42 @@ impl TableSchema {
             }
             if version >= 9 {
                 for idx in &mut indices {
-                    if pos >= data.len() {
-                        break;
-                    }
-                    let tag = data[pos];
-                    pos += 1;
+                    let tag = reader.u8()?;
                     idx.kind = match tag {
                         0 => IndexKind::BTree,
                         1 => {
-                            if pos >= data.len() {
+                            if reader.is_empty() {
                                 return Err(crate::error::SqlError::InvalidValue(
                                     "GIN index missing opclass tag".into(),
                                 ));
                             }
-                            let ops = GinOpsClass::from_tag(data[pos]).ok_or_else(|| {
+                            let ops = GinOpsClass::from_tag(reader.u8()?).ok_or_else(|| {
                                 crate::error::SqlError::InvalidValue(
                                     "unknown GIN opclass tag".into(),
                                 )
                             })?;
-                            pos += 1;
                             IndexKind::Inverted(InvertedKind::Gin(ops))
                         }
                         2 => {
-                            if pos >= data.len() {
+                            if reader.is_empty() {
                                 return Err(crate::error::SqlError::InvalidValue(
                                     "FTS index missing config_id".into(),
                                 ));
                             }
-                            let config_id = data[pos];
-                            pos += 1;
+                            let config_id = reader.u8()?;
                             IndexKind::Inverted(InvertedKind::Fts { config_id })
                         }
                         3 => {
-                            if pos >= data.len() {
+                            if reader.is_empty() {
                                 return Err(crate::error::SqlError::InvalidValue(
                                     "ANN index missing metric tag".into(),
                                 ));
                             }
-                            let metric = AnnMetric::from_tag(data[pos]).ok_or_else(|| {
+                            let metric = AnnMetric::from_tag(reader.u8()?).ok_or_else(|| {
                                 crate::error::SqlError::InvalidValue(
                                     "unknown ANN metric tag".into(),
                                 )
                             })?;
-                            pos += 1;
                             IndexKind::Inverted(InvertedKind::Ann { metric })
                         }
                         _ => {
@@ -2425,39 +2409,28 @@ impl TableSchema {
                     };
                 }
             }
-            if pos < data.len() {
-                flags = data[pos];
-                pos += 1;
+            // Older records may omit the table flags tail. Current
+            // version 14 writers always emit it, even without indexes.
+            if version >= 14 || !reader.is_empty() {
+                flags = reader.u8()?;
             }
             if version >= 12 {
                 for idx in &mut indices {
-                    if pos + 2 > data.len() {
-                        break;
-                    }
-                    let expr_count = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
-                    pos += 2;
+                    let expr_count = reader.u16()? as usize;
                     for _ in 0..expr_count {
-                        if pos + 6 > data.len() {
+                        if reader.remaining() < 6 {
                             return Err(crate::error::SqlError::InvalidValue(
                                 "truncated index expression key".into(),
                             ));
                         }
-                        let key_pos = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
-                        pos += 2;
-                        let sql_len = u32::from_le_bytes([
-                            data[pos],
-                            data[pos + 1],
-                            data[pos + 2],
-                            data[pos + 3],
-                        ]) as usize;
-                        pos += 4;
-                        if pos + sql_len > data.len() {
+                        let key_pos = reader.u16()? as usize;
+                        let sql_len = reader.u32()? as usize;
+                        if sql_len > reader.remaining() {
                             return Err(crate::error::SqlError::InvalidValue(
                                 "truncated expression-key SQL".into(),
                             ));
                         }
-                        let sql = String::from_utf8_lossy(&data[pos..pos + sql_len]).into_owned();
-                        pos += sql_len;
+                        let sql = reader.string(sql_len)?;
                         let expr = crate::parser::parse_sql_expr(&sql).map_err(|_| {
                             crate::error::SqlError::InvalidValue(format!(
                                 "cannot parse index expression: {sql}"
@@ -2474,26 +2447,20 @@ impl TableSchema {
             }
             if version >= 14 {
                 for idx in &mut indices {
-                    if pos + 2 > data.len() {
-                        break;
-                    }
-                    let fcount = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
-                    pos += 2;
-                    let mut fcols = Vec::with_capacity(fcount);
+                    let fcount = reader.u16()? as usize;
+                    let mut fcols = Vec::with_capacity(fcount.min(reader.remaining() / 2));
                     for _ in 0..fcount {
-                        if pos + 2 > data.len() {
+                        if reader.remaining() < 2 {
                             return Err(crate::error::SqlError::InvalidValue(
                                 "truncated ANN filter columns".into(),
                             ));
                         }
-                        fcols.push(u16::from_le_bytes([data[pos], data[pos + 1]]));
-                        pos += 2;
+                        fcols.push(reader.u16()?);
                     }
                     idx.ann_filter_cols = fcols;
                 }
             }
         }
-        let _ = pos;
 
         let mut schema = Self::with_drops_checked(
             name,
