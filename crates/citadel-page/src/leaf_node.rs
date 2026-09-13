@@ -262,28 +262,7 @@ pub fn insert_append_direct(
     value: &[u8],
 ) -> bool {
     let pos = page.num_cells();
-    let total = LEAF_CELL_FIXED + key.len() + value.len();
-
-    if page
-        .insert_cell_direct(pos, total, |slot| {
-            write_cell_into(slot, key, val_type, value);
-        })
-        .is_some()
-    {
-        return true;
-    }
-
-    let cell_len_with_ptr = total + 2;
-    if (page.free_space() as usize) >= cell_len_with_ptr {
-        compact_page(page);
-        return page
-            .insert_cell_direct(pos, total, |slot| {
-                write_cell_into(slot, key, val_type, value);
-            })
-            .is_some();
-    }
-
-    false
+    insert_vacant_at(page, pos, key, val_type, value)
 }
 
 pub fn insert_direct(page: &mut Page, key: &[u8], val_type: ValueType, value: &[u8]) -> bool {
@@ -295,9 +274,41 @@ pub fn insert_direct(page: &mut Page, key: &[u8], val_type: ValueType, value: &[
         }
         Err(idx) => idx,
     };
+    insert_vacant_at(page, pos, key, val_type, value)
+}
 
+/// Insert using a suggested vacancy in a valid, sorted leaf. The position is
+/// advisory: bounds and both neighboring keys are checked before use. A stale
+/// position or an existing key falls back to `insert_direct`, including its
+/// replacement behavior. Returns false under the same space rules as that API.
+pub fn insert_direct_with_hint(
+    page: &mut Page,
+    pos: u16,
+    key: &[u8],
+    val_type: ValueType,
+    value: &[u8],
+) -> bool {
+    let count = page.num_cells();
+    let vacant = pos <= count
+        && (pos == 0 || read_cell(page, pos - 1).key < key)
+        && (pos == count || key < read_cell(page, pos).key);
+    if vacant {
+        insert_vacant_at(page, pos, key, val_type, value)
+    } else {
+        insert_direct(page, key, val_type, value)
+    }
+}
+
+// The caller resolved a vacant position, or removed the previous cell there.
+// Compaction changes physical offsets but preserves this logical position.
+fn insert_vacant_at(
+    page: &mut Page,
+    pos: u16,
+    key: &[u8],
+    val_type: ValueType,
+    value: &[u8],
+) -> bool {
     let total = LEAF_CELL_FIXED + key.len() + value.len();
-
     if page
         .insert_cell_direct(pos, total, |slot| {
             write_cell_into(slot, key, val_type, value);
@@ -316,7 +327,6 @@ pub fn insert_direct(page: &mut Page, key: &[u8], val_type: ValueType, value: &[
             })
             .is_some();
     }
-
     false
 }
 
@@ -330,30 +340,9 @@ pub fn replace_at(
     if update_value_in_place(page, idx, val_type, value) {
         return true;
     }
-
     let old_size = get_cell_size(page, idx);
     page.delete_cell_at(idx, old_size);
-    let total = LEAF_CELL_FIXED + key.len() + value.len();
-    if page
-        .insert_cell_direct(idx, total, |slot| {
-            write_cell_into(slot, key, val_type, value)
-        })
-        .is_some()
-    {
-        return true;
-    }
-
-    let cell_len_with_ptr = total + 2;
-    if (page.free_space() as usize) >= cell_len_with_ptr {
-        compact_page(page);
-        return page
-            .insert_cell_direct(idx, total, |slot| {
-                write_cell_into(slot, key, val_type, value)
-            })
-            .is_some();
-    }
-
-    false
+    insert_vacant_at(page, idx, key, val_type, value)
 }
 
 /// Insert key-value at sorted position. Returns false if not enough space.
