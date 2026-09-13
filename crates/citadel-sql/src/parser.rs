@@ -678,50 +678,20 @@ pub enum UnaryOp {
 }
 
 pub fn has_subquery(expr: &Expr) -> bool {
-    match expr {
-        Expr::InSubquery { .. } | Expr::Exists { .. } | Expr::ScalarSubquery(_) => true,
-        Expr::BinaryOp { left, right, .. } => has_subquery(left) || has_subquery(right),
-        Expr::UnaryOp { expr, .. } => has_subquery(expr),
-        Expr::IsNull(e) | Expr::IsNotNull(e) => has_subquery(e),
-        Expr::InList { expr, list, .. } => has_subquery(expr) || list.iter().any(has_subquery),
-        Expr::InSet { expr, .. } => has_subquery(expr),
-        Expr::Between {
-            expr, low, high, ..
-        } => has_subquery(expr) || has_subquery(low) || has_subquery(high),
-        Expr::IsDistinctFrom { left, right, .. } => has_subquery(left) || has_subquery(right),
-        Expr::Like {
-            expr,
-            pattern,
-            escape,
-            ..
-        } => {
-            has_subquery(expr)
-                || has_subquery(pattern)
-                || escape.as_ref().is_some_and(|e| has_subquery(e))
-        }
-        Expr::Case {
-            operand,
-            conditions,
-            else_result,
-        } => {
-            operand.as_ref().is_some_and(|e| has_subquery(e))
-                || conditions
-                    .iter()
-                    .any(|(c, r)| has_subquery(c) || has_subquery(r))
-                || else_result.as_ref().is_some_and(|e| has_subquery(e))
-        }
-        Expr::Coalesce(args) | Expr::Function { args, .. } => args.iter().any(has_subquery),
-        Expr::Cast { expr, .. } => has_subquery(expr),
-        Expr::ArrayLiteral(elems) => elems.iter().any(has_subquery),
-        Expr::Quantified { left, right, .. } => {
-            has_subquery(left)
-                || match right {
-                    QuantifiedRhs::Subquery(_) => true,
-                    QuantifiedRhs::Array(e) => has_subquery(e),
+    let mut found = false;
+    visit_expr(expr, &mut |candidate| {
+        found |= matches!(
+            candidate,
+            Expr::InSubquery { .. }
+                | Expr::Exists { .. }
+                | Expr::ScalarSubquery(_)
+                | Expr::Quantified {
+                    right: QuantifiedRhs::Subquery(_),
+                    ..
                 }
-        }
-        _ => false,
-    }
+        );
+    });
+    found
 }
 
 pub fn parse_sql_expr(sql: &str) -> Result<Expr> {
