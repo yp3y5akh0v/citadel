@@ -1274,3 +1274,105 @@ fn update_scratch_releases_oversized_value_buffers_on_return_error_and_panic() {
         });
     }
 }
+
+#[test]
+fn truncate_returning_admits_each_materialized_value_once_before_mutation() {
+    use citadel::{Argon2Profile, DatabaseBuilder};
+    let dir = tempfile::tempdir().unwrap();
+    let db = DatabaseBuilder::new(dir.path().join("returning-budget.db"))
+        .passphrase(b"returning-budget")
+        .argon2_profile(Argon2Profile::Iot)
+        .create()
+        .unwrap();
+    let conn = crate::Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT)")
+        .unwrap();
+    let insert = conn.prepare("INSERT INTO t VALUES($1,$2)").unwrap();
+    for id in 0..3 {
+        insert
+            .execute(&[i(id), Value::Text("x".repeat(12_000).into())])
+            .unwrap();
+    }
+    let schema = SchemaManager::load(&db).unwrap();
+    let stmt = DeleteStmt {
+        table: "t".into(),
+        where_clause: None,
+        returning: Some(vec![SelectColumn::AllColumns]),
+    };
+    let mut max = 0;
+    let mut total = 0;
+    db.begin_read()
+        .table_for_each(b"t", |_, value| {
+            max = max.max(value.len());
+            total += value.len();
+            Ok(())
+        })
+        .unwrap();
+    for allowance in [total - 1, total] {
+        let mut writer = db.begin_write().unwrap();
+        let budget = citadel_txn::ReadBudget::new(max, allowance);
+        writer.set_read_budget(Some(budget.clone()));
+        let marker = writer.mutation_marker();
+        let result = exec_delete_in_txn(&mut writer, &schema, &stmt);
+        if allowance < total {
+            assert!(matches!(
+                result,
+                Err(SqlError::Storage(
+                    citadel_core::Error::ReadBudgetExceeded { .. }
+                ))
+            ));
+            assert!(!writer.mutated_since(marker));
+            assert!(!writer.is_poisoned());
+        } else {
+            let ExecutionResult::Query(result) = result.unwrap() else {
+                panic!("missing RETURNING result")
+            };
+            assert_eq!(result.rows.len(), 3);
+            assert_eq!(budget.remaining(), 0);
+            assert_eq!(writer.table_entry_count(b"t").unwrap(), 0);
+        }
+        // Dropping restores each attempt, including the successful truncate.
+    }
+    assert_eq!(
+        conn.query("SELECT COUNT(*) FROM t").unwrap().rows,
+        [vec![i(3)]]
+    );
+    assert!(db.manager().integrity_check().unwrap().is_ok());
+}
+
+#[test]
+fn truncate_returning_checks_the_requested_fk_name_before_alias_resolution() {
+    use citadel::{Argon2Profile, DatabaseBuilder};
+    let dir = tempfile::tempdir().unwrap();
+    let db = DatabaseBuilder::new(dir.path().join("returning-alias.db"))
+        .passphrase(b"returning-alias")
+        .argon2_profile(Argon2Profile::Iot)
+        .create()
+        .unwrap();
+    let conn = crate::Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("CREATE TABLE child(id INTEGER PRIMARY KEY, p INTEGER REFERENCES parent(id))")
+        .unwrap();
+    conn.execute("CREATE TABLE temp_parent(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    let mut schema = SchemaManager::load(&db).unwrap();
+    schema.register_temp_alias("parent", "temp_parent".into());
+    let table = schema.get("parent").unwrap();
+    assert_eq!(table.name, "temp_parent");
+    assert!(schema.child_fks_for(&table.name).is_empty());
+    assert!(!schema.child_fks_for("parent").is_empty());
+    let stmt = DeleteStmt {
+        table: "parent".into(),
+        where_clause: None,
+        returning: Some(vec![SelectColumn::AllColumns]),
+    };
+    let mut writer = db.begin_write().unwrap();
+    let marker = writer.mutation_marker();
+    assert!(
+        try_truncate_delete(&mut writer, &schema, table, "parent", &stmt)
+            .unwrap()
+            .is_none()
+    );
+    assert!(!writer.mutated_since(marker));
+}

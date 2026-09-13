@@ -1954,24 +1954,10 @@ pub(super) fn exec_delete(
         super::ann_persist::purge_segment(&mut wtx, &lower_name)?;
     }
 
-    // Fast TRUNCATE path skips per-row firing; gate on no DELETE triggers (ROW
-    // + STATEMENT).
-    let has_delete_triggers = super::triggers::has_delete_triggers(schema, &table_schema.name);
-    if stmt.where_clause.is_none()
-        && schema.child_fks_for(&lower_name).is_empty()
-        && stmt.returning.is_none()
-        && !has_delete_triggers
-    {
-        let count = wtx
-            .table_truncate(lower_name.as_bytes())
-            .map_err(SqlError::Storage)?;
-        for idx in &table_schema.indices {
-            let idx_table = TableSchema::index_table_name(&lower_name, &idx.name);
-            wtx.table_truncate(&idx_table).map_err(SqlError::Storage)?;
-        }
+    if let Some(result) = try_truncate_delete(&mut wtx, schema, table_schema, &user_name, stmt)? {
         super::helpers::drain_deferred_fk_checks(&mut wtx, schema)?;
         super::commit_with_ann_publication(wtx, schema)?;
-        return Ok(ExecutionResult::RowsAffected(count));
+        return Ok(result);
     }
 
     let all_candidates = collect_keyed_rows_write(&mut wtx, table_schema, &stmt.where_clause)?;
@@ -3008,6 +2994,64 @@ pub(super) fn exec_update_in_txn(
     super::row_mutation::update_rows(wtx, schema, table_schema, stmt, matching_rows)
 }
 
+/// Without a predicate, referencing children or DELETE triggers, every live
+/// row is removed independently. RETURNING is projected after all mutations in
+/// the general row executor too, so keep its old rows and use the same projector.
+fn try_truncate_delete(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    schema: &SchemaManager,
+    table: &TableSchema,
+    requested_name: &str,
+    stmt: &DeleteStmt,
+) -> Result<Option<ExecutionResult>> {
+    if stmt.where_clause.is_some()
+        || !schema.child_fks_for(&table.name).is_empty()
+        || (requested_name != table.name && !schema.child_fks_for(requested_name).is_empty())
+        || super::triggers::has_delete_triggers(schema, &table.name)
+        // The general operation refreshes outgoing-FK rows, which also spends
+        // their materialization budget. Keep that contract for RETURNING.
+        || (stmt.returning.is_some() && !table.foreign_keys.is_empty())
+    {
+        return Ok(None);
+    }
+    let returning_rows = stmt
+        .returning
+        .as_ref()
+        .map(|_| {
+            collect_keyed_rows_write(wtx, table, &None).map(|rows| {
+                rows.into_iter()
+                    .map(|(_, old)| (Some(old), None))
+                    .collect::<Vec<_>>()
+            })
+        })
+        .transpose()?;
+    let count = if returning_rows.as_ref().is_some_and(Vec::is_empty) {
+        // An empty RETURNING operation keeps its metadata without creating a
+        // physical mutation that the ordinary row executor would not perform.
+        0
+    } else {
+        let count = wtx
+            .table_truncate(table.name.as_bytes())
+            .map_err(SqlError::Storage)?;
+        for index in &table.indices {
+            let index_table = TableSchema::index_table_name(&table.name, &index.name);
+            wtx.table_truncate(&index_table)
+                .map_err(SqlError::Storage)?;
+        }
+        count
+    };
+    let result = match (&stmt.returning, returning_rows) {
+        (Some(columns), Some(rows)) => ExecutionResult::Query(project_returning(
+            table,
+            columns,
+            &rows,
+            wtx.cancel_token(),
+        )?),
+        _ => ExecutionResult::RowsAffected(count),
+    };
+    Ok(Some(result))
+}
+
 pub(super) fn exec_delete_in_txn(
     wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
     schema: &SchemaManager,
@@ -3046,32 +3090,14 @@ pub(super) fn exec_delete_in_txn(
     if table_schema.has_ann_index() {
         super::ann_persist::purge_segment(wtx, &table_schema.name)?;
     }
-    let lower_name = table_schema.name.clone();
 
-    let has_delete_triggers_in_txn =
-        super::triggers::has_delete_triggers(schema, &table_schema.name);
-    if stmt.where_clause.is_none()
-        && schema.child_fks_for(&user_name).is_empty()
-        && stmt.returning.is_none()
-        && !has_delete_triggers_in_txn
-    {
-        let count = wtx
-            .table_truncate(lower_name.as_bytes())
-            .map_err(SqlError::Storage)?;
-        for idx in &table_schema.indices {
-            let idx_table = TableSchema::index_table_name(&lower_name, &idx.name);
-            wtx.table_truncate(&idx_table).map_err(SqlError::Storage)?;
-        }
-        return Ok(ExecutionResult::RowsAffected(count));
+    if let Some(result) = try_truncate_delete(wtx, schema, table_schema, &user_name, stmt)? {
+        return Ok(result);
     }
 
     let col_map = table_schema.column_map();
     let all_candidates = collect_keyed_rows_write(wtx, table_schema, &stmt.where_clause)?;
     let rows_to_delete = filter_keyed_rows(all_candidates, &stmt.where_clause, col_map, cancel)?;
-
-    if rows_to_delete.is_empty() {
-        return Ok(ExecutionResult::RowsAffected(0));
-    }
 
     super::row_mutation::delete_rows(
         wtx,

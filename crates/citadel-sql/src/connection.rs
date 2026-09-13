@@ -3128,6 +3128,36 @@ mod tests {
     }
 
     #[test]
+    fn late_cancellation_of_delete_returning_cannot_commit_truncated_trees() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER)")
+            .unwrap();
+        conn.execute("CREATE INDEX n_index ON t(n)").unwrap();
+        conn.execute("INSERT INTO t VALUES(1,10),(2,20)").unwrap();
+        conn.execute("BEGIN").unwrap();
+        let token = citadel::CancelToken::new();
+        db.set_cancel(Some(token.clone()));
+        let _late = cancel_after_statement(token);
+        assert!(matches!(
+            conn.query("DELETE FROM t RETURNING *"),
+            Err(SqlError::Storage(citadel_core::Error::Interrupted))
+        ));
+        db.set_cancel(None);
+        assert!(conn.execute("COMMIT").is_err());
+        assert_eq!(
+            conn.query("SELECT id FROM t WHERE n=10").unwrap().rows,
+            [vec![Value::Integer(1)]]
+        );
+        assert_eq!(
+            conn.query("SELECT id FROM t ORDER BY id").unwrap().rows,
+            [vec![Value::Integer(1)], vec![Value::Integer(2)]]
+        );
+        assert!(db.manager().integrity_check().unwrap().is_ok());
+    }
+
+    #[test]
     fn late_cancellation_restores_a_timezone_change_before_commit() {
         let dir = tempfile::tempdir().unwrap();
         let db = fresh_db(dir.path());
