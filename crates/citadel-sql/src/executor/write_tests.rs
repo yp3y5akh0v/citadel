@@ -1431,3 +1431,209 @@ fn update_context_proof_checks_nested_and_hidden_expressions() {
     table.columns[1].generated_expr = Some(crate::parser::parse_sql_expr("CURRENT_DATE").unwrap());
     assert!(!update_schema_and_expressions_context_free(&table, &stmt));
 }
+
+#[test]
+fn legacy_cross_type_stored_update_rewrites_preserve_neighbors() {
+    for text in ["7", "12345678"] {
+        for prepared in [false, true] {
+            for explicit in [false, true] {
+                let db = update_database();
+                let conn = crate::Connection::open(&db).unwrap();
+                conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY,x INTEGER NOT NULL,label TEXT,d INTEGER NOT NULL,sentinel INTEGER NOT NULL)").unwrap();
+                // Deliberately create the representation older lazy DEFAULT
+                // materialization could persist. The 8-byte text payload is the
+                // important fixed-width patch hazard; the 1-byte case must grow.
+                let mut wtx = db.begin_write().unwrap();
+                for (id, x, label) in [(1, 10, "first"), (2, 20, "second")] {
+                    wtx.table_insert(
+                        b"t",
+                        &encode_composite_key(&[i(id)]),
+                        &encode_row(&[
+                            i(x),
+                            Value::Text(label.into()),
+                            Value::Text(text.into()),
+                            i(42),
+                        ]),
+                    )
+                    .unwrap();
+                }
+                wtx.commit().unwrap();
+                assert_eq!(
+                    conn.query("SELECT d FROM t WHERE id=1").unwrap().rows,
+                    vec![vec![Value::Text(text.into())]]
+                );
+                if explicit {
+                    conn.execute("BEGIN").unwrap();
+                    conn.execute("SAVEPOINT original").unwrap();
+                }
+                for sql in [
+                    "UPDATE t SET d=9 WHERE id=1",
+                    "UPDATE t SET x=x+1 WHERE id=2",
+                    "UPDATE t SET d=9 WHERE id BETWEEN 2 AND 3",
+                ] {
+                    if prepared {
+                        assert_eq!(conn.prepare(sql).unwrap().execute(&[]).unwrap(), 1);
+                    } else {
+                        assert!(matches!(
+                            conn.execute(sql).unwrap(),
+                            crate::ExecutionResult::RowsAffected(1)
+                        ));
+                    }
+                }
+                assert_eq!(
+                    conn.query("SELECT * FROM t ORDER BY id").unwrap().rows,
+                    vec![
+                        vec![i(1), i(10), Value::Text("first".into()), i(9), i(42)],
+                        vec![i(2), i(21), Value::Text("second".into()), i(9), i(42)],
+                    ]
+                );
+                if explicit {
+                    conn.execute("ROLLBACK TO original").unwrap();
+                    assert_eq!(
+                        conn.query("SELECT d FROM t ORDER BY id").unwrap().rows,
+                        vec![
+                            vec![Value::Text(text.into())],
+                            vec![Value::Text(text.into())]
+                        ]
+                    );
+                    conn.execute("COMMIT").unwrap();
+                } else {
+                    assert_eq!(
+                        stored_update_row(&db, 2),
+                        encode_row(&[i(21), Value::Text("second".into()), i(9), i(42)])
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn legacy_range_set_and_generated_rewrites_preserve_snapshots_and_error_rollback() {
+    for prepared in [false, true] {
+        for explicit in [false, true] {
+            for late_error in [false, true] {
+                let db = update_database();
+                let conn = crate::Connection::open(&db).unwrap();
+                conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY,x INTEGER NOT NULL,y INTEGER NOT NULL,g INTEGER NOT NULL GENERATED ALWAYS AS(x+y) STORED,sentinel TEXT)").unwrap();
+                let overflow_tail = "z".repeat(citadel_core::MAX_INLINE_VALUE_SIZE + 33);
+                let old_rows = [
+                    vec![i(10), i(20), i(30), Value::Text("first".into())],
+                    vec![
+                        i(11),
+                        Value::Text("12345678".into()),
+                        i(32),
+                        Value::Text("second".into()),
+                    ],
+                    vec![
+                        i(12),
+                        i(22),
+                        Value::Text("7".into()),
+                        Value::Text("third".into()),
+                    ],
+                    vec![
+                        i(if late_error { i64::MAX } else { 13 }),
+                        i(23),
+                        Value::Null,
+                        Value::Text(overflow_tail.clone().into()),
+                    ],
+                ];
+                let mut original: Vec<Vec<u8>> =
+                    old_rows.iter().map(|row| encode_row(row)).collect();
+                // A valid V1 row whose legacy TEXT target has the same payload
+                // width as INTEGER. Other rows exercise V2 framing and NULLs.
+                let mut v1 = 4u16.to_le_bytes().to_vec();
+                v1.push(0);
+                for value in &old_rows[1] {
+                    let payload = match value {
+                        Value::Integer(value) => value.to_le_bytes().to_vec(),
+                        Value::Text(value) => value.as_bytes().to_vec(),
+                        _ => unreachable!(),
+                    };
+                    v1.push(value.data_type().type_tag());
+                    v1.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+                    v1.extend_from_slice(&payload);
+                }
+                original[1] = v1;
+                let mut tx = db.begin_write().unwrap();
+                for (index, bytes) in original.iter().enumerate() {
+                    tx.table_insert(b"t", &encode_composite_key(&[i(index as i64 + 1)]), bytes)
+                        .unwrap();
+                }
+                tx.commit().unwrap();
+                let mut old_reader = db.begin_read();
+                if explicit {
+                    conn.execute("BEGIN").unwrap();
+                    conn.execute("SAVEPOINT original").unwrap();
+                }
+                // x is patched first. Both a later SET target and generated
+                // targets can require detached replacement on following rows.
+                let sql = "UPDATE t SET x=x+1,y=9 WHERE id BETWEEN 1 AND 4";
+                let result = if prepared {
+                    conn.prepare(sql).unwrap().execute(&[])
+                } else {
+                    conn.execute(sql).map(|result| match result {
+                        crate::ExecutionResult::RowsAffected(count) => count,
+                        _ => panic!("UPDATE must report affected rows"),
+                    })
+                };
+                if late_error {
+                    assert!(
+                        matches!(result, Err(SqlError::IntegerOverflow)),
+                        "{result:?}"
+                    );
+                } else {
+                    assert_eq!(result.unwrap(), 4);
+                    let expected: Vec<Vec<Value>> = old_rows
+                        .iter()
+                        .enumerate()
+                        .map(|(index, row)| {
+                            vec![
+                                i(index as i64 + 1),
+                                i(index as i64 + 11),
+                                i(9),
+                                i(index as i64 + 20),
+                                row[3].clone(),
+                            ]
+                        })
+                        .collect();
+                    assert_eq!(
+                        conn.query("SELECT * FROM t ORDER BY id").unwrap().rows,
+                        expected
+                    );
+                }
+                // Even an error after both in-place and deferred rows must not
+                // publish that prefix; savepoint rollback restores exact bytes.
+                if explicit {
+                    conn.execute("ROLLBACK TO original").unwrap();
+                    conn.execute("COMMIT").unwrap();
+                }
+                for (index, bytes) in original.iter().enumerate() {
+                    let id = index as i64 + 1;
+                    assert_eq!(
+                        old_reader
+                            .table_get(b"t", &encode_composite_key(&[i(id)]))
+                            .unwrap()
+                            .as_deref(),
+                        Some(bytes.as_slice())
+                    );
+                    if explicit || late_error {
+                        assert_eq!(stored_update_row(&db, id), *bytes);
+                    } else {
+                        // V1 may remain V1 if all replacements fit its cells;
+                        // the public semantics and neighboring values agree.
+                        assert_eq!(
+                            crate::encoding::decode_row(&stored_update_row(&db, id)).unwrap(),
+                            vec![
+                                i(index as i64 + 11),
+                                i(9),
+                                i(index as i64 + 20),
+                                old_rows[index][3].clone()
+                            ]
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
