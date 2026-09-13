@@ -2,6 +2,7 @@ pub mod durable;
 pub mod file_lock;
 pub mod file_manager;
 pub mod memory_io;
+mod ranges;
 pub mod traits;
 
 #[cfg(all(target_os = "linux", feature = "io-uring"))]

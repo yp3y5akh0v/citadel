@@ -4,6 +4,7 @@ use std::io;
 use memmap2::{MmapMut, MmapOptions};
 use parking_lot::{Mutex, RwLock};
 
+use crate::ranges::{checked_batch_end, checked_range, checked_size};
 use crate::traits::PageIO;
 use citadel_core::{Error, Result, PAGE_SIZE};
 
@@ -25,10 +26,11 @@ impl MmapPageIO {
     pub fn try_new(file: File) -> Result<Self> {
         let current = file.metadata()?.len();
         let initial = current.max(INITIAL_MAPPING_SIZE);
+        let mapping_len = checked_size(initial)?;
         if current < initial {
             file.set_len(initial)?;
         }
-        let mmap = unsafe { MmapOptions::new().len(initial as usize).map_mut(&file)? };
+        let mmap = unsafe { MmapOptions::new().len(mapping_len).map_mut(&file)? };
         Ok(Self {
             file: Mutex::new(file),
             inner: RwLock::new(MmapInner {
@@ -60,6 +62,7 @@ impl MmapPageIO {
     }
 
     fn remap_locked(file: &File, inner: &mut MmapInner, new_size: u64) -> Result<()> {
+        let mapping_len = checked_size(new_size)?;
         if inner.size == new_size {
             return Ok(());
         }
@@ -70,7 +73,7 @@ impl MmapPageIO {
         drop(old);
         let mapped = file
             .set_len(new_size)
-            .and_then(|()| unsafe { MmapOptions::new().len(new_size as usize).map_mut(file) });
+            .and_then(|()| unsafe { MmapOptions::new().len(mapping_len).map_mut(file) });
         match mapped {
             Ok(mmap) => {
                 inner.mmap = mmap;
@@ -84,11 +87,13 @@ impl MmapPageIO {
                 inner.size = 0;
                 if let Ok(len) = file.metadata().map(|m| m.len()) {
                     if len > 0 {
-                        if let Ok(mmap) =
-                            unsafe { MmapOptions::new().len(len as usize).map_mut(file) }
-                        {
-                            inner.mmap = mmap;
-                            inner.size = len;
+                        if let Ok(mapping_len) = checked_size(len) {
+                            if let Ok(mmap) =
+                                unsafe { MmapOptions::new().len(mapping_len).map_mut(file) }
+                            {
+                                inner.mmap = mmap;
+                                inner.size = len;
+                            }
                         }
                     }
                 }
@@ -98,85 +103,73 @@ impl MmapPageIO {
     }
 }
 
+impl MmapPageIO {
+    /// Check capacity under the same lock as the copy. A concurrent truncate
+    /// may shrink the mapping after ensure_mapped returns, so retry growth
+    /// without holding the mapping lock across the file -> mapping lock order.
+    fn with_mapping_mut<T>(
+        &self,
+        needed: usize,
+        write: impl FnOnce(&mut MmapMut) -> T,
+    ) -> Result<T> {
+        loop {
+            let mut inner = self.inner.write();
+            if needed as u64 <= inner.size {
+                return Ok(write(&mut inner.mmap));
+            }
+            drop(inner);
+            self.ensure_mapped(needed as u64)?;
+        }
+    }
+
+    fn write_batch<'a>(
+        &self,
+        pages: impl Iterator<Item = (u64, &'a [u8; PAGE_SIZE])> + Clone,
+    ) -> Result<()> {
+        let end = checked_batch_end(pages.clone().map(|(offset, _)| offset))?;
+        self.with_mapping_mut(end, |mapping| {
+            for (offset, page) in pages {
+                // The complete immutable input was checked before remapping.
+                let start = offset as usize;
+                mapping[start..start + PAGE_SIZE].copy_from_slice(page);
+            }
+        })
+    }
+}
+
 impl PageIO for MmapPageIO {
     fn read_page(&self, offset: u64, buf: &mut [u8; PAGE_SIZE]) -> Result<()> {
-        let inner = self.inner.read();
-        let start = offset as usize;
-        let end = start + PAGE_SIZE;
-        if end > inner.size as usize {
-            return Err(Error::Io(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "read past end of mapping",
-            )));
-        }
-        buf.copy_from_slice(&inner.mmap[start..end]);
-        Ok(())
+        self.read_at(offset, buf)
     }
 
     fn write_page(&self, offset: u64, buf: &[u8; PAGE_SIZE]) -> Result<()> {
-        let end = offset + PAGE_SIZE as u64;
-        self.ensure_mapped(end)?;
-        let mut inner = self.inner.write();
-        inner.mmap[offset as usize..end as usize].copy_from_slice(buf);
-        Ok(())
+        self.write_at(offset, buf)
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        let range = checked_range(offset, buf.len())?;
         let inner = self.inner.read();
-        let start = offset as usize;
-        let end = start + buf.len();
-        if end > inner.size as usize {
+        if range.end as u64 > inner.size {
             return Err(Error::Io(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "read past end of mapping",
             )));
         }
-        buf.copy_from_slice(&inner.mmap[start..end]);
+        buf.copy_from_slice(&inner.mmap[range]);
         Ok(())
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
-        let end = offset + buf.len() as u64;
-        self.ensure_mapped(end)?;
-        let mut inner = self.inner.write();
-        inner.mmap[offset as usize..end as usize].copy_from_slice(buf);
-        Ok(())
+        let range = checked_range(offset, buf.len())?;
+        self.with_mapping_mut(range.end, |mapping| mapping[range].copy_from_slice(buf))
     }
 
     fn write_pages(&self, pages: &[(u64, [u8; PAGE_SIZE])]) -> Result<()> {
-        if pages.is_empty() {
-            return Ok(());
-        }
-        let max_end = pages
-            .iter()
-            .map(|(o, _)| o + PAGE_SIZE as u64)
-            .max()
-            .unwrap();
-        self.ensure_mapped(max_end)?;
-        let mut inner = self.inner.write();
-        for (offset, buf) in pages {
-            let start = *offset as usize;
-            inner.mmap[start..start + PAGE_SIZE].copy_from_slice(buf);
-        }
-        Ok(())
+        self.write_batch(pages.iter().map(|(offset, page)| (*offset, page)))
     }
 
     fn write_pages_ref(&self, pages: &[(u64, &[u8; PAGE_SIZE])]) -> Result<()> {
-        if pages.is_empty() {
-            return Ok(());
-        }
-        let max_end = pages
-            .iter()
-            .map(|(o, _)| o + PAGE_SIZE as u64)
-            .max()
-            .unwrap();
-        self.ensure_mapped(max_end)?;
-        let mut inner = self.inner.write();
-        for &(offset, buf) in pages {
-            let start = offset as usize;
-            inner.mmap[start..start + PAGE_SIZE].copy_from_slice(buf);
-        }
-        Ok(())
+        self.write_batch(pages.iter().copied())
     }
 
     fn fsync(&self) -> Result<()> {
@@ -204,17 +197,13 @@ impl PageIO for MmapPageIO {
         slot_offset: u64,
         slot_buf: &[u8],
     ) -> Result<()> {
-        let max_end = (god_offset + 1).max(slot_offset + slot_buf.len() as u64);
-        self.ensure_mapped(max_end)?;
-        let mut inner = self.inner.write();
-        // Slot before god byte: a crash between the two must leave the god
-        // byte selecting the previous commit, not a stale two-generations-old
-        // slot.
-        let slot_start = slot_offset as usize;
-        let slot_end = slot_start + slot_buf.len();
-        inner.mmap[slot_start..slot_end].copy_from_slice(slot_buf);
-        inner.mmap[god_offset as usize] = god_byte;
-        Ok(())
+        let slot = checked_range(slot_offset, slot_buf.len())?;
+        let god = checked_range(god_offset, 1)?;
+        self.with_mapping_mut(slot.end.max(god.end), |mapping| {
+            // Slot before god byte, including overlapping caller ranges.
+            mapping[slot].copy_from_slice(slot_buf);
+            mapping[god.start] = god_byte;
+        })
     }
 }
 
