@@ -492,19 +492,19 @@ pub fn read_header(bytes: &[u8]) -> Result<(JsonbType, usize, usize)> {
     let ty = JsonbType::from_nibble(h >> 4)
         .ok_or_else(|| SqlError::InvalidValue("invalid JSONB type tag".into()))?;
     let size_class = h & 0x0F;
-    let (payload_start, payload_len) = match size_class {
-        0..=11 => (1, size_class as usize),
+    let (payload_start, payload_len): (usize, u64) = match size_class {
+        0..=11 => (1, u64::from(size_class)),
         SIZE_CLASS_U8 => {
             if bytes.len() < 2 {
                 return Err(SqlError::InvalidValue("truncated JSONB header".into()));
             }
-            (2, bytes[1] as usize)
+            (2, u64::from(bytes[1]))
         }
         SIZE_CLASS_U16 => {
             if bytes.len() < 3 {
                 return Err(SqlError::InvalidValue("truncated JSONB header".into()));
             }
-            (3, u16::from_le_bytes([bytes[1], bytes[2]]) as usize)
+            (3, u64::from(u16::from_le_bytes([bytes[1], bytes[2]])))
         }
         SIZE_CLASS_U32 => {
             if bytes.len() < 5 {
@@ -512,7 +512,7 @@ pub fn read_header(bytes: &[u8]) -> Result<(JsonbType, usize, usize)> {
             }
             (
                 5,
-                u32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]) as usize,
+                u64::from(u32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]])),
             )
         }
         SIZE_CLASS_U64 => {
@@ -520,7 +520,7 @@ pub fn read_header(bytes: &[u8]) -> Result<(JsonbType, usize, usize)> {
                 return Err(SqlError::InvalidValue("truncated JSONB header".into()));
             }
             let arr: [u8; 8] = bytes[1..9].try_into().unwrap();
-            (9, u64::from_le_bytes(arr) as usize)
+            (9, u64::from_le_bytes(arr))
         }
         _ => unreachable!(),
     };
@@ -529,8 +529,12 @@ pub fn read_header(bytes: &[u8]) -> Result<(JsonbType, usize, usize)> {
         JsonbType::Integer | JsonbType::Real => Some(8),
         _ => None,
     };
-    let payload_len = fixed_payload.unwrap_or(payload_len);
-    if payload_start + payload_len > bytes.len() {
+    // Fixed-width types ignore the declared length as before. Convert only
+    // the effective length, then compare against remaining bytes without an
+    // overflowing addition (or a truncating u64 cast on 32-bit targets).
+    let payload_len = usize::try_from(fixed_payload.unwrap_or(payload_len))
+        .map_err(|_| SqlError::InvalidValue("JSONB payload truncated".into()))?;
+    if payload_len > bytes.len() - payload_start {
         return Err(SqlError::InvalidValue("JSONB payload truncated".into()));
     }
     Ok((ty, payload_start, payload_len))
