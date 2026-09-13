@@ -1,4 +1,4 @@
-use aes::Aes256;
+use aes::Aes256Enc;
 use cipher::{KeyIvInit, StreamCipher};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -7,7 +7,7 @@ use subtle::ConstantTimeEq;
 use citadel_core::types::PageId;
 use citadel_core::{BODY_SIZE, DEK_SIZE, IV_SIZE, MAC_KEY_SIZE, MAC_SIZE, PAGE_SIZE};
 
-type Aes256Ctr = ctr::Ctr128BE<Aes256>;
+type Aes256Ctr = ctr::Ctr128BE<Aes256Enc>;
 type HmacSha256 = Hmac<Sha256>;
 
 /// Encrypt: body(8160) -> [IV(16) | ciphertext(8160) | MAC(32)]

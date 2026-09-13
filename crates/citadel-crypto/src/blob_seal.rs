@@ -7,7 +7,7 @@
 //! [`crate::hkdf_utils::derive_seal_keys`]); `aad` binds the seal to its atom id so a
 //! blob cannot be replayed into another row.
 
-use aes::Aes256;
+use aes::Aes256Enc;
 use cipher::{KeyIvInit, StreamCipher};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -17,7 +17,7 @@ use citadel_core::{IV_SIZE, MAC_SIZE};
 
 use crate::hkdf_utils::SealKeys;
 
-type Aes256Ctr = ctr::Ctr128BE<Aes256>;
+type Aes256Ctr = ctr::Ctr128BE<Aes256Enc>;
 type HmacSha256 = Hmac<Sha256>;
 
 /// Seal `plaintext` to `[IV(16) | ciphertext(len) | MAC(32)]`.
