@@ -751,8 +751,8 @@ impl TxnManager {
         self.read_page_into_pool(page_id)
     }
 
-    fn read_validated_page(&self, page_id: PageId) -> Result<Page> {
-        citadel_buffer::pool::read_and_validate_with_hmac(
+    fn read_validated_page(&self, page_id: PageId) -> Result<Arc<Page>> {
+        citadel_buffer::pool::read_and_validate_shared_with_hmac(
             &*self.io,
             page_id,
             page_offset(page_id),
@@ -762,7 +762,7 @@ impl TxnManager {
     }
 
     fn read_page_into_pool(&self, page_id: PageId) -> Result<Arc<Page>> {
-        let arc = Arc::new(self.read_validated_page(page_id)?);
+        let arc = self.read_validated_page(page_id)?;
         self.pool.lock().insert_if_absent(page_id, Arc::clone(&arc));
         Ok(arc)
     }
@@ -2552,7 +2552,7 @@ impl TxnManager {
         if page.txn_id() > committed_txn_id {
             return Err(Error::DatabaseCorrupted);
         }
-        Ok(Arc::new(page))
+        Ok(page)
     }
 
     pub(crate) fn fetch_merkle_hash(

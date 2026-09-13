@@ -50,23 +50,49 @@ fn read_with_decrypt<const VALIDATE: bool>(
     let mut encrypted = [0u8; PAGE_SIZE];
     io.read_page(offset, &mut encrypted)?;
 
-    // Decrypt into the page that checksum and layout validation will inspect.
-    // Keeping a separate body would move a full page before those checks.
     let mut page = Page::default();
-    decrypt(&encrypted, page.as_bytes_mut())?;
+    decrypt_and_validate::<VALIDATE>(page_id, &encrypted, &mut page, decrypt)?;
+    Ok(page)
+}
+
+#[inline]
+fn read_shared_with_decrypt(
+    io: &dyn PageIO,
+    page_id: PageId,
+    offset: u64,
+    decrypt: impl FnOnce(&[u8; PAGE_SIZE], &mut [u8; BODY_SIZE]) -> Result<()>,
+) -> Result<Arc<Page>> {
+    let mut encrypted = [0u8; PAGE_SIZE];
+    io.read_page(offset, &mut encrypted)?;
+
+    // Allocate only after I/O succeeds. This owner cannot escape until every
+    // check succeeds, and no other strong or weak reference has been created.
+    let mut page = Arc::new(Page::default());
+    let destination = Arc::get_mut(&mut page).expect("fresh page Arc is unique");
+    decrypt_and_validate::<true>(page_id, &encrypted, destination, decrypt)?;
+    Ok(page)
+}
+
+#[inline]
+fn decrypt_and_validate<const VALIDATE: bool>(
+    page_id: PageId,
+    encrypted: &[u8; PAGE_SIZE],
+    page: &mut Page,
+    decrypt: impl FnOnce(&[u8; PAGE_SIZE], &mut [u8; BODY_SIZE]) -> Result<()>,
+) -> Result<()> {
+    // All owners decrypt into the exact page inspected below. Raw integrity
+    // callers retain their checksum-only boundary without a layout check.
+    decrypt(encrypted, page.as_bytes_mut())?;
 
     if !page.verify_checksum() {
         return Err(Error::ChecksumMismatch(page_id));
     }
 
-    // Validate the decrypted body before returning the large owned page. Both
-    // load modes share authentication/checksum ordering without materializing
-    // another intermediate Result<Page> around the raw loader.
     if VALIDATE {
         page.validate_for_read(page_id)?;
     }
 
-    Ok(page)
+    Ok(())
 }
 
 /// Load a source page for normal reads, validating its identity and structural
@@ -94,6 +120,21 @@ pub fn read_and_validate_with_hmac(
     hmac_state: &page_cipher::HmacState,
 ) -> Result<Page> {
     read_with_decrypt::<true>(io, page_id, offset, |encrypted, body| {
+        page_cipher::decrypt_page_with_hmac(dek, hmac_state, page_id, encrypted, body)
+    })
+}
+
+/// Load a normal page directly into a fresh shared owner using exact HMAC state.
+/// The Arc is allocated after successful I/O, before authentication/validation;
+/// errors discard it without exposing a page. No cache admission occurs here.
+pub fn read_and_validate_shared_with_hmac(
+    io: &dyn PageIO,
+    page_id: PageId,
+    offset: u64,
+    dek: &[u8; DEK_SIZE],
+    hmac_state: &page_cipher::HmacState,
+) -> Result<Arc<Page>> {
+    read_shared_with_decrypt(io, page_id, offset, |encrypted, body| {
         page_cipher::decrypt_page_with_hmac(dek, hmac_state, page_id, encrypted, body)
     })
 }
