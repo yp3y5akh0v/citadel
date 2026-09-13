@@ -3,6 +3,7 @@ pub mod integrity;
 pub mod manager;
 pub mod merkle;
 pub(crate) mod overflow_io;
+mod owned_pages;
 pub mod pending_free;
 mod read_budget;
 pub mod read_txn;
