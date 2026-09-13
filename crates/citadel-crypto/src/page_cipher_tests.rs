@@ -308,3 +308,84 @@ fn cached_hmac_decrypt_keeps_dek_separate_from_authentication() {
     assert_eq!(raw, cached);
     assert_ne!(cached, body);
 }
+
+// Keep the previous full cipher as an independent compatibility reference.
+type PriorFullAes256Ctr = ctr::Ctr128BE<aes::Aes256>;
+
+fn prior_full_aes_page(
+    dek: &[u8; DEK_SIZE],
+    mac_key: &[u8; MAC_KEY_SIZE],
+    page_id: PageId,
+    epoch: u32,
+    body: &[u8; BODY_SIZE],
+    iv: &[u8; IV_SIZE],
+) -> [u8; PAGE_SIZE] {
+    let mut encrypted = [0; PAGE_SIZE];
+    encrypted[..IV_SIZE].copy_from_slice(iv);
+    encrypted[IV_SIZE..IV_SIZE + BODY_SIZE].copy_from_slice(body);
+    PriorFullAes256Ctr::new(dek.into(), iv.into())
+        .apply_keystream(&mut encrypted[IV_SIZE..IV_SIZE + BODY_SIZE]);
+    let mut mac = HmacSha256::new_from_slice(mac_key).unwrap();
+    mac.update(&epoch.to_le_bytes());
+    mac.update(&page_id.as_u32().to_le_bytes());
+    mac.update(iv);
+    mac.update(&encrypted[IV_SIZE..IV_SIZE + BODY_SIZE]);
+    encrypted[IV_SIZE + BODY_SIZE..].copy_from_slice(&mac.finalize().into_bytes());
+    encrypted
+}
+
+#[test]
+fn page_ctr_bytes_and_cross_decryption_match_prior_full_aes() {
+    let mut carry_iv = [0xa6; IV_SIZE];
+    carry_iv[IV_SIZE - 2..].copy_from_slice(&[0xff, 0xfe]);
+    for (dek, mac_key, page_id, epoch) in [
+        ([0; DEK_SIZE], [0; MAC_KEY_SIZE], PageId(0), 0),
+        (
+            std::array::from_fn(|i| (i as u8).wrapping_mul(7)),
+            std::array::from_fn(|i| (i as u8).wrapping_add(0x80)),
+            PageId(u32::MAX),
+            u32::MAX,
+        ),
+    ] {
+        let body = std::array::from_fn(|i| (i as u8).wrapping_mul(31).wrapping_add(5));
+        let state = HmacState::new(&mac_key, epoch);
+        for iv in [[0; IV_SIZE], carry_iv] {
+            let prior = prior_full_aes_page(&dek, &mac_key, page_id, epoch, &body, &iv);
+            let mut current = [0; PAGE_SIZE];
+            encrypt_page_with_iv(&dek, &mac_key, page_id, epoch, &body, &iv, &mut current);
+            assert_eq!(current, prior, "fixed-IV complete page envelope changed");
+
+            let mut raw = [0xa5; BODY_SIZE];
+            let mut cached = [0x5a; BODY_SIZE];
+            decrypt_page(&dek, &mac_key, page_id, epoch, &prior, &mut raw).unwrap();
+            decrypt_page_with_hmac(&dek, &state, page_id, &prior, &mut cached).unwrap();
+            assert_eq!(raw, body);
+            assert_eq!(cached, body);
+
+            let mut old_reader = [0; BODY_SIZE];
+            old_reader.copy_from_slice(&current[IV_SIZE..IV_SIZE + BODY_SIZE]);
+            PriorFullAes256Ctr::new((&dek).into(), (&iv).into()).apply_keystream(&mut old_reader);
+            assert_eq!(old_reader, body);
+        }
+
+        // Both random-IV entry points must produce the old envelope for the IV
+        // they actually chose. This tests their bytes without replacing the RNG.
+        for cached_hmac in [false, true] {
+            let mut current = [0; PAGE_SIZE];
+            if cached_hmac {
+                encrypt_page_with_hmac(&dek, &state, page_id, &body, &mut current);
+            } else {
+                encrypt_page(&dek, &mac_key, page_id, epoch, &body, &mut current);
+            }
+            let iv: &[u8; IV_SIZE] = current[..IV_SIZE].try_into().unwrap();
+            assert_eq!(
+                current,
+                prior_full_aes_page(&dek, &mac_key, page_id, epoch, &body, iv)
+            );
+            let mut old_reader = [0; BODY_SIZE];
+            old_reader.copy_from_slice(&current[IV_SIZE..IV_SIZE + BODY_SIZE]);
+            PriorFullAes256Ctr::new((&dek).into(), iv.into()).apply_keystream(&mut old_reader);
+            assert_eq!(old_reader, body);
+        }
+    }
+}

@@ -92,3 +92,124 @@ fn cross_atom_replay_swap_rejected() {
         "blob20 must not open as atom 10"
     );
 }
+
+// Deliberately independent of the production alias and its sealing helper.
+type PriorFullAes256Ctr = ctr::Ctr128BE<aes::Aes256>;
+
+fn prior_full_aes_blob(
+    keys: &SealKeys,
+    aad: u64,
+    plaintext: &[u8],
+    iv: &[u8; citadel_core::IV_SIZE],
+) -> Vec<u8> {
+    use cipher::{KeyIvInit, StreamCipher};
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    let mut ciphertext = plaintext.to_vec();
+    PriorFullAes256Ctr::new((&keys.dek).into(), iv.into()).apply_keystream(&mut ciphertext);
+    let mut mac = Hmac::<Sha256>::new_from_slice(&keys.mac_key).unwrap();
+    mac.update(&aad.to_le_bytes());
+    mac.update(iv);
+    mac.update(&ciphertext);
+    let mut blob = Vec::new();
+    blob.extend_from_slice(iv);
+    blob.extend_from_slice(&ciphertext);
+    blob.extend_from_slice(&mac.finalize().into_bytes());
+    blob
+}
+
+#[test]
+fn blob_ctr_bytes_and_cross_open_match_prior_full_aes() {
+    use cipher::{KeyIvInit, StreamCipher};
+    use citadel_core::{IV_SIZE, MAC_SIZE};
+
+    let mut carry_iv = [0x63; IV_SIZE];
+    carry_iv[IV_SIZE - 2..].copy_from_slice(&[0xff, 0xfe]);
+    for (keys, aad) in [
+        (
+            SealKeys {
+                dek: [0; 32],
+                mac_key: [0; 32],
+            },
+            0,
+        ),
+        (
+            SealKeys {
+                dek: std::array::from_fn(|i| (i as u8).wrapping_add(0x80)),
+                mac_key: std::array::from_fn(|i| (i as u8).wrapping_mul(11)),
+            },
+            u64::MAX,
+        ),
+    ] {
+        for len in [0, 1, 15, 16, 17, 31, 32, 33, 255, 4097] {
+            let plaintext: Vec<u8> = (0..len)
+                .map(|i| (i as u8).wrapping_mul(29).wrapping_add(3))
+                .collect();
+            for iv in [[0; IV_SIZE], carry_iv] {
+                let prior = prior_full_aes_blob(&keys, aad, &plaintext, &iv);
+                assert_eq!(open(&keys, aad, &prior).unwrap(), plaintext);
+            }
+
+            let current = seal(&keys, aad, &plaintext);
+            let iv: &[u8; IV_SIZE] = current[..IV_SIZE].try_into().unwrap();
+            assert_eq!(
+                current,
+                prior_full_aes_blob(&keys, aad, &plaintext, iv),
+                "complete blob envelope changed at length {len}"
+            );
+            let mut old_reader = current[IV_SIZE..current.len() - MAC_SIZE].to_vec();
+            PriorFullAes256Ctr::new((&keys.dek).into(), iv.into()).apply_keystream(&mut old_reader);
+            assert_eq!(old_reader, plaintext);
+            assert_eq!(open(&keys, aad, &current).unwrap(), plaintext);
+        }
+    }
+}
+
+#[test]
+fn prior_full_aes_blobs_reject_tampering_and_wrong_context() {
+    use citadel_core::{Error, IV_SIZE, MAC_KEY_SIZE, MAC_SIZE};
+
+    let keys = keys(0x91);
+    let aad = 0x1020_3040_5060_7080;
+    for plaintext in [b"".as_slice(), b"seventeen bytes!!".as_slice()] {
+        let blob = prior_full_aes_blob(&keys, aad, plaintext, &[0x42; IV_SIZE]);
+        let mut offsets = vec![0, IV_SIZE - 1, blob.len() - MAC_SIZE, blob.len() - 1];
+        if !plaintext.is_empty() {
+            offsets.extend([IV_SIZE, blob.len() - MAC_SIZE - 1]);
+        }
+        for offset in offsets {
+            let mut tampered = blob.clone();
+            tampered[offset] ^= 0x80;
+            assert!(matches!(
+                open(&keys, aad, &tampered),
+                Err(Error::RegionSealTampered)
+            ));
+        }
+        let wrong_mac = SealKeys {
+            dek: keys.dek,
+            mac_key: [0x19; MAC_KEY_SIZE],
+        };
+        assert!(matches!(
+            open(&wrong_mac, aad, &blob),
+            Err(Error::RegionSealTampered)
+        ));
+        assert!(matches!(
+            open(&keys, aad + 1, &blob),
+            Err(Error::RegionSealTampered)
+        ));
+        for len in [
+            0,
+            IV_SIZE - 1,
+            IV_SIZE,
+            IV_SIZE + MAC_SIZE - 1,
+            blob.len() - 1,
+        ] {
+            assert!(matches!(
+                open(&keys, aad, &blob[..len]),
+                Err(Error::RegionSealTampered)
+            ));
+        }
+        assert_eq!(open(&keys, aad, &blob).unwrap(), plaintext);
+    }
+}
