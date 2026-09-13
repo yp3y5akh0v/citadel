@@ -1502,6 +1502,10 @@ impl TableSchema {
         None
     }
 
+    /// Build column mappings for a table or in-memory relation.
+    ///
+    /// Panics if the logical count or physical positions cannot be represented.
+    /// Stored schemas additionally require at most 32767 non-PK physical slots.
     pub fn new(
         name: String,
         columns: Vec<ColumnDef>,
@@ -1521,6 +1525,11 @@ impl TableSchema {
         )
     }
 
+    /// Build column mappings, preserving physical holes from DROP COLUMN.
+    ///
+    /// Panics if logical counts or physical positions cannot be represented, or
+    /// dropped positions are not strictly increasing and within the layout.
+    /// In-memory relation metadata may exceed the stored row's 32767-slot limit.
     pub fn with_drops(
         name: String,
         columns: Vec<ColumnDef>,
@@ -1530,12 +1539,35 @@ impl TableSchema {
         foreign_keys: Vec<ForeignKeySchemaEntry>,
         dropped_non_pk_slots: Vec<u16>,
     ) -> Self {
+        Self::with_drops_checked(
+            name,
+            columns,
+            primary_key_columns,
+            indices,
+            check_constraints,
+            foreign_keys,
+            dropped_non_pk_slots,
+        )
+        .expect("unrepresentable schema column layout")
+    }
+
+    fn with_drops_checked(
+        name: String,
+        columns: Vec<ColumnDef>,
+        primary_key_columns: Vec<u16>,
+        indices: Vec<IndexDef>,
+        check_constraints: Vec<TableCheckDef>,
+        foreign_keys: Vec<ForeignKeySchemaEntry>,
+        dropped_non_pk_slots: Vec<u16>,
+    ) -> crate::error::Result<Self> {
+        Self::validate_column_count(columns.len())?;
         let pk_idx_cache: Vec<usize> = primary_key_columns.iter().map(|&i| i as usize).collect();
         let non_pk_idx_cache: Vec<usize> = (0..columns.len())
             .filter(|i| !primary_key_columns.contains(&(*i as u16)))
             .collect();
 
-        let physical_count = non_pk_idx_cache.len() + dropped_non_pk_slots.len();
+        let physical_count =
+            Self::checked_physical_count(non_pk_idx_cache.len(), &dropped_non_pk_slots)?;
         let mut decode_mapping_cache = vec![usize::MAX; physical_count];
         let mut encoding_positions_cache = Vec::with_capacity(non_pk_idx_cache.len());
 
@@ -1560,7 +1592,7 @@ impl TableSchema {
             )
         });
 
-        Self {
+        Ok(Self {
             name,
             columns,
             primary_key_columns,
@@ -1575,7 +1607,56 @@ impl TableSchema {
             encoding_positions_cache,
             has_virtual_columns_cache,
             column_map_cache: std::sync::OnceLock::new(),
+        })
+    }
+
+    fn checked_physical_count(
+        non_pk_count: usize,
+        dropped_non_pk_slots: &[u16],
+    ) -> crate::error::Result<usize> {
+        let physical_count = non_pk_count
+            .checked_add(dropped_non_pk_slots.len())
+            .ok_or_else(|| {
+                crate::error::SqlError::InvalidValue("schema physical column count overflow".into())
+            })?;
+        if physical_count > usize::from(u16::MAX) + 1 {
+            return Err(crate::error::SqlError::InvalidValue(
+                "schema physical column position exceeds u16".into(),
+            ));
         }
+        if dropped_non_pk_slots
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+            || dropped_non_pk_slots
+                .last()
+                .is_some_and(|&slot| usize::from(slot) >= physical_count)
+        {
+            return Err(crate::error::SqlError::InvalidValue(
+                "invalid dropped physical column positions".into(),
+            ));
+        }
+        Ok(physical_count)
+    }
+
+    pub(crate) fn validate_column_count(count: usize) -> crate::error::Result<()> {
+        if count > usize::from(u16::MAX) {
+            return Err(crate::error::SqlError::InvalidValue(
+                "schema exceeds 65535 logical columns".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_storage_layout(&self) -> crate::error::Result<()> {
+        Self::validate_column_count(self.columns.len())?;
+        // Public fields may have changed since the mapping caches were built.
+        // Admission for serialization uses the columns that will be written.
+        let non_pk_count = (0..self.columns.len())
+            .filter(|i| !self.primary_key_columns.contains(&(*i as u16)))
+            .count();
+        let physical_count =
+            Self::checked_physical_count(non_pk_count, &self.dropped_non_pk_slots)?;
+        crate::encoding::validate_row_column_count(physical_count)
     }
 
     #[inline]
@@ -1785,7 +1866,11 @@ fn read_string(data: &[u8], pos: &mut usize) -> String {
 }
 
 impl TableSchema {
+    /// Serialize a stored schema. Its physical row layout must fit 32767 slots.
+    /// Panics if that precondition or the u16 logical-column count is exceeded.
     pub fn serialize(&self) -> Vec<u8> {
+        self.validate_storage_layout()
+            .expect("unrepresentable stored schema");
         let mut buf = Vec::new();
         buf.push(SCHEMA_VERSION);
 
@@ -2410,7 +2495,7 @@ impl TableSchema {
         }
         let _ = pos;
 
-        let mut schema = Self::with_drops(
+        let mut schema = Self::with_drops_checked(
             name,
             columns,
             primary_key_columns,
@@ -2418,7 +2503,8 @@ impl TableSchema {
             check_constraints,
             foreign_keys,
             dropped_non_pk_slots,
-        );
+        )?;
+        schema.validate_storage_layout()?;
         schema.flags = flags;
         Ok(schema)
     }

@@ -208,7 +208,7 @@ pub(super) fn try_fuse_view<'a>(
     }))
 }
 
-pub(super) fn build_view_schema(name: &str, view: &CteRows) -> TableSchema {
+pub(super) fn build_view_schema(name: &str, view: &CteRows) -> Result<TableSchema> {
     super::build_cte_schema(name, view)
 }
 

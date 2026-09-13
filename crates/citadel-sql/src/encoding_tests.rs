@@ -1212,3 +1212,63 @@ fn key_skip_rejects_unknown_type_tags() {
         ));
     }
 }
+
+#[test]
+fn row_count_boundary_preserves_the_last_representable_slot() {
+    let mut values = vec![Value::Null; 32767];
+    values[0] = Value::Integer(11);
+    values[32766] = Value::Integer(22);
+    let encoded = encode_row(&values);
+    assert_eq!(decode_row(&encoded).unwrap(), values);
+
+    let slots: Vec<_> = (0..32767)
+        .map(|i| {
+            if i == 0 || i == 32766 {
+                TemplateSlot::IntHole
+            } else {
+                TemplateSlot::Null
+            }
+        })
+        .collect();
+    let template = build_row_template(32767, &slots);
+    let mut out = Vec::new();
+    encode_row_with_template(&template, &values, &mut out).unwrap();
+    assert_eq!(out, encoded);
+    patch_row_column(&encode_row(&[]), 32766, &Value::Integer(22), &mut out).unwrap();
+    let decoded = decode_row(&out).unwrap();
+    assert_eq!(decoded.len(), 32767);
+    assert!(decoded[..32766].iter().all(Value::is_null));
+    assert_eq!(decoded[32766], Value::Integer(22));
+}
+
+#[test]
+fn row_count_boundary_rejects_before_clearing_output_or_count_arithmetic() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    let oversized = vec![Value::Null; 32768];
+    let mut out = vec![0xa5; 7];
+    assert!(catch_unwind(AssertUnwindSafe(|| encode_row_into(&oversized, &mut out))).is_err());
+    assert_eq!(out, vec![0xa5; 7]);
+    for count in [32768, usize::MAX] {
+        assert!(catch_unwind(|| build_row_template(count, &[])).is_err());
+    }
+    assert!(catch_unwind(|| build_row_template(1, &[])).is_err());
+    let template = build_row_template(0, &[]);
+    assert!(matches!(
+        encode_row_with_template(&template, &oversized, &mut out),
+        Err(SqlError::InvalidValue(_))
+    ));
+    assert_eq!(out, vec![0xa5; 7]);
+
+    for target in [32767, usize::MAX] {
+        let err =
+            patch_row_column(&encode_row(&[]), target, &Value::Integer(1), &mut out).unwrap_err();
+        assert!(matches!(err, SqlError::InvalidValue(_)));
+        assert_eq!(out, vec![0xa5; 7]);
+    }
+    assert!(matches!(
+        patch_row_column(&[], usize::MAX, &Value::Null, &mut out),
+        Err(SqlError::InvalidValue(message)) if message == "row data too short"
+    ));
+    assert_eq!(out, vec![0xa5; 7]);
+}

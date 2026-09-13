@@ -264,7 +264,7 @@ pub(super) fn resolve_inner_schema_with_read(
     }
     if let Some(vd) = schema.get_view(name) {
         let qr = super::exec_view_with_read(rtx, schema, vd)?;
-        return Ok(super::build_view_schema(name, &qr));
+        return super::build_view_schema(name, &qr);
     }
     Err(SqlError::TableNotFound(name.to_string()))
 }
@@ -279,7 +279,7 @@ pub(super) fn resolve_inner_schema_write(
     }
     if let Some(vd) = schema.get_view(name) {
         let qr = super::exec_view_write(wtx, schema, vd)?;
-        return Ok(super::build_view_schema(name, &qr));
+        return super::build_view_schema(name, &qr);
     }
     Err(SqlError::TableNotFound(name.to_string()))
 }
@@ -902,7 +902,7 @@ pub(super) fn decorrelate_exists_with_read(
         (ts.clone(), rows)
     } else if let Some(vd) = schema.get_view(&inner_name) {
         let vqr = super::exec_view_with_read(rtx, schema, vd)?;
-        let vs = super::build_view_schema(&inner_name, &vqr);
+        let vs = super::build_view_schema(&inner_name, &vqr)?;
         let (inner_where, _) =
             strip_correlation_predicates(&subquery.where_clause, corr_pairs, ctx, &vs);
         let col_map = ColumnMap::new(&vs.columns);

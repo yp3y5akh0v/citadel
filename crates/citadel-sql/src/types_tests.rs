@@ -842,3 +842,63 @@ fn exact_value_identity_preserves_nested_numeric_representations() {
     assert_eq!(Value::Integer(1), Value::Real(1.0));
     assert_eq!(Value::Real(0.0), Value::Real(-0.0));
 }
+
+#[test]
+fn schema_count_boundary_distinguishes_logical_metadata_and_stored_slots() {
+    assert!(TableSchema::validate_column_count(65535).is_ok());
+    assert!(TableSchema::validate_column_count(65536).is_err());
+    assert!(TableSchema::validate_column_count(usize::MAX).is_err());
+    let columns = (0..32768)
+        .map(|i| col("x", DataType::Integer, true, i))
+        .collect();
+    let schema = TableSchema::new("derived".into(), columns, vec![], vec![], vec![], vec![]);
+    assert_eq!(schema.physical_non_pk_count(), 32768);
+    assert!(matches!(
+        schema.validate_storage_layout(),
+        Err(crate::error::SqlError::InvalidValue(_))
+    ));
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| schema.serialize())).is_err());
+}
+
+#[test]
+fn schema_count_boundary_deserialize_is_fallible_for_legacy_oversized_rows() {
+    // Build V1 independently: no current serializer may create the rejected fixture.
+    fn legacy(count: u16) -> Vec<u8> {
+        let mut bytes = vec![1, 1, 0, b't'];
+        bytes.extend_from_slice(&count.to_le_bytes());
+        for position in 0..count {
+            bytes.extend_from_slice(&[1, 0, b'x', DataType::Integer.type_tag(), 1]);
+            bytes.extend_from_slice(&position.to_le_bytes());
+        }
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // No PK columns.
+        bytes
+    }
+    let accepted = TableSchema::deserialize(&legacy(32767)).unwrap();
+    assert_eq!(accepted.physical_non_pk_count(), 32767);
+    assert!(
+        matches!(TableSchema::deserialize(&legacy(32768)), Err(crate::error::SqlError::InvalidValue(message)) if message.contains("32767"))
+    );
+}
+
+#[test]
+fn schema_count_boundary_revalidates_holes_after_public_field_mutation() {
+    let mut schema = TableSchema::with_drops(
+        "t".into(),
+        vec![
+            col("id", DataType::Integer, false, 0),
+            col("v", DataType::Integer, true, 1),
+        ],
+        vec![0],
+        vec![],
+        vec![],
+        vec![],
+        vec![1],
+    );
+    assert!(schema.validate_storage_layout().is_ok());
+    // Turning the remaining live non-PK into a PK makes physical hole 1 out of range.
+    schema.primary_key_columns.push(1);
+    assert!(
+        matches!(schema.validate_storage_layout(), Err(crate::error::SqlError::InvalidValue(message)) if message.contains("dropped physical"))
+    );
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| schema.serialize())).is_err());
+}

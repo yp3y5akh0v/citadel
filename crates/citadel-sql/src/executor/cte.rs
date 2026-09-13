@@ -480,7 +480,8 @@ pub(super) fn cte_body_references_self(body: &QueryBody, name: &str) -> bool {
 /// The rows of a CTE, derived table or view, presented as a table. Collations come
 /// from the columns the rows were projected from; reporting binary loses them at the
 /// boundary, so a NOCASE column would compare byte-exact through a derived table.
-pub(super) fn build_cte_schema(name: &str, cte: &CteRows) -> TableSchema {
+pub(super) fn build_cte_schema(name: &str, cte: &CteRows) -> Result<TableSchema> {
+    TableSchema::validate_column_count(cte.result.columns.len())?;
     let columns: Vec<ColumnDef> = cte
         .result
         .columns
@@ -490,7 +491,14 @@ pub(super) fn build_cte_schema(name: &str, cte: &CteRows) -> TableSchema {
             super::helpers::projected_column(col_name.clone(), i, cte.collation_at(i))
         })
         .collect();
-    TableSchema::new(name.into(), columns, vec![], vec![], vec![], vec![])
+    Ok(TableSchema::new(
+        name.into(),
+        columns,
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+    ))
 }
 
 pub(super) fn exec_select_from_cte(
@@ -499,7 +507,7 @@ pub(super) fn exec_select_from_cte(
     exec_sub: &mut dyn FnMut(&SelectStmt) -> Result<CteRows>,
     cancel: Option<&citadel::CancelToken>,
 ) -> Result<ExecutionResult> {
-    let cte_schema = build_cte_schema(&stmt.from, cte);
+    let cte_schema = build_cte_schema(&stmt.from, cte)?;
     let actual_stmt;
     let s = if super::stmt_has_subquery(stmt) {
         actual_stmt = super::materialize_stmt(stmt, exec_sub)?;

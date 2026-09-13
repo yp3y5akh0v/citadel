@@ -77,7 +77,7 @@ fn build_cte_schema_columns_from_query_result() {
         columns: vec!["a".into(), "b".into()],
         rows: vec![],
     };
-    let ts = build_cte_schema("c", &CteRows::binary(qr));
+    let ts = build_cte_schema("c", &CteRows::binary(qr)).unwrap();
     assert_eq!(ts.name, "c");
     assert_eq!(ts.columns.len(), 2);
     assert_eq!(ts.columns[0].name, "a");
@@ -90,7 +90,7 @@ fn build_cte_schema_empty() {
         columns: vec![],
         rows: vec![Vec::<Value>::new()],
     };
-    let ts = build_cte_schema("c", &CteRows::binary(qr));
+    let ts = build_cte_schema("c", &CteRows::binary(qr)).unwrap();
     assert!(ts.columns.is_empty());
 }
 
@@ -435,4 +435,24 @@ fn cte_aggregate_filter_passes_cancellation_into_scalar_evaluation() {
     );
 
     assert_interrupted(outcome);
+}
+
+#[test]
+fn cte_schema_count_boundary_preserves_wide_metadata_and_returns_typed_error() {
+    for count in [32768, 65535, 65536] {
+        let rows = CteRows::binary(QueryResult {
+            columns: vec!["x".into(); count],
+            rows: vec![],
+        });
+        let result = build_cte_schema("wide", &rows);
+        if count <= 65535 {
+            let schema = result.unwrap();
+            assert_eq!(schema.columns.len(), count);
+            assert_eq!(usize::from(schema.columns[count - 1].position), count - 1);
+        } else {
+            assert!(
+                matches!(result, Err(SqlError::InvalidValue(message)) if message.contains("65535"))
+            );
+        }
+    }
 }

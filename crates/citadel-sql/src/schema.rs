@@ -791,6 +791,7 @@ impl SchemaManager {
         wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
         schema: &TableSchema,
     ) -> Result<()> {
+        schema.validate_storage_layout()?;
         let lower = schema.name.to_ascii_lowercase();
         let data = schema.serialize();
         wtx.table_insert(SCHEMA_TABLE, lower.as_bytes(), &data)?;

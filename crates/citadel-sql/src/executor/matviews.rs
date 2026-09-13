@@ -62,6 +62,8 @@ pub(super) fn exec_create_matview_in_txn(
         &stmt.select_parsed,
         column_names.len(),
     );
+    TableSchema::validate_column_count(column_names.len())?;
+    crate::encoding::validate_row_column_count(column_names.len().saturating_sub(1))?;
     let columns = derive_columns(&column_names, &rows, &collations);
     if columns.is_empty() {
         return Err(SqlError::Unsupported(
@@ -150,7 +152,11 @@ pub(super) fn exec_refresh_matview(
         let mut rtx = db.begin_read();
         let qr = super::cte::exec_select_query_with_read(&mut rtx, schema, &sq)?;
         match qr {
-            ExecutionResult::Query(q) => q.rows,
+            ExecutionResult::Query(q) => {
+                TableSchema::validate_column_count(q.columns.len())?;
+                crate::encoding::validate_row_column_count(q.columns.len().saturating_sub(1))?;
+                q.rows
+            }
             _ => Vec::new(),
         }
     };
@@ -218,7 +224,11 @@ pub(super) fn exec_refresh_matview_in_txn(
     reject_non_deterministic(&sq)?;
     let qr = super::cte::exec_select_query_in_txn(wtx, schema, &sq)?;
     let rows = match qr {
-        ExecutionResult::Query(q) => q.rows,
+        ExecutionResult::Query(q) => {
+            TableSchema::validate_column_count(q.columns.len())?;
+            crate::encoding::validate_row_column_count(q.columns.len().saturating_sub(1))?;
+            q.rows
+        }
         _ => Vec::new(),
     };
 

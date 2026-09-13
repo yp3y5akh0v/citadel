@@ -546,13 +546,30 @@ fn encode_cell_v2(v: &Value, buf: &mut Vec<u8>) {
     }
 }
 
+/// Maximum number of physical columns carried by either row header version.
+pub(crate) const MAX_ROW_COLUMNS: usize = COL_COUNT_MASK as usize;
+
+pub(crate) fn validate_row_column_count(count: usize) -> Result<()> {
+    if count > MAX_ROW_COLUMNS {
+        return Err(SqlError::InvalidValue(format!(
+            "encoded row exceeds {MAX_ROW_COLUMNS} physical columns"
+        )));
+    }
+    Ok(())
+}
+
+/// Encode a row. Panics if more than 32767 physical columns are supplied.
 pub fn encode_row(values: &[Value]) -> Vec<u8> {
     let mut buf = Vec::new();
     encode_row_into(values, &mut buf);
     buf
 }
 
+/// Encode a row, retaining the buffer allocation.
+///
+/// Panics before changing `buf` if more than 32767 physical columns are supplied.
 pub fn encode_row_into(values: &[Value], buf: &mut Vec<u8>) {
+    validate_row_column_count(values.len()).expect("unrepresentable encoded row");
     buf.clear();
     let col_count = values.len();
     let bitmap_bytes = col_count.div_ceil(8);
@@ -585,7 +602,11 @@ pub struct RowTemplate {
     pub slot_offsets: Vec<(usize, usize)>,
 }
 
+/// Build a template with exactly one slot description per physical column.
+/// Panics if the count exceeds 32767 or `slots.len()` differs from the count.
 pub fn build_row_template(phys_count: usize, slots: &[TemplateSlot]) -> RowTemplate {
+    validate_row_column_count(phys_count).expect("unrepresentable encoded row template");
+    assert_eq!(slots.len(), phys_count, "row template slot count differs");
     let bitmap_bytes = phys_count.div_ceil(8);
     let mut template = Vec::with_capacity(2 + bitmap_bytes + phys_count * 9);
     let header = (phys_count as u16) | V2_FLAG;
@@ -621,6 +642,7 @@ pub fn encode_row_with_template(
     values: &[Value],
     buf: &mut Vec<u8>,
 ) -> Result<()> {
+    validate_row_column_count(values.len())?;
     // NULL in an int hole removes its cell: take the generic encoder.
     if tmpl
         .slot_offsets
@@ -1525,6 +1547,11 @@ pub fn patch_row_column(
     out: &mut Vec<u8>,
 ) -> Result<()> {
     let (version, col_count, bitmap, header_end) = parse_row_header(data)?;
+    if target >= MAX_ROW_COLUMNS {
+        return Err(SqlError::InvalidValue(format!(
+            "encoded row column index must be less than {MAX_ROW_COLUMNS}"
+        )));
+    }
 
     let new_col_count = if target >= col_count {
         target + 1
