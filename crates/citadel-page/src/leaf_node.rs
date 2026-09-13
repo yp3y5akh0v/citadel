@@ -320,14 +320,28 @@ fn insert_vacant_at(
 
     let cell_len_with_ptr = total + 2;
     if (page.free_space() as usize) >= cell_len_with_ptr {
-        compact_page(page);
-        return page
-            .insert_cell_direct(pos, total, |slot| {
-                write_cell_into(slot, key, val_type, value);
-            })
-            .is_some();
+        return compact_and_insert_at(page, pos, total, key, val_type, value);
     }
     false
+}
+
+// Keep compaction allocations and retry work outside the ordinary insert path.
+// The caller already proved total free space can hold the cell and its pointer.
+#[cold]
+#[inline(never)]
+fn compact_and_insert_at(
+    page: &mut Page,
+    pos: u16,
+    total: usize,
+    key: &[u8],
+    val_type: ValueType,
+    value: &[u8],
+) -> bool {
+    compact_page(page);
+    page.insert_cell_direct(pos, total, |slot| {
+        write_cell_into(slot, key, val_type, value);
+    })
+    .is_some()
 }
 
 pub fn replace_at(
