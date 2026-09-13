@@ -298,11 +298,13 @@ gpt-4o-mini for LoCoMo, gpt-4o for LongMemEval. The protocol and results are in
 
 ## Speed benchmarks
 
-Measured on September 6, 2026 on an Intel Core i9-12900HX, Windows 11 Pro, Rust 1.98.0, and SQLite 3.51.3. Runs use one fixed logical processor, with durability disabled and both caches configured for 4,096 pages (about 32 MiB). Most cases use 100K rows; schemas and operations vary as listed below.
+Measured on September 13, 2026 on an Intel Core i9-12900HX, Windows 11 Pro, Rust 1.98.0, and SQLite 3.51.3. Runs use one fixed logical processor, with durability disabled and both caches configured for 4,096 pages (about 32 MiB). Most cases use 100K rows; schemas and operations vary as listed below.
 
-Each time is the median of two per-pass sample medians, with 100 samples per pass. Ratios use unrounded SQLite time / Citadel time: above 1 means Citadel is faster, below 1 means Citadel is slower. For example, 0.5x means Citadel takes twice as long as SQLite.
+Each time is the mean of two per-run sample medians, with 30 samples per run. Ratios use unrounded SQLite time / Citadel time: above 1 means Citadel is faster, below 1 means Citadel is slower. For example, 0.5x means Citadel takes twice as long as SQLite.
 
-Measurements combine multiple source revisions; they are not a full-suite timing run at one revision. [Per-pass measurements and source provenance](site/data/sql-benchmarks.json) identify every row.
+The complete 129-ID run at `6b41d0c3` supplies the base measurements. Eight execution pairs use later `ea8827d7` results: `insert`, `fk_cascade`, `covered_range`, `insert_select`, `upsert_dedup`, `upsert_returning`, `upsert_all_new`, and `scan`. Three UPDATE pairs (`update`, `update_gen_propagate`, `update_returning`) use `0f9362cf`. Each row uses Citadel and SQLite from the same cohort. This combined per-row snapshot is not a full-suite timing run at the latest revision. [Per-run medians, 95% intervals, drift, and source provenance](site/data/sql-benchmarks.json) identify every row.
+
+58 of the 59 aggregate SQLite/Citadel point ratios exceed 1. Generated UPDATE remains slower at **0.960x**: one matching run interval overlaps SQLite's, and the other is wholly slower. Point ratios and changes between published snapshots are not a universal speedup claim; per-run intervals and control drift remain relevant.
 
 ### Execution speed
 
@@ -311,43 +313,43 @@ Measurements combine multiple source revisions; they are not a full-suite timing
 ```
 Benchmark                     Citadel        SQLite         Ratio
 ----------------------------------------------------------------------
-join_param                    2.19 us        43.5 us        19.9x
-fts_rank_first_execution      5.26 ms        50 ms          9.49x
-insert_returning              67.1 us        283 us         4.22x
-upsert_returning              104 us         298 us         2.85x
-update_returning              78.7 us        205 us         2.6x
-sort_paginate_pk              7.78 us        19.4 us        2.5x
-delete_returning              87.6 us        219 us         2.5x
-fts_phrase                    4.43 ms        11 ms          2.47x
-fts_match                     3.71 ms        9.13 ms        2.46x
-json_extract                  17.2 ms        38.3 ms        2.22x
-scan                          6.14 ms        12.4 ms        2.02x
-window_rank                   65.8 ms        127 ms         1.93x
-window_agg                    41.5 ms        75.5 ms        1.82x
-wide_proj_full                5.39 ms        9.48 ms        1.76x
-insert_gen_stored             33.3 us        53.4 us        1.6x
-insert_gen_virtual            33.4 us        53.2 us        1.59x
-truncate                      51.5 us        77.6 us        1.51x
-insert                        33.1 us        49.5 us        1.5x
-upsert_all_new                32.9 us        49.1 us        1.49x
-covered_count                 306 us         452 us         1.48x
-upsert_dedup                  28 us          40.7 us        1.45x
-wide_proj_3col                1.13 ms        1.52 ms        1.34x
-delete                        71.7 us        94.9 us        1.32x
-wide_proj_pk                  443 us         574 us         1.3x
-wide_proj_2col                618 us         791 us         1.28x
-savepoint_create              751 ns         851 ns         1.13x
-savepoint_nested              259 us         273 us         1.06x
-savepoint_rollback            2.58 ms        2.66 ms        1.03x
-upsert_counter                72.1 us        71.7 us        0.995x
-covered_range                 94.3 us        93.6 us        0.993x
-with_dml                      123 us         116 us         0.943x
-upsert_mixed                  57.3 us        51.6 us        0.901x
-fk_cascade                    130 us         114 us         0.874x
-update                        49.3 us        39.7 us        0.805x
-update_gen_propagate          77.6 us        61.6 us        0.794x
-fk_cascade_delete_only        64 us          50.2 us        0.785x
-insert_select                 364 us         198 us         0.545x
+join_param                    2.74 us        54.1 us        19.8x
+fts_rank_first_execution      6.86 ms        64.5 ms        9.4x
+insert_returning              80.8 us        351 us         4.34x
+update_returning              78.7 us        244 us         3.1x
+upsert_returning              135 us         392 us         2.91x
+sort_paginate_pk              9.13 us        26.1 us        2.86x
+delete_returning              97.2 us        269 us         2.76x
+fts_phrase                    5.66 ms        14.6 ms        2.58x
+fts_match                     4.94 ms        12.1 ms        2.44x
+json_extract                  22.6 ms        49 ms          2.17x
+window_rank                   93.6 ms        191 ms         2.05x
+window_agg                    57 ms          112 ms         1.96x
+scan                          7.97 ms        15.2 ms        1.91x
+insert_gen_virtual            36.4 us        66.4 us        1.82x
+wide_proj_full                6.83 ms        12.1 ms        1.77x
+insert_gen_stored             37.3 us        65.7 us        1.76x
+upsert_all_new                36.2 us        63.5 us        1.76x
+wide_proj_pk                  416 us         728 us         1.75x
+truncate                      57.6 us        101 us         1.75x
+insert                        36.6 us        62.7 us        1.71x
+upsert_dedup                  31.9 us        53.7 us        1.68x
+savepoint_rollback            2.08 ms        3.22 ms        1.55x
+delete                        75.1 us        116 us         1.54x
+wide_proj_2col                651 us         998 us         1.53x
+covered_count                 377 us         561 us         1.49x
+wide_proj_3col                1.28 ms        1.89 ms        1.47x
+savepoint_nested              232 us         322 us         1.39x
+with_dml                      122 us         147 us         1.21x
+fk_cascade_delete_only        52.4 us        63.2 us        1.2x
+insert_select                 229 us         272 us         1.19x
+fk_cascade                    122 us         144 us         1.18x
+savepoint_create              916 ns         1.07 us        1.16x
+covered_range                 105 us         119 us         1.14x
+update                        45 us          49.3 us        1.09x
+upsert_mixed                  62.3 us        66 us          1.06x
+upsert_counter                81.6 us        85.9 us        1.05x
+update_gen_propagate          77.2 us        74.1 us        0.96x
 ```
 
 ### Cached repeat reads
@@ -357,28 +359,28 @@ insert_select                 364 us         198 us         0.545x
 ```
 Benchmark                     Citadel        SQLite         Ratio
 ----------------------------------------------------------------------
-correlated_in                 223 ns         2.36 s         10600000x
-fts_rank                      412 ns         49.7 ms        121000x
-correlated_exists             220 ns         8.31 ms        37700x
-jsonb_contains                1.5 us         31.4 ms        20900x
-sort_nocase                   364 ns         4.03 ms        11100x
-cte                           1.2 us         7.41 ms        6160x
-sort                          552 ns         3.27 ms        5930x
-group_by                      2.16 us        12.4 ms        5770x
-sum                           684 ns         2.35 ms        3430x
-distinct                      1.51 us        4.83 ms        3190x
-full_outer_join               20.7 us        24.9 ms        1200x
-correlated_scalar             19.5 us        22.6 ms        1160x
-recursive_cte                 229 ns         150 us         657x
-partial_index_point           218 ns         16.9 us        77.5x
-view_filter                   31.2 us        2.22 ms        71x
-filter                        31.1 us        2.21 ms        70.9x
-point                         248 ns         16.9 us        68.3x
-view_point                    254 ns         17.1 us        67.3x
-count                         655 ns         26.9 us        41x
-select_gen_virtual            1.83 us        26.6 us        14.6x
-join                          21 us          127 us         6.04x
-union                         41.4 us        197 us         4.76x
+correlated_in                 268 ns         2.86 s         10700000x
+fts_rank                      534 ns         63.8 ms        120000x
+correlated_exists             267 ns         10.1 ms        37900x
+jsonb_contains                1.81 us        40.5 ms        22400x
+sort_nocase                   446 ns         4.71 ms        10600x
+cte                           1.46 us        9.29 ms        6350x
+group_by                      2.62 us        15.9 ms        6060x
+sort                          674 ns         4.03 ms        5990x
+sum                           851 ns         2.88 ms        3390x
+distinct                      1.82 us        5.94 ms        3260x
+full_outer_join               25.7 us        31 ms          1210x
+correlated_scalar             24.1 us        28.7 ms        1190x
+recursive_cte                 267 ns         175 us         654x
+partial_index_point           269 ns         22.6 us        84.1x
+view_point                    300 ns         22.8 us        75.9x
+point                         302 ns         22.6 us        74.9x
+filter                        38.6 us        2.74 ms        70.9x
+view_filter                   38.6 us        2.65 ms        68.8x
+count                         855 ns         37.4 us        43.7x
+select_gen_virtual            2.21 us        34.5 us        15.6x
+join                          25.3 us        151 us         5.95x
+union                         50.6 us        230 us         4.54x
 ```
 
 ### Citadel-only
@@ -388,13 +390,13 @@ No SQLite comparison is reported for these seven cases. `json_table` executes ea
 ```
 Benchmark                     Citadel        SQLite         Ratio
 ----------------------------------------------------------------------
-json_table                    6.09 ms        -              -
-lateral                       2.17 us        -              -
-date_sort                     1.49 us        -              -
-date_extract                  683 ns         -              -
-date_groupby                  469 ns         -              -
-date_arith                    222 ns         -              -
-date_range_scan               218 ns         -              -
+json_table                    7.42 ms        -              -
+lateral                       2.63 us        -              -
+date_sort                     1.81 us        -              -
+date_extract                  848 ns         -              -
+date_groupby                  576 ns         -              -
+date_arith                    260 ns         -              -
+date_range_scan               257 ns         -              -
 ```
 
 ### Index comparisons
@@ -404,8 +406,8 @@ The same query within Citadel, with and without its index. Ratios are unindexed 
 ```
 Benchmark                     Without index  With index     Ratio
 ----------------------------------------------------------------------
-json_gin                      6.41 ms        4.54 us        1410x
-fts_index                     1.66 s         3.85 ms        430x
+json_gin                      8.26 ms        5.77 us        1430x
+fts_index                     1.95 s         4.76 ms        409x
 ```
 
 <details>
@@ -434,24 +436,29 @@ result collection are in [common.rs](crates/citadel-sql/benches/h2h/common.rs).
   rolls back to the sixth, releases the remaining savepoints, and commits.
   `savepoint_rollback` inserts 1K rows before a savepoint and 10K after it,
   rolls back the latter, and commits.
-- Criterion uses 100 samples, a 3-second warmup, and a 5-second measurement target
-  per arm. Slow cases run longer to complete all samples. The two passes run
-  sequentially on logical processor 0.
+- Criterion uses 30 samples, a 1-second warmup, and a 2-second measurement target
+  per arm. Slow cases run longer to complete all samples. Each cohort runs in
+  reference/candidate/candidate/reference order, serially on logical processor 0.
+  The tables use only the two candidate runs and their matching SQLite controls.
+  The data file retains the reference runs, each run's 95% median interval, and
+  within-role drift; no pooled confidence interval or overall speedup is claimed.
 - Corrected fixtures, result collection, and SQLite journaling differ from the
   earlier published measurements. A changed ratio alone does not establish an
   engine regression or improvement.
 
-Run twice at the source snapshot being measured:
+Run a case at its declared source snapshot with the recorded Criterion settings:
 
 ```sh
-cargo bench --locked -p citadeldb-sql --bench h2h_bench
+cargo bench --locked -p citadeldb-sql --bench h2h_bench -- \
+  --sample-size 30 --warm-up-time 1 --measurement-time 2 --noplot
 ```
 
-The FTS refresh used the `^fts_` filter; the window refresh used
-`^window_(rank|agg)/`. The write refresh used
-`^(update|update_gen_propagate|upsert_counter|update_returning)/` and
-`^(upsert_mixed|upsert_returning)/`. Source snapshots, executable hashes, and
-both per-pass medians are in [sql-benchmarks.json](site/data/sql-benchmarks.json).
+For a source comparison, build and preserve both source snapshots first, then run
+the same anchored case filter in reference/candidate/candidate/reference order,
+with no concurrent builds and fixed CPU affinity. The command above runs the
+current checkout; reproducing a published row requires that row's recorded
+revision and cohort. Source snapshots, executable hashes, exact Criterion IDs,
+per-run medians, and intervals are in [sql-benchmarks.json](site/data/sql-benchmarks.json).
 
 </details>
 
