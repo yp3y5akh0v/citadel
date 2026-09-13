@@ -1,6 +1,80 @@
 use citadel::{Argon2Profile, DatabaseBuilder};
 use citadel_sql::{Connection, ExecutionResult, SqlError, Value};
 
+#[test]
+fn strict_coercion_survives_add_drop_savepoint_and_reopen() {
+    for alter in [
+        "ALTER TABLE t ADD COLUMN added TEXT DEFAULT 'new'",
+        "ALTER TABLE t DROP COLUMN spare",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = create_db(dir.path());
+            let conn = Connection::open(&db).unwrap();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY,n INTEGER,spare TEXT) STRICT")
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES(1,7,'old')").unwrap();
+            let insert = conn.prepare("INSERT INTO t(id,n) VALUES($1,$2)").unwrap();
+            conn.execute("BEGIN").unwrap();
+            conn.execute("SAVEPOINT before_alter").unwrap();
+            conn.execute(alter).unwrap();
+            let error = insert
+                .execute(&[Value::Integer(2), Value::Real(1.5)])
+                .unwrap_err();
+            assert!(
+                matches!(error, SqlError::TypeMismatch { .. }),
+                "{alter}: {error:?}"
+            );
+            conn.execute("ROLLBACK TO before_alter").unwrap();
+            conn.execute("COMMIT").unwrap();
+            assert_eq!(
+                conn.query("SELECT spare FROM t").unwrap().rows,
+                vec![vec![Value::Text("old".into())]]
+            );
+            assert_eq!(
+                insert
+                    .execute(&[Value::Integer(2), Value::Text("8".into())])
+                    .unwrap(),
+                1
+            );
+            conn.execute(alter).unwrap();
+            let error = insert
+                .execute(&[Value::Integer(3), Value::Real(1.5)])
+                .unwrap_err();
+            assert!(
+                matches!(error, SqlError::TypeMismatch { .. }),
+                "{alter}: {error:?}"
+            );
+            assert_eq!(
+                insert
+                    .execute(&[Value::Integer(3), Value::Text("9".into())])
+                    .unwrap(),
+                1
+            );
+        }
+        let db = DatabaseBuilder::new(dir.path().join("test.db"))
+            .passphrase(b"x")
+            .open()
+            .unwrap();
+        let conn = Connection::open(&db).unwrap();
+        let error = conn
+            .execute("INSERT INTO t(id,n) VALUES(4,1.5)")
+            .unwrap_err();
+        assert!(
+            matches!(error, SqlError::TypeMismatch { .. }),
+            "{alter}: {error:?}"
+        );
+        assert_eq!(
+            conn.query("SELECT id,n FROM t ORDER BY id").unwrap().rows,
+            vec![
+                vec![Value::Integer(1), Value::Integer(7)],
+                vec![Value::Integer(2), Value::Integer(8)],
+                vec![Value::Integer(3), Value::Integer(9)],
+            ]
+        );
+    }
+}
+
 fn create_db(dir: &std::path::Path) -> citadel::Database {
     DatabaseBuilder::new(dir.join("test.db"))
         .passphrase(b"x")

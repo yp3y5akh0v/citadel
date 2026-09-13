@@ -1595,7 +1595,7 @@ impl TableSchema {
     /// Rebuild caches (preserving dropped slots). Use after mutating fields in place.
     pub fn rebuild(self) -> Self {
         let drops = self.dropped_non_pk_slots;
-        Self::with_drops(
+        let mut rebuilt = Self::with_drops(
             self.name,
             self.columns,
             self.primary_key_columns,
@@ -1603,7 +1603,9 @@ impl TableSchema {
             self.check_constraints,
             self.foreign_keys,
             drops,
-        )
+        );
+        rebuilt.flags = self.flags;
+        rebuilt
     }
 
     pub fn has_checks(&self) -> bool {
@@ -1734,7 +1736,7 @@ impl TableSchema {
             .cloned()
             .collect();
 
-        Self::with_drops(
+        let mut reduced = Self::with_drops(
             self.name.clone(),
             columns,
             primary_key_columns,
@@ -1742,7 +1744,9 @@ impl TableSchema {
             check_constraints,
             foreign_keys,
             new_dropped,
-        )
+        );
+        reduced.flags = self.flags;
+        reduced
     }
 }
 
