@@ -63,7 +63,7 @@ impl MmapPageIO {
 
     fn remap_locked(file: &File, inner: &mut MmapInner, new_size: u64) -> Result<()> {
         let mapping_len = checked_size(new_size)?;
-        if inner.size == new_size {
+        if inner.size == new_size && new_size != 0 {
             return Ok(());
         }
         let _ = inner.mmap.flush_async();
@@ -71,12 +71,19 @@ impl MmapPageIO {
         let dummy = MmapOptions::new().len(1).map_anon()?;
         let old = std::mem::replace(&mut inner.mmap, dummy);
         drop(old);
-        let mapped = file
-            .set_len(new_size)
-            .and_then(|()| unsafe { MmapOptions::new().len(mapping_len).map_mut(file) });
+        let mapped = file.set_len(new_size).and_then(|()| {
+            if new_size == 0 {
+                // Keep the anonymous sentinel: an empty file has no mapping.
+                Ok(None)
+            } else {
+                unsafe { MmapOptions::new().len(mapping_len).map_mut(file).map(Some) }
+            }
+        });
         match mapped {
             Ok(mmap) => {
-                inner.mmap = mmap;
+                if let Some(mmap) = mmap {
+                    inner.mmap = mmap;
+                }
                 inner.size = new_size;
                 Ok(())
             }
@@ -174,7 +181,22 @@ impl PageIO for MmapPageIO {
 
     fn fsync(&self) -> Result<()> {
         let inner = self.inner.read();
-        inner.mmap.flush()?;
+        if inner.size != 0 {
+            inner.mmap.flush()?;
+            return Ok(());
+        }
+        drop(inner);
+
+        // The empty/degraded state has only an anonymous sentinel. Sync the
+        // actual file, retaining remap's file -> mapping lock order. Recheck
+        // because a writer may have grown and mapped the file in between.
+        let file = self.file.lock();
+        let inner = self.inner.read();
+        if inner.size == 0 {
+            file.sync_all()?;
+        } else {
+            inner.mmap.flush()?;
+        }
         Ok(())
     }
 
