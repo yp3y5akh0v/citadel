@@ -325,3 +325,99 @@ fn pool_cold_misses_use_each_supplied_key_and_epoch() {
     }
     assert_eq!(pool.len(), 2);
 }
+
+#[test]
+fn loaders_preserve_nonempty_leaf_and_branch_bytes() {
+    use citadel_core::types::ValueType;
+    use citadel_page::{branch_node, leaf_node};
+
+    let io = MockIO::new();
+    let (dek, mac_key) = test_keys();
+    let epoch = 17;
+    let state = page_cipher::HmacState::new(&mac_key, epoch);
+    let mut leaf = Page::new(PageId(11), PageType::Leaf, TxnId(9));
+    assert!(leaf_node::insert(
+        &mut leaf,
+        b"alpha",
+        ValueType::Inline,
+        &[0xa5; 1537],
+    ));
+    assert!(leaf_node::insert(
+        &mut leaf,
+        b"omega",
+        ValueType::Tombstone,
+        &[],
+    ));
+    leaf.update_checksum();
+    let mut branch = Page::new(PageId(12), PageType::Branch, TxnId(9));
+    branch.set_right_child(PageId(20));
+    assert!(branch_node::insert_separator(
+        &mut branch,
+        0,
+        PageId(20),
+        b"middle",
+        PageId(21),
+    ));
+    assert!(branch_node::insert_separator(
+        &mut branch,
+        1,
+        PageId(21),
+        b"upper",
+        PageId(22),
+    ));
+    branch.update_checksum();
+
+    for page in [leaf, branch] {
+        let id = page.page_id();
+        let offset = page_offset(id);
+        page.validate_for_read(id).unwrap();
+        write_encrypted_page(&io, &page, &dek, &mac_key, epoch);
+        let loaded = [
+            read_and_decrypt(&io, id, offset, &dek, &mac_key, epoch),
+            read_and_decrypt_with_hmac(&io, id, offset, &dek, &state),
+            read_and_validate(&io, id, offset, &dek, &mac_key, epoch),
+            read_and_validate_with_hmac(&io, id, offset, &dek, &state),
+        ];
+        // Returned pages own their complete bytes after the encrypted source
+        // disappears, including payload, pointer array and unused free space.
+        io.pages.lock().remove(&offset);
+        for result in loaded {
+            assert_eq!(result.unwrap().as_bytes(), page.as_bytes());
+        }
+    }
+}
+
+#[test]
+fn load_kernel_returns_read_or_decrypt_error_before_page_validation() {
+    fn check<const VALIDATE: bool>() {
+        let io = MockIO::new();
+        let id = PageId(13);
+        let offset = page_offset(id);
+        let decrypted = std::cell::Cell::new(false);
+        let result = read_with_decrypt::<VALIDATE>(&io, id, offset, |_, _| {
+            decrypted.set(true);
+            Ok(())
+        });
+        assert!(matches!(result, Err(Error::Io(error))
+            if error.kind() == std::io::ErrorKind::NotFound));
+        assert!(!decrypted.get());
+
+        io.write_page(offset, &[0; PAGE_SIZE]).unwrap();
+        let result = read_with_decrypt::<VALIDATE>(&io, id, offset, |_, body| {
+            // A failing decrypt callback must not expose or validate whatever
+            // bytes it happened to write before reporting failure.
+            body.fill(0xff);
+            Err(Error::PageTampered(id))
+        });
+        assert!(matches!(result, Err(Error::PageTampered(actual)) if actual == id));
+
+        let expected = Page::new(id, PageType::Leaf, TxnId(1));
+        let result = read_with_decrypt::<VALIDATE>(&io, id, offset, |_, body| {
+            body.copy_from_slice(expected.as_bytes());
+            Ok(())
+        });
+        assert_eq!(result.unwrap().as_bytes(), expected.as_bytes());
+    }
+    check::<false>();
+    check::<true>();
+}

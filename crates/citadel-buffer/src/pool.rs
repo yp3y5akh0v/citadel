@@ -50,10 +50,10 @@ fn read_with_decrypt<const VALIDATE: bool>(
     let mut encrypted = [0u8; PAGE_SIZE];
     io.read_page(offset, &mut encrypted)?;
 
-    let mut body = [0u8; BODY_SIZE];
-    decrypt(&encrypted, &mut body)?;
-
-    let page = Page::from_bytes(body);
+    // Decrypt into the page that checksum and layout validation will inspect.
+    // Keeping a separate body would move a full page before those checks.
+    let mut page = Page::default();
+    decrypt(&encrypted, page.as_bytes_mut())?;
 
     if !page.verify_checksum() {
         return Err(Error::ChecksumMismatch(page_id));
