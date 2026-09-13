@@ -2175,6 +2175,17 @@ pub(crate) fn is_volatile_function_expr(name_upper: &str, args: &[Expr]) -> bool
         }
 }
 
+/// Function-local proof that evaluation is independent of the session zone,
+/// transaction/statement/live clocks, and JSONPath date context. Callers must
+/// also prove every argument; runtime text that can become `now` fails closed.
+/// RNG/tzdb volatility is conservatively excluded by the same shared rules.
+pub(crate) fn is_function_context_independent(name_upper: &str, args: &[Expr]) -> bool {
+    !is_volatile_function_expr(name_upper, args)
+        && !is_session_dependent_jsonpath_function(name_upper, args)
+        && (!matches!(name_upper, "DATE" | "TIME" | "DATETIME")
+            || matches!(args.first(), Some(Expr::Literal(_))))
+}
+
 fn literal_jsonpath_text(expr: &Expr) -> Option<&str> {
     match expr {
         Expr::Literal(Value::Text(path)) => Some(path),
@@ -2264,11 +2275,7 @@ pub(crate) fn is_statement_constant(expr: &Expr) -> bool {
         }
         Expr::Function { name, args, .. } => {
             let upper = name.to_ascii_uppercase();
-            !is_volatile_function_expr(&upper, args)
-                && !is_session_dependent_jsonpath_function(&upper, args)
-                && (!matches!(upper.as_str(), "DATE" | "TIME" | "DATETIME")
-                    || matches!(args.first(), Some(Expr::Literal(_))))
-                && args.iter().all(is_statement_constant)
+            is_function_context_independent(&upper, args) && args.iter().all(is_statement_constant)
         }
         Expr::Coalesce(args) | Expr::ArrayLiteral(args) => args.iter().all(is_statement_constant),
         Expr::InList { expr, list, .. } => {

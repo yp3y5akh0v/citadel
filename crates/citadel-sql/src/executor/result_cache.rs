@@ -418,26 +418,8 @@ fn cacheable_expr(ctx: &mut WalkCtx<'_>, expr: &Expr) -> bool {
         | Expr::TypedNullRecord(_) => true,
         Expr::Function { name, args, .. } => {
             let upper = name.to_ascii_uppercase();
-            if crate::eval::is_volatile_function(&upper, args.len()) {
-                return false;
-            }
-            if crate::eval::is_session_dependent_jsonpath_function(&upper, args) {
-                return false;
-            }
-            // Stricter than the shared check: 'now' can also arrive from
-            // column data at runtime; only literal first args are provably safe.
-            if matches!(upper.as_str(), "DATE" | "TIME" | "DATETIME") {
-                match args.first() {
-                    Some(Expr::Literal(Value::Text(s))) => {
-                        if s.trim().eq_ignore_ascii_case("now") {
-                            return false;
-                        }
-                    }
-                    Some(Expr::Literal(_)) => {}
-                    _ => return false,
-                }
-            }
-            args.iter().all(|a| cacheable_expr(ctx, a))
+            crate::eval::is_function_context_independent(&upper, args)
+                && args.iter().all(|a| cacheable_expr(ctx, a))
         }
         Expr::BinaryOp { left, op, right } => {
             // ANN index construction uses RNG; distance results can differ

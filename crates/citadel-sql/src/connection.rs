@@ -1446,10 +1446,22 @@ impl<'a> ConnectionInner<'a> {
             if !conn.savepoint_stack.is_empty() && executor::stmt_mutates(stmt) {
                 conn.capture_pending_snapshots();
             }
-            let statement_timestamp = crate::datetime::now_micros();
-            let transaction_timestamp = conn.txn_start_ts.unwrap_or(statement_timestamp);
-            let timezone = conn.session_timezone.zone.clone();
-            let jsonpath_context = conn.jsonpath_session_context(transaction_timestamp);
+            // Only a positive compiled proof covers every interpreter fallback
+            // and schema expression. Other plans retain the full statement scope.
+            let context = if plan.can_skip_session_context() {
+                None
+            } else {
+                let statement_timestamp = crate::datetime::now_micros();
+                let transaction_timestamp = conn.txn_start_ts.unwrap_or(statement_timestamp);
+                let timezone = conn.session_timezone.zone.clone();
+                let jsonpath_context = conn.jsonpath_session_context(transaction_timestamp);
+                Some((
+                    statement_timestamp,
+                    transaction_timestamp,
+                    timezone,
+                    jsonpath_context,
+                ))
+            };
             let schema = &conn.schema;
             let txn = match &mut conn.active_txn {
                 ActiveTxn::Write(wtx) => ActiveTxnRef::Write(wtx),
@@ -1464,6 +1476,11 @@ impl<'a> ConnectionInner<'a> {
                         plan.execute(db, schema, stmt, params, txn)
                     })
                 }
+            };
+            let Some((statement_timestamp, transaction_timestamp, timezone, jsonpath_context)) =
+                context
+            else {
+                return execute();
             };
             crate::datetime::with_session_timezone(timezone, || {
                 crate::datetime::with_statement_clock(Some(statement_timestamp), || {
@@ -1913,6 +1930,195 @@ mod tests {
             .unwrap()
     }
 
+    fn update_skips_context(conn: &Connection<'_>, sql: &str) -> bool {
+        let stmt = parser::parse_sql(sql).unwrap();
+        executor::compile::compile(&conn.inner.borrow().schema, &stmt)
+            .is_some_and(|plan| plan.can_skip_session_context())
+    }
+
+    #[test]
+    fn compiled_update_context_proof_excludes_schema_side_effects_and_general_plans() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, d INTEGER GENERATED ALWAYS AS (a*2+1) STORED)").unwrap();
+        for sql in [
+            "UPDATE t SET a=a+$1 WHERE id=$2",
+            "UPDATE t SET a=COALESCE(a,$1) WHERE id >= $2 RETURNING a,d",
+        ] {
+            assert!(update_skips_context(&conn, sql), "{sql}");
+        }
+        for sql in [
+            "UPDATE t SET id=$1 WHERE id=$2",
+            "UPDATE t SET a=a+1 WHERE CURRENT_TIMESTAMP IS NOT NULL",
+            "UPDATE t SET a=a+1 WHERE id=1 RETURNING CURRENT_DATE",
+            "UPDATE t SET a=(SELECT 1) WHERE id=1",
+            "DELETE FROM t WHERE id=1",
+            "SELECT a FROM t",
+            "INSERT INTO t(id,a) VALUES ($1,$2)",
+        ] {
+            assert!(!update_skips_context(&conn, sql), "{sql}");
+        }
+        conn.execute("CREATE TABLE checked (id INTEGER PRIMARY KEY, a INTEGER CHECK(a>0))")
+            .unwrap();
+        conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY, a INTEGER)")
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE child (id INTEGER PRIMARY KEY, a INTEGER REFERENCES parent(id))",
+        )
+        .unwrap();
+        conn.execute("CREATE TABLE indexed (id INTEGER PRIMARY KEY, a INTEGER)")
+            .unwrap();
+        conn.execute("CREATE INDEX a_index ON indexed(a)").unwrap();
+        conn.execute("CREATE TABLE triggered (id INTEGER PRIMARY KEY, a INTEGER)")
+            .unwrap();
+        conn.execute("CREATE TABLE audit (id INTEGER PRIMARY KEY, at TIMESTAMP)")
+            .unwrap();
+        conn.execute("CREATE TRIGGER track_update AFTER UPDATE ON triggered BEGIN INSERT INTO audit VALUES (NEW.id, CURRENT_TIMESTAMP); END").unwrap();
+        conn.execute("CREATE TABLE defaults (id INTEGER PRIMARY KEY, a INTEGER, d DATE DEFAULT CURRENT_DATE)").unwrap();
+        for table in [
+            "checked",
+            "parent",
+            "child",
+            "indexed",
+            "triggered",
+            "defaults",
+        ] {
+            let sql = format!("UPDATE {table} SET a=a+$1 WHERE id=$2");
+            assert!(!update_skips_context(&conn, &sql), "{sql}");
+        }
+    }
+
+    #[test]
+    fn pure_prepared_update_preserves_parameters_generated_rhs_and_savepoint_fallbacks() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, d INTEGER GENERATED ALWAYS AS (a*2+b) STORED)").unwrap();
+        conn.execute("INSERT INTO t(id,a,b) VALUES (1,2,10),(2,NULL,20)")
+            .unwrap();
+        let point = conn
+            .prepare("UPDATE t SET a=a+$1,b=a WHERE id=$2 RETURNING a,b,d")
+            .unwrap();
+        let range = conn
+            .prepare("UPDATE t SET a=COALESCE(a,0)+$1,b=a WHERE id >= $2 RETURNING a,b,d")
+            .unwrap();
+        conn.execute("BEGIN").unwrap();
+        let timestamp = crate::datetime::parse_timestamp("2024-01-01T00:30:00Z").unwrap();
+        conn.inner.borrow_mut().txn_start_ts = Some(timestamp);
+        conn.set_session_timezone("America/New_York").unwrap();
+        crate::eval::with_scoped_params(&[Value::Integer(99), Value::Integer(99)], || {
+            assert_eq!(
+                point
+                    .query_collect(&[Value::Integer(3), Value::Integer(1)])
+                    .unwrap()
+                    .rows,
+                vec![vec![
+                    Value::Integer(5),
+                    Value::Integer(2),
+                    Value::Integer(12)
+                ]]
+            );
+            assert_eq!(
+                crate::eval::resolve_scoped_param(1).unwrap(),
+                Value::Integer(99)
+            );
+            assert_eq!(
+                point
+                    .query_collect(&[Value::Integer(3), Value::Integer(2)])
+                    .unwrap()
+                    .rows,
+                vec![vec![Value::Null; 3]]
+            );
+            assert!(point
+                .query_collect(&[Value::Integer(1), Value::Integer(9)])
+                .unwrap()
+                .rows
+                .is_empty());
+            // A non-integer bound declines the point key encoding and executes
+            // the general RETURNING path with the same context-free predicate.
+            assert!(point
+                .query_collect(&[Value::Integer(1), Value::Null])
+                .unwrap()
+                .rows
+                .is_empty());
+        });
+        assert_eq!(conn.inner.borrow().session_timezone.date_cache, None);
+        conn.execute("SAVEPOINT before_range").unwrap();
+        conn.set_session_timezone("+05:30").unwrap();
+        assert_eq!(
+            range
+                .query_collect(&[Value::Integer(1), Value::Integer(1)])
+                .unwrap()
+                .rows,
+            vec![
+                vec![Value::Integer(6), Value::Integer(5), Value::Integer(17)],
+                vec![Value::Integer(1), Value::Null, Value::Null]
+            ]
+        );
+        assert_eq!(conn.inner.borrow().session_timezone.date_cache, None);
+        conn.execute("ROLLBACK TO before_range").unwrap();
+        assert_eq!(
+            conn.query("SELECT a,b,d FROM t ORDER BY id").unwrap().rows,
+            vec![
+                vec![Value::Integer(5), Value::Integer(2), Value::Integer(12)],
+                vec![Value::Null; 3]
+            ]
+        );
+        conn.execute("ROLLBACK").unwrap();
+        assert_eq!(
+            conn.query("SELECT a,b,d FROM t ORDER BY id").unwrap().rows,
+            vec![
+                vec![Value::Integer(2), Value::Integer(10), Value::Integer(14)],
+                vec![Value::Null, Value::Integer(20), Value::Null]
+            ]
+        );
+    }
+
+    #[test]
+    fn prepared_context_proof_recompiles_after_added_lazy_default() {
+        use jiff::civil::date;
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1,2)").unwrap();
+        let sql = "UPDATE t SET a=a+$1 WHERE id=1";
+        let update = conn.prepare(sql).unwrap();
+        assert!(update_skips_context(&conn, sql));
+        conn.execute("BEGIN").unwrap();
+        let timestamp = crate::datetime::parse_timestamp("2024-01-01T00:30:00Z").unwrap();
+        conn.inner.borrow_mut().txn_start_ts = Some(timestamp);
+        conn.set_session_timezone("-12:00").unwrap();
+        update.execute(&[Value::Integer(1)]).unwrap();
+        assert_eq!(conn.inner.borrow().session_timezone.date_cache, None);
+        conn.execute("ALTER TABLE t ADD COLUMN day DATE DEFAULT CURRENT_DATE")
+            .unwrap();
+        assert!(!update_skips_context(&conn, sql));
+        conn.set_session_timezone("+14:00").unwrap();
+        update.execute(&[Value::Integer(1)]).unwrap();
+        assert_eq!(
+            conn.inner.borrow().session_timezone.date_cache,
+            Some((timestamp, date(2024, 1, 1)))
+        );
+        conn.set_session_timezone("-12:00").unwrap();
+        // The first post-ALTER update materializes the hidden default once.
+        assert_eq!(
+            conn.query("SELECT day FROM t").unwrap().rows,
+            vec![vec![Value::Date(
+                crate::datetime::parse_date("2024-01-01").unwrap()
+            )]]
+        );
+        conn.execute("ROLLBACK").unwrap();
+        assert!(update_skips_context(&conn, sql));
+        conn.execute("BEGIN").unwrap();
+        conn.set_session_timezone("UTC").unwrap();
+        update.execute(&[Value::Integer(1)]).unwrap();
+        assert_eq!(conn.inner.borrow().session_timezone.date_cache, None);
+        conn.execute("ROLLBACK").unwrap();
+    }
+
     #[test]
     fn session_timezone_date_cache_tracks_exact_instants_and_local_midnight() {
         use jiff::civil::date;
@@ -1978,7 +2184,9 @@ mod tests {
         conn.execute("INSERT INTO clock_items VALUES (1, 0)")
             .unwrap();
         let update = conn
-            .prepare("UPDATE clock_items SET n = n + 1 WHERE id = 1")
+            .prepare(
+                "UPDATE clock_items SET n = n + 1 WHERE id = 1 AND CURRENT_TIMESTAMP IS NOT NULL",
+            )
             .unwrap();
         conn.execute("SET TIME ZONE '+05:30'").unwrap();
         conn.execute("BEGIN").unwrap();
