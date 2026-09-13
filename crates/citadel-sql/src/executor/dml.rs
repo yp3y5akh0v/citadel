@@ -1606,6 +1606,7 @@ struct InsertBufs {
     value_buf: Vec<u8>,
     col_indices: Vec<usize>,
     fk_key_buf: Vec<u8>,
+    upsert_value_buf: Vec<u8>,
 }
 
 impl InsertBufs {
@@ -1618,6 +1619,7 @@ impl InsertBufs {
             value_buf: Vec::with_capacity(256),
             col_indices: Vec::new(),
             fk_key_buf: Vec::with_capacity(64),
+            upsert_value_buf: Vec::new(),
         }
     }
 }
@@ -1628,8 +1630,19 @@ thread_local! {
 }
 
 fn with_insert_scratch<R>(f: impl FnOnce(&mut InsertBufs) -> R) -> R {
+    struct Guard<'a>(std::cell::RefMut<'a, InsertBufs>);
+    impl Drop for Guard<'_> {
+        fn drop(&mut self) {
+            if self.0.upsert_value_buf.capacity() > citadel_core::MAX_INLINE_VALUE_SIZE {
+                self.0.upsert_value_buf = Vec::new();
+            }
+        }
+    }
     INSERT_SCRATCH.with(|slot| match slot.try_borrow_mut() {
-        Ok(mut borrowed) => f(&mut borrowed),
+        Ok(borrowed) => {
+            let mut guard = Guard(borrowed);
+            f(&mut guard.0)
+        }
         Err(_) => {
             let mut local = InsertBufs::new();
             f(&mut local)
@@ -3245,6 +3258,11 @@ fn apply_fast_path_patch(
         if value.is_null() && !col.nullable && null_violation.is_none() {
             null_violation = Some(&col.name);
         }
+        // NULL arithmetic preserves the existing bitmap and has no cell to patch.
+        // Keep constraint validation above, then avoid rebuilding identical bytes.
+        if value.is_null() && matches!(old, RawColumn::Null) {
+            continue;
+        }
         if !patch_at_offset(&mut bytes, offset, &value)? {
             scratch.clear();
             patch_row_column(&bytes, fp.phys_idx, &value, &mut scratch)?;
@@ -3928,10 +3946,11 @@ fn exec_insert_trivial_fast(
 
     if let DupPolicy::Patch(fps) = &prog.on_dup {
         let cancel = wtx.cancel_token().cloned();
-        let outcome = wtx.table_upsert_with_owned::<_, SqlError>(
+        let outcome = wtx.table_upsert_with_owned_buffer::<_, SqlError>(
             table_lower.as_bytes(),
             &bufs.key_buf,
             &bufs.value_buf,
+            &mut bufs.upsert_value_buf,
             |old_bytes| {
                 let table_schema = schema
                     .get(table_lower)

@@ -673,3 +673,111 @@ fn materialize_query_body_pass_through_dml() {
     let result = materialize_query_body(&body, &mut exec_sub).unwrap();
     assert!(matches!(result, QueryBody::Insert(_)));
 }
+
+#[test]
+fn insert_scratch_bounds_upsert_retention_on_return_error_panic_and_reentry() {
+    for outcome in 0..3 {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_insert_scratch(|bufs| -> Result<()> {
+                bufs.upsert_value_buf
+                    .resize(citadel_core::MAX_INLINE_VALUE_SIZE * 3, 0x5a);
+                with_insert_scratch(|nested| {
+                    assert!(nested.upsert_value_buf.is_empty());
+                    nested.upsert_value_buf.resize(8, 0xa5);
+                });
+                assert_eq!(
+                    bufs.upsert_value_buf.len(),
+                    citadel_core::MAX_INLINE_VALUE_SIZE * 3
+                );
+                match outcome {
+                    0 => Ok(()),
+                    1 => Err(SqlError::IntegerOverflow),
+                    _ => panic!("scratch callback panicked"),
+                }
+            })
+        }));
+        match outcome {
+            0 => assert!(matches!(result, Ok(Ok(())))),
+            1 => assert!(matches!(result, Ok(Err(SqlError::IntegerOverflow)))),
+            _ => assert!(result.is_err()),
+        }
+        INSERT_SCRATCH.with(|slot| assert_eq!(slot.borrow().upsert_value_buf.capacity(), 0));
+    }
+}
+
+#[test]
+fn prepared_mixed_upsert_reuses_inline_patch_buffer_and_preserves_fallbacks() {
+    use citadel::{Argon2Profile, DatabaseBuilder};
+    let dir = tempfile::tempdir().unwrap();
+    let db = DatabaseBuilder::new(dir.path().join("mixed-buffer.db"))
+        .passphrase(b"mixed-buffer")
+        .argon2_profile(Argon2Profile::Iot)
+        .create()
+        .unwrap();
+    let conn = crate::Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, c INTEGER, d INTEGER)")
+        .unwrap();
+    let insert = conn.prepare("INSERT INTO t VALUES($1,$2,$3)").unwrap();
+    for id in 0..50 {
+        insert
+            .execute(&[i(id), if id == 3 { Value::Null } else { i(0) }, i(10)])
+            .unwrap();
+    }
+    let mixed = conn
+        .prepare("INSERT INTO t VALUES($1,1,12) ON CONFLICT(id) DO UPDATE SET c=c+1,d=d+2")
+        .unwrap();
+    INSERT_SCRATCH.with(|slot| {
+        slot.borrow_mut().upsert_value_buf = Vec::with_capacity(64);
+    });
+    let allocation = INSERT_SCRATCH.with(|slot| slot.borrow().upsert_value_buf.as_ptr());
+    conn.execute("BEGIN").unwrap();
+    for id in 0..100 {
+        mixed.execute(&[i(id)]).unwrap();
+        INSERT_SCRATCH.with(|slot| {
+            assert_eq!(
+                slot.borrow().upsert_value_buf.as_ptr(),
+                allocation,
+                "inline allocation changed while processing row {id}"
+            );
+        });
+    }
+    INSERT_SCRATCH.with(|slot| {
+        let scratch = slot.borrow();
+        assert_eq!(scratch.upsert_value_buf.as_ptr(), allocation);
+        assert!(scratch.upsert_value_buf.capacity() <= citadel_core::MAX_INLINE_VALUE_SIZE);
+    });
+    conn.execute("COMMIT").unwrap();
+    let rows = conn.query("SELECT id,c,d FROM t ORDER BY id").unwrap().rows;
+    assert_eq!(rows.len(), 100);
+    for (id, row) in rows.iter().enumerate() {
+        assert_eq!(
+            *row,
+            vec![
+                i(id as i64),
+                if id == 3 { Value::Null } else { i(1) },
+                i(12)
+            ]
+        );
+    }
+    // Cross-target expressions use the ordinary simultaneous-assignment lane.
+    let swap = conn
+        .prepare("INSERT INTO t VALUES($1,0,0) ON CONFLICT(id) DO UPDATE SET c=d,d=c RETURNING c,d")
+        .unwrap();
+    assert_eq!(
+        swap.query_collect(&[i(0)]).unwrap().rows,
+        [vec![i(12), i(1)]]
+    );
+    // The binding fallback still rejects a parameter with the wrong PK type.
+    conn.execute("BEGIN").unwrap();
+    assert!(matches!(
+        mixed.execute(&[Value::Text("50".into())]),
+        Err(SqlError::TypeMismatch { .. })
+    ));
+    mixed.execute(&[i(50)]).unwrap();
+    conn.execute("COMMIT").unwrap();
+    assert_eq!(
+        conn.query("SELECT c,d FROM t WHERE id=50").unwrap().rows,
+        [vec![i(2), i(14)]]
+    );
+    assert!(db.manager().integrity_check().unwrap().is_ok());
+}

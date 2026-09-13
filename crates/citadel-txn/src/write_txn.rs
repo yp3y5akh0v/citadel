@@ -688,6 +688,26 @@ impl<'db> WriteTxn<'db> {
         })
     }
 
+    /// Keep a match only for the detached callback operation which owns this
+    /// loaded path. Staging may rehash the map but cannot edit the source leaf.
+    fn search_loaded_leaf<'p>(
+        pages: &'p FxHashMap<PageId, Page>,
+        leaf: &mut Option<LoadedLeaf>,
+        key: &[u8],
+    ) -> Result<Option<(ValueType, &'p [u8])>> {
+        match leaf {
+            Some(leaf) => Ok(
+                BTree::search_at_leaf_ref_with_hint(pages, leaf.id, key)?.map(
+                    |(hint, kind, payload)| {
+                        leaf.hint = Some(hint);
+                        (kind, payload)
+                    },
+                ),
+            ),
+            None => Ok(None),
+        }
+    }
+
     pub fn delete(&mut self, key: &[u8]) -> Result<bool> {
         self.check_cancel()?;
         let (mut path, leaf_id) =
@@ -1250,17 +1270,7 @@ impl<'db> WriteTxn<'db> {
             key,
             &[],
         )?;
-        let found = match &mut leaf {
-            Some(leaf) => BTree::search_at_leaf_ref_with_hint(&self.pages, leaf.id, key)?.map(
-                |(hint, val_type, payload)| {
-                    // Only this detached callback operation retains the match.
-                    // Overflow staging can rehash pages but cannot edit this leaf.
-                    leaf.hint = Some(hint);
-                    (val_type, payload)
-                },
-            ),
-            None => None,
-        };
+        let found = Self::search_loaded_leaf(&self.pages, &mut leaf, key)?;
         let mut overflow_value;
         let value = match found {
             None | Some((ValueType::Tombstone, _)) => None,
@@ -1323,23 +1333,57 @@ impl<'db> WriteTxn<'db> {
         F: FnOnce(Vec<u8>) -> std::result::Result<UpsertAction, E>,
         E: From<Error>,
     {
+        self.table_upsert_with_owned_buffer(table, key, default_value, &mut Vec::new(), f)
+    }
+
+    /// Owned upsert with reusable inline scratch. The callback has the same
+    /// detached-value guarantees as [`Self::table_upsert_with_owned`]. A successful
+    /// replacement of an inline value returns its allocation to `buffer`.
+    /// Overflow reads stay local and do not replace the retained allocation.
+    ///
+    /// Scratch contents are unspecified after the call. Skip, error and panic
+    /// may consume its allocation. An inline callback can grow the replacement;
+    /// callers retaining this buffer can impose their own capacity limit.
+    pub fn table_upsert_with_owned_buffer<F, E>(
+        &mut self,
+        table: &[u8],
+        key: &[u8],
+        default_value: &[u8],
+        buffer: &mut Vec<u8>,
+        f: F,
+    ) -> std::result::Result<UpsertOutcome, E>
+    where
+        F: FnOnce(Vec<u8>) -> std::result::Result<UpsertAction, E>,
+        E: From<Error>,
+    {
         self.check_cancel()?;
         Self::validate_key_value(key, default_value)?;
         self.invalidate_fk_cache_for(table);
         self.ensure_table(table)?;
 
-        let leaf = Self::load_insert_leaf(
+        let mut leaf = Self::load_insert_leaf(
             &self.named_trees[table],
             &mut self.pages,
             self.manager,
             key,
             default_value,
         )?;
-        let found = match &leaf {
-            Some(leaf) => BTree::search_at_leaf(&self.pages, leaf.id, key)?,
-            None => None,
+        let found = Self::search_loaded_leaf(&self.pages, &mut leaf, key)?;
+        let (existing, retain_inline) = match found {
+            None | Some((ValueType::Tombstone, _)) => (None, false),
+            Some((ValueType::Overflow, payload)) => {
+                let reference = OverflowRef::from_bytes(payload);
+                (Some(self.materialize_overflow(&reference)?), false)
+            }
+            Some((_, payload)) => {
+                if let Some(budget) = &self.read_budget {
+                    budget.try_charge(payload.len())?;
+                }
+                buffer.clear();
+                buffer.extend_from_slice(payload);
+                (Some(std::mem::take(buffer)), true)
+            }
         };
-        let existing = self.materialize_value(found)?;
 
         let outcome = match existing {
             Some(old) => match f(old)? {
@@ -1347,6 +1391,9 @@ impl<'db> WriteTxn<'db> {
                 UpsertAction::Replace(new_bytes) => {
                     Self::validate_key_value(key, &new_bytes)?;
                     self.stage_and_insert_at_leaf(table, key, &new_bytes, leaf)?;
+                    if retain_inline {
+                        *buffer = new_bytes;
+                    }
                     Ok(UpsertOutcome::Updated)
                 }
             },
