@@ -2137,3 +2137,69 @@ mod checked_leaf_hint {
         );
     }
 }
+
+#[test]
+fn unavailable_or_nonleaf_append_hint_falls_back_without_changing_the_tree() {
+    for nonleaf in [false, true] {
+        let (mut pages, mut alloc, mut tree) = new_tree();
+        assert!(tree
+            .insert(
+                &mut pages,
+                &mut alloc,
+                TxnId(1),
+                b"a",
+                ValueType::Inline,
+                b"old"
+            )
+            .unwrap());
+        let leaf = tree.last_insert.as_ref().unwrap().1;
+        let held = pages.remove(&leaf).unwrap();
+        if nonleaf {
+            let mut branch = Page::new(leaf, PageType::Branch, TxnId(1));
+            branch.set_right_child(PageId(101));
+            branch.rebuild_cells(&[&branch_node::build_cell(PageId(100), b"a")]);
+            pages.insert(leaf, branch);
+        }
+        let old_root = tree.root;
+        let old_count = tree.entry_count;
+        assert_eq!(
+            tree.try_lil_insert(
+                &mut pages,
+                &mut alloc,
+                TxnId(1),
+                b"b",
+                ValueType::Inline,
+                b"new"
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(tree.root, old_root);
+        assert_eq!(tree.entry_count, old_count);
+        assert!(tree.last_insert.is_none());
+        if nonleaf {
+            assert_eq!(pages[&leaf].page_type(), Some(PageType::Branch));
+            assert_eq!(pages[&leaf].num_cells(), 1);
+            assert_eq!(pages[&leaf].right_child(), PageId(101));
+        }
+        pages.insert(leaf, held);
+        assert!(tree
+            .insert_if_absent(
+                &mut pages,
+                &mut alloc,
+                TxnId(1),
+                b"b",
+                ValueType::Inline,
+                b"new"
+            )
+            .unwrap());
+        assert_eq!(
+            tree.search(&pages, b"a").unwrap(),
+            Some((ValueType::Inline, b"old".to_vec()))
+        );
+        assert_eq!(
+            tree.search(&pages, b"b").unwrap(),
+            Some((ValueType::Inline, b"new".to_vec()))
+        );
+    }
+}
