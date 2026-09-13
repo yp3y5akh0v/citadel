@@ -2372,3 +2372,284 @@ fn lil_admission_checks_once_and_misses_do_not_enter_page_mutation() {
         }
     }
 }
+
+mod unchanged_ancestor_tests {
+    use super::*;
+
+    struct ObservedPages {
+        pages: FxHashMap<PageId, Page>,
+        mutable_branches: Vec<PageId>,
+    }
+
+    impl PageMap for ObservedPages {
+        fn get_page(&self, id: &PageId) -> Option<&Page> {
+            self.pages.get(id)
+        }
+    }
+
+    impl MutablePageMap for ObservedPages {
+        fn get_page_mut(&mut self, id: &PageId) -> Option<&mut Page> {
+            let page = self.pages.get_mut(id)?;
+            if page.page_type() == Some(PageType::Branch) {
+                self.mutable_branches.push(*id);
+            }
+            Some(page)
+        }
+
+        fn insert_page(&mut self, id: PageId, page: Page) {
+            self.pages.insert(id, page);
+        }
+
+        fn remove_page(&mut self, id: &PageId) {
+            self.pages.remove(id);
+        }
+    }
+
+    fn deep_tree() -> (ObservedPages, PageAllocator, BTree) {
+        let mut pages = FxHashMap::default();
+        let mut alloc = PageAllocator::new(0);
+        let mut leaves = Vec::new();
+        for keys in [*b"ac", *b"hj", *b"np", *b"uw"] {
+            let id = alloc.allocate();
+            let mut page = Page::new(id, PageType::Leaf, TxnId(1));
+            for key in keys {
+                assert!(leaf_node::insert_append_direct(
+                    &mut page,
+                    &[key],
+                    ValueType::Inline,
+                    b"old"
+                ));
+            }
+            pages.insert(id, page);
+            leaves.push(id);
+        }
+        let mut branches = Vec::new();
+        for (pair, separator) in [(0, b'g'), (2, b't')] {
+            let id = alloc.allocate();
+            let mut page = Page::new(id, PageType::Branch, TxnId(1));
+            page.rebuild_cells(&[&branch_node::build_cell(leaves[pair], &[separator])]);
+            page.set_right_child(leaves[pair + 1]);
+            pages.insert(id, page);
+            branches.push(id);
+        }
+        let root = alloc.allocate();
+        let mut page = Page::new(root, PageType::Branch, TxnId(1));
+        page.rebuild_cells(&[&branch_node::build_cell(branches[0], b"m")]);
+        page.set_right_child(branches[1]);
+        pages.insert(root, page);
+        (
+            ObservedPages {
+                pages,
+                mutable_branches: Vec::new(),
+            },
+            alloc,
+            BTree::from_existing(root, 3, 8),
+        )
+    }
+
+    #[test]
+    fn same_generation_insert_routes_leave_unchanged_deep_branches_immutable() {
+        for route in 0..3 {
+            let (mut pages, mut alloc, mut tree) = deep_tree();
+            let (path, leaf) = tree.walk_to_leaf(&pages, b"b").unwrap();
+            assert_eq!(path.len(), 2);
+            let original_root = tree.root;
+            let branch_bytes: Vec<_> = path
+                .iter()
+                .map(|(id, _)| (*id, pages.pages[id].as_bytes().to_vec()))
+                .collect();
+            match route {
+                0 => assert!(
+                    tree.insert_at_leaf(
+                        &mut pages,
+                        &mut alloc,
+                        TxnId(1),
+                        b"b",
+                        ValueType::Inline,
+                        b"new",
+                        path,
+                        leaf
+                    )
+                    .unwrap()
+                    .0
+                ),
+                1 => assert!(tree
+                    .insert_or_fetch_at_leaf(
+                        &mut pages,
+                        &mut alloc,
+                        TxnId(1),
+                        b"b",
+                        ValueType::Inline,
+                        b"new",
+                        path,
+                        leaf
+                    )
+                    .unwrap()
+                    .is_none()),
+                2 => assert!(tree
+                    .insert_if_absent_at_leaf(
+                        &mut pages,
+                        &mut alloc,
+                        TxnId(1),
+                        b"b",
+                        ValueType::Inline,
+                        b"new",
+                        path,
+                        leaf
+                    )
+                    .unwrap()),
+                _ => unreachable!(),
+            }
+            assert!(
+                pages.mutable_branches.is_empty(),
+                "route {route} acquired unchanged branches mutably"
+            );
+            assert_eq!(tree.root, original_root);
+            assert_eq!(tree.entry_count, 9);
+            for (id, bytes) in branch_bytes {
+                assert_eq!(pages.pages[&id].as_bytes().as_slice(), bytes);
+            }
+            for key in *b"achjnpuw" {
+                assert_eq!(
+                    tree.search(&pages, &[key]).unwrap(),
+                    Some((ValueType::Inline, b"old".to_vec()))
+                );
+            }
+            assert_eq!(
+                tree.search(&pages, b"b").unwrap(),
+                Some((ValueType::Inline, b"new".to_vec()))
+            );
+        }
+    }
+
+    #[test]
+    fn propagation_keeps_old_epoch_cow_and_updates_changed_current_child() {
+        for (key, replacement_keys) in [(b"a".as_slice(), *b"ac"), (b"h".as_slice(), *b"hj")] {
+            for epoch in [TxnId(1), TxnId(2)] {
+                let (mut pages, mut alloc, mut tree) = deep_tree();
+                let original = tree.clone();
+                let (mut path, leaf) = tree.walk_to_leaf(&pages, key).unwrap();
+                let old_path = path.clone();
+                let old_bytes: Vec<_> = path
+                    .iter()
+                    .map(|(id, _)| (*id, pages.pages[id].as_bytes().to_vec()))
+                    .collect();
+                // A public caller can request propagation with an unchanged child.
+                // Old epochs still require physical CoW; current ones do not.
+                tree.root = propagate_cow_up(&mut pages, &mut alloc, epoch, &mut path, leaf);
+                if epoch == TxnId(1) {
+                    assert_eq!(tree.root, original.root);
+                    assert_eq!(path, old_path);
+                    assert!(pages.mutable_branches.is_empty());
+                } else {
+                    assert_ne!(tree.root, original.root);
+                    assert_eq!(pages.mutable_branches.len(), 2);
+                    for ((old, _), (new, _)) in old_path.iter().zip(&path) {
+                        assert_ne!(old, new);
+                        assert_eq!(pages.pages[new].txn_id(), epoch);
+                    }
+                }
+                for (id, bytes) in old_bytes {
+                    assert_eq!(pages.pages[&id].as_bytes().as_slice(), bytes);
+                }
+                assert_eq!(
+                    original.search(&pages, key).unwrap(),
+                    Some((ValueType::Inline, b"old".to_vec()))
+                );
+
+                let replacement = alloc.allocate();
+                let mut page = Page::new(replacement, PageType::Leaf, epoch);
+                for replacement_key in replacement_keys {
+                    assert!(leaf_node::insert_append_direct(
+                        &mut page,
+                        &[replacement_key],
+                        ValueType::Inline,
+                        b"replacement"
+                    ));
+                }
+                pages.insert_page(replacement, page);
+                pages.mutable_branches.clear();
+                let root_before = tree.root;
+                tree.root = propagate_cow_up(&mut pages, &mut alloc, epoch, &mut path, replacement);
+                assert_eq!(tree.root, root_before);
+                assert_eq!(
+                    pages.mutable_branches,
+                    [path[1].0],
+                    "only the changed pointer's current parent needs mutable access"
+                );
+                assert_eq!(
+                    tree.search(&pages, key).unwrap(),
+                    Some((ValueType::Inline, b"replacement".to_vec()))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn full_leaf_split_still_propagates_and_preserves_old_deep_root() {
+        let (mut pages, mut alloc, mut tree) = deep_tree();
+        let (path, leaf) = tree.walk_to_leaf(&pages, b"b00000").unwrap();
+        let mut packed = Page::new(leaf, PageType::Leaf, TxnId(1));
+        let payload = vec![0x52; citadel_core::MAX_INLINE_VALUE_SIZE];
+        let mut original_keys = Vec::new();
+        for index in 0..1000 {
+            let key = format!("a{index:05}").into_bytes();
+            if !leaf_node::insert_append_direct(&mut packed, &key, ValueType::Inline, &payload) {
+                break;
+            }
+            original_keys.push(key);
+        }
+        assert!(original_keys.len() >= 2 && original_keys.len() < 1000);
+        pages.pages.insert(leaf, packed);
+        tree.entry_count = 6 + original_keys.len() as u64;
+        let original = tree.clone();
+        let old_root_bytes = pages.pages[&original.root].as_bytes().to_vec();
+        let before_pages = pages.pages.len();
+        assert!(
+            tree.insert_at_leaf(
+                &mut pages,
+                &mut alloc,
+                TxnId(2),
+                b"b00000",
+                ValueType::Inline,
+                &payload,
+                path,
+                leaf
+            )
+            .unwrap()
+            .0
+        );
+        assert_ne!(tree.root, original.root);
+        assert!(
+            pages.pages.len() >= before_pages + 4,
+            "leaf split plus two old ancestors must allocate physical pages"
+        );
+        assert!(!pages.mutable_branches.is_empty());
+        assert_eq!(
+            pages.pages[&original.root].as_bytes().as_slice(),
+            old_root_bytes
+        );
+        assert_eq!(original.search(&pages, b"b00000").unwrap(), None);
+        assert_eq!(
+            tree.search(&pages, b"b00000").unwrap(),
+            Some((ValueType::Inline, payload.clone()))
+        );
+        for key in original_keys {
+            assert_eq!(
+                original.search(&pages, &key).unwrap(),
+                Some((ValueType::Inline, payload.clone()))
+            );
+            assert_eq!(
+                tree.search(&pages, &key).unwrap(),
+                Some((ValueType::Inline, payload.clone()))
+            );
+        }
+        for key in *b"hjnpuw" {
+            assert_eq!(
+                tree.search(&pages, &[key]).unwrap(),
+                Some((ValueType::Inline, b"old".to_vec()))
+            );
+        }
+        assert_eq!(tree.entry_count, original.entry_count + 1);
+    }
+}

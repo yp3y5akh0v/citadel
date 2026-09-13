@@ -560,15 +560,12 @@ impl BTree {
             let mut moved: Vec<(PageId, PageId)> = Vec::new();
             for i in (0..new_path.len()).rev() {
                 let (ancestor_id, child_idx) = new_path[i];
-                let new_ancestor = cow_page(pages, alloc, ancestor_id, txn_id);
+                let (new_ancestor, rightmost_child) =
+                    update_ancestor_child(pages, alloc, txn_id, ancestor_id, child_idx, child);
                 if new_ancestor != ancestor_id {
                     moved.push((ancestor_id, new_ancestor));
                 }
-                let page = pages.get_page_mut(&new_ancestor).unwrap();
-                update_branch_child(page, child_idx, child);
-                if child_idx != page.num_cells() as usize {
-                    is_rightmost = false;
-                }
+                is_rightmost &= rightmost_child;
                 new_path[i] = (new_ancestor, child_idx);
                 child = new_ancestor;
             }
@@ -733,15 +730,12 @@ impl BTree {
             let mut moved: Vec<(PageId, PageId)> = Vec::new();
             for i in (0..new_path.len()).rev() {
                 let (ancestor_id, child_idx) = new_path[i];
-                let new_ancestor = cow_page(pages, alloc, ancestor_id, txn_id);
+                let (new_ancestor, rightmost_child) =
+                    update_ancestor_child(pages, alloc, txn_id, ancestor_id, child_idx, child);
                 if new_ancestor != ancestor_id {
                     moved.push((ancestor_id, new_ancestor));
                 }
-                let page = pages.get_page_mut(&new_ancestor).unwrap();
-                update_branch_child(page, child_idx, child);
-                if child_idx != page.num_cells() as usize {
-                    is_rightmost = false;
-                }
+                is_rightmost &= rightmost_child;
                 new_path[i] = (new_ancestor, child_idx);
                 child = new_ancestor;
             }
@@ -893,15 +887,12 @@ impl BTree {
             let mut moved: Vec<(PageId, PageId)> = Vec::new();
             for i in (0..new_path.len()).rev() {
                 let (ancestor_id, child_idx) = new_path[i];
-                let new_ancestor = cow_page(pages, alloc, ancestor_id, txn_id);
+                let (new_ancestor, rightmost_child) =
+                    update_ancestor_child(pages, alloc, txn_id, ancestor_id, child_idx, child);
                 if new_ancestor != ancestor_id {
                     moved.push((ancestor_id, new_ancestor));
                 }
-                let page = pages.get_page_mut(&new_ancestor).unwrap();
-                update_branch_child(page, child_idx, child);
-                if child_idx != page.num_cells() as usize {
-                    is_rightmost = false;
-                }
+                is_rightmost &= rightmost_child;
                 new_path[i] = (new_ancestor, child_idx);
                 child = new_ancestor;
             }
@@ -1217,6 +1208,31 @@ fn update_branch_child(page: &mut Page, child_idx: usize, new_child: PageId) {
     }
 }
 
+/// Return the ancestor's physical ID and whether this is its rightmost child.
+/// Epoch-based commit and Merkle traversal select current-generation pages
+/// independently of mutable access. An equal child ID changes no branch bytes.
+/// Older physical generations must still CoW, even when the pointer matches.
+fn update_ancestor_child(
+    pages: &mut impl MutablePageMap,
+    alloc: &mut PageAllocator,
+    txn_id: TxnId,
+    ancestor_id: PageId,
+    child_idx: usize,
+    child: PageId,
+) -> (PageId, bool) {
+    let rightmost = {
+        let page = pages.get_page(&ancestor_id).unwrap();
+        let rightmost = child_idx == page.num_cells() as usize;
+        if page.txn_id() == txn_id && branch_node::get_child(page, child_idx) == child {
+            return (ancestor_id, rightmost);
+        }
+        rightmost
+    };
+    let ancestor = cow_page(pages, alloc, ancestor_id, txn_id);
+    update_branch_child(pages.get_page_mut(&ancestor).unwrap(), child_idx, child);
+    (ancestor, rightmost)
+}
+
 pub fn propagate_cow_up(
     pages: &mut impl MutablePageMap,
     alloc: &mut PageAllocator,
@@ -1226,9 +1242,8 @@ pub fn propagate_cow_up(
 ) -> PageId {
     for i in (0..path.len()).rev() {
         let (ancestor_id, child_idx) = path[i];
-        let new_ancestor = cow_page(pages, alloc, ancestor_id, txn_id);
-        let page = pages.get_page_mut(&new_ancestor).unwrap();
-        update_branch_child(page, child_idx, new_child);
+        let (new_ancestor, _) =
+            update_ancestor_child(pages, alloc, txn_id, ancestor_id, child_idx, new_child);
         path[i] = (new_ancestor, child_idx);
         new_child = new_ancestor;
     }

@@ -462,3 +462,73 @@ fn recomputing_gives_same_hash() {
 
     assert_eq!(h1, h2);
 }
+
+#[test]
+fn unchanged_branch_ids_do_not_hide_merkle_updates_after_mid_epoch_hash_refresh() {
+    use citadel_buffer::allocator::PageAllocator;
+    use citadel_buffer::btree::BTree;
+    use rustc_hash::FxHashMap;
+
+    for parent_epoch in [TxnId(1), TxnId(2)] {
+        let current = TxnId(2);
+        let mut pages = FxHashMap::default();
+        pages.insert(
+            PageId(0),
+            make_branch(PageId(0), parent_epoch, &[(PageId(1), b"m")], PageId(2)),
+        );
+        pages.insert(
+            PageId(1),
+            make_leaf(PageId(1), current, &[(b"a", b"old"), (b"c", b"old")]),
+        );
+        pages.insert(
+            PageId(2),
+            make_leaf(PageId(2), TxnId(1), &[(b"z", b"untouched")]),
+        );
+        let mut tree = BTree::from_existing(PageId(0), 2, 3);
+        let mut alloc = PageAllocator::new(3);
+        // A hash refresh does not end an epoch or clear its physical txn ID.
+        // An unusual public caller can also retain an older parent above a
+        // current-generation leaf; it must not suppress the parent's CoW.
+        let old_hash = compute_tree_merkle(&mut pages, tree.root, TxnId(1), &|_| {
+            panic!("all pages resident")
+        })
+        .unwrap();
+        let old_parent = pages[&tree.root].as_bytes().to_vec();
+        let (path, leaf) = tree.walk_to_leaf(&pages, b"b").unwrap();
+        assert!(
+            tree.insert_at_leaf(
+                &mut pages,
+                &mut alloc,
+                current,
+                b"b",
+                ValueType::Inline,
+                b"new",
+                path,
+                leaf
+            )
+            .unwrap()
+            .0
+        );
+        assert_eq!(pages[&tree.root].txn_id(), current);
+        if parent_epoch == current {
+            assert_eq!(tree.root, PageId(0));
+            assert_eq!(pages[&tree.root].as_bytes().as_slice(), old_parent);
+        } else {
+            assert_ne!(tree.root, PageId(0));
+            assert_eq!(pages[&PageId(0)].as_bytes().as_slice(), old_parent);
+        }
+        let incremental = compute_tree_merkle(&mut pages, tree.root, current, &|_| {
+            panic!("all pages resident")
+        })
+        .unwrap();
+        let full = compute_tree_merkle(&mut pages, tree.root, TxnId(1), &|_| {
+            panic!("all pages resident")
+        })
+        .unwrap();
+        assert_ne!(incremental, old_hash);
+        assert_eq!(
+            incremental, full,
+            "an unchanged pointer must not retain a stale parent hash"
+        );
+    }
+}
