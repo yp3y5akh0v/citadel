@@ -1343,6 +1343,7 @@ fn insert_or_fetch_budget_failure_after_overflow_staging_poison_transaction() {
 #[derive(Clone, Copy)]
 enum CallbackWriteRoute {
     Upsert,
+    UpsertWithBuffer,
     Update,
     UpdateWithBuffer,
 }
@@ -1350,6 +1351,11 @@ enum CallbackWriteRoute {
 #[test]
 fn upsert_split_overflow_and_savepoint_preserve_deep_tree_snapshots() {
     exercise_callback_split_overflow_and_savepoint(CallbackWriteRoute::Upsert);
+}
+
+#[test]
+fn buffered_upsert_split_overflow_and_savepoint_preserve_deep_tree_snapshots() {
+    exercise_callback_split_overflow_and_savepoint(CallbackWriteRoute::UpsertWithBuffer);
 }
 
 #[test]
@@ -1392,6 +1398,23 @@ fn exercise_callback_split_overflow_and_savepoint(route: CallbackWriteRoute) {
                 CallbackWriteRoute::Update => writer.table_update_with(b"deep", key, update),
                 CallbackWriteRoute::UpdateWithBuffer => {
                     writer.table_update_with_buffer(b"deep", key, &mut Vec::new(), update)
+                }
+                CallbackWriteRoute::UpsertWithBuffer => {
+                    let mut previous_len = None;
+                    let outcome = writer
+                        .table_upsert_with_owned_buffer::<_, Error>(
+                            b"deep",
+                            key,
+                            b"unused",
+                            &mut Vec::new(),
+                            |mut old| {
+                                previous_len = Some(update(&mut old)?);
+                                Ok(UpsertAction::Replace(old))
+                            },
+                        )
+                        .unwrap();
+                    assert!(matches!(outcome, UpsertOutcome::Updated));
+                    Ok(previous_len)
                 }
                 CallbackWriteRoute::Upsert => unreachable!(),
             }
@@ -2365,6 +2388,212 @@ mod eager_inline_append {
             writer.commit().unwrap();
         }
     }
+}
+
+#[test]
+fn buffered_owned_upsert_reuses_inline_bytes_and_refreshes_after_restore() {
+    let manager = create_test_manager();
+    let mut seed = manager.begin_write().unwrap();
+    seed.create_table(b"buffered_upsert").unwrap();
+    seed.table_insert(b"buffered_upsert", b"a", b"original")
+        .unwrap();
+    seed.commit().unwrap();
+    let mut old_reader = manager.begin_read();
+    let mut writer = manager.begin_write().unwrap();
+    let mut buffer = Vec::with_capacity(64);
+    buffer.extend_from_slice(b"scratch");
+    let allocation = buffer.as_ptr();
+    writer.set_read_budget(Some(crate::ReadBudget::new(8, 8)));
+    assert!(matches!(
+        writer
+            .table_upsert_with_owned_buffer::<_, Error>(
+                b"buffered_upsert",
+                b"a",
+                b"unused",
+                &mut buffer,
+                |mut old| {
+                    assert_eq!(old, b"original");
+                    assert_eq!(old.as_ptr(), allocation);
+                    old.copy_from_slice(b"modified");
+                    Ok(UpsertAction::Replace(old))
+                }
+            )
+            .unwrap(),
+        UpsertOutcome::Updated
+    ));
+    assert_eq!(buffer.as_ptr(), allocation);
+    writer.set_read_budget(None);
+    let checkpoint = writer.begin_savepoint();
+    assert!(matches!(
+        writer
+            .table_upsert_with_owned_buffer::<_, Error>(
+                b"buffered_upsert",
+                b"b",
+                b"inserted",
+                &mut buffer,
+                |_| panic!("new key called callback")
+            )
+            .unwrap(),
+        UpsertOutcome::Inserted
+    ));
+    assert_eq!(buffer.as_ptr(), allocation);
+    writer.restore_snapshot(checkpoint);
+    writer
+        .table_upsert_with_owned_buffer::<_, Error>(
+            b"buffered_upsert",
+            b"a",
+            b"unused",
+            &mut buffer,
+            |mut old| {
+                assert_eq!(old, b"modified");
+                assert_eq!(old.as_ptr(), allocation);
+                old.copy_from_slice(b"retained");
+                Ok(UpsertAction::Replace(old))
+            },
+        )
+        .unwrap();
+    assert_eq!(writer.table_get(b"buffered_upsert", b"b").unwrap(), None);
+    writer.commit().unwrap();
+    assert_eq!(
+        old_reader.table_get(b"buffered_upsert", b"a").unwrap(),
+        Some(b"original".to_vec())
+    );
+    assert_eq!(
+        manager
+            .begin_read()
+            .table_get(b"buffered_upsert", b"a")
+            .unwrap(),
+        Some(b"retained".to_vec())
+    );
+    assert!(manager.integrity_check().unwrap().is_ok());
+}
+
+#[test]
+fn buffered_owned_upsert_skip_error_panic_and_budget_are_detached() {
+    let manager = create_test_manager();
+    let mut seed = manager.begin_write().unwrap();
+    seed.create_table(b"buffered_upsert").unwrap();
+    seed.table_insert(b"buffered_upsert", b"a", b"original")
+        .unwrap();
+    seed.commit().unwrap();
+    for outcome in 0..3 {
+        let mut writer = manager.begin_write().unwrap();
+        let mut buffer = Vec::with_capacity(64);
+        buffer.extend_from_slice(b"retained scratch");
+        let allocation = buffer.as_ptr();
+        let marker = writer.mutation_marker();
+        writer.set_read_budget(Some(crate::ReadBudget::new(7, 8)));
+        assert!(matches!(
+            writer.table_upsert_with_owned_buffer::<_, Error>(
+                b"buffered_upsert",
+                b"a",
+                b"unused",
+                &mut buffer,
+                |_| panic!("denied value called callback")
+            ),
+            Err(Error::ReadBudgetExceeded { .. })
+        ));
+        assert_eq!(buffer, b"retained scratch");
+        assert_eq!(buffer.as_ptr(), allocation);
+        writer.set_read_budget(Some(crate::ReadBudget::new(8, 8)));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            writer.table_upsert_with_owned_buffer::<_, Error>(
+                b"buffered_upsert",
+                b"a",
+                b"unused",
+                &mut buffer,
+                |mut old| {
+                    assert_eq!(old, b"original");
+                    assert_eq!(old.as_ptr(), allocation);
+                    old.resize(MAX_INLINE_VALUE_SIZE * 3, 0x5a);
+                    match outcome {
+                        0 => Ok(UpsertAction::Skip),
+                        1 => Err(Error::Sync("rejected detached replacement".into())),
+                        _ => panic!("detached callback panic"),
+                    }
+                },
+            )
+        }));
+        match outcome {
+            0 => assert!(matches!(result, Ok(Ok(UpsertOutcome::Skipped)))),
+            1 => assert!(matches!(result, Ok(Err(Error::Sync(_))))),
+            _ => assert!(result.is_err()),
+        }
+        assert!(!writer.is_poisoned());
+        assert!(!writer.mutated_since(marker));
+        assert!(writer.alloc.allocated_this_txn().is_empty());
+        writer.set_read_budget(None);
+        assert_eq!(
+            writer.table_get(b"buffered_upsert", b"a").unwrap(),
+            Some(b"original".to_vec())
+        );
+        writer.commit().unwrap();
+    }
+}
+
+#[test]
+fn buffered_owned_upsert_keeps_overflow_local_and_refuses_late_cancellation() {
+    let manager = create_test_manager();
+    let original = vec![0x5a; MAX_INLINE_VALUE_SIZE * 3 + 17];
+    let mut seed = manager.begin_write().unwrap();
+    seed.create_table(b"buffered_upsert").unwrap();
+    seed.table_insert(b"buffered_upsert", b"large", &original)
+        .unwrap();
+    seed.table_insert(b"buffered_upsert", b"small", b"original")
+        .unwrap();
+    seed.commit().unwrap();
+    let mut writer = manager.begin_write().unwrap();
+    let mut buffer = Vec::with_capacity(64);
+    buffer.extend_from_slice(b"retained");
+    let allocation = buffer.as_ptr();
+    let capacity = buffer.capacity();
+    writer.set_read_budget(Some(crate::ReadBudget::new(original.len(), original.len())));
+    writer
+        .table_upsert_with_owned_buffer::<_, Error>(
+            b"buffered_upsert",
+            b"large",
+            b"unused",
+            &mut buffer,
+            |mut old| {
+                assert_eq!(old, original);
+                old.clear();
+                old.extend_from_slice(b"small");
+                Ok(UpsertAction::Replace(old))
+            },
+        )
+        .unwrap();
+    assert_eq!(buffer, b"retained");
+    assert_eq!(buffer.as_ptr(), allocation);
+    assert_eq!(buffer.capacity(), capacity);
+    writer.set_read_budget(None);
+    writer.commit().unwrap();
+    assert!(manager.integrity_check().unwrap().is_ok());
+    let mut writer = manager.begin_write().unwrap();
+    let token = CancelToken::new();
+    writer.set_cancel(Some(token.clone()));
+    assert!(matches!(
+        writer.table_upsert_with_owned_buffer::<_, Error>(
+            b"buffered_upsert",
+            b"small",
+            b"unused",
+            &mut buffer,
+            |mut old| {
+                old.copy_from_slice(b"modified");
+                token.cancel();
+                Ok(UpsertAction::Replace(old))
+            }
+        ),
+        Err(Error::Interrupted)
+    ));
+    assert!(writer.is_poisoned());
+    assert!(writer.commit().is_err());
+    assert_eq!(
+        manager
+            .begin_read()
+            .table_get(b"buffered_upsert", b"small")
+            .unwrap(),
+        Some(b"original".to_vec())
+    );
 }
 
 mod shared_write_scan {
