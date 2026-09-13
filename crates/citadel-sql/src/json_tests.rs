@@ -812,3 +812,124 @@ fn jsonb_fixed_payloads_ignore_declared_length_before_host_width_conversion() {
         assert_eq!(read_scalar_text(&bytes).unwrap().as_deref(), text);
     }
 }
+
+#[test]
+fn scalar_text_borrows_decoded_string_payloads_and_keeps_owned_public_results() {
+    for text in [
+        String::new(),
+        "user_99999".to_owned(),
+        "quotes \" slash \\ newline\n café 東京 😀".to_owned(),
+        "large 雪".repeat(4096),
+    ] {
+        // Encoding stores the already-unescaped string. Borrow exactly those
+        // UTF-8 bytes, including long strings; never borrow a temporary render.
+        let json_text = serde_json::to_string(&text).unwrap();
+        let Value::Jsonb(bytes) = text_to_jsonb(&json_text).unwrap() else {
+            panic!("expected JSONB");
+        };
+        let (_, start, length) = read_header(&bytes).unwrap();
+        let borrowed = read_scalar_text_cow(&bytes).unwrap().unwrap();
+        let Cow::Borrowed(value) = borrowed else {
+            panic!("string payload was copied");
+        };
+        assert_eq!(value, text);
+        assert_eq!(value.as_ptr(), bytes[start..start + length].as_ptr());
+        let owned = read_scalar_text(&bytes).unwrap().unwrap();
+        drop(bytes);
+        assert_eq!(owned, text);
+    }
+
+    let Value::Jsonb(bytes) = text_to_jsonb(r#""\u96ea\n\"\\\ud83d\ude00""#).unwrap() else {
+        panic!("expected JSONB");
+    };
+    assert_eq!(
+        read_scalar_text_cow(&bytes).unwrap().as_deref(),
+        Some("雪\n\"\\😀")
+    );
+}
+
+#[test]
+fn scalar_text_borrowed_and_owned_branches_preserve_every_json_representation() {
+    for (input, expected, borrowed) in [
+        ("null", None, false),
+        ("true", Some("true"), true),
+        ("false", Some("false"), true),
+        ("-9223372036854775808", Some("-9223372036854775808"), false),
+        ("9223372036854775807", Some("9223372036854775807"), false),
+        ("2.5", Some("2.5"), false),
+        ("-0.0", Some("-0.0"), false),
+        (
+            r#"[true,null,"line\n雪",2.5]"#,
+            Some(r#"[true,null,"line\n雪",2.5]"#),
+            false,
+        ),
+        (
+            r#"{"z":2,"a":"quoted\""}"#,
+            Some(r#"{"a":"quoted\"","z":2}"#),
+            false,
+        ),
+    ] {
+        let Value::Jsonb(bytes) = text_to_jsonb(input).unwrap() else {
+            panic!("expected JSONB");
+        };
+        let output = read_scalar_text_cow(&bytes).unwrap();
+        assert_eq!(output.as_deref(), expected, "{input}");
+        if let Some(output) = &output {
+            assert_eq!(matches!(output, Cow::Borrowed(_)), borrowed, "{input}");
+        }
+        assert_eq!(
+            read_scalar_text(&bytes).unwrap().as_deref(),
+            expected,
+            "{input}"
+        );
+        let token = CancelToken::new();
+        let with_token = run_json_work(Some(&token), |work| {
+            read_scalar_text_with_work(&bytes, work)
+        })
+        .unwrap();
+        assert_eq!(with_token.as_deref(), expected, "{input}");
+    }
+}
+
+#[test]
+fn scalar_text_shared_decoder_preserves_malformed_errors_and_trailing_scalar_behavior() {
+    let mut nonfinite = vec![header_byte(JsonbType::Real, 0)];
+    nonfinite.extend_from_slice(&f64::INFINITY.to_le_bytes());
+    for (bytes, expected) in [
+        (Vec::new(), "empty JSONB"),
+        (vec![0xf0], "invalid JSONB type tag"),
+        (
+            vec![header_byte(JsonbType::String, SIZE_CLASS_U16), 1],
+            "truncated JSONB header",
+        ),
+        (
+            vec![header_byte(JsonbType::String, 2), b'a'],
+            "JSONB payload truncated",
+        ),
+        (
+            vec![header_byte(JsonbType::String, 1), 0xff],
+            "JSONB string not UTF-8",
+        ),
+        (
+            vec![header_byte(JsonbType::Integer, 0), 0],
+            "JSONB payload truncated",
+        ),
+        (nonfinite, "non-finite JSONB number"),
+        (
+            vec![header_byte(JsonbType::Array, 1), 0xf0],
+            "invalid JSONB type tag",
+        ),
+    ] {
+        for error in [
+            read_scalar_text_cow(&bytes).unwrap_err(),
+            read_scalar_text(&bytes).unwrap_err(),
+        ] {
+            assert!(matches!(error, SqlError::InvalidValue(message) if message == expected));
+        }
+    }
+    // Existing scalar readers accept trailing bytes beyond the first payload;
+    // this optimization must not silently strengthen that public contract.
+    let bytes = [header_byte(JsonbType::String, 1), b'x', 0xff];
+    assert_eq!(read_scalar_text_cow(&bytes).unwrap().as_deref(), Some("x"));
+    assert_eq!(read_scalar_text(&bytes).unwrap().as_deref(), Some("x"));
+}

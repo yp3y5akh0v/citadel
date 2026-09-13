@@ -376,3 +376,86 @@ fn json_object_agg_returns_json_text() {
         _ => panic!("expected json text variant"),
     }
 }
+
+#[test]
+fn jsonb_text_extraction_keeps_values_across_collect_stream_buffered_and_write_views() {
+    let db = DatabaseBuilder::new("")
+        .passphrase(b"borrowed-json-text")
+        .argon2_profile(Argon2Profile::Iot)
+        .create_in_memory()
+        .unwrap();
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE extracted(id INTEGER PRIMARY KEY, doc JSONB, textual JSON)")
+        .unwrap();
+    let payloads = [
+        serde_json::json!({"value": "user_99999"}),
+        serde_json::json!({"value": "quotes \" slash \\ newline\n 雪 😀"}),
+        serde_json::json!({"value": "long 雪".repeat(4096)}),
+        serde_json::json!({"value": true}),
+        serde_json::json!({"value": -42}),
+        serde_json::json!({"value": 2.5}),
+        serde_json::json!({"value": [true, null, "雪"]}),
+        serde_json::json!({"value": {"z": 2, "a": "x"}}),
+        serde_json::json!({"value": null}),
+        serde_json::json!({}),
+    ];
+    let expected = vec![
+        vec![Value::Text("user_99999".into())],
+        vec![Value::Text("quotes \" slash \\ newline\n 雪 😀".into())],
+        vec![Value::Text("long 雪".repeat(4096).into())],
+        vec![Value::Text("true".into())],
+        vec![Value::Text("-42".into())],
+        vec![Value::Text("2.5".into())],
+        vec![Value::Text(r#"[true,null,"雪"]"#.into())],
+        vec![Value::Text(r#"{"a":"x","z":2}"#.into())],
+        vec![Value::Null],
+        vec![Value::Null],
+    ];
+    let insert = conn
+        .prepare("INSERT INTO extracted VALUES($1,$2,$3)")
+        .unwrap();
+    for (id, payload) in payloads.iter().enumerate() {
+        let text = serde_json::to_string(payload).unwrap();
+        insert
+            .execute(&[
+                Value::Integer(id as i64),
+                citadel_sql::json::text_to_jsonb(&text).unwrap(),
+                Value::Json(text.into()),
+            ])
+            .unwrap();
+    }
+    let select = conn
+        .prepare("SELECT doc ->> 'value' FROM extracted")
+        .unwrap();
+    let collected = select.query_collect(&[]).unwrap();
+    assert_eq!(collected.rows, expected);
+    let mut cursor = select.query(&[]).unwrap();
+    let mut streamed = Vec::new();
+    while let Some(row) = cursor.next().unwrap() {
+        streamed.push(vec![row.get(0).unwrap().clone()]);
+    }
+    drop(cursor);
+    assert_eq!(streamed, expected);
+    assert_eq!(
+        conn.query("SELECT doc ->> 'value' FROM extracted ORDER BY id")
+            .unwrap()
+            .rows,
+        expected
+    );
+    assert_eq!(
+        conn.query("SELECT textual ->> 'value' FROM extracted ORDER BY id")
+            .unwrap()
+            .rows,
+        expected
+    );
+
+    conn.execute("BEGIN").unwrap();
+    assert_eq!(select.query_collect(&[]).unwrap().rows, expected);
+    conn.execute("DELETE FROM extracted").unwrap();
+    assert!(select.query_collect(&[]).unwrap().rows.is_empty());
+    conn.execute("ROLLBACK").unwrap();
+    assert_eq!(select.query_collect(&[]).unwrap().rows, expected);
+    // Results own their text even when the source rows are later removed.
+    conn.execute("DELETE FROM extracted").unwrap();
+    assert_eq!(collected.rows, expected);
+}
