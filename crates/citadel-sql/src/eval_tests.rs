@@ -1203,3 +1203,41 @@ fn compiled_expr_matches_interpreter() {
         }
     }
 }
+
+#[test]
+fn empty_parameter_scope_masks_outer_and_restores_on_error() {
+    with_scoped_params(&[Value::Integer(99)], || {
+        let result: Result<()> = with_scoped_params(&[], || {
+            assert!(matches!(
+                resolve_scoped_param(1),
+                Err(SqlError::ParameterCountMismatch {
+                    expected: 1,
+                    got: 0
+                })
+            ));
+            with_scoped_params(&[], || {
+                with_scoped_params(&[Value::Integer(7)], || {
+                    assert_eq!(resolve_scoped_param(1).unwrap(), Value::Integer(7));
+                });
+                assert!(resolve_scoped_param(1).is_err());
+            });
+            resolve_scoped_param(1).map(|_| ())
+        });
+        assert!(result.is_err());
+        assert_eq!(resolve_scoped_param(1).unwrap(), Value::Integer(99));
+    });
+}
+
+#[test]
+fn empty_parameter_scope_restores_outer_after_unwind() {
+    with_scoped_params(&[Value::Integer(99)], || {
+        let outcome = std::panic::catch_unwind(|| {
+            with_scoped_params(&[], || {
+                assert!(resolve_scoped_param(1).is_err());
+                panic!("parameter scope unwind probe");
+            });
+        });
+        assert!(outcome.is_err());
+        assert_eq!(resolve_scoped_param(1).unwrap(), Value::Integer(99));
+    });
+}

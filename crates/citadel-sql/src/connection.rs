@@ -1199,13 +1199,9 @@ impl<'a> ConnectionInner<'a> {
         let mut rtx = db.begin_read();
         rtx.set_read_budget(Some(budget));
         let execute = || {
-            if params.is_empty() {
+            crate::eval::with_scoped_params(params, || {
                 executor::execute_with_read(&mut rtx, &self.schema, stmt, params)
-            } else {
-                crate::eval::with_scoped_params(params, || {
-                    executor::execute_with_read(&mut rtx, &self.schema, stmt, params)
-                })
-            }
+            })
         };
         crate::datetime::with_session_timezone(timezone, || {
             crate::datetime::with_statement_clock(Some(statement_timestamp), || {
@@ -1344,13 +1340,9 @@ impl<'a> ConnectionInner<'a> {
             let jsonpath_context = conn.jsonpath_session_context(transaction_timestamp);
             let schema = &conn.schema;
             let exec = || {
-                if params.is_empty() {
+                crate::eval::with_scoped_params(params, || {
                     plan.execute(db, schema, stmt, params, ActiveTxnRef::None)
-                } else {
-                    crate::eval::with_scoped_params(params, || {
-                        plan.execute(db, schema, stmt, params, ActiveTxnRef::None)
-                    })
-                }
+                })
             };
             crate::datetime::with_session_timezone(timezone, || {
                 crate::datetime::with_statement_clock(Some(statement_timestamp), || {
@@ -1465,7 +1457,7 @@ impl<'a> ConnectionInner<'a> {
                 ActiveTxn::None => ActiveTxnRef::None,
             };
             let execute = || {
-                if params.is_empty() || !plan.uses_scoped_params() {
+                if !plan.uses_scoped_params() {
                     plan.execute(db, schema, stmt, params, txn)
                 } else {
                     crate::eval::with_scoped_params(params, || {
@@ -1621,13 +1613,9 @@ impl<'a> ConnectionInner<'a> {
             crate::datetime::with_statement_clock(Some(statement_timestamp), || {
                 crate::datetime::with_txn_clock(Some(transaction_timestamp), || {
                     crate::json::with_jsonpath_session_context(jsonpath_context, || {
-                        if params.is_empty() {
+                        crate::eval::with_scoped_params(params, || {
                             self.dispatch_inner(db, stmt, params)
-                        } else {
-                            crate::eval::with_scoped_params(params, || {
-                                self.dispatch_inner(db, stmt, params)
-                            })
-                        }
+                        })
                     })
                 })
             })

@@ -245,6 +245,11 @@ pub fn with_scoped_params<R>(params: &[Value], f: impl FnOnce() -> R) -> R {
     }
     SCOPED_PARAMS.with(|slot| {
         let prev = slot.get();
+        // An empty statement scope must mask an enclosing nonempty scope.
+        // Only the already-empty case can skip installing a restore guard.
+        if params.is_empty() && prev.1 == 0 {
+            return f();
+        }
         slot.set((params.as_ptr(), params.len()));
         let _guard = Guard(prev);
         f()
