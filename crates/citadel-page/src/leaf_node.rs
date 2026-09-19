@@ -222,9 +222,46 @@ pub fn read_cell_bytes(page: &Page, i: u16) -> Vec<u8> {
 
 /// Binary search for key. Ok(index) if found, Err(index) for insertion point.
 pub fn search(page: &Page, search_key: &[u8]) -> Result<u16, u16> {
-    let n = page.num_cells();
-    let mut lo = 0u16;
-    let mut hi = n;
+    search_range(page, search_key, 0, page.num_cells())
+}
+
+/// Search a valid, sorted leaf using an advisory previous position. A stale or
+/// out-of-range position cannot change the result: comparisons against current
+/// keys either find the key or bound the remaining binary search.
+pub fn search_with_hint(page: &Page, search_key: &[u8], position: u16) -> Result<u16, u16> {
+    let count = page.num_cells();
+    if position >= count || count <= 1 {
+        return search_range(page, search_key, 0, count);
+    }
+    match search_key.cmp(read_key(page, position)) {
+        std::cmp::Ordering::Equal => Ok(position),
+        std::cmp::Ordering::Less => {
+            if position == 0 {
+                return Err(0);
+            }
+            let previous = position - 1;
+            match search_key.cmp(read_key(page, previous)) {
+                std::cmp::Ordering::Equal => Ok(previous),
+                std::cmp::Ordering::Greater => Err(position),
+                std::cmp::Ordering::Less => search_range(page, search_key, 0, previous),
+            }
+        }
+        std::cmp::Ordering::Greater => {
+            let next = position + 1;
+            if next == count {
+                return Err(count);
+            }
+            match search_key.cmp(read_key(page, next)) {
+                std::cmp::Ordering::Equal => Ok(next),
+                std::cmp::Ordering::Less => Err(next),
+                std::cmp::Ordering::Greater => search_range(page, search_key, next + 1, count),
+            }
+        }
+    }
+}
+
+#[inline]
+fn search_range(page: &Page, search_key: &[u8], mut lo: u16, mut hi: u16) -> Result<u16, u16> {
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
         match search_key.cmp(read_key(page, mid)) {

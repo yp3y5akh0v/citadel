@@ -198,6 +198,53 @@ fn insert_update_existing_key() {
 }
 
 #[test]
+fn hinted_search_matches_sorted_keys_for_every_start_position() {
+    let keys: &[&[u8]] = &[
+        b"",
+        b"\0",
+        b"\0\0",
+        b"a",
+        b"a\0",
+        b"a\0\0",
+        b"alphabet",
+        b"b",
+        b"\xff",
+        b"\xff\xff",
+    ];
+    let mut queries: Vec<Vec<u8>> = keys.iter().map(|key| key.to_vec()).collect();
+    for key in keys {
+        let mut after = key.to_vec();
+        after.push(0);
+        queries.push(after);
+        if !key.is_empty() {
+            queries.push(key[..key.len() - 1].to_vec());
+        }
+    }
+    queries.extend([b"al".to_vec(), b"z".to_vec(), vec![0x7f]]);
+
+    for count in 0..=keys.len() {
+        let mut page = Page::new(PageId(0), PageType::Leaf, TxnId(1));
+        for key in keys[..count].iter().rev() {
+            assert!(insert_direct(&mut page, key, ValueType::Inline, key));
+        }
+        for query in &queries {
+            let expected = keys[..count]
+                .binary_search_by(|stored| stored.cmp(&query.as_slice()))
+                .map(|index| index as u16)
+                .map_err(|index| index as u16);
+            assert_eq!(search(&page, query), expected);
+            for position in (0..=count as u16 + 1).chain([u16::MAX]) {
+                assert_eq!(
+                    search_with_hint(&page, query, position),
+                    expected,
+                    "count={count}, query={query:?}, position={position}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn delete_key() {
     let mut page = Page::new(PageId(0), PageType::Leaf, TxnId(1));
     insert(&mut page, b"a", ValueType::Inline, b"1");

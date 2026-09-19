@@ -18,6 +18,9 @@ pub struct BTree {
     pub entry_count: u64,
     last_insert: Option<(Vec<(PageId, usize)>, PageId)>,
     last_delete: Option<(Vec<(PageId, usize)>, PageId)>,
+    // An advisory position, never a retained page or lookup result. Every use
+    // checks the current loaded leaf, so mutations need not invalidate it.
+    last_lookup: Option<LeafEntryHint>,
 }
 
 #[derive(Debug, Clone)]
@@ -36,7 +39,7 @@ pub enum UpsertAction {
 /// An advisory match from an already loaded leaf. Insertion rechecks the leaf,
 /// cell bounds and key before using it; a stale or foreign hint falls back to
 /// the ordinary search. It does not establish that a supplied tree path is current.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct LeafEntryHint {
     leaf_id: PageId,
     index: u16,
@@ -54,6 +57,7 @@ impl BTree {
             entry_count: 0,
             last_insert: None,
             last_delete: None,
+            last_lookup: None,
         }
     }
 
@@ -65,6 +69,7 @@ impl BTree {
             entry_count,
             last_insert: None,
             last_delete: None,
+            last_lookup: None,
         }
     }
 
@@ -96,10 +101,39 @@ impl BTree {
         leaf_id: PageId,
         key: &[u8],
     ) -> Result<Option<(LeafEntryHint, ValueType, &'a [u8])>> {
+        Self::search_at_leaf_ref_from_hint(pages, leaf_id, key, None)
+    }
+
+    /// Search a freshly loaded leaf, retaining only an advisory position for
+    /// the next mutation lookup. The caller must still resolve the current
+    /// leaf from this tree; the position cannot establish a valid tree path.
+    /// Current keys are rechecked after every mutation, split or CoW.
+    pub fn search_at_leaf_cached_ref<'a>(
+        &mut self,
+        pages: &'a impl PageMap,
+        leaf_id: PageId,
+        key: &[u8],
+    ) -> Result<Option<(LeafEntryHint, ValueType, &'a [u8])>> {
+        let found = Self::search_at_leaf_ref_from_hint(pages, leaf_id, key, self.last_lookup)?;
+        self.last_lookup = found.as_ref().map(|(hint, _, _)| *hint);
+        Ok(found)
+    }
+
+    #[inline]
+    fn search_at_leaf_ref_from_hint<'a>(
+        pages: &'a impl PageMap,
+        leaf_id: PageId,
+        key: &[u8],
+        previous: Option<LeafEntryHint>,
+    ) -> Result<Option<(LeafEntryHint, ValueType, &'a [u8])>> {
         let page = pages
             .get_page(&leaf_id)
             .ok_or(Error::PageOutOfBounds(leaf_id))?;
-        match leaf_node::search(page, key) {
+        let position = match previous.filter(|hint| hint.leaf_id == leaf_id) {
+            Some(hint) => leaf_node::search_with_hint(page, key, hint.index),
+            None => leaf_node::search(page, key),
+        };
+        match position {
             Ok(idx) => {
                 let cell = leaf_node::read_cell(page, idx);
                 let hint = LeafEntryHint {
