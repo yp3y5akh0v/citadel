@@ -18,3 +18,10 @@ name = "citadel_page"
 [dependencies]
 citadel-core = { workspace = true }
 xxhash-rust = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "page_mutations"
+harness = false

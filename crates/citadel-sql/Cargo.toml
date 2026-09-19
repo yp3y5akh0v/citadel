@@ -92,3 +92,7 @@ harness = false
 [[bench]]
 name = "integer_key_decode"
 harness = false
+
+[[bench]]
+name = "payload_resize"
+harness = false
