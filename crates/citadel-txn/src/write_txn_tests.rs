@@ -3,6 +3,139 @@ use citadel_buffer::cursor::PageMap;
 use citadel_core::types::PageId;
 
 #[test]
+fn exhaustion_after_cow_rejects_commit_and_savepoint_restores_the_writer() {
+    use citadel_buffer::allocator::PageAllocator;
+    use citadel_core::types::ValueType;
+
+    for restore in [false, true] {
+        let mgr = create_test_manager();
+        let mut seed = mgr.begin_write().unwrap();
+        seed.create_table(b"t").unwrap();
+        let value = vec![0x5a; 1000];
+        let mut next = 0u32;
+        loop {
+            let root = seed.named_trees[b"t".as_slice()].root;
+            let mut trial = seed.pages.get_page(&root).unwrap().clone();
+            if !citadel_page::leaf_node::insert_append_direct(
+                &mut trial,
+                &next.to_be_bytes(),
+                ValueType::Inline,
+                &value,
+            ) {
+                break;
+            }
+            seed.table_insert(b"t", &next.to_be_bytes(), &value)
+                .unwrap();
+            next += 1;
+        }
+        seed.commit().unwrap();
+
+        let mut writer = mgr.begin_write().unwrap();
+        let saved = writer.begin_savepoint();
+        writer.alloc = PageAllocator::new(u32::MAX - 1);
+        assert!(matches!(
+            writer.table_insert(b"t", &next.to_be_bytes(), &value),
+            Err(Error::PageIdExhausted)
+        ));
+        assert_eq!(writer.alloc.allocated_this_txn(), &[PageId(u32::MAX - 1)]);
+        assert!(writer.is_poisoned());
+        assert!(writer.pages.get_page(&PageId::INVALID).is_none());
+        if restore {
+            writer.restore_snapshot(saved);
+            assert!(!writer.is_poisoned());
+            assert!(writer.pages.get_page(&PageId(u32::MAX - 1)).is_none());
+            writer
+                .table_insert(b"t", &next.to_be_bytes(), &value)
+                .unwrap();
+            writer.commit().unwrap();
+        } else {
+            assert!(matches!(writer.commit(), Err(Error::TransactionFailed)));
+        }
+        let mut reader = mgr.begin_read();
+        assert_eq!(
+            reader.table_entry_count(b"t").unwrap(),
+            u64::from(next) + u64::from(restore)
+        );
+        for key in 0..next {
+            assert_eq!(
+                reader
+                    .table_get(b"t", &key.to_be_bytes())
+                    .unwrap()
+                    .as_deref(),
+                Some(value.as_slice())
+            );
+        }
+        assert_eq!(
+            reader
+                .table_get(b"t", &next.to_be_bytes())
+                .unwrap()
+                .is_some(),
+            restore
+        );
+    }
+}
+
+#[test]
+fn truncate_exhaustion_after_retirement_poisoning_can_be_rolled_back() {
+    use citadel_buffer::allocator::PageAllocator;
+
+    let mgr = create_test_manager();
+    let mut seed = mgr.begin_write().unwrap();
+    seed.create_table(b"t").unwrap();
+    seed.table_insert(b"t", b"key", b"old").unwrap();
+    seed.commit().unwrap();
+
+    let mut writer = mgr.begin_write().unwrap();
+    let saved = writer.begin_savepoint();
+    writer.alloc = PageAllocator::new(u32::MAX);
+    assert!(matches!(
+        writer.table_truncate(b"t"),
+        Err(Error::PageIdExhausted)
+    ));
+    assert!(writer.alloc.freed_count() > 0);
+    assert!(writer.is_poisoned());
+    writer.restore_snapshot(saved);
+    assert_eq!(writer.alloc.freed_count(), 0);
+    assert!(!writer.is_poisoned());
+    assert_eq!(
+        writer.table_get(b"t", b"key").unwrap(),
+        Some(b"old".to_vec())
+    );
+    writer.table_insert(b"t", b"key", b"new").unwrap();
+    writer.commit().unwrap();
+    assert_eq!(
+        mgr.begin_read().table_get(b"t", b"key").unwrap(),
+        Some(b"new".to_vec())
+    );
+}
+
+#[test]
+fn overflow_exhaustion_after_partial_allocation_requires_rollback() {
+    use citadel_buffer::allocator::PageAllocator;
+
+    for cancel in [None, Some(CancelToken::new())] {
+        let mgr = create_test_manager();
+        let mut writer = mgr.begin_write().unwrap();
+        writer.set_cancel(cancel);
+        let saved = writer.begin_savepoint();
+        writer.alloc = PageAllocator::new(u32::MAX - 1);
+        let value = vec![0x5a; citadel_page::overflow::OVERFLOW_DATA_CAPACITY + 1];
+        assert!(matches!(
+            writer.insert(b"key", &value),
+            Err(Error::PageIdExhausted)
+        ));
+        assert_eq!(writer.alloc.allocated_this_txn(), &[PageId(u32::MAX - 1)]);
+        assert!(writer.pages.get_page(&PageId(u32::MAX - 1)).is_none());
+        assert!(writer.is_poisoned());
+        writer.restore_snapshot(saved);
+        assert!(!writer.is_poisoned());
+        writer.insert(b"key", &value).unwrap();
+        writer.commit().unwrap();
+        assert_eq!(mgr.begin_read().get(b"key").unwrap(), Some(value));
+    }
+}
+
+#[test]
 fn table_prefix_scan_tracks_uncommitted_rows_and_does_not_load_the_next_prefix() {
     let mgr = create_test_manager();
     let mut writer = mgr.begin_write().unwrap();

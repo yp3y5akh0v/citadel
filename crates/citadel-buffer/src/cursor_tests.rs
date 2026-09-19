@@ -6,7 +6,7 @@ use citadel_core::types::TxnId;
 fn build_tree(keys: &[&[u8]]) -> (rustc_hash::FxHashMap<PageId, Page>, BTree) {
     let mut pages = rustc_hash::FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
-    let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
+    let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1)).unwrap();
     for k in keys {
         tree.insert(&mut pages, &mut alloc, TxnId(1), k, ValueType::Inline, k)
             .unwrap();
@@ -73,7 +73,7 @@ fn cursor_seek_past_end() {
 fn cursor_empty_tree() {
     let mut pages = rustc_hash::FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
-    let tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
+    let tree = BTree::new(&mut pages, &mut alloc, TxnId(1)).unwrap();
 
     let cursor = Cursor::first(&pages, tree.root).unwrap();
     assert!(!cursor.is_valid());

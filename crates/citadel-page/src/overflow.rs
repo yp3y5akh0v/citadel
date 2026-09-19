@@ -69,16 +69,16 @@ pub fn write_chain<F, S>(
     txn_id: citadel_core::types::TxnId,
     mut allocate: F,
     mut sink: S,
-) -> citadel_core::types::PageId
+) -> Result<citadel_core::types::PageId>
 where
-    F: FnMut() -> citadel_core::types::PageId,
+    F: FnMut() -> Result<citadel_core::types::PageId>,
     S: FnMut(citadel_core::types::PageId, Page),
 {
     use citadel_core::types::{PageId, PageType};
     let needed = pages_needed(data.len());
     let mut ids: Vec<PageId> = Vec::with_capacity(needed);
     for _ in 0..needed {
-        ids.push(allocate());
+        ids.push(allocate()?);
     }
     for i in 0..needed {
         let pid = ids[i];
@@ -95,13 +95,13 @@ where
         p.update_checksum();
         sink(pid, p);
     }
-    ids[0]
+    Ok(ids[0])
 }
 
 /// Cancellable form of [`write_chain`], checked once per page in both the
 /// allocation and construction passes and again after the final sink.
 ///
-/// The `None` lane delegates to the original infallible implementation, so a
+/// The `None` lane delegates to the non-cancellable implementation, so a
 /// caller without cancellation enabled keeps the exact no-check fast path.
 /// On error, allocation and sink callbacks may already have run for a prefix;
 /// callers that own transactional state must roll that work back or poison it.
@@ -113,11 +113,11 @@ pub fn write_chain_with_cancel<F, S>(
     cancel: Option<&CancelToken>,
 ) -> Result<citadel_core::types::PageId>
 where
-    F: FnMut() -> citadel_core::types::PageId,
+    F: FnMut() -> Result<citadel_core::types::PageId>,
     S: FnMut(citadel_core::types::PageId, Page),
 {
     let Some(token) = cancel else {
-        return Ok(write_chain(data, txn_id, allocate, sink));
+        return write_chain(data, txn_id, allocate, sink);
     };
 
     use citadel_core::types::{PageId, PageType};
@@ -127,7 +127,7 @@ where
     let mut ids: Vec<PageId> = Vec::with_capacity(needed);
     for _ in 0..needed {
         token.check()?;
-        ids.push(allocate());
+        ids.push(allocate()?);
     }
     token.check()?;
 

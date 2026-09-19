@@ -3,6 +3,34 @@ use citadel_core::types::{PageType, TxnId};
 use citadel_core::{CancelToken, Error};
 
 #[test]
+fn allocation_failure_stops_before_emitting_any_chain_pages() {
+    let data = vec![0x5a; OVERFLOW_DATA_CAPACITY * 2 + 1];
+    let token = CancelToken::new();
+    for cancel in [None, Some(&token)] {
+        for fail_at in 0..pages_needed(data.len()) {
+            let mut allocated = 0;
+            let mut emitted = 0;
+            let result = write_chain_with_cancel(
+                &data,
+                TxnId(7),
+                || {
+                    if allocated == fail_at {
+                        return Err(Error::PageIdExhausted);
+                    }
+                    allocated += 1;
+                    Ok(PageId(allocated as u32))
+                },
+                |_, _| emitted += 1,
+                cancel,
+            );
+            assert!(matches!(result, Err(Error::PageIdExhausted)));
+            assert_eq!(allocated, fail_at);
+            assert_eq!(emitted, 0);
+        }
+    }
+}
+
+#[test]
 fn overflow_page_write_read() {
     let mut page = Page::new(PageId(10), PageType::Overflow, TxnId(1));
     let data = b"overflow value data here";
@@ -60,12 +88,13 @@ fn write_chain_single_page() {
         || {
             let id = PageId(next_id);
             next_id += 1;
-            id
+            Ok(id)
         },
         |pid, page| {
             pages.insert(pid, page);
         },
-    );
+    )
+    .unwrap();
     assert_eq!(first, PageId(100));
     assert_eq!(pages.len(), 1);
     let p = &pages[&first];
@@ -84,12 +113,13 @@ fn write_chain_multi_page_links() {
         || {
             let id = PageId(next_id);
             next_id += 1;
-            id
+            Ok(id)
         },
         |pid, page| {
             pages.insert(pid, page);
         },
-    );
+    )
+    .unwrap();
     assert_eq!(pages.len(), 4);
     let mut cur = first;
     let mut acc = Vec::new();
@@ -117,7 +147,7 @@ fn cancellable_write_stops_during_the_allocation_pass() {
             if allocated == 2 {
                 cancel_from_alloc.cancel();
             }
-            PageId(300 + allocated)
+            Ok(PageId(300 + allocated))
         },
         |pid, page| {
             pages.insert(pid, page);
@@ -148,7 +178,7 @@ fn cancellable_write_stops_during_the_page_build_pass() {
         TxnId(4),
         || {
             allocated += 1;
-            PageId(400 + allocated)
+            Ok(PageId(400 + allocated))
         },
         |pid, page| {
             sunk += 1;
@@ -181,19 +211,20 @@ fn no_token_write_is_byte_for_byte_equivalent_to_the_fast_path() {
         || {
             let id = PageId(fast_id);
             fast_id += 1;
-            id
+            Ok(id)
         },
         |pid, page| {
             fast_pages.insert(pid, page);
         },
-    );
+    )
+    .unwrap();
     let checked_first = write_chain_with_cancel(
         &data,
         TxnId(5),
         || {
             let id = PageId(checked_id);
             checked_id += 1;
-            id
+            Ok(id)
         },
         |pid, page| {
             checked_pages.insert(pid, page);

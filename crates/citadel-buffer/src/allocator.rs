@@ -1,6 +1,7 @@
 //! Page allocator with two-phase pending-free model for CoW B+ tree.
 
 use citadel_core::types::PageId;
+use citadel_core::{Error, Result};
 use std::sync::Arc;
 
 #[derive(Clone, Default)]
@@ -111,16 +112,14 @@ impl PageAllocator {
     }
 
     /// Prefers reusing reclaimed pages over incrementing the high water mark.
-    pub fn allocate(&mut self) -> PageId {
+    pub fn allocate(&mut self) -> Result<PageId> {
         let id = if let Some(id) = self.ready_to_use.pop() {
             id
         } else {
-            let id = PageId(self.next_page_id);
-            self.next_page_id += 1;
-            id
+            self.allocate_fresh()?
         };
         self.allocated_this_txn.push(id);
-        id
+        Ok(id)
     }
 
     /// Allocate a page whose id is not zero.
@@ -128,7 +127,7 @@ impl PageAllocator {
     /// Overflow chains use page zero as their on-disk terminator, but page zero
     /// is also a real page that can re-enter the reclaim pool, so overflow
     /// writers take it from here and leave it for types that can represent it.
-    pub fn allocate_nonzero(&mut self) -> PageId {
+    pub fn allocate_nonzero(&mut self) -> Result<PageId> {
         if self.next_page_id == 0 {
             self.ready_to_use.trailing_zeros += 1;
             self.next_page_id = 1;
@@ -136,14 +135,21 @@ impl PageAllocator {
 
         let id = match self.ready_to_use.pop_nonzero() {
             Some(page) => page,
-            None => {
-                let id = PageId(self.next_page_id);
-                self.next_page_id += 1;
-                id
-            }
+            None => self.allocate_fresh()?,
         };
         self.allocated_this_txn.push(id);
-        id
+        Ok(id)
+    }
+
+    fn allocate_fresh(&mut self) -> Result<PageId> {
+        let id = PageId(self.next_page_id);
+        // MAX is the invalid-page sentinel, and remains the high water mark
+        // after allocating the final valid page. Reclaimed IDs still work.
+        self.next_page_id = self
+            .next_page_id
+            .checked_add(1)
+            .ok_or(Error::PageIdExhausted)?;
+        Ok(id)
     }
 
     /// Not immediately reusable - goes into pending-free list.

@@ -186,6 +186,7 @@ fn core_kind(e: &CoreError) -> Kind {
         CoreError::NamedTableHashCollision { .. } => Kind::Usage,
         CoreError::TransactionTooLarge { .. }
         | CoreError::BufferPoolFull
+        | CoreError::PageIdExhausted
         | CoreError::KeyTooLarge { .. }
         | CoreError::ValueTooLarge { .. }
         | CoreError::ReadBudgetExceeded { .. } => Kind::Capacity,

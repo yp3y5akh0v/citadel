@@ -1,11 +1,67 @@
 use super::*;
 
 #[test]
+fn exhaustion_preserves_the_final_valid_id_and_checkpoint() {
+    for nonzero in [false, true] {
+        let mut alloc = PageAllocator::new(u32::MAX - 1);
+        let checkpoint = alloc.checkpoint();
+        for _ in 0..2 {
+            let last = if nonzero {
+                alloc.allocate_nonzero()
+            } else {
+                alloc.allocate()
+            }
+            .unwrap();
+            assert_eq!(last, PageId(u32::MAX - 1));
+            assert!(last.is_valid());
+            for _ in 0..2 {
+                let result = if nonzero {
+                    alloc.allocate_nonzero()
+                } else {
+                    alloc.allocate()
+                };
+                assert!(matches!(result, Err(Error::PageIdExhausted)));
+                assert_eq!(alloc.high_water_mark(), u32::MAX);
+                assert_eq!(alloc.allocated_this_txn(), &[last]);
+                assert_eq!(alloc.ready_count(), 0);
+                assert_eq!(alloc.freed_count(), 0);
+            }
+            alloc.restore(checkpoint.clone());
+            assert!(alloc.allocated_this_txn().is_empty());
+        }
+    }
+}
+
+#[test]
+fn exhaustion_still_allows_reclaimed_pages_and_preserves_skipped_zero() {
+    let mut alloc = PageAllocator::with_ready_pages(
+        u32::MAX,
+        Arc::new(vec![PageId(7), PageId(0), PageId(3), PageId(0)]),
+    );
+    assert_eq!(alloc.allocate_nonzero().unwrap(), PageId(3));
+    assert_eq!(alloc.allocate_nonzero().unwrap(), PageId(7));
+    let checkpoint = alloc.checkpoint();
+    for _ in 0..2 {
+        assert!(matches!(
+            alloc.allocate_nonzero(),
+            Err(Error::PageIdExhausted)
+        ));
+        assert_eq!(alloc.ready_count(), 2);
+        assert_eq!(alloc.allocated_this_txn(), &[PageId(3), PageId(7)]);
+        assert_eq!(alloc.allocate().unwrap(), PageId(0));
+        assert_eq!(alloc.allocate().unwrap(), PageId(0));
+        assert!(matches!(alloc.allocate(), Err(Error::PageIdExhausted)));
+        assert_eq!(alloc.high_water_mark(), u32::MAX);
+        alloc.restore(checkpoint.clone());
+    }
+}
+
+#[test]
 fn allocate_from_hwm() {
     let mut alloc = PageAllocator::new(0);
-    assert_eq!(alloc.allocate(), PageId(0));
-    assert_eq!(alloc.allocate(), PageId(1));
-    assert_eq!(alloc.allocate(), PageId(2));
+    assert_eq!(alloc.allocate().unwrap(), PageId(0));
+    assert_eq!(alloc.allocate().unwrap(), PageId(1));
+    assert_eq!(alloc.allocate().unwrap(), PageId(2));
     assert_eq!(alloc.high_water_mark(), 3);
 }
 
@@ -13,17 +69,17 @@ fn allocate_from_hwm() {
 fn allocate_from_ready_to_use() {
     let mut alloc = PageAllocator::new(10);
     alloc.add_ready_to_use(vec![PageId(3), PageId(7)]);
-    assert_eq!(alloc.allocate(), PageId(7));
-    assert_eq!(alloc.allocate(), PageId(3));
-    assert_eq!(alloc.allocate(), PageId(10));
+    assert_eq!(alloc.allocate().unwrap(), PageId(7));
+    assert_eq!(alloc.allocate().unwrap(), PageId(3));
+    assert_eq!(alloc.allocate().unwrap(), PageId(10));
 }
 
 #[test]
 fn nonzero_allocation_preserves_page_zero_for_other_page_types() {
     let mut alloc = PageAllocator::new(0);
 
-    assert_eq!(alloc.allocate_nonzero(), PageId(1));
-    assert_eq!(alloc.allocate(), PageId(0));
+    assert_eq!(alloc.allocate_nonzero().unwrap(), PageId(1));
+    assert_eq!(alloc.allocate().unwrap(), PageId(0));
     assert_eq!(alloc.high_water_mark(), 2);
 }
 
@@ -32,8 +88,8 @@ fn nonzero_allocation_skips_reclaimed_page_zero() {
     let mut alloc = PageAllocator::new(10);
     alloc.add_ready_to_use(vec![PageId(7), PageId(0)]);
 
-    assert_eq!(alloc.allocate_nonzero(), PageId(7));
-    assert_eq!(alloc.allocate(), PageId(0));
+    assert_eq!(alloc.allocate_nonzero().unwrap(), PageId(7));
+    assert_eq!(alloc.allocate().unwrap(), PageId(0));
 }
 
 #[test]
@@ -62,7 +118,7 @@ fn allocator_checkpoints_share_the_immutable_reclaimed_batch() {
     let pages = Arc::new((1..=4096).map(PageId).collect::<Vec<_>>());
     let mut alloc = PageAllocator::with_ready_pages(5000, Arc::clone(&pages));
     let before = alloc.checkpoint();
-    assert_eq!(alloc.allocate(), PageId(4096));
+    assert_eq!(alloc.allocate().unwrap(), PageId(4096));
     let after = alloc.checkpoint();
     for ready in [
         &alloc.ready_to_use,
@@ -80,16 +136,16 @@ fn allocator_checkpoints_share_the_immutable_reclaimed_batch() {
 fn checkpoint_restores_reclaimed_pages_hwm_and_retirement_log() {
     let pages = Arc::new(vec![PageId(3), PageId(0), PageId(7)]);
     let mut alloc = PageAllocator::with_ready_pages(100, Arc::clone(&pages));
-    assert_eq!(alloc.allocate(), PageId(7));
+    assert_eq!(alloc.allocate().unwrap(), PageId(7));
     alloc.free(PageId(90));
     let snapshot = alloc.checkpoint();
     for _ in 0..8 {
-        assert_eq!(alloc.allocate_nonzero(), PageId(3));
-        assert_eq!(alloc.allocate_nonzero(), PageId(100));
-        assert_eq!(alloc.allocate(), PageId(0));
+        assert_eq!(alloc.allocate_nonzero().unwrap(), PageId(3));
+        assert_eq!(alloc.allocate_nonzero().unwrap(), PageId(100));
+        assert_eq!(alloc.allocate().unwrap(), PageId(0));
         alloc.free(PageId(3));
         let inner = alloc.checkpoint();
-        assert_eq!(alloc.allocate(), PageId(101));
+        assert_eq!(alloc.allocate().unwrap(), PageId(101));
         alloc.restore(inner);
         assert_eq!(alloc.high_water_mark(), 101);
         alloc.restore(snapshot.clone());
@@ -108,11 +164,11 @@ fn checkpoint_restores_the_initial_nonzero_allocation() {
     let mut alloc = PageAllocator::new(0);
     let snapshot = alloc.checkpoint();
     for _ in 0..4 {
-        assert_eq!(alloc.allocate_nonzero(), PageId(1));
+        assert_eq!(alloc.allocate_nonzero().unwrap(), PageId(1));
         let after_nonzero = alloc.checkpoint();
-        assert_eq!(alloc.allocate(), PageId(0));
+        assert_eq!(alloc.allocate().unwrap(), PageId(0));
         alloc.restore(after_nonzero);
-        assert_eq!(alloc.allocate(), PageId(0));
+        assert_eq!(alloc.allocate().unwrap(), PageId(0));
         alloc.restore(snapshot.clone());
         assert_eq!(alloc.high_water_mark(), 0);
         assert_eq!(alloc.ready_count(), 0);

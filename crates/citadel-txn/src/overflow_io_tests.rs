@@ -55,7 +55,8 @@ fn build_chain(data: &[u8]) -> (FxHashMap<PageId, Page>, PageId, PageAllocator) 
         |pid, page| {
             pages.insert(pid, page);
         },
-    );
+    )
+    .unwrap();
     (pages, first, alloc)
 }
 
