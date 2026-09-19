@@ -88,3 +88,7 @@ harness = false
 [[bench]]
 name = "window_range"
 harness = false
+
+[[bench]]
+name = "integer_key_decode"
+harness = false
