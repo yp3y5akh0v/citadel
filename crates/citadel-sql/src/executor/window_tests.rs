@@ -700,3 +700,278 @@ fn full_partition_extrema_preserve_the_first_equal_value_representation() {
         }
     }
 }
+
+// These tests order by a distinct integer position so the extrema arguments
+// are not sort keys.
+fn assert_sliding_extreme_crosses_equal_bridge(function: &str, values: [Value; 3]) {
+    let mut position = column("position", DataType::Integer);
+    position.position = 1;
+    let columns = [column("x", DataType::Null), position];
+    for frame in [
+        "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW",
+        "ROWS BETWEEN 2 PRECEDING AND CURRENT ROW",
+    ] {
+        let rows = values
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(position, value)| vec![value, i(position as i64)])
+            .collect();
+        let ExecutionResult::Query(result) = evaluate_window_query(
+            &format!("SELECT {function}(x) OVER (ORDER BY position {frame}) FROM t"),
+            &columns,
+            rows,
+        )
+        .unwrap() else {
+            panic!("expected rows");
+        };
+        // The middle value compares equal to both neighbors. It must not stop
+        // the strictly better third value from replacing the first value.
+        assert_eq!(result.rows.len(), values.len());
+        let expected = [&values[0], &values[0], &values[2]];
+        for (position, (row, expected)) in result.rows.iter().zip(expected).enumerate() {
+            assert!(
+                row[0].bit_eq(expected),
+                "{function}, {frame}, row {position}: {:?}, expected {expected:?}",
+                row[0],
+            );
+        }
+    }
+}
+
+#[test]
+fn sliding_extrema_do_not_treat_nan_as_a_transitive_equal_bridge() {
+    let nan = Value::Real(f64::from_bits(0x7ff8_0000_0000_0001));
+    assert_sliding_extreme_crosses_equal_bridge(
+        "MIN",
+        [Value::Real(1.0), nan.clone(), Value::Real(0.0)],
+    );
+    assert_sliding_extreme_crosses_equal_bridge("MAX", [Value::Real(1.0), nan, Value::Real(2.0)]);
+}
+
+#[test]
+fn sliding_extrema_preserve_large_integer_order_across_real_values() {
+    let boundary = 1_i64 << 53;
+    assert_sliding_extreme_crosses_equal_bridge(
+        "MIN",
+        [i(boundary + 1), Value::Real(boundary as f64), i(boundary)],
+    );
+    assert_sliding_extreme_crosses_equal_bridge(
+        "MAX",
+        [i(boundary), Value::Real(boundary as f64), i(boundary + 1)],
+    );
+}
+
+#[test]
+fn sliding_extrema_preserve_nested_array_comparison_order() {
+    let nested = |value| {
+        Value::Array(std::sync::Arc::new(vec![Value::Array(
+            std::sync::Arc::new(vec![value]),
+        )]))
+    };
+    assert_sliding_extreme_crosses_equal_bridge(
+        "MIN",
+        [
+            nested(Value::Real(1.0)),
+            nested(Value::Real(f64::from_bits(0x7ff8_0000_0000_0001))),
+            nested(Value::Real(0.0)),
+        ],
+    );
+}
+
+#[test]
+fn sliding_extrema_match_frame_order_with_expiry_and_lookahead() {
+    let nan1 = Value::Real(f64::from_bits(0x7ff8_0000_0000_0001));
+    let nan2 = Value::Real(f64::from_bits(0x7ff8_0000_0000_0002));
+    let boundary = 1_i64 << 53;
+    let nested = |value| {
+        Value::Array(std::sync::Arc::new(vec![Value::Array(
+            std::sync::Arc::new(vec![value]),
+        )]))
+    };
+    let cases = [
+        vec![
+            Value::Null,
+            Value::Real(1.0),
+            nan1.clone(),
+            Value::Real(0.0),
+            nan2.clone(),
+            Value::Real(2.0),
+            Value::Null,
+        ],
+        vec![
+            nan1.clone(),
+            Value::Real(1.0),
+            nan2.clone(),
+            Value::Real(0.0),
+            Value::Real(2.0),
+        ],
+        vec![
+            i(boundary + 1),
+            Value::Real(boundary as f64),
+            i(boundary),
+            Value::Null,
+            i(-boundary - 1),
+            Value::Real(-boundary as f64),
+            i(-boundary),
+        ],
+        vec![
+            i(i64::MAX - 1),
+            Value::Real(i64::MAX as f64),
+            i(i64::MAX),
+            i(i64::MIN),
+            Value::Real(i64::MIN as f64),
+        ],
+        vec![
+            nested(Value::Real(1.0)),
+            nested(nan1),
+            nested(Value::Real(0.0)),
+            Value::Null,
+            nested(nan2),
+            nested(Value::Real(2.0)),
+        ],
+        vec![
+            Value::Real(-0.0),
+            Value::Real(0.0),
+            Value::Null,
+            i(0),
+            Value::Real(-0.0),
+        ],
+        vec![
+            Value::Text("First_heap_spelling_with_equal_collation".into()),
+            Value::Text("first_heap_spelling_with_equal_collation".into()),
+            Value::Null,
+            Value::Text("Another_long_heap_spelling".into()),
+            Value::Text("another_long_heap_spelling".into()),
+        ],
+    ];
+    let mut x = column("x", DataType::Null);
+    x.collation = Collation::NoCase;
+    let mut position = column("position", DataType::Integer);
+    position.position = 1;
+    let columns = [x, position];
+
+    for values in cases {
+        for (frame, preceding, end_offset) in [
+            ("UNBOUNDED PRECEDING AND CURRENT ROW", None, 0_i64),
+            ("UNBOUNDED PRECEDING AND 1 PRECEDING", None, -1),
+            ("UNBOUNDED PRECEDING AND 1 FOLLOWING", None, 1),
+            ("2 PRECEDING AND CURRENT ROW", Some(2), 0),
+            ("1 PRECEDING AND 1 FOLLOWING", Some(1), 1),
+        ] {
+            let rows = values
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(position, value)| vec![value, i(position as i64)])
+                .collect();
+            let ExecutionResult::Query(result) = evaluate_window_query(
+                &format!("SELECT MIN(x) OVER (ORDER BY position ROWS BETWEEN {frame}), MAX(x) OVER (ORDER BY position ROWS BETWEEN {frame}) FROM t"),
+                &columns,
+                rows,
+            ).unwrap() else { panic!("expected rows") };
+            assert_eq!(result.rows.len(), values.len());
+            for (position, row) in result.rows.iter().enumerate() {
+                let start = preceding.map_or(0, |count| position.saturating_sub(count));
+                let end = (position as i64 + end_offset + 1).clamp(0, values.len() as i64) as usize;
+                for (column, is_min) in [(0, true), (1, false)] {
+                    // This explicit left fold is independent of deque pruning
+                    // and keeps the first representation on equal comparisons.
+                    let mut expected = Value::Null;
+                    for value in &values[start..end] {
+                        if value.is_null() {
+                            continue;
+                        }
+                        let order = Collation::NoCase.cmp_value(value, &expected);
+                        if expected.is_null()
+                            || (is_min && order.is_lt())
+                            || (!is_min && order.is_gt())
+                        {
+                            expected = value.clone();
+                        }
+                    }
+                    assert!(row[column].bit_eq(&expected), "{frame}, row {position}, MIN={is_min}: {:?}, expected {expected:?}; input {values:?}", row[column]);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn sliding_extrema_certify_the_evaluated_comparison_domain() {
+    let exact_large = 1_i64 << 60;
+    for (values, expected) in [
+        (vec![i(i64::MAX), i(i64::MIN), Value::Null], true),
+        (vec![i(exact_large), Value::Real(exact_large as f64)], true),
+        (vec![i(i64::MIN), Value::Real(i64::MIN as f64)], true),
+        (
+            vec![Value::Real(-0.0), i(0), Value::Real(f64::INFINITY)],
+            true,
+        ),
+        (
+            vec![
+                Value::Vector(std::sync::Arc::from([f32::NAN])),
+                Value::Vector(std::sync::Arc::from([1.0_f32])),
+            ],
+            true,
+        ),
+        (
+            vec![
+                Value::Json("{\"n\":1}".into()),
+                Value::Json("{\"n\":0}".into()),
+            ],
+            true,
+        ),
+        (
+            vec![i(exact_large + 1), Value::Real(exact_large as f64)],
+            false,
+        ),
+        (vec![i(i64::MAX), Value::Real(i64::MAX as f64)], false),
+        (vec![Value::Real(f64::NAN)], false),
+        (vec![Value::Array(std::sync::Arc::new(vec![i(1)]))], false),
+    ] {
+        let mut arguments = WindowValues::with_capacity(values.len(), 1).unwrap();
+        for value in &values {
+            arguments
+                .push_row(std::iter::once(Ok(value.clone())))
+                .unwrap();
+        }
+        let indices: Vec<usize> = (0..values.len()).collect();
+        assert_eq!(
+            supports_monotonic_extrema(&indices, &arguments, None).unwrap(),
+            expected,
+            "{values:?}"
+        );
+    }
+}
+
+#[test]
+fn growing_rows_extrema_visit_unsafe_values_once() {
+    let n = 128;
+    let nan = Value::Real(f64::from_bits(0x7ff8_0000_0000_0001));
+    let rows = (0..n)
+        .map(|position| {
+            vec![
+                if position % 2 == 0 {
+                    nan.clone()
+                } else {
+                    i(i64::MAX)
+                },
+                i(position),
+            ]
+        })
+        .collect();
+    let mut position = column("position", DataType::Integer);
+    position.position = 1;
+    let _ = take_window_aggregate_steps();
+    let ExecutionResult::Query(result) = evaluate_window_query(
+        "SELECT MIN(x) OVER (ORDER BY position ROWS UNBOUNDED PRECEDING), MAX(x) OVER (ORDER BY position ROWS UNBOUNDED PRECEDING) FROM t",
+        &[column("x", DataType::Null), position], rows,
+    ).unwrap() else { panic!("expected rows") };
+    assert_eq!(result.rows.len(), n as usize);
+    assert_eq!(take_window_aggregate_steps(), 2 * n as usize);
+    for row in result.rows {
+        assert!(row[0].bit_eq(&nan));
+        assert!(row[1].bit_eq(&nan));
+    }
+}

@@ -322,6 +322,10 @@ impl ResolvedFrame {
         )
     }
 
+    fn is_rows_prefix(&self) -> bool {
+        matches!(self, Self::Rows { start: None, .. })
+    }
+
     fn supports_sliding(&self) -> bool {
         matches!(self, Self::Rows { sliding: true, .. })
     }
@@ -425,6 +429,7 @@ fn collated_keys_equal(left: &[Value], right: &[Value], collations: &[Collation]
 }
 
 /// Monotonic deque for sliding MIN/MAX.
+/// The caller must establish transitive ordering for the argument domain.
 pub(super) struct MonoDeque {
     deque: VecDeque<(usize, Value)>,
     is_min: bool,
@@ -608,6 +613,71 @@ impl WindowAccumulator {
     }
 }
 
+/// Exact frame-order extrema fold. Equal comparisons retain the first value,
+/// including its numeric representation, NaN payload, or collated spelling.
+struct WindowExtreme {
+    result: Value,
+    is_min: bool,
+    collation: Collation,
+}
+
+impl WindowExtreme {
+    fn new(is_min: bool, collation: Collation) -> Self {
+        Self {
+            result: Value::Null,
+            is_min,
+            collation,
+        }
+    }
+
+    fn add(&mut self, value: &Value) {
+        note_window_aggregate_step();
+        if value.is_null() {
+            return;
+        }
+        let replace = self.result.is_null() || {
+            let ordering = self.collation.cmp_value(value, &self.result);
+            (self.is_min && ordering.is_lt()) || (!self.is_min && ordering.is_gt())
+        };
+        if replace {
+            self.result = value.clone();
+        }
+    }
+
+    fn result(&self) -> Value {
+        self.result.clone()
+    }
+}
+
+/// Deque pruning requires transitive comparisons. SQL mixed numeric equality
+/// can bridge distinct integers, and NaN compares equal to every numeric value.
+/// Array ordering recursively inherits those relations, so arrays use the exact
+/// fold. Vector ordering uses total_cmp; other value domains are transitive.
+fn supports_monotonic_extrema(
+    indices: &[usize],
+    arguments: &WindowValues,
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<bool> {
+    let mut has_real = false;
+    let mut has_inexact_integer = false;
+    for (work, &index) in indices.iter().enumerate() {
+        check_cancel_at(cancel, work)?;
+        match &arguments[index][0] {
+            Value::Real(value) if value.is_nan() => return Ok(false),
+            Value::Real(_) => has_real = true,
+            value @ Value::Integer(_) => {
+                has_inexact_integer |= value.strict_coerce(DataType::Real).is_none();
+            }
+            Value::Array(_) => return Ok(false),
+            _ => {}
+        }
+        if has_real && has_inexact_integer {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn window_extreme(
     indices: &[usize],
     arguments: &WindowValues,
@@ -615,26 +685,12 @@ fn window_extreme(
     collation: Collation,
     cancel: Option<&citadel::CancelToken>,
 ) -> Result<Value> {
-    let mut result = Value::Null;
+    let mut acc = WindowExtreme::new(is_min, collation);
     for (work, &index) in indices.iter().enumerate() {
         check_cancel_at(cancel, work)?;
-        note_window_aggregate_step();
-        let value = &arguments[index][0];
-        if !value.is_null() {
-            result = match result {
-                Value::Null => value.clone(),
-                ref current => {
-                    let ordering = collation.cmp_value(value, current);
-                    if (is_min && ordering.is_lt()) || (!is_min && ordering.is_gt()) {
-                        value.clone()
-                    } else {
-                        current.clone()
-                    }
-                }
-            };
-        }
+        acc.add(&arguments[index][0]);
     }
-    Ok(result)
+    Ok(acc.result())
 }
 
 fn validate_window_args(name: &str, count: usize) -> Result<()> {
@@ -1076,7 +1132,24 @@ pub(super) fn eval_window_select(
                             check_cancel_at(cancel, work)?;
                             row_results[orig_idx][win_idx] = result.clone();
                         }
-                    } else if frame.supports_sliding() {
+                    } else if frame.is_rows_prefix() {
+                        // Growing prefixes append inputs in their original order;
+                        // unlike deque pruning, this does not require transitivity.
+                        let mut acc = WindowExtreme::new(is_min, value_collation);
+                        let mut previous_end = 0;
+                        for (pos, &orig_idx) in part_indices.iter().enumerate() {
+                            check_cancel_at(cancel, pos)?;
+                            let range = frame.indices(pos, part_len, &peer_bounds);
+                            for (work, add_pos) in (previous_end..range.end).enumerate() {
+                                check_cancel_at(cancel, work)?;
+                                acc.add(&arg_values[win_idx][part_indices[add_pos]][0]);
+                            }
+                            row_results[orig_idx][win_idx] = acc.result();
+                            previous_end = range.end;
+                        }
+                    } else if frame.supports_sliding()
+                        && supports_monotonic_extrema(part_indices, &arg_values[win_idx], cancel)?
+                    {
                         let mut deque = MonoDeque::new(is_min, value_collation);
                         let mut prev_end = 0;
                         for (pos, &orig_idx) in part_indices.iter().enumerate() {
