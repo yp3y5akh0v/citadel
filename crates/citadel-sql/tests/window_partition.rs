@@ -90,3 +90,29 @@ fn full_and_changing_partition_frames_match_sqlite_with_nulls_and_collations() {
     sqlite.execute_batch("DELETE FROM t").unwrap();
     matches_sqlite(&connection, &sqlite, full);
 }
+
+#[test]
+fn moving_real_sum_and_avg_match_sqlite_after_large_values_expire() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = database(directory.path());
+    let connection = Connection::open(&database).unwrap();
+    let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, g TEXT, v REAL)",
+        "INSERT INTO t VALUES \
+         (1, 'a', 1e20), (2, 'a', 1.0), (3, 'a', 1.0), (4, 'a', 2.0), \
+         (5, 'a', NULL), (6, 'a', 4.0), \
+         (7, 'b', -1e20), (8, 'b', -1.0), (9, 'b', -1.0), (10, 'b', -2.0)",
+    ] {
+        connection.execute(sql).unwrap();
+        sqlite.execute_batch(sql).unwrap();
+    }
+    for frame in ["1 PRECEDING AND CURRENT ROW", "1 PRECEDING AND 1 FOLLOWING"] {
+        let spec = format!("PARTITION BY g ORDER BY id ROWS BETWEEN {frame}");
+        matches_sqlite(
+            &connection,
+            &sqlite,
+            &format!("SELECT id, SUM(v) OVER ({spec}), AVG(v) OVER ({spec}) FROM t ORDER BY id"),
+        );
+    }
+}
