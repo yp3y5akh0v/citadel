@@ -420,9 +420,9 @@ impl Cursor {
             return Ok(None);
         }
         pages.ensure_loaded(self.leaf)?;
-        let page = pages
-            .get_page(&self.leaf)
-            .ok_or(Error::PageOutOfBounds(self.leaf))?;
+        let Some(page) = pages.get_page(&self.leaf) else {
+            return Err(Error::PageOutOfBounds(self.leaf));
+        };
         Ok(Some(leaf_node::read_cell(page, self.cell_idx)))
     }
 
