@@ -76,3 +76,7 @@ harness = false
 [[bench]]
 name = "topk_scan_probes"
 harness = false
+
+[[bench]]
+name = "mutation_locality"
+harness = false
