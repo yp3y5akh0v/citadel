@@ -80,3 +80,7 @@ harness = false
 [[bench]]
 name = "mutation_locality"
 harness = false
+
+[[bench]]
+name = "window_partition"
+harness = false
