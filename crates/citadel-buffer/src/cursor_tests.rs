@@ -126,7 +126,7 @@ fn lazy_cursor_forward() {
     let mut cursor = Cursor::seek_lazy(&mut loader, tree.root, b"").unwrap();
     let mut count = 0u32;
     while cursor.is_valid() {
-        let entry = cursor.current_ref_lazy(&mut loader);
+        let entry = cursor.current_ref_lazy(&mut loader).unwrap();
         assert!(entry.is_some());
         count += 1;
         cursor.next_lazy(&mut loader).unwrap();
@@ -147,7 +147,7 @@ fn lazy_cursor_range_loads_fewer_pages() {
     let mut cursor = Cursor::seek_lazy(&mut loader, tree.root, b"001000").unwrap();
     let mut count = 0u32;
     while cursor.is_valid() {
-        if let Some(entry) = cursor.current_ref_lazy(&mut loader) {
+        if let Some(entry) = cursor.current_ref_lazy(&mut loader).unwrap() {
             if entry.key > b"001009".as_slice() {
                 break;
             }
@@ -163,6 +163,75 @@ fn lazy_cursor_range_loads_fewer_pages() {
         touched,
         total_pages,
     );
+}
+
+#[test]
+fn lazy_current_propagates_loading_errors_without_retrying_or_moving() {
+    struct FallibleLoader {
+        pages: rustc_hash::FxHashMap<PageId, Page>,
+        failure: Option<Error>,
+        loads: usize,
+    }
+    impl PageMap for FallibleLoader {
+        fn get_page(&self, id: &PageId) -> Option<&Page> {
+            self.pages.get(id)
+        }
+    }
+    impl PageLoader for FallibleLoader {
+        fn ensure_loaded(&mut self, _id: PageId) -> Result<()> {
+            self.loads += 1;
+            match self.failure.take() {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
+        }
+    }
+
+    let (pages, tree) = build_tree(&[b"a", b"b"]);
+    let mut loader = FallibleLoader {
+        pages,
+        failure: None,
+        loads: 0,
+    };
+    let mut cursor = Cursor::seek_lazy(&mut loader, tree.root, b"a").unwrap();
+    let leaf = cursor.leaf_page_id();
+    let index = cursor.cell_index();
+    for interrupted in [false, true] {
+        loader.failure = Some(if interrupted {
+            Error::Interrupted
+        } else {
+            Error::ChecksumMismatch(leaf)
+        });
+        let loads = loader.loads;
+        let result = cursor.current_ref_lazy(&mut loader);
+        if interrupted {
+            assert!(matches!(result, Err(Error::Interrupted)));
+        } else {
+            assert!(matches!(result, Err(Error::ChecksumMismatch(id)) if id == leaf));
+        }
+        assert_eq!(loader.loads, loads + 1, "a failed read must not retry");
+        assert!(cursor.is_valid());
+        assert_eq!(cursor.leaf_page_id(), leaf);
+        assert_eq!(cursor.cell_index(), index);
+        let cell = cursor.current_ref_lazy(&mut loader).unwrap().unwrap();
+        assert_eq!(cell.key, b"a");
+        assert_eq!(cell.value, b"a");
+    }
+
+    // A loader that returns success without exposing the current page must
+    // report the missing page, not claim that the cursor reached EOF.
+    let page = loader.pages.remove(&leaf).unwrap();
+    assert!(matches!(
+        cursor.current_ref_lazy(&mut loader),
+        Err(Error::PageOutOfBounds(id)) if id == leaf
+    ));
+    loader.pages.insert(leaf, page);
+    while cursor.next_lazy(&mut loader).unwrap() {}
+    loader.failure = Some(Error::Interrupted);
+    let loads = loader.loads;
+    assert!(cursor.current_ref_lazy(&mut loader).unwrap().is_none());
+    assert_eq!(loader.loads, loads, "EOF must not attempt another load");
+    assert!(matches!(loader.failure, Some(Error::Interrupted)));
 }
 
 #[test]

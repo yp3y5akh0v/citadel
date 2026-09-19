@@ -772,7 +772,7 @@ impl<'db> ReadTxn<'db> {
             snapshot_txn_id: self.snapshot.txn_id,
         };
         let mut cursor = Cursor::seek_lazy(&mut view, root, start_key)?;
-        while let Some(cell) = cursor.current_ref_lazy(&mut view) {
+        while let Some(cell) = cursor.current_ref_lazy(&mut view)? {
             if let Some(t) = cancel.as_ref() {
                 t.check()?;
             }

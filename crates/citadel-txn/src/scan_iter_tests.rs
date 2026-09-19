@@ -138,3 +138,60 @@ fn table_scan_iter_write_txn() {
     }
     assert_eq!(count, 4);
 }
+
+#[test]
+fn table_scan_iter_returns_the_first_load_error_without_skipping_the_row() {
+    use citadel_buffer::cursor::{Cursor, PageLoader, PageMap};
+    use citadel_core::types::{PageId, PageType, TxnId, ValueType};
+    use citadel_core::{Error, Result};
+    use citadel_page::{leaf_node, page::Page};
+
+    struct FallibleAdapter {
+        page: Page,
+        fail_next: bool,
+        loads: usize,
+    }
+    impl PageMap for FallibleAdapter {
+        fn get_page(&self, id: &PageId) -> Option<&Page> {
+            (*id == self.page.page_id()).then_some(&self.page)
+        }
+    }
+    impl PageLoader for FallibleAdapter {
+        fn ensure_loaded(&mut self, id: PageId) -> Result<()> {
+            self.loads += 1;
+            if std::mem::take(&mut self.fail_next) {
+                return Err(Error::ChecksumMismatch(id));
+            }
+            Ok(())
+        }
+    }
+    impl super::TxnScanAdapter for FallibleAdapter {
+        fn with_loader<R>(
+            &mut self,
+            f: &mut dyn FnMut(&mut dyn PageLoader) -> Result<R>,
+        ) -> Result<R> {
+            f(self)
+        }
+    }
+
+    let id = PageId(7);
+    let mut page = Page::new(id, PageType::Leaf, TxnId(1));
+    page.rebuild_cells(&[
+        &leaf_node::build_cell(b"a", ValueType::Inline, b"first"),
+        &leaf_node::build_cell(b"b", ValueType::Inline, b"second"),
+    ]);
+    let mut adapter = FallibleAdapter {
+        page,
+        fail_next: false,
+        loads: 0,
+    };
+    let cursor = Cursor::seek_lazy(&mut adapter, id, b"").unwrap();
+    adapter.fail_next = true;
+    let loads = adapter.loads;
+    let mut iter = super::TableIter::new(adapter, cursor);
+    assert!(matches!(iter.next(), Err(Error::ChecksumMismatch(page)) if page == id));
+    assert_eq!(iter.inner.loads, loads + 1);
+    assert_eq!(iter.next().unwrap(), Some((&b"a"[..], &b"first"[..])));
+    assert_eq!(iter.next().unwrap(), Some((&b"b"[..], &b"second"[..])));
+    assert!(iter.next().unwrap().is_none());
+}

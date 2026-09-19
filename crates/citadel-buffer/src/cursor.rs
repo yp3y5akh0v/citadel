@@ -410,16 +410,20 @@ impl Cursor {
     }
 
     /// Read the current entry, loading the leaf page if needed.
+    /// Only an invalid cursor returns `None`; loading failures leave its
+    /// position unchanged and propagate to the caller.
     pub fn current_ref_lazy<'a, P: PageLoader + ?Sized>(
         &self,
         pages: &'a mut P,
-    ) -> Option<LeafCell<'a>> {
+    ) -> Result<Option<LeafCell<'a>>> {
         if !self.valid {
-            return None;
+            return Ok(None);
         }
-        pages.ensure_loaded(self.leaf).ok()?;
-        let page = pages.get_page(&self.leaf)?;
-        Some(leaf_node::read_cell(page, self.cell_idx))
+        pages.ensure_loaded(self.leaf)?;
+        let page = pages
+            .get_page(&self.leaf)
+            .ok_or(Error::PageOutOfBounds(self.leaf))?;
+        Ok(Some(leaf_node::read_cell(page, self.cell_idx)))
     }
 
     /// Advance to the next entry, loading pages on demand.
