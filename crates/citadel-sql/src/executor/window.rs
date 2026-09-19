@@ -337,7 +337,7 @@ impl ResolvedFrame {
 /// window order, and `keys` are the values used to establish that order.
 fn peer_group_bounds(
     part_indices: &[usize],
-    keys: &[Vec<Value>],
+    keys: &WindowValues,
     order_key_start: usize,
     order_collations: &[Collation],
     cancel: Option<&citadel::CancelToken>,
@@ -602,6 +602,64 @@ fn uses_window_frame(name: &str) -> bool {
     )
 }
 
+/// Fixed-width temporary rows, kept contiguous rather than allocating once per row.
+/// A zero-width matrix still has logical rows (for functions such as COUNT(*)).
+struct WindowValues {
+    values: Vec<Value>,
+    rows: usize,
+    width: usize,
+}
+
+impl WindowValues {
+    fn with_capacity(rows: usize, width: usize) -> Result<Self> {
+        let len = rows
+            .checked_mul(width)
+            .ok_or_else(|| SqlError::InvalidValue("window temporary size overflow".into()))?;
+        Ok(Self {
+            values: Vec::with_capacity(len),
+            rows,
+            width,
+        })
+    }
+
+    fn nulls(rows: usize, width: usize) -> Result<Self> {
+        let mut values = Self::with_capacity(rows, width)?;
+        values.values.resize(rows * width, Value::Null);
+        Ok(values)
+    }
+
+    fn push_row(&mut self, values: impl Iterator<Item = Result<Value>>) -> Result<()> {
+        let start = self.values.len();
+        for value in values {
+            self.values.push(value?);
+        }
+        debug_assert_eq!(self.values.len() - start, self.width);
+        debug_assert!(self.values.len() <= self.rows * self.width);
+        Ok(())
+    }
+
+    fn row_range(&self, row: usize) -> Range<usize> {
+        assert!(row < self.rows, "window row index out of bounds");
+        let start = row * self.width;
+        start..start + self.width
+    }
+}
+
+impl std::ops::Index<usize> for WindowValues {
+    type Output = [Value];
+
+    fn index(&self, row: usize) -> &Self::Output {
+        &self.values[self.row_range(row)]
+    }
+}
+
+impl std::ops::IndexMut<usize> for WindowValues {
+    fn index_mut(&mut self, row: usize) -> &mut Self::Output {
+        let range = self.row_range(row);
+        &mut self.values[range]
+    }
+}
+
 pub(super) fn eval_window_select(
     mut rows: Vec<Vec<Value>>,
     ctx: super::SelectCtx<'_>,
@@ -680,23 +738,22 @@ pub(super) fn eval_window_select(
         })
         .collect();
     let num_win = all_extracted.len();
-    let mut arg_values: Vec<Vec<Vec<Value>>> = Vec::with_capacity(num_win);
+    let mut arg_values: Vec<WindowValues> = Vec::with_capacity(num_win);
     for (window_idx, (_, _, args, _)) in all_extracted.iter().enumerate() {
         check_cancel_at(cancel, window_idx)?;
-        let mut per_row = Vec::with_capacity(rows.len());
+        let mut per_row = WindowValues::with_capacity(rows.len(), args.len())?;
         for (row_idx, row) in rows.iter().enumerate() {
             check_cancel_at(cancel, row_idx)?;
-            let vals: Vec<Value> = args
-                .iter()
-                .map(|a| eval_expr(a, &EvalCtx::new(&col_map, row).with_cancel(cancel)))
-                .collect::<Result<Vec<_>>>()?;
-            per_row.push(vals);
+            per_row.push_row(
+                args.iter()
+                    .map(|a| eval_expr(a, &EvalCtx::new(&col_map, row).with_cancel(cancel))),
+            )?;
         }
         arg_values.push(per_row);
     }
 
     let n = rows.len();
-    let mut row_results: Vec<Vec<Value>> = (0..n).map(|_| vec![Value::Null; num_win]).collect();
+    let mut row_results = WindowValues::nulls(n, num_win)?;
 
     for (win_idx, (_, fn_name, args, spec)) in all_extracted.iter().enumerate() {
         check_cancel_at(cancel, win_idx)?;
@@ -717,24 +774,16 @@ pub(super) fn eval_window_select(
             .collect();
 
         let mut indices: Vec<usize> = (0..n).collect();
-        let keys: Vec<Vec<Value>> = if sort_keys.is_empty() {
-            Vec::new()
-        } else {
-            let mut keys = Vec::with_capacity(n);
+        let mut keys = WindowValues::with_capacity(n, sort_keys.len())?;
+        if !sort_keys.is_empty() {
             for (position, row) in rows.iter().enumerate() {
                 check_cancel_at(cancel, position)?;
                 note_window_key_evaluation();
-                keys.push(
-                    sort_keys
-                        .iter()
-                        .map(|o| {
-                            eval_expr(&o.expr, &EvalCtx::new(&col_map, row).with_cancel(cancel))
-                        })
-                        .collect::<Result<Vec<_>>>()?,
-                );
+                keys.push_row(sort_keys.iter().map(|o| {
+                    eval_expr(&o.expr, &EvalCtx::new(&col_map, row).with_cancel(cancel))
+                }))?;
             }
-            keys
-        };
+        }
         if !sort_keys.is_empty() {
             sort_indices_by(&mut indices, cancel, |a, b| {
                 compare_sort_keys(&keys[a], &keys[b], &sort_keys, &key_collations)
