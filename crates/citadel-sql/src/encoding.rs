@@ -339,9 +339,7 @@ pub(crate) fn decode_signed_varint(data: &[u8]) -> Result<(i64, usize)> {
         if data.len() < 1 + byte_count {
             return Err(SqlError::InvalidValue("truncated positive integer".into()));
         }
-        let mut bytes = [0u8; 8];
-        bytes[8 - byte_count..].copy_from_slice(&data[1..1 + byte_count]);
-        let val = i64::from_be_bytes(bytes);
+        let val = read_key_magnitude(&data[1..1 + byte_count]) as i64;
         if val < 0 {
             return Err(SqlError::InvalidValue(
                 "positive integer out of range".into(),
@@ -353,11 +351,10 @@ pub(crate) fn decode_signed_varint(data: &[u8]) -> Result<(i64, usize)> {
         if data.len() < 1 + byte_count {
             return Err(SqlError::InvalidValue("truncated negative integer".into()));
         }
-        let mut bytes = [0u8; 8];
-        for i in 0..byte_count {
-            bytes[8 - byte_count + i] = !data[1 + i];
-        }
-        let abs_val = u64::from_be_bytes(bytes);
+        // Complement only the declared payload bits; narrower encodings have
+        // implicit zero high bytes, including noncanonical negative zero.
+        let width_mask = u64::MAX >> ((8 - byte_count) * 8);
+        let abs_val = read_key_magnitude(&data[1..1 + byte_count]) ^ width_mask;
         if abs_val > 1u64 << 63 {
             return Err(SqlError::InvalidValue(
                 "negative integer out of range".into(),
@@ -365,6 +362,22 @@ pub(crate) fn decode_signed_varint(data: &[u8]) -> Result<(i64, usize)> {
         }
         let val = (-(abs_val as i128)) as i64;
         Ok((val, 1 + byte_count))
+    }
+}
+
+/// Decode a checked one-to-eight-byte key magnitude without a variable-size copy.
+#[inline]
+fn read_key_magnitude(body: &[u8]) -> u64 {
+    match body {
+        [a] => u64::from(*a),
+        [a, b] => u64::from(u16::from_be_bytes([*a, *b])),
+        [a, b, c] => u64::from(u32::from_be_bytes([0, *a, *b, *c])),
+        [a, b, c, d] => u64::from(u32::from_be_bytes([*a, *b, *c, *d])),
+        [a, b, c, d, e] => u64::from_be_bytes([0, 0, 0, *a, *b, *c, *d, *e]),
+        [a, b, c, d, e, f] => u64::from_be_bytes([0, 0, *a, *b, *c, *d, *e, *f]),
+        [a, b, c, d, e, f, g] => u64::from_be_bytes([0, *a, *b, *c, *d, *e, *f, *g]),
+        [a, b, c, d, e, f, g, h] => u64::from_be_bytes([*a, *b, *c, *d, *e, *f, *g, *h]),
+        _ => unreachable!("signed key marker determines a magnitude width of 1..=8"),
     }
 }
 
