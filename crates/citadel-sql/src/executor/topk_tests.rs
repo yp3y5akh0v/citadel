@@ -148,13 +148,13 @@ fn raw_sort_comparisons_match_owned_values_for_every_runtime_type() {
                     for right in &values {
                         let expected = order.compare(owned_left, right);
                         assert_eq!(
-                            order.compare_raw(left, right),
+                            order.compare_raw(left, right).unwrap(),
                             expected,
                             "{left:?} / {right:?}, {collation:?}, \
                              descending={descending}, nulls_first={nulls_first}"
                         );
                         assert_eq!(
-                            SortKey::Borrowed(left).compare(right, order),
+                            SortKey::Borrowed(left).compare(right, order).unwrap(),
                             expected,
                             "borrowed sort key {left:?} / {right:?}"
                         );
@@ -166,18 +166,16 @@ fn raw_sort_comparisons_match_owned_values_for_every_runtime_type() {
 }
 
 #[test]
-fn raw_sort_comparisons_preserve_malformed_array_and_vector_nulls() {
+fn raw_sort_comparisons_reject_malformed_arrays_and_vectors() {
     let truncated_element = [1, 0, 0, 0];
-    let malformed = [
+    for raw in [
         RawColumn::Array(&[]),
         RawColumn::Array(&truncated_element),
         RawColumn::Vector(&[]),
         RawColumn::Vector(&truncated_element),
-    ];
-    let values = values();
-    for raw in malformed {
-        let owned = raw.to_value();
-        assert!(owned.is_null(), "fixture must fail decoding: {raw:?}");
+    ] {
+        assert!(raw.to_value().is_err());
+        assert!(SortKey::Borrowed(raw).into_owned().is_err());
         for collation in [Collation::Binary, Collation::NoCase, Collation::Rtrim] {
             for descending in [false, true] {
                 for nulls_first in [false, true] {
@@ -186,15 +184,9 @@ fn raw_sort_comparisons_preserve_malformed_array_and_vector_nulls() {
                         nulls_first,
                         collation,
                     };
-                    for right in &values {
-                        let expected = order.compare(&owned, right);
-                        assert_eq!(
-                            order.compare_raw(raw, right),
-                            expected,
-                            "{raw:?} / {right:?}, {collation:?}, \
-                             descending={descending}, nulls_first={nulls_first}"
-                        );
-                        assert_eq!(SortKey::Borrowed(raw).compare(right, order), expected);
+                    for right in values() {
+                        assert!(order.compare_raw(raw, &right).is_err());
+                        assert!(SortKey::Borrowed(raw).compare(&right, order).is_err());
                     }
                 }
             }

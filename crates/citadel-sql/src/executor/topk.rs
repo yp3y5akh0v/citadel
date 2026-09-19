@@ -68,20 +68,28 @@ impl SortOrder {
         })
     }
 
-    fn compare_raw(self, left: RawColumn<'_>, right: &Value) -> std::cmp::Ordering {
+    fn compare_raw(self, left: RawColumn<'_>, right: &Value) -> Result<std::cmp::Ordering> {
         if matches!(left, RawColumn::Array(_) | RawColumn::Vector(_)) {
-            return self.compare(&left.to_value(), right);
+            return Ok(self.compare(&left.to_value()?, right));
         }
-        self.compare_by(
-            matches!(left, RawColumn::Null),
-            right.is_null(),
-            || match (left, right) {
-                (RawColumn::Text(left), Value::Text(right)) => self.collation.cmp_text(left, right),
-                _ => left
-                    .cmp_value(right)
-                    .unwrap_or_else(|| left.to_value().cmp(right)),
+        let left_null = matches!(left, RawColumn::Null);
+        if left_null || right.is_null() {
+            return Ok(self.compare_by(left_null, right.is_null(), || {
+                unreachable!("NULL comparison does not compare payloads")
+            }));
+        }
+        let ordering = match (left, right) {
+            (RawColumn::Text(left), Value::Text(right)) => self.collation.cmp_text(left, right),
+            _ => match left.cmp_value(right)? {
+                Some(ordering) => ordering,
+                None => left.to_value()?.cmp(right),
             },
-        )
+        };
+        Ok(if self.descending {
+            ordering.reverse()
+        } else {
+            ordering
+        })
     }
 }
 
@@ -91,17 +99,17 @@ enum SortKey<'a> {
 }
 
 impl SortKey<'_> {
-    fn compare(&self, right: &Value, order: SortOrder) -> std::cmp::Ordering {
+    fn compare(&self, right: &Value, order: SortOrder) -> Result<std::cmp::Ordering> {
         match self {
             Self::Borrowed(raw) => order.compare_raw(*raw, right),
-            Self::Owned(value) => order.compare(value, right),
+            Self::Owned(value) => Ok(order.compare(value, right)),
         }
     }
 
-    fn into_owned(self) -> Value {
+    fn into_owned(self) -> Result<Value> {
         match self {
             Self::Borrowed(raw) => raw.to_value(),
-            Self::Owned(value) => value,
+            Self::Owned(value) => Ok(value),
         }
     }
 }
@@ -378,31 +386,20 @@ impl TopKScanPlan {
         let mut heap = std::collections::BinaryHeap::<Candidate>::new();
         let mut scan_err: Option<SqlError> = None;
 
-        scan(&mut |key, value| {
-            match accepts(key, value) {
-                Ok(true) => {}
-                Ok(false) => return true,
-                Err(error) => {
-                    scan_err = Some(error);
-                    return false;
-                }
+        let mut visit = |key: &[u8], value: &[u8]| -> Result<bool> {
+            if !accepts(key, value)? {
+                return Ok(true);
             }
-            let sort_key = match self.read_sort_key(schema, key, value, cancel) {
-                Ok(key) => key,
-                Err(error) => {
-                    scan_err = Some(error);
-                    return false;
-                }
-            };
+            let sort_key = self.read_sort_key(schema, key, value, cancel)?;
             if heap.len() >= k {
                 if let Some(top) = heap.peek() {
-                    if sort_key.compare(&top.sort_key, order) != std::cmp::Ordering::Less {
-                        return true;
+                    if sort_key.compare(&top.sort_key, order)? != std::cmp::Ordering::Less {
+                        return Ok(true);
                     }
                 }
             }
             let candidate = Candidate {
-                sort_key: sort_key.into_owned(),
+                sort_key: sort_key.into_owned()?,
                 raw_key: key.to_vec(),
                 raw_value: value.to_vec(),
                 order,
@@ -412,7 +409,14 @@ impl TopKScanPlan {
             } else if let Some(mut top) = heap.peek_mut() {
                 *top = candidate;
             }
-            true
+            Ok(true)
+        };
+        scan(&mut |key, value| match visit(key, value) {
+            Ok(keep_going) => keep_going,
+            Err(error) => {
+                scan_err = Some(error);
+                false
+            }
         })
         .map_err(SqlError::Storage)?;
 

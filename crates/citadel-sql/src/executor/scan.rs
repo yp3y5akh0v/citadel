@@ -2,8 +2,8 @@ use citadel::Database;
 use citadel_txn::read_txn::ReadTxn;
 
 use crate::encoding::{
-    decode_columns, decode_composite_key, decode_key_value, decode_stored_column_raw,
-    encode_composite_key, RawColumn,
+    decode_composite_key, decode_key_value, decode_stored_column_raw, encode_composite_key,
+    RawColumn,
 };
 use crate::error::{Result, SqlError};
 use crate::eval::{
@@ -1671,14 +1671,8 @@ impl SimplePredicate {
             return self.matches_value(&pk[self.pk_pos]);
         }
         match decode_stored_column_raw(value, self.nonpk_idx)? {
-            Some(raw) if self.arithmetic.is_none() => {
-                Ok(raw_matches_op(&raw, self.op, &self.literal))
-            }
-            Some(RawColumn::Array(_) | RawColumn::Vector(_)) => {
-                let decoded = decode_columns(value, &[self.nonpk_idx])?;
-                self.matches_value(&decoded[0])
-            }
-            Some(raw) => self.matches_value(&raw.to_value()),
+            Some(raw) if self.arithmetic.is_none() => raw_matches_op(&raw, self.op, &self.literal),
+            Some(raw) => self.matches_value(&raw.to_value()?),
             None => self.matches_value(self.default_val.as_ref().unwrap_or(&Value::Null)),
         }
     }
@@ -1727,8 +1721,8 @@ impl BetweenPredicate {
         if matches!(raw, RawColumn::Null) {
             return Ok(false);
         }
-        let ge = raw_matches_op(&raw, BinOp::GtEq, &self.low);
-        let le = raw_matches_op(&raw, BinOp::LtEq, &self.high);
+        let ge = raw_matches_op(&raw, BinOp::GtEq, &self.low)?;
+        let le = raw_matches_op(&raw, BinOp::LtEq, &self.high)?;
         let in_range = ge && le;
         Ok(if self.negated { !in_range } else { in_range })
     }
@@ -2046,33 +2040,33 @@ fn raw_comparison_supported(column_type: DataType, literal: &Value) -> bool {
             && matches!(literal_type, DataType::Integer | DataType::Real))
 }
 
-pub(super) fn raw_matches_op(raw: &RawColumn, op: BinOp, literal: &Value) -> bool {
+pub(super) fn raw_matches_op(raw: &RawColumn, op: BinOp, literal: &Value) -> Result<bool> {
     if matches!(raw, RawColumn::Null) || literal.is_null() {
-        return false;
+        return Ok(false);
     }
     // Keep mixed numeric and NaN comparisons identical to expression evaluation.
     match raw {
         RawColumn::Integer(value) => {
-            return raw_matches_op_value(&Value::Integer(*value), op, literal);
+            return Ok(raw_matches_op_value(&Value::Integer(*value), op, literal));
         }
         RawColumn::Real(value) => {
-            return raw_matches_op_value(&Value::Real(*value), op, literal);
+            return Ok(raw_matches_op_value(&Value::Real(*value), op, literal));
         }
         _ => {}
     }
-    match op {
-        BinOp::Eq => raw.eq_value(literal),
-        BinOp::NotEq => !raw.eq_value(literal),
-        BinOp::Lt => raw.cmp_value(literal) == Some(std::cmp::Ordering::Less),
-        BinOp::Gt => raw.cmp_value(literal) == Some(std::cmp::Ordering::Greater),
+    Ok(match op {
+        BinOp::Eq => raw.eq_value(literal)?,
+        BinOp::NotEq => !raw.eq_value(literal)?,
+        BinOp::Lt => raw.cmp_value(literal)? == Some(std::cmp::Ordering::Less),
+        BinOp::Gt => raw.cmp_value(literal)? == Some(std::cmp::Ordering::Greater),
         BinOp::LtEq => raw
-            .cmp_value(literal)
+            .cmp_value(literal)?
             .is_some_and(|o| o != std::cmp::Ordering::Greater),
         BinOp::GtEq => raw
-            .cmp_value(literal)
+            .cmp_value(literal)?
             .is_some_and(|o| o != std::cmp::Ordering::Less),
         _ => false,
-    }
+    })
 }
 
 pub(super) fn raw_matches_op_value(val: &Value, op: BinOp, literal: &Value) -> bool {
