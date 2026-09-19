@@ -682,22 +682,22 @@ impl<'db> WriteTxn<'db> {
         })
     }
 
-    /// Keep a match only for the detached callback operation which owns this
-    /// loaded path. Staging may rehash the map but cannot edit the source leaf.
+    /// Retain this operation's checked match for replacement. The tree's prior
+    /// lookup position is only advisory and is rechecked against the current
+    /// leaf. Staging may rehash the map but cannot edit that source leaf.
     fn search_loaded_leaf<'p>(
+        tree: &mut BTree,
         pages: &'p OwnedPages,
         leaf: &mut Option<LoadedLeaf>,
         key: &[u8],
     ) -> Result<Option<(ValueType, &'p [u8])>> {
         match leaf {
-            Some(leaf) => Ok(
-                BTree::search_at_leaf_ref_with_hint(pages, leaf.id, key)?.map(
-                    |(hint, kind, payload)| {
-                        leaf.hint = Some(hint);
-                        (kind, payload)
-                    },
-                ),
-            ),
+            Some(leaf) => Ok(tree.search_at_leaf_cached_ref(pages, leaf.id, key)?.map(
+                |(hint, kind, payload)| {
+                    leaf.hint = Some(hint);
+                    (kind, payload)
+                },
+            )),
             None => Ok(None),
         }
     }
@@ -1257,14 +1257,9 @@ impl<'db> WriteTxn<'db> {
         self.check_cancel()?;
         Self::validate_key_value(key, &[])?;
         self.ensure_table(table)?;
-        let mut leaf = Self::load_insert_leaf(
-            &self.named_trees[table],
-            &mut self.pages,
-            self.manager,
-            key,
-            &[],
-        )?;
-        let found = Self::search_loaded_leaf(&self.pages, &mut leaf, key)?;
+        let tree = self.named_trees.get_mut(table).unwrap();
+        let mut leaf = Self::load_insert_leaf(tree, &mut self.pages, self.manager, key, &[])?;
+        let found = Self::search_loaded_leaf(tree, &self.pages, &mut leaf, key)?;
         let mut overflow_value;
         let value = match found {
             None | Some((ValueType::Tombstone, _)) => None,
@@ -1355,14 +1350,10 @@ impl<'db> WriteTxn<'db> {
         self.invalidate_fk_cache_for(table);
         self.ensure_table(table)?;
 
-        let mut leaf = Self::load_insert_leaf(
-            &self.named_trees[table],
-            &mut self.pages,
-            self.manager,
-            key,
-            default_value,
-        )?;
-        let found = Self::search_loaded_leaf(&self.pages, &mut leaf, key)?;
+        let tree = self.named_trees.get_mut(table).unwrap();
+        let mut leaf =
+            Self::load_insert_leaf(tree, &mut self.pages, self.manager, key, default_value)?;
+        let found = Self::search_loaded_leaf(tree, &self.pages, &mut leaf, key)?;
         let (existing, retain_inline) = match found {
             None | Some((ValueType::Tombstone, _)) => (None, false),
             Some((ValueType::Overflow, payload)) => {

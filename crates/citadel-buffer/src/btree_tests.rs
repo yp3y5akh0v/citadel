@@ -2138,6 +2138,160 @@ mod checked_leaf_hint {
     }
 }
 
+mod cached_leaf_lookup {
+    use super::*;
+
+    fn lookup(
+        tree: &mut BTree,
+        pages: &FxHashMap<PageId, Page>,
+        key: &[u8],
+    ) -> Option<(ValueType, Vec<u8>)> {
+        let (_, leaf) = tree.walk_to_leaf(pages, key).unwrap();
+        tree.search_at_leaf_cached_ref(pages, leaf, key)
+            .unwrap()
+            .map(|(_, kind, value)| (kind, value.to_vec()))
+    }
+
+    #[test]
+    fn shifted_deleted_and_replaced_cells_are_read_from_the_current_page() {
+        let (mut pages, mut alloc, mut tree) = new_tree();
+        for key in *b"bdfh" {
+            tree.insert(
+                &mut pages,
+                &mut alloc,
+                TxnId(1),
+                &[key],
+                ValueType::Inline,
+                &[key],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            lookup(&mut tree, &pages, b"d"),
+            Some((ValueType::Inline, b"d".to_vec()))
+        );
+        tree.insert(
+            &mut pages,
+            &mut alloc,
+            TxnId(1),
+            b"a",
+            ValueType::Inline,
+            b"a",
+        )
+        .unwrap();
+        assert_eq!(
+            lookup(&mut tree, &pages, b"d"),
+            Some((ValueType::Inline, b"d".to_vec()))
+        );
+
+        assert_eq!(
+            lookup(&mut tree, &pages, b"h"),
+            Some((ValueType::Inline, b"h".to_vec()))
+        );
+        assert!(tree.delete(&mut pages, &mut alloc, TxnId(1), b"a").unwrap());
+        assert_eq!(
+            lookup(&mut tree, &pages, b"h"),
+            Some((ValueType::Inline, b"h".to_vec()))
+        );
+
+        lookup(&mut tree, &pages, b"d").unwrap();
+        assert!(tree.delete(&mut pages, &mut alloc, TxnId(1), b"d").unwrap());
+        assert_eq!(lookup(&mut tree, &pages, b"d"), None);
+        assert!(tree.last_lookup.is_none());
+
+        lookup(&mut tree, &pages, b"f").unwrap();
+        tree.insert(
+            &mut pages,
+            &mut alloc,
+            TxnId(1),
+            b"f",
+            ValueType::Tombstone,
+            b"",
+        )
+        .unwrap();
+        assert_eq!(
+            lookup(&mut tree, &pages, b"f"),
+            Some((ValueType::Tombstone, Vec::new()))
+        );
+        tree.insert(
+            &mut pages,
+            &mut alloc,
+            TxnId(1),
+            b"f",
+            ValueType::Inline,
+            &[9; 1024],
+        )
+        .unwrap();
+        assert_eq!(
+            lookup(&mut tree, &pages, b"f"),
+            Some((ValueType::Inline, vec![9; 1024]))
+        );
+        leaf_node::read_cells_checked(&pages[&tree.root]).unwrap();
+    }
+
+    #[test]
+    fn cow_split_and_cloned_snapshot_recheck_leaf_identity() {
+        let (mut pages, mut alloc, mut tree) = new_tree();
+        for key in 0..32u16 {
+            tree.insert(
+                &mut pages,
+                &mut alloc,
+                TxnId(1),
+                &key.to_be_bytes(),
+                ValueType::Inline,
+                b"old",
+            )
+            .unwrap();
+        }
+        let key = 16u16.to_be_bytes();
+        assert_eq!(
+            lookup(&mut tree, &pages, &key),
+            Some((ValueType::Inline, b"old".to_vec()))
+        );
+        let mut snapshot = tree.clone();
+        let old_root = tree.root;
+        tree.insert(
+            &mut pages,
+            &mut alloc,
+            TxnId(2),
+            &key,
+            ValueType::Inline,
+            b"new",
+        )
+        .unwrap();
+        assert_ne!(tree.root, old_root);
+        assert_eq!(
+            lookup(&mut tree, &pages, &key),
+            Some((ValueType::Inline, b"new".to_vec()))
+        );
+
+        for inserted in 32..256u16 {
+            tree.insert(
+                &mut pages,
+                &mut alloc,
+                TxnId(2),
+                &inserted.to_be_bytes(),
+                ValueType::Inline,
+                &[7; 128],
+            )
+            .unwrap();
+        }
+        assert!(tree.depth > 1);
+        for current in [16u16, 17, 18, 19, 18, 17, 16, 255, 254, 253, 17, 0, 33] {
+            let key = current.to_be_bytes();
+            let expected = tree.search(&pages, &key).unwrap();
+            assert_eq!(lookup(&mut tree, &pages, &key), expected);
+        }
+        for old in 0..32u16 {
+            assert_eq!(
+                lookup(&mut snapshot, &pages, &old.to_be_bytes()),
+                Some((ValueType::Inline, b"old".to_vec()))
+            );
+        }
+        assert_eq!(lookup(&mut snapshot, &pages, &255u16.to_be_bytes()), None);
+    }
+}
+
 #[test]
 fn unavailable_or_nonleaf_append_hint_falls_back_without_changing_the_tree() {
     for nonleaf in [false, true] {
