@@ -537,3 +537,166 @@ fn window_argument_passes_cancellation_into_scalar_evaluation() {
         crate::error::SqlError::Storage(citadel_core::Error::Interrupted)
     ));
 }
+
+fn evaluate_window_query(
+    sql: &str,
+    columns: &[ColumnDef],
+    rows: Vec<Vec<Value>>,
+) -> Result<ExecutionResult> {
+    let Statement::Select(query) = crate::parser::parse_sql(sql).unwrap() else {
+        panic!("expected SELECT");
+    };
+    let QueryBody::Select(stmt) = query.body else {
+        panic!("expected plain SELECT");
+    };
+    eval_window_select(rows, crate::executor::SelectCtx::new(columns, &stmt, None))
+}
+
+#[test]
+fn whole_partition_aggregates_visit_each_input_once_per_function() {
+    let n = 128;
+    let rows: Vec<Vec<Value>> = (0..n)
+        .map(|index| {
+            vec![if index % 7 == 0 {
+                Value::Null
+            } else {
+                i(index)
+            }]
+        })
+        .collect();
+    let sum: i64 = (0..n).filter(|index| index % 7 != 0).sum();
+    let count = (0..n).filter(|index| index % 7 != 0).count() as i64;
+    let expected = vec![
+        i(sum),
+        i(n),
+        i(count),
+        Value::Real(sum as f64 / count as f64),
+        i(1),
+        i(n - 1),
+    ];
+    for spec in [
+        "",
+        "ORDER BY x ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING",
+        "ORDER BY x DESC RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING",
+    ] {
+        let sql = [
+            "SUM(x)", "COUNT(*)", "COUNT(x)", "AVG(x)", "MIN(x)", "MAX(x)",
+        ]
+        .map(|function| format!("{function} OVER ({spec})"))
+        .join(", ");
+        let _ = take_window_aggregate_steps();
+        let ExecutionResult::Query(result) = evaluate_window_query(
+            &format!("SELECT {sql} FROM t"),
+            &[column("x", DataType::Integer)],
+            rows.clone(),
+        )
+        .unwrap() else {
+            panic!("expected rows");
+        };
+        assert_eq!(result.rows, vec![expected.clone(); n as usize]);
+        assert_eq!(take_window_aggregate_steps(), 6 * n as usize, "{spec}");
+    }
+}
+
+#[test]
+fn full_partition_float_results_follow_existing_sorted_accumulation_order() {
+    let mut position = column("position", DataType::Integer);
+    position.position = 1;
+    let columns = [column("x", DataType::Real), position];
+    // Include a stored integer alongside real values: SlidingSum preserves
+    // separate integer and real subtotals before combining them at result().
+    let rows = vec![
+        vec![Value::Real(1e20), i(0)],
+        vec![Value::Real(-1e20), i(1)],
+        vec![Value::Real(3.5), i(2)],
+        vec![i(1), i(3)],
+    ];
+    for (direction, sum, average) in [("ASC", 4.5, 1.125), ("DESC", 1.0, 0.25)] {
+        let spec = format!("ORDER BY position {direction} ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING");
+        let ExecutionResult::Query(result) = evaluate_window_query(
+            &format!("SELECT SUM(x) OVER ({spec}), AVG(x) OVER ({spec}) FROM t"),
+            &columns,
+            rows.clone(),
+        )
+        .unwrap() else {
+            panic!("expected rows");
+        };
+        assert_eq!(
+            result.rows,
+            vec![vec![Value::Real(sum), Value::Real(average)]; 4]
+        );
+    }
+}
+
+#[test]
+fn full_partition_aggregate_errors_match_existing_accumulator_rules() {
+    let columns = [column("x", DataType::Integer)];
+    for spec in [
+        "",
+        "ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING",
+    ] {
+        assert!(matches!(
+            evaluate_window_query(
+                &format!("SELECT SUM(x) OVER ({spec}) FROM t"),
+                &columns,
+                vec![vec![i(i64::MAX)], vec![i(1)]],
+            ),
+            Err(SqlError::IntegerOverflow)
+        ));
+        assert!(matches!(
+            evaluate_window_query(
+                &format!("SELECT AVG(x) OVER ({spec}) FROM t"),
+                &columns,
+                vec![vec![i(1)], vec![Value::Text("not numeric".into())]],
+            ),
+            Err(SqlError::TypeMismatch { .. })
+        ));
+    }
+}
+
+#[test]
+fn full_partition_extrema_preserve_the_first_equal_value_representation() {
+    let mut x = column("x", DataType::Null);
+    x.collation = Collation::NoCase;
+    for values in [
+        vec![i(1), Value::Real(1.0)],
+        vec![Value::Real(1.0), i(1)],
+        vec![Value::Real(-0.0), Value::Real(0.0)],
+        vec![
+            Value::Real(f64::from_bits(0x7ff8_0000_0000_0001)),
+            Value::Real(f64::from_bits(0x7ff8_0000_0000_0002)),
+            Value::Real(1.0),
+        ],
+        vec![
+            Value::Text("First_heap_text_value_with_equal_collation".into()),
+            Value::Text("first_heap_text_value_with_equal_collation".into()),
+        ],
+    ] {
+        for frame in [
+            "",
+            "ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING",
+            "RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING",
+        ] {
+            let rows = values.iter().cloned().map(|value| vec![value]).collect();
+            let ExecutionResult::Query(result) = evaluate_window_query(
+                &format!("SELECT MIN(x) OVER ({frame}), MAX(x) OVER ({frame}) FROM t"),
+                std::slice::from_ref(&x),
+                rows,
+            )
+            .unwrap() else {
+                panic!("expected rows");
+            };
+            assert_eq!(result.rows.len(), values.len());
+            for row in result.rows {
+                assert!(
+                    row[0].bit_eq(&values[0]),
+                    "MIN changed the equal representative: {row:?}"
+                );
+                assert!(
+                    row[1].bit_eq(&values[0]),
+                    "MAX changed the equal representative: {row:?}"
+                );
+            }
+        }
+    }
+}

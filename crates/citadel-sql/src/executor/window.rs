@@ -12,6 +12,7 @@ use super::helpers::*;
 thread_local! {
     static WINDOW_KEY_EVALUATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static WINDOW_PEER_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static WINDOW_AGGREGATE_STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[inline]
@@ -34,6 +35,17 @@ fn take_window_key_evaluations() -> usize {
 #[cfg(test)]
 fn take_window_peer_comparisons() -> usize {
     WINDOW_PEER_COMPARISONS.with(|count| count.replace(0))
+}
+
+#[inline]
+fn note_window_aggregate_step() {
+    #[cfg(test)]
+    WINDOW_AGGREGATE_STEPS.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(test)]
+fn take_window_aggregate_steps() -> usize {
+    WINDOW_AGGREGATE_STEPS.with(|count| count.replace(0))
 }
 
 pub(super) fn has_window_function(expr: &Expr) -> bool {
@@ -292,6 +304,22 @@ impl ResolvedFrame {
 
     fn uses_peers(&self) -> bool {
         matches!(self, Self::Range { unbounded_start, unbounded_end } if !unbounded_start || !unbounded_end)
+    }
+
+    /// Only explicit unbounded ends (or the unordered default) prove
+    /// every output row consumes this same complete partition.
+    fn covers_partition(&self) -> bool {
+        matches!(
+            self,
+            Self::Rows {
+                start: None,
+                end: None,
+                ..
+            } | Self::Range {
+                unbounded_start: true,
+                unbounded_end: true
+            }
+        )
     }
 
     fn supports_sliding(&self) -> bool {
@@ -554,6 +582,7 @@ impl WindowAccumulator {
     }
 
     fn add(&mut self, args: &[Value]) -> Result<()> {
+        note_window_aggregate_step();
         match self {
             Self::Count { count, star } => {
                 *count += i64::from(*star || !args[0].is_null());
@@ -577,6 +606,35 @@ impl WindowAccumulator {
             Self::Avg(sum) => Ok(sum.result_avg()),
         }
     }
+}
+
+fn window_extreme(
+    indices: &[usize],
+    arguments: &WindowValues,
+    is_min: bool,
+    collation: Collation,
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<Value> {
+    let mut result = Value::Null;
+    for (work, &index) in indices.iter().enumerate() {
+        check_cancel_at(cancel, work)?;
+        note_window_aggregate_step();
+        let value = &arguments[index][0];
+        if !value.is_null() {
+            result = match result {
+                Value::Null => value.clone(),
+                ref current => {
+                    let ordering = collation.cmp_value(value, current);
+                    if (is_min && ordering.is_lt()) || (!is_min && ordering.is_gt()) {
+                        value.clone()
+                    } else {
+                        current.clone()
+                    }
+                }
+            };
+        }
+    }
+    Ok(result)
 }
 
 fn validate_window_args(name: &str, count: usize) -> Result<()> {
@@ -955,7 +1013,18 @@ pub(super) fn eval_window_select(
                     }
                 }
                 "SUM" | "COUNT" | "AVG" => {
-                    if frame.supports_sliding() {
+                    if frame.covers_partition() {
+                        let mut acc = WindowAccumulator::new(&upper_name, args.len());
+                        for (work, &orig_idx) in part_indices.iter().enumerate() {
+                            check_cancel_at(cancel, work)?;
+                            acc.add(&arg_values[win_idx][orig_idx])?;
+                        }
+                        let result = acc.result()?;
+                        for (work, &orig_idx) in part_indices.iter().enumerate() {
+                            check_cancel_at(cancel, work)?;
+                            row_results[orig_idx][win_idx] = result.clone();
+                        }
+                    } else if frame.supports_sliding() {
                         let mut acc = WindowAccumulator::new(&upper_name, args.len());
                         let mut previous = 0..0;
                         for (pos, &orig_idx) in part_indices.iter().enumerate() {
@@ -995,7 +1064,19 @@ pub(super) fn eval_window_select(
                         .first()
                         .and_then(|arg| operand_collation(arg, &col_map))
                         .unwrap_or_default();
-                    if frame.supports_sliding() {
+                    if frame.covers_partition() {
+                        let result = window_extreme(
+                            part_indices,
+                            &arg_values[win_idx],
+                            is_min,
+                            value_collation,
+                            cancel,
+                        )?;
+                        for (work, &orig_idx) in part_indices.iter().enumerate() {
+                            check_cancel_at(cancel, work)?;
+                            row_results[orig_idx][win_idx] = result.clone();
+                        }
+                    } else if frame.supports_sliding() {
                         let mut deque = MonoDeque::new(is_min, value_collation);
                         let mut prev_end = 0;
                         for (pos, &orig_idx) in part_indices.iter().enumerate() {
@@ -1018,27 +1099,13 @@ pub(super) fn eval_window_select(
                         for (pos, &orig_idx) in part_indices.iter().enumerate() {
                             check_cancel_at(cancel, pos)?;
                             let range = frame.indices(pos, part_len, &peer_bounds);
-                            let mut result = Value::Null;
-                            for (frame_iteration, fpos) in range.enumerate() {
-                                check_cancel_at(cancel, frame_iteration)?;
-                                let v = &arg_values[win_idx][part_indices[fpos]][0];
-                                if !v.is_null() {
-                                    result = match result {
-                                        Value::Null => v.clone(),
-                                        ref cur => {
-                                            let ordering = value_collation.cmp_value(v, cur);
-                                            if (is_min && ordering.is_lt())
-                                                || (!is_min && ordering.is_gt())
-                                            {
-                                                v.clone()
-                                            } else {
-                                                cur.clone()
-                                            }
-                                        }
-                                    };
-                                }
-                            }
-                            row_results[orig_idx][win_idx] = result;
+                            row_results[orig_idx][win_idx] = window_extreme(
+                                &part_indices[range],
+                                &arg_values[win_idx],
+                                is_min,
+                                value_collation,
+                                cancel,
+                            )?;
                         }
                     }
                 }
