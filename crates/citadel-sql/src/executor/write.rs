@@ -479,7 +479,7 @@ fn decode_cols_into(
     partial_row: &mut [Value],
 ) -> Result<()> {
     for &(schema_idx, phys_idx) in cols {
-        partial_row[schema_idx] = decode_column_raw(value, phys_idx)?.to_value();
+        partial_row[schema_idx] = decode_column_raw(value, phys_idx)?.to_value()?;
     }
     Ok(())
 }
@@ -763,7 +763,7 @@ impl<'a> UpdateValue<'a> {
 
     fn decode_columns(&mut self, columns: &[(usize, usize)], row: &mut [Value]) -> Result<()> {
         for &(schema_idx, physical_idx) in columns {
-            row[schema_idx] = self.column(physical_idx)?.to_value();
+            row[schema_idx] = self.column(physical_idx)?.to_value()?;
         }
         Ok(())
     }
@@ -1787,7 +1787,8 @@ pub(super) fn exec_update(
                             ),
                     )?;
                     for target in &targets {
-                        partial_row[target.schema_idx] = value.column(target.phys_idx)?.to_value();
+                        partial_row[target.schema_idx] =
+                            value.column(target.phys_idx)?.to_value()?;
                     }
                     value.decode_columns(&rhs_extra_cols, &mut partial_row)?;
                     for target in &targets {
@@ -1912,7 +1913,7 @@ pub(super) fn exec_update(
             }
             for target in &targets {
                 partial_row[target.schema_idx] =
-                    decode_column_raw(raw_value, target.phys_idx)?.to_value();
+                    decode_column_raw(raw_value, target.phys_idx)?.to_value()?;
             }
             decode_cols_into(raw_value, &rhs_extra_cols, &mut partial_row)?;
             for target in &targets {
@@ -2683,7 +2684,7 @@ fn patch_compiled_update_value(
     // Capture every SET input before patching: multiple assignments share the
     // old row, while generated expressions below observe the completed SET.
     for target in targets {
-        partial_row[target.schema_idx] = value.column(target.phys_idx)?.to_value();
+        partial_row[target.schema_idx] = value.column(target.phys_idx)?.to_value()?;
     }
     value.decode_columns(&fast.rhs_extra_cols, partial_row)?;
     for target in targets {
@@ -2907,7 +2908,7 @@ fn try_fast_update_in_txn(
                         ),
                 )?;
                 for target in &targets {
-                    partial_row[target.schema_idx] = value.column(target.phys_idx)?.to_value();
+                    partial_row[target.schema_idx] = value.column(target.phys_idx)?.to_value()?;
                 }
                 value.decode_columns(&rhs_extra_cols, &mut partial_row)?;
                 for target in &targets {
@@ -3017,7 +3018,7 @@ fn try_fast_update_in_txn(
         }
         for target in &targets {
             partial_row[target.schema_idx] =
-                decode_column_raw(raw_value, target.phys_idx)?.to_value();
+                decode_column_raw(raw_value, target.phys_idx)?.to_value()?;
         }
         decode_cols_into(raw_value, &rhs_extra_cols, &mut partial_row)?;
         for target in &targets {

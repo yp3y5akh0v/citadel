@@ -1903,7 +1903,7 @@ fn extract_raw_value(
                 Ok(pk[*pk_pos].clone())
             }
         }
-        RawColTarget::NonPk(idx) => Ok(decode_column_raw(value, *idx)?.to_value()),
+        RawColTarget::NonPk(idx) => decode_column_raw(value, *idx)?.to_value(),
     }
 }
 

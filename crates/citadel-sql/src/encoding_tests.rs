@@ -371,7 +371,7 @@ fn raw_column_integer() {
     let encoded = encode_row(&values);
     let raw = decode_column_raw(&encoded, 0).unwrap();
     assert!(matches!(raw, RawColumn::Integer(42)));
-    assert_eq!(raw.to_value(), Value::Integer(42));
+    assert_eq!(raw.to_value().unwrap(), Value::Integer(42));
 }
 
 #[test]
@@ -421,23 +421,32 @@ fn raw_column_out_of_bounds_returns_null() {
 #[test]
 fn raw_column_eq_value() {
     let raw_int = RawColumn::Integer(42);
-    assert!(raw_int.eq_value(&Value::Integer(42)));
-    assert!(!raw_int.eq_value(&Value::Integer(43)));
-    assert!(raw_int.eq_value(&Value::Real(42.0)));
+    assert!(raw_int.eq_value(&Value::Integer(42)).unwrap());
+    assert!(!raw_int.eq_value(&Value::Integer(43)).unwrap());
+    assert!(raw_int.eq_value(&Value::Real(42.0)).unwrap());
 
     let raw_text = RawColumn::Text("hello");
-    assert!(raw_text.eq_value(&Value::Text("hello".into())));
-    assert!(!raw_text.eq_value(&Value::Text("world".into())));
+    assert!(raw_text.eq_value(&Value::Text("hello".into())).unwrap());
+    assert!(!raw_text.eq_value(&Value::Text("world".into())).unwrap());
 }
 
 #[test]
 fn raw_column_cmp_value() {
     use std::cmp::Ordering;
     let raw = RawColumn::Integer(42);
-    assert_eq!(raw.cmp_value(&Value::Integer(42)), Some(Ordering::Equal));
-    assert_eq!(raw.cmp_value(&Value::Integer(50)), Some(Ordering::Less));
-    assert_eq!(raw.cmp_value(&Value::Integer(10)), Some(Ordering::Greater));
-    assert_eq!(raw.cmp_value(&Value::Null), None);
+    assert_eq!(
+        raw.cmp_value(&Value::Integer(42)).unwrap(),
+        Some(Ordering::Equal)
+    );
+    assert_eq!(
+        raw.cmp_value(&Value::Integer(50)).unwrap(),
+        Some(Ordering::Less)
+    );
+    assert_eq!(
+        raw.cmp_value(&Value::Integer(10)).unwrap(),
+        Some(Ordering::Greater)
+    );
+    assert_eq!(raw.cmp_value(&Value::Null).unwrap(), None);
 }
 
 #[test]
@@ -490,7 +499,7 @@ fn raw_column_matches_full_decode() {
     let full = decode_row(&encoded).unwrap();
     for (i, expected) in full.iter().enumerate() {
         let raw = decode_column_raw(&encoded, i).unwrap();
-        assert_eq!(raw.to_value(), *expected, "mismatch at column {i}");
+        assert_eq!(raw.to_value().unwrap(), *expected, "mismatch at column {i}");
     }
 }
 
@@ -944,7 +953,10 @@ fn row_layout_patches_match_public_paths_across_successive_type_changes() {
             let mut by_offset = located.clone();
             let mut layout = RowLayout::default();
             // Prime all locations before any mutation, including the suffix.
-            assert_eq!(layout.column(&located, 3).unwrap().to_value(), expected[3]);
+            assert_eq!(
+                layout.column(&located, 3).unwrap().to_value().unwrap(),
+                expected[3]
+            );
             for (replacement, admitted) in replacements {
                 let before = located.clone();
                 let (_, offset) = decode_column_with_offset(&by_offset, 1).unwrap();
@@ -972,8 +984,12 @@ fn row_layout_patches_match_public_paths_across_successive_type_changes() {
                     .column(&located, 1)
                     .unwrap()
                     .to_value()
+                    .unwrap()
                     .bit_eq(&expected[1]));
-                assert_eq!(layout.column(&located, 3).unwrap().to_value(), expected[3]);
+                assert_eq!(
+                    layout.column(&located, 3).unwrap().to_value().unwrap(),
+                    expected[3]
+                );
             }
             for target in [0, expected.len()] {
                 let before = located.clone();
@@ -1044,7 +1060,7 @@ fn raw_column_array_decodes() {
     let encoded = encode_row(std::slice::from_ref(&v));
     let raw = decode_column_raw(&encoded, 0).unwrap();
     assert!(matches!(raw, RawColumn::Array(_)));
-    assert_eq!(raw.to_value(), v);
+    assert_eq!(raw.to_value().unwrap(), v);
 }
 
 #[test]
@@ -1470,5 +1486,110 @@ fn signed_key_decoder_zero_marker_preserves_following_component() {
             decode_key_value(&key[2..]).unwrap(),
             (Value::Boolean(true), 2)
         );
+    }
+}
+
+#[test]
+fn raw_composite_operations_propagate_malformed_payload_errors() {
+    let array_count = [2, 0, 0, 0, 0xff];
+    let array_marker = [1, 0, 0, 0, 0x7f];
+    let vector_count = [2, 0, 0, 0, 0, 0];
+    for raw in [
+        RawColumn::Array(&[]),
+        RawColumn::Array(&array_count),
+        RawColumn::Array(&array_marker),
+        RawColumn::Vector(&[]),
+        RawColumn::Vector(&vector_count),
+    ] {
+        let expected = match raw {
+            RawColumn::Array(bytes) => decode_array_v2(bytes).unwrap_err(),
+            RawColumn::Vector(bytes) => decode_vector(bytes).unwrap_err(),
+            _ => unreachable!(),
+        };
+        assert!(matches!(expected, SqlError::InvalidValue(_)));
+        let expected = expected.to_string();
+        assert_eq!(raw.to_value().unwrap_err().to_string(), expected);
+        for other in [
+            Value::Null,
+            Value::Integer(0),
+            Value::Array(vec![].into()),
+            Value::Vector(vec![].into()),
+        ] {
+            assert_eq!(raw.cmp_value(&other).unwrap_err().to_string(), expected);
+            assert_eq!(raw.eq_value(&other).unwrap_err().to_string(), expected);
+        }
+    }
+}
+
+#[test]
+fn impossible_array_counts_are_rejected_before_element_allocation() {
+    // This allocation-free header validator can safely receive maximal counts
+    // even if a future caller accidentally omits its pre-allocation check.
+    for count in [1u32, 1024, u32::MAX] {
+        assert!(matches!(
+            array_element_count(&count.to_le_bytes()),
+            Err(SqlError::InvalidValue(_))
+        ));
+    }
+    assert_eq!(array_element_count(&0u32.to_le_bytes()).unwrap(), 0);
+    let all_null = [3, 0, 0, 0, 0xff, 0xff, 0xff];
+    assert_eq!(array_element_count(&all_null).unwrap(), 3);
+    assert_eq!(
+        decode_array_v2(&all_null).unwrap(),
+        Value::Array(vec![Value::Null; 3].into())
+    );
+    // Exercise the actual decoder with a bounded count as well.
+    assert!(decode_array_v2(&[2, 0, 0, 0, 0xff]).is_err());
+}
+
+#[test]
+fn nested_array_payload_errors_and_impossible_variable_lengths_propagate() {
+    let mut nested = vec![1, 0, 0, 0, 0, DataType::Array.type_tag()];
+    nested.extend_from_slice(&4u32.to_le_bytes());
+    nested.extend_from_slice(&1u32.to_le_bytes());
+    let mut huge_element = vec![1, 0, 0, 0, 0, DataType::Text.type_tag()];
+    huge_element.extend_from_slice(&u32::MAX.to_le_bytes());
+    for body in [&nested, &huge_element] {
+        let raw = RawColumn::Array(body);
+        assert!(matches!(raw.to_value(), Err(SqlError::InvalidValue(_))));
+        assert!(matches!(
+            raw.eq_value(&Value::Array(vec![].into())),
+            Err(SqlError::InvalidValue(_))
+        ));
+        assert!(matches!(
+            raw.cmp_value(&Value::Array(vec![].into())),
+            Err(SqlError::InvalidValue(_))
+        ));
+    }
+}
+
+#[test]
+fn valid_raw_composite_comparisons_match_owned_representation_semantics() {
+    let values = [
+        Value::Array(vec![].into()),
+        Value::Array(vec![Value::Null, Value::Integer(1)].into()),
+        Value::Array(vec![Value::Null, Value::Real(1.0)].into()),
+        Value::Vector(vec![].into()),
+        Value::Vector(vec![-0.0, 1.0].into()),
+        Value::Vector(vec![0.0, 1.0].into()),
+        Value::Vector(vec![f32::from_bits(0x7fc0_0001)].into()),
+        Value::Vector(vec![f32::from_bits(0x7fc0_0002)].into()),
+    ];
+    for value in &values {
+        let encoded = encode_row(std::slice::from_ref(value));
+        let raw = decode_column_raw(&encoded, 0).unwrap();
+        assert_eq!(raw.to_value().unwrap(), *value);
+        for other in &values {
+            assert_eq!(raw.eq_value(other).unwrap(), value == other);
+            let expected = (value.data_type() == other.data_type()).then(|| value.cmp(other));
+            // VECTOR dimension is carried in DataType, but ordering also
+            // compares vectors of different dimensions by their lengths.
+            let expected = if matches!((value, other), (Value::Vector(_), Value::Vector(_))) {
+                Some(value.cmp(other))
+            } else {
+                expected
+            };
+            assert_eq!(raw.cmp_value(other).unwrap(), expected);
+        }
     }
 }

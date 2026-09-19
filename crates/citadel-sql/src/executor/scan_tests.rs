@@ -1,5 +1,5 @@
 use super::*;
-use crate::encoding::RawColumn;
+use crate::encoding::{decode_columns, RawColumn};
 use crate::parser::{BinOp, Expr};
 use crate::types::{Collation, ColumnDef, DataType, TableSchema, Value};
 
@@ -141,41 +141,37 @@ fn raw_matches_op_value_non_comparison_returns_false() {
 
 #[test]
 fn raw_matches_op_raw_null_short_circuits() {
-    assert!(!raw_matches_op(&RawColumn::Null, BinOp::Eq, &i(5)));
+    assert!(!raw_matches_op(&RawColumn::Null, BinOp::Eq, &i(5)).unwrap());
 }
 
 #[test]
 fn raw_matches_op_literal_null_short_circuits() {
-    assert!(!raw_matches_op(
-        &RawColumn::Integer(5),
-        BinOp::Eq,
-        &Value::Null
-    ));
+    assert!(!raw_matches_op(&RawColumn::Integer(5), BinOp::Eq, &Value::Null).unwrap());
 }
 
 #[test]
 fn raw_matches_op_eq_integer() {
-    assert!(raw_matches_op(&RawColumn::Integer(5), BinOp::Eq, &i(5)));
-    assert!(!raw_matches_op(&RawColumn::Integer(5), BinOp::Eq, &i(6)));
+    assert!(raw_matches_op(&RawColumn::Integer(5), BinOp::Eq, &i(5)).unwrap());
+    assert!(!raw_matches_op(&RawColumn::Integer(5), BinOp::Eq, &i(6)).unwrap());
 }
 
 #[test]
 fn raw_matches_op_neq_integer() {
-    assert!(raw_matches_op(&RawColumn::Integer(5), BinOp::NotEq, &i(6)));
-    assert!(!raw_matches_op(&RawColumn::Integer(5), BinOp::NotEq, &i(5)));
+    assert!(raw_matches_op(&RawColumn::Integer(5), BinOp::NotEq, &i(6)).unwrap());
+    assert!(!raw_matches_op(&RawColumn::Integer(5), BinOp::NotEq, &i(5)).unwrap());
 }
 
 #[test]
 fn raw_matches_op_lt_integer() {
-    assert!(raw_matches_op(&RawColumn::Integer(4), BinOp::Lt, &i(5)));
-    assert!(!raw_matches_op(&RawColumn::Integer(5), BinOp::Lt, &i(5)));
+    assert!(raw_matches_op(&RawColumn::Integer(4), BinOp::Lt, &i(5)).unwrap());
+    assert!(!raw_matches_op(&RawColumn::Integer(5), BinOp::Lt, &i(5)).unwrap());
 }
 
 #[test]
 fn raw_matches_op_gteq_integer() {
-    assert!(raw_matches_op(&RawColumn::Integer(5), BinOp::GtEq, &i(5)));
-    assert!(raw_matches_op(&RawColumn::Integer(6), BinOp::GtEq, &i(5)));
-    assert!(!raw_matches_op(&RawColumn::Integer(4), BinOp::GtEq, &i(5)));
+    assert!(raw_matches_op(&RawColumn::Integer(5), BinOp::GtEq, &i(5)).unwrap());
+    assert!(raw_matches_op(&RawColumn::Integer(6), BinOp::GtEq, &i(5)).unwrap());
+    assert!(!raw_matches_op(&RawColumn::Integer(4), BinOp::GtEq, &i(5)).unwrap());
 }
 
 #[test]
@@ -1438,4 +1434,60 @@ fn select_scan_preserves_defaults_between_filter_and_projection() {
 
     assert_eq!(row, vec![i(1), expected, i(2), Value::Null]);
     assert!(!token.is_cancelled());
+}
+
+#[test]
+fn raw_predicate_comparisons_propagate_array_and_vector_decode_errors() {
+    let truncated = [1, 0, 0, 0];
+    for raw in [RawColumn::Array(&truncated), RawColumn::Vector(&truncated)] {
+        let literal = match raw {
+            RawColumn::Array(_) => Value::Array(vec![].into()),
+            RawColumn::Vector(_) => Value::Vector(vec![].into()),
+            _ => unreachable!(),
+        };
+        for op in [
+            BinOp::Eq,
+            BinOp::NotEq,
+            BinOp::Lt,
+            BinOp::LtEq,
+            BinOp::Gt,
+            BinOp::GtEq,
+        ] {
+            assert!(matches!(
+                raw_matches_op(&raw, op, &literal),
+                Err(SqlError::InvalidValue(_))
+            ));
+        }
+        // SQL's existing NULL comparison short-circuit remains unchanged.
+        assert!(!raw_matches_op(&raw, BinOp::Eq, &Value::Null).unwrap());
+    }
+}
+
+#[test]
+fn compiled_raw_array_predicate_propagates_malformed_storage_error() {
+    let table = schema(
+        "items",
+        columns(&[("id", DataType::Integer), ("v", DataType::Array)]),
+        vec![0],
+    );
+    let literal = Value::Array(vec![Value::Integer(7)].into());
+    let mut encoded = crate::encoding::encode_row(std::slice::from_ref(&literal));
+    let body_len = match decode_stored_column_raw(&encoded, 0).unwrap().unwrap() {
+        RawColumn::Array(body) => body.len(),
+        _ => unreachable!(),
+    };
+    let body_start = encoded.len() - body_len;
+    encoded[body_start] = 2;
+    for op in [BinOp::Eq, BinOp::NotEq, BinOp::Lt, BinOp::GtEq] {
+        let expr = Expr::BinaryOp {
+            left: Box::new(Expr::Column("v".into())),
+            op,
+            right: Box::new(Expr::Literal(literal.clone())),
+        };
+        let predicate = try_simple_predicate(&expr, &table).unwrap();
+        assert!(matches!(
+            predicate.matches_raw(&[], &encoded),
+            Err(SqlError::InvalidValue(_))
+        ));
+    }
 }

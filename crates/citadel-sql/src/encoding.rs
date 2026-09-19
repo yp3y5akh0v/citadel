@@ -855,11 +855,21 @@ fn write_array_v2_into_slice(elems: &[Value], out: &mut [u8]) {
     }
 }
 
-fn decode_array_v2(data: &[u8]) -> Result<Value> {
+fn array_element_count(data: &[u8]) -> Result<usize> {
     if data.len() < 4 {
         return Err(SqlError::InvalidValue("truncated array length".into()));
     }
     let count = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+    // Every element consumes at least its one-byte NULL/present marker.
+    // Reject impossible advertised counts before reserving element storage.
+    if count > data.len() - 4 {
+        return Err(SqlError::InvalidValue("truncated array elements".into()));
+    }
+    Ok(count)
+}
+
+fn decode_array_v2(data: &[u8]) -> Result<Value> {
+    let count = array_element_count(data)?;
     let mut pos = 4;
     let mut elems = Vec::with_capacity(count);
     for _ in 0..count {
@@ -900,7 +910,7 @@ fn decode_array_v2(data: &[u8]) -> Result<Value> {
                 }
                 let len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
                 pos += 4;
-                if pos + len > data.len() {
+                if len > data.len() - pos {
                     return Err(SqlError::InvalidValue(
                         "truncated variable-width array element".into(),
                     ));
@@ -1357,8 +1367,9 @@ pub enum RawColumn<'a> {
 }
 
 impl<'a> RawColumn<'a> {
-    pub fn to_value(self) -> Value {
-        match self {
+    /// Materialize a borrowed value, rejecting malformed composite payloads.
+    pub fn to_value(self) -> Result<Value> {
+        Ok(match self {
             RawColumn::Null => Value::Null,
             RawColumn::Integer(i) => Value::Integer(i),
             RawColumn::Real(r) => Value::Real(r),
@@ -1381,14 +1392,22 @@ impl<'a> RawColumn<'a> {
             RawColumn::Jsonb(b) => Value::Jsonb(std::sync::Arc::from(b)),
             RawColumn::TsVector(b) => Value::TsVector(std::sync::Arc::from(b)),
             RawColumn::TsQuery(b) => Value::TsQuery(std::sync::Arc::from(b)),
-            RawColumn::Array(bytes) => decode_array_v2(bytes).unwrap_or(Value::Null),
-            RawColumn::Vector(bytes) => decode_vector(bytes).unwrap_or(Value::Null),
-        }
+            RawColumn::Array(bytes) => return decode_array_v2(bytes),
+            RawColumn::Vector(bytes) => return decode_vector(bytes),
+        })
     }
 
-    pub fn cmp_value(&self, other: &Value) -> Option<std::cmp::Ordering> {
+    pub fn cmp_value(&self, other: &Value) -> Result<Option<std::cmp::Ordering>> {
         use std::cmp::Ordering;
-        match (self, other) {
+        Ok(match (self, other) {
+            (RawColumn::Array(bytes), other) => {
+                let value = decode_array_v2(bytes)?;
+                matches!(other, Value::Array(_)).then(|| value.cmp(other))
+            }
+            (RawColumn::Vector(bytes), other) => {
+                let value = decode_vector(bytes)?;
+                matches!(other, Value::Vector(_)).then(|| value.cmp(other))
+            }
             (RawColumn::Null, Value::Null) => Some(Ordering::Equal),
             (RawColumn::Null, _) | (_, Value::Null) => None,
             (RawColumn::Integer(a), Value::Integer(b)) => Some(a.cmp(b)),
@@ -1417,16 +1436,14 @@ impl<'a> RawColumn<'a> {
             (RawColumn::Jsonb(a), Value::Jsonb(b)) => Some((*a).cmp(b.as_ref())),
             (RawColumn::TsVector(a), Value::TsVector(b)) => Some((*a).cmp(b.as_ref())),
             (RawColumn::TsQuery(a), Value::TsQuery(b)) => Some((*a).cmp(b.as_ref())),
-            (RawColumn::Array(bytes), Value::Array(b)) => match decode_array_v2(bytes).ok()? {
-                Value::Array(a) => Some(a.as_ref().cmp(b.as_ref())),
-                _ => None,
-            },
             _ => None,
-        }
+        })
     }
 
-    pub fn eq_value(&self, other: &Value) -> bool {
-        match (self, other) {
+    pub fn eq_value(&self, other: &Value) -> Result<bool> {
+        Ok(match (self, other) {
+            (RawColumn::Array(bytes), other) => decode_array_v2(bytes)? == *other,
+            (RawColumn::Vector(bytes), other) => decode_vector(bytes)? == *other,
             (RawColumn::Null, Value::Null) => true,
             (RawColumn::Integer(a), Value::Integer(b)) => a == b,
             (RawColumn::Integer(a), Value::Real(b)) => (*a as f64) == *b,
@@ -1454,12 +1471,8 @@ impl<'a> RawColumn<'a> {
             (RawColumn::Jsonb(a), Value::Jsonb(b)) => *a == b.as_ref(),
             (RawColumn::TsVector(a), Value::TsVector(b)) => *a == b.as_ref(),
             (RawColumn::TsQuery(a), Value::TsQuery(b)) => *a == b.as_ref(),
-            (RawColumn::Array(bytes), Value::Array(b)) => match decode_array_v2(bytes) {
-                Ok(Value::Array(a)) => a.as_ref() == b.as_ref(),
-                _ => false,
-            },
             _ => false,
-        }
+        })
     }
 
     pub fn as_f64(&self) -> Option<f64> {

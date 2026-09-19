@@ -2037,7 +2037,7 @@ impl AggState {
                 collation,
             } => {
                 if !matches!(raw, RawColumn::Null) {
-                    let val = raw.to_value();
+                    let val = raw.to_value()?;
                     *cur = Some(match cur.take() {
                         None => val,
                         Some(m) => {
@@ -2055,7 +2055,7 @@ impl AggState {
                 collation,
             } => {
                 if !matches!(raw, RawColumn::Null) {
-                    let val = raw.to_value();
+                    let val = raw.to_value()?;
                     *cur = Some(match cur.take() {
                         None => val,
                         Some(m) => {
@@ -3059,13 +3059,15 @@ fn try_streaming_distinct_with_read(
                         }
                     }
                 }
-                RawAggTarget::NonPk(idx) => match decode_column_raw(value, *idx) {
-                    Ok(raw) => raw.to_value(),
-                    Err(e) => {
-                        scan_err = Some(e);
-                        return false;
+                RawAggTarget::NonPk(idx) => {
+                    match decode_column_raw(value, *idx).and_then(RawColumn::to_value) {
+                        Ok(value) => value,
+                        Err(e) => {
+                            scan_err = Some(e);
+                            return false;
+                        }
                     }
-                },
+                }
             };
             row_val.push(val);
         }

@@ -798,7 +798,7 @@ fn scan_rows(
     let mut vector_work = 0usize;
 
     txn.ann_scan(table_schema.name.as_bytes(), &mut |key, value| {
-        let vector = match decode_column_raw(value, enc_idx)?.to_value() {
+        let vector = match decode_column_raw(value, enc_idx)?.to_value()? {
             Value::Vector(arr) if cancel.is_none() => Some(arr.to_vec()),
             Value::Vector(arr) => {
                 let mut vector = Vec::with_capacity(arr.len());
@@ -1373,7 +1373,7 @@ impl Extract {
     fn extract(&self, key: &[u8], value: &[u8]) -> Result<Value> {
         match self {
             Extract::Pk => Ok(Value::Integer(decode_pk_integer(key)?)),
-            Extract::NonPk(ei) => Ok(decode_column_raw(value, *ei)?.to_value()),
+            Extract::NonPk(ei) => decode_column_raw(value, *ei)?.to_value(),
         }
     }
 }
