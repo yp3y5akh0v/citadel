@@ -20,6 +20,15 @@ pub struct BranchCell<'a> {
     pub key: &'a [u8],
 }
 
+/// Read only the separator key from a valid branch cell.
+#[inline]
+pub fn read_key(page: &Page, i: u16) -> &[u8] {
+    let offset = page.cell_offset(i) as usize;
+    let key_len =
+        u16::from_le_bytes(page.data[offset + 4..offset + 6].try_into().unwrap()) as usize;
+    &page.data[offset + 6..offset + 6 + key_len]
+}
+
 pub fn read_cell(page: &Page, i: u16) -> BranchCell<'_> {
     let offset = page.cell_offset(i) as usize;
     let child = u32::from_le_bytes(page.data[offset..offset + 4].try_into().unwrap());
@@ -173,8 +182,7 @@ pub fn search_child_index(page: &Page, search_key: &[u8]) -> usize {
     let mut hi = n;
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
-        let cell = read_cell(page, mid as u16);
-        if search_key < cell.key {
+        if search_key < read_key(page, mid as u16) {
             hi = mid;
         } else {
             lo = mid + 1;
@@ -187,7 +195,10 @@ pub fn search_child_index(page: &Page, search_key: &[u8]) -> usize {
 pub fn get_child(page: &Page, child_idx: usize) -> PageId {
     let n = page.num_cells() as usize;
     if child_idx < n {
-        read_cell(page, child_idx as u16).child
+        let offset = page.cell_offset(child_idx as u16) as usize;
+        PageId(u32::from_le_bytes(
+            page.data[offset..offset + 4].try_into().unwrap(),
+        ))
     } else {
         page.right_child()
     }
@@ -219,8 +230,7 @@ pub fn insert_separator(
 
     if child_idx < n {
         // Read old key before modifying
-        let old_cell = read_cell(page, child_idx as u16);
-        let old_key = old_cell.key.to_vec();
+        let old_key = read_key(page, child_idx as u16).to_vec();
         let old_cell_size = get_cell_size(page, child_idx as u16);
 
         // Build the new cell that replaces cell[child_idx]

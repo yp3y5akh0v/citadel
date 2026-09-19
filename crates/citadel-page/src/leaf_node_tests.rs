@@ -139,6 +139,54 @@ fn search_found_and_not_found() {
 }
 
 #[test]
+fn search_distinguishes_binary_prefix_keys_with_mixed_values() {
+    let overflow = OverflowRef {
+        first_page: PageId(42),
+        total_len: 4096,
+    }
+    .to_bytes();
+    let payload = [7u8; 1024];
+    let entries = [
+        (b"".as_slice(), ValueType::Inline, b"empty key".as_slice()),
+        (b"\0".as_slice(), ValueType::Tombstone, b"".as_slice()),
+        (b"a".as_slice(), ValueType::Overflow, overflow.as_slice()),
+        (b"a\0".as_slice(), ValueType::Inline, payload.as_slice()),
+        (b"alphabet".as_slice(), ValueType::Inline, b"".as_slice()),
+        (b"b".as_slice(), ValueType::Tombstone, b"".as_slice()),
+        (
+            b"\xff\xff".as_slice(),
+            ValueType::Inline,
+            b"last".as_slice(),
+        ),
+    ];
+    let mut page = Page::new(PageId(0), PageType::Leaf, TxnId(1));
+    assert_eq!(search(&page, b"a"), Err(0));
+    // Reverse insertion separates physical placement from logical key order.
+    for &(key, kind, value) in entries.iter().rev() {
+        assert!(insert_direct(&mut page, key, kind, value));
+    }
+    read_cells_checked(&page).unwrap();
+
+    for (index, &(key, kind, value)) in entries.iter().enumerate() {
+        assert_eq!(read_key(&page, index as u16), key);
+        let found = search(&page, key).unwrap();
+        assert_eq!(found, index as u16);
+        let cell = read_cell(&page, found);
+        assert_eq!((cell.key, cell.val_type, cell.value), (key, kind, value));
+    }
+    for (key, position) in [
+        (b"\0\0".as_slice(), 2),
+        (b"a\0\0".as_slice(), 4),
+        (b"al".as_slice(), 4),
+        (b"alphabet\0".as_slice(), 5),
+        (b"\xff".as_slice(), 6),
+        (b"\xff\xff\0".as_slice(), 7),
+    ] {
+        assert_eq!(search(&page, key), Err(position), "key={key:?}");
+    }
+}
+
+#[test]
 fn insert_update_existing_key() {
     let mut page = Page::new(PageId(0), PageType::Leaf, TxnId(1));
     insert(&mut page, b"key", ValueType::Inline, b"value1");
