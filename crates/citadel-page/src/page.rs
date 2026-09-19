@@ -562,6 +562,20 @@ impl Page {
         }
     }
 
+    /// Pack live cells in logical order without allocating per-cell buffers.
+    /// The cell format supplies lengths; the page owns offsets and free space.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn compact_cells(&mut self, cell_size: impl Fn(&Page, u16) -> usize) {
+        let source = self.clone();
+        self.rebuild_cells(&[]);
+        for index in 0..source.num_cells() {
+            let offset = source.cell_offset(index);
+            self.write_cell(source.cell_data(offset, cell_size(&source, index)))
+                .expect("compact_cells: existing cells should fit");
+        }
+    }
+
     pub fn compute_checksum(&self) -> u64 {
         xxhash_rust::xxh64::xxh64(&self.data[CHECKSUM_SIZE..], 0)
     }

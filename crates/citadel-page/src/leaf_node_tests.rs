@@ -496,3 +496,45 @@ fn checked_vacancy_hint_compacts_holes_and_preserves_full_page_failure() {
     assert!(search(&hinted, &absent).is_err());
     read_cells_checked(&hinted).unwrap();
 }
+
+#[test]
+fn compaction_preserves_mixed_cells_and_page_metadata() {
+    for count in [0u16, 1, 200] {
+        let mut page = Page::new(PageId(71), PageType::Leaf, TxnId(42));
+        page.set_merkle_hash(&[0x5a; citadel_core::MERKLE_HASH_SIZE]);
+        // Insert in a permutation so logical slots differ from physical order.
+        for step in 0..count {
+            let id = (step * 37) % count;
+            let key = id.to_be_bytes();
+            let value = vec![id as u8; (id % 33) as usize];
+            let (kind, value) = match id % 5 {
+                0 => (ValueType::Tombstone, Vec::new()),
+                1 => (
+                    ValueType::Overflow,
+                    OverflowRef {
+                        first_page: PageId(1000 + u32::from(id)),
+                        total_len: 10_000,
+                    }
+                    .to_bytes()
+                    .to_vec(),
+                ),
+                _ => (ValueType::Inline, value),
+            };
+            assert!(insert_direct(&mut page, &key, kind, &value));
+        }
+        for id in (0..count).step_by(3) {
+            assert!(delete(&mut page, &id.to_be_bytes()));
+        }
+        let cells: Vec<_> = (0..page.num_cells())
+            .map(|i| read_cell_bytes(&page, i))
+            .collect();
+        let refs: Vec<_> = cells.iter().map(Vec::as_slice).collect();
+        let mut expected = page.clone();
+        expected.rebuild_cells(&refs);
+        compact_page(&mut page);
+        // Compare the whole layout, including preserved header and unused bytes,
+        // against the existing public rebuild operation.
+        assert_eq!(page.data, expected.data);
+        read_cells_checked(&page).unwrap();
+    }
+}

@@ -369,7 +369,7 @@ fn insert_vacant_at(
     false
 }
 
-// Keep compaction allocations and retry work outside the ordinary insert path.
+// Keep compaction and retry work outside the ordinary insert path.
 // The caller already proved total free space can hold the cell and its pointer.
 #[cold]
 #[inline(never)]
@@ -432,16 +432,7 @@ pub fn insert(page: &mut Page, key: &[u8], val_type: ValueType, value: &[u8]) ->
 
 /// Compact a leaf page by rebuilding its cell data, eliminating holes.
 fn compact_page(page: &mut Page) {
-    let n = page.num_cells();
-    let cells: Vec<Vec<u8>> = (0..n)
-        .map(|i| {
-            let offset = page.cell_offset(i) as usize;
-            let sz = get_cell_size(page, i);
-            page.data[offset..offset + sz].to_vec()
-        })
-        .collect();
-    let refs: Vec<&[u8]> = cells.iter().map(|c| c.as_slice()).collect();
-    page.rebuild_cells(&refs);
+    page.compact_cells(get_cell_size);
 }
 
 /// Delete a cell at an index already resolved in this page.

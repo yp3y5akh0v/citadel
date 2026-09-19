@@ -279,6 +279,117 @@ fn insert_separator_right_child() {
 }
 
 #[test]
+fn separator_uses_exact_remaining_space() {
+    // Adding (child, "a") needs 6 + 1 bytes and exactly one 2-byte slot.
+    let old_key = vec![b'z'; citadel_core::USABLE_SIZE - 8 - 9];
+    let mut page = make_branch_page(&[&old_key], &[PageId(1)], PageId(2));
+    assert_eq!(page.free_space(), 9);
+    assert!(insert_separator(&mut page, 0, PageId(3), b"a", PageId(4)));
+    assert_eq!(page.free_space(), 0);
+    let cells = read_cells_checked(&page).unwrap();
+    assert_eq!((cells[0].child, cells[0].key), (PageId(3), b"a".as_slice()));
+    assert_eq!(
+        (cells[1].child, cells[1].key),
+        (PageId(4), old_key.as_slice())
+    );
+    assert_eq!(page.right_child(), PageId(2));
+}
+
+#[test]
+fn separator_reclaims_holes_for_interior_and_rightmost_splits() {
+    for rightmost in [false, true] {
+        let old_key = vec![b'm'; 4000];
+        let removed_key = vec![b'a'; 4000];
+        let mut page = make_branch_page(
+            &[&removed_key, &old_key],
+            &[PageId(1), PageId(2)],
+            PageId(3),
+        );
+        page.delete_cell_at(0, get_cell_size(&page, 0));
+        let separator = vec![if rightmost { b'z' } else { b'b' }; 256];
+        assert!(page.available_space() < BRANCH_CELL_FIXED + separator.len());
+        assert!(insert_separator(
+            &mut page,
+            usize::from(rightmost),
+            PageId(4),
+            &separator,
+            PageId(5)
+        ));
+        let cells = read_cells_checked(&page).unwrap();
+        assert_eq!(cells.len(), 2);
+        if rightmost {
+            assert_eq!(
+                (cells[0].child, cells[0].key),
+                (PageId(2), old_key.as_slice())
+            );
+            assert_eq!(
+                (cells[1].child, cells[1].key),
+                (PageId(4), separator.as_slice())
+            );
+            assert_eq!(page.right_child(), PageId(5));
+        } else {
+            assert_eq!(
+                (cells[0].child, cells[0].key),
+                (PageId(4), separator.as_slice())
+            );
+            assert_eq!(
+                (cells[1].child, cells[1].key),
+                (PageId(5), old_key.as_slice())
+            );
+            assert_eq!(page.right_child(), PageId(3));
+        }
+    }
+}
+
+#[test]
+fn oversized_separator_leaves_page_unchanged() {
+    let old_key = vec![b'm'; citadel_core::USABLE_SIZE - 8 - 8];
+    for child_idx in [0, 1] {
+        let mut page = make_branch_page(&[&old_key], &[PageId(1)], PageId(2));
+        let before = page.clone();
+        assert!(!insert_separator(
+            &mut page,
+            child_idx,
+            PageId(3),
+            b"z",
+            PageId(4)
+        ));
+        assert_eq!(page.data, before.data);
+    }
+}
+
+#[test]
+fn separator_insertion_keeps_existing_cell_payloads_in_place() {
+    let mut page = make_branch_page(
+        &[b"ant", b"monkey", b"zebra"],
+        &[PageId(1), PageId(2), PageId(3)],
+        PageId(4),
+    );
+    let offsets: Vec<_> = (0..page.num_cells()).map(|i| page.cell_offset(i)).collect();
+    assert!(insert_separator(
+        &mut page,
+        1,
+        PageId(5),
+        b"elephant",
+        PageId(6)
+    ));
+    assert_eq!(page.cell_offset(0), offsets[0]);
+    assert_eq!(page.cell_offset(2), offsets[1]);
+    assert_eq!(page.cell_offset(3), offsets[2]);
+    let cells = read_cells_checked(&page).unwrap();
+    assert_eq!(
+        cells.iter().map(|c| (c.child, c.key)).collect::<Vec<_>>(),
+        vec![
+            (PageId(1), b"ant".as_slice()),
+            (PageId(5), b"elephant".as_slice()),
+            (PageId(6), b"monkey".as_slice()),
+            (PageId(3), b"zebra".as_slice()),
+        ]
+    );
+    assert_eq!(page.right_child(), PageId(4));
+}
+
+#[test]
 fn split_branch() {
     let page = make_branch_page(
         &[b"b", b"d", b"f", b"h", b"j"],
