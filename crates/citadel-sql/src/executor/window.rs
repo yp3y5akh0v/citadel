@@ -322,6 +322,18 @@ impl ResolvedFrame {
         )
     }
 
+    /// Prefix RANGE frames grow; peer-only RANGE frames are disjoint groups.
+    /// Both can add each argument once in its original sorted order.
+    fn supports_forward_range(&self) -> bool {
+        matches!(
+            self,
+            Self::Range {
+                unbounded_end: false,
+                ..
+            }
+        )
+    }
+
     fn is_rows_prefix(&self) -> bool {
         matches!(self, Self::Rows { start: None, .. })
     }
@@ -1089,6 +1101,24 @@ pub(super) fn eval_window_select(
                             check_cancel_at(cancel, work)?;
                             row_results[orig_idx][win_idx] = result.clone();
                         }
+                    } else if frame.supports_forward_range() {
+                        let mut acc = WindowAccumulator::new(&upper_name, args.len());
+                        let mut previous = 0..0;
+                        for (pos, &orig_idx) in part_indices.iter().enumerate() {
+                            check_cancel_at(cancel, pos)?;
+                            let current = frame.indices(pos, part_len, &peer_bounds);
+                            if current.start != previous.start {
+                                acc = WindowAccumulator::new(&upper_name, args.len());
+                            }
+                            for (work, add_pos) in
+                                (previous.end.max(current.start)..current.end).enumerate()
+                            {
+                                check_cancel_at(cancel, work)?;
+                                acc.add(&arg_values[win_idx][part_indices[add_pos]])?;
+                            }
+                            row_results[orig_idx][win_idx] = acc.result()?;
+                            previous = current;
+                        }
                     } else if frame.supports_sliding() {
                         let mut acc = WindowAccumulator::new(&upper_name, args.len());
                         let mut previous = 0..0;
@@ -1146,20 +1176,26 @@ pub(super) fn eval_window_select(
                             check_cancel_at(cancel, work)?;
                             row_results[orig_idx][win_idx] = result.clone();
                         }
-                    } else if frame.is_rows_prefix() {
-                        // Growing prefixes append inputs in their original order;
-                        // unlike deque pruning, this does not require transitivity.
+                    } else if frame.is_rows_prefix() || frame.supports_forward_range() {
+                        // Forward folds retain exact tie representatives without
+                        // assuming comparison transitivity. Peer-only frames reset
+                        // at each disjoint group; growing prefixes retain state.
                         let mut acc = WindowExtreme::new(is_min, value_collation);
-                        let mut previous_end = 0;
+                        let mut previous = 0..0;
                         for (pos, &orig_idx) in part_indices.iter().enumerate() {
                             check_cancel_at(cancel, pos)?;
-                            let range = frame.indices(pos, part_len, &peer_bounds);
-                            for (work, add_pos) in (previous_end..range.end).enumerate() {
+                            let current = frame.indices(pos, part_len, &peer_bounds);
+                            if current.start != previous.start {
+                                acc = WindowExtreme::new(is_min, value_collation);
+                            }
+                            for (work, add_pos) in
+                                (previous.end.max(current.start)..current.end).enumerate()
+                            {
                                 check_cancel_at(cancel, work)?;
                                 acc.add(&arg_values[win_idx][part_indices[add_pos]][0]);
                             }
                             row_results[orig_idx][win_idx] = acc.result();
-                            previous_end = range.end;
+                            previous = current;
                         }
                     } else if frame.supports_sliding()
                         && supports_monotonic_extrema(part_indices, &arg_values[win_idx], cancel)?

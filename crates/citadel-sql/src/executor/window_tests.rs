@@ -538,6 +538,253 @@ fn window_argument_passes_cancellation_into_scalar_evaluation() {
     ));
 }
 
+#[test]
+fn forward_range_aggregates_visit_each_input_once() {
+    let n = 64_i64;
+    let mut partition = column("p", DataType::Integer);
+    partition.position = 1;
+    let mut key = column("k", DataType::Integer);
+    key.position = 2;
+    let columns = [column("x", DataType::Integer), partition, key];
+    for peer_size in [1, 7, 128] {
+        let rows: Vec<Vec<Value>> = (0..n)
+            .rev()
+            .map(|id| {
+                let local = id / 2;
+                vec![
+                    if local % 7 == 0 {
+                        Value::Null
+                    } else {
+                        i(local - 16)
+                    },
+                    i(id % 2),
+                    i(local / peer_size),
+                ]
+            })
+            .collect();
+        for (frame, prefix) in [
+            ("", true),
+            ("RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW", true),
+            ("RANGE BETWEEN CURRENT ROW AND CURRENT ROW", false),
+        ] {
+            let select = [
+                "SUM(x)", "COUNT(*)", "COUNT(x)", "AVG(x)", "MIN(x)", "MAX(x)",
+            ]
+            .map(|function| format!("{function} OVER (PARTITION BY p ORDER BY k {frame})"))
+            .join(", ");
+            let expected: Vec<Vec<Value>> = rows
+                .iter()
+                .map(|row| {
+                    let members: Vec<&Vec<Value>> = rows
+                        .iter()
+                        .filter(|other| {
+                            other[1] == row[1]
+                                && if prefix {
+                                    other[2] <= row[2]
+                                } else {
+                                    other[2] == row[2]
+                                }
+                        })
+                        .collect();
+                    let values: Vec<i64> = members
+                        .iter()
+                        .filter_map(|row| {
+                            if let Value::Integer(value) = &row[0] {
+                                Some(*value)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    let sum: i64 = values.iter().sum();
+                    vec![
+                        if values.is_empty() {
+                            Value::Null
+                        } else {
+                            i(sum)
+                        },
+                        i(members.len() as i64),
+                        i(values.len() as i64),
+                        if values.is_empty() {
+                            Value::Null
+                        } else {
+                            Value::Real(sum as f64 / values.len() as f64)
+                        },
+                        values.iter().min().copied().map_or(Value::Null, i),
+                        values.iter().max().copied().map_or(Value::Null, i),
+                    ]
+                })
+                .collect();
+            let _ = take_window_aggregate_steps();
+            let ExecutionResult::Query(result) =
+                evaluate_window_query(&format!("SELECT {select} FROM t"), &columns, rows.clone())
+                    .unwrap()
+            else {
+                panic!("expected rows")
+            };
+            assert_eq!(result.rows, expected, "peer_size={peer_size}, {frame}");
+            assert_eq!(
+                take_window_aggregate_steps(),
+                6 * n as usize,
+                "peer_size={peer_size}, {frame}"
+            );
+        }
+    }
+}
+
+#[test]
+fn forward_range_preserves_floating_addition_order_and_peer_resets() {
+    let mut position = column("position", DataType::Integer);
+    position.position = 1;
+    let columns = [column("x", DataType::Null), position];
+    let values = [
+        Value::Real(1e20),
+        Value::Real(-1e20),
+        Value::Real(3.5),
+        i(1),
+    ];
+    let rows = values
+        .into_iter()
+        .enumerate()
+        .map(|(position, value)| vec![value, i(position as i64)])
+        .collect::<Vec<_>>();
+    let r = Value::Real;
+    for (spec, expected) in [
+        (
+            "ORDER BY position",
+            vec![
+                vec![r(1e20), r(1e20)],
+                vec![r(0.0), r(0.0)],
+                vec![r(3.5), r(3.5 / 3.0)],
+                vec![r(4.5), r(1.125)],
+            ],
+        ),
+        (
+            "ORDER BY position DESC",
+            vec![
+                vec![r(1.0), r(0.25)],
+                vec![r(-1e20), r(-1e20 / 3.0)],
+                vec![r(4.5), r(2.25)],
+                vec![i(1), r(1.0)],
+            ],
+        ),
+        (
+            "ORDER BY CASE WHEN position < 3 THEN 0 ELSE 1 END \
+             RANGE BETWEEN CURRENT ROW AND CURRENT ROW",
+            vec![
+                vec![r(3.5), r(3.5 / 3.0)],
+                vec![r(3.5), r(3.5 / 3.0)],
+                vec![r(3.5), r(3.5 / 3.0)],
+                vec![i(1), r(1.0)],
+            ],
+        ),
+    ] {
+        let ExecutionResult::Query(result) = evaluate_window_query(
+            &format!("SELECT SUM(x) OVER ({spec}), AVG(x) OVER ({spec}) FROM t"),
+            &columns,
+            rows.clone(),
+        )
+        .unwrap() else {
+            panic!("expected rows")
+        };
+        assert_eq!(result.rows.len(), expected.len());
+        for (actual, expected) in result.rows.iter().zip(expected) {
+            assert_eq!(actual.len(), expected.len());
+            assert!(
+                actual.iter().zip(expected.iter()).all(|(a, e)| a.bit_eq(e)),
+                "{spec}: {actual:?}, expected {expected:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn forward_range_preserves_result_error_boundaries() {
+    let mut position = column("position", DataType::Integer);
+    position.position = 1;
+    let columns = [column("x", DataType::Null), position];
+    for later in [Value::Real(0.0), Value::Text("not numeric".into())] {
+        assert!(matches!(
+            evaluate_window_query(
+                "SELECT SUM(x) OVER (ORDER BY position) FROM t",
+                &columns,
+                vec![vec![i(i64::MAX), i(0)], vec![i(1), i(1)], vec![later, i(2)]],
+            ),
+            Err(SqlError::IntegerOverflow)
+        ));
+    }
+    // A peer contributes its entire frame before result(), so temporary
+    // integer overflow inside a peer must not reject its valid final sum.
+    for frame in ["", "RANGE BETWEEN CURRENT ROW AND CURRENT ROW"] {
+        let ExecutionResult::Query(result) = evaluate_window_query(
+            &format!("SELECT SUM(x) OVER (ORDER BY position {frame}) FROM t"),
+            &columns,
+            vec![vec![i(i64::MAX), i(0)], vec![i(1), i(0)], vec![i(-1), i(0)]],
+        )
+        .unwrap() else {
+            panic!("expected rows")
+        };
+        assert_eq!(result.rows, vec![vec![i(i64::MAX)]; 3]);
+    }
+    assert!(matches!(
+        evaluate_window_query(
+            "SELECT AVG(x) OVER (ORDER BY position RANGE BETWEEN CURRENT ROW AND CURRENT ROW) FROM t",
+            &columns,
+            vec![vec![i(1), i(0)], vec![Value::Text("not numeric".into()), i(1)]],
+        ),
+        Err(SqlError::TypeMismatch { .. })
+    ));
+}
+
+#[test]
+fn forward_range_extrema_preserve_nan_representatives_across_peers() {
+    let nan1 = Value::Real(f64::from_bits(0x7ff8_0000_0000_0001));
+    let nan2 = Value::Real(f64::from_bits(0x7ff8_0000_0000_0002));
+    let mut key = column("k", DataType::Integer);
+    key.position = 1;
+    let columns = [column("x", DataType::Null), key];
+    let rows = vec![
+        vec![Value::Real(1.0), i(0)],
+        vec![nan1, i(0)],
+        vec![Value::Real(0.0), i(0)],
+        vec![nan2.clone(), i(1)],
+        vec![Value::Real(3.0), i(1)],
+        vec![Value::Real(2.0), i(1)],
+    ];
+    let first_peer = [Value::Real(0.0), Value::Real(1.0)];
+    for (frame, second_peer) in [
+        ("", vec![Value::Real(0.0), Value::Real(3.0)]),
+        (
+            "RANGE BETWEEN CURRENT ROW AND CURRENT ROW",
+            vec![nan2.clone(), nan2],
+        ),
+    ] {
+        let ExecutionResult::Query(result) = evaluate_window_query(
+            &format!(
+                "SELECT MIN(x) OVER (ORDER BY k {frame}), MAX(x) OVER (ORDER BY k {frame}) FROM t"
+            ),
+            &columns,
+            rows.clone(),
+        )
+        .unwrap() else {
+            panic!("expected rows")
+        };
+        assert_eq!(result.rows.len(), 6);
+        for (position, row) in result.rows.iter().enumerate() {
+            let expected = if position < 3 {
+                &first_peer[..]
+            } else {
+                &second_peer
+            };
+            assert_eq!(row.len(), expected.len());
+            assert!(
+                row.iter().zip(expected).all(|(a, e)| a.bit_eq(e)),
+                "{frame}, row {position}: {row:?}, expected {expected:?}"
+            );
+        }
+    }
+}
+
 fn evaluate_window_query(
     sql: &str,
     columns: &[ColumnDef],
