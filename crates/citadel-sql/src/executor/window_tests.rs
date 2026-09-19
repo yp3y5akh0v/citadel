@@ -486,12 +486,12 @@ fn window_order_keys_are_evaluated_once_per_row() {
 fn one_large_peer_group_is_indexed_with_linear_comparisons() {
     let n = 4_096;
     let indices: Vec<usize> = (0..n).collect();
-    let keys: Vec<Vec<Value>> = (0..n)
-        .map(|position| {
-            let spelling = if position.is_multiple_of(2) { "A" } else { "a" };
-            vec![Value::Text(spelling.into())]
-        })
-        .collect();
+    let mut keys = WindowValues::with_capacity(n, 1).unwrap();
+    for position in 0..n {
+        let spelling = if position.is_multiple_of(2) { "A" } else { "a" };
+        keys.push_row(std::iter::once(Ok(Value::Text(spelling.into()))))
+            .unwrap();
+    }
     let _ = take_window_peer_comparisons();
 
     let bounds = peer_group_bounds(&indices, &keys, 0, &[Collation::NoCase], None).unwrap();
