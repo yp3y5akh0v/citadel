@@ -116,3 +116,42 @@ fn moving_real_sum_and_avg_match_sqlite_after_large_values_expire() {
         );
     }
 }
+
+#[test]
+fn forward_range_matches_sqlite_with_desc_collated_and_null_peers() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = database(directory.path());
+    let connection = Connection::open(&database).unwrap();
+    let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, g TEXT COLLATE NOCASE, \
+         k TEXT COLLATE NOCASE, v INTEGER)",
+        "INSERT INTO t VALUES \
+         (1, 'A', NULL, 9), (2, 'a', NULL, -2), \
+         (3, 'A', 'Alpha', 10), (4, 'a', 'alpha', NULL), \
+         (5, 'A', 'Beta', -5), (6, 'a', 'BETA', 3), \
+         (7, 'B', NULL, 4), (8, 'b', 'ALPHA', NULL), (9, 'B', 'alpha', NULL), \
+         (10, 'B', 'Beta', 0), (11, 'b', 'beta', 6), \
+         (12, NULL, NULL, 2), (13, NULL, 'Alpha', 7), (14, NULL, 'alpha', -1)",
+    ] {
+        connection.execute(sql).unwrap();
+        sqlite.execute_batch(sql).unwrap();
+    }
+    // Keep collated text in the keys. Numeric extrema have identical
+    // representatives in both engines, so parity tests peer membership.
+    for nulls in ["FIRST", "LAST"] {
+        for frame in ["", "RANGE BETWEEN CURRENT ROW AND CURRENT ROW"] {
+            let spec = format!("PARTITION BY g ORDER BY k DESC NULLS {nulls} {frame}");
+            let projection = [
+                "SUM(v)", "COUNT(*)", "COUNT(v)", "AVG(v)", "MIN(v)", "MAX(v)",
+            ]
+            .map(|function| format!("{function} OVER ({spec})"))
+            .join(", ");
+            matches_sqlite(
+                &connection,
+                &sqlite,
+                &format!("SELECT id, {projection} FROM t ORDER BY id"),
+            );
+        }
+    }
+}
