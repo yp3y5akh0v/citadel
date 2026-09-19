@@ -3151,3 +3151,106 @@ fn vacant_index_inserts_preserve_overflow_savepoint_snapshot_and_reopen() {
         assert!(report.is_ok(), "{report:?}");
     }
 }
+
+#[test]
+fn buffered_update_misses_preserve_warm_append_trees_and_read_budget() {
+    for count in [8_u16, 256] {
+        let manager = create_test_manager();
+        let mut seed = manager.begin_write().unwrap();
+        seed.create_table(b"existing").unwrap();
+        for index in 1..=count {
+            seed.table_insert(b"existing", &(index * 2).to_be_bytes(), &[0x6d; 64])
+                .unwrap();
+        }
+        assert_eq!(
+            seed.named_trees[b"existing".as_slice()].depth > 1,
+            count == 256,
+            "cover both a leaf root and an internal root"
+        );
+        seed.commit().unwrap();
+        let mut old_reader = manager.begin_read();
+        let mut writer = manager.begin_write().unwrap();
+        let last = (count * 2).to_be_bytes();
+        let mut buffer = Vec::with_capacity(128);
+        writer
+            .table_update_with_buffer::<_, (), Error>(b"existing", &last, &mut buffer, |value| {
+                value[0] = 0x11;
+                Ok(())
+            })
+            .unwrap();
+        assert!(writer.named_trees[b"existing".as_slice()]
+            .lil_would_hit(&writer.pages, &u16::MAX.to_be_bytes()));
+
+        let marker = writer.mutation_marker();
+        let allocated = writer.alloc.allocated_this_txn().len();
+        let freed = writer.pending_free_count();
+        let stamp = writer.table_root_stamp(b"existing").unwrap();
+        let budget = crate::ReadBudget::new(0, 0);
+        writer.set_read_budget(Some(budget.clone()));
+        // Before the first key, between live keys, and after the cached maximum.
+        for missing in [0_u16, 3, u16::MAX] {
+            assert_eq!(
+                writer
+                    .table_update_with_buffer::<_, (), Error>(
+                        b"existing",
+                        &missing.to_be_bytes(),
+                        &mut buffer,
+                        |_| panic!("missing UPDATE must not call its callback"),
+                    )
+                    .unwrap(),
+                None
+            );
+        }
+        assert_eq!(budget.remaining(), 0);
+        assert!(!writer.mutated_since(marker));
+        assert!(!writer.is_poisoned());
+        assert_eq!(writer.alloc.allocated_this_txn().len(), allocated);
+        assert_eq!(writer.pending_free_count(), freed);
+        assert_eq!(writer.table_root_stamp(b"existing").unwrap(), stamp);
+        writer.set_read_budget(None);
+
+        // A miss must not turn the retained point position into a stale match.
+        let next = (count * 2 - 2).to_be_bytes();
+        assert_eq!(
+            writer
+                .table_update_with_buffer::<_, _, Error>(b"existing", &next, &mut buffer, |value| {
+                    assert_eq!(value, &[0x6d; 64]);
+                    value[0] = 0x22;
+                    Ok(7)
+                })
+                .unwrap(),
+            Some(7)
+        );
+        assert_eq!(
+            writer.table_entry_count(b"existing").unwrap(),
+            u64::from(count)
+        );
+        writer.commit().unwrap();
+        let mut reader = manager.begin_read();
+        for index in 1..=count {
+            let key = (index * 2).to_be_bytes();
+            let mut expected = vec![0x6d; 64];
+            if key == last {
+                expected[0] = 0x11;
+            } else if key == next {
+                expected[0] = 0x22;
+            }
+            assert_eq!(reader.table_get(b"existing", &key).unwrap(), Some(expected));
+            assert_eq!(
+                old_reader.table_get(b"existing", &key).unwrap(),
+                Some(vec![0x6d; 64])
+            );
+        }
+        for missing in [0_u16, 3, u16::MAX] {
+            assert_eq!(
+                reader
+                    .table_get(b"existing", &missing.to_be_bytes())
+                    .unwrap(),
+                None
+            );
+        }
+        drop(old_reader);
+        let report = manager.integrity_check().unwrap();
+        assert!(report.is_ok(), "{report:?}");
+    }
+}
