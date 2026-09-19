@@ -241,6 +241,53 @@ fn row_roundtrip_empty() {
 }
 
 #[test]
+fn row_fixed_width_decoders_preserve_boolean_bytes_and_real_bits() {
+    for version in [RowVersion::V1, RowVersion::V2] {
+        let row = |kind: DataType, payload: &[u8]| {
+            let header = 1u16
+                | if version == RowVersion::V2 {
+                    V2_FLAG
+                } else {
+                    0
+                };
+            let mut row = header.to_le_bytes().to_vec();
+            row.extend_from_slice(&[0, kind.type_tag()]);
+            if version == RowVersion::V1 {
+                row.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            }
+            row.extend_from_slice(payload);
+            row
+        };
+        for byte in [0, 1, 2, 0x7f, 0x80, 0xff] {
+            let data = row(DataType::Boolean, &[byte]);
+            let expected = byte != 0;
+            assert_eq!(decode_row(&data).unwrap(), vec![Value::Boolean(expected)]);
+            assert!(matches!(
+                decode_column_raw(&data, 0).unwrap(),
+                RawColumn::Boolean(value) if value == expected
+            ));
+        }
+        for bits in [
+            0u64,
+            0x8000_0000_0000_0000, // Negative zero.
+            0x7ff0_0000_0000_0000, // Positive infinity.
+            0xfff0_0000_0000_0000, // Negative infinity.
+            0x7ff8_0000_0000_0123, // Quiet NaN with a payload.
+            0x7ff0_0000_0000_0042, // Signaling NaN bits remain unchanged.
+            1,                     // Smallest positive subnormal.
+        ] {
+            let data = row(DataType::Real, &bits.to_le_bytes());
+            let values = decode_row(&data).unwrap();
+            assert!(matches!(&values[..], [Value::Real(value)] if value.to_bits() == bits));
+            assert!(matches!(
+                decode_column_raw(&data, 0).unwrap(),
+                RawColumn::Real(value) if value.to_bits() == bits
+            ));
+        }
+    }
+}
+
+#[test]
 fn row_roundtrip_all_types() {
     let values = vec![
         Value::Integer(-100),
