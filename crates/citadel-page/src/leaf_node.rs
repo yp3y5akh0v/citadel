@@ -37,6 +37,14 @@ impl OverflowRef {
     }
 }
 
+/// Read only the key from a valid leaf cell, without decoding its value.
+#[inline]
+pub fn read_key(page: &Page, i: u16) -> &[u8] {
+    let offset = page.cell_offset(i) as usize;
+    let key_len = u16::from_le_bytes(page.data[offset..offset + 2].try_into().unwrap()) as usize;
+    &page.data[offset + 6..offset + 6 + key_len]
+}
+
 pub fn read_cell(page: &Page, i: u16) -> LeafCell<'_> {
     let offset = page.cell_offset(i) as usize;
     let key_len = u16::from_le_bytes(page.data[offset..offset + 2].try_into().unwrap()) as usize;
@@ -219,8 +227,7 @@ pub fn search(page: &Page, search_key: &[u8]) -> Result<u16, u16> {
     let mut hi = n;
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
-        let cell = read_cell(page, mid);
-        match search_key.cmp(cell.key) {
+        match search_key.cmp(read_key(page, mid)) {
             std::cmp::Ordering::Less => hi = mid,
             std::cmp::Ordering::Equal => return Ok(mid),
             std::cmp::Ordering::Greater => lo = mid + 1,
@@ -290,8 +297,8 @@ pub fn insert_direct_with_hint(
 ) -> bool {
     let count = page.num_cells();
     let vacant = pos <= count
-        && (pos == 0 || read_cell(page, pos - 1).key < key)
-        && (pos == count || key < read_cell(page, pos).key);
+        && (pos == 0 || read_key(page, pos - 1) < key)
+        && (pos == count || key < read_key(page, pos));
     if vacant {
         insert_vacant_at(page, pos, key, val_type, value)
     } else {
@@ -428,8 +435,7 @@ pub fn split(page: &Page) -> (Vec<u8>, Vec<Vec<u8>>) {
     let split_point = n / 2;
 
     // Separator = first key of right half
-    let sep_cell = read_cell(page, split_point as u16);
-    let sep_key = sep_cell.key.to_vec();
+    let sep_key = read_key(page, split_point as u16).to_vec();
 
     let mut right_cells = Vec::with_capacity(n - split_point);
     for i in split_point..n {

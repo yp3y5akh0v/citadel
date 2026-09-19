@@ -182,6 +182,54 @@ fn search_child_index_binary_search() {
 }
 
 #[test]
+fn binary_prefix_separators_route_to_the_correct_child() {
+    let keys: &[&[u8]] = &[b"", b"\0", b"a", b"a\0", b"alphabet", b"\xff"];
+    let children = [
+        PageId(17),
+        PageId(3),
+        PageId(88),
+        PageId(55),
+        PageId(34),
+        PageId(2),
+    ];
+    let right_child = PageId(4096);
+    let page = make_branch_page(keys, &children, right_child);
+    read_cells_checked(&page).unwrap();
+
+    for (index, (&key, &child)) in keys.iter().zip(&children).enumerate() {
+        assert_eq!(read_key(&page, index as u16), key);
+        assert_eq!(get_child(&page, index), child);
+        let cell = read_cell(&page, index as u16);
+        assert_eq!((cell.key, cell.child), (key, child));
+    }
+    assert_eq!(get_child(&page, keys.len()), right_child);
+
+    for (key, child) in [
+        (b"".as_slice(), PageId(3)),
+        (b"\0".as_slice(), PageId(88)),
+        (b"\0\0".as_slice(), PageId(88)),
+        (b"a".as_slice(), PageId(55)),
+        (b"a\0".as_slice(), PageId(34)),
+        (b"a\0\0".as_slice(), PageId(34)),
+        (b"al".as_slice(), PageId(34)),
+        (b"alphabet".as_slice(), PageId(2)),
+        (b"alphabet\0".as_slice(), PageId(2)),
+        (b"\xff".as_slice(), right_child),
+        (b"\xff\0".as_slice(), right_child),
+    ] {
+        assert_eq!(
+            get_child(&page, search_child_index(&page, key)),
+            child,
+            "key={key:?}"
+        );
+    }
+
+    let empty = make_branch_page(&[], &[], right_child);
+    assert_eq!(search_child_index(&empty, b"any key"), 0);
+    assert_eq!(get_child(&empty, 0), right_child);
+}
+
+#[test]
 fn insert_separator_middle() {
     let mut page = make_branch_page(&[b"b", b"f"], &[PageId(1), PageId(2)], PageId(3));
 
