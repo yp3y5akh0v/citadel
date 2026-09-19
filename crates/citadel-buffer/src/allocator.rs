@@ -145,10 +145,10 @@ impl PageAllocator {
         let id = PageId(self.next_page_id);
         // MAX is the invalid-page sentinel, and remains the high water mark
         // after allocating the final valid page. Reclaimed IDs still work.
-        self.next_page_id = self
-            .next_page_id
-            .checked_add(1)
-            .ok_or(Error::PageIdExhausted)?;
+        let Some(next_page_id) = self.next_page_id.checked_add(1) else {
+            return Err(Error::PageIdExhausted);
+        };
+        self.next_page_id = next_page_id;
         Ok(id)
     }
 
