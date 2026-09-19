@@ -98,37 +98,35 @@ impl<T: TxnScanAdapter> TableIter<T> {
             *rows += 1;
             let found = self.inner.with_loader(&mut |pages| {
                 let mut emit = false;
-                let kind = cursor.current_ref_lazy(pages).map(|c| c.val_type);
-                match kind {
-                    Some(ValueType::Tombstone) | None => {}
-                    Some(ValueType::Inline) => {
-                        let entry = cursor.current_ref_lazy(pages).unwrap();
-                        if let Some(budget) = &self.budget {
-                            budget.try_charge(entry.value.len())?;
-                        }
-                        key_buf.clear();
-                        key_buf.extend_from_slice(entry.key);
-                        value_buf.clear();
-                        value_buf.extend_from_slice(entry.value);
-                        emit = true;
-                    }
-                    Some(ValueType::Overflow) => {
-                        let oref = {
-                            let c = cursor.current_ref_lazy(pages).unwrap();
+                match cursor.current_ref_lazy(pages)? {
+                    None => {}
+                    Some(entry) => match entry.val_type {
+                        ValueType::Tombstone => {}
+                        ValueType::Inline => {
+                            if let Some(budget) = &self.budget {
+                                budget.try_charge(entry.value.len())?;
+                            }
                             key_buf.clear();
-                            key_buf.extend_from_slice(c.key);
-                            OverflowRef::from_bytes(c.value)
-                        };
-                        let materialized = overflow_io::read_chain_value_with_budget(
-                            pages,
-                            &oref,
-                            cancel,
-                            self.budget.as_ref(),
-                        )?;
-                        value_buf.clear();
-                        value_buf.extend_from_slice(&materialized);
-                        emit = true;
-                    }
+                            key_buf.extend_from_slice(entry.key);
+                            value_buf.clear();
+                            value_buf.extend_from_slice(entry.value);
+                            emit = true;
+                        }
+                        ValueType::Overflow => {
+                            let oref = OverflowRef::from_bytes(entry.value);
+                            key_buf.clear();
+                            key_buf.extend_from_slice(entry.key);
+                            let materialized = overflow_io::read_chain_value_with_budget(
+                                pages,
+                                &oref,
+                                cancel,
+                                self.budget.as_ref(),
+                            )?;
+                            value_buf.clear();
+                            value_buf.extend_from_slice(&materialized);
+                            emit = true;
+                        }
+                    },
                 }
                 cursor.next_lazy(pages)?;
                 Ok(emit)
