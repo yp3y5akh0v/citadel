@@ -1694,7 +1694,6 @@ impl<'db> WriteTxn<'db> {
                         return Err(E::from(err));
                     }
                 }
-                scanned.rows += 1;
                 let leaf_id = cursor.leaf_page_id();
                 view.ensure_loaded(leaf_id)?;
 
@@ -1703,6 +1702,7 @@ impl<'db> WriteTxn<'db> {
                     citadel_page::leaf_node::read_cell(page, cursor.cell_index()).val_type
                 };
                 if val_type == ValueType::Tombstone {
+                    scanned.rows += 1;
                     cursor.next_lazy(&mut view)?;
                     continue;
                 }
@@ -1725,6 +1725,7 @@ impl<'db> WriteTxn<'db> {
                 }
 
                 if val_type == ValueType::Overflow {
+                    scanned.rows += 1;
                     // The ref is overwritten in place, so cell indices are
                     // unaffected.
                     let (key, oref) = {
@@ -1795,34 +1796,55 @@ impl<'db> WriteTxn<'db> {
                     continue;
                 }
 
+                // Hold one mutable page borrow across its inline cells. Their
+                // lengths cannot change, so cell positions remain valid and
+                // each row needs neither a map lookup nor an Arc uniqueness
+                // check. Overflow processing releases the borrow because it
+                // loads, allocates and frees other pages in the same map.
                 let page = view.pages.get_page_mut(&cow_leaf).unwrap();
-                let ci = cursor.cell_index();
-                let cell_off = page.cell_offset(ci) as usize;
-                let key_len =
-                    u16::from_le_bytes(page.data[cell_off..cell_off + 2].try_into().unwrap())
-                        as usize;
-                let val_len =
-                    u32::from_le_bytes(page.data[cell_off + 2..cell_off + 6].try_into().unwrap())
-                        as usize;
-                let key_start = cell_off + 6;
-                let val_start = cell_off + 7 + key_len;
+                let cells = page.num_cells();
+                while cursor.cell_index() < cells {
+                    let ci = cursor.cell_index();
+                    let val_type = citadel_page::leaf_node::read_cell(page, ci).val_type;
+                    if val_type == ValueType::Overflow {
+                        break;
+                    }
+                    if let Some(token) = cancel.as_ref() {
+                        if let Err(err) = token.check() {
+                            Self::record_failure(panic_guard.failure, &err);
+                            return Err(E::from(err));
+                        }
+                    }
+                    scanned.rows += 1;
+                    if val_type != ValueType::Tombstone {
+                        let cell_off = page.cell_offset(ci) as usize;
+                        let key_len = u16::from_le_bytes(
+                            page.data[cell_off..cell_off + 2].try_into().unwrap(),
+                        ) as usize;
+                        let val_len = u32::from_le_bytes(
+                            page.data[cell_off + 2..cell_off + 6].try_into().unwrap(),
+                        ) as usize;
+                        let key_start = cell_off + 6;
+                        let val_start = cell_off + 7 + key_len;
 
-                // Split borrow: key immutable, value mutable, non-overlapping.
-                let (before_val, from_val) = page.data.split_at_mut(val_start);
-                let key = &before_val[key_start..key_start + key_len];
-                let value = &mut from_val[..val_len];
-
-                if let Some(budget) = read_budget.as_ref() {
-                    budget.try_charge(value.len())?;
+                        // Split borrow: key immutable, value mutable, non-overlapping.
+                        let (before_val, from_val) = page.data.split_at_mut(val_start);
+                        let key = &before_val[key_start..key_start + key_len];
+                        let value = &mut from_val[..val_len];
+                        if let Some(budget) = read_budget.as_ref() {
+                            budget.try_charge(value.len())?;
+                        }
+                        match f(key, value)? {
+                            Some(true) => count += 1,
+                            Some(false) => {}
+                            None => return Ok(count),
+                        }
+                    }
+                    cursor.set_cell_index(ci + 1);
                 }
-
-                match f(key, value)? {
-                    Some(true) => count += 1,
-                    Some(false) => {}
-                    None => break,
+                if cursor.cell_index() == cells {
+                    cursor.advance_to_next_leaf(&mut view)?;
                 }
-
-                cursor.next_lazy(&mut view)?;
             }
             Ok(count)
         })();
@@ -2645,3 +2667,7 @@ impl<'a, 'db: 'a> crate::scan_iter::TxnScanAdapter for WriteTxnScanAdapter<'a, '
 #[cfg(test)]
 #[path = "write_txn_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "range_update_tests.rs"]
+mod range_update_tests;
