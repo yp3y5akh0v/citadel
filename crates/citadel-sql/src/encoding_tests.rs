@@ -1272,3 +1272,203 @@ fn row_count_boundary_rejects_before_clearing_output_or_count_arithmetic() {
     ));
     assert_eq!(out, vec![0xa5; 7]);
 }
+
+// Independent arithmetic oracle: no fixed-width array reconstruction or masking.
+fn reference_signed_key(data: &[u8]) -> std::result::Result<(i64, usize), &'static str> {
+    let (&marker, tail) = data.split_first().ok_or("truncated integer")?;
+    if !(0x78..=0x88).contains(&marker) {
+        return Err("invalid integer width");
+    }
+    if marker == 0x80 {
+        return Ok((0, 1));
+    }
+    let negative = marker < 0x80;
+    let width = usize::from(marker.abs_diff(0x80));
+    let body = tail.get(..width).ok_or(if negative {
+        "truncated negative integer"
+    } else {
+        "truncated positive integer"
+    })?;
+    let mut magnitude = 0u128;
+    for &byte in body {
+        magnitude = magnitude * 256 + u128::from(if negative { !byte } else { byte });
+    }
+    let value = if negative {
+        -(magnitude as i128)
+    } else {
+        magnitude as i128
+    };
+    let value = i64::try_from(value).map_err(|_| {
+        if negative {
+            "negative integer out of range"
+        } else {
+            "positive integer out of range"
+        }
+    })?;
+    Ok((value, width + 1))
+}
+
+fn assert_signed_key_matches_reference(data: &[u8]) {
+    let expected = reference_signed_key(data);
+    let actual = decode_signed_varint(data);
+    let normalized = match &actual {
+        Ok(pair) => Ok(*pair),
+        Err(SqlError::InvalidValue(message)) => Err(message.as_str()),
+        Err(error) => panic!("unexpected signed key error for {data:?}: {error:?}"),
+    };
+    assert_eq!(normalized, expected, "encoded signed key: {data:?}");
+}
+
+fn signed_key_payload(width: usize, negative: bool, magnitude: u64) -> Vec<u8> {
+    let marker = if negative {
+        0x80 - width as u8
+    } else {
+        0x80 + width as u8
+    };
+    let mut data = vec![marker];
+    data.extend(magnitude.to_be_bytes()[8 - width..].iter().map(|&byte| {
+        if negative {
+            !byte
+        } else {
+            byte
+        }
+    }));
+    data
+}
+
+#[test]
+fn signed_key_decoder_exhaustive_short_payloads_match_reference() {
+    for width in 1..=2usize {
+        for negative in [false, true] {
+            let mut data = [0u8; 3];
+            data[0] = if negative {
+                0x80 - width as u8
+            } else {
+                0x80 + width as u8
+            };
+            // All encoded payloads, including redundant leading bytes and signed zero.
+            for raw in 0..(1u32 << (width * 8)) {
+                data[1..1 + width].copy_from_slice(&raw.to_be_bytes()[4 - width..]);
+                assert_signed_key_matches_reference(&data[..1 + width]);
+            }
+        }
+    }
+}
+
+#[test]
+fn signed_key_decoder_wide_payloads_match_reference() {
+    let mut state = 0xb914_27a6_3ed0_85cfu64;
+    for width in 3..=8usize {
+        for negative in [false, true] {
+            let mut data = [0u8; 9];
+            data[0] = if negative {
+                0x80 - width as u8
+            } else {
+                0x80 + width as u8
+            };
+            for _ in 0..1024 {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                data[1..1 + width].copy_from_slice(&state.to_be_bytes()[8 - width..]);
+                assert_signed_key_matches_reference(&data[..1 + width]);
+            }
+        }
+    }
+}
+
+#[test]
+fn signed_key_decoder_boundaries_noncanonical_widths_and_tails() {
+    let following_component = encode_key_value(&Value::Boolean(true));
+    for width in 1..=8usize {
+        let mask = u64::MAX >> ((8 - width) * 8);
+        let smallest_canonical = 1u64 << ((width - 1) * 8);
+        for magnitude in [
+            0,
+            1,
+            smallest_canonical - 1,
+            smallest_canonical,
+            mask - 1,
+            mask,
+            i64::MAX as u64,
+            1u64 << 63,
+            (1u64 << 63) + 1,
+        ] {
+            if magnitude > mask {
+                continue;
+            }
+            for negative in [false, true] {
+                let mut data = signed_key_payload(width, negative, magnitude);
+                assert_signed_key_matches_reference(&data);
+                let component_len = data.len();
+                data.extend_from_slice(&following_component);
+                assert_signed_key_matches_reference(&data);
+                let Ok((value, consumed)) = reference_signed_key(&data) else {
+                    continue;
+                };
+                assert_eq!(consumed, component_len);
+                for tag in [TAG_INTEGER, TAG_TIME, TAG_DATE, TAG_TIMESTAMP] {
+                    let mut key = vec![tag];
+                    key.extend_from_slice(&data);
+                    let expected = match tag {
+                        TAG_INTEGER => Value::Integer(value),
+                        TAG_TIME => Value::Time(value),
+                        // Preserve the existing Date wrapper's clamping semantics.
+                        TAG_DATE => {
+                            Value::Date(value.clamp(i32::MIN as i64, i32::MAX as i64) as i32)
+                        }
+                        TAG_TIMESTAMP => Value::Timestamp(value),
+                        _ => unreachable!(),
+                    };
+                    assert_eq!(
+                        decode_key_value(&key).unwrap(),
+                        (expected, component_len + 1)
+                    );
+                    assert_eq!(skip_key_value(&key).unwrap(), component_len + 1);
+                    assert_eq!(
+                        decode_key_value(&key[component_len + 1..]).unwrap(),
+                        (Value::Boolean(true), following_component.len())
+                    );
+                    if tag == TAG_INTEGER {
+                        assert_eq!(decode_pk_integer(&key).unwrap(), value);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn signed_key_decoder_truncation_and_bad_markers_match_reference() {
+    assert_signed_key_matches_reference(&[]);
+    for marker in 0..=u8::MAX {
+        let mut data = [0x5au8; 9];
+        data[0] = marker;
+        assert_signed_key_matches_reference(&data);
+    }
+    for width in 1..=8usize {
+        for negative in [false, true] {
+            let data = signed_key_payload(width, negative, 1);
+            for available in 0..data.len() {
+                assert_signed_key_matches_reference(&data[..available]);
+            }
+        }
+    }
+}
+
+#[test]
+fn signed_key_decoder_zero_marker_preserves_following_component() {
+    let data = [0x80, TAG_BOOLEAN, 1];
+    assert_signed_key_matches_reference(&data[..1]);
+    assert_signed_key_matches_reference(&data);
+    assert_eq!(decode_signed_varint(&data).unwrap(), (0, 1));
+    for tag in [TAG_INTEGER, TAG_TIME, TAG_DATE, TAG_TIMESTAMP] {
+        let key = [tag, 0x80, TAG_BOOLEAN, 1];
+        assert_eq!(decode_key_value(&key).unwrap().1, 2);
+        assert_eq!(skip_key_value(&key).unwrap(), 2);
+        assert_eq!(
+            decode_key_value(&key[2..]).unwrap(),
+            (Value::Boolean(true), 2)
+        );
+    }
+}
