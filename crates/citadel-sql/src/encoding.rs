@@ -682,31 +682,25 @@ pub fn encode_row_with_template(
 }
 
 fn decode_value(type_tag: u8, data: &[u8]) -> Result<Value> {
-    validate_fixed_width(type_tag, data)?;
     match DataType::from_tag(type_tag) {
-        Some(DataType::Integer) => Ok(Value::Integer(i64::from_le_bytes(
-            data[..8].try_into().unwrap(),
-        ))),
-        Some(DataType::Real) => Ok(Value::Real(f64::from_le_bytes(
-            data[..8].try_into().unwrap(),
-        ))),
-        Some(DataType::Boolean) => Ok(Value::Boolean(data[0] != 0)),
+        Some(DataType::Integer) => Ok(Value::Integer(i64::from_le_bytes(*checked_bytes::<8>(
+            data,
+        )?))),
+        Some(DataType::Real) => Ok(Value::Real(f64::from_le_bytes(*checked_bytes::<8>(data)?))),
+        Some(DataType::Boolean) => Ok(Value::Boolean(checked_bytes::<1>(data)?[0] != 0)),
         Some(DataType::Text) => {
             let s = std::str::from_utf8(data)
                 .map_err(|_| SqlError::InvalidValue("invalid UTF-8 in column".into()))?;
             Ok(Value::Text(CompactString::from(s)))
         }
         Some(DataType::Blob) => Ok(Value::Blob(data.to_vec())),
-        Some(DataType::Time) => Ok(Value::Time(i64::from_le_bytes(
-            data[..8].try_into().unwrap(),
-        ))),
-        Some(DataType::Date) => Ok(Value::Date(i32::from_le_bytes(
-            data[..4].try_into().unwrap(),
-        ))),
-        Some(DataType::Timestamp) => Ok(Value::Timestamp(i64::from_le_bytes(
-            data[..8].try_into().unwrap(),
-        ))),
+        Some(DataType::Time) => Ok(Value::Time(i64::from_le_bytes(*checked_bytes::<8>(data)?))),
+        Some(DataType::Date) => Ok(Value::Date(i32::from_le_bytes(*checked_bytes::<4>(data)?))),
+        Some(DataType::Timestamp) => Ok(Value::Timestamp(i64::from_le_bytes(*checked_bytes::<8>(
+            data,
+        )?))),
         Some(DataType::Interval) => {
+            let data = checked_bytes::<16>(data)?;
             let months = i32::from_le_bytes(data[0..4].try_into().unwrap());
             let days = i32::from_le_bytes(data[4..8].try_into().unwrap());
             let micros = i64::from_le_bytes(data[8..16].try_into().unwrap());
@@ -955,14 +949,13 @@ pub(crate) fn fixed_width_size(type_tag: u8) -> Option<usize> {
     }
 }
 
-#[inline]
-fn validate_fixed_width(type_tag: u8, data: &[u8]) -> Result<()> {
-    if fixed_width_size(type_tag).is_some_and(|width| data.len() != width) {
+fn checked_bytes<const N: usize>(data: &[u8]) -> Result<&[u8; N]> {
+    let Ok(bytes) = data.try_into() else {
         return Err(SqlError::InvalidValue(
             "invalid fixed-width column length".into(),
         ));
-    }
-    Ok(())
+    };
+    Ok(bytes)
 }
 
 /// Resolve a cell's `(data_len, body_pos)` from its tag. Variable-width cells carry a
@@ -1495,31 +1488,31 @@ impl<'a> RawColumn<'a> {
 }
 
 fn decode_value_raw(type_tag: u8, data: &[u8]) -> Result<RawColumn<'_>> {
-    validate_fixed_width(type_tag, data)?;
     match DataType::from_tag(type_tag) {
-        Some(DataType::Integer) => Ok(RawColumn::Integer(i64::from_le_bytes(
-            data[..8].try_into().unwrap(),
-        ))),
-        Some(DataType::Real) => Ok(RawColumn::Real(f64::from_le_bytes(
-            data[..8].try_into().unwrap(),
-        ))),
-        Some(DataType::Boolean) => Ok(RawColumn::Boolean(data[0] != 0)),
+        Some(DataType::Integer) => Ok(RawColumn::Integer(i64::from_le_bytes(*checked_bytes::<8>(
+            data,
+        )?))),
+        Some(DataType::Real) => Ok(RawColumn::Real(f64::from_le_bytes(*checked_bytes::<8>(
+            data,
+        )?))),
+        Some(DataType::Boolean) => Ok(RawColumn::Boolean(checked_bytes::<1>(data)?[0] != 0)),
         Some(DataType::Text) => {
             let s = std::str::from_utf8(data)
                 .map_err(|_| SqlError::InvalidValue("invalid UTF-8 in column".into()))?;
             Ok(RawColumn::Text(s))
         }
         Some(DataType::Blob) => Ok(RawColumn::Blob(data)),
-        Some(DataType::Time) => Ok(RawColumn::Time(i64::from_le_bytes(
-            data[..8].try_into().unwrap(),
-        ))),
-        Some(DataType::Date) => Ok(RawColumn::Date(i32::from_le_bytes(
-            data[..4].try_into().unwrap(),
-        ))),
+        Some(DataType::Time) => Ok(RawColumn::Time(i64::from_le_bytes(*checked_bytes::<8>(
+            data,
+        )?))),
+        Some(DataType::Date) => Ok(RawColumn::Date(i32::from_le_bytes(*checked_bytes::<4>(
+            data,
+        )?))),
         Some(DataType::Timestamp) => Ok(RawColumn::Timestamp(i64::from_le_bytes(
-            data[..8].try_into().unwrap(),
+            *checked_bytes::<8>(data)?,
         ))),
         Some(DataType::Interval) => {
+            let data = checked_bytes::<16>(data)?;
             let months = i32::from_le_bytes(data[0..4].try_into().unwrap());
             let days = i32::from_le_bytes(data[4..8].try_into().unwrap());
             let micros = i64::from_le_bytes(data[8..16].try_into().unwrap());
