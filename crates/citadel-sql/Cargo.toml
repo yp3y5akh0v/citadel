@@ -84,3 +84,7 @@ harness = false
 [[bench]]
 name = "window_partition"
 harness = false
+
+[[bench]]
+name = "window_range"
+harness = false
