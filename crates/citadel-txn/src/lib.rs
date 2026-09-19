@@ -5,6 +5,7 @@ pub mod merkle;
 pub(crate) mod overflow_io;
 mod owned_pages;
 pub mod pending_free;
+mod range_scan;
 mod read_budget;
 pub mod read_txn;
 pub mod scan_iter;

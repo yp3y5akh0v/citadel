@@ -16,6 +16,7 @@ use citadel_buffer::cursor::{Cursor, DescentGuard, PageLoader, PageMap};
 use crate::catalog::{ResolvedCatalog, TableDescriptor};
 use crate::manager::TxnManager;
 use crate::overflow_io;
+use crate::range_scan::{self, LeafLoader};
 use crate::ReadBudget;
 
 struct ReadPages<'a> {
@@ -42,6 +43,18 @@ impl PageLoader for ReadPages<'_> {
             self.cache.insert(id, arc);
         }
         Ok(())
+    }
+}
+
+impl LeafLoader for ReadPages<'_> {
+    type Leaf = Arc<Page>;
+
+    fn load_leaf(&mut self, id: PageId) -> Result<Self::Leaf> {
+        self.ensure_loaded(id)?;
+        let Some(page) = self.cache.get(&id) else {
+            return Err(Error::PageOutOfBounds(id));
+        };
+        Ok(Arc::clone(page))
     }
 }
 
@@ -737,7 +750,7 @@ impl<'db> ReadTxn<'db> {
     where
         F: FnMut(&[u8], &[u8]) -> Result<bool>,
     {
-        self.table_scan_from_impl(table, start_key, None, f)
+        self.table_scan_from_impl::<true, F>(table, start_key, None, f)
     }
 
     /// Lazy prefix scan. Out-of-prefix values are not materialized or charged.
@@ -745,15 +758,15 @@ impl<'db> ReadTxn<'db> {
     where
         F: FnMut(&[u8], &[u8]) -> Result<bool>,
     {
-        self.table_scan_from_impl(table, prefix, Some(prefix), f)
+        self.table_scan_from_impl::<true, F>(table, prefix, Some(prefix), f)
     }
 
-    fn table_scan_from_impl<F>(
+    fn table_scan_from_impl<const CHECK_EACH_ROW: bool, F>(
         &mut self,
         table: &[u8],
         start_key: &[u8],
         prefix: Option<&[u8]>,
-        mut f: F,
+        f: F,
     ) -> Result<()>
     where
         F: FnMut(&[u8], &[u8]) -> Result<bool>,
@@ -771,116 +784,24 @@ impl<'db> ReadTxn<'db> {
             high_water_mark: self.snapshot.high_water_mark,
             snapshot_txn_id: self.snapshot.txn_id,
         };
-        let mut cursor = Cursor::seek_lazy(&mut view, root, start_key)?;
-        while let Some(cell) = cursor.current_ref_lazy(&mut view)? {
-            if let Some(t) = cancel.as_ref() {
-                t.check()?;
-            }
-            if prefix.is_some_and(|prefix| !cell.key.starts_with(prefix)) {
-                break;
-            }
-            count.rows += 1;
-            match cell.val_type {
-                ValueType::Tombstone => {}
-                ValueType::Inline => {
-                    if let Some(budget) = &budget {
-                        budget.try_charge(cell.value.len())?;
-                    }
-                    if !f(cell.key, cell.value)? {
-                        break;
-                    }
-                }
-                ValueType::Overflow => {
-                    let key = cell.key.to_vec();
-                    let oref = OverflowRef::from_bytes(cell.value);
-                    let materialized = overflow_io::read_chain_value_with_budget(
-                        &mut view,
-                        &oref,
-                        cancel.as_ref(),
-                        budget.as_ref(),
-                    )?;
-                    if !f(&key, &materialized)? {
-                        break;
-                    }
-                }
-            }
-            cursor.next_lazy(&mut view)?;
-        }
-        Ok(())
+        range_scan::scan_from::<CHECK_EACH_ROW, _, _>(
+            &mut view,
+            root,
+            start_key,
+            prefix,
+            cancel.as_ref(),
+            budget.as_ref(),
+            &mut count.rows,
+            f,
+        )
     }
 
-    pub fn table_scan_from_fast<F>(
-        &mut self,
-        table: &[u8],
-        start_key: &[u8],
-        mut f: F,
-    ) -> Result<()>
+    /// Leaf-oriented range scan, retaining cancellation checks at leaf boundaries.
+    pub fn table_scan_from_fast<F>(&mut self, table: &[u8], start_key: &[u8], f: F) -> Result<()>
     where
         F: FnMut(&[u8], &[u8]) -> Result<bool>,
     {
-        self.check_cancel()?;
-        let desc = self.lookup_table(table)?;
-        let root = desc.root_page;
-        let cancel = self.cancel.clone();
-        let budget = self.read_budget.clone();
-        let measurements = self.captured_scan_measurements();
-        let mut count = ScanCount::with_measurements(self.manager, measurements);
-        let mut view = ReadPages {
-            cache: &mut self.page_cache,
-            manager: self.manager,
-            high_water_mark: self.snapshot.high_water_mark,
-            snapshot_txn_id: self.snapshot.txn_id,
-        };
-        let mut cursor = Cursor::seek_lazy(&mut view, root, start_key)?;
-        if !cursor.is_valid() {
-            return Ok(());
-        }
-        loop {
-            if let Some(t) = cancel.as_ref() {
-                t.check()?;
-            }
-            view.ensure_loaded(cursor.leaf_page_id())?;
-            let leaf_page = view
-                .cache
-                .get(&cursor.leaf_page_id())
-                .map(Arc::clone)
-                .ok_or(Error::PageOutOfBounds(cursor.leaf_page_id()))?;
-            let n = leaf_page.num_cells();
-            let mut idx = cursor.cell_index();
-            while idx < n {
-                count.rows += 1;
-                let cell = leaf_node::read_cell(&leaf_page, idx);
-                let continue_scan = match cell.val_type {
-                    ValueType::Tombstone => true,
-                    ValueType::Inline => {
-                        if let Some(budget) = &budget {
-                            budget.try_charge(cell.value.len())?;
-                        }
-                        f(cell.key, cell.value)?
-                    }
-                    ValueType::Overflow => {
-                        let oref = OverflowRef::from_bytes(cell.value);
-                        let key_owned = cell.key.to_vec();
-                        let materialized = overflow_io::read_chain_value_with_budget(
-                            &mut view,
-                            &oref,
-                            cancel.as_ref(),
-                            budget.as_ref(),
-                        )?;
-                        f(&key_owned, &materialized)?
-                    }
-                };
-                if !continue_scan {
-                    return Ok(());
-                }
-                idx += 1;
-            }
-            cursor.set_cell_index(n);
-            if !cursor.advance_to_next_leaf(&mut view)? {
-                break;
-            }
-        }
-        Ok(())
+        self.table_scan_from_impl::<false, F>(table, start_key, None, f)
     }
 
     /// Pull-based scan from `start_key`. Returns a lending iterator.
