@@ -19,6 +19,9 @@ pub enum Error {
     #[error("transaction requires more pages than buffer pool capacity ({capacity})")]
     TransactionTooLarge { capacity: usize },
 
+    #[error("database page ID space is exhausted")]
+    PageIdExhausted,
+
     #[error("database file is corrupted")]
     DatabaseCorrupted,
 

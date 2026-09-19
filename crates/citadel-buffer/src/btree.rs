@@ -47,18 +47,22 @@ pub struct LeafEntryHint {
 
 impl BTree {
     /// Create a new empty B+ tree with a single leaf root.
-    pub fn new(pages: &mut impl MutablePageMap, alloc: &mut PageAllocator, txn_id: TxnId) -> Self {
-        let root_id = alloc.allocate();
+    pub fn new(
+        pages: &mut impl MutablePageMap,
+        alloc: &mut PageAllocator,
+        txn_id: TxnId,
+    ) -> Result<Self> {
+        let root_id = alloc.allocate()?;
         let root = Page::new(root_id, PageType::Leaf, txn_id);
         pages.insert_page(root_id, root);
-        Self {
+        Ok(Self {
             root: root_id,
             depth: 1,
             entry_count: 0,
             last_insert: None,
             last_delete: None,
             last_lookup: None,
-        }
+        })
     }
 
     /// Create a BTree from existing metadata (e.g., loaded from commit slot).
@@ -269,7 +273,7 @@ impl BTree {
                 val_type,
                 value,
             },
-        );
+        )?;
         Ok(Some(true))
     }
 
@@ -283,7 +287,7 @@ impl BTree {
         cached_leaf: PageId,
         needs_cow: bool,
         cell: leaf_node::LeafCell<'_>,
-    ) {
+    ) -> Result<()> {
         let leaf_node::LeafCell {
             key,
             val_type,
@@ -291,7 +295,7 @@ impl BTree {
         } = cell;
         let mut cached_path = self.last_insert.take().unwrap().0;
         let cow_id = if needs_cow {
-            cow_page(pages, alloc, cached_leaf, txn_id)
+            cow_page(pages, alloc, cached_leaf, txn_id)?
         } else {
             cached_leaf
         };
@@ -301,15 +305,15 @@ impl BTree {
         };
         if ok {
             if cow_id != cached_leaf {
-                self.root = propagate_cow_up(pages, alloc, txn_id, &mut cached_path, cow_id);
+                self.root = propagate_cow_up(pages, alloc, txn_id, &mut cached_path, cow_id)?;
             }
             self.entry_count += 1;
             self.last_delete = None;
             self.last_insert = Some((cached_path, cow_id));
-            return;
+            return Ok(());
         }
         let (sep_key, right_id) =
-            split_leaf_with_insert(pages, alloc, txn_id, cow_id, key, val_type, value, true);
+            split_leaf_with_insert(pages, alloc, txn_id, cow_id, key, val_type, value, true)?;
         self.root = propagate_split_up(
             pages,
             alloc,
@@ -320,10 +324,11 @@ impl BTree {
             right_id,
             &mut self.depth,
             true,
-        );
+        )?;
         self.last_delete = None;
         self.last_insert = Some((cached_path, right_id));
         self.entry_count += 1;
+        Ok(())
     }
 
     /// LIL fast-path delete. Returns `Some((deleted, overflow_head))` on
@@ -385,7 +390,7 @@ impl BTree {
 
         let mut cached_path = self.last_delete.take().unwrap().0;
         let cow_id = if needs_cow {
-            cow_page(pages, alloc, cached_leaf, txn_id)
+            cow_page(pages, alloc, cached_leaf, txn_id)?
         } else {
             cached_leaf
         };
@@ -398,7 +403,7 @@ impl BTree {
 
         if !leaf_empty || cached_path.is_empty() {
             if cow_id != cached_leaf {
-                self.root = propagate_cow_up(pages, alloc, txn_id, &mut cached_path, cow_id);
+                self.root = propagate_cow_up(pages, alloc, txn_id, &mut cached_path, cow_id)?;
             }
             self.entry_count -= 1;
             self.clear_lil_caches();
@@ -408,7 +413,7 @@ impl BTree {
 
         alloc.free(cow_id);
         pages.remove_page(&cow_id);
-        self.root = propagate_remove_up(pages, alloc, txn_id, &mut cached_path, &mut self.depth);
+        self.root = propagate_remove_up(pages, alloc, txn_id, &mut cached_path, &mut self.depth)?;
         self.entry_count -= 1;
         self.clear_lil_caches();
         self.last_delete = None;
@@ -439,7 +444,7 @@ impl BTree {
             };
             if hit {
                 let cow_id = if needs_cow {
-                    cow_page(pages, alloc, cached_leaf, txn_id)
+                    cow_page(pages, alloc, cached_leaf, txn_id)?
                 } else {
                     cached_leaf
                 };
@@ -450,7 +455,7 @@ impl BTree {
                 if ok {
                     if cow_id != cached_leaf {
                         self.root =
-                            propagate_cow_up(pages, alloc, txn_id, &mut cached_path, cow_id);
+                            propagate_cow_up(pages, alloc, txn_id, &mut cached_path, cow_id)?;
                     }
                     self.entry_count += 1;
                     self.last_delete = None;
@@ -459,7 +464,7 @@ impl BTree {
                 }
                 let (sep_key, right_id) = split_leaf_with_insert(
                     pages, alloc, txn_id, cow_id, key, val_type, value, true,
-                );
+                )?;
                 self.root = propagate_split_up(
                     pages,
                     alloc,
@@ -470,7 +475,7 @@ impl BTree {
                     right_id,
                     &mut self.depth,
                     true,
-                );
+                )?;
                 self.last_delete = None;
                 self.last_insert = Some((cached_path, right_id));
                 self.entry_count += 1;
@@ -575,7 +580,7 @@ impl BTree {
         };
         let key_exists = position.is_ok();
 
-        let new_leaf_id = cow_page(pages, alloc, leaf_id, txn_id);
+        let new_leaf_id = cow_page(pages, alloc, leaf_id, txn_id)?;
 
         let leaf_ok = {
             let page = pages.get_page_mut(&new_leaf_id).unwrap();
@@ -594,7 +599,7 @@ impl BTree {
             for i in (0..new_path.len()).rev() {
                 let (ancestor_id, child_idx) = new_path[i];
                 let (new_ancestor, rightmost_child) =
-                    update_ancestor_child(pages, alloc, txn_id, ancestor_id, child_idx, child);
+                    update_ancestor_child(pages, alloc, txn_id, ancestor_id, child_idx, child)?;
                 if new_ancestor != ancestor_id {
                     moved.push((ancestor_id, new_ancestor));
                 }
@@ -628,7 +633,7 @@ impl BTree {
             val_type,
             value,
             append_rightmost,
-        );
+        )?;
         self.root = propagate_split_up(
             pages,
             alloc,
@@ -639,7 +644,7 @@ impl BTree {
             right_id,
             &mut self.depth,
             append_rightmost,
-        );
+        )?;
         if append_rightmost {
             self.last_insert = Some((path, right_id));
         }
@@ -674,7 +679,7 @@ impl BTree {
             };
             if hit {
                 let cow_id = if needs_cow {
-                    cow_page(pages, alloc, cached_leaf, txn_id)
+                    cow_page(pages, alloc, cached_leaf, txn_id)?
                 } else {
                     cached_leaf
                 };
@@ -685,7 +690,7 @@ impl BTree {
                 if ok {
                     if cow_id != cached_leaf {
                         self.root =
-                            propagate_cow_up(pages, alloc, txn_id, &mut cached_path, cow_id);
+                            propagate_cow_up(pages, alloc, txn_id, &mut cached_path, cow_id)?;
                     }
                     self.entry_count += 1;
                     self.last_delete = None;
@@ -694,7 +699,7 @@ impl BTree {
                 }
                 let (sep_key, right_id) = split_leaf_with_insert(
                     pages, alloc, txn_id, cow_id, key, val_type, value, true,
-                );
+                )?;
                 self.root = propagate_split_up(
                     pages,
                     alloc,
@@ -705,7 +710,7 @@ impl BTree {
                     right_id,
                     &mut self.depth,
                     true,
-                );
+                )?;
                 self.last_delete = None;
                 self.last_insert = Some((cached_path, right_id));
                 self.entry_count += 1;
@@ -750,7 +755,7 @@ impl BTree {
             return Ok(Some(v));
         }
 
-        let new_leaf_id = cow_page(pages, alloc, leaf_id, txn_id);
+        let new_leaf_id = cow_page(pages, alloc, leaf_id, txn_id)?;
         let leaf_ok = {
             let page = pages.get_page_mut(&new_leaf_id).unwrap();
             match vacancy {
@@ -767,7 +772,7 @@ impl BTree {
             for i in (0..new_path.len()).rev() {
                 let (ancestor_id, child_idx) = new_path[i];
                 let (new_ancestor, rightmost_child) =
-                    update_ancestor_child(pages, alloc, txn_id, ancestor_id, child_idx, child);
+                    update_ancestor_child(pages, alloc, txn_id, ancestor_id, child_idx, child)?;
                 if new_ancestor != ancestor_id {
                     moved.push((ancestor_id, new_ancestor));
                 }
@@ -798,7 +803,7 @@ impl BTree {
             val_type,
             value,
             append_rightmost,
-        );
+        )?;
         self.root = propagate_split_up(
             pages,
             alloc,
@@ -809,7 +814,7 @@ impl BTree {
             right_id,
             &mut self.depth,
             append_rightmost,
-        );
+        )?;
         if append_rightmost {
             self.last_insert = Some((path, right_id));
         }
@@ -839,7 +844,7 @@ impl BTree {
             };
             if hit {
                 let cow_id = if needs_cow {
-                    cow_page(pages, alloc, cached_leaf, txn_id)
+                    cow_page(pages, alloc, cached_leaf, txn_id)?
                 } else {
                     cached_leaf
                 };
@@ -850,7 +855,7 @@ impl BTree {
                 if ok {
                     if cow_id != cached_leaf {
                         self.root =
-                            propagate_cow_up(pages, alloc, txn_id, &mut cached_path, cow_id);
+                            propagate_cow_up(pages, alloc, txn_id, &mut cached_path, cow_id)?;
                     }
                     self.entry_count += 1;
                     self.last_delete = None;
@@ -859,7 +864,7 @@ impl BTree {
                 }
                 let (sep_key, right_id) = split_leaf_with_insert(
                     pages, alloc, txn_id, cow_id, key, val_type, value, true,
-                );
+                )?;
                 self.root = propagate_split_up(
                     pages,
                     alloc,
@@ -870,7 +875,7 @@ impl BTree {
                     right_id,
                     &mut self.depth,
                     true,
-                );
+                )?;
                 self.last_delete = None;
                 self.last_insert = Some((cached_path, right_id));
                 self.entry_count += 1;
@@ -910,7 +915,7 @@ impl BTree {
             return Ok(false);
         }
 
-        let new_leaf_id = cow_page(pages, alloc, leaf_id, txn_id);
+        let new_leaf_id = cow_page(pages, alloc, leaf_id, txn_id)?;
         let leaf_ok = {
             let page = pages.get_page_mut(&new_leaf_id).unwrap();
             match vacancy {
@@ -927,7 +932,7 @@ impl BTree {
             for i in (0..new_path.len()).rev() {
                 let (ancestor_id, child_idx) = new_path[i];
                 let (new_ancestor, rightmost_child) =
-                    update_ancestor_child(pages, alloc, txn_id, ancestor_id, child_idx, child);
+                    update_ancestor_child(pages, alloc, txn_id, ancestor_id, child_idx, child)?;
                 if new_ancestor != ancestor_id {
                     moved.push((ancestor_id, new_ancestor));
                 }
@@ -958,7 +963,7 @@ impl BTree {
             val_type,
             value,
             append_rightmost,
-        );
+        )?;
         self.root = propagate_split_up(
             pages,
             alloc,
@@ -969,7 +974,7 @@ impl BTree {
             right_id,
             &mut self.depth,
             append_rightmost,
-        );
+        )?;
         if append_rightmost {
             self.last_insert = Some((path, right_id));
         }
@@ -1026,9 +1031,9 @@ impl BTree {
         self.clear_lil_caches();
 
         let (mut path, mut leaf_id) = self.walk_to_leaf(pages, pairs[0].0)?;
-        let mut cow_leaf = cow_page(pages, alloc, leaf_id, txn_id);
+        let mut cow_leaf = cow_page(pages, alloc, leaf_id, txn_id)?;
         if cow_leaf != leaf_id {
-            self.root = propagate_cow_up(pages, alloc, txn_id, &mut path, cow_leaf);
+            self.root = propagate_cow_up(pages, alloc, txn_id, &mut path, cow_leaf)?;
         }
 
         let mut count: u64 = 0;
@@ -1047,9 +1052,9 @@ impl BTree {
                 let (new_path, new_leaf) = self.walk_to_leaf(pages, key)?;
                 path = new_path;
                 leaf_id = new_leaf;
-                cow_leaf = cow_page(pages, alloc, leaf_id, txn_id);
+                cow_leaf = cow_page(pages, alloc, leaf_id, txn_id)?;
                 if cow_leaf != leaf_id {
-                    self.root = propagate_cow_up(pages, alloc, txn_id, &mut path, cow_leaf);
+                    self.root = propagate_cow_up(pages, alloc, txn_id, &mut path, cow_leaf)?;
                 }
                 hint = 0;
                 need_walk = false;
@@ -1088,7 +1093,7 @@ impl BTree {
                     // split-insert restores the key (net-zero entry count).
                     let (sep_key, right_id) = split_leaf_with_insert(
                         pages, alloc, txn_id, cow_leaf, key, val_type, value, false,
-                    );
+                    )?;
                     self.root = propagate_split_up(
                         pages,
                         alloc,
@@ -1099,7 +1104,7 @@ impl BTree {
                         right_id,
                         &mut self.depth,
                         false,
-                    );
+                    )?;
                     // Leaf contents and `path` are stale after the split.
                     need_walk = true;
                 }
@@ -1164,7 +1169,7 @@ impl BTree {
             (index, head)
         };
 
-        let new_leaf_id = cow_page(pages, alloc, leaf_id, txn_id);
+        let new_leaf_id = cow_page(pages, alloc, leaf_id, txn_id)?;
         {
             let page = pages.get_page_mut(&new_leaf_id).unwrap();
             leaf_node::delete_at(page, found_idx);
@@ -1173,7 +1178,7 @@ impl BTree {
         let leaf_empty = pages.get_page(&new_leaf_id).unwrap().num_cells() == 0;
 
         if !leaf_empty || path.is_empty() {
-            self.root = propagate_cow_up(pages, alloc, txn_id, path, new_leaf_id);
+            self.root = propagate_cow_up(pages, alloc, txn_id, path, new_leaf_id)?;
             self.entry_count -= 1;
             self.last_delete = Some((path.clone(), new_leaf_id));
             return Ok((true, overflow_head));
@@ -1182,7 +1187,7 @@ impl BTree {
         alloc.free(new_leaf_id);
         pages.remove_page(&new_leaf_id);
 
-        self.root = propagate_remove_up(pages, alloc, txn_id, path, &mut self.depth);
+        self.root = propagate_remove_up(pages, alloc, txn_id, path, &mut self.depth)?;
         self.entry_count -= 1;
         self.last_delete = None;
         Ok((true, overflow_head))
@@ -1220,20 +1225,20 @@ pub fn cow_page(
     alloc: &mut PageAllocator,
     old_id: PageId,
     txn_id: TxnId,
-) -> PageId {
+) -> Result<PageId> {
     let mut new_page = {
         let page = pages.get_page(&old_id).unwrap();
         if page.txn_id() == txn_id {
-            return old_id;
+            return Ok(old_id);
         }
         page.clone()
     };
-    let new_id = alloc.allocate();
+    let new_id = alloc.allocate()?;
     new_page.set_page_id(new_id);
     new_page.set_txn_id(txn_id);
     pages.insert_page(new_id, new_page);
     alloc.free(old_id);
-    new_id
+    Ok(new_id)
 }
 
 /// Update a branch's child pointer at `child_idx` to point to `new_child`.
@@ -1258,18 +1263,18 @@ fn update_ancestor_child(
     ancestor_id: PageId,
     child_idx: usize,
     child: PageId,
-) -> (PageId, bool) {
+) -> Result<(PageId, bool)> {
     let rightmost = {
         let page = pages.get_page(&ancestor_id).unwrap();
         let rightmost = child_idx == page.num_cells() as usize;
         if page.txn_id() == txn_id && branch_node::get_child(page, child_idx) == child {
-            return (ancestor_id, rightmost);
+            return Ok((ancestor_id, rightmost));
         }
         rightmost
     };
-    let ancestor = cow_page(pages, alloc, ancestor_id, txn_id);
+    let ancestor = cow_page(pages, alloc, ancestor_id, txn_id)?;
     update_branch_child(pages.get_page_mut(&ancestor).unwrap(), child_idx, child);
-    (ancestor, rightmost)
+    Ok((ancestor, rightmost))
 }
 
 pub fn propagate_cow_up(
@@ -1278,15 +1283,15 @@ pub fn propagate_cow_up(
     txn_id: TxnId,
     path: &mut [(PageId, usize)],
     mut new_child: PageId,
-) -> PageId {
+) -> Result<PageId> {
     for i in (0..path.len()).rev() {
         let (ancestor_id, child_idx) = path[i];
         let (new_ancestor, _) =
-            update_ancestor_child(pages, alloc, txn_id, ancestor_id, child_idx, new_child);
+            update_ancestor_child(pages, alloc, txn_id, ancestor_id, child_idx, new_child)?;
         path[i] = (new_ancestor, child_idx);
         new_child = new_ancestor;
     }
-    new_child
+    Ok(new_child)
 }
 
 fn is_rightmost_path(pages: &impl PageMap, path: &[(PageId, usize)]) -> bool {
@@ -1307,14 +1312,14 @@ fn split_leaf_with_insert(
     val_type: ValueType,
     value: &[u8],
     append_rightmost: bool,
-) -> (Vec<u8>, PageId) {
+) -> Result<(Vec<u8>, PageId)> {
     if append_rightmost
         && leaf_node::cell_size(key.len(), value.len()) + 2 <= citadel_core::constants::USABLE_SIZE
     {
         // Sequential appends will fill this new right edge. Keep the completed
         // left leaf intact instead of copying half its cells into the new page
         // and leaving every historical leaf half full.
-        let right_id = alloc.allocate();
+        let right_id = alloc.allocate()?;
         let mut right_page = Page::new_for_write(right_id, PageType::Leaf, txn_id);
         assert!(leaf_node::insert_append_direct(
             &mut right_page,
@@ -1323,7 +1328,7 @@ fn split_leaf_with_insert(
             value,
         ));
         pages.insert_page(right_id, right_page);
-        return (key.to_vec(), right_id);
+        return Ok((key.to_vec(), right_id));
     }
 
     let new_raw = leaf_node::build_cell(key, val_type, value);
@@ -1369,6 +1374,7 @@ fn split_leaf_with_insert(
     }
 
     let sep_key = cells[split_point].0.clone();
+    let right_id = alloc.allocate()?;
 
     {
         let left_refs: Vec<&[u8]> = cells[..split_point]
@@ -1379,7 +1385,6 @@ fn split_leaf_with_insert(
         page.rebuild_cells(&left_refs);
     }
 
-    let right_id = alloc.allocate();
     {
         let mut right_page = Page::new(right_id, PageType::Leaf, txn_id);
         let right_refs: Vec<&[u8]> = cells[split_point..]
@@ -1390,7 +1395,7 @@ fn split_leaf_with_insert(
         pages.insert_page(right_id, right_page);
     }
 
-    (sep_key, right_id)
+    Ok((sep_key, right_id))
 }
 
 /// Propagate a split, optionally retaining the path to its new rightmost leaf.
@@ -1406,13 +1411,13 @@ fn propagate_split_up(
     mut right_child: PageId,
     depth: &mut u16,
     retain_rightmost: bool,
-) -> PageId {
+) -> Result<PageId> {
     let mut sep_key = initial_sep.to_vec();
     let mut pending_split = true;
 
     for i in (0..path.len()).rev() {
         let (ancestor_id, child_idx) = path[i];
-        let new_ancestor = cow_page(pages, alloc, ancestor_id, txn_id);
+        let new_ancestor = cow_page(pages, alloc, ancestor_id, txn_id)?;
 
         if pending_split {
             let ok = {
@@ -1436,7 +1441,7 @@ fn propagate_split_up(
                     left_child,
                     &sep_key,
                     right_child,
-                );
+                )?;
                 if retain_rightmost {
                     let right_index = pages.get_page(&new_right).unwrap().num_cells() as usize;
                     path[i] = (new_right, right_index);
@@ -1456,7 +1461,7 @@ fn propagate_split_up(
     }
 
     if pending_split {
-        let new_root_id = alloc.allocate();
+        let new_root_id = alloc.allocate()?;
         let mut new_root = Page::new(new_root_id, PageType::Branch, txn_id);
         let cell = branch_node::build_cell(left_child, &sep_key);
         new_root.write_cell(&cell).unwrap();
@@ -1466,9 +1471,9 @@ fn propagate_split_up(
         if retain_rightmost {
             path.insert(0, (new_root_id, 1));
         }
-        new_root_id
+        Ok(new_root_id)
     } else {
-        left_child
+        Ok(left_child)
     }
 }
 
@@ -1482,7 +1487,7 @@ fn split_branch_with_insert(
     new_left: PageId,
     sep_key: &[u8],
     new_right: PageId,
-) -> (Vec<u8>, PageId) {
+) -> Result<(Vec<u8>, PageId)> {
     let (new_cells, final_right_child) = {
         let page = pages.get_page(&branch_id).unwrap();
         let n = page.num_cells() as usize;
@@ -1542,6 +1547,7 @@ fn split_branch_with_insert(
 
     let promoted_sep = new_cells[split_point].1.clone();
     let promoted_child = new_cells[split_point].0;
+    let right_branch_id = alloc.allocate()?;
 
     {
         let left_raw: Vec<Vec<u8>> = new_cells[..split_point]
@@ -1554,7 +1560,6 @@ fn split_branch_with_insert(
         page.set_right_child(promoted_child);
     }
 
-    let right_branch_id = alloc.allocate();
     {
         let mut right_page = Page::new(right_branch_id, PageType::Branch, txn_id);
         let right_raw: Vec<Vec<u8>> = new_cells[split_point + 1..]
@@ -1567,7 +1572,7 @@ fn split_branch_with_insert(
         pages.insert_page(right_branch_id, right_page);
     }
 
-    (promoted_sep, right_branch_id)
+    Ok((promoted_sep, right_branch_id))
 }
 
 fn remove_child_from_branch(page: &mut Page, child_idx: usize) {
@@ -1590,7 +1595,7 @@ fn propagate_remove_up(
     txn_id: TxnId,
     path: &mut [(PageId, usize)],
     depth: &mut u16,
-) -> PageId {
+) -> Result<PageId> {
     let mut level = path.len();
     let mut need_remove_at_level = true;
     let mut new_child = PageId(0);
@@ -1598,7 +1603,7 @@ fn propagate_remove_up(
     while level > 0 && need_remove_at_level {
         level -= 1;
         let (ancestor_id, child_idx) = path[level];
-        let new_ancestor = cow_page(pages, alloc, ancestor_id, txn_id);
+        let new_ancestor = cow_page(pages, alloc, ancestor_id, txn_id)?;
 
         {
             let page = pages.get_page_mut(&new_ancestor).unwrap();
@@ -1615,7 +1620,7 @@ fn propagate_remove_up(
                 // Only a root collapse shrinks global depth (a walk-capacity
                 // bound that must stay >= true height, hence >= 1).
                 *depth = (*depth).saturating_sub(1).max(1);
-                return only_child;
+                return Ok(only_child);
             }
             new_child = new_ancestor;
             need_remove_at_level = false;
@@ -1633,10 +1638,10 @@ fn propagate_remove_up(
 
     if level > 0 {
         let remaining_path = &mut path[..level];
-        new_child = propagate_cow_up(pages, alloc, txn_id, remaining_path, new_child);
+        new_child = propagate_cow_up(pages, alloc, txn_id, remaining_path, new_child)?;
     }
 
-    new_child
+    Ok(new_child)
 }
 
 #[cfg(test)]

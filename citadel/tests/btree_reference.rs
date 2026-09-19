@@ -34,7 +34,7 @@ impl Rng {
 fn btree_vs_btreemap_expected() {
     let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
-    let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
+    let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1)).unwrap();
     let mut expected: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
 
     let mut rng = Rng::new(42);
@@ -131,7 +131,7 @@ fn btree_vs_btreemap_expected() {
 fn btree_cursor_range_scan() {
     let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
-    let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
+    let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1)).unwrap();
 
     for i in 0..1000u32 {
         let key = format!("{i:06}");
@@ -167,7 +167,7 @@ fn btree_cursor_range_scan() {
 fn btree_cursor_reverse_range() {
     let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
-    let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
+    let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1)).unwrap();
 
     for i in 0..100u32 {
         let key = format!("{i:04}");
@@ -201,7 +201,7 @@ fn btree_cursor_reverse_range() {
 fn btree_cow_isolation() {
     let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
-    let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
+    let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1)).unwrap();
 
     tree.insert(
         &mut pages,
@@ -245,7 +245,7 @@ fn btree_cow_isolation() {
 fn btree_large_values() {
     let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
-    let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
+    let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1)).unwrap();
 
     // Insert keys with large inline values (near the 1920-byte inline limit)
     for i in 0..20u32 {
@@ -278,7 +278,7 @@ fn btree_large_values() {
 fn btree_tombstone_values() {
     let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
-    let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
+    let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1)).unwrap();
 
     tree.insert(
         &mut pages,
@@ -297,7 +297,7 @@ fn btree_tombstone_values() {
 fn btree_max_key_length() {
     let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
-    let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
+    let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1)).unwrap();
 
     // 2048-byte key (max per plan)
     let big_key = vec![0x42; 2048];
@@ -331,7 +331,7 @@ fn btree_max_key_length() {
 fn btree_insert_delete_reinsert() {
     let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
-    let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
+    let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1)).unwrap();
 
     tree.insert(
         &mut pages,
@@ -365,7 +365,7 @@ fn btree_insert_delete_reinsert() {
 fn btree_allocator_frees_pages_on_cow() {
     let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
-    let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
+    let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1)).unwrap();
 
     // Same-txn inserts reuse pages (no CoW needed)
     for i in 0..10u32 {
@@ -412,7 +412,7 @@ fn btree_allocator_frees_pages_on_cow() {
 fn btree_single_entry() {
     let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
-    let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
+    let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1)).unwrap();
 
     tree.insert(
         &mut pages,
@@ -446,7 +446,7 @@ fn btree_single_entry() {
 fn btree_delete_all_and_reinsert() {
     let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
-    let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
+    let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1)).unwrap();
 
     let count = 200;
     let keys: Vec<String> = (0..count).map(|i| format!("key-{i:04}")).collect();
@@ -500,7 +500,7 @@ fn btree_delete_all_and_reinsert() {
 fn btree_depth_grows_with_entries() {
     let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
-    let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
+    let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1)).unwrap();
 
     assert_eq!(tree.depth, 1, "empty tree should have depth 1");
 
@@ -535,7 +535,7 @@ fn btree_sequential_insert_stress() {
     // Sequential keys are a worst-case pattern (all inserts at the right edge)
     let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
-    let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
+    let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1)).unwrap();
 
     let count = 5000u32;
     for i in 0..count {
@@ -582,7 +582,7 @@ fn btree_sequential_insert_stress() {
 fn btree_cursor_bidirectional() {
     let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
-    let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
+    let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1)).unwrap();
 
     for i in 0..100u32 {
         let key = format!("{i:04}");
@@ -619,7 +619,7 @@ fn btree_cursor_bidirectional() {
 fn btree_delete_until_empty_one_by_one() {
     let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
-    let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
+    let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1)).unwrap();
 
     let count = 100u32;
     let keys: Vec<String> = (0..count).map(|i| format!("{i:04}")).collect();
@@ -653,7 +653,7 @@ fn btree_delete_until_empty_one_by_one() {
 fn btree_heavy_random_expected() {
     let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
-    let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
+    let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1)).unwrap();
     let mut expected: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
 
     let mut rng = Rng::new(123456);
@@ -721,7 +721,7 @@ fn btree_heavy_random_expected() {
 fn btree_duplicate_key_updates_value() {
     let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
-    let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
+    let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1)).unwrap();
 
     for i in 0..10u32 {
         let val = format!("version-{i}");
@@ -754,7 +754,7 @@ fn btree_variable_key_length_stress() {
     // split/merge paths and guard against page type confusion during rebalance.
     let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
-    let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
+    let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1)).unwrap();
     let mut expected: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
 
     let mut rng = Rng::new(0xDEAD);
@@ -861,7 +861,7 @@ fn btree_insert_delete_same_key_repeatedly() {
     // repeatedly should CoW the same leaf multiple times without corruption.
     let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
-    let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
+    let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1)).unwrap();
 
     // First populate the tree so the target key is in a multi-page tree
     for i in 0..200u32 {

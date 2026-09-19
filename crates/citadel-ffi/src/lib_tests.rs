@@ -1,4 +1,11 @@
 use super::*;
+
+#[test]
+fn page_id_exhaustion_reports_capacity_failure_without_changing_the_c_abi() {
+    let error = citadel_core::Error::PageIdExhausted;
+    assert_eq!(map_error(&error), CitadelError::IoError);
+    assert_eq!(error.to_string(), "database page ID space is exhausted");
+}
 use std::ffi::CString;
 
 fn temp_path() -> (tempfile::TempDir, CString) {

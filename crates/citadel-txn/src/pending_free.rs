@@ -192,14 +192,14 @@ fn prepend_chain(
     txn_id: TxnId,
     entries: &[PendingFreeEntry],
     mut tail: PageId,
-) -> PageId {
+) -> Result<PageId> {
     // Keep spare capacity at the head, so later appends replace at most one page.
     for chunk in entries.rchunks(MAX_ENTRIES_PER_PAGE) {
-        let page_id = alloc.allocate();
+        let page_id = alloc.allocate()?;
         write_chain_page(pages, txn_id, page_id, tail, chunk);
         tail = page_id;
     }
-    tail
+    Ok(tail)
 }
 
 /// Collect all page IDs that form the chain (for deferred freeing after write).
@@ -290,7 +290,7 @@ impl ChainSnapshot {
             return Err(Error::DatabaseCorrupted);
         }
         if commit.consumed.is_empty() && loan_pool.is_empty() {
-            return Ok(self.prepend_frees(pages, alloc, commit, retired_chain_pages));
+            return self.prepend_frees(pages, alloc, commit, retired_chain_pages);
         }
         if let Some(replacement) = self.head_replacement(loan_pool, commit) {
             loan_pool.pop();
@@ -357,7 +357,7 @@ impl ChainSnapshot {
             retired_chain_pages.remove(page_id);
         }
         while structure.len() < chain_pages_needed(entries.len() + new_count) {
-            structure.push(alloc.allocate());
+            structure.push(alloc.allocate()?);
         }
 
         let surviving_len = entries.len();
@@ -474,7 +474,7 @@ impl ChainSnapshot {
         alloc: &mut PageAllocator,
         commit: &ChainCommit<'_>,
         retired_chain_pages: &mut FxHashMap<PageId, TxnId>,
-    ) -> (PageId, Vec<PendingFreeEntry>) {
+    ) -> Result<(PageId, Vec<PendingFreeEntry>)> {
         let Self {
             mut entries,
             page_ids,
@@ -510,7 +510,7 @@ impl ChainSnapshot {
                         freed_at_txn: commit.txn_id,
                     }),
             );
-            new_root = prepend_chain(pages, alloc, commit.txn_id, &prefix, tail);
+            new_root = prepend_chain(pages, alloc, commit.txn_id, &prefix, tail)?;
         }
 
         // Reader release must make old entries available even when the chain is
@@ -522,7 +522,7 @@ impl ChainSnapshot {
         if let Some(page_id) = retired_head {
             retired_chain_pages.insert(page_id, commit.txn_id);
         }
-        (new_root, entries)
+        Ok((new_root, entries))
     }
 }
 

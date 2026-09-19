@@ -1,9 +1,87 @@
 use super::*;
 
+#[test]
+fn exhaustion_rejects_new_tree_and_cow_without_changing_pages() {
+    let mut pages = FxHashMap::default();
+    let mut alloc = PageAllocator::new(u32::MAX);
+    assert!(matches!(
+        BTree::new(&mut pages, &mut alloc, TxnId(1)),
+        Err(Error::PageIdExhausted)
+    ));
+    assert!(pages.is_empty());
+    let root = PageId(7);
+    pages.insert(root, Page::new(root, PageType::Leaf, TxnId(1)));
+    let before = pages[&root].data;
+    assert_eq!(
+        cow_page(&mut pages, &mut alloc, root, TxnId(1)).unwrap(),
+        root
+    );
+    assert!(matches!(
+        cow_page(&mut pages, &mut alloc, root, TxnId(2)),
+        Err(Error::PageIdExhausted)
+    ));
+    assert_eq!(pages.len(), 1);
+    assert_eq!(pages[&root].data, before);
+    assert!(alloc.allocated_this_txn().is_empty());
+    assert!(alloc.freed_this_txn().is_empty());
+}
+
+#[test]
+fn exhaustion_propagates_from_leaf_sibling_and_new_root_allocation() {
+    for remaining in [0, 1] {
+        let (mut pages, mut alloc, mut tree) = new_tree();
+        let value = vec![0x5a; 1000];
+        let mut next = 0u32;
+        loop {
+            let mut trial = pages[&tree.root].clone();
+            if !leaf_node::insert_append_direct(
+                &mut trial,
+                &next.to_be_bytes(),
+                ValueType::Inline,
+                &value,
+            ) {
+                break;
+            }
+            tree.insert(
+                &mut pages,
+                &mut alloc,
+                TxnId(1),
+                &next.to_be_bytes(),
+                ValueType::Inline,
+                &value,
+            )
+            .unwrap();
+            next += 1;
+        }
+        let count = tree.entry_count;
+        let old_root = tree.root;
+        let original = pages[&old_root].data;
+        let mut alloc = PageAllocator::new(u32::MAX - remaining);
+        assert!(matches!(
+            tree.insert(
+                &mut pages,
+                &mut alloc,
+                TxnId(1),
+                &next.to_be_bytes(),
+                ValueType::Inline,
+                &value
+            ),
+            Err(Error::PageIdExhausted)
+        ));
+        assert_eq!(tree.root, old_root);
+        assert_eq!(tree.entry_count, count);
+        assert_eq!(tree.depth, 1);
+        assert_eq!(pages[&old_root].data, original);
+        assert_eq!(alloc.allocated_this_txn().len(), remaining as usize);
+        assert!(alloc.allocated_this_txn().iter().all(|id| id.is_valid()));
+        assert!(!pages.contains_key(&PageId::INVALID));
+    }
+}
+
 fn new_tree() -> (FxHashMap<PageId, Page>, PageAllocator, BTree) {
     let mut pages = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
-    let tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
+    let tree = BTree::new(&mut pages, &mut alloc, TxnId(1)).unwrap();
     (pages, alloc, tree)
 }
 
@@ -2006,7 +2084,7 @@ mod checked_leaf_hint {
             let hint = match case {
                 2 => hint_for(&tree, &pages, b"f"),
                 3 => {
-                    let mut foreign = BTree::new(&mut pages, &mut alloc, TxnId(1));
+                    let mut foreign = BTree::new(&mut pages, &mut alloc, TxnId(1)).unwrap();
                     foreign
                         .insert(
                             &mut pages,
@@ -2362,7 +2440,7 @@ fn unavailable_or_nonleaf_append_hint_falls_back_without_changing_the_tree() {
 fn default_hasher_page_map_preserves_split_cow_and_removal() {
     let mut pages = std::collections::HashMap::<PageId, Page>::new();
     let mut alloc = PageAllocator::new(0);
-    let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
+    let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1)).unwrap();
     let value = [0x52; 512];
     for key in 0..64u32 {
         assert!(tree
@@ -2564,7 +2642,7 @@ mod unchanged_ancestor_tests {
         let mut alloc = PageAllocator::new(0);
         let mut leaves = Vec::new();
         for keys in [*b"ac", *b"hj", *b"np", *b"uw"] {
-            let id = alloc.allocate();
+            let id = alloc.allocate().unwrap();
             let mut page = Page::new(id, PageType::Leaf, TxnId(1));
             for key in keys {
                 assert!(leaf_node::insert_append_direct(
@@ -2579,14 +2657,14 @@ mod unchanged_ancestor_tests {
         }
         let mut branches = Vec::new();
         for (pair, separator) in [(0, b'g'), (2, b't')] {
-            let id = alloc.allocate();
+            let id = alloc.allocate().unwrap();
             let mut page = Page::new(id, PageType::Branch, TxnId(1));
             page.rebuild_cells(&[&branch_node::build_cell(leaves[pair], &[separator])]);
             page.set_right_child(leaves[pair + 1]);
             pages.insert(id, page);
             branches.push(id);
         }
-        let root = alloc.allocate();
+        let root = alloc.allocate().unwrap();
         let mut page = Page::new(root, PageType::Branch, TxnId(1));
         page.rebuild_cells(&[&branch_node::build_cell(branches[0], b"m")]);
         page.set_right_child(branches[1]);
@@ -2690,7 +2768,8 @@ mod unchanged_ancestor_tests {
                     .collect();
                 // A public caller can request propagation with an unchanged child.
                 // Old epochs still require physical CoW; current ones do not.
-                tree.root = propagate_cow_up(&mut pages, &mut alloc, epoch, &mut path, leaf);
+                tree.root =
+                    propagate_cow_up(&mut pages, &mut alloc, epoch, &mut path, leaf).unwrap();
                 if epoch == TxnId(1) {
                     assert_eq!(tree.root, original.root);
                     assert_eq!(path, old_path);
@@ -2711,7 +2790,7 @@ mod unchanged_ancestor_tests {
                     Some((ValueType::Inline, b"old".to_vec()))
                 );
 
-                let replacement = alloc.allocate();
+                let replacement = alloc.allocate().unwrap();
                 let mut page = Page::new(replacement, PageType::Leaf, epoch);
                 for replacement_key in replacement_keys {
                     assert!(leaf_node::insert_append_direct(
@@ -2724,7 +2803,8 @@ mod unchanged_ancestor_tests {
                 pages.insert_page(replacement, page);
                 pages.mutable_branches.clear();
                 let root_before = tree.root;
-                tree.root = propagate_cow_up(&mut pages, &mut alloc, epoch, &mut path, replacement);
+                tree.root = propagate_cow_up(&mut pages, &mut alloc, epoch, &mut path, replacement)
+                    .unwrap();
                 assert_eq!(tree.root, root_before);
                 assert_eq!(
                     pages.mutable_branches,

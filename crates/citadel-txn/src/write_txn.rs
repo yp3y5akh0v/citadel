@@ -975,7 +975,7 @@ impl<'db> WriteTxn<'db> {
             self.reject_table_name_hash_collision(name, None)?;
         }
 
-        let page_id = self.alloc.allocate();
+        let page_id = self.alloc.allocate()?;
         let mut leaf = Page::new(page_id, PageType::Leaf, self.txn_id);
         leaf.update_checksum();
         self.pages.insert_page(page_id, leaf);
@@ -1699,7 +1699,7 @@ impl<'db> WriteTxn<'db> {
                 }
 
                 if cow_leaf != leaf_id {
-                    let new_id = btree::cow_page(view.pages, alloc, leaf_id, txn_id);
+                    let new_id = btree::cow_page(view.pages, alloc, leaf_id, txn_id)?;
                     if new_id != leaf_id {
                         let cell = citadel_page::leaf_node::read_cell(
                             view.pages.get_page(&new_id).unwrap(),
@@ -1708,7 +1708,7 @@ impl<'db> WriteTxn<'db> {
                         let key_for_walk = cell.key.to_vec();
                         let (mut path, _) = tree.walk_to_leaf(view.pages, &key_for_walk)?;
                         let new_root =
-                            btree::propagate_cow_up(view.pages, alloc, txn_id, &mut path, new_id);
+                            btree::propagate_cow_up(view.pages, alloc, txn_id, &mut path, new_id)?;
                         tree.reroot_after_external_cow(new_root);
                         cursor.set_leaf_page_id(new_id);
                     }
@@ -1937,7 +1937,10 @@ impl<'db> WriteTxn<'db> {
         let old_tree = self.named_trees[table].clone();
         self.free_tree_pages(old_tree.root)?;
 
-        let new_root = self.alloc.allocate();
+        let new_root = match self.alloc.allocate() {
+            Ok(root) => root,
+            Err(err) => return self.fail(err),
+        };
         let mut leaf = Page::new(new_root, PageType::Leaf, self.txn_id);
         leaf.update_checksum();
         self.pages.insert_page(new_root, leaf);
@@ -2191,7 +2194,7 @@ impl<'db> WriteTxn<'db> {
                 slot.entry_count,
             ));
         } else {
-            let page_id = self.alloc.allocate();
+            let page_id = self.alloc.allocate()?;
             let mut leaf = Page::new(page_id, PageType::Leaf, self.txn_id);
             leaf.update_checksum();
             self.pages.insert_page(page_id, leaf);

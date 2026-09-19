@@ -74,7 +74,7 @@ fn unique_old_generation_requires_physical_cow_but_current_generation_does_not()
     pages.insert_page(PageId(1), page(1));
     let old_pointer = Arc::as_ptr(pages.get_shared(&PageId(1)).unwrap());
     assert_eq!(Arc::strong_count(pages.get_shared(&PageId(1)).unwrap()), 1);
-    let current = btree::cow_page(&mut pages, &mut alloc, PageId(1), TxnId(2));
+    let current = btree::cow_page(&mut pages, &mut alloc, PageId(1), TxnId(2)).unwrap();
     assert_ne!(current, PageId(1));
     assert_eq!(
         Arc::as_ptr(pages.get_shared(&PageId(1)).unwrap()),
@@ -85,7 +85,7 @@ fn unique_old_generation_requires_physical_cow_but_current_generation_does_not()
     assert_eq!(pages.get_page(&current).unwrap().txn_id(), TxnId(2));
     let current_pointer = Arc::as_ptr(pages.get_shared(&current).unwrap());
     assert_eq!(
-        btree::cow_page(&mut pages, &mut alloc, current, TxnId(2)),
+        btree::cow_page(&mut pages, &mut alloc, current, TxnId(2)).unwrap(),
         current
     );
     pages.get_page_mut(&current).unwrap().data[200] = 0x5a;

@@ -1,8 +1,57 @@
 use super::*;
 
+#[test]
+fn exhaustion_propagates_from_prepend_and_full_chain_rewrite() {
+    for rewrite in [false, true] {
+        let mut pages = FxHashMap::default();
+        let mut alloc = PageAllocator::new(u32::MAX);
+        let mut loan_pool = Vec::new();
+        let mut consumed = FxHashSet::default();
+        let root = if rewrite {
+            consumed.insert(PageId(5));
+            write_chain(
+                &mut pages,
+                TxnId(2),
+                &[PendingFreeEntry {
+                    page_id: PageId(5),
+                    freed_at_txn: TxnId(1),
+                }],
+                &[PageId(10)],
+            )
+        } else {
+            PageId::INVALID
+        };
+        let before = if rewrite {
+            Some(pages[&root].data)
+        } else {
+            None
+        };
+        let result = process_chain(
+            &mut pages,
+            &mut alloc,
+            &mut loan_pool,
+            &ChainCommit {
+                txn_id: TxnId(3),
+                current_root: root,
+                freed_this_txn: &[PageId(6)],
+                consumed: &consumed,
+                reclaim_horizon: TxnId(1),
+            },
+        );
+        assert!(matches!(result, Err(Error::PageIdExhausted)));
+        assert_eq!(pages.len(), usize::from(rewrite));
+        if let Some(before) = before {
+            assert_eq!(pages[&root].data, before);
+        }
+        assert!(alloc.allocated_this_txn().is_empty());
+        assert_eq!(alloc.high_water_mark(), u32::MAX);
+        assert!(!pages.contains_key(&PageId::INVALID));
+    }
+}
+
 fn structure_for(alloc: &mut PageAllocator, entries: &[PendingFreeEntry]) -> Vec<PageId> {
     (0..chain_pages_needed(entries.len()))
-        .map(|_| alloc.allocate())
+        .map(|_| alloc.allocate().unwrap())
         .collect()
 }
 
@@ -461,7 +510,11 @@ fn prepend_packs_the_head_and_preserves_sparse_tails() {
             for horizon in [TxnId(3), TxnId(u64::MAX)] {
                 let mut pages = FxHashMap::default();
                 let mut alloc = PageAllocator::new(10_000);
-                let old_ids = [alloc.allocate(), alloc.allocate(), alloc.allocate()];
+                let old_ids = [
+                    alloc.allocate().unwrap(),
+                    alloc.allocate().unwrap(),
+                    alloc.allocate().unwrap(),
+                ];
                 let initial: Vec<_> = (0..head_count + 3)
                     .map(|i| PendingFreeEntry {
                         page_id: PageId(i as u32),
@@ -561,7 +614,7 @@ fn a_pinned_horizon_retires_at_most_one_chain_page_per_append() {
             .map(|id| pages[id].as_bytes().to_vec())
             .collect();
         let replaced = root.is_valid() && read_entry_count(&pages[&root]) < MAX_ENTRIES_PER_PAGE;
-        let freed = [alloc.allocate(), alloc.allocate()];
+        let freed = [alloc.allocate().unwrap(), alloc.allocate().unwrap()];
         ordinary_frees += freed.len();
         retired_heads += usize::from(replaced);
         assert!(pages.len() * citadel_core::PAGE_SIZE < 2 * 1024 * 1024);
@@ -713,7 +766,7 @@ fn an_undrained_allocator_is_rejected_before_chain_mutation() {
             page_id: PageId(10),
             freed_at_txn: TxnId(1),
         }],
-        &[alloc.allocate()],
+        &[alloc.allocate().unwrap()],
     );
     let old_bytes = pages[&root].as_bytes().to_vec();
     alloc.add_ready_to_use(vec![PageId(10)]);
@@ -741,8 +794,8 @@ fn prepending_does_not_skip_validation_of_the_shared_tail() {
     for freed in [&[][..], &[PageId(20)][..]] {
         let mut pages = FxHashMap::default();
         let mut alloc = PageAllocator::new(100);
-        let head = alloc.allocate();
-        let tail = alloc.allocate();
+        let head = alloc.allocate().unwrap();
+        let tail = alloc.allocate().unwrap();
         write_chain_page(&mut pages, TxnId(1), head, tail, &[]);
         write_chain_page(&mut pages, TxnId(1), tail, tail, &[]);
         let result = process_chain(
@@ -807,7 +860,7 @@ fn metadata_eligibility_requires_the_exact_retirement_and_an_intervening_commit(
                 freed_at_txn: TxnId(4),
             })
             .collect();
-        let root = write_chain(&mut pages, TxnId(4), &initial, &[alloc.allocate()]);
+        let root = write_chain(&mut pages, TxnId(4), &initial, &[alloc.allocate().unwrap()]);
         let mut metadata: FxHashMap<_, _> = [
             (PageId(10), TxnId(4)),
             (PageId(11), TxnId(3)),
@@ -1240,7 +1293,11 @@ mod head_consuming_cow {
     impl Fixture {
         fn new(head_len: usize) -> Self {
             let mut alloc = PageAllocator::new(10_000);
-            let ids = [alloc.allocate(), alloc.allocate(), alloc.allocate()];
+            let ids = [
+                alloc.allocate().unwrap(),
+                alloc.allocate().unwrap(),
+                alloc.allocate().unwrap(),
+            ];
             let entries: Vec<_> = (0..head_len + MAX_ENTRIES_PER_PAGE + 3)
                 .map(|index| PendingFreeEntry {
                     page_id: PageId(100 + index as u32),

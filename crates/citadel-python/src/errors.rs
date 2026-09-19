@@ -125,6 +125,7 @@ fn core_category(e: &CoreError) -> Category {
         | CoreError::TransactionTooLarge { .. }
         | CoreError::PageOutOfBounds(_)
         | CoreError::BufferPoolFull
+        | CoreError::PageIdExhausted
         | CoreError::Io(_)
         | CoreError::AuditFailureAfterOperation { .. }
         | CoreError::DurabilityFailureAfterOperation { .. }

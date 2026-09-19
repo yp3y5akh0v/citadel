@@ -224,6 +224,7 @@ fn map_error(err: &citadel_core::Error) -> CitadelError {
         | citadel_core::Error::RegionSealTampered
         | citadel_core::Error::RegionStoreCorrupt(_) => CitadelError::DatabaseCorrupted,
         citadel_core::Error::BufferPoolFull
+        | citadel_core::Error::PageIdExhausted
         | citadel_core::Error::Sync(_)
         | citadel_core::Error::FipsViolation(_) => CitadelError::IoError,
         citadel_core::Error::UnsupportedVersion(_)
