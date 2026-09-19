@@ -227,51 +227,31 @@ pub fn insert_separator(
     right_child: PageId,
 ) -> bool {
     let n = page.num_cells() as usize;
-
-    if child_idx < n {
-        // Read old key before modifying
-        let old_key = read_key(page, child_idx as u16).to_vec();
-        let old_cell_size = get_cell_size(page, child_idx as u16);
-
-        // Build the new cell that replaces cell[child_idx]
-        let new_cell = build_cell(left_child, sep_key);
-        // Build the cell to insert at child_idx + 1
-        let insert_cell = build_cell(right_child, &old_key);
-
-        // Check if we have space for the size difference + new cell + pointer
-        // We need: new_cell.len - old_cell_size + insert_cell.len + 2 (for new ptr)
-        if page.available_space() + old_cell_size < new_cell.len() + insert_cell.len() + 2 {
-            // Not enough space - caller must split this branch
-            return false;
-        }
-
-        // Strategy: rebuild all cells to avoid fragmentation issues.
-        // Collect all cells, modify, and rebuild.
-        let mut cells: Vec<Vec<u8>> = Vec::with_capacity(n + 1);
-        for i in 0..n {
-            if i == child_idx {
-                cells.push(new_cell.clone());
-            } else {
-                let c = read_cell(page, i as u16);
-                cells.push(build_cell(c.child, c.key));
-            }
-        }
-        cells.insert(child_idx + 1, insert_cell);
-
-        let rc = page.right_child();
-        let cell_refs: Vec<&[u8]> = cells.iter().map(|c| c.as_slice()).collect();
-        page.rebuild_cells(&cell_refs);
-        page.set_right_child(rc);
-    } else {
-        // right_child split
-        let new_cell = build_cell(left_child, sep_key);
-        if page.available_space() < new_cell.len() {
-            return false;
-        }
-        page.write_cell(&new_cell);
-        page.set_right_child(right_child);
+    let cell_len = cell_size(sep_key.len());
+    if (page.free_space() as usize) < cell_len + 2 {
+        return false;
+    }
+    if page.available_space() < cell_len {
+        page.compact_cells(get_cell_size);
     }
 
+    // Keep the old separator in its existing cell, shifting only slot offsets.
+    // The new separator precedes it; the old cell now points to the split's
+    // right child. No other separator bytes need to move.
+    let index = child_idx.min(n) as u16;
+    page.insert_cell_direct(index, cell_len, |slot| {
+        slot[..4].copy_from_slice(&left_child.as_u32().to_le_bytes());
+        slot[4..6].copy_from_slice(&(sep_key.len() as u16).to_le_bytes());
+        slot[6..].copy_from_slice(sep_key);
+    })
+    .expect("insert_separator: checked cell and slot space");
+
+    if child_idx < n {
+        let offset = page.cell_offset(index + 1) as usize;
+        page.data[offset..offset + 4].copy_from_slice(&right_child.as_u32().to_le_bytes());
+    } else {
+        page.set_right_child(right_child);
+    }
     true
 }
 
