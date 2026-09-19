@@ -975,3 +975,165 @@ fn growing_rows_extrema_visit_unsafe_values_once() {
         assert!(row[1].bit_eq(&nan));
     }
 }
+
+fn evaluate_bounded_real_sum_and_avg(values: [f64; 3]) -> Vec<Vec<Value>> {
+    let mut position = column("position", DataType::Integer);
+    position.position = 1;
+    let rows = values
+        .into_iter()
+        .enumerate()
+        .map(|(index, value)| vec![Value::Real(value), i(index as i64)])
+        .collect();
+    let ExecutionResult::Query(result) = evaluate_window_query(
+        "SELECT SUM(x) OVER (ORDER BY position ROWS BETWEEN 1 PRECEDING AND CURRENT ROW), \
+         AVG(x) OVER (ORDER BY position ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t",
+        &[column("x", DataType::Real), position],
+        rows,
+    )
+    .unwrap() else {
+        panic!("expected rows");
+    };
+    result.rows
+}
+
+#[test]
+fn sliding_sum_and_avg_retain_small_values_after_a_large_real_expires() {
+    assert_eq!(
+        evaluate_bounded_real_sum_and_avg([1e20, 1.0, 1.0]),
+        vec![
+            vec![Value::Real(1e20), Value::Real(1e20)],
+            vec![Value::Real(1e20), Value::Real(5e19)],
+            vec![Value::Real(2.0), Value::Real(1.0)],
+        ]
+    );
+}
+
+#[test]
+fn sliding_sum_and_avg_recover_after_nan_expires() {
+    let rows = evaluate_bounded_real_sum_and_avg([f64::NAN, 1.0, 2.0]);
+    assert_eq!(rows[2], vec![Value::Real(3.0), Value::Real(1.5)]);
+}
+
+#[test]
+fn sliding_sum_and_avg_recover_after_infinity_expires() {
+    for infinity in [f64::INFINITY, f64::NEG_INFINITY] {
+        let rows = evaluate_bounded_real_sum_and_avg([infinity, 1.0, 2.0]);
+        assert_eq!(rows[2], vec![Value::Real(3.0), Value::Real(1.5)]);
+    }
+}
+
+fn evaluate_sum_and_avg_frame(values: Vec<Value>, frame: &str) -> Vec<Vec<Value>> {
+    let mut position = column("position", DataType::Integer);
+    position.position = 1;
+    let rows = values
+        .into_iter()
+        .enumerate()
+        .map(|(index, value)| vec![value, i(index as i64)])
+        .collect();
+    let spec = format!("ORDER BY position ROWS BETWEEN {frame}");
+    let ExecutionResult::Query(result) = evaluate_window_query(
+        &format!("SELECT SUM(x) OVER ({spec}), AVG(x) OVER ({spec}) FROM t"),
+        &[column("x", DataType::Null), position],
+        rows,
+    )
+    .unwrap() else {
+        panic!("expected rows");
+    };
+    result.rows
+}
+
+#[test]
+fn sliding_sum_rebuild_preserves_integer_subtotals_and_following_bounds() {
+    let rows = evaluate_sum_and_avg_frame(
+        vec![
+            Value::Real(1e20),
+            i(7),
+            Value::Real(1.0),
+            i(11),
+            Value::Real(2.0),
+        ],
+        "2 PRECEDING AND CURRENT ROW",
+    );
+    assert_eq!(rows[3], vec![Value::Real(19.0), Value::Real(19.0 / 3.0)]);
+    assert_eq!(rows[4], vec![Value::Real(14.0), Value::Real(14.0 / 3.0)]);
+
+    let rows = evaluate_sum_and_avg_frame(
+        vec![
+            Value::Real(1e20),
+            Value::Real(1.0),
+            Value::Real(1.0),
+            Value::Real(2.0),
+        ],
+        "1 PRECEDING AND 1 FOLLOWING",
+    );
+    assert_eq!(rows[2], vec![Value::Real(4.0), Value::Real(4.0 / 3.0)]);
+    assert_eq!(rows[3], vec![Value::Real(3.0), Value::Real(1.5)]);
+}
+
+#[test]
+fn sliding_sum_and_avg_keep_exact_integer_frames_linear() {
+    let n = 128usize;
+    let _ = take_window_aggregate_steps();
+    let rows = evaluate_sum_and_avg_frame(vec![i(1); n], "7 PRECEDING AND CURRENT ROW");
+    assert_eq!(take_window_aggregate_steps(), 2 * n);
+    for (index, row) in rows.into_iter().enumerate() {
+        assert_eq!(row, vec![i((index + 1).min(8) as i64), Value::Real(1.0)]);
+    }
+}
+
+#[test]
+fn growing_real_sum_and_avg_keep_forward_order_and_linear_work() {
+    let n = 128usize;
+    let mut values = vec![Value::Real(1.0); n];
+    values[0] = Value::Real(1e20);
+    values[1] = Value::Real(-1e20);
+    for frame in [
+        "UNBOUNDED PRECEDING AND CURRENT ROW",
+        "UNBOUNDED PRECEDING AND 1 FOLLOWING",
+    ] {
+        let _ = take_window_aggregate_steps();
+        let rows = evaluate_sum_and_avg_frame(values.clone(), frame);
+        assert_eq!(take_window_aggregate_steps(), 2 * n, "{frame}");
+        assert_eq!(
+            rows[n - 1],
+            vec![Value::Real(126.0), Value::Real(126.0 / 128.0)]
+        );
+    }
+}
+
+#[test]
+fn expiring_the_only_real_resets_its_subtotal_without_rescanning() {
+    let _ = take_window_aggregate_steps();
+    let rows = evaluate_sum_and_avg_frame(
+        vec![Value::Real(f64::NAN), i(2), Value::Null, i(4), i(5)],
+        "1 PRECEDING AND CURRENT ROW",
+    );
+    assert_eq!(take_window_aggregate_steps(), 10);
+    assert_eq!(rows[2], vec![i(2), Value::Real(2.0)]);
+    assert_eq!(rows[3], vec![i(4), Value::Real(4.0)]);
+    assert_eq!(rows[4], vec![i(9), Value::Real(4.5)]);
+}
+
+#[test]
+fn count_of_real_values_keeps_exact_linear_removal() {
+    let n = 128usize;
+    let mut position = column("position", DataType::Integer);
+    position.position = 1;
+    let rows = (0..n)
+        .map(|index| vec![Value::Real(f64::NAN), i(index as i64)])
+        .collect();
+    let _ = take_window_aggregate_steps();
+    let ExecutionResult::Query(result) = evaluate_window_query(
+        "SELECT COUNT(x) OVER (ORDER BY position ROWS BETWEEN 7 PRECEDING AND CURRENT ROW), \
+         COUNT(*) OVER (ORDER BY position ROWS BETWEEN 7 PRECEDING AND CURRENT ROW) FROM t",
+        &[column("x", DataType::Real), position],
+        rows,
+    )
+    .unwrap() else {
+        panic!("expected rows");
+    };
+    assert_eq!(take_window_aggregate_steps(), 2 * n);
+    for (index, row) in result.rows.into_iter().enumerate() {
+        assert_eq!(row, vec![i((index + 1).min(8) as i64); 2]);
+    }
+}

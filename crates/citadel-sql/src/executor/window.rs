@@ -523,22 +523,27 @@ impl SlidingSum {
         Ok(())
     }
 
-    pub(super) fn remove(&mut self, val: &Value) {
+    /// Remove only when the remaining forward sum can be recovered exactly.
+    /// A failed removal leaves the accumulator unchanged; the caller must
+    /// rebuild the frame because floating addition has no exact inverse.
+    #[must_use]
+    pub(super) fn try_remove(&mut self, val: &Value) -> bool {
         match val {
             Value::Integer(i) => {
                 self.int_sum -= i128::from(*i);
                 self.count -= 1;
             }
-            Value::Real(r) => {
-                self.real_sum -= r;
-                self.real_count -= 1;
-                if self.real_count == 0 {
-                    self.real_sum = 0.0;
+            Value::Real(_) => {
+                if self.real_count != 1 {
+                    return false;
                 }
+                self.real_sum = 0.0;
+                self.real_count = 0;
                 self.count -= 1;
             }
             _ => {}
         }
+        true
     }
 
     pub(super) fn result_sum(&self) -> Result<Value> {
@@ -597,10 +602,14 @@ impl WindowAccumulator {
         }
     }
 
-    fn remove(&mut self, args: &[Value]) {
+    #[must_use]
+    fn try_remove(&mut self, args: &[Value]) -> bool {
         match self {
-            Self::Count { count, star } => *count -= i64::from(*star || !args[0].is_null()),
-            Self::Sum(sum) | Self::Avg(sum) => sum.remove(&args[0]),
+            Self::Count { count, star } => {
+                *count -= i64::from(*star || !args[0].is_null());
+                true
+            }
+            Self::Sum(sum) | Self::Avg(sum) => sum.try_remove(&args[0]),
         }
     }
 
@@ -1086,15 +1095,20 @@ pub(super) fn eval_window_select(
                         for (pos, &orig_idx) in part_indices.iter().enumerate() {
                             check_cancel_at(cancel, pos)?;
                             let current = frame.indices(pos, part_len, &peer_bounds);
+                            let mut add_start = previous.end.max(current.start);
                             for (work, remove_pos) in
                                 (previous.start..current.start.min(previous.end)).enumerate()
                             {
                                 check_cancel_at(cancel, work)?;
-                                acc.remove(&arg_values[win_idx][part_indices[remove_pos]]);
+                                if !acc.try_remove(&arg_values[win_idx][part_indices[remove_pos]]) {
+                                    // Expiring a real can lose small terms or leave
+                                    // NaN/infinity behind. Rebuild in frame order.
+                                    acc = WindowAccumulator::new(&upper_name, args.len());
+                                    add_start = current.start;
+                                    break;
+                                }
                             }
-                            for (work, add_pos) in
-                                (previous.end.max(current.start)..current.end).enumerate()
-                            {
+                            for (work, add_pos) in (add_start..current.end).enumerate() {
                                 check_cancel_at(cancel, work)?;
                                 acc.add(&arg_values[win_idx][part_indices[add_pos]])?;
                             }
