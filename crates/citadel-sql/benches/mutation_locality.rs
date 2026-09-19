@@ -178,7 +178,7 @@ impl MissingKeys {
     }
 }
 
-fn run_missing_batch(update: &PreparedStatement<'_, '_>, bindings: &[[Value; 2]]) -> u64 {
+fn run_prepared_batch(update: &PreparedStatement<'_, '_>, bindings: &[[Value; 2]]) -> u64 {
     bindings
         .iter()
         .map(|params| update.execute(params).unwrap())
@@ -271,14 +271,14 @@ fn bench_missing(c: &mut Criterion) {
                 1
             );
             for _ in 0..2 {
-                assert_eq!(run_missing_batch(&update, &bindings), 0);
+                assert_eq!(run_prepared_batch(&update, &bindings), 0);
             }
             check_missing_rows(&connection, row_count);
 
             let mut total_affected = 0_u64;
             group.bench_function(BenchmarkId::new(pattern.name(), row_count), |b| {
                 b.iter(|| {
-                    let affected = run_missing_batch(&update, &bindings);
+                    let affected = run_prepared_batch(&update, &bindings);
                     total_affected += affected;
                     black_box(affected)
                 });
@@ -292,5 +292,178 @@ fn bench_missing(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench, bench_missing);
+#[derive(Clone, Copy)]
+enum PrimedKeys {
+    Rightmost,
+    Left,
+    Interior,
+    Alternating,
+}
+
+impl PrimedKeys {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Rightmost => "rightmost",
+            Self::Left => "left",
+            Self::Interior => "interior",
+            Self::Alternating => "alternating",
+        }
+    }
+
+    fn bindings(self, row_count: usize) -> Vec<[Value; 2]> {
+        assert_eq!(BATCH % 4, 0);
+        let maximum = (row_count - 1) as i64;
+        let middle = (row_count / 2) as i64;
+        let mut bindings = Vec::with_capacity(BATCH);
+        let mut push = |delta, key| bindings.push([Value::Integer(delta), Value::Integer(key)]);
+        if matches!(self, Self::Alternating) {
+            for offset in 0..BATCH / 4 {
+                let interior = middle + offset as i64;
+                push(1, interior);
+                push(1, maximum);
+                push(-1, interior);
+                push(-1, maximum);
+            }
+        } else {
+            for offset in 0..BATCH / 2 {
+                let key = match self {
+                    Self::Rightmost => maximum,
+                    Self::Left => offset as i64,
+                    Self::Interior => middle + offset as i64,
+                    Self::Alternating => unreachable!(),
+                };
+                push(1, key);
+                push(-1, key);
+            }
+        }
+        assert_eq!(bindings.len(), BATCH);
+        // Every batch restores the initial data, with at most +1 per key
+        // in flight. No numeric growth or timed reset/allocation is needed.
+        let mut deltas = vec![0_i64; row_count];
+        for params in &bindings {
+            let [Value::Integer(delta), Value::Integer(key)] = params else {
+                unreachable!()
+            };
+            deltas[*key as usize] += delta;
+            assert!((0..=1).contains(&deltas[*key as usize]));
+        }
+        assert!(deltas.into_iter().all(|delta| delta == 0));
+        bindings
+    }
+
+    fn preview_len(self) -> usize {
+        if matches!(self, Self::Alternating) {
+            2
+        } else {
+            1
+        }
+    }
+}
+
+fn check_primed_rows(connection: &Connection<'_>, row_count: usize, raised: &[i64]) {
+    let rows = connection
+        .query("SELECT id, a, d FROM t ORDER BY id")
+        .unwrap()
+        .rows;
+    assert_eq!(rows.len(), row_count);
+    for (id, row) in rows.iter().enumerate() {
+        let id = id as i64;
+        let a = id + i64::from(raised.contains(&id));
+        assert_eq!(
+            row.as_slice(),
+            &[
+                Value::Integer(id),
+                Value::Integer(a),
+                Value::Integer(a * 2 + 1)
+            ],
+            "primed UPDATE changed row {id} unexpectedly"
+        );
+    }
+}
+
+fn bench_primed(c: &mut Criterion) {
+    let row_count = 10_000usize;
+    let mut group = c.benchmark_group("mutation_primed");
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(2));
+    group.sample_size(30);
+    group.throughput(Throughput::Elements(BATCH as u64));
+    for pattern in [
+        PrimedKeys::Rightmost,
+        PrimedKeys::Left,
+        PrimedKeys::Interior,
+        PrimedKeys::Alternating,
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let database = DatabaseBuilder::new(directory.path().join("bench.citadel"))
+            .passphrase(b"bench-passphrase")
+            .argon2_profile(Argon2Profile::Iot)
+            .cache_size(4096)
+            .sync_mode(SyncMode::Off)
+            .create()
+            .unwrap();
+        let connection = Connection::open(&database).unwrap();
+        connection.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, a INTEGER, d INTEGER GENERATED ALWAYS AS (a * 2 + 1) STORED)").unwrap();
+        connection.execute("BEGIN").unwrap();
+        let insert = connection
+            .prepare("INSERT INTO t (id, a) VALUES ($1, $1)")
+            .unwrap();
+        for id in 0..row_count {
+            assert_eq!(insert.execute(&[Value::Integer(id as i64)]).unwrap(), 1);
+        }
+        connection.execute("COMMIT").unwrap();
+        check_primed_rows(&connection, row_count, &[]);
+        let bindings = pattern.bindings(row_count);
+        let update = connection
+            .prepare("UPDATE t SET a = a + $1 WHERE id = $2")
+            .unwrap();
+
+        // Only the physical maximum is assumed to occupy the rightmost leaf.
+        // The cache is primed before preflight and the long-lived transaction
+        // remains open through warmup/measurement; no BEGIN/COMMIT is timed.
+        connection.execute("BEGIN").unwrap();
+        assert_eq!(
+            update
+                .execute(&[Value::Integer(0), Value::Integer((row_count - 1) as i64)])
+                .unwrap(),
+            1
+        );
+        let preview = &bindings[..pattern.preview_len()];
+        let mut raised = Vec::with_capacity(preview.len());
+        for params in preview {
+            assert_eq!(update.execute(params).unwrap(), 1);
+            let [Value::Integer(1), Value::Integer(key)] = params else {
+                unreachable!()
+            };
+            raised.push(*key);
+        }
+        // Verify actual changes and generated propagation before restoring
+        // the trial batch; checking only the final zero deltas could hide them.
+        check_primed_rows(&connection, row_count, &raised);
+        for params in &bindings[preview.len()..] {
+            assert_eq!(update.execute(params).unwrap(), 1);
+        }
+        check_primed_rows(&connection, row_count, &[]);
+        assert_eq!(run_prepared_batch(&update, &bindings), BATCH as u64);
+        check_primed_rows(&connection, row_count, &[]);
+
+        let mut completed_batches = 0_u64;
+        let mut total_affected = 0_u64;
+        group.bench_function(BenchmarkId::new(pattern.name(), row_count), |b| {
+            b.iter(|| {
+                let affected = run_prepared_batch(&update, &bindings);
+                completed_batches += 1;
+                total_affected += affected;
+                black_box(affected)
+            });
+        });
+        assert_eq!(total_affected, completed_batches * BATCH as u64);
+        check_primed_rows(&connection, row_count, &[]);
+        connection.execute("COMMIT").unwrap();
+        check_primed_rows(&connection, row_count, &[]);
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench, bench_missing, bench_primed);
 criterion_main!(benches);
