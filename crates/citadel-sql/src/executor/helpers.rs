@@ -618,10 +618,20 @@ pub(super) fn eval_fast_gen(
 }
 
 pub(super) fn checked_gen_mul_add(value: i64, mul: i64, add: i64) -> Result<i64> {
-    value
+    let Some(value) = value
         .checked_mul(mul)
         .and_then(|product| product.checked_add(add))
-        .ok_or(SqlError::IntegerOverflow)
+    else {
+        return Err(SqlError::IntegerOverflow);
+    };
+    Ok(value)
+}
+
+pub(super) fn checked_integer_value(value: Option<i64>) -> Result<Value> {
+    match value {
+        Some(value) => Ok(Value::Integer(value)),
+        None => Err(SqlError::IntegerOverflow),
+    }
 }
 
 pub(super) fn eval_fast_gen_with_cancel(
@@ -647,10 +657,7 @@ pub(super) fn eval_fast_gen_with_cancel(
             left_idx,
             right_idx,
         } => match (&partial_row[*left_idx], &partial_row[*right_idx]) {
-            (Value::Integer(a), Value::Integer(b)) => a
-                .checked_add(*b)
-                .map(Value::Integer)
-                .ok_or(SqlError::IntegerOverflow),
+            (Value::Integer(a), Value::Integer(b)) => checked_integer_value(a.checked_add(*b)),
             _ => eval_expr(
                 expr,
                 &EvalCtx::new(col_map, partial_row).with_cancel(cancel),

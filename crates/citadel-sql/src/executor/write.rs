@@ -2721,46 +2721,28 @@ fn compiled_target_eval(
     };
     match target.fast_eval {
         FastEval::IntAdd(n) => match partial_row[target.schema_idx] {
-            Value::Integer(v) => v
-                .checked_add(n)
-                .map(Value::Integer)
-                .ok_or(SqlError::IntegerOverflow),
+            Value::Integer(v) => checked_integer_value(v.checked_add(n)),
             _ => generic(),
         },
         FastEval::IntSub(n) => match partial_row[target.schema_idx] {
-            Value::Integer(v) => v
-                .checked_sub(n)
-                .map(Value::Integer)
-                .ok_or(SqlError::IntegerOverflow),
+            Value::Integer(v) => checked_integer_value(v.checked_sub(n)),
             _ => generic(),
         },
         FastEval::IntMul(n) => match partial_row[target.schema_idx] {
-            Value::Integer(v) => v
-                .checked_mul(n)
-                .map(Value::Integer)
-                .ok_or(SqlError::IntegerOverflow),
+            Value::Integer(v) => checked_integer_value(v.checked_mul(n)),
             _ => generic(),
         },
         FastEval::IntSet(n) => Ok(Value::Integer(n)),
         FastEval::IntAddParam(p) => match (resolve_int_param(p), &partial_row[target.schema_idx]) {
-            (Some(n), Value::Integer(v)) => v
-                .checked_add(n)
-                .map(Value::Integer)
-                .ok_or(SqlError::IntegerOverflow),
+            (Some(n), Value::Integer(v)) => checked_integer_value(v.checked_add(n)),
             _ => generic(),
         },
         FastEval::IntSubParam(p) => match (resolve_int_param(p), &partial_row[target.schema_idx]) {
-            (Some(n), Value::Integer(v)) => v
-                .checked_sub(n)
-                .map(Value::Integer)
-                .ok_or(SqlError::IntegerOverflow),
+            (Some(n), Value::Integer(v)) => checked_integer_value(v.checked_sub(n)),
             _ => generic(),
         },
         FastEval::IntMulParam(p) => match (resolve_int_param(p), &partial_row[target.schema_idx]) {
-            (Some(n), Value::Integer(v)) => v
-                .checked_mul(n)
-                .map(Value::Integer)
-                .ok_or(SqlError::IntegerOverflow),
+            (Some(n), Value::Integer(v)) => checked_integer_value(v.checked_mul(n)),
             _ => generic(),
         },
         FastEval::IntSetParam(p) => match resolve_int_param(p) {
