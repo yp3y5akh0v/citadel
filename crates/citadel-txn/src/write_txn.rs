@@ -23,6 +23,7 @@ use crate::manager::TxnManager;
 use crate::merkle;
 use crate::overflow_io;
 use crate::owned_pages::OwnedPages;
+use crate::range_scan::{self, LeafLoader};
 use crate::read_txn::ScanCount;
 use crate::ReadBudget;
 
@@ -146,9 +147,19 @@ impl PageLoader for WritePages<'_> {
 // A read-only scan pins committed pages by Arc, while borrowing pages already
 // owned by this writer. One local map keeps cursor lookups independent of page
 // ownership and is dropped before the next mutation or savepoint operation.
+#[derive(Clone)]
 enum WriteScanPage<'a> {
     Borrowed(&'a Page),
     Shared(Arc<Page>),
+}
+
+impl AsRef<Page> for WriteScanPage<'_> {
+    fn as_ref(&self) -> &Page {
+        match self {
+            Self::Borrowed(page) => page,
+            Self::Shared(page) => page.as_ref(),
+        }
+    }
 }
 
 struct WriteScanPages<'a> {
@@ -161,10 +172,7 @@ struct WriteScanPages<'a> {
 
 impl PageMap for WriteScanPages<'_> {
     fn get_page(&self, id: &PageId) -> Option<&Page> {
-        self.loaded.get(id).map(|page| match page {
-            WriteScanPage::Borrowed(page) => *page,
-            WriteScanPage::Shared(page) => page.as_ref(),
-        })
+        self.loaded.get(id).map(AsRef::as_ref)
     }
 }
 
@@ -182,6 +190,18 @@ impl PageLoader for WriteScanPages<'_> {
             entry.insert(page);
         }
         Ok(())
+    }
+}
+
+impl<'a> LeafLoader for WriteScanPages<'a> {
+    type Leaf = WriteScanPage<'a>;
+
+    fn load_leaf(&mut self, id: PageId) -> Result<Self::Leaf> {
+        self.ensure_loaded(id)?;
+        let Some(page) = self.loaded.get(&id) else {
+            return Err(Error::PageOutOfBounds(id));
+        };
+        Ok(page.clone())
     }
 }
 
@@ -862,7 +882,7 @@ impl<'db> WriteTxn<'db> {
         table: &[u8],
         start_key: &[u8],
         prefix: Option<&[u8]>,
-        mut f: F,
+        f: F,
     ) -> Result<()>
     where
         F: FnMut(&[u8], &[u8]) -> Result<bool>,
@@ -880,42 +900,16 @@ impl<'db> WriteTxn<'db> {
             high_water_mark: self.old_slot.high_water_mark,
             snapshot_txn_id: self.old_slot.txn_id,
         };
-        let mut cursor = Cursor::seek_lazy(&mut view, root, start_key)?;
-        while let Some(cell) = cursor.current_ref_lazy(&mut view)? {
-            if let Some(t) = cancel.as_ref() {
-                t.check()?;
-            }
-            if prefix.is_some_and(|prefix| !cell.key.starts_with(prefix)) {
-                break;
-            }
-            count.rows += 1;
-            match cell.val_type {
-                ValueType::Tombstone => {}
-                ValueType::Inline => {
-                    if let Some(budget) = &budget {
-                        budget.try_charge(cell.value.len())?;
-                    }
-                    if !f(cell.key, cell.value)? {
-                        break;
-                    }
-                }
-                ValueType::Overflow => {
-                    let key = cell.key.to_vec();
-                    let oref = OverflowRef::from_bytes(cell.value);
-                    let materialized = overflow_io::read_chain_value_with_budget(
-                        &mut view,
-                        &oref,
-                        cancel.as_ref(),
-                        budget.as_ref(),
-                    )?;
-                    if !f(&key, &materialized)? {
-                        break;
-                    }
-                }
-            }
-            cursor.next_lazy(&mut view)?;
-        }
-        Ok(())
+        range_scan::scan_from::<true, _, _>(
+            &mut view,
+            root,
+            start_key,
+            prefix,
+            cancel.as_ref(),
+            budget.as_ref(),
+            &mut count.rows,
+            f,
+        )
     }
 
     /// Pull-based scan from `start_key`. Returns a lending iterator.

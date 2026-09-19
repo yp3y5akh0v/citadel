@@ -1,10 +1,9 @@
 //! Every scan shape must stop when the token is tripped.
 //!
-//! Five shapes do not share a loop: the lazy cursor scan, the leaf-at-a-time
-//! `_fast` scan indexed reads use, the pull-based iterator, the write-side scan
-//! behind UPDATE and DELETE, and the sharded scanner on worker threads. Cover
-//! only the obvious one and cancellation is dead on exactly the long queries it
-//! exists for, with every test still green.
+//! Range/prefix scans and their historical fast entry share a loop. Raw scans,
+//! pull-based iterators, mutating scans, and sharded scanners still have their
+//! own cancellation paths. Keep every public shape covered so one working
+//! entry point cannot hide another that runs through cancellation.
 
 use crate::manager::tests::create_test_manager;
 use crate::manager::TxnManager;
@@ -83,7 +82,7 @@ fn a_lazy_cursor_scan_stops() {
     assert!(seen < ROWS as usize, "the scan ran to completion anyway");
 }
 
-/// This duplicates the lazy loop independently, and is what indexed reads use.
+/// Indexed reads retain this entry point, with its per-leaf cancellation cadence.
 #[test]
 fn the_fast_scan_stops() {
     let mgr = seeded();
