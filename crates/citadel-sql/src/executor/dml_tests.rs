@@ -160,6 +160,45 @@ fn compile_generated_insert_template(generated: &str, values: &str) -> CompiledI
 }
 
 #[test]
+fn compiled_insert_context_proof_checks_unreferenced_legacy_virtual_expressions() {
+    for (generated, independent) in [
+        ("a * 2 + 1", true),
+        ("CURRENT_DATE", false),
+        ("COALESCE(a, CURRENT_DATE)", false),
+        ("DATE($1)", false),
+    ] {
+        let mut columns = integer_template_columns(&["id", "a", "g"]);
+        columns[2].nullable = true;
+        columns[2].generated_expr = Some(crate::parser::parse_sql_expr(generated).unwrap());
+        columns[2].generated_sql = Some(generated.into());
+        columns[2].generated_kind = Some(GeneratedKind::Virtual);
+        let mut schema = SchemaManager::empty();
+        schema.register(TableSchema::new(
+            "t".into(),
+            columns,
+            vec![0],
+            vec![],
+            vec![],
+            vec![],
+        ));
+        let Statement::Insert(stmt) =
+            crate::parser::parse_sql("INSERT INTO t(id,a) VALUES ($1,$2)").unwrap()
+        else {
+            panic!("expected INSERT statement");
+        };
+        let compiled = CompiledInsert::try_compile(&schema, &stmt).unwrap();
+        // These legacy virtuals are not needed by the current template, but
+        // their expressions must still participate in the context proof.
+        assert!(compiled.cached.as_ref().unwrap().is_trivial_fast);
+        assert_eq!(
+            compiled.can_skip_session_context(),
+            independent,
+            "{generated}"
+        );
+    }
+}
+
+#[test]
 fn trivial_generated_insert_templates_preserve_parameter_shapes() {
     for (generated, values) in [
         ("a + b", "$1, $2, $3"),

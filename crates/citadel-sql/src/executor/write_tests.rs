@@ -1388,7 +1388,7 @@ fn update_context_proof_checks_nested_and_hidden_expressions() {
         "JSONB_PATH_EXISTS(j, '$.a')",
     ] {
         let expr = crate::parser::parse_sql_expr(sql).unwrap();
-        assert!(update_expr_context_free(&expr), "{sql}");
+        assert!(expr_context_free(&expr), "{sql}");
     }
     for sql in [
         "CURRENT_DATE",
@@ -1407,7 +1407,7 @@ fn update_context_proof_checks_nested_and_hidden_expressions() {
         "(SELECT 1) COLLATE NOCASE",
     ] {
         let expr = crate::parser::parse_sql_expr(sql).unwrap();
-        assert!(!update_expr_context_free(&expr), "{sql}");
+        assert!(!expr_context_free(&expr), "{sql}");
     }
     let mut table = schema(
         "t",

@@ -2481,6 +2481,7 @@ struct InsertCache {
     row_fully_overwritten: bool,
     row_encoder: Option<crate::encoding::RowTemplate>,
     is_trivial_fast: bool,
+    session_context_free: bool,
     trivial_fast_program: Option<TrivialFastProgram>,
     needs_scoped_params: bool,
 }
@@ -4223,6 +4224,20 @@ impl CompiledInsert {
                 None
             };
             let is_trivial_fast = trivial_fast_program.is_some();
+            // A template alone does not prove its generic fallback independent
+            // of session context. Exclude schema side effects and conflict
+            // handling, and inspect even currently unreferenced expressions.
+            // Template eligibility already excludes defaults, checks, RETURNING,
+            // subqueries and INSERT triggers, and binds every input directly.
+            let session_context_free = is_trivial_fast
+                && stmt.on_conflict.is_none()
+                && ts.indices.is_empty()
+                && ts.foreign_keys.is_empty()
+                && schema.child_fks_for(&ts.name).is_empty()
+                && ts.columns.iter().all(|column| {
+                    column.default_expr.as_ref().is_none_or(expr_context_free)
+                        && column.generated_expr.as_ref().is_none_or(expr_context_free)
+                });
             let has_checks = ts.has_checks();
             let any_defaults = ts.columns.iter().any(|c| c.default_expr.is_some());
             let needs_scoped_params = bind_plan.is_none()
@@ -4256,6 +4271,7 @@ impl CompiledInsert {
                 row_fully_overwritten,
                 row_encoder,
                 is_trivial_fast,
+                session_context_free,
                 trivial_fast_program,
                 needs_scoped_params,
             })
@@ -4314,6 +4330,12 @@ impl CompiledPlan for CompiledInsert {
                 None => exec_insert_in_txn(outer, schema, ins, params),
             },
         }
+    }
+
+    fn can_skip_session_context(&self) -> bool {
+        self.cached
+            .as_ref()
+            .is_some_and(|cache| cache.session_context_free)
     }
 
     fn uses_scoped_params(&self) -> bool {
