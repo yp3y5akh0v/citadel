@@ -1,6 +1,8 @@
 use std::collections::VecDeque;
 use std::ops::Range;
 
+use rustc_hash::FxHashMap;
+
 use crate::error::{Result, SqlError};
 use crate::eval::{collation_of, eval_expr, operand_collation, ColumnMap, EvalCtx};
 use crate::parser::*;
@@ -13,6 +15,8 @@ thread_local! {
     static WINDOW_KEY_EVALUATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static WINDOW_PEER_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static WINDOW_AGGREGATE_STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static WINDOW_ORDER_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static WINDOW_ARGUMENT_EVALUATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[inline]
@@ -30,6 +34,28 @@ fn note_window_peer_comparison() {
 #[cfg(test)]
 fn take_window_key_evaluations() -> usize {
     WINDOW_KEY_EVALUATIONS.with(|count| count.replace(0))
+}
+
+#[inline]
+fn note_window_order_build() {
+    #[cfg(test)]
+    WINDOW_ORDER_BUILDS.with(|count| count.set(count.get() + 1));
+}
+
+#[inline]
+fn note_window_argument_evaluation() {
+    #[cfg(test)]
+    WINDOW_ARGUMENT_EVALUATIONS.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(test)]
+fn take_window_order_builds() -> usize {
+    WINDOW_ORDER_BUILDS.with(|count| count.replace(0))
+}
+
+#[cfg(test)]
+fn take_window_argument_evaluations() -> usize {
+    WINDOW_ARGUMENT_EVALUATIONS.with(|count| count.replace(0))
 }
 
 #[cfg(test)]
@@ -795,6 +821,198 @@ impl std::ops::IndexMut<usize> for WindowValues {
     }
 }
 
+#[derive(PartialEq, Eq, Hash)]
+struct WindowOrderKey {
+    column: usize,
+    descending: bool,
+    nulls_first: bool,
+    collation: Collation,
+}
+
+#[derive(PartialEq, Eq, Hash)]
+struct WindowOrderDescriptor {
+    partition_count: usize,
+    keys: Vec<WindowOrderKey>,
+}
+
+impl WindowOrderDescriptor {
+    fn resolve(spec: &WindowSpec, col_map: &ColumnMap) -> Option<Self> {
+        fn column_slot(expr: &Expr, col_map: &ColumnMap) -> Option<usize> {
+            match expr {
+                Expr::Column(name) => col_map.resolve(name).ok(),
+                Expr::Collate { expr, .. } => column_slot(expr, col_map),
+                _ => None,
+            }
+        }
+        let key = |expr: &Expr, descending, nulls_first| {
+            Some(WindowOrderKey {
+                column: column_slot(expr, col_map)?,
+                descending,
+                nulls_first,
+                collation: operand_collation(expr, col_map).unwrap_or_default(),
+            })
+        };
+        let keys = spec
+            .partition_by
+            .iter()
+            .map(|expr| key(expr, false, true))
+            .chain(spec.order_by.iter().map(|item| {
+                key(
+                    &item.expr,
+                    item.descending,
+                    item.nulls_first.unwrap_or(!item.descending),
+                )
+            }))
+            .collect::<Option<Vec<_>>>()?;
+        Some(Self {
+            partition_count: spec.partition_by.len(),
+            keys,
+        })
+    }
+}
+
+struct WindowOrder {
+    indices: Vec<usize>,
+    keys: WindowValues,
+    key_collations: Vec<Collation>,
+    partitions: Vec<(usize, usize)>,
+}
+
+impl WindowOrder {
+    fn build(
+        spec: &WindowSpec,
+        rows: &[Vec<Value>],
+        col_map: &ColumnMap,
+        cancel: Option<&citadel::CancelToken>,
+    ) -> Result<Self> {
+        note_window_order_build();
+        let mut sort_keys: Vec<OrderByItem> = spec
+            .partition_by
+            .iter()
+            .map(|expr| OrderByItem {
+                expr: expr.clone(),
+                output_name: None,
+                output_ordinal: None,
+                descending: false,
+                nulls_first: Some(true),
+            })
+            .collect();
+        sort_keys.extend(spec.order_by.clone());
+        let key_collations: Vec<Collation> = sort_keys
+            .iter()
+            .map(|key| operand_collation(&key.expr, col_map).unwrap_or_default())
+            .collect();
+        let n = rows.len();
+        let mut indices: Vec<usize> = (0..n).collect();
+        let mut keys = WindowValues::with_capacity(n, sort_keys.len())?;
+        if !sort_keys.is_empty() {
+            for (position, row) in rows.iter().enumerate() {
+                check_cancel_at(cancel, position)?;
+                note_window_key_evaluation();
+                keys.push_row(sort_keys.iter().map(|item| {
+                    eval_expr(&item.expr, &EvalCtx::new(col_map, row).with_cancel(cancel))
+                }))?;
+            }
+            sort_indices_by(&mut indices, cancel, |a, b| {
+                compare_sort_keys(&keys[a], &keys[b], &sort_keys, &key_collations)
+            })?;
+        }
+        let part_count = spec.partition_by.len();
+        let partition_collations = &key_collations[..part_count];
+        let mut partitions = Vec::new();
+        let mut part_start = 0;
+        for pos in 1..n {
+            check_cancel_at(cancel, pos)?;
+            let same = part_count == 0
+                || collated_keys_equal(
+                    &keys[indices[pos - 1]][..part_count],
+                    &keys[indices[pos]][..part_count],
+                    partition_collations,
+                );
+            if !same {
+                partitions.push((part_start, pos));
+                part_start = pos;
+            }
+        }
+        partitions.push((part_start, n));
+        Ok(Self {
+            indices,
+            keys,
+            key_collations,
+            partitions,
+        })
+    }
+}
+
+struct WindowOrderSlot {
+    last_use: usize,
+    order: Option<WindowOrder>,
+}
+
+/// Reuse only ordering expressions that read immutable input slots. Functions
+/// still run in their original order; unresolved or complex keys build alone.
+struct WindowOrders {
+    groups: Vec<usize>,
+    slots: Vec<WindowOrderSlot>,
+}
+
+impl WindowOrders {
+    fn new<'a>(
+        specs: impl Iterator<Item = &'a WindowSpec>,
+        col_map: &ColumnMap,
+        cancel: Option<&citadel::CancelToken>,
+    ) -> Result<Self> {
+        let mut shared = FxHashMap::default();
+        let mut groups = Vec::new();
+        let mut slots: Vec<WindowOrderSlot> = Vec::new();
+        for (index, spec) in specs.enumerate() {
+            check_cancel_at(cancel, index)?;
+            let group = match WindowOrderDescriptor::resolve(spec, col_map) {
+                Some(descriptor) => *shared.entry(descriptor).or_insert_with(|| {
+                    slots.push(WindowOrderSlot {
+                        last_use: index,
+                        order: None,
+                    });
+                    slots.len() - 1
+                }),
+                None => {
+                    slots.push(WindowOrderSlot {
+                        last_use: index,
+                        order: None,
+                    });
+                    slots.len() - 1
+                }
+            };
+            slots[group].last_use = index;
+            groups.push(group);
+        }
+        Ok(Self { groups, slots })
+    }
+
+    fn get_or_build(
+        &mut self,
+        index: usize,
+        spec: &WindowSpec,
+        rows: &[Vec<Value>],
+        col_map: &ColumnMap,
+        cancel: Option<&citadel::CancelToken>,
+    ) -> Result<&WindowOrder> {
+        check_cancel(cancel)?;
+        let slot = &mut self.slots[self.groups[index]];
+        if slot.order.is_none() {
+            slot.order = Some(WindowOrder::build(spec, rows, col_map, cancel)?);
+        }
+        Ok(slot.order.as_ref().unwrap())
+    }
+
+    fn release(&mut self, index: usize) {
+        let slot = &mut self.slots[self.groups[index]];
+        if slot.last_use == index {
+            slot.order = None;
+        }
+    }
+}
+
 pub(super) fn eval_window_select(
     mut rows: Vec<Vec<Value>>,
     ctx: super::SelectCtx<'_>,
@@ -879,71 +1097,32 @@ pub(super) fn eval_window_select(
         let mut per_row = WindowValues::with_capacity(rows.len(), args.len())?;
         for (row_idx, row) in rows.iter().enumerate() {
             check_cancel_at(cancel, row_idx)?;
-            per_row.push_row(
-                args.iter()
-                    .map(|a| eval_expr(a, &EvalCtx::new(&col_map, row).with_cancel(cancel))),
-            )?;
+            per_row.push_row(args.iter().map(|a| {
+                note_window_argument_evaluation();
+                eval_expr(a, &EvalCtx::new(&col_map, row).with_cancel(cancel))
+            }))?;
         }
         arg_values.push(per_row);
     }
 
     let n = rows.len();
     let mut row_results = WindowValues::nulls(n, num_win)?;
+    let mut orders = WindowOrders::new(
+        all_extracted.iter().map(|(_, _, _, spec)| spec),
+        &col_map,
+        cancel,
+    )?;
 
     for (win_idx, (_, fn_name, args, spec)) in all_extracted.iter().enumerate() {
         check_cancel_at(cancel, win_idx)?;
-        let mut sort_keys: Vec<OrderByItem> = Vec::new();
-        for pb in &spec.partition_by {
-            sort_keys.push(OrderByItem {
-                expr: pb.clone(),
-                output_name: None,
-                output_ordinal: None,
-                descending: false,
-                nulls_first: Some(true),
-            });
-        }
-        sort_keys.extend(spec.order_by.clone());
-        let key_collations: Vec<Collation> = sort_keys
-            .iter()
-            .map(|key| operand_collation(&key.expr, &col_map).unwrap_or_default())
-            .collect();
-
-        let mut indices: Vec<usize> = (0..n).collect();
-        let mut keys = WindowValues::with_capacity(n, sort_keys.len())?;
-        if !sort_keys.is_empty() {
-            for (position, row) in rows.iter().enumerate() {
-                check_cancel_at(cancel, position)?;
-                note_window_key_evaluation();
-                keys.push_row(sort_keys.iter().map(|o| {
-                    eval_expr(&o.expr, &EvalCtx::new(&col_map, row).with_cancel(cancel))
-                }))?;
-            }
-        }
-        if !sort_keys.is_empty() {
-            sort_indices_by(&mut indices, cancel, |a, b| {
-                compare_sort_keys(&keys[a], &keys[b], &sort_keys, &key_collations)
-            })?;
-        }
-
+        let WindowOrder {
+            indices,
+            keys,
+            key_collations,
+            partitions,
+        } = orders.get_or_build(win_idx, spec, &rows, &col_map, cancel)?;
         let part_count = spec.partition_by.len();
-        let partition_collations = &key_collations[..part_count];
         let order_collations = &key_collations[part_count..];
-        let mut partitions: Vec<(usize, usize)> = Vec::new();
-        let mut part_start = 0;
-        for pos in 1..n {
-            check_cancel_at(cancel, pos)?;
-            let same = part_count == 0
-                || collated_keys_equal(
-                    &keys[indices[pos - 1]][..part_count],
-                    &keys[indices[pos]][..part_count],
-                    partition_collations,
-                );
-            if !same {
-                partitions.push((part_start, pos));
-                part_start = pos;
-            }
-        }
-        partitions.push((part_start, n));
 
         let frame = &frames[win_idx];
         let upper_name = fn_name.to_ascii_uppercase();
@@ -955,7 +1134,7 @@ pub(super) fn eval_window_select(
             let uses_frame = uses_window_frame(&upper_name);
             let range_uses_peers = uses_frame && frame.uses_peers();
             let peer_bounds = if range_uses_peers {
-                peer_group_bounds(part_indices, &keys, part_count, order_collations, cancel)?
+                peer_group_bounds(part_indices, keys, part_count, order_collations, cancel)?
             } else {
                 Vec::new()
             };
@@ -1237,6 +1416,7 @@ pub(super) fn eval_window_select(
                 }
             }
         }
+        orders.release(win_idx);
     }
 
     let base_col_count = columns.len();
