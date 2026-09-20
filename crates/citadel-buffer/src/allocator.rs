@@ -4,81 +4,257 @@ use citadel_core::types::PageId;
 use citadel_core::{Error, Result};
 use std::sync::Arc;
 
+/// Immutable reclaimed-page batches with an independent allocation cursor.
+/// Cloning a cursor or appending a batch shares all untouched pages.
 #[derive(Clone, Default)]
-struct ReadyPages {
+pub struct ReadyPages {
     pages: Option<Arc<Vec<PageId>>>,
     remaining: usize,
-    /// The logical pool is `pages[..remaining]` followed by these zero IDs.
+    tail: Option<Arc<ReadyPages>>,
+    total_len: usize,
     trailing_zeros: usize,
+}
+
+impl Drop for ReadyPages {
+    fn drop(&mut self) {
+        // A long-lived loan can contain many small batches. Release unique
+        // tails iteratively rather than recursing once per batch.
+        while let Some(tail) = self.tail.take() {
+            match Arc::try_unwrap(tail) {
+                Ok(mut tail) => self.tail = tail.tail.take(),
+                Err(_) => break,
+            }
+        }
+    }
 }
 
 impl ReadyPages {
     fn shared(pages: Arc<Vec<PageId>>) -> Self {
-        if pages.is_empty() {
+        let len = pages.len();
+        if len == 0 {
             return Self::default();
         }
         Self {
-            remaining: pages.len(),
             pages: Some(pages),
+            remaining: len,
+            total_len: len,
+            tail: None,
             trailing_zeros: 0,
         }
     }
 
-    fn len(&self) -> usize {
-        self.remaining + self.trailing_zeros
+    /// Construct a batch whose first input page is allocated first.
+    pub fn from_pop_order(mut pages: Vec<PageId>) -> Self {
+        pages.reverse();
+        Self::shared(Arc::new(pages))
     }
 
-    fn pop(&mut self) -> Option<PageId> {
+    /// Number of unconsumed pages, including page zero.
+    pub fn len(&self) -> usize {
+        self.total_len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.total_len == 0
+    }
+
+    /// The next page that `pop` will return.
+    pub fn last(&self) -> Option<PageId> {
+        let mut current = self;
+        loop {
+            if current.trailing_zeros != 0 {
+                return Some(PageId(0));
+            }
+            if current.remaining != 0 {
+                return Some(current.pages.as_ref().unwrap()[current.remaining - 1]);
+            }
+            current = current.tail.as_deref()?;
+        }
+    }
+
+    fn normalize(&mut self) {
+        while self.remaining == 0 && self.trailing_zeros == 0 {
+            let Some(tail) = self.tail.take() else {
+                self.pages = None;
+                return;
+            };
+            *self = Arc::try_unwrap(tail).unwrap_or_else(|tail| (*tail).clone());
+        }
+    }
+
+    /// Consume the next page without copying the remaining batches.
+    pub fn pop(&mut self) -> Option<PageId> {
+        self.normalize();
         if self.trailing_zeros != 0 {
             self.trailing_zeros -= 1;
+            self.total_len -= 1;
             return Some(PageId(0));
         }
         self.remaining = self.remaining.checked_sub(1)?;
-        Some(self.pages.as_ref().unwrap()[self.remaining])
+        self.total_len -= 1;
+        let page = self.pages.as_ref().unwrap()[self.remaining];
+        self.normalize();
+        Some(page)
     }
 
     fn pop_nonzero(&mut self) -> Option<PageId> {
-        while self.remaining != 0 {
-            self.remaining -= 1;
-            let page = self.pages.as_ref().unwrap()[self.remaining];
-            if page.as_u32() != 0 {
-                return Some(page);
+        let mut zeros = 0;
+        let found = loop {
+            self.normalize();
+            zeros += self.trailing_zeros;
+            self.total_len -= self.trailing_zeros;
+            self.trailing_zeros = 0;
+            // Removing a zero-only prefix may reveal another batch.
+            self.normalize();
+            if self.trailing_zeros != 0 {
+                continue;
             }
-            self.trailing_zeros += 1;
-        }
-        None
+            match self.pop() {
+                Some(PageId(0)) => zeros += 1,
+                page => break page,
+            }
+        };
+        self.trailing_zeros += zeros;
+        self.total_len += zeros;
+        found
+    }
+
+    /// Put a page back at the front of this cursor.
+    pub fn push(&mut self, page: PageId) {
+        self.append(vec![page]);
+    }
+
+    /// Add pages before the current remainder, first input page first.
+    pub fn prepend_pop_order(&mut self, mut pages: Vec<PageId>) {
+        pages.reverse();
+        self.append(pages);
     }
 
     fn append(&mut self, pages: Vec<PageId>) {
         if pages.is_empty() {
             return;
         }
-        let combined = if self.len() == 0 {
-            pages
-        } else {
-            let mut combined = self.take();
-            combined.extend(pages);
-            combined
-        };
-        *self = Self::shared(Arc::new(combined));
+        self.normalize();
+        let previous = std::mem::take(self);
+        let len = pages.len();
+        self.total_len = previous.len() + len;
+        self.remaining = len;
+        self.pages = Some(Arc::new(pages));
+        if !previous.is_empty() {
+            self.tail = Some(Arc::new(previous));
+        }
     }
 
     fn take(&mut self) -> Vec<PageId> {
-        let previous = std::mem::take(self);
-        let mut pages = match previous.pages {
-            Some(pages) => match Arc::try_unwrap(pages) {
-                Ok(mut pages) => {
-                    pages.truncate(previous.remaining);
-                    pages
-                }
-                Err(pages) => pages[..previous.remaining].to_vec(),
-            },
-            None => Vec::new(),
-        };
-        pages.resize(pages.len() + previous.trailing_zeros, PageId(0));
+        let mut previous = std::mem::take(self);
+        previous.normalize();
+        if previous.tail.is_none() {
+            let mut pages = match previous.pages.take() {
+                Some(pages) => match Arc::try_unwrap(pages) {
+                    Ok(mut pages) => {
+                        pages.truncate(previous.remaining);
+                        pages
+                    }
+                    Err(pages) => pages[..previous.remaining].to_vec(),
+                },
+                None => Vec::new(),
+            };
+            pages.resize(pages.len() + previous.trailing_zeros, PageId(0));
+            return pages;
+        }
+
+        // The Vec adapter stores the oldest batch first, opposite to cursor
+        // traversal. Copy each whole slice into its final position; zero IDs
+        // already occupy the gaps between batches.
+        let mut pages = vec![PageId(0); previous.len()];
+        let mut end = pages.len();
+        let mut current = &previous;
+        loop {
+            end -= current.trailing_zeros;
+            let start = end - current.remaining;
+            if let Some(batch) = &current.pages {
+                pages[start..end].copy_from_slice(&batch[..current.remaining]);
+            }
+            end = start;
+            let Some(tail) = current.tail.as_deref() else {
+                break;
+            };
+            current = tail;
+        }
+        debug_assert_eq!(end, 0);
         pages
     }
 }
+
+impl std::fmt::Debug for ReadyPages {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
+impl PartialEq for ReadyPages {
+    fn eq(&self, other: &Self) -> bool {
+        self.len() == other.len() && self.iter().eq(other.iter())
+    }
+}
+
+impl Eq for ReadyPages {}
+
+impl ReadyPages {
+    /// Check whether an unconsumed loan contains this page.
+    pub fn contains(&self, page: &PageId) -> bool {
+        self.iter().any(|candidate| candidate == page)
+    }
+
+    /// Visit the remaining pages in allocation order without consuming them.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &PageId> {
+        ReadyPagesIter {
+            current: Some(self),
+            remaining: self.remaining,
+            zeros: self.trailing_zeros,
+            total: self.len(),
+        }
+    }
+}
+
+struct ReadyPagesIter<'a> {
+    current: Option<&'a ReadyPages>,
+    remaining: usize,
+    zeros: usize,
+    total: usize,
+}
+
+impl<'a> Iterator for ReadyPagesIter<'a> {
+    type Item = &'a PageId;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        const ZERO: PageId = PageId(0);
+        loop {
+            let current = self.current?;
+            if self.zeros != 0 {
+                self.zeros -= 1;
+                self.total -= 1;
+                return Some(&ZERO);
+            }
+            if self.remaining != 0 {
+                self.remaining -= 1;
+                self.total -= 1;
+                return Some(&current.pages.as_ref().unwrap()[self.remaining]);
+            }
+            self.current = current.tail.as_deref();
+            if let Some(tail) = self.current {
+                self.remaining = tail.remaining;
+                self.zeros = tail.trailing_zeros;
+            }
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.total, Some(self.total))
+    }
+}
+
+impl ExactSizeIterator for ReadyPagesIter<'_> {}
 
 #[derive(Clone)]
 pub struct PageAllocator {
@@ -105,8 +281,13 @@ impl PageAllocator {
 
     /// Use an immutable reclaimed batch without copying it into the allocator.
     pub fn with_ready_pages(high_water_mark: u32, pages: Arc<Vec<PageId>>) -> Self {
+        Self::with_ready(high_water_mark, ReadyPages::shared(pages))
+    }
+
+    /// Carry a segmented committed loan into a writer without flattening it.
+    pub fn with_ready(high_water_mark: u32, pages: ReadyPages) -> Self {
         Self {
-            ready_to_use: ReadyPages::shared(pages),
+            ready_to_use: pages,
             ..Self::new(high_water_mark)
         }
     }
@@ -130,6 +311,7 @@ impl PageAllocator {
     pub fn allocate_nonzero(&mut self) -> Result<PageId> {
         if self.next_page_id == 0 {
             self.ready_to_use.trailing_zeros += 1;
+            self.ready_to_use.total_len += 1;
             self.next_page_id = 1;
         }
 
@@ -177,6 +359,11 @@ impl PageAllocator {
     /// to the next transaction instead of leaking them.
     pub fn take_ready_to_use(&mut self) -> Vec<PageId> {
         self.ready_to_use.take()
+    }
+
+    /// Transfer the unconsumed loan cursor without copying its page IDs.
+    pub fn take_ready(&mut self) -> ReadyPages {
+        std::mem::take(&mut self.ready_to_use)
     }
 
     pub fn commit(&mut self) -> Vec<PageId> {
