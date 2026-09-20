@@ -13,15 +13,15 @@
     "samples_per_pass": 30,
     "warmup_seconds": 1,
     "measurement_target_seconds": 2,
-    "statistic": "Arithmetic mean of the two candidate per-run sample medians, in nanoseconds (also their median).",
-    "scope": "Per-row source snapshots: complete 129-ID coverage at 6b41d0c3, eight paired execution cases from ea8827d7, and three UPDATE pairs from 0f9362cf. This is not a full-suite run at the latest source.",
+    "statistic": "Arithmetic mean of all candidate per-run sample medians, in nanoseconds; two or four runs as specified by the cohort.",
+    "scope": "Top-level date and measurement settings are the September 13 historical defaults; per-cohort measurement fields override them for September 20 results. Rows use matched Citadel and SQLite runs from their declared source and cohort. This is not a full-suite run at the latest revision.",
     "comparison_order": [
       "reference",
       "candidate",
       "candidate",
       "reference"
     ],
-    "uncertainty": "Each run retains its own Criterion 95% median interval. No pooled confidence interval or aggregate speedup across rows is claimed; within-role drift is retained."
+    "uncertainty": "Each run retains its own Criterion 95% median interval. No pooled confidence interval or aggregate speedup across rows is claimed; within-role drift is retained, separately for each block in balanced cohorts."
   },
   "configuration": {
     "citadel": {
@@ -46,9 +46,13 @@
       "revision": "ea8827d7c64efe98985a13a40ef50ef60f205b38",
       "executable_sha256": "379cf5d4ad244f2d77c879af788199c7e7fdefbf969c372353b904dcc01e66f2"
     },
-    "selected_0f9362cf": {
-      "revision": "0f9362cf9f7defb652cb1ab4585d4964ec6189c5",
-      "executable_sha256": "e36019f81b60aeda9d8a6fe2a822e9c32b8787bedee3ec5fbfae06272e569429"
+    "selected_2bb8516f": {
+      "revision": "2bb8516f0ca36071e9c59c1e78ba045eea04e089",
+      "executable_sha256": "badeccb720ab4f889775d461a76ce72e38f25657f7320d489c8082a2bf30acda"
+    },
+    "selected_74aa7020": {
+      "revision": "74aa7020f13ea9a7b872ada784a2935066f50698",
+      "executable_sha256": "267107a7199d421e026cc76680e9c46eed69cd7896a5f81703f6fdbc78b353aa"
     }
   },
   "execution": [
@@ -327,91 +331,91 @@
     },
     {
       "name": "update_returning",
-      "source": "selected_0f9362cf",
+      "source": "selected_2bb8516f",
       "samples_ns": {
         "citadel": [
-          79458.85241301908,
-          77906.204004329
+          55410.04268086545,
+          58471.00610085304
         ],
         "sqlite": [
-          242725.92592592593,
-          244497.73148148146
+          206949.60843373492,
+          211484.22949002218
         ]
       },
       "provenance": {
-        "cohort": "c7r3-vs-c6-update-001",
+        "cohort": "sql-writes-20260920",
         "arms": {
           "citadel": {
             "criterion_id": "update_returning/citadel/",
             "runs": [
               {
-                "median_ns": 74025.14018288476,
+                "median_ns": 57491.483208149875,
                 "median_ci95_ns": [
-                  73171.07142857142,
-                  76504.57341269842
+                  57237.494553376906,
+                  58019.708994709
                 ]
               },
               {
-                "median_ns": 79458.85241301908,
+                "median_ns": 55410.04268086545,
                 "median_ci95_ns": [
-                  75839.91137566138,
-                  81642.0781893004
+                  55249.89106753813,
+                  55826.993464052284
                 ]
               },
               {
-                "median_ns": 77906.204004329,
+                "median_ns": 58471.00610085304,
                 "median_ci95_ns": [
-                  76104.8869047619,
-                  80848.60119047618
+                  58236.91002591513,
+                  58998.117656153365
                 ]
               },
               {
-                "median_ns": 75847.26631393298,
+                "median_ns": 59812.920415224915,
                 "median_ci95_ns": [
-                  73832.43827160494,
-                  78401.73686758653
+                  59435.427202555235,
+                  60011.30157040192
                 ]
               }
             ],
-            "reference_drift_percent": 2.4614963599481454,
-            "candidate_drift_percent": -1.9540282316431679,
-            "change_from_reference_percent": 4.999352513025435
+            "reference_drift_percent": 4.037880182478859,
+            "candidate_drift_percent": 5.524203324688326,
+            "change_from_reference_percent": -2.9183515161524065
           },
           "sqlite": {
             "criterion_id": "update_returning/sqlite/",
             "runs": [
               {
-                "median_ns": 243210.50925925927,
+                "median_ns": 207728.6746987952,
                 "median_ci95_ns": [
-                  238686.74603174604,
-                  250837.04693998813
+                  207147.38271266886,
+                  208575.9036144578
                 ]
               },
               {
-                "median_ns": 242725.92592592593,
+                "median_ns": 206949.60843373492,
                 "median_ci95_ns": [
-                  238468.11965811966,
-                  247693.3511314518
+                  206105.0441767068,
+                  207622.79888785913
                 ]
               },
               {
-                "median_ns": 244497.73148148146,
+                "median_ns": 211484.22949002218,
                 "median_ci95_ns": [
-                  238761.88271604938,
-                  249538.18181818182
+                  210282.7218098268,
+                  213302.9725609756
                 ]
               },
               {
-                "median_ns": 244349.358974359,
+                "median_ns": 208522.2891566265,
                 "median_ci95_ns": [
-                  240341.66666666666,
-                  252003.91452991453
+                  207539.2594186269,
+                  210558.37636259323
                 ]
               }
             ],
-            "reference_drift_percent": 0.4682567865049503,
-            "candidate_drift_percent": 0.7299613952636674,
-            "change_from_reference_percent": -0.06895785484332118
+            "reference_drift_percent": 0.38204376886439295,
+            "candidate_drift_percent": 2.1911716048205188,
+            "change_from_reference_percent": 0.5244129762768779
           }
         }
       }
@@ -964,273 +968,441 @@
     },
     {
       "name": "window_rank",
-      "source": "complete_6b41d0c3",
+      "source": "selected_74aa7020",
       "samples_ns": {
         "citadel": [
-          93457550.0,
-          93656900.0
+          60330950.0,
+          63162800.0,
+          65882612.5,
+          66327337.5
         ],
         "sqlite": [
-          194769600.0,
-          187905350.0
+          149621375.0,
+          159356750.0,
+          166593625.0,
+          166465800.0
         ]
       },
       "provenance": {
-        "cohort": "complete3-execution",
+        "cohort": "sql-window-20260920",
         "arms": {
           "citadel": {
             "criterion_id": "window_rank/citadel/",
             "runs": [
               {
-                "median_ns": 94115250.0,
+                "median_ns": 60080200.0,
                 "median_ci95_ns": [
-                  92324300.0,
-                  95849700.0
+                  59789720.0,
+                  60454360.0
                 ]
               },
               {
-                "median_ns": 93457550.0,
+                "median_ns": 60330950.0,
                 "median_ci95_ns": [
-                  91930000.0,
-                  95874050.0
+                  60113920.0,
+                  60482470.0
                 ]
               },
               {
-                "median_ns": 93656900.0,
+                "median_ns": 63162800.0,
                 "median_ci95_ns": [
-                  91855450.0,
-                  94735800.0
+                  62885250.0,
+                  64148220.0
                 ]
               },
               {
-                "median_ns": 92342800.0,
+                "median_ns": 65226087.5,
                 "median_ci95_ns": [
-                  91051250.0,
-                  94198600.0
+                  64936812.5,
+                  65852600.0
+                ]
+              },
+              {
+                "median_ns": 65882612.5,
+                "median_ci95_ns": [
+                  65485925.0,
+                  66645687.5
+                ]
+              },
+              {
+                "median_ns": 68596900.0,
+                "median_ci95_ns": [
+                  68099750.0,
+                  69343500.0
+                ]
+              },
+              {
+                "median_ns": 68235975.0,
+                "median_ci95_ns": [
+                  67762087.5,
+                  68709487.5
+                ]
+              },
+              {
+                "median_ns": 66327337.5,
+                "median_ci95_ns": [
+                  66083637.5,
+                  66708400.0
                 ]
               }
             ],
-            "reference_drift_percent": -1.883276089687913,
-            "candidate_drift_percent": 0.2133053990822642,
-            "change_from_reference_percent": 0.3520362891277662
+            "reference_drift_percent": 13.574813332845093,
+            "candidate_drift_percent": 9.939156436290153,
+            "change_from_reference_percent": -2.4549794233816535,
+            "blocks": {
+              "abba": {
+                "reference_drift_percent": 8.565030575797028,
+                "candidate_drift_percent": 4.693859453564042,
+                "change_from_reference_percent": -1.4464856761477352
+              },
+              "baab": {
+                "reference_drift_percent": -0.5261535142258578,
+                "candidate_drift_percent": 0.6750263584341054,
+                "change_from_reference_percent": -3.378519233773314
+              }
+            }
           },
           "sqlite": {
             "criterion_id": "window_rank/sqlite/",
             "runs": [
               {
-                "median_ns": 193290100.0,
+                "median_ns": 143909500.0,
                 "median_ci95_ns": [
-                  190350850.0,
-                  196927850.0
+                  142812175.0,
+                  144653250.0
                 ]
               },
               {
-                "median_ns": 194769600.0,
+                "median_ns": 149621375.0,
                 "median_ci95_ns": [
-                  191940650.0,
-                  198914650.0
+                  149180700.0,
+                  150470225.0
                 ]
               },
               {
-                "median_ns": 187905350.0,
+                "median_ns": 159356750.0,
                 "median_ci95_ns": [
-                  186711100.0,
-                  189440200.0
+                  158486350.0,
+                  160908075.0
                 ]
               },
               {
-                "median_ns": 188790750.0,
+                "median_ns": 160161650.0,
                 "median_ci95_ns": [
-                  187469500.0,
-                  189840050.0
+                  159759175.0,
+                  161249475.0
+                ]
+              },
+              {
+                "median_ns": 166593625.0,
+                "median_ci95_ns": [
+                  165326300.0,
+                  167538275.0
+                ]
+              },
+              {
+                "median_ns": 167243975.0,
+                "median_ci95_ns": [
+                  165827975.0,
+                  168956475.0
+                ]
+              },
+              {
+                "median_ns": 165592250.0,
+                "median_ci95_ns": [
+                  164482625.0,
+                  166912350.0
+                ]
+              },
+              {
+                "median_ns": 166465800.0,
+                "median_ci95_ns": [
+                  165629725.0,
+                  167186200.0
                 ]
               }
             ],
-            "reference_drift_percent": -2.3277705376529845,
-            "candidate_drift_percent": -3.5242922920209363,
-            "change_from_reference_percent": 0.15549065073530155
+            "reference_drift_percent": 15.066934427539525,
+            "candidate_drift_percent": 11.25803382036825,
+            "change_from_reference_percent": 0.8054821158257175,
+            "blocks": {
+              "abba": {
+                "reference_drift_percent": 11.29331281117647,
+                "candidate_drift_percent": 6.506673929443574,
+                "change_from_reference_percent": 1.6137588192763452
+              },
+              "baab": {
+                "reference_drift_percent": -0.9876140530623023,
+                "candidate_drift_percent": -0.07672862632048805,
+                "change_from_reference_percent": 0.06706000826683933
+              }
+            }
           }
         }
       }
     },
     {
       "name": "window_agg",
-      "source": "complete_6b41d0c3",
+      "source": "selected_74aa7020",
       "samples_ns": {
         "citadel": [
-          56732900.0,
-          57182250.0
+          27614251.81818182,
+          28947391.666666664,
+          29933614.102564104,
+          30597422.807017542
         ],
         "sqlite": [
-          113710050.0,
-          109327950.0
+          90995066.66666666,
+          97515833.33333333,
+          100716650.0,
+          100423383.33333334
         ]
       },
       "provenance": {
-        "cohort": "complete3-execution",
+        "cohort": "sql-window-20260920",
         "arms": {
           "citadel": {
             "criterion_id": "window_agg/citadel/",
             "runs": [
               {
-                "median_ns": 56652500.0,
+                "median_ns": 30998348.615384616,
                 "median_ci95_ns": [
-                  55920025.0,
-                  57513500.0
+                  30372093.38235294,
+                  31643094.444444444
                 ]
               },
               {
-                "median_ns": 56732900.0,
+                "median_ns": 27614251.81818182,
                 "median_ci95_ns": [
-                  55927250.0,
-                  57399675.0
+                  27434750.0,
+                  27782745.512820512
                 ]
               },
               {
-                "median_ns": 57182250.0,
+                "median_ns": 28947391.666666664,
                 "median_ci95_ns": [
-                  55458675.0,
-                  57906675.0
+                  28809983.94736842,
+                  29151223.569023572
                 ]
               },
               {
-                "median_ns": 55328825.0,
+                "median_ns": 32040959.615384616,
                 "median_ci95_ns": [
-                  54790675.0,
-                  57058475.0
+                  31877684.640522875,
+                  32360100.0
+                ]
+              },
+              {
+                "median_ns": 29933614.102564104,
+                "median_ci95_ns": [
+                  29736169.242424242,
+                  30086702.272727273
+                ]
+              },
+              {
+                "median_ns": 33283895.748987854,
+                "median_ci95_ns": [
+                  32988010.714285716,
+                  33694557.57575758
+                ]
+              },
+              {
+                "median_ns": 33630012.14285714,
+                "median_ci95_ns": [
+                  33368480.92105263,
+                  34371922.08333333
+                ]
+              },
+              {
+                "median_ns": 30597422.807017542,
+                "median_ci95_ns": [
+                  30478151.363636363,
+                  30924536.296296295
                 ]
               }
             ],
-            "reference_drift_percent": -2.3364811791183104,
-            "candidate_drift_percent": 0.7920448276044434,
-            "change_from_reference_percent": 1.726917412345319
+            "reference_drift_percent": 8.489689435154046,
+            "candidate_drift_percent": 10.803012185438021,
+            "change_from_reference_percent": -9.896281224813897,
+            "blocks": {
+              "abba": {
+                "reference_drift_percent": 3.3634404623817504,
+                "candidate_drift_percent": 4.827723949439311,
+                "change_from_reference_percent": -10.27559617597299
+              },
+              "baab": {
+                "reference_drift_percent": 1.0398914732804743,
+                "candidate_drift_percent": 2.2176029335414515,
+                "change_from_reference_percent": -9.538930221472308
+              }
+            }
           },
           "sqlite": {
             "criterion_id": "window_agg/sqlite/",
             "runs": [
               {
-                "median_ns": 115627000.0,
+                "median_ns": 87240075.0,
                 "median_ci95_ns": [
-                  113152400.0,
-                  116587350.0
+                  86936800.0,
+                  87607350.0
                 ]
               },
               {
-                "median_ns": 113710050.0,
+                "median_ns": 90995066.66666666,
                 "median_ci95_ns": [
-                  112427050.0,
-                  116855150.0
+                  90539416.66666666,
+                  91715400.0
                 ]
               },
               {
-                "median_ns": 109327950.0,
+                "median_ns": 97515833.33333333,
                 "median_ci95_ns": [
-                  107597850.0,
-                  112164950.0
+                  96779466.66666667,
+                  98046383.33333333
                 ]
               },
               {
-                "median_ns": 113883050.0,
+                "median_ns": 96509933.33333333,
                 "median_ci95_ns": [
-                  112001350.0,
-                  115424600.0
+                  96373183.33333334,
+                  97160100.0
+                ]
+              },
+              {
+                "median_ns": 100716650.0,
+                "median_ci95_ns": [
+                  100182966.66666666,
+                  101100750.0
+                ]
+              },
+              {
+                "median_ns": 99977366.66666666,
+                "median_ci95_ns": [
+                  99510066.66666666,
+                  101219350.0
+                ]
+              },
+              {
+                "median_ns": 97207516.66666667,
+                "median_ci95_ns": [
+                  96660683.33333333,
+                  97824083.33333334
+                ]
+              },
+              {
+                "median_ns": 100423383.33333334,
+                "median_ci95_ns": [
+                  100049916.66666667,
+                  100744150.0
                 ]
               }
             ],
-            "reference_drift_percent": -1.5082549923460808,
-            "candidate_drift_percent": -3.8537490749498415,
-            "change_from_reference_percent": -2.8199418718265257
+            "reference_drift_percent": 11.425301579195878,
+            "candidate_drift_percent": 10.361349259959907,
+            "change_from_reference_percent": 2.288065981179166,
+            "blocks": {
+              "abba": {
+                "reference_drift_percent": 10.625688175226045,
+                "candidate_drift_percent": 7.16606614571047,
+                "change_from_reference_percent": 2.590961333743258
+              },
+              "baab": {
+                "reference_drift_percent": -2.7704770513059307,
+                "candidate_drift_percent": -0.2911799257289238,
+                "change_from_reference_percent": 2.0058079164790854
+              }
+            }
           }
         }
       }
     },
     {
       "name": "scan",
-      "source": "selected_ea8827d7",
+      "source": "selected_2bb8516f",
       "samples_ns": {
         "citadel": [
-          8005419.285714285,
-          7943743.452380952
+          6390817.948717948,
+          6231087.051282052
         ],
         "sqlite": [
-          15466280.0,
-          14963840.0
+          12536363.157894738,
+          13892745.5
         ]
       },
       "provenance": {
-        "cohort": "c6r3-vs-c5-controls-001",
+        "cohort": "sql-writes-20260920",
         "arms": {
           "citadel": {
             "criterion_id": "scan/citadel/",
             "runs": [
               {
-                "median_ns": 8075778.663003663,
+                "median_ns": 6307805.213464696,
                 "median_ci95_ns": [
-                  7801632.291666666,
-                  8204050.0
+                  6236770.104895105,
+                  6391544.584286803
                 ]
               },
               {
-                "median_ns": 8005419.285714285,
+                "median_ns": 6390817.948717948,
                 "median_ci95_ns": [
-                  7850952.0,
-                  8207844.417077176
+                  6336032.75862069,
+                  6446456.209150327
                 ]
               },
               {
-                "median_ns": 7943743.452380952,
+                "median_ns": 6231087.051282052,
                 "median_ci95_ns": [
-                  7749888.0,
-                  8034370.289855072
+                  6193409.126984127,
+                  6299103.21969697
                 ]
               },
               {
-                "median_ns": 7813113.333333334,
+                "median_ns": 6351519.4771241825,
                 "median_ci95_ns": [
-                  7686032.456140351,
-                  7893038.888888889
+                  6330920.238095239,
+                  6405325.757575758
                 ]
               }
             ],
-            "reference_drift_percent": -3.252507784464642,
-            "candidate_drift_percent": -0.7704260218249104,
-            "change_from_reference_percent": 0.3793262725439783
+            "reference_drift_percent": 0.6930186044136866,
+            "candidate_drift_percent": -2.499381123318334,
+            "change_from_reference_percent": -0.2955899426191122
           },
           "sqlite": {
             "criterion_id": "scan/sqlite/",
             "runs": [
               {
-                "median_ns": 16181580.0,
+                "median_ns": 12886745.5,
                 "median_ci95_ns": [
-                  15673200.0,
-                  16693750.0
+                  12816379.166666668,
+                  13153153.393665157
                 ]
               },
               {
-                "median_ns": 15466280.0,
+                "median_ns": 12536363.157894738,
                 "median_ci95_ns": [
-                  14967650.0,
-                  15786510.0
+                  12496930.944055945,
+                  12569360.714285715
                 ]
               },
               {
-                "median_ns": 14963840.0,
+                "median_ns": 13892745.5,
                 "median_ci95_ns": [
-                  14472180.0,
-                  15131530.0
+                  13790423.484848484,
+                  13960514.285714285
                 ]
               },
               {
-                "median_ns": 15587130.0,
+                "median_ns": 13175424.725274727,
                 "median_ci95_ns": [
-                  15324590.0,
-                  15884030.0
+                  13085361.666666668,
+                  13241761.174242424
                 ]
               }
             ],
-            "reference_drift_percent": -3.6736214881365137,
-            "candidate_drift_percent": -3.2486156981510694,
-            "change_from_reference_percent": -4.213548488434061
+            "reference_drift_percent": 2.2401251369069675,
+            "candidate_drift_percent": 10.81958399754146,
+            "change_from_reference_percent": 1.4079350623846354
           }
         }
       }
@@ -1783,91 +1955,91 @@
     },
     {
       "name": "insert",
-      "source": "selected_ea8827d7",
+      "source": "selected_2bb8516f",
       "samples_ns": {
         "citadel": [
-          36461.79617117117,
-          36657.707355242565
+          25771.446251768033,
+          25242.56343903621
         ],
         "sqlite": [
-          62452.984817115255,
-          62933.002645502645
+          51782.27146814404,
+          51854.150250926315
         ]
       },
       "provenance": {
-        "cohort": "c6r3-vs-c5-main-001",
+        "cohort": "sql-writes-20260920",
         "arms": {
           "citadel": {
             "criterion_id": "insert/citadel/",
             "runs": [
               {
-                "median_ns": 35209.8275058275,
+                "median_ns": 26084.119985758367,
                 "median_ci95_ns": [
-                  34399.0,
-                  36014.468253968254
+                  26007.267188859878,
+                  26151.301007086906
                 ]
               },
               {
-                "median_ns": 36461.79617117117,
+                "median_ns": 25771.446251768033,
                 "median_ci95_ns": [
-                  35437.144287144285,
-                  37632.3359073359
+                  25677.567185289958,
+                  25931.239686468645
                 ]
               },
               {
-                "median_ns": 36657.707355242565,
+                "median_ns": 25242.56343903621,
                 "median_ci95_ns": [
-                  35508.802816901414,
-                  37519.92370892019
+                  25198.14710042433,
+                  25323.978076379066
                 ]
               },
               {
-                "median_ns": 36454.87891737892,
+                "median_ns": 27650.924796747968,
                 "median_ci95_ns": [
-                  35880.36265432098,
-                  37878.584656084655
+                  27528.316556975093,
+                  27858.51154707199
                 ]
               }
             ],
-            "reference_drift_percent": 3.5360906307914997,
-            "candidate_drift_percent": 0.5373053569596165,
-            "change_from_reference_percent": 2.0300049715074264
+            "reference_drift_percent": 6.006738244744536,
+            "candidate_drift_percent": -2.052204628195975,
+            "change_from_reference_percent": -5.0637998027461055
           },
           "sqlite": {
             "criterion_id": "insert/sqlite/",
             "runs": [
               {
-                "median_ns": 62582.19822812846,
+                "median_ns": 50377.802355560765,
                 "median_ci95_ns": [
-                  60602.46652572234,
-                  64416.529671210905
+                  50216.02156334232,
+                  50668.6382524708
                 ]
               },
               {
-                "median_ns": 62452.984817115255,
+                "median_ns": 51782.27146814404,
                 "median_ci95_ns": [
-                  61870.56277056277,
-                  64306.66463166463
+                  51623.05123604466,
+                  52079.828548644335
                 ]
               },
               {
-                "median_ns": 62933.002645502645,
+                "median_ns": 51854.150250926315,
                 "median_ci95_ns": [
-                  61844.9074074074,
-                  64749.507389162565
+                  51723.40210355987,
+                  52125.76647930506
                 ]
               },
               {
-                "median_ns": 63179.79714912281,
+                "median_ns": 54499.609097370296,
                 "median_ci95_ns": [
-                  62457.48299319728,
-                  65844.24603174604
+                  53941.04690224094,
+                  54995.06633499171
                 ]
               }
             ],
-            "reference_drift_percent": 0.9549024130087957,
-            "candidate_drift_percent": 0.7686067043761957,
-            "change_from_reference_percent": -0.29898373789748467
+            "reference_drift_percent": 8.181791481728972,
+            "candidate_drift_percent": 0.13880963647276978,
+            "change_from_reference_percent": -1.1832764717097044
           }
         }
       }
@@ -2693,91 +2865,91 @@
     },
     {
       "name": "insert_select",
-      "source": "selected_ea8827d7",
+      "source": "selected_2bb8516f",
       "samples_ns": {
         "citadel": [
-          223875.28594771243,
-          233215.18207282913
+          170187.33579638752,
+          171542.68235071807
         ],
         "sqlite": [
-          265000.1552795031,
-          278401.4285714286
+          210290.11672407197,
+          217676.64220647773
         ]
       },
       "provenance": {
-        "cohort": "c6r3-vs-c5-main-001",
+        "cohort": "sql-writes-20260920",
         "arms": {
           "citadel": {
             "criterion_id": "insert_select/citadel/",
             "runs": [
               {
-                "median_ns": 219074.8559837728,
+                "median_ns": 169890.49719326384,
                 "median_ci95_ns": [
-                  214187.0232708468,
-                  226108.5294117647
+                  169434.75636766333,
+                  170618.50775193798
                 ]
               },
               {
-                "median_ns": 223875.28594771243,
+                "median_ns": 170187.33579638752,
                 "median_ci95_ns": [
-                  214868.10550130985,
-                  227688.63636363635
+                  169623.31215970963,
+                  170874.82533243182
                 ]
               },
               {
-                "median_ns": 233215.18207282913,
+                "median_ns": 171542.68235071807,
                 "median_ci95_ns": [
-                  224989.4712585889,
-                  243266.83298319328
+                  171134.74571846283,
+                  171879.71638655462
                 ]
               },
               {
-                "median_ns": 223579.185520362,
+                "median_ns": 186270.6119791667,
                 "median_ci95_ns": [
-                  218178.67647058825,
-                  227535.32126696833
+                  185466.9760338346,
+                  187891.3802083333
                 ]
               }
             ],
-            "reference_drift_percent": 2.0560686968671638,
-            "candidate_drift_percent": 4.171919238686361,
-            "change_from_reference_percent": 3.261333945433309
+            "reference_drift_percent": 9.641572104688812,
+            "candidate_drift_percent": 0.7963850823495378,
+            "change_from_reference_percent": -4.051843576873615
           },
           "sqlite": {
             "criterion_id": "insert_select/sqlite/",
             "runs": [
               {
-                "median_ns": 251290.29761904763,
+                "median_ns": 210733.37121212122,
                 "median_ci95_ns": [
-                  247583.0807453416,
-                  257582.5206043956
+                  209833.12709673872,
+                  212018.42320261436
                 ]
               },
               {
-                "median_ns": 265000.1552795031,
+                "median_ns": 210290.11672407197,
                 "median_ci95_ns": [
-                  255876.92743764172,
-                  271913.47117794486
+                  209053.63805970148,
+                  211440.26119402985
                 ]
               },
               {
-                "median_ns": 278401.4285714286,
+                "median_ns": 217676.64220647773,
                 "median_ci95_ns": [
-                  260592.50469924812,
-                  285005.47218887554
+                  215940.35294117645,
+                  219965.02197802198
                 ]
               },
               {
-                "median_ns": 256336.0119047619,
+                "median_ns": 229378.47148736037,
                 "median_ci95_ns": [
-                  254265.68783068782,
-                  258198.3134920635
+                  225414.38084812468,
+                  233319.2328042328
                 ]
               }
             ],
-            "reference_drift_percent": 2.0079224440903376,
-            "candidate_drift_percent": 5.0570812978546265,
-            "change_from_reference_percent": 7.047561100740007
+            "reference_drift_percent": 8.847720780052093,
+            "candidate_drift_percent": 3.5125404833446616,
+            "change_from_reference_percent": -2.7595448680586387
           }
         }
       }
@@ -3057,364 +3229,532 @@
     },
     {
       "name": "update",
-      "source": "selected_0f9362cf",
+      "source": "selected_2bb8516f",
       "samples_ns": {
         "citadel": [
-          45414.24684994273,
-          44627.63784461153
+          33261.51605675877,
+          32816.55950095969,
+          34148.19985495234,
+          33552.73944805194
         ],
         "sqlite": [
-          49039.77272727272,
-          49526.53308416389
+          41388.86598683735,
+          41845.067905035576,
+          43186.19795525263,
+          43592.59588268471
         ]
       },
       "provenance": {
-        "cohort": "c7r3-vs-c6-update-001",
+        "cohort": "sql-update-20260920",
         "arms": {
           "citadel": {
             "criterion_id": "update/citadel/",
             "runs": [
               {
-                "median_ns": 64407.083174178755,
+                "median_ns": 32615.659224594587,
                 "median_ci95_ns": [
-                  54484.887941919194,
-                  69640.5303030303
+                  32493.98605830165,
+                  32853.14566891395
                 ]
               },
               {
-                "median_ns": 45414.24684994273,
+                "median_ns": 33261.51605675877,
                 "median_ci95_ns": [
-                  44244.93259318001,
-                  46558.3676975945
+                  33175.54247572816,
+                  33446.35999383572
                 ]
               },
               {
-                "median_ns": 44627.63784461153,
+                "median_ns": 32816.55950095969,
                 "median_ci95_ns": [
-                  44100.47619047619,
-                  46049.39969286612
+                  32511.834695656013,
+                  32983.15807513024
                 ]
               },
               {
-                "median_ns": 43307.300950683304,
+                "median_ns": 33809.00066800267,
                 "median_ci95_ns": [
-                  42638.72053872054,
-                  43643.77104377104
+                  33724.497033282256,
+                  33869.305807381956
+                ]
+              },
+              {
+                "median_ns": 34148.19985495234,
+                "median_ci95_ns": [
+                  33492.32507158196,
+                  34437.819881889765
+                ]
+              },
+              {
+                "median_ns": 34650.30240549828,
+                "median_ci95_ns": [
+                  34536.96735395189,
+                  34958.46649484536
+                ]
+              },
+              {
+                "median_ns": 36476.67258207631,
+                "median_ci95_ns": [
+                  35731.139365197334,
+                  36953.87551759834
+                ]
+              },
+              {
+                "median_ns": 33552.73944805194,
+                "median_ci95_ns": [
+                  33326.98696145124,
+                  34033.44486345263
                 ]
               }
             ],
-            "reference_drift_percent": -32.76003380937844,
-            "candidate_drift_percent": -1.7320754166204821,
-            "change_from_reference_percent": -16.40681472014166
+            "reference_drift_percent": 11.837912981903598,
+            "candidate_drift_percent": 0.8755565765439455,
+            "change_from_reference_percent": -2.7426936966148174,
+            "blocks": {
+              "abba": {
+                "reference_drift_percent": 3.6587990915364355,
+                "candidate_drift_percent": -1.3377518782962117,
+                "change_from_reference_percent": -0.5217705825505181
+              },
+              "baab": {
+                "reference_drift_percent": 5.270863599413267,
+                "candidate_drift_percent": -1.7437534318929582,
+                "change_from_reference_percent": -4.816788124574134
+              }
+            }
           },
           "sqlite": {
             "criterion_id": "update/sqlite/",
             "runs": [
               {
-                "median_ns": 68990.05281690141,
+                "median_ns": 40093.25485359115,
                 "median_ci95_ns": [
-                  63401.40845070423,
-                  73881.25997363491
+                  39953.79126171088,
+                  40176.438573247084
                 ]
               },
               {
-                "median_ns": 49039.77272727272,
+                "median_ns": 41388.86598683735,
                 "median_ci95_ns": [
-                  47540.83806818182,
-                  50442.32585596222
+                  41177.06233978609,
+                  41609.223438400135
                 ]
               },
               {
-                "median_ns": 49526.53308416389,
+                "median_ns": 41845.067905035576,
                 "median_ci95_ns": [
-                  48718.992248062015,
-                  50667.00446396429
+                  41691.748768472906,
+                  42099.24297305129
                 ]
               },
               {
-                "median_ns": 51190.12254901961,
+                "median_ns": 42558.87778474628,
                 "median_ci95_ns": [
-                  50188.01994301994,
-                  52677.212566844915
+                  42397.10286883461,
+                  42698.68505150764
+                ]
+              },
+              {
+                "median_ns": 43186.19795525263,
+                "median_ci95_ns": [
+                  42999.21781784436,
+                  43576.135300467795
+                ]
+              },
+              {
+                "median_ns": 42612.03818369453,
+                "median_ci95_ns": [
+                  42414.660059239,
+                  42841.13408521304
+                ]
+              },
+              {
+                "median_ns": 46746.476145962006,
+                "median_ci95_ns": [
+                  46284.90145672665,
+                  47091.37663964142
+                ]
+              },
+              {
+                "median_ns": 43592.59588268471,
+                "median_ci95_ns": [
+                  43349.244096226,
+                  43785.60252445689
                 ]
               }
             ],
-            "reference_drift_percent": -25.800719873519384,
-            "candidate_drift_percent": 0.9925828155815886,
-            "change_from_reference_percent": -17.984554847482237
+            "reference_drift_percent": 16.594365602559535,
+            "candidate_drift_percent": 5.3244510167256065,
+            "change_from_reference_percent": -1.1615090538874773,
+            "blocks": {
+              "abba": {
+                "reference_drift_percent": 6.149720046822993,
+                "candidate_drift_percent": 1.1022334324001681,
+                "change_from_reference_percent": 0.703915597775695
+              },
+              "baab": {
+                "reference_drift_percent": 9.702511634023448,
+                "candidate_drift_percent": 0.9410365965838663,
+                "change_from_reference_percent": -2.886933059565222
+              }
+            }
           }
         }
       }
     },
     {
       "name": "upsert_mixed",
-      "source": "complete_6b41d0c3",
+      "source": "selected_2bb8516f",
       "samples_ns": {
         "citadel": [
-          62545.16746411483,
-          62024.62203736714
+          47125.052374301675,
+          50152.00408997956
         ],
         "sqlite": [
-          65670.04048582996,
-          66403.1981981982
+          56265.98981129368,
+          59094.64508376975
         ]
       },
       "provenance": {
-        "cohort": "complete3-main",
+        "cohort": "sql-writes-20260920",
         "arms": {
           "citadel": {
             "criterion_id": "upsert_mixed/citadel/",
             "runs": [
               {
-                "median_ns": 66628.34201388889,
+                "median_ns": 49121.58263305322,
                 "median_ci95_ns": [
-                  65990.92261904762,
-                  68158.83059954751
+                  48913.71250209486,
+                  49827.389173060525
                 ]
               },
               {
-                "median_ns": 62545.16746411483,
+                "median_ns": 47125.052374301675,
                 "median_ci95_ns": [
-                  61608.792470156106,
-                  65157.32323232324
+                  46707.304469273746,
+                  47313.109446419505
                 ]
               },
               {
-                "median_ns": 62024.62203736714,
+                "median_ns": 50152.00408997956,
                 "median_ci95_ns": [
-                  60855.21929824562,
-                  64674.2378328742
+                  49991.41104294478,
+                  50406.53118609407
                 ]
               },
               {
-                "median_ns": 65746.70758928571,
+                "median_ns": 52075.183722360714,
                 "median_ci95_ns": [
-                  64903.29861111111,
-                  66508.34635416666
+                  51890.52441229657,
+                  52312.35615650173
                 ]
               }
             ],
-            "reference_drift_percent": -1.3232123116907246,
-            "candidate_drift_percent": -0.8322712175106939,
-            "change_from_reference_percent": -5.896322702118528
+            "reference_drift_percent": 6.012837801606286,
+            "candidate_drift_percent": 6.423232576243332,
+            "change_from_reference_percent": -3.8733548830663933
           },
           "sqlite": {
             "criterion_id": "upsert_mixed/sqlite/",
             "runs": [
               {
-                "median_ns": 66218.77413127414,
+                "median_ns": 57242.59746954602,
                 "median_ci95_ns": [
-                  64924.014014014014,
-                  70264.26313870092
+                  56669.22651933702,
+                  57623.81675874769
                 ]
               },
               {
-                "median_ns": 65670.04048582996,
+                "median_ns": 56265.98981129368,
                 "median_ci95_ns": [
-                  64625.52973342447,
-                  67150.65789473684
+                  56030.215299990305,
+                  56919.626414101556
                 ]
               },
               {
-                "median_ns": 66403.1981981982,
+                "median_ns": 59094.64508376975,
                 "median_ci95_ns": [
-                  64963.18211068211,
-                  70027.92792792793
+                  58840.61143984221,
+                  59223.05416477014
                 ]
               },
               {
-                "median_ns": 68533.40104810693,
+                "median_ns": 59756.65444893832,
                 "median_ci95_ns": [
-                  66346.19932432432,
-                  69863.58776358777
+                  59352.61627906977,
+                  60364.28779069767
                 ]
               }
             ],
-            "reference_drift_percent": 3.4954239899461115,
-            "candidate_drift_percent": 1.1164264662307133,
-            "change_from_reference_percent": -1.9880469400859302
+            "reference_drift_percent": 4.3919337879973375,
+            "candidate_drift_percent": 5.0272914098959065,
+            "change_from_reference_percent": -1.4005363252771685
           }
         }
       }
     },
     {
       "name": "upsert_counter",
-      "source": "complete_6b41d0c3",
+      "source": "selected_2bb8516f",
       "samples_ns": {
         "citadel": [
-          82771.1,
-          80424.48717948719
+          63416.15911661867,
+          63901.11111111111
         ],
         "sqlite": [
-          87348.8170289855,
-          84514.06666666668
+          73181.55601659752,
+          75830.73750606502
         ]
       },
       "provenance": {
-        "cohort": "complete3-main",
+        "cohort": "sql-writes-20260920",
         "arms": {
           "citadel": {
             "criterion_id": "upsert_counter/citadel/",
             "runs": [
               {
-                "median_ns": 80833.3920940171,
+                "median_ns": 63456.03543647364,
                 "median_ci95_ns": [
-                  78585.9706959707,
-                  84702.72727272726
+                  63335.37814573888,
+                  63713.907095297545
                 ]
               },
               {
-                "median_ns": 82771.1,
+                "median_ns": 63416.15911661867,
                 "median_ci95_ns": [
-                  81995.75,
-                  85097.81320450886
+                  63236.69117647059,
+                  63779.10774886877
                 ]
               },
               {
-                "median_ns": 80424.48717948719,
+                "median_ns": 63901.11111111111,
                 "median_ci95_ns": [
-                  79366.9413919414,
-                  83551.6013986014
+                  63797.85806544202,
+                  64060.347814498935
                 ]
               },
               {
-                "median_ns": 79698.71794871795,
+                "median_ns": 67040.1607854297,
                 "median_ci95_ns": [
-                  77837.74725274724,
-                  83026.82186234818
+                  66877.09163346613,
+                  67329.8406374502
                 ]
               }
             ],
-            "reference_drift_percent": -1.403719571707951,
-            "candidate_drift_percent": -2.8350629875799838,
-            "change_from_reference_percent": 1.6591553777266732
+            "reference_drift_percent": 5.6482024511981255,
+            "candidate_drift_percent": 0.7647136017818967,
+            "change_from_reference_percent": -2.436029620946145
           },
           "sqlite": {
             "criterion_id": "upsert_counter/sqlite/",
             "runs": [
               {
-                "median_ns": 83735.23999999999,
+                "median_ns": 74181.1757852077,
                 "median_ci95_ns": [
-                  82974.33333333334,
-                  85451.09090909091
+                  73481.94958371879,
+                  74458.48789435069
                 ]
               },
               {
-                "median_ns": 87348.8170289855,
+                "median_ns": 73181.55601659752,
                 "median_ci95_ns": [
-                  85278.36666666667,
-                  89654.53333333333
+                  72794.73462222425,
+                  73837.32365145229
                 ]
               },
               {
-                "median_ns": 84514.06666666668,
+                "median_ns": 75830.73750606502,
                 "median_ci95_ns": [
-                  83361.34615384616,
-                  87023.88222222222
+                  75490.25536358458,
+                  76248.84539405281
                 ]
               },
               {
-                "median_ns": 85994.25770308124,
+                "median_ns": 75904.60264075734,
                 "median_ci95_ns": [
-                  83067.13705684294,
-                  87229.06862745098
+                  75737.30677921392,
+                  76194.3759342302
                 ]
               }
             ],
-            "reference_drift_percent": 2.6978100296616514,
-            "candidate_drift_percent": -3.245321984587557,
-            "change_from_reference_percent": 1.2569329559338094
+            "reference_drift_percent": 2.323267105579241,
+            "candidate_drift_percent": 3.620012519092475,
+            "change_from_reference_percent": -0.7152475834557803
           }
         }
       }
     },
     {
       "name": "update_gen_propagate",
-      "source": "selected_0f9362cf",
+      "source": "selected_2bb8516f",
       "samples_ns": {
         "citadel": [
-          75877.32142857142,
-          78476.72955974843
+          58814.707167832166,
+          58905.78389830509,
+          60280.16333548249,
+          59690.67071577848
         ],
         "sqlite": [
-          73703.05472263868,
-          74463.62577639752
+          65432.76759056369,
+          64622.723135642984,
+          67000.97785356407,
+          67255.77256944444
         ]
       },
       "provenance": {
-        "cohort": "c7r3-vs-c6-update-001",
+        "cohort": "sql-update-20260920",
         "arms": {
           "citadel": {
             "criterion_id": "update_gen_propagate/citadel/",
             "runs": [
               {
-                "median_ns": 72355.02824858757,
+                "median_ns": 55838.87229275578,
                 "median_ci95_ns": [
-                  71450.58514931396,
-                  74777.0127118644
+                  55387.18258249003,
+                  56689.530070118664
                 ]
               },
               {
-                "median_ns": 75877.32142857142,
+                "median_ns": 58814.707167832166,
                 "median_ci95_ns": [
-                  74023.85531135532,
-                  77326.14795918367
+                  58429.868320085705,
+                  59168.29020979021
                 ]
               },
               {
-                "median_ns": 78476.72955974843,
+                "median_ns": 58905.78389830509,
                 "median_ci95_ns": [
-                  76819.91273584907,
-                  80092.43191746445
+                  58701.21398305085,
+                  59253.52861704741
                 ]
               },
               {
-                "median_ns": 76168.23491848847,
+                "median_ns": 60148.98029556651,
                 "median_ci95_ns": [
-                  74270.10600560963,
-                  77516.52348394768
+                  59980.76309067688,
+                  60575.317733990145
+                ]
+              },
+              {
+                "median_ns": 60280.16333548249,
+                "median_ci95_ns": [
+                  60092.85460992908,
+                  60546.791666666664
+                ]
+              },
+              {
+                "median_ns": 61261.82598320408,
+                "median_ci95_ns": [
+                  60977.94102595345,
+                  62009.68366145044
+                ]
+              },
+              {
+                "median_ns": 60600.222419928825,
+                "median_ci95_ns": [
+                  60364.52748121787,
+                  60890.75368581596
+                ]
+              },
+              {
+                "median_ns": 59690.67071577848,
+                "median_ci95_ns": [
+                  59506.58620689655,
+                  60110.9518678161
                 ]
               }
             ],
-            "reference_drift_percent": 5.270133620568851,
-            "candidate_drift_percent": 3.4258037609089964,
-            "change_from_reference_percent": 3.925841445245304
+            "reference_drift_percent": 8.52694535485945,
+            "candidate_drift_percent": 1.4893614031719737,
+            "change_from_reference_percent": -0.06667056551040718,
+            "blocks": {
+              "abba": {
+                "reference_drift_percent": 7.718830674468857,
+                "candidate_drift_percent": 0.15485366646990073,
+                "change_from_reference_percent": 1.493810290604003
+              },
+              "baab": {
+                "reference_drift_percent": -1.0799605670530288,
+                "candidate_drift_percent": -0.9779214041329864,
+                "change_from_reference_percent": -1.5519305449516296
+              }
+            }
           },
           "sqlite": {
             "criterion_id": "update_gen_propagate/sqlite/",
             "runs": [
               {
-                "median_ns": 76535.26785714286,
+                "median_ns": 62530.227068345324,
                 "median_ci95_ns": [
-                  74006.88244047618,
-                  78056.44642857142
+                  61589.946043165466,
+                  64491.934309695105
                 ]
               },
               {
-                "median_ns": 73703.05472263868,
+                "median_ns": 65432.76759056369,
                 "median_ci95_ns": [
-                  72252.2988505747,
-                  75609.9066091954
+                  65199.28872468528,
+                  65660.77700237183
                 ]
               },
               {
-                "median_ns": 74463.62577639752,
+                "median_ns": 64622.723135642984,
                 "median_ci95_ns": [
-                  73056.47321428571,
-                  76526.63633461048
+                  64429.19211195929,
+                  64908.03137701993
                 ]
               },
               {
-                "median_ns": 77704.13101604278,
+                "median_ns": 65918.64249342511,
                 "median_ci95_ns": [
-                  75403.93939393939,
-                  81756.95151515151
+                  65692.36574236574,
+                  66309.38299152584
+                ]
+              },
+              {
+                "median_ns": 67000.97785356407,
+                "median_ci95_ns": [
+                  66384.98126102293,
+                  67304.10052910054
+                ]
+              },
+              {
+                "median_ns": 67101.26236263735,
+                "median_ci95_ns": [
+                  66543.70384615383,
+                  67302.17548076922
+                ]
+              },
+              {
+                "median_ns": 67359.78346121057,
+                "median_ci95_ns": [
+                  67201.56862745098,
+                  67626.16339869282
+                ]
+              },
+              {
+                "median_ns": 67255.77256944444,
+                "median_ci95_ns": [
+                  66980.52455357142,
+                  67724.5958652421
                 ]
               }
             ],
-            "reference_drift_percent": 1.5272216216472456,
-            "candidate_drift_percent": 1.0319396619597798,
-            "change_from_reference_percent": -3.9372030872230956
+            "reference_drift_percent": 7.723554861853543,
+            "candidate_drift_percent": 2.7860734705399404,
+            "change_from_reference_percent": 0.5333864116688236,
+            "blocks": {
+              "abba": {
+                "reference_drift_percent": 5.418843947865826,
+                "candidate_drift_percent": -1.2379798146235355,
+                "change_from_reference_percent": 1.2507865346869762
+              },
+              "baab": {
+                "reference_drift_percent": 0.3852700969708689,
+                "candidate_drift_percent": 0.38028507052128013,
+                "change_from_reference_percent": -0.15193649550149235
+              }
+            }
           }
         }
       }
@@ -6304,87 +6644,290 @@
         }
       ]
     },
-    "c6r3-vs-c5-controls-001": {
-      "source": "selected_ea8827d7",
+    "sql-writes-20260920": {
+      "source": "selected_2bb8516f",
       "reference": {
-        "revision": "02abec6d2f49ab14dc62e25a56bb4273ee2949e5",
-        "executable_sha256": "04ee61f569bbde23ce3de08c1f7ed6e05c1853b309cf38de21b36bac2291dd08"
+        "revision": "74aa7020f13ea9a7b872ada784a2935066f50698",
+        "executable_sha256": "267107a7199d421e026cc76680e9c46eed69cd7896a5f81703f6fdbc78b353aa"
       },
-      "plan_sha256": "116e144940d8b05b4f6f72f4a498c62bc6bae6671a4fd9eb5ca54b6ac7f3fba2",
+      "plan_sha256": "8144adabafd40159cde0c34280ec92980275239b3b0fd637b03611ee7a39e483",
+      "measurement": {
+        "measured_on": "2026-09-20",
+        "passes": 2,
+        "samples_per_pass": 30,
+        "warmup_seconds": 3,
+        "measurement_target_seconds": 8,
+        "comparison_order": [
+          "reference",
+          "candidate",
+          "candidate",
+          "reference"
+        ]
+      },
+      "criterion_ids": [
+        "insert/citadel/",
+        "insert/sqlite/",
+        "insert_select/citadel/",
+        "insert_select/sqlite/",
+        "scan/citadel/",
+        "scan/sqlite/",
+        "update/citadel/",
+        "update/sqlite/",
+        "update_gen_propagate/citadel/",
+        "update_gen_propagate/sqlite/",
+        "update_returning/citadel/",
+        "update_returning/sqlite/",
+        "upsert_counter/citadel/",
+        "upsert_counter/sqlite/",
+        "upsert_mixed/citadel/",
+        "upsert_mixed/sqlite/"
+      ],
       "jobs": [
         {
           "step": 1,
           "role": "reference",
-          "started_utc": "2026-09-13T12:23:43.768820+00:00",
-          "finished_utc": "2026-09-13T12:24:31.311583+00:00",
-          "receipt_sha256": "cdfc2a750fc9f90a443769ee221def8fe527e6c21f9b3bc040ff5937e3533777",
-          "result_sha256": "89a48d4ed6cc1b8887c4ef3c30d673479c6d8488915b1084d2376ef8703330b7"
+          "block": "abba",
+          "started_utc": "2026-09-20T20:35:20.742039+00:00",
+          "finished_utc": "2026-09-20T20:39:12.283973+00:00",
+          "receipt_sha256": "da1810dbf2f34581183d744c044bb114e851af013e9ef4967453d366bb4c86df",
+          "result_sha256": "f992e1e9e0cea80b1e13c1a89dd2a4f8b1566d32d937508a49f1d585553dd423"
         },
         {
           "step": 2,
           "role": "candidate",
-          "started_utc": "2026-09-13T12:24:31.964131+00:00",
-          "finished_utc": "2026-09-13T12:25:19.085890+00:00",
-          "receipt_sha256": "c39c7c4c92366c5461108b28537405412f0c38c6191dff0bb4e5504ef009cf36",
-          "result_sha256": "e270fea73d393f3e0a1473cf6cb25ea199a0e471d031fc5b4751565cf6a15b38"
+          "block": "abba",
+          "started_utc": "2026-09-20T20:39:13.297097+00:00",
+          "finished_utc": "2026-09-20T20:43:05.414267+00:00",
+          "receipt_sha256": "dd2808a3c85881a92a3bf750bef66bde1eb9e71a4f03d349331e91a66743eb5c",
+          "result_sha256": "e046fe60c1f72498def83cdb38e1d8a947f7e9aeb240cd21c23023f7c40d274e"
         },
         {
           "step": 3,
           "role": "candidate",
-          "started_utc": "2026-09-13T12:25:19.716654+00:00",
-          "finished_utc": "2026-09-13T12:26:08.460247+00:00",
-          "receipt_sha256": "d450a1b56d886d4f8d7108332fb3d3ce9be2a9d2440dd94777042ed6ad0b2107",
-          "result_sha256": "6690a0bd54d132b2727d310fd35ba1241727a37c9c3bd0a06a270dbb5376632c"
+          "block": "abba",
+          "started_utc": "2026-09-20T20:43:06.370286+00:00",
+          "finished_utc": "2026-09-20T20:46:59.885164+00:00",
+          "receipt_sha256": "11eacb9f77241614aba9a02da8429c4e67b07169692ea7219a67342de8e1b261",
+          "result_sha256": "d1218e2708fdcf7ae439b2df36505a7fd7c92b3baf850f1e87a72c1698ae231c"
         },
         {
           "step": 4,
           "role": "reference",
-          "started_utc": "2026-09-13T12:26:09.136173+00:00",
-          "finished_utc": "2026-09-13T12:26:57.160318+00:00",
-          "receipt_sha256": "c129827fb6795d5d8b4d85ca32e0b466df66b210b05bcdbb5e3b1c950e4ea725",
-          "result_sha256": "74d08b4573c2accaad12d9ec796b5d5f46e9c9610fe7c943738770d2720939b5"
+          "block": "abba",
+          "started_utc": "2026-09-20T20:47:00.906156+00:00",
+          "finished_utc": "2026-09-20T20:50:54.533420+00:00",
+          "receipt_sha256": "9d4d8512932ba2e85587de878e458c01225ffd030c23f54fa6b6ccfadf98f9d5",
+          "result_sha256": "3263bf8358e6f6f3918e81c45b0f8386678d241d11d7317d7d8e7e73947fe0df"
         }
       ]
     },
-    "c7r3-vs-c6-update-001": {
-      "source": "selected_0f9362cf",
+    "sql-update-20260920": {
+      "source": "selected_2bb8516f",
       "reference": {
-        "revision": "ea8827d7c64efe98985a13a40ef50ef60f205b38",
-        "executable_sha256": "379cf5d4ad244f2d77c879af788199c7e7fdefbf969c372353b904dcc01e66f2"
+        "revision": "74aa7020f13ea9a7b872ada784a2935066f50698",
+        "executable_sha256": "267107a7199d421e026cc76680e9c46eed69cd7896a5f81703f6fdbc78b353aa"
       },
-      "plan_sha256": "544e76f8fa77b0ff410505ab7e846efc1e2ac927c8414cf48de625362fa30e21",
+      "plan_sha256": "5ae2c57b89a3d490e8715556437910441b85e719600e929848d82014380baa64",
+      "measurement": {
+        "measured_on": "2026-09-20",
+        "passes": 4,
+        "samples_per_pass": 30,
+        "warmup_seconds": 3,
+        "measurement_target_seconds": 8,
+        "comparison_order": [
+          "reference",
+          "candidate",
+          "candidate",
+          "reference",
+          "candidate",
+          "reference",
+          "reference",
+          "candidate"
+        ]
+      },
+      "criterion_ids": [
+        "update/citadel/",
+        "update/sqlite/",
+        "update_gen_propagate/citadel/",
+        "update_gen_propagate/sqlite/"
+      ],
       "jobs": [
         {
           "step": 1,
           "role": "reference",
-          "started_utc": "2026-09-13T13:54:49.395137+00:00",
-          "finished_utc": "2026-09-13T13:55:50.807590+00:00",
-          "receipt_sha256": "df38db29cd8c303f0a6999eae2d4700c1e578ebc03a24463a086516b87623dc8",
-          "result_sha256": "be055b308bef8a5f04d5672731c8a91f58b0427f0b0010be2e01bf2e8eef44a8"
+          "block": "abba",
+          "started_utc": "2026-09-20T20:51:20.390316+00:00",
+          "finished_utc": "2026-09-20T20:52:43.122636+00:00",
+          "receipt_sha256": "8f5f51378ba897fe368d5a08bba4acceaae559d9db59b2b93ae40127c1b2966e",
+          "result_sha256": "960ef915865c705a810b2f34e132de0e16e980e377c57be1c47965d465c06baf"
         },
         {
           "step": 2,
           "role": "candidate",
-          "started_utc": "2026-09-13T13:55:51.432105+00:00",
-          "finished_utc": "2026-09-13T13:56:50.596673+00:00",
-          "receipt_sha256": "ad03103ea564234c4690fec50d69779c7964ea12ec440eb15d4eb5f1cea4cf1a",
-          "result_sha256": "6e59d58a424aa4b02cd88ece0952938159379a4f5a83d16eb81642588e6050a8"
+          "block": "abba",
+          "started_utc": "2026-09-20T20:52:44.124226+00:00",
+          "finished_utc": "2026-09-20T20:54:07.040784+00:00",
+          "receipt_sha256": "015a0321024aa3118b05add0d4fe9c220e4f7c1786a6861abb9bd9e848517b63",
+          "result_sha256": "4a9de4069f6be876307703026aa967d2a79920fb7dd2318314f641ea5b2359ff"
         },
         {
           "step": 3,
           "role": "candidate",
-          "started_utc": "2026-09-13T13:56:51.264279+00:00",
-          "finished_utc": "2026-09-13T13:57:50.789091+00:00",
-          "receipt_sha256": "2fa9be4b8d775e699fe47dd2775ca5a8a84e3ec6d4a3471605b98695e6183dc4",
-          "result_sha256": "08f7a735535fcb7ce1b69a3506ea2f48da6e8763990d82fb01e862d86ff87234"
+          "block": "abba",
+          "started_utc": "2026-09-20T20:54:08.074251+00:00",
+          "finished_utc": "2026-09-20T20:55:30.942929+00:00",
+          "receipt_sha256": "ec5830f594ecd5defa0ef1c411b5ed336ddb3d2a3239390aba4f0095efb7e436",
+          "result_sha256": "7d4700df682a4531fe3f6d67a52b086a268be24045da2b03b14da28348f6c2b6"
         },
         {
           "step": 4,
           "role": "reference",
-          "started_utc": "2026-09-13T13:57:51.480251+00:00",
-          "finished_utc": "2026-09-13T13:58:50.893996+00:00",
-          "receipt_sha256": "d43ee11af60eb661a064733fb309ab04853251aa78191a70623f72e2884dd636",
-          "result_sha256": "9db1a0034f5c8ec17b4ce5c196de27ee20e27b756308082e715d6f0838e4273f"
+          "block": "abba",
+          "started_utc": "2026-09-20T20:55:31.974020+00:00",
+          "finished_utc": "2026-09-20T20:56:55.947723+00:00",
+          "receipt_sha256": "f70a685cd670ca510f0b26fbbf396da541b5ddc224a5cea5a414276ddabe8257",
+          "result_sha256": "f5ba73f2a043460531b3d8694480a8da0a20e400c2ba7ec74ed383d30140f40c"
+        },
+        {
+          "step": 5,
+          "role": "candidate",
+          "block": "baab",
+          "started_utc": "2026-09-20T20:56:56.982782+00:00",
+          "finished_utc": "2026-09-20T20:58:20.906372+00:00",
+          "receipt_sha256": "3b540806645c2bf3c6391c5706c83ef2053e47a3e1da5483b240979cf5b71a35",
+          "result_sha256": "73441fcd9adeeed554afc460eaa6ee3605573bec346d6dedec13c85aa9a05a82"
+        },
+        {
+          "step": 6,
+          "role": "reference",
+          "block": "baab",
+          "started_utc": "2026-09-20T20:58:21.940175+00:00",
+          "finished_utc": "2026-09-20T20:59:46.712707+00:00",
+          "receipt_sha256": "899da8975a4c590e25f726683a4dce54f613383a528cf36a13b4026cf5c4d470",
+          "result_sha256": "78dbac75fe73f6a21fe07a5b4f2576e83febb89bada6645cbb4161c148a868b4"
+        },
+        {
+          "step": 7,
+          "role": "reference",
+          "block": "baab",
+          "started_utc": "2026-09-20T20:59:47.868006+00:00",
+          "finished_utc": "2026-09-20T21:01:13.791302+00:00",
+          "receipt_sha256": "2090514228d2305167a4e4f539e3d7ac44de1bca5553f545183ebfdabe36d382",
+          "result_sha256": "cee04cf0db1d1f2013690c73b054f9fafc250120303d117135a46efb1c445130"
+        },
+        {
+          "step": 8,
+          "role": "candidate",
+          "block": "baab",
+          "started_utc": "2026-09-20T21:01:14.876102+00:00",
+          "finished_utc": "2026-09-20T21:02:39.129486+00:00",
+          "receipt_sha256": "2d9943267843dfa96179f12267e9e92a81929ff2cf9237fc1c440b99882a2649",
+          "result_sha256": "b2246891dd62f579c5fb881b157e834985024d703e7e89bde32a3d8b6df2d0fd"
+        }
+      ]
+    },
+    "sql-window-20260920": {
+      "source": "selected_74aa7020",
+      "reference": {
+        "revision": "a866ee343be5273c799adc082da88b8439b470f5",
+        "executable_sha256": "869238d3b3c710bd829e59f46b69590f1c86d2445bfae13c9f06d5836dbca8fa"
+      },
+      "plan_sha256": "48edbb1f04d51dd2f884173165339e59043d86283c40b658a8cc6a110b2ffaf8",
+      "measurement": {
+        "measured_on": "2026-09-20",
+        "passes": 4,
+        "samples_per_pass": 30,
+        "warmup_seconds": 3,
+        "measurement_target_seconds": 8,
+        "comparison_order": [
+          "reference",
+          "candidate",
+          "candidate",
+          "reference",
+          "candidate",
+          "reference",
+          "reference",
+          "candidate"
+        ]
+      },
+      "criterion_ids": [
+        "window_agg/citadel/",
+        "window_agg/sqlite/",
+        "window_rank/citadel/",
+        "window_rank/sqlite/"
+      ],
+      "jobs": [
+        {
+          "step": 1,
+          "role": "reference",
+          "block": "abba",
+          "started_utc": "2026-09-20T17:38:09.450329+00:00",
+          "finished_utc": "2026-09-20T17:39:38.684030+00:00",
+          "receipt_sha256": "41a930ac43730d0dd8ffe53e24e2ef98a167ded7f43764570052ae58d31a82b9",
+          "result_sha256": "8b0d91d4d7267b153c66054402f1c7bbc4d11c004bb970a1826ee947e46fe7e6"
+        },
+        {
+          "step": 2,
+          "role": "candidate",
+          "block": "abba",
+          "started_utc": "2026-09-20T17:39:39.656306+00:00",
+          "finished_utc": "2026-09-20T17:41:07.447739+00:00",
+          "receipt_sha256": "cdbf6ad3ec4cda5bd11c4c1c3d8745116cec7ab8d6a2f6330253d18f59c2f8b2",
+          "result_sha256": "779f9c6f96ac7e638a6f94d91686c376145367a7fdbb57cb3002d438a2b1c884"
+        },
+        {
+          "step": 3,
+          "role": "candidate",
+          "block": "abba",
+          "started_utc": "2026-09-20T17:41:08.334372+00:00",
+          "finished_utc": "2026-09-20T17:42:40.279026+00:00",
+          "receipt_sha256": "2c64df188142bfb5226bdf82403712358d0deb88cf4520da8a7f6a17596c5cc7",
+          "result_sha256": "17aa50191c500718ded4def99960ebcdc8813586049c24acc4b6adc71331f779"
+        },
+        {
+          "step": 4,
+          "role": "reference",
+          "block": "abba",
+          "started_utc": "2026-09-20T17:42:41.276613+00:00",
+          "finished_utc": "2026-09-20T17:44:14.219446+00:00",
+          "receipt_sha256": "4a383ad4e46fe8befa42c788416346cad2d71ad780bd6f5d6719391f52e27a0c",
+          "result_sha256": "b01e8b737cbdc90da3dde9ce326d0db0ddcc04109875f948c30cc3edcd723724"
+        },
+        {
+          "step": 5,
+          "role": "candidate",
+          "block": "baab",
+          "started_utc": "2026-09-20T17:44:15.128432+00:00",
+          "finished_utc": "2026-09-20T17:45:45.542870+00:00",
+          "receipt_sha256": "96cea00894f34d5a108ab5a3bb7dddbf63780a423c5fc92b1a486eb181cdbac9",
+          "result_sha256": "94b7a0bfcf28402cb326d0841527894c56a754872bf597a0e0b4efcd599b64b3"
+        },
+        {
+          "step": 6,
+          "role": "reference",
+          "block": "baab",
+          "started_utc": "2026-09-20T17:45:46.463189+00:00",
+          "finished_utc": "2026-09-20T17:47:20.081598+00:00",
+          "receipt_sha256": "4db80f2d0c7ff3f404262a269b719d6db24f3c9213853da30f8ca09911af6236",
+          "result_sha256": "727426ff1f5a030cf372b7f95e5990d3f7d7ba8973f382f020b1678e56e60c80"
+        },
+        {
+          "step": 7,
+          "role": "reference",
+          "block": "baab",
+          "started_utc": "2026-09-20T17:47:21.021812+00:00",
+          "finished_utc": "2026-09-20T17:48:53.285121+00:00",
+          "receipt_sha256": "b5bfa85c6c20bd2aac028d2990bab8c70b5baaddbb706643f10c464886b929b8",
+          "result_sha256": "270db926bff8fad6ef9ed5d4fff4cf847e9e0dff839ba53cd61ee99ba582abd4"
+        },
+        {
+          "step": 8,
+          "role": "candidate",
+          "block": "baab",
+          "started_utc": "2026-09-20T17:48:54.255354+00:00",
+          "finished_utc": "2026-09-20T17:50:24.763831+00:00",
+          "receipt_sha256": "38ea91891da119d50724516afe22db8a59640a9a52b613c3e4e5c4090d2a840d",
+          "result_sha256": "8e35cbd573027e50783efb9044e53e80263ad86f08bfb62df80f06369e955e20"
         }
       ]
     }

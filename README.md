@@ -298,13 +298,11 @@ gpt-4o-mini for LoCoMo, gpt-4o for LongMemEval. The protocol and results are in
 
 ## Speed benchmarks
 
-Measured on September 13, 2026 on an Intel Core i9-12900HX, Windows 11 Pro, Rust 1.98.0, and SQLite 3.51.3. Runs use one fixed logical processor, with durability disabled and both caches configured for 4,096 pages (about 32 MiB). Most cases use 100K rows; schemas and operations vary as listed below.
+Measured on September 13 and 20, 2026 (UTC) on an Intel Core i9-12900HX, Windows 11 Pro, Rust 1.98.0, and SQLite 3.51.3. Runs use one fixed logical processor, with durability disabled and both caches configured for 4,096 pages (about 32 MiB). Most cases use 100K rows; schemas and operations vary as listed below.
 
-Each time is the mean of two per-run sample medians, with 30 samples per run. Ratios use unrounded SQLite time / Citadel time: above 1 means Citadel is faster, below 1 means Citadel is slower. For example, 0.5x means Citadel takes twice as long as SQLite.
+Each time is the arithmetic mean of two or four per-run sample medians, with 30 samples per run. Ratios use unrounded SQLite time / Citadel time: above 1 means Citadel is faster, below 1 means Citadel is slower. For example, 0.5x means Citadel takes twice as long as SQLite.
 
-The complete 129-ID run at `6b41d0c3` supplies the base measurements. Eight execution pairs use later `ea8827d7` results: `insert`, `fk_cascade`, `covered_range`, `insert_select`, `upsert_dedup`, `upsert_returning`, `upsert_all_new`, and `scan`. Three UPDATE pairs (`update`, `update_gen_propagate`, `update_returning`) use `0f9362cf`. Each row uses Citadel and SQLite from the same cohort. This combined per-row snapshot is not a full-suite timing run at the latest revision. [Per-run medians, 95% intervals, drift, and source provenance](site/data/sql-benchmarks.json) identify every row.
-
-58 of the 59 aggregate SQLite/Citadel point ratios exceed 1. Generated UPDATE remains slower at **0.960x**: one matching run interval overlaps SQLite's, and the other is wholly slower. Point ratios and changes between published snapshots are not a universal speedup claim; per-run intervals and control drift remain relevant.
+Ten execution comparisons were refreshed on September 20: eight write/scan cases at `2bb8516f` and two window cases at `74aa7020`. Other rows retain September 13 measurements at `6b41d0c3` or `ea8827d7`. Each row pairs Citadel and SQLite from the same cohort. This is a combined snapshot, not a full-suite run at the latest revision. [Source revisions, run settings, medians, 95% intervals, and drift](site/data/sql-benchmarks.json) identify every row.
 
 ### Execution speed
 
@@ -316,23 +314,23 @@ Benchmark                     Citadel        SQLite         Ratio
 join_param                    2.74 us        54.1 us        19.8x
 fts_rank_first_execution      6.86 ms        64.5 ms        9.4x
 insert_returning              80.8 us        351 us         4.34x
-update_returning              78.7 us        244 us         3.1x
+update_returning              56.9 us        209 us         3.67x
+window_agg                    29.3 ms        97.4 ms        3.33x
 upsert_returning              135 us         392 us         2.91x
 sort_paginate_pk              9.13 us        26.1 us        2.86x
 delete_returning              97.2 us        269 us         2.76x
 fts_phrase                    5.66 ms        14.6 ms        2.58x
+window_rank                   63.9 ms        161 ms         2.51x
 fts_match                     4.94 ms        12.1 ms        2.44x
 json_extract                  22.6 ms        49 ms          2.17x
-window_rank                   93.6 ms        191 ms         2.05x
-window_agg                    57 ms          112 ms         1.96x
-scan                          7.97 ms        15.2 ms        1.91x
+scan                          6.31 ms        13.2 ms        2.09x
+insert                        25.5 us        51.8 us        2.03x
 insert_gen_virtual            36.4 us        66.4 us        1.82x
 wide_proj_full                6.83 ms        12.1 ms        1.77x
 insert_gen_stored             37.3 us        65.7 us        1.76x
 upsert_all_new                36.2 us        63.5 us        1.76x
 wide_proj_pk                  416 us         728 us         1.75x
 truncate                      57.6 us        101 us         1.75x
-insert                        36.6 us        62.7 us        1.71x
 upsert_dedup                  31.9 us        53.7 us        1.68x
 savepoint_rollback            2.08 ms        3.22 ms        1.55x
 delete                        75.1 us        116 us         1.54x
@@ -340,16 +338,16 @@ wide_proj_2col                651 us         998 us         1.53x
 covered_count                 377 us         561 us         1.49x
 wide_proj_3col                1.28 ms        1.89 ms        1.47x
 savepoint_nested              232 us         322 us         1.39x
+update                        33.4 us        42.5 us        1.27x
+insert_select                 171 us         214 us         1.25x
 with_dml                      122 us         147 us         1.21x
 fk_cascade_delete_only        52.4 us        63.2 us        1.2x
-insert_select                 229 us         272 us         1.19x
+upsert_mixed                  48.6 us        57.7 us        1.19x
 fk_cascade                    122 us         144 us         1.18x
+upsert_counter                63.7 us        74.5 us        1.17x
 savepoint_create              916 ns         1.07 us        1.16x
 covered_range                 105 us         119 us         1.14x
-update                        45 us          49.3 us        1.09x
-upsert_mixed                  62.3 us        66 us          1.06x
-upsert_counter                81.6 us        85.9 us        1.05x
-update_gen_propagate          77.2 us        74.1 us        0.96x
+update_gen_propagate          59.4 us        66.1 us        1.11x
 ```
 
 ### Cached repeat reads
@@ -436,29 +434,31 @@ result collection are in [common.rs](crates/citadel-sql/benches/h2h/common.rs).
   rolls back to the sixth, releases the remaining savepoints, and commits.
   `savepoint_rollback` inserts 1K rows before a savepoint and 10K after it,
   rolls back the latter, and commits.
-- Criterion uses 30 samples, a 1-second warmup, and a 2-second measurement target
-  per arm. Slow cases run longer to complete all samples. Each cohort runs in
-  reference/candidate/candidate/reference order, serially on logical processor 0.
-  The tables use only the two candidate runs and their matching SQLite controls.
-  The data file retains the reference runs, each run's 95% median interval, and
-  within-role drift; no pooled confidence interval or overall speedup is claimed.
-- Corrected fixtures, result collection, and SQLite journaling differ from the
-  earlier published measurements. A changed ratio alone does not establish an
-  engine regression or improvement.
+- Criterion uses 30 samples per arm. September 13 cohorts use a 1-second warmup
+  and a 2-second measurement target; September 20 cohorts use 3 and 8 seconds.
+  Slow cases run longer to complete all samples. Runs are serial on logical
+  processor 0 in reference/candidate/candidate/reference order. The September 20
+  `update`, `update_gen_propagate`, `window_agg`, and `window_rank` cohorts also
+  run in reverse order, giving four candidate runs; other rows use two. Every
+  candidate run and its matching SQLite control contributes to the displayed mean.
+- Per-run 95% median intervals and drift are retained in the data. Intervals are
+  not pooled, and ratios do not establish a universal speedup or measure the
+  change from a previous release.
 
-Run a case at its declared source snapshot with the recorded Criterion settings:
+For example, run the September 20 UPDATE cohort at its recorded revision:
 
 ```sh
 cargo bench --locked -p citadeldb-sql --bench h2h_bench -- \
-  --sample-size 30 --warm-up-time 1 --measurement-time 2 --noplot
+  '^(update|update_gen_propagate)/(citadel|sqlite)/$' \
+  --sample-size 30 --warm-up-time 3 --measurement-time 8 --noplot
 ```
 
 For a source comparison, build and preserve both source snapshots first, then run
-the same anchored case filter in reference/candidate/candidate/reference order,
-with no concurrent builds and fixed CPU affinity. The command above runs the
-current checkout; reproducing a published row requires that row's recorded
-revision and cohort. Source snapshots, executable hashes, exact Criterion IDs,
-per-run medians, and intervals are in [sql-benchmarks.json](site/data/sql-benchmarks.json).
+the cohort's recorded case filter and run order, with no concurrent builds and
+fixed CPU affinity. The command above runs the current checkout; reproducing a
+published row requires its recorded revision and cohort. Exact Criterion IDs,
+executable hashes, and per-run results are in
+[sql-benchmarks.json](site/data/sql-benchmarks.json).
 
 </details>
 
