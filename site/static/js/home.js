@@ -248,7 +248,7 @@ cleanup:
   const source = document.getElementById('sqlBenchmarks');
   if (!source) return;
   const benchmarks = JSON.parse(source.textContent);
-  const median = (samples) => (samples[0] + samples[1]) / 2;
+  const mean = (samples) => samples.reduce((sum, value) => sum + value, 0) / samples.length;
   const fmtNumber = (value) => Number(value.toPrecision(3)).toLocaleString('en-US', {
     useGrouping: false, maximumSignificantDigits: 3,
   });
@@ -262,8 +262,8 @@ cleanup:
     const table = document.getElementById(id);
     if (!table) return;
     const rows = data.map(({ name, samples_ns }) => {
-      const citadel = median(samples_ns.citadel);
-      const sqlite = median(samples_ns.sqlite);
+      const citadel = mean(samples_ns.citadel);
+      const sqlite = mean(samples_ns.sqlite);
       return { name, citadel, sqlite, ratio: sqlite / citadel };
     });
     const maxLog = Math.max(0, ...rows.map(({ ratio }) => Math.log10(ratio)));

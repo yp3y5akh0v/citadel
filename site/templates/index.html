@@ -455,13 +455,13 @@
   <div class="sec-head">
     <div class="eyebrow">Benchmarks</div>
     <h2>{{ config.extra.benchmarks }} SQL comparisons with SQLite.</h2>
-    <p>Single-threaded measurements with durability off and both caches configured for 4,096 pages (about 32 MiB). Ratios are SQLite time / Citadel time: above 1 means Citadel is faster, below 1 means Citadel is slower. Execution and cached repeat reads are reported separately. Measurements from September 13, 2026 combine the complete <code>6b41d0c3</code> run with eight execution pairs from <code>ea8827d7</code> and three UPDATE pairs from <code>0f9362cf</code>, as listed in the <a href="{{ config.extra.github }}#speed-benchmarks">methodology</a>; they are not a full-suite timing run at one revision. 58 of 59 aggregate point ratios exceed 1; generated UPDATE is 0.960×, with run-level uncertainty retained in the data.</p>
+    <p>Single-threaded measurements with durability off and both caches configured for 4,096 pages (about 32 MiB). Ratios are SQLite time / Citadel time: above 1 means Citadel is faster, below 1 means Citadel is slower. Execution and cached repeat reads are reported separately. Ten execution comparisons were refreshed on September 20, 2026; other rows retain September 13 results. Each row uses matching Citadel and SQLite runs. See the <a href="{{ config.extra.github }}#speed-benchmarks">methodology and source revisions</a> for this combined snapshot.</p>
   </div>
 
   <div class="bench-kpis">
     <div class="kpi"><div class="val"><em>{{ sql_benchmarks.execution | length }}</em></div><div class="lab">execution comparisons</div></div>
     <div class="kpi"><div class="val"><em>{{ sql_benchmarks.cached | length }}</em></div><div class="lab">cached-read comparisons</div></div>
-    <div class="kpi"><div class="val"><em>{{ sql_benchmarks.measurement.passes }}</em></div><div class="lab">candidate runs per measurement</div></div>
+    <div class="kpi"><div class="val"><em>2–4</em></div><div class="lab">candidate runs per measurement</div></div>
     <div class="kpi"><div class="val"><em>{{ sql_benchmarks.measurement.samples_per_pass }}</em></div><div class="lab">samples per run</div></div>
   </div>
 
@@ -487,7 +487,7 @@
       <div>Ratio</div>
     </div>
   </div>
-  <div class="bench-note">SQLite: <code>page_size=8192, journal_mode=MEMORY, synchronous=OFF, cache_size=4096</code>. Citadel: <code>SyncMode::Off, cache_size=4096</code>. Reproduce: <code>cargo bench --locked -p citadeldb-sql --bench h2h_bench -- --sample-size 30 --warm-up-time 1 --measurement-time 2 --noplot</code>. The displayed rows use the two candidate runs from serial reference/candidate/candidate/reference cohorts; the data retains per-run intervals and drift.</div>
+  <div class="bench-note">SQLite: <code>page_size=8192, journal_mode=MEMORY, synchronous=OFF, cache_size=4096</code>. Citadel: <code>SyncMode::Off, cache_size=4096</code>. Times are means of two or four per-run medians, with 30 samples per run. Cohort settings, source revisions, intervals, and drift are recorded in the <a href="{{ config.extra.github }}/blob/HEAD/site/data/sql-benchmarks.json">benchmark data</a>. These timings do not measure durable commit latency.</div>
 </section>
 
 <section class="block shell" id="arch">
