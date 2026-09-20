@@ -363,64 +363,14 @@ fn fast_lane_column_refs(expr: &Expr, out: &mut Vec<String>) -> bool {
     }
 }
 
-/// Uses the shared exhaustive expression visitor and the same function/path
-/// classification as constant evaluation and result caching. Parameters remain
-/// available through their own scope; unsupported forms fail this proof.
-fn update_expr_context_free(expr: &Expr) -> bool {
-    let mut independent = true;
-    crate::parser::visit_expr(expr, &mut |node| match node {
-        Expr::Function { name, args, .. } => {
-            independent &=
-                crate::eval::is_function_context_independent(&name.to_ascii_uppercase(), args);
-        }
-        Expr::BinaryOp { left, op, right } => {
-            independent &= !crate::eval::is_session_dependent_jsonpath_op(op, left, right);
-        }
-        Expr::InSubquery { .. }
-        | Expr::Exists { .. }
-        | Expr::ScalarSubquery(_)
-        | Expr::WindowFunction { .. }
-        | Expr::Quantified { .. } => independent = false,
-        Expr::Literal(_)
-        | Expr::Column(_)
-        | Expr::QualifiedColumn { .. }
-        | Expr::Parameter(_)
-        | Expr::TypedNullRecord(_)
-        | Expr::CountStar
-        | Expr::UnaryOp { .. }
-        | Expr::Cast { .. }
-        | Expr::Collate { .. }
-        | Expr::IsNull(_)
-        | Expr::IsNotNull(_)
-        | Expr::InList { .. }
-        | Expr::InSet { .. }
-        | Expr::Between { .. }
-        | Expr::IsDistinctFrom { .. }
-        | Expr::Like { .. }
-        | Expr::Case { .. }
-        | Expr::Coalesce(_)
-        | Expr::ArrayLiteral(_) => {}
-    });
-    independent
-}
-
 fn update_schema_and_expressions_context_free(table: &TableSchema, stmt: &UpdateStmt) -> bool {
     stmt.assignments
         .iter()
-        .all(|(_, expr)| update_expr_context_free(expr))
-        && stmt
-            .where_clause
-            .as_ref()
-            .is_none_or(update_expr_context_free)
+        .all(|(_, expr)| expr_context_free(expr))
+        && stmt.where_clause.as_ref().is_none_or(expr_context_free)
         && table.columns.iter().all(|column| {
-            column
-                .default_expr
-                .as_ref()
-                .is_none_or(update_expr_context_free)
-                && column
-                    .generated_expr
-                    .as_ref()
-                    .is_none_or(update_expr_context_free)
+            column.default_expr.as_ref().is_none_or(expr_context_free)
+                && column.generated_expr.as_ref().is_none_or(expr_context_free)
         })
 }
 

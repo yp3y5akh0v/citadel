@@ -8,6 +8,47 @@ use crate::eval::{eval_expr, is_truthy, operand_collation, ColumnMap, EvalCtx};
 use crate::parser::*;
 use crate::types::*;
 
+/// Uses the shared exhaustive expression visitor and the same function/path
+/// classification as constant evaluation and result caching. Parameters remain
+/// available through their own scope; unsupported forms fail this proof.
+pub(super) fn expr_context_free(expr: &Expr) -> bool {
+    let mut independent = true;
+    crate::parser::visit_expr(expr, &mut |node| match node {
+        Expr::Function { name, args, .. } => {
+            independent &=
+                crate::eval::is_function_context_independent(&name.to_ascii_uppercase(), args);
+        }
+        Expr::BinaryOp { left, op, right } => {
+            independent &= !crate::eval::is_session_dependent_jsonpath_op(op, left, right);
+        }
+        Expr::InSubquery { .. }
+        | Expr::Exists { .. }
+        | Expr::ScalarSubquery(_)
+        | Expr::WindowFunction { .. }
+        | Expr::Quantified { .. } => independent = false,
+        Expr::Literal(_)
+        | Expr::Column(_)
+        | Expr::QualifiedColumn { .. }
+        | Expr::Parameter(_)
+        | Expr::TypedNullRecord(_)
+        | Expr::CountStar
+        | Expr::UnaryOp { .. }
+        | Expr::Cast { .. }
+        | Expr::Collate { .. }
+        | Expr::IsNull(_)
+        | Expr::IsNotNull(_)
+        | Expr::InList { .. }
+        | Expr::InSet { .. }
+        | Expr::Between { .. }
+        | Expr::IsDistinctFrom { .. }
+        | Expr::Like { .. }
+        | Expr::Case { .. }
+        | Expr::Coalesce(_)
+        | Expr::ArrayLiteral(_) => {}
+    });
+    independent
+}
+
 pub(super) type ReturningRow = (Option<Vec<Value>>, Option<Vec<Value>>);
 
 pub(super) const CANCEL_CHECK_INTERVAL: usize = 256;
