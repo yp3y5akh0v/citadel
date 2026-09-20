@@ -761,9 +761,13 @@ impl<'a> UpdateValue<'a> {
         self.layout.column(self.storage.bytes(), column)
     }
 
+    fn decode_column(&mut self, column: usize) -> Result<Value> {
+        self.layout.column_value(self.storage.bytes(), column)
+    }
+
     fn decode_columns(&mut self, columns: &[(usize, usize)], row: &mut [Value]) -> Result<()> {
         for &(schema_idx, physical_idx) in columns {
-            row[schema_idx] = self.column(physical_idx)?.to_value()?;
+            row[schema_idx] = self.decode_column(physical_idx)?;
         }
         Ok(())
     }
@@ -1787,8 +1791,7 @@ pub(super) fn exec_update(
                             ),
                     )?;
                     for target in &targets {
-                        partial_row[target.schema_idx] =
-                            value.column(target.phys_idx)?.to_value()?;
+                        partial_row[target.schema_idx] = value.decode_column(target.phys_idx)?;
                     }
                     value.decode_columns(&rhs_extra_cols, &mut partial_row)?;
                     for target in &targets {
@@ -2684,7 +2687,7 @@ fn patch_compiled_update_value(
     // Capture every SET input before patching: multiple assignments share the
     // old row, while generated expressions below observe the completed SET.
     for target in targets {
-        partial_row[target.schema_idx] = value.column(target.phys_idx)?.to_value()?;
+        partial_row[target.schema_idx] = value.decode_column(target.phys_idx)?;
     }
     value.decode_columns(&fast.rhs_extra_cols, partial_row)?;
     for target in targets {
@@ -2908,7 +2911,7 @@ fn try_fast_update_in_txn(
                         ),
                 )?;
                 for target in &targets {
-                    partial_row[target.schema_idx] = value.column(target.phys_idx)?.to_value()?;
+                    partial_row[target.schema_idx] = value.decode_column(target.phys_idx)?;
                 }
                 value.decode_columns(&rhs_extra_cols, &mut partial_row)?;
                 for target in &targets {
