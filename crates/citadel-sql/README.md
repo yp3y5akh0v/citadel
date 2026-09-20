@@ -6,6 +6,9 @@ Current date/time functions use the connection's session zone and transaction-st
 `STATEMENT_TIMESTAMP()` is statement-stable and `CLOCK_TIMESTAMP()` reads the wall clock.
 `SET TIME ZONE` accepts IANA names, fixed offsets, numeric hours, intervals, `LOCAL`, and `DEFAULT`.
 
+`CREATE MATERIALIZED VIEW` requires unique output column names after ASCII case
+folding, with or without data. Use distinct aliases for repeated names.
+
 ## Storage and metadata limits
 
 Stored rows support at most **32,767 physical non-primary-key slots**, including
@@ -18,6 +21,11 @@ schema metadata supports up to 65,535 logical columns.
 including SQL quotes and escaping. Metadata lengths and counts are checked before
 catalog persistence; the metadata types also expose fallible `try_serialize()`
 methods. Loading truncated required metadata returns an error.
+
+`encoding::RawColumn::to_value`, `cmp_value`, and `eq_value` return
+`Result<Value>`, `Result<Option<Ordering>>`, and `Result<bool>`, respectively.
+Callers must propagate malformed ARRAY and VECTOR payload errors when
+materializing or comparing borrowed values.
 
 A failed mutating statement can leave an explicit transaction requiring rollback
 if it already changed storage. Restore a preceding savepoint or roll back the
