@@ -794,7 +794,7 @@ fn crash_with_reclaimed_chain_pages_preserves_reader_and_durable_snapshot() {
         let before = mgr.current_slot();
         assert!(before.txn_id > oldest_slot.txn_id);
         assert_eq!(mgr.reclaim_horizon(), oldest_slot.txn_id);
-        let before_tags = mgr.state.lock().retired_chain_pages.clone();
+        let before_tags = mgr.state.lock().retired_chain_pages().clone();
         assert!(
             !before_tags.is_empty(),
             "fixture must carry published metadata provenance"
@@ -807,10 +807,11 @@ fn crash_with_reclaimed_chain_pages_preserves_reader_and_durable_snapshot() {
                 .iter()
                 .position(|id| before_tags.contains_key(id))
                 .expect("fixture must offer a tagged metadata loan");
-            let last = state.reclaimed_pages.len() - 1;
             // Change only allocation order: put an already-eligible metadata
-            // page first in the allocator's LIFO body allocation path.
-            Arc::make_mut(&mut state.reclaimed_pages).swap(tagged, last);
+            // page first in the allocator's body allocation path.
+            let mut order: Vec<_> = state.reclaimed_pages.iter().copied().collect();
+            order.swap(tagged, 0);
+            state.reclaimed_pages = ReadyPages::from_pop_order(order);
             assert_eq!(
                 state
                     .reclaimed_pages
@@ -821,7 +822,7 @@ fn crash_with_reclaimed_chain_pages_preserves_reader_and_durable_snapshot() {
             );
             state.reclaimed_pages.clone()
         };
-        let tagged_body = *loan.last().unwrap();
+        let tagged_body = loan.last().unwrap();
         assert!(
             loan.len() > 2,
             "fixture must offer data and structure loans"
@@ -830,7 +831,7 @@ fn crash_with_reclaimed_chain_pages_preserves_reader_and_durable_snapshot() {
         txn.insert(&keys[0], &new_value).unwrap();
         let target_txn = txn.txn_id();
         assert_eq!(
-            mgr.state.lock().retired_chain_pages,
+            mgr.state.lock().retired_chain_pages(),
             before_tags,
             "uncommitted body allocation must not publish tag removal"
         );
@@ -847,7 +848,7 @@ fn crash_with_reclaimed_chain_pages_preserves_reader_and_durable_snapshot() {
             assert!(matches!(result, Err(Error::Io(_))));
             assert!(write_attempts > limit, "the injected write fault must fire");
             assert_eq!(
-                mgr.state.lock().retired_chain_pages,
+                mgr.state.lock().retired_chain_pages(),
                 before_tags,
                 "failed loan consumption must not alter published metadata provenance"
             );
@@ -859,7 +860,7 @@ fn crash_with_reclaimed_chain_pages_preserves_reader_and_durable_snapshot() {
             assert!(!mgr
                 .state
                 .lock()
-                .retired_chain_pages
+                .retired_chain_pages()
                 .contains_key(&tagged_body));
             let reused = mgr.read_page_from_disk(tagged_body).unwrap();
             assert_eq!(reused.txn_id(), target_txn);
@@ -999,8 +1000,8 @@ fn held_reader_pending_free_growth_is_linear_and_reuses_after_release() {
                 .map(|entry| (entry.page_id, entry.freed_at_txn))
                 .collect();
             for page in state.reclaimed_pages.iter() {
-                assert_eq!(state.retired_chain_pages.get(page), entries.get(page));
-                assert!(state.retired_chain_pages.contains_key(page));
+                assert_eq!(state.retired_chain_pages().get(page), entries.get(page));
+                assert!(state.retired_chain_pages().contains_key(page));
             }
         }
         let held_slot = mgr.current_slot();
@@ -1117,9 +1118,9 @@ fn shared_pending_free_tail_survives_each_commit_write_failure() {
         );
         drop(original_reader);
         drop(mgr);
-        // The loan-backed commit left a full head. Reopen naturally clears the
-        // loan map, so the next small commit prepends a partial head. Both
-        // physical slots now contain small rows instead of the bulk setup value.
+        // Reopen clears the loan map. The next small commit replaces the
+        // partial head while sharing its tail. Both physical slots then
+        // contain small rows instead of the bulk setup value.
         let mgr = TxnManager::open_with_sync(
             Box::new(CappedCommitIO::new(io.share(), MAX_BYTES)),
             dek,
@@ -1130,10 +1131,8 @@ fn shared_pending_free_tail_survives_each_commit_write_failure() {
         )
         .unwrap();
         let chain = pending_chain_pages(&mgr, mgr.current_slot().pending_free_root);
-        assert_eq!(
-            pending_free::read_page_entries(&chain[0]).unwrap().len(),
-            pending_free::MAX_ENTRIES_PER_PAGE
-        );
+        let head_entries = pending_free::read_page_entries(&chain[0]).unwrap().len();
+        assert!((1..pending_free::MAX_ENTRIES_PER_PAGE - 4).contains(&head_entries));
         commit_insert(&mgr, b"key", b"durable2");
         drop(mgr);
         io
@@ -1187,7 +1186,7 @@ fn shared_pending_free_tail_survives_each_commit_write_failure() {
                 b"durable1".as_slice()
             }
         });
-        let before_tags = mgr.state.lock().retired_chain_pages.clone();
+        let before_tags = mgr.state.lock().retired_chain_pages().clone();
         assert!(before_tags.is_empty());
 
         let mut txn = mgr.begin_write().unwrap();
@@ -1207,7 +1206,7 @@ fn shared_pending_free_tail_survives_each_commit_write_failure() {
             assert!(matches!(result, Err(Error::Io(_))));
             assert!(attempts > limit, "the write fault must actually fire");
             assert_eq!(
-                mgr.state.lock().retired_chain_pages,
+                mgr.state.lock().retired_chain_pages(),
                 before_tags,
                 "failed commit must not publish candidate metadata provenance"
             );
@@ -1227,7 +1226,7 @@ fn shared_pending_free_tail_survives_each_commit_write_failure() {
                 "newly retired head must not become a loan"
             );
             assert_eq!(
-                state.retired_chain_pages.get(&chain[0].page_id()),
+                state.retired_chain_pages().get(&chain[0].page_id()),
                 Some(&target_txn)
             );
         }
@@ -1400,16 +1399,16 @@ fn consuming_pending_head_survives_each_commit_write_failure() {
             let state = manager.state.lock();
             (
                 state.reclaimed_pages.clone(),
-                state.retired_chain_pages.clone(),
+                state.retired_chain_pages().clone(),
             )
         };
         assert!(loan.len() >= 2);
         assert!(
-            loan.iter().rev().take(2).all(|id| head_ids.contains(id)),
+            loan.iter().take(2).all(|id| head_ids.contains(id)),
             "the next body and structure loans must both be in the old head"
         );
-        let body_loan = loan[loan.len() - 1];
-        let structure_loan = loan[loan.len() - 2];
+        let body_loan = loan.last().unwrap();
+        let structure_loan = *loan.iter().nth(1).unwrap();
         let old_bytes: Vec<_> = old_ids
             .iter()
             .map(|&id| {
@@ -1446,8 +1445,8 @@ fn consuming_pending_head_survives_each_commit_write_failure() {
             assert_eq!(manager.current_slot(), before);
             assert_eq!(manager.commit_generation(), before_generation);
             let state = manager.state.lock();
-            assert_eq!(state.reclaimed_pages.as_ref(), loan.as_ref());
-            assert_eq!(state.retired_chain_pages, before_tags);
+            assert_eq!(state.reclaimed_pages, loan);
+            assert_eq!(state.retired_chain_pages(), before_tags);
         } else {
             let after = manager.current_slot();
             let next_chain = pending_chain_pages(&manager, after.pending_free_root);
@@ -1479,7 +1478,7 @@ fn consuming_pending_head_survives_each_commit_write_failure() {
             expected_tags.remove(&structure_loan);
             expected_tags.insert(old_ids[0], target_txn);
             let state = manager.state.lock();
-            assert_eq!(state.retired_chain_pages, expected_tags);
+            assert_eq!(state.retired_chain_pages(), expected_tags);
             for id in [body_loan, structure_loan, old_ids[0], before.tree_root] {
                 assert!(!state.reclaimed_pages.contains(&id));
             }
@@ -1708,7 +1707,7 @@ fn consuming_pending_head_preserves_aborted_and_restored_loans() {
     aborted.abort();
     manager.begin_write().unwrap().commit().unwrap();
     assert_eq!(manager.current_slot(), before);
-    assert_eq!(manager.state.lock().reclaimed_pages.as_ref(), loan.as_ref());
+    assert_eq!(manager.state.lock().reclaimed_pages, loan);
 
     let mut writer = manager.begin_write().unwrap();
     let snapshot = writer.begin_savepoint();
@@ -1730,8 +1729,8 @@ fn consuming_pending_head_preserves_aborted_and_restored_loans() {
     assert_eq!(new_ids.len(), old_ids.len());
     assert_eq!(new_ids[1..], old_ids[1..]);
     assert_eq!(after.high_water_mark, before.high_water_mark);
-    assert_eq!(after.tree_root, loan[loan.len() - 1]);
-    assert_eq!(after.pending_free_root, loan[loan.len() - 2]);
+    assert_eq!(after.tree_root, loan.last().unwrap());
+    assert_eq!(after.pending_free_root, *loan.iter().nth(1).unwrap());
     let mut expected = old_entries;
     assert!(expected.remove(&after.tree_root).is_some());
     assert!(expected.remove(&after.pending_free_root).is_some());
@@ -1813,7 +1812,7 @@ fn rolling_readers_bound_retired_metadata_and_survive_reopen() {
                     "{sync_mode:?}, commit {sequence}: {} pages exceed the reader window",
                     slot.high_water_mark
                 );
-                assert!(mgr.state.lock().retired_chain_pages.len() <= entries);
+                assert!(mgr.state.lock().retired_chain_pages().len() <= entries);
             }
         }
         assert_eq!(data_retirements, COMMITS);
@@ -1839,7 +1838,7 @@ fn rolling_readers_bound_retired_metadata_and_survive_reopen() {
             sync_mode,
         )
         .unwrap();
-        assert!(reopened.state.lock().retired_chain_pages.is_empty());
+        assert!(reopened.state.lock().retired_chain_pages().is_empty());
         assert!(reopened.state.lock().reclaimed_pages.is_empty());
         // No write or maintenance pass is allowed before this first new reader.
         let mut pinned = reopened.begin_read();
@@ -1881,12 +1880,12 @@ fn metadata_reused_as_data_loses_early_reclamation_provenance() {
         let oldest = mgr.begin_read();
         let mut reused = None;
         for sequence in 1..=32u64 {
-            let tags = mgr.state.lock().retired_chain_pages.clone();
+            let tags = mgr.state.lock().retired_chain_pages().clone();
             commit_insert(&mgr, b"key", &sequence.to_le_bytes());
             let root = mgr.current_slot().tree_root;
             if tags.contains_key(&root) {
                 assert!(
-                    !mgr.state.lock().retired_chain_pages.contains_key(&root),
+                    !mgr.state.lock().retired_chain_pages().contains_key(&root),
                     "a body allocation must invalidate its previous metadata lifetime"
                 );
                 reused = Some((root, sequence, mgr.begin_read()));
@@ -1899,7 +1898,7 @@ fn metadata_reused_as_data_loses_early_reclamation_provenance() {
         for sequence in 100..132u64 {
             commit_insert(&mgr, b"key", &sequence.to_le_bytes());
             let state = mgr.state.lock();
-            assert!(!state.retired_chain_pages.contains_key(&reused_page));
+            assert!(!state.retired_chain_pages().contains_key(&reused_page));
             assert!(
                 !state.reclaimed_pages.contains(&reused_page),
                 "its new data lifetime must honor the reader horizon"
@@ -1946,7 +1945,11 @@ fn early_metadata_zeroing_does_not_skip_later_reader_pinned_data() {
         // maintenance retains metadata long enough to erase it; preserve its
         // durable entries, provenance, and the original data reader throughout.
         for _ in 0..2 {
-            mgr.state.lock().reclaimed_pages = Arc::new(Vec::new());
+            {
+                let mut state = mgr.state.lock();
+                state.reclaimed_pages = ReadyPages::default();
+                state.reclaim.as_mut().unwrap().reset_ready_progress();
+            }
             let mut writer = mgr.begin_write().unwrap();
             writer.refresh_all_catalog_descriptors(&[]).unwrap();
             writer.commit().unwrap();
@@ -1961,7 +1964,7 @@ fn early_metadata_zeroing_does_not_skip_later_reader_pinned_data() {
                 state.zeroed_up_to < retired_at,
                 "metadata erasure must not advance the data watermark"
             );
-            assert!(!state.retired_chain_pages.contains_key(&original_page));
+            assert!(!state.retired_chain_pages().contains_key(&original_page));
         }
         mgr.pool.lock().clear();
         assert_eq!(
@@ -2389,7 +2392,7 @@ fn repeated_savepoint_rollback_preserves_the_reclaimed_loan_and_reader() {
     }
     writer.commit().unwrap();
     assert_eq!(manager.current_slot(), before);
-    assert_eq!(manager.state.lock().reclaimed_pages.as_ref(), loan.as_ref());
+    assert_eq!(manager.state.lock().reclaimed_pages, loan);
     commit_insert(&manager, b"key", b"committed");
     commit_insert(&control, b"key", b"committed");
     assert_eq!(
@@ -4187,5 +4190,158 @@ fn shared_manager_load_survives_failed_cache_admission_without_losing_ownership(
     manager.pool.lock().clear();
     for page in [private, uncached, admitted, cached] {
         assert_eq!(page.as_bytes(), expected.as_bytes());
+    }
+}
+
+#[test]
+fn warm_head_reclamation_keeps_work_bounded_with_a_large_pinned_tail() {
+    use citadel_page::overflow::OVERFLOW_DATA_CAPACITY;
+    for overflow_pages in [1024usize, 8192] {
+        let (dek, mac_key, dek_id) = test_keys();
+        let io = MemIO::new(1024 * 1024);
+        let mgr = TxnManager::create_with_sync(
+            Box::new(CappedCommitIO::new(io.share(), 192 * 1024 * 1024)),
+            dek,
+            mac_key,
+            1,
+            0x1234,
+            dek_id,
+            256,
+            SyncMode::Off,
+        )
+        .unwrap();
+        let mut writer = mgr.begin_write().unwrap();
+        writer.insert(b"anchor", b"original").unwrap();
+        writer
+            .insert(
+                b"temporary",
+                &vec![0x5a; overflow_pages * OVERFLOW_DATA_CAPACITY],
+            )
+            .unwrap();
+        writer.commit().unwrap();
+        let mut oldest = mgr.begin_read();
+        let mut writer = mgr.begin_write().unwrap();
+        assert!(writer.delete(b"temporary").unwrap());
+        writer.commit().unwrap();
+
+        // Reach a head-local body loan. A second head loan can fund the
+        // replacement; when the body consumes the last loan, fresh structure
+        // must also preserve the large pinned tail.
+        let mut ready = false;
+        for sequence in 0..64u64 {
+            commit_insert(&mgr, b"anchor", &sequence.to_le_bytes());
+            let slot = mgr.current_slot();
+            let chain = pending_chain_pages(&mgr, slot.pending_free_root);
+            assert!(chain.len() >= 2);
+            let head_ids: FxHashSet<_> = pending_free::read_page_entries(&chain[0])
+                .unwrap()
+                .map(|entry| entry.page_id)
+                .collect();
+            let state = mgr.state.lock();
+            let first: Vec<_> = state.reclaimed_pages.iter().take(2).copied().collect();
+            if !first.is_empty() && first.iter().all(|id| head_ids.contains(id)) {
+                ready = true;
+                break;
+            }
+        }
+        assert!(ready, "fixture must reach a head-local commit");
+        for sequence in 0..32u64 {
+            commit_insert(&mgr, b"anchor", &(sequence + 100).to_le_bytes());
+            let (decoded, work) = mgr.state.lock().last_reclaim_work.unwrap();
+            assert_eq!(decoded, 0, "validated tail must not be decoded again");
+            assert_eq!(work.rewrite_entries, 0, "step {sequence}: {work:?}");
+            assert!(
+                work.head_entries <= 3 * pending_free::MAX_ENTRIES_PER_PAGE,
+                "step {sequence}: {work:?}"
+            );
+            assert!(
+                work.eligibility_entries < pending_free::MAX_ENTRIES_PER_PAGE,
+                "step {sequence}: {work:?}"
+            );
+        }
+        assert_eq!(oldest.get(b"anchor").unwrap(), Some(b"original".to_vec()));
+        drop(oldest);
+        commit_insert(&mgr, b"anchor", b"released");
+        assert_eq!(
+            mgr.begin_read().get(b"anchor").unwrap(),
+            Some(b"released".to_vec())
+        );
+        assert!(mgr.integrity_check().unwrap().is_ok());
+    }
+}
+
+#[test]
+fn invalid_new_retirements_leave_commit_io_and_published_state_unchanged() {
+    for sync_mode in [SyncMode::Off, SyncMode::Full] {
+        for damage in 0..3 {
+            let (dek, mac_key, dek_id) = test_keys();
+            let io = MemIO::new(1024 * 1024);
+            let recorder = CommitIoRecorder::default();
+            let mgr = TxnManager::create_with_sync(
+                Box::new(RecordingCommitIO {
+                    inner: io.share(),
+                    recorder: recorder.clone(),
+                }),
+                dek,
+                mac_key,
+                1,
+                0x1234,
+                dek_id,
+                256,
+                sync_mode,
+            )
+            .unwrap();
+            commit_insert(&mgr, b"anchor", b"original");
+            commit_insert(&mgr, b"anchor", b"original");
+            let before = mgr.current_slot();
+            let generation = mgr.commit_generation();
+            let bytes = io.data.lock().unwrap().clone();
+            let loans = mgr.state.lock().reclaimed_pages.clone();
+            let tags = mgr.state.lock().retired_chain_pages();
+            let writer = mgr.begin_write().unwrap();
+            let mut alloc = PageAllocator::new(before.high_water_mark);
+            match damage {
+                0 => {
+                    let fresh = alloc.allocate().unwrap();
+                    alloc.free(fresh);
+                    alloc.free(fresh);
+                }
+                1 => alloc.free(PageId(alloc.high_water_mark())),
+                _ => {
+                    assert!(before.pending_free_root.is_valid());
+                    alloc.free(before.pending_free_root);
+                }
+            }
+            let tree =
+                BTree::from_existing(before.tree_root, before.tree_depth, before.tree_entries);
+            recorder.arm();
+            let result = mgr.commit_write(
+                writer.txn_id(),
+                writer.txn_id(),
+                &mut OwnedPages::default(),
+                &mut alloc,
+                &tree,
+                &before,
+                before.catalog_root,
+                &FxHashMap::default(),
+                &FxHashMap::default(),
+                &FxHashSet::default(),
+                true,
+            );
+            assert!(result.is_err(), "{sync_mode:?}, damage {damage}");
+            assert_eq!(recorder.effects(), CommitIoEffects::default());
+            assert_eq!(*io.data.lock().unwrap(), bytes);
+            assert_eq!(mgr.current_slot(), before);
+            assert_eq!(mgr.commit_generation(), generation);
+            assert_eq!(mgr.state.lock().reclaimed_pages, loans);
+            assert_eq!(mgr.state.lock().retired_chain_pages(), tags);
+            drop(writer);
+            commit_insert(&mgr, b"anchor", b"retry-ok");
+            assert_eq!(
+                mgr.begin_read().get(b"anchor").unwrap(),
+                Some(b"retry-ok".to_vec())
+            );
+            assert!(mgr.integrity_check().unwrap().is_ok());
+        }
     }
 }

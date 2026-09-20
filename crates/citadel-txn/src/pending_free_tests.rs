@@ -1,5 +1,36 @@
 use super::*;
 
+// Fixture support for testing metadata provenance through the canonical engine.
+// Only exact committed retirement tags survive successful publication.
+impl ChainSnapshot {
+    fn process_with_metadata_fixture(
+        self,
+        pages: &mut impl MutablePageMap,
+        alloc: &mut PageAllocator,
+        loan_pool: &mut Vec<PageId>,
+        commit: &ChainCommit<'_>,
+        metadata: &mut FxHashMap<PageId, TxnId>,
+    ) -> Result<(PageId, Vec<PendingFreeEntry>)> {
+        let prior_txn = self.max_txn;
+        let mut state =
+            CommittedReclaim::from_snapshot(self, alloc.high_water_mark(), prior_txn, metadata);
+        let mut loans = ReadyPages::from_pop_order(loan_pool.iter().rev().copied().collect());
+        let result = state.prepare(pages, alloc, &mut loans, commit);
+        loan_pool.clear();
+        while let Some(id) = loans.pop() {
+            loan_pool.push(id);
+        }
+        loan_pool.reverse();
+        let prepared = result?;
+        prepared.seal_staged_pages(pages);
+        let root = prepared.root();
+        let available = state.available_after(&prepared, commit.reclaim_horizon);
+        state.publish(prepared, alloc.high_water_mark());
+        *metadata = state.metadata_retirements();
+        Ok((root, available))
+    }
+}
+
 #[test]
 fn exhaustion_propagates_from_prepend_and_full_chain_rewrite() {
     for rewrite in [false, true] {
@@ -91,6 +122,7 @@ fn write_and_read_chain() {
     assert_eq!(read_back[0], entries[0]);
     assert_eq!(read_back[1], entries[1]);
     assert_eq!(read_back[2], entries[2]);
+    assert!(ids.iter().all(|id| pages[id].verify_checksum()));
 }
 
 #[test]
@@ -110,6 +142,7 @@ fn write_chain_multi_page() {
     let root = write_chain(&mut pages, TxnId(999), &entries, &ids);
     let read_back = read_chain(&pages, root).unwrap();
     assert_eq!(read_back.len(), count);
+    assert!(ids.iter().all(|id| pages[id].verify_checksum()));
 
     for (i, entry) in read_back.iter().enumerate() {
         assert_eq!(entry.page_id, PageId(100 + i as u32));
@@ -148,7 +181,7 @@ fn collect_chain_pages() {
 #[test]
 fn process_chain_availability_retains_entries() {
     let mut pages = FxHashMap::default();
-    let mut alloc = PageAllocator::new(0);
+    let mut alloc = PageAllocator::new(10_000);
 
     let initial_entries = vec![
         PendingFreeEntry {
@@ -203,7 +236,7 @@ fn process_chain_availability_retains_entries() {
 #[test]
 fn process_chain_drops_consumed_entries() {
     let mut pages = FxHashMap::default();
-    let mut alloc = PageAllocator::new(0);
+    let mut alloc = PageAllocator::new(10_000);
 
     let initial_entries = vec![
         PendingFreeEntry {
@@ -270,7 +303,7 @@ fn process_chain_structure_consumes_loan_pool() {
         &ChainCommit {
             txn_id: TxnId(2),
             current_root: root,
-            freed_this_txn: &[],
+            freed_this_txn: &[PageId(30)],
             consumed: &FxHashSet::default(),
             reclaim_horizon: TxnId(u64::MAX),
         },
@@ -292,7 +325,7 @@ fn process_chain_structure_consumes_loan_pool() {
 #[test]
 fn process_chain_freed_this_txn_never_available() {
     let mut pages = FxHashMap::default();
-    let mut alloc = PageAllocator::new(0);
+    let mut alloc = PageAllocator::new(10_000);
 
     let (new_root, available) = process_chain(
         &mut pages,
@@ -323,7 +356,7 @@ fn process_chain_freed_this_txn_never_available() {
 #[test]
 fn process_chain_all_consumed_drops_all_entries() {
     let mut pages = FxHashMap::default();
-    let mut alloc = PageAllocator::new(0);
+    let mut alloc = PageAllocator::new(10_000);
 
     let initial = vec![
         PendingFreeEntry {
@@ -396,7 +429,7 @@ fn process_chain_multipage_structure_from_loan_pool() {
         &ChainCommit {
             txn_id: TxnId(2),
             current_root: root,
-            freed_this_txn: &[],
+            freed_this_txn: &[PageId(9000)],
             consumed: &FxHashSet::default(),
             reclaim_horizon: TxnId(5),
         },
@@ -408,8 +441,8 @@ fn process_chain_multipage_structure_from_loan_pool() {
 
     let entries = read_chain(&pages, new_root).unwrap();
     // Surviving data entries plus the 2 old structure pages; the two loan
-    // pages dropped their entries, so the chain does not grow.
-    assert_eq!(entries.len(), count);
+    // pages dropped their entries; one current free adds one entry.
+    assert_eq!(entries.len(), count + 1);
     for id in [PageId(1000), PageId(1001)] {
         assert!(
             !entries.iter().any(|e| e.page_id == id),
@@ -485,6 +518,10 @@ fn chain_snapshot_reads_each_page_once_and_processes_without_old_pages_in_write_
         .unwrap();
 
     let mut expected = initial.clone();
+    expected.push(PendingFreeEntry {
+        page_id: root,
+        freed_at_txn: TxnId(9),
+    });
     expected.extend(freed.iter().map(|&page_id| PendingFreeEntry {
         page_id,
         freed_at_txn: TxnId(9),
@@ -499,8 +536,10 @@ fn chain_snapshot_reads_each_page_once_and_processes_without_old_pages_in_write_
     assert_same_entries(&result.entries, &expected);
     assert_same_entries(&available, &initial);
     assert!(old_ids.iter().all(|page_id| !pages.contains_key(page_id)));
-    assert_eq!(pages.len(), 1);
-    assert_eq!(pages[&new_root].right_child(), root);
+    assert_eq!(pages.len(), 2, "only the full head is split into new pages");
+    let next = pages[&new_root].right_child();
+    assert_eq!(pages[&next].right_child(), old_ids[1]);
+    assert!(!result.page_ids.contains(&root));
 }
 
 #[test]
@@ -556,7 +595,7 @@ fn prepend_packs_the_head_and_preserves_sparse_tails() {
                 )
                 .unwrap();
 
-                let replaced = freed_count != 0 && head_count < MAX_ENTRIES_PER_PAGE;
+                let replaced = freed_count != 0;
                 let mut expected = initial.clone();
                 if replaced {
                     expected.push(PendingFreeEntry {
@@ -583,18 +622,27 @@ fn prepend_packs_the_head_and_preserves_sparse_tails() {
                 let prefix_pages = chain_pages_needed(prefix_entries);
                 assert_eq!(alloc.high_water_mark(), hwm + prefix_pages as u32);
                 let mut current = root;
-                for i in 0..prefix_pages {
+                let mut stored_prefix_entries = 0;
+                for _ in 0..prefix_pages {
                     assert!(current.as_u32() >= hwm);
                     let page = &pages[&current];
-                    let expected_count = if i == 0 {
-                        prefix_entries - (prefix_pages - 1) * MAX_ENTRIES_PER_PAGE
-                    } else {
-                        MAX_ENTRIES_PER_PAGE
-                    };
-                    assert_eq!(read_entry_count(page), expected_count);
+                    let count = read_entry_count(page);
+                    assert!((1..=MAX_ENTRIES_PER_PAGE).contains(&count));
+                    stored_prefix_entries += count;
                     current = page.right_child();
                 }
+                assert_eq!(stored_prefix_entries, prefix_entries);
                 assert_eq!(current, old_ids[usize::from(replaced)]);
+                if replaced {
+                    assert_eq!(
+                        read_page_entries(&pages[&root]).unwrap().next(),
+                        Some(PendingFreeEntry {
+                            page_id: old_ids[0],
+                            freed_at_txn: TxnId(9),
+                        }),
+                        "next-commit metadata stays at the new head"
+                    );
+                }
             }
         }
     }
@@ -613,7 +661,7 @@ fn a_pinned_horizon_retires_at_most_one_chain_page_per_append() {
             .iter()
             .map(|id| pages[id].as_bytes().to_vec())
             .collect();
-        let replaced = root.is_valid() && read_entry_count(&pages[&root]) < MAX_ENTRIES_PER_PAGE;
+        let replaced = root.is_valid();
         let freed = [alloc.allocate().unwrap(), alloc.allocate().unwrap()];
         ordinary_frees += freed.len();
         retired_heads += usize::from(replaced);
@@ -710,23 +758,21 @@ fn an_unchanged_chain_becomes_loanable_after_reader_release() {
         },
     )
     .unwrap();
-    let new_ids = collect_chain_page_ids(&pages, next).unwrap();
-    assert!(new_ids
-        .iter()
-        .all(|id| initial.iter().any(|entry| entry.page_id == *id)));
+    assert_eq!(
+        next, root,
+        "eligible loans alone do not require rewriting metadata"
+    );
+    assert_eq!(collect_chain_page_ids(&pages, next).unwrap(), old_ids);
     assert_eq!(alloc.high_water_mark(), hwm);
-    let surviving: Vec<_> = initial
-        .iter()
-        .filter(|entry| !new_ids.contains(&entry.page_id))
-        .copied()
-        .collect();
-    assert_same_entries(&available, &surviving);
-    let mut expected = surviving;
-    expected.extend(old_ids.iter().map(|&page_id| PendingFreeEntry {
-        page_id,
-        freed_at_txn: TxnId(5),
-    }));
-    assert_same_entries(&read_chain(&pages, next).unwrap(), &expected);
+    assert_eq!(
+        loans,
+        initial
+            .iter()
+            .map(|entry| entry.page_id)
+            .collect::<Vec<_>>()
+    );
+    assert_same_entries(&available, &initial);
+    assert_same_entries(&read_chain(&pages, next).unwrap(), &initial);
     for (id, bytes) in old_ids.iter().zip(&old_bytes) {
         assert_eq!(pages[id].as_bytes().as_slice(), bytes);
     }
@@ -876,7 +922,7 @@ fn metadata_eligibility_requires_the_exact_retirement_and_an_intervening_commit(
         let snapshot =
             ChainSnapshot::read(root, |id| pages.get(&id).ok_or(Error::DatabaseCorrupted)).unwrap();
         let (next, available) = snapshot
-            .process_with_metadata(
+            .process_with_metadata_fixture(
                 &mut pages,
                 &mut alloc,
                 &mut Vec::new(),
@@ -900,6 +946,10 @@ fn metadata_eligibility_requires_the_exact_retirement_and_an_intervening_commit(
             .collect();
         assert_same_entries(&available, &expected);
         assert_eq!(metadata.get(&root), Some(&TxnId(5)));
+        assert!(
+            !metadata.contains_key(&PageId(11)),
+            "the mismatched age is not canonical provenance"
+        );
         assert!(!metadata.contains_key(&PageId(20)));
         if rewrite {
             assert!(!metadata.contains_key(&PageId(12)));
@@ -913,7 +963,7 @@ fn metadata_eligibility_requires_the_exact_retirement_and_an_intervening_commit(
         let snapshot =
             ChainSnapshot::read(next, |id| pages.get(&id).ok_or(Error::DatabaseCorrupted)).unwrap();
         let (same, available) = snapshot
-            .process_with_metadata(
+            .process_with_metadata_fixture(
                 &mut pages,
                 &mut alloc,
                 &mut Vec::new(),
@@ -962,7 +1012,7 @@ fn metadata_tags_follow_final_structure_consumption_at_the_loan_boundary() {
         let snapshot =
             ChainSnapshot::read(root, |id| pages.get(&id).ok_or(Error::DatabaseCorrupted)).unwrap();
         let (next, available) = snapshot
-            .process_with_metadata(
+            .process_with_metadata_fixture(
                 &mut pages,
                 &mut alloc,
                 &mut loans,
@@ -1399,7 +1449,7 @@ mod head_consuming_cow {
             // Processing a validated snapshot must not require loading its shared tail again.
             let mut written = FxHashMap::default();
             let (root, available) = snapshot
-                .process_with_metadata(
+                .process_with_metadata_fixture(
                     &mut written,
                     &mut fixture.alloc,
                     &mut loans,
@@ -1448,6 +1498,9 @@ mod head_consuming_cow {
             assert_same_entries(&read_chain(&combined, root).unwrap(), &expected);
             assert_same_entries(&available, &eligible(&surviving, &prior_metadata, TxnId(2)));
             let mut expected_metadata = prior_metadata;
+            // This entry remains pending, but its stale metadata age was ignored.
+            expected_metadata.remove(&fixture.entries[3].page_id);
+            assert!(!metadata.contains_key(&fixture.entries[3].page_id));
             expected_metadata.insert(fixture.ids[0], TxnId(9));
             assert_eq!(metadata, expected_metadata, "shared tails are not retired");
         }
@@ -1463,7 +1516,7 @@ mod head_consuming_cow {
             let mut metadata = fixture.metadata();
             let mut written = FxHashMap::default();
             let (root, available) = snapshot
-                .process_with_metadata(
+                .process_with_metadata_fixture(
                     &mut written,
                     &mut fixture.alloc,
                     &mut vec![replacement],
@@ -1492,7 +1545,7 @@ mod head_consuming_cow {
             .unwrap();
             let mut next_writes = FxHashMap::default();
             let (same, next_available) = snapshot
-                .process_with_metadata(
+                .process_with_metadata_fixture(
                     &mut next_writes,
                     &mut fixture.alloc,
                     &mut Vec::new(),
@@ -1531,7 +1584,7 @@ mod head_consuming_cow {
         metadata.insert(replacement, TxnId(1));
         let mut written = FxHashMap::default();
         let (root, available) = snapshot
-            .process_with_metadata(
+            .process_with_metadata_fixture(
                 &mut written,
                 &mut fixture.alloc,
                 &mut vec![replacement],
@@ -1584,7 +1637,7 @@ mod head_consuming_cow {
         let mut written = FxHashMap::default();
         let high_water_mark = fixture.alloc.high_water_mark();
         let (root, available) = snapshot
-            .process_with_metadata(
+            .process_with_metadata_fixture(
                 &mut written,
                 &mut fixture.alloc,
                 &mut vec![PageId(0)],
@@ -1637,7 +1690,7 @@ mod head_consuming_cow {
         let mut written = FxHashMap::default();
         let high_water_mark = fixture.alloc.high_water_mark();
         let (root, available) = snapshot
-            .process_with_metadata(
+            .process_with_metadata_fixture(
                 &mut written,
                 &mut fixture.alloc,
                 &mut vec![replacement],
@@ -1689,9 +1742,7 @@ mod head_consuming_cow {
     enum Fallback {
         TailConsumption,
         TooManyFrees,
-        NoLoan,
         LoanAtTail,
-        UnknownConsumption,
     }
 
     fn check_fallback(reason: Fallback) {
@@ -1709,11 +1760,7 @@ mod head_consuming_cow {
                     .map(|index| PageId(5000 + index as u32))
                     .collect();
             }
-            Fallback::NoLoan => loans.clear(),
             Fallback::LoanAtTail => loans.push(fixture.entries[fixture.head_len].page_id),
-            Fallback::UnknownConsumption => {
-                consumed.insert(PageId(9001));
-            }
         }
         let offered_loans = loans.clone();
         let mut metadata = fixture.metadata();
@@ -1721,7 +1768,7 @@ mod head_consuming_cow {
         let high_water_mark = fixture.alloc.high_water_mark();
         let mut written = FxHashMap::default();
         let (root, available) = snapshot
-            .process_with_metadata(
+            .process_with_metadata_fixture(
                 &mut written,
                 &mut fixture.alloc,
                 &mut loans,
@@ -1802,8 +1849,76 @@ mod head_consuming_cow {
     }
 
     #[test]
-    fn no_remaining_loan_rewrites_the_chain() {
-        check_fallback(Fallback::NoLoan);
+    fn no_remaining_loan_replaces_or_splits_only_the_head_with_fresh_pages() {
+        for head_len in [8, MAX_ENTRIES_PER_PAGE] {
+            let mut fixture = Fixture::new(head_len);
+            let snapshot = fixture.snapshot();
+            let consumed: FxHashSet<_> = [fixture.entries[0].page_id].into_iter().collect();
+            let freed = [PageId(9000)];
+            let mut metadata = fixture.metadata();
+            let previous_metadata = metadata.clone();
+            let high_water_mark = fixture.alloc.high_water_mark();
+            let mut written = FxHashMap::default();
+            let (root, available) = snapshot
+                .process_with_metadata_fixture(
+                    &mut written,
+                    &mut fixture.alloc,
+                    &mut Vec::new(),
+                    &ChainCommit {
+                        txn_id: TxnId(9),
+                        current_root: fixture.ids[0],
+                        freed_this_txn: &freed,
+                        consumed: &consumed,
+                        reclaim_horizon: TxnId(2),
+                    },
+                    &mut metadata,
+                )
+                .unwrap();
+            let prefix_pages = chain_pages_needed(head_len - consumed.len() + freed.len() + 1);
+            assert_eq!(written.len(), prefix_pages);
+            assert_eq!(
+                fixture.alloc.high_water_mark(),
+                high_water_mark + prefix_pages as u32
+            );
+            assert!(written
+                .iter()
+                .all(|(id, page)| { id.as_u32() >= high_water_mark && page.verify_checksum() }));
+            let combined = fixture.combined(&written);
+            let structure = collect_chain_page_ids(&combined, root).unwrap();
+            assert_eq!(&structure[prefix_pages..], &fixture.ids[1..]);
+            assert!(!structure.contains(&fixture.ids[0]));
+            let surviving: Vec<_> = fixture
+                .entries
+                .iter()
+                .filter(|entry| !consumed.contains(&entry.page_id))
+                .copied()
+                .collect();
+            assert_same_entries(
+                &available,
+                &eligible(&surviving, &previous_metadata, TxnId(2)),
+            );
+            let mut expected = surviving;
+            expected.extend([fixture.ids[0], freed[0]].map(|page_id| PendingFreeEntry {
+                page_id,
+                freed_at_txn: TxnId(9),
+            }));
+            assert_same_entries(&read_chain(&combined, root).unwrap(), &expected);
+            let mut expected_metadata = previous_metadata;
+            // This entry remains pending, but its stale metadata age was ignored.
+            expected_metadata.remove(&fixture.entries[3].page_id);
+            assert!(!metadata.contains_key(&fixture.entries[3].page_id));
+            for id in &consumed {
+                expected_metadata.remove(id);
+            }
+            expected_metadata.insert(fixture.ids[0], TxnId(9));
+            assert_eq!(metadata, expected_metadata);
+            for id in &fixture.ids {
+                assert_eq!(combined[id].as_bytes(), fixture.pages[id].as_bytes());
+            }
+            for id in consumed.iter().chain(&structure) {
+                assert!(!metadata.contains_key(id));
+            }
+        }
     }
 
     #[test]
@@ -1813,9 +1928,33 @@ mod head_consuming_cow {
 
     #[test]
     fn an_unknown_consumed_id_cannot_authorize_head_sharing() {
-        // Preserve the existing full-rewrite handling of an unknown consumed ID;
-        // its absence must not count as a removed head entry in the size proof.
-        check_fallback(Fallback::UnknownConsumption);
+        let mut fixture = Fixture::new(8);
+        let snapshot = fixture.snapshot();
+        let consumed = [fixture.entries[0].page_id, PageId(9001)]
+            .into_iter()
+            .collect();
+        let mut loans = vec![fixture.entries[2].page_id];
+        let before_loans = loans.clone();
+        let mut metadata = fixture.metadata();
+        let before_metadata = metadata.clone();
+        let mut written = FxHashMap::default();
+        let result = snapshot.process_with_metadata_fixture(
+            &mut written,
+            &mut fixture.alloc,
+            &mut loans,
+            &ChainCommit {
+                txn_id: TxnId(9),
+                current_root: fixture.ids[0],
+                freed_this_txn: &[PageId(9000)],
+                consumed: &consumed,
+                reclaim_horizon: TxnId(2),
+            },
+            &mut metadata,
+        );
+        assert!(matches!(result, Err(Error::DatabaseCorrupted)));
+        assert!(written.is_empty());
+        assert_eq!(loans, before_loans);
+        assert_eq!(metadata, before_metadata);
     }
 
     #[test]
