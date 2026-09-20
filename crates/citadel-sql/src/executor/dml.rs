@@ -4063,12 +4063,14 @@ fn build_bind_plan(
 
 impl CompiledInsert {
     pub fn try_compile(schema: &SchemaManager, stmt: &InsertStmt) -> Option<Self> {
-        let lower = stmt.table.to_ascii_lowercase();
+        let mut lower = stmt.table.to_ascii_lowercase();
         // Matview names resolve to their backing table; only the interpreted
         // path raises the modification error.
         let cached = if schema.get_matview(&lower).is_some() {
             None
         } else if let Some(ts) = schema.get(&lower) {
+            // Direct storage access must use the resolved TEMP/table identity.
+            lower.clone_from(&ts.name);
             let insert_columns: Vec<&str> = if stmt.columns.is_empty() {
                 ts.columns.iter().map(|c| c.name.as_str()).collect()
             } else {

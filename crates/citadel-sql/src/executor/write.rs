@@ -2767,7 +2767,7 @@ fn try_fast_update_in_txn(
     let strict = table_schema.is_strict();
     let cancel = wtx.cancel_token().cloned();
     let cancel = cancel.as_ref();
-    let lower_name = stmt.table.to_ascii_lowercase();
+    let lower_name = table_schema.name.clone();
     let pk_changed_by_set = stmt.assignments.iter().any(|(col_name, _)| {
         table_schema
             .column_index(col_name)
