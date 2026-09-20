@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use std::sync::{Arc, OnceLock};
 
-use citadel_buffer::allocator::PageAllocator;
+use citadel_buffer::allocator::{PageAllocator, ReadyPages};
 use citadel_buffer::btree::BTree;
 use citadel_buffer::cursor::{MutablePageMap, PageMap};
 use citadel_buffer::pool::BufferPool;
@@ -380,18 +380,43 @@ struct ManagerState {
     /// the reclaim horizon is the min snapshot still referenced. Values are
     /// refcounts: concurrent readers share a snapshot.
     reader_table: BTreeMap<TxnId, usize>,
-    /// Reusable free pages, a RAM cache of the durable pending-free chain:
-    /// shared immutably with the writer and re-derived every commit, so an
-    /// abort/no-op/shutdown never strands a page.
-    reclaimed_pages: Arc<Vec<PageId>>,
-    /// Known metadata retirements retain their durable age but need no data
-    /// reader horizon. Empty on reopen: no pre-open reader can survive it.
-    retired_chain_pages: FxHashMap<PageId, TxnId>,
+    /// Published loans retain immutable batches across writers and savepoints.
+    reclaimed_pages: ReadyPages,
+    /// Validated committed chain and incremental retirement indexes. Writers
+    /// prepare changes privately and publish them with the successful slot.
+    reclaim: Option<Box<pending_free::CommittedReclaim>>,
+    #[cfg(test)]
+    last_reclaim_work: Option<(usize, pending_free::ReclaimWork)>,
     /// Secure delete: highest freed_at_txn whose available data pages have been
     /// zero-filled. RAM-only; a reopen re-zeroes once, which is harmless.
     zeroed_up_to: TxnId,
     zeroed_chain_up_to: TxnId,
     recycled_pages: Option<OwnedPages>,
+}
+
+/// A writer temporarily owns the committed cache while preparing publication.
+/// Errors restore that unchanged cache; successful publication takes it first.
+struct ReclaimGuard<'a> {
+    manager: &'a TxnManager,
+    committed: Option<Box<pending_free::CommittedReclaim>>,
+}
+
+impl Drop for ReclaimGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(committed) = self.committed.take() {
+            self.manager.state.lock().reclaim = Some(committed);
+        }
+    }
+}
+
+#[cfg(test)]
+impl ManagerState {
+    fn retired_chain_pages(&self) -> FxHashMap<PageId, TxnId> {
+        self.reclaim
+            .as_ref()
+            .map(|state| state.metadata_retirements())
+            .unwrap_or_default()
+    }
 }
 
 /// A stable on-disk commit-slot snapshot held while writers are excluded.
@@ -507,8 +532,10 @@ impl TxnManager {
                 cached_god_byte: active_slot as u8 & GOD_BIT_ACTIVE_SLOT,
                 cached_file_size: file_size,
                 reader_table: BTreeMap::new(),
-                reclaimed_pages: Arc::new(Vec::new()),
-                retired_chain_pages: FxHashMap::default(),
+                reclaimed_pages: ReadyPages::default(),
+                reclaim: None,
+                #[cfg(test)]
+                last_reclaim_work: None,
                 zeroed_up_to: TxnId(0),
                 zeroed_chain_up_to: TxnId(0),
                 recycled_pages: None,
@@ -625,8 +652,10 @@ impl TxnManager {
                 cached_god_byte: 0,
                 cached_file_size: file_size,
                 reader_table: BTreeMap::new(),
-                reclaimed_pages: Arc::new(Vec::new()),
-                retired_chain_pages: FxHashMap::default(),
+                reclaimed_pages: ReadyPages::default(),
+                reclaim: None,
+                #[cfg(test)]
+                last_reclaim_work: None,
                 zeroed_up_to: TxnId(0),
                 zeroed_chain_up_to: TxnId(0),
                 recycled_pages: None,
@@ -722,15 +751,11 @@ impl TxnManager {
         let snapshot = state.current_slot.clone();
         // Keep the shared loan in state and the durable chain until a commit
         // records its consumption.
-        let reclaimed =
-            (!state.reclaimed_pages.is_empty()).then(|| Arc::clone(&state.reclaimed_pages));
+        let reclaimed = state.reclaimed_pages.clone();
         let recycled = state.recycled_pages.take();
         drop(state);
 
-        let alloc = match reclaimed {
-            Some(pages) => PageAllocator::with_ready_pages(snapshot.high_water_mark, pages),
-            None => PageAllocator::new(snapshot.high_water_mark),
-        };
+        let alloc = PageAllocator::with_ready(snapshot.high_water_mark, reclaimed);
 
         let tree = BTree::from_existing(
             snapshot.tree_root,
@@ -924,13 +949,14 @@ impl TxnManager {
             return Ok(generation);
         }
 
-        let (active_slot, reclaim_horizon, current_god_byte, cached_file_size) = {
-            let state = self.state.lock();
+        let (active_slot, reclaim_horizon, current_god_byte, cached_file_size, committed_reclaim) = {
+            let mut state = self.state.lock();
             (
                 state.active_slot,
                 self.reclaim_horizon_locked(&state),
                 state.cached_god_byte,
                 state.cached_file_size,
+                state.reclaim.take(),
             )
         };
         let inactive_slot_idx = 1 - active_slot;
@@ -938,20 +964,24 @@ impl TxnManager {
         // Validate durable reclaim metadata before touching allocator state or
         // the recovery marker, so a structural error leaves this process and
         // the next open on the unchanged committed slot.
-        let pending_free = self.load_pending_free_chain(
-            pages,
-            old_slot.pending_free_root,
-            old_slot.high_water_mark,
-            old_slot.txn_id,
-            alloc.ready_count(),
-        )?;
-        // Publish provenance only with the new slot. Failed commits must leave
-        // the current slot's classifications unchanged.
-        let mut retired_chain_pages = self.state.lock().retired_chain_pages.clone();
-
-        if self.sync_mode != citadel_core::types::SyncMode::Off {
-            let recovery_god_byte = current_god_byte | GOD_BIT_RECOVERY;
-            write_god_byte(&*self.io, recovery_god_byte)?;
+        let mut reclaim = ReclaimGuard {
+            manager: self,
+            committed: committed_reclaim,
+        };
+        let needs_reclaim_load = !reclaim.committed.as_ref().is_some_and(|state| {
+            state.matches(
+                old_slot.pending_free_root,
+                old_slot.high_water_mark,
+                old_slot.txn_id,
+            )
+        });
+        if needs_reclaim_load {
+            reclaim.committed = Some(Box::new(self.load_pending_free_chain(
+                pages,
+                old_slot.pending_free_root,
+                old_slot.high_water_mark,
+                old_slot.txn_id,
+            )?));
         }
 
         // Reclaimed allocations are below the committed high water mark;
@@ -974,22 +1004,41 @@ impl TxnManager {
         // Data-page reuse respects readers; metadata needs only recovery-slot
         // protection. The unconsumed loan remainder supplies the chain
         // rewrite's structure pages.
-        let mut loan_pool = alloc.take_ready_to_use();
-        let (new_pf_root, available) = {
-            pending_free.process_with_metadata(
-                pages,
-                alloc,
-                &mut loan_pool,
-                &pending_free::ChainCommit {
-                    txn_id,
-                    current_root: old_slot.pending_free_root,
-                    freed_this_txn: &freed_this_txn,
-                    consumed: &consumed,
-                    reclaim_horizon,
-                },
-                &mut retired_chain_pages,
-            )?
-        };
+        let mut loan_pool = alloc.take_ready();
+        let prepared_reclaim = reclaim.committed.as_ref().unwrap().prepare(
+            pages,
+            alloc,
+            &mut loan_pool,
+            &pending_free::ChainCommit {
+                txn_id,
+                current_root: old_slot.pending_free_root,
+                freed_this_txn: &freed_this_txn,
+                consumed: &consumed,
+                reclaim_horizon,
+            },
+        )?;
+        #[cfg(test)]
+        let reclaim_work = (
+            if needs_reclaim_load {
+                reclaim
+                    .committed
+                    .as_ref()
+                    .unwrap()
+                    .initial_decoded_entries()
+            } else {
+                0
+            },
+            prepared_reclaim.work(),
+        );
+        let new_pf_root = prepared_reclaim.root();
+        let next_loans = prepared_reclaim.ready_pages();
+
+        // Both the committed metadata and the new delta are checked before
+        // changing the recovery marker. Staged pages remain writer-private.
+        if self.sync_mode != citadel_core::types::SyncMode::Off {
+            let recovery_god_byte = current_god_byte | GOD_BIT_RECOVERY;
+            write_god_byte(&*self.io, recovery_god_byte)?;
+        }
 
         // Reclamation above can stage metadata pages. Select the final dirty
         // set through immutable access before any Arc-backed page mutation;
@@ -1138,27 +1187,19 @@ impl TxnManager {
             let zeros = [0u8; PAGE_SIZE];
             let mut high = zeroed_up_to;
             let mut chain_high = zeroed_chain_up_to;
-            for entry in &available {
-                // The newest retirement may still belong to the inactive slot.
-                // Preserve it until a later commit has replaced that slot.
-                if entry.freed_at_txn >= old_slot.txn_id {
-                    continue;
-                }
-                let is_chain = retired_chain_pages.get(&entry.page_id) == Some(&entry.freed_at_txn);
-                let watermark = if is_chain {
-                    zeroed_chain_up_to
+            for (entry, is_chain) in reclaim.committed.as_ref().unwrap().zero_candidates(
+                &prepared_reclaim,
+                zeroed_up_to,
+                zeroed_chain_up_to,
+            ) {
+                self.io.write_page(page_offset(entry.page_id), &zeros)?;
+                if is_chain {
+                    chain_high = chain_high.max(entry.freed_at_txn);
                 } else {
-                    zeroed_up_to
-                };
-                if entry.freed_at_txn > watermark {
-                    self.io.write_page(page_offset(entry.page_id), &zeros)?;
-                    if is_chain {
-                        chain_high = chain_high.max(entry.freed_at_txn);
-                    } else {
-                        high = high.max(entry.freed_at_txn);
-                    }
+                    high = high.max(entry.freed_at_txn);
                 }
             }
+
             Some((high, chain_high))
         } else {
             None
@@ -1241,6 +1282,15 @@ impl TxnManager {
         // locks. Recycle only empty buckets after successful publication.
         pages.clear();
 
+        // The durable slot succeeded. Update the writer-owned metadata before
+        // taking the publication lock, so index maintenance and old-chain
+        // destruction do not block readers entering their snapshots.
+        reclaim
+            .committed
+            .as_mut()
+            .unwrap()
+            .publish(prepared_reclaim, alloc.high_water_mark());
+
         let generation = {
             let mut state = self.state.lock();
             state.active_slot = inactive_slot_idx;
@@ -1250,13 +1300,13 @@ impl TxnManager {
             state.current_slot = Arc::new(new_slot);
             state.cached_god_byte = new_god_byte;
             state.cached_file_size = new_file_size;
-            // Availability is re-derived from the durable chain every commit,
-            // so an abort, no-op commit, or shutdown strands nothing.
-            // The allocator pops from the end. Prefer entries near the chain
-            // head so small commits can share the unchanged metadata tail.
-            state.reclaimed_pages =
-                Arc::new(available.iter().rev().map(|entry| entry.page_id).collect());
-            state.retired_chain_pages = retired_chain_pages;
+            state.reclaimed_pages = next_loans;
+            state.reclaim = reclaim.committed.take();
+            #[cfg(test)]
+            {
+                state.last_reclaim_work = Some(reclaim_work);
+            }
+
             if let Some((watermark, chain_watermark)) = zeroed_watermark {
                 state.zeroed_up_to = watermark;
                 state.zeroed_chain_up_to = chain_watermark;
@@ -2497,30 +2547,23 @@ impl TxnManager {
         root: PageId,
         high_water_mark: u32,
         slot_txn: TxnId,
-        capacity_hint: usize,
-    ) -> Result<pending_free::ChainSnapshot> {
+    ) -> Result<pending_free::CommittedReclaim> {
         // Local reclaim invariants only. Proving an entry is absent from every
         // live tree needs an O(database) walk per commit, so that stays behind
         // the explicit integrity_check boundary.
-        pending_free::ChainSnapshot::read_committed(
-            root,
-            high_water_mark,
-            slot_txn,
-            capacity_hint,
-            |page_id| {
-                if page_id.as_u32() >= high_water_mark {
-                    return Err(Error::PageOutOfBounds(page_id));
-                }
-                let page = match pages.get_page(&page_id) {
-                    Some(page) => PendingFreePage::Borrowed(page),
-                    None => PendingFreePage::Cached(self.fetch_page(page_id)?),
-                };
-                if page.txn_id() > slot_txn {
-                    return Err(Error::DatabaseCorrupted);
-                }
-                Ok(page)
-            },
-        )
+        pending_free::CommittedReclaim::read_committed(root, high_water_mark, slot_txn, |page_id| {
+            if page_id.as_u32() >= high_water_mark {
+                return Err(Error::PageOutOfBounds(page_id));
+            }
+            let page = match pages.get_page(&page_id) {
+                Some(page) => PendingFreePage::Borrowed(page),
+                None => PendingFreePage::Cached(self.fetch_page(page_id)?),
+            };
+            if page.txn_id() > slot_txn {
+                return Err(Error::DatabaseCorrupted);
+            }
+            Ok(page)
+        })
     }
 
     /// Acquire a writer source without changing cold-miss pool admission.
