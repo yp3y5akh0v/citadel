@@ -640,6 +640,7 @@ struct JudgeVerdict {
 }
 
 /// Accept a final JSON verdict or an exact plain label used by earlier clients.
+/// A single trailing JSON object may also follow prose or span multiple lines.
 pub(crate) fn judge_label(response: &CompletionResponse) -> Result<bool> {
     let last = response
         .message
@@ -652,11 +653,25 @@ pub(crate) fn judge_label(response: &CompletionResponse) -> Result<bool> {
     match last {
         "CORRECT" => Ok(true),
         "WRONG" => Ok(false),
-        _ => serde_json::from_str::<JudgeVerdict>(last)
-            .map(|verdict| matches!(verdict.label, JudgeLabel::Correct))
-            .map_err(|_| {
-                invalid_judge_response(response, "expected a final CORRECT/WRONG verdict")
-            }),
+        _ => {
+            // Preserve the existing whole-line form before trying a suffix. The
+            // fallback starts at the first opening brace, so it cannot skip an
+            // invalid outer object or choose between multiple inline objects.
+            let verdict = serde_json::from_str::<JudgeVerdict>(last).ok().or_else(|| {
+                let content = response.message.content.trim();
+                let start = content.find('{')?;
+                let prefix = content[..start].trim_end();
+                if prefix.contains('}') || prefix.ends_with(['[', '"']) {
+                    return None;
+                }
+                serde_json::from_str::<JudgeVerdict>(&content[start..]).ok()
+            });
+            verdict
+                .map(|verdict| matches!(verdict.label, JudgeLabel::Correct))
+                .ok_or_else(|| {
+                    invalid_judge_response(response, "expected a final CORRECT/WRONG verdict")
+                })
+        }
     }
 }
 
@@ -683,6 +698,83 @@ fn invalid_judge_response(response: &CompletionResponse, reason: &'static str) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn judge_label_accepts_inline_and_multiline_final_json() {
+        for (text, expected) in [
+            ("The dates differ. {\"label\": \"WRONG\"}", false),
+            ("The answer matches. {\"label\":\"CORRECT\"}", true),
+            ("{\n  \"label\": \"WRONG\"\n}\n", false),
+            (
+                "The answer matches.\n{\n  \"label\": \"CORRECT\"\n}\n",
+                true,
+            ),
+        ] {
+            assert_eq!(
+                judge_label(&CompletionResponse::text(text)).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn judge_label_preserves_existing_final_line_forms() {
+        for (text, expected) in [
+            ("CORRECT", true),
+            ("Explanation.\n WRONG \n\n", false),
+            (
+                "Earlier prose contains {braces}.\n{\"label\":\"CORRECT\"}",
+                true,
+            ),
+            ("{\"label\":\"CORRECT\"}\n{\"label\":\"WRONG\"}", false),
+        ] {
+            assert_eq!(
+                judge_label(&CompletionResponse::text(text)).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn judge_label_rejects_malformed_or_ambiguous_suffixes() {
+        for text in [
+            "The answer is CORRECT.",
+            "Explanation. {}",
+            "Explanation. {\"label\":\"correct\"}",
+            "Explanation. {\"label\":\"WRONG\",\"extra\":true}",
+            "Explanation. {\"label\":\"WRONG\",\"label\":\"CORRECT\"}",
+            "Explanation. {\"label\":\"WRONG\"} trailing text",
+            "Explanation. {\"label\":\"WRONG\"} {\"label\":\"CORRECT\"}",
+            "Explanation. {\"label\":\"WRONG\"",
+            "Explanation. {{\"label\":\"WRONG\"}",
+            "Explanation. {\"nested\":{\"label\":\"WRONG\"}}",
+            "[{\"label\":\"WRONG\"}",
+            "\"{\"label\":\"WRONG\"}",
+            "} {\"label\":\"WRONG\"}",
+        ] {
+            assert!(
+                judge_label(&CompletionResponse::text(text)).is_err(),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn abstention_label_still_requires_only_a_plain_label() {
+        assert!(abstention_label(&CompletionResponse::text(" CORRECT\n")).unwrap());
+        assert!(!abstention_label(&CompletionResponse::text("WRONG")).unwrap());
+        for text in [
+            "Explanation.\nCORRECT",
+            "{\"label\":\"CORRECT\"}",
+            "Explanation. {\"label\":\"WRONG\"}",
+            "{\n\"label\":\"WRONG\"\n}",
+        ] {
+            assert!(
+                abstention_label(&CompletionResponse::text(text)).is_err(),
+                "{text}"
+            );
+        }
+    }
 
     #[test]
     fn reader_audit_matches_native_recall_for_plaintext_and_sealed_regions() {
