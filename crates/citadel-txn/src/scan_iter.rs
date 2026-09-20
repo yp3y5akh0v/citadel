@@ -122,8 +122,7 @@ impl<T: TxnScanAdapter> TableIter<T> {
                                 cancel,
                                 self.budget.as_ref(),
                             )?;
-                            value_buf.clear();
-                            value_buf.extend_from_slice(&materialized);
+                            *value_buf = materialized;
                             emit = true;
                         }
                     },

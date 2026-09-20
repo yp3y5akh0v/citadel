@@ -195,3 +195,58 @@ fn table_scan_iter_returns_the_first_load_error_without_skipping_the_row() {
     assert_eq!(iter.next().unwrap(), Some((&b"b"[..], &b"second"[..])));
     assert!(iter.next().unwrap().is_none());
 }
+
+#[test]
+fn table_scan_iter_preserves_mixed_inline_and_overflow_values_across_adapters() {
+    fn assert_entries<T: super::TxnScanAdapter>(
+        mut iter: super::TableIter<T>,
+        expected: &[(Vec<u8>, Vec<u8>)],
+    ) {
+        for (key, value) in expected {
+            assert_eq!(
+                iter.next().unwrap(),
+                Some((key.as_slice(), value.as_slice()))
+            );
+        }
+        assert!(iter.next().unwrap().is_none());
+        assert!(iter.next().unwrap().is_none());
+    }
+
+    let capacity = citadel_page::overflow::OVERFLOW_DATA_CAPACITY;
+    let expected = vec![
+        (b"a".to_vec(), Vec::new()),
+        (b"b".to_vec(), vec![0xB1; capacity * 2 + 17]),
+        (b"c".to_vec(), Vec::new()),
+        (b"d".to_vec(), b"small".to_vec()),
+        (b"e".to_vec(), vec![0xE2; capacity * 4 + 31]),
+        (b"f".to_vec(), b"after overflow".to_vec()),
+        (b"g".to_vec(), vec![0x73; capacity + 7]),
+        (b"h".to_vec(), Vec::new()),
+    ];
+    let mgr = create_test_manager();
+    let mut writer = mgr.begin_write().unwrap();
+    writer.create_table(b"t").unwrap();
+    for (key, value) in &expected {
+        writer.table_insert(b"t", key, value).unwrap();
+    }
+    writer.commit().unwrap();
+
+    let mut reader = mgr.begin_read();
+    assert_entries(reader.table_scan_iter(b"t", b"").unwrap(), &expected);
+    assert_entries(
+        mgr.begin_read().into_table_scan_iter(b"t", b"").unwrap(),
+        &expected,
+    );
+
+    let mut writer = mgr.begin_write().unwrap();
+    let mut uncommitted = expected.clone();
+    uncommitted[4].1 = vec![0xE4; capacity * 3 + 11];
+    writer
+        .table_insert(b"t", &uncommitted[4].0, &uncommitted[4].1)
+        .unwrap();
+    uncommitted.push((b"i".to_vec(), b"uncommitted tail".to_vec()));
+    writer
+        .table_insert(b"t", &uncommitted[8].0, &uncommitted[8].1)
+        .unwrap();
+    assert_entries(writer.table_scan_iter(b"t", b"").unwrap(), &uncommitted);
+}
