@@ -211,3 +211,119 @@ fn ready_pages_match_vec_allocation_order_through_restore_append_and_drain() {
         assert_eq!(actual.clone().take(), expected, "step {step}");
     }
 }
+
+#[test]
+fn segmented_loans_share_batches_and_restore_across_boundaries() {
+    let original = Arc::new((1..=4096).map(PageId).collect::<Vec<_>>());
+    let mut loan = ReadyPages::shared(Arc::clone(&original));
+    assert_eq!(loan.pop(), Some(PageId(4096)));
+    loan.prepend_pop_order(vec![PageId(5001), PageId(0), PageId(5002)]);
+    let checkpoint = loan.clone();
+    for _ in 0..3 {
+        assert_eq!(loan.pop_nonzero(), Some(PageId(5001)));
+        assert_eq!(loan.pop_nonzero(), Some(PageId(5002)));
+        assert_eq!(loan.pop_nonzero(), Some(PageId(4095)));
+        assert_eq!(loan.pop(), Some(PageId(0)));
+        assert!(Arc::ptr_eq(loan.pages.as_ref().unwrap(), &original));
+        loan = checkpoint.clone();
+    }
+    assert_eq!(
+        checkpoint.iter().take(4).copied().collect::<Vec<_>>(),
+        vec![PageId(5001), PageId(0), PageId(5002), PageId(4095)]
+    );
+    let mut allocator = PageAllocator::with_ready(6000, loan);
+    assert_eq!(allocator.allocate().unwrap(), PageId(5001));
+    let mut remainder = allocator.take_ready();
+    assert_eq!(allocator.ready_count(), 0);
+    assert_eq!(remainder.pop(), Some(PageId(0)));
+    assert_eq!(remainder.pop(), Some(PageId(5002)));
+    assert!(Arc::ptr_eq(remainder.pages.as_ref().unwrap(), &original));
+    assert_eq!(original.len(), 4096);
+}
+
+#[test]
+fn segmented_loans_retain_zeroes_and_report_exact_iteration_length() {
+    let mut loan = ReadyPages::default();
+    loan.prepend_pop_order(vec![PageId(0), PageId(2), PageId(0)]);
+    loan.prepend_pop_order(vec![PageId(0), PageId(0)]);
+    assert_eq!(loan.pop_nonzero(), Some(PageId(2)));
+    for _ in 0..3 {
+        assert_eq!(loan.pop_nonzero(), None);
+        assert_eq!(loan.len(), 4);
+        let mut iter = loan.iter();
+        for remaining in (1..=4).rev() {
+            assert_eq!(iter.len(), remaining);
+            assert_eq!(iter.next(), Some(&PageId(0)));
+        }
+        assert_eq!(iter.len(), 0);
+        assert_eq!(iter.next(), None);
+    }
+    loan.prepend_pop_order(vec![PageId(7)]);
+    assert_eq!(loan.last(), Some(PageId(7)));
+    assert_eq!(loan.pop(), Some(PageId(7)));
+    for _ in 0..4 {
+        assert_eq!(loan.pop(), Some(PageId(0)));
+    }
+    assert!(loan.is_empty());
+    assert_eq!(loan.last(), None);
+    assert_eq!(loan.pop(), None);
+}
+
+#[test]
+fn deeply_segmented_loan_drop_is_iterative_with_unique_and_shared_tails() {
+    let mut loan = ReadyPages::default();
+    for id in 1..=100_000 {
+        loan.push(PageId(id));
+    }
+    let mut shared = loan.clone();
+    drop(loan);
+    assert_eq!(shared.pop(), Some(PageId(100_000)));
+    assert_eq!(shared.len(), 99_999);
+    drop(shared);
+}
+
+#[test]
+fn taking_a_unique_batch_preserves_its_vec_allocation_and_skipped_zero() {
+    let mut source = Vec::with_capacity(64);
+    source.extend([PageId(1), PageId(2), PageId(0), PageId(9)]);
+    let pointer = source.as_ptr();
+    let capacity = source.capacity();
+    let mut alloc = PageAllocator::with_ready_pages(100, Arc::new(source));
+    assert_eq!(alloc.allocate().unwrap(), PageId(9));
+    assert_eq!(alloc.allocate_nonzero().unwrap(), PageId(2));
+    let remainder = alloc.take_ready_to_use();
+    assert_eq!(remainder, [PageId(1), PageId(0)]);
+    assert_eq!(remainder.as_ptr(), pointer);
+    assert_eq!(remainder.capacity(), capacity);
+    assert_eq!(alloc.ready_count(), 0);
+    assert_eq!(alloc.allocate().unwrap(), PageId(100));
+}
+
+#[test]
+fn taking_shared_or_segmented_batches_preserves_the_source_and_checkpoint() {
+    for segmented in [false, true] {
+        let source = Arc::new(vec![PageId(1), PageId(2), PageId(0), PageId(9)]);
+        let mut alloc = PageAllocator::with_ready_pages(100, Arc::clone(&source));
+        assert_eq!(alloc.allocate().unwrap(), PageId(9));
+        assert_eq!(alloc.allocate_nonzero().unwrap(), PageId(2));
+        let mut expected = vec![PageId(1), PageId(0)];
+        if segmented {
+            alloc.add_ready_to_use(vec![PageId(3), PageId(0), PageId(4)]);
+            expected.extend([PageId(3), PageId(0), PageId(4)]);
+        }
+        let checkpoint = alloc.checkpoint();
+        let remainder = alloc.take_ready_to_use();
+        assert_eq!(remainder, expected);
+        assert_ne!(remainder.as_ptr(), source.as_ptr());
+        assert_eq!(
+            source.as_slice(),
+            [PageId(1), PageId(2), PageId(0), PageId(9)]
+        );
+        assert_eq!(alloc.ready_count(), 0);
+        alloc.restore(checkpoint);
+        for &id in expected.iter().rev() {
+            assert_eq!(alloc.allocate().unwrap(), id);
+        }
+        assert_eq!(alloc.ready_count(), 0);
+    }
+}
