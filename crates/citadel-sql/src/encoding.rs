@@ -1698,6 +1698,17 @@ impl RowLayout {
         )
     }
 
+    pub(crate) fn column_value(&mut self, data: &[u8], target: usize) -> Result<Value> {
+        let location = self.locate(data, target)?;
+        if location.tag_offset == usize::MAX {
+            return Ok(Value::Null);
+        }
+        decode_value(
+            data[location.tag_offset],
+            &data[location.body_start..location.end],
+        )
+    }
+
     pub(crate) fn patch(&mut self, data: &mut [u8], target: usize, value: &Value) -> Result<bool> {
         if value.is_null() {
             return Ok(false);

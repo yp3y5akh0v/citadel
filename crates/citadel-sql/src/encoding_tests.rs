@@ -1027,6 +1027,11 @@ fn row_layout_patches_match_public_paths_across_successive_type_changes() {
                 let decoded = decode_row(&located).unwrap();
                 assert_eq!(decoded.len(), expected.len());
                 assert!(decoded.iter().zip(&expected).all(|(a, b)| a.bit_eq(b)));
+                for target in 0..=expected.len() {
+                    let owned = layout.column_value(&located, target).unwrap();
+                    let expected = expected.get(target).unwrap_or(&Value::Null);
+                    assert!(owned.bit_eq(expected), "owned column {target}");
+                }
                 assert!(layout
                     .column(&located, 1)
                     .unwrap()
@@ -1637,6 +1642,87 @@ fn valid_raw_composite_comparisons_match_owned_representation_semantics() {
                 expected
             };
             assert_eq!(raw.cmp_value(other).unwrap(), expected);
+        }
+    }
+}
+
+#[test]
+fn row_layout_owned_materialization_matches_raw_values_and_errors() {
+    let values = vec![
+        Value::Null,
+        Value::Boolean(true),
+        Value::Integer(i64::MIN),
+        Value::Real(f64::from_bits(0x7ff8_0000_0000_0123)),
+        Value::Real(-0.0),
+        Value::Text("é and a text value longer than inline storage".into()),
+        Value::Blob(vec![0, 1, 255]),
+        Value::Date(-1),
+        Value::Time(123),
+        Value::Timestamp(-456),
+        Value::Interval {
+            months: 2,
+            days: -3,
+            micros: 4,
+        },
+        Value::Json("{\"a\":1}".into()),
+        Value::Jsonb(vec![1, 2].into()),
+        Value::TsVector(vec![3, 4].into()),
+        Value::TsQuery(vec![5, 6].into()),
+        arr(vec![Value::Null, arr(vec![Value::Integer(7)])]),
+        Value::Vector(vec![-0.0, f32::from_bits(0x7fc0_0123)].into()),
+    ];
+    for version in [RowVersion::V1, RowVersion::V2] {
+        let bytes = row_for_layout_patch_test(&values, version);
+        let mut layout = RowLayout::default();
+        // Locate the suffix first, then revisit cached earlier locations.
+        for target in (0..=values.len()).rev() {
+            let raw = decode_column_raw(&bytes, target)
+                .unwrap()
+                .to_value()
+                .unwrap();
+            let owned = layout.column_value(&bytes, target).unwrap();
+            assert!(owned.bit_eq(&raw), "{version:?} column {target}");
+            assert!(owned.bit_eq(values.get(target).unwrap_or(&Value::Null)));
+        }
+    }
+
+    // Preserve errors from checked framing and owned payload validation.
+    for (kind, payload) in [
+        (DataType::Integer, vec![0; 7]),
+        (DataType::Text, vec![0xff]),
+        (DataType::Array, vec![2, 0, 0, 0, 0xff]),
+        (DataType::Vector { dim: 0 }, vec![2, 0, 0, 0, 0, 0]),
+    ] {
+        for version in [RowVersion::V1, RowVersion::V2] {
+            let header = 1u16
+                | if version == RowVersion::V2 {
+                    V2_FLAG
+                } else {
+                    0
+                };
+            let mut bytes = header.to_le_bytes().to_vec();
+            bytes.extend_from_slice(&[0, kind.type_tag()]);
+            if version == RowVersion::V1 || fixed_width_size(kind.type_tag()).is_none() {
+                bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            }
+            bytes.extend_from_slice(&payload);
+            let expected = decode_column_raw(&bytes, 0)
+                .and_then(RawColumn::to_value)
+                .unwrap_err();
+            let mut layout = RowLayout::default();
+            // A composite can have a valid cached location but invalid contents.
+            let _ = layout.column(&bytes, 0);
+            let error = layout.column_value(&bytes, 0).unwrap_err();
+            assert!(matches!(error, SqlError::InvalidValue(_)));
+            assert_eq!(
+                error.to_string(),
+                expected.to_string(),
+                "{version:?} {kind:?}"
+            );
+            assert_eq!(
+                error.to_string(),
+                decode_row(&bytes).unwrap_err().to_string()
+            );
         }
     }
 }
