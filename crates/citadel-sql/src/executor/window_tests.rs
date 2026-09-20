@@ -800,6 +800,238 @@ fn evaluate_window_query(
 }
 
 #[test]
+fn window_functions_share_ordering_without_sharing_argument_evaluation() {
+    let n = 128;
+    let mut columns = vec![
+        column("id", DataType::Integer),
+        column("x", DataType::Integer),
+    ];
+    columns[1].position = 1;
+    let value = |id: i64| id % 7 - 3;
+    let rows = (0..n).rev().map(|id| vec![i(id), i(value(id))]).collect();
+    take_window_order_builds();
+    take_window_key_evaluations();
+    take_window_argument_evaluations();
+
+    let ExecutionResult::Query(result) = evaluate_window_query(
+        "SELECT id,
+         SUM(x) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW),
+         MIN(x) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW),
+         AVG(x) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+         LAG(x, 1, -9) OVER (ORDER BY id ASC NULLS FIRST) FROM t",
+        &columns,
+        rows,
+    )
+    .unwrap() else {
+        panic!("expected rows")
+    };
+
+    assert_eq!(take_window_order_builds(), 1);
+    assert_eq!(take_window_key_evaluations(), n as usize);
+    assert_eq!(take_window_argument_evaluations(), 6 * n as usize);
+    assert_eq!(result.rows.len(), n as usize);
+    for (position, row) in result.rows.iter().enumerate() {
+        let id = n - position as i64 - 1;
+        let start = (id - 2).max(0);
+        let expected = [
+            i(id),
+            i((start..=id).map(value).sum()),
+            i((start..=id).map(value).min().unwrap()),
+            Value::Real((0..=id).map(value).sum::<i64>() as f64 / (id + 1) as f64),
+            i(if id == 0 { -9 } else { value(id - 1) }),
+        ];
+        assert_eq!(row.len(), expected.len());
+        assert!(
+            row.iter().zip(&expected).all(|(a, e)| a.bit_eq(e)),
+            "row {position}: {row:?}, expected {expected:?}"
+        );
+    }
+}
+
+#[test]
+fn shared_window_order_matches_independent_orders_across_key_semantics() {
+    let mut columns = vec![
+        column("p", DataType::Text),
+        column("k", DataType::Text),
+        column("v", DataType::Integer),
+    ];
+    for (position, column) in columns.iter_mut().enumerate() {
+        column.position = position as u16;
+    }
+    columns[0].collation = Collation::NoCase;
+    columns[1].collation = Collation::NoCase;
+    let text = |s: &str| Value::Text(s.into());
+    let rows = vec![
+        vec![text("b"), text("a"), i(3)],
+        vec![text("A"), text("B"), i(8)],
+        vec![text("a"), Value::Null, i(5)],
+        vec![text("B"), text("A"), Value::Null],
+        vec![text("a"), text("b"), i(-2)],
+        vec![Value::Null, text("B"), i(7)],
+        vec![Value::Null, Value::Null, i(9)],
+        vec![text("A"), text("a"), i(1)],
+    ];
+    let expressions = [
+        "SUM(v) OVER (PARTITION BY p ORDER BY k DESC NULLS LAST ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)",
+        "ROW_NUMBER() OVER (PARTITION BY p ORDER BY k ASC NULLS LAST)",
+        "RANK() OVER (PARTITION BY p ORDER BY k DESC NULLS LAST)",
+        "ROW_NUMBER() OVER (PARTITION BY p ORDER BY k DESC NULLS FIRST)",
+        "DENSE_RANK() OVER (PARTITION BY p ORDER BY k COLLATE BINARY DESC NULLS LAST)",
+        "ROW_NUMBER() OVER (PARTITION BY p ORDER BY k)",
+        // Same combined sort keys as the previous function, different partitions.
+        "ROW_NUMBER() OVER (PARTITION BY p, k)",
+        "COUNT(*) OVER (PARTITION BY p ORDER BY k COLLATE NOCASE DESC NULLS LAST RANGE BETWEEN CURRENT ROW AND CURRENT ROW)",
+        "ROW_NUMBER() OVER (ORDER BY p)",
+        "ROW_NUMBER() OVER (ORDER BY k)",
+    ];
+    take_window_order_builds();
+    take_window_key_evaluations();
+    let ExecutionResult::Query(combined) = evaluate_window_query(
+        &format!("SELECT {} FROM t", expressions.join(", ")),
+        &columns,
+        rows.clone(),
+    )
+    .unwrap() else {
+        panic!("expected rows")
+    };
+    assert_eq!(take_window_order_builds(), 8);
+    assert_eq!(take_window_key_evaluations(), 8 * rows.len());
+    assert_eq!(combined.rows.len(), rows.len());
+    for (column, expression) in expressions.iter().enumerate() {
+        let ExecutionResult::Query(independent) = evaluate_window_query(
+            &format!("SELECT {expression} FROM t"),
+            &columns,
+            rows.clone(),
+        )
+        .unwrap() else {
+            panic!("expected rows")
+        };
+        assert_eq!(independent.rows.len(), rows.len());
+        for (position, (actual, expected)) in
+            combined.rows.iter().zip(&independent.rows).enumerate()
+        {
+            assert_eq!(actual.len(), expressions.len());
+            assert!(
+                actual[column].bit_eq(&expected[0]),
+                "{expression}, row {position}: {:?}, expected {:?}",
+                actual[column],
+                expected[0]
+            );
+        }
+    }
+}
+
+#[test]
+fn complex_and_volatile_window_keys_keep_independent_evaluations() {
+    let columns = vec![column("x", DataType::Integer)];
+    let rows: Vec<_> = (0..32).rev().map(|id| vec![i(id)]).collect();
+    for key in ["x + 0", "RANDOM()"] {
+        take_window_order_builds();
+        take_window_key_evaluations();
+        let ExecutionResult::Query(result) = evaluate_window_query(
+            &format!(
+                "SELECT ROW_NUMBER() OVER (ORDER BY {key}), RANK() OVER (ORDER BY {key}) FROM t"
+            ),
+            &columns,
+            rows.clone(),
+        )
+        .unwrap() else {
+            panic!("expected rows")
+        };
+        assert_eq!(result.rows.len(), rows.len());
+        assert_eq!(take_window_order_builds(), 2);
+        assert_eq!(take_window_key_evaluations(), 2 * rows.len());
+        if key == "x + 0" {
+            assert!(result
+                .rows
+                .iter()
+                .enumerate()
+                .all(|(position, row)| row
+                    == &vec![i(32 - position as i64), i(32 - position as i64)]));
+        }
+    }
+}
+
+#[test]
+fn window_order_planning_preserves_argument_and_function_error_order() {
+    let columns = vec![column("x", DataType::Integer)];
+    let rows = vec![vec![i(i64::MAX)], vec![i(1)]];
+    take_window_order_builds();
+    let err = evaluate_window_query(
+        "SELECT SUM(x) OVER (), ROW_NUMBER() OVER (ORDER BY missing_key) FROM t",
+        &columns,
+        rows.clone(),
+    )
+    .unwrap_err();
+    assert!(matches!(err, SqlError::IntegerOverflow));
+    assert_eq!(take_window_order_builds(), 1);
+
+    let err = evaluate_window_query(
+        "SELECT SUM(missing_argument) OVER (ORDER BY x), ROW_NUMBER() OVER (ORDER BY missing_key) FROM t",
+        &columns, rows,
+    ).unwrap_err();
+    assert!(matches!(err, SqlError::ColumnNotFound(name) if name == "missing_argument"));
+    assert_eq!(take_window_order_builds(), 0);
+}
+
+#[test]
+fn window_orders_release_last_consumers_and_check_cancelled_hits() {
+    let columns = vec![column("x", DataType::Integer)];
+    let col_map = ColumnMap::new(&columns);
+    let rows = vec![vec![i(3)], vec![i(1)], vec![i(2)]];
+    let spec = |descending, nulls_first| WindowSpec {
+        partition_by: vec![],
+        order_by: vec![OrderByItem {
+            expr: Expr::Column("x".into()),
+            output_name: None,
+            output_ordinal: None,
+            descending,
+            nulls_first: Some(nulls_first),
+        }],
+        frame: None,
+    };
+    let specs = [
+        spec(false, true),
+        spec(true, false),
+        spec(false, true),
+        spec(false, false),
+        spec(true, false),
+    ];
+    let mut orders = WindowOrders::new(specs.iter(), &col_map, None).unwrap();
+    take_window_order_builds();
+    take_window_key_evaluations();
+    for (index, expected_retained) in [1, 2, 1, 1, 0].into_iter().enumerate() {
+        orders
+            .get_or_build(index, &specs[index], &rows, &col_map, None)
+            .unwrap();
+        orders.release(index);
+        assert_eq!(
+            orders
+                .slots
+                .iter()
+                .filter(|slot| slot.order.is_some())
+                .count(),
+            expected_retained
+        );
+    }
+    assert_eq!(take_window_order_builds(), 3);
+    assert_eq!(take_window_key_evaluations(), 3 * rows.len());
+
+    let repeated = [spec(false, true), spec(false, true)];
+    let mut orders = WindowOrders::new(repeated.iter(), &col_map, None).unwrap();
+    let token = citadel::CancelToken::new();
+    orders
+        .get_or_build(0, &repeated[0], &rows, &col_map, Some(&token))
+        .unwrap();
+    orders.release(0);
+    token.cancel();
+    assert!(matches!(
+        orders.get_or_build(1, &repeated[1], &rows, &col_map, Some(&token)),
+        Err(SqlError::Storage(citadel_core::Error::Interrupted))
+    ));
+}
+
+#[test]
 fn whole_partition_aggregates_visit_each_input_once_per_function() {
     let n = 128;
     let rows: Vec<Vec<Value>> = (0..n)
