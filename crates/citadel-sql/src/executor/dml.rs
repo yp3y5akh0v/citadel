@@ -2979,7 +2979,7 @@ impl IntPatchArithmetic {
             Self::Add(rhs) => value.checked_add(rhs),
             Self::Sub(rhs) => value.checked_sub(rhs),
         };
-        result.map(Value::Integer).ok_or(SqlError::IntegerOverflow)
+        checked_integer_value(result)
     }
 
     fn parts(self) -> (BinOp, Value) {
