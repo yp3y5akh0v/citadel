@@ -1276,6 +1276,52 @@ fn update_scratch_releases_oversized_value_buffers_on_return_error_and_panic() {
 }
 
 #[test]
+fn update_scratch_releases_rewrite_buffers_after_success_error_and_panic() {
+    let original = encode_row(&[Value::Text("small".into())]);
+    let large = Value::Text("x".repeat(citadel_core::MAX_INLINE_VALUE_SIZE * 3).into());
+    for outcome in 0..3 {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_update_scratch(|bufs| -> Result<()> {
+                *bufs = UpdateBufs::new();
+                bufs.value_buf.extend_from_slice(&original);
+                let mut row = UpdateValue::growable(&mut bufs.value_buf, &mut bufs.row_layout);
+                row.patch(0, &large, &mut bufs.patch_buf)?;
+                row.patch(0, &Value::Text("small".into()), &mut bufs.patch_buf)?;
+                assert_eq!(bufs.value_buf, original);
+                // Rewriting the large row back to a small one swaps the large
+                // allocation into patch scratch, where the guard must release it.
+                assert!(bufs.patch_buf.capacity() > citadel_core::MAX_INLINE_VALUE_SIZE);
+                match outcome {
+                    0 => Ok(()),
+                    1 => Err(SqlError::InvalidValue("rejected after rewrite".into())),
+                    2 => panic!("panicked after rewrite"),
+                    _ => unreachable!(),
+                }
+            })
+        }));
+        match outcome {
+            0 => assert!(matches!(result, Ok(Ok(())))),
+            1 => assert!(matches!(result, Ok(Err(SqlError::InvalidValue(_))))),
+            2 => assert!(result.is_err()),
+            _ => unreachable!(),
+        }
+        UPDATE_SCRATCH.with(|slot| assert_eq!(slot.borrow().patch_buf.capacity(), 0));
+    }
+
+    let retained = with_update_scratch(|bufs| {
+        bufs.patch_buf.reserve(64);
+        (bufs.patch_buf.as_ptr(), bufs.patch_buf.capacity())
+    });
+    UPDATE_SCRATCH.with(|slot| {
+        let bufs = slot.borrow();
+        assert_eq!(
+            (bufs.patch_buf.as_ptr(), bufs.patch_buf.capacity()),
+            retained
+        );
+    });
+}
+
+#[test]
 fn truncate_returning_admits_each_materialized_value_once_before_mutation() {
     use citadel::{Argon2Profile, DatabaseBuilder};
     let dir = tempfile::tempdir().unwrap();

@@ -61,6 +61,9 @@ fn with_update_scratch<R>(f: impl FnOnce(&mut UpdateBufs) -> R) -> R {
             if self.0.value_buf.capacity() > citadel_core::MAX_INLINE_VALUE_SIZE {
                 self.0.value_buf = Vec::new();
             }
+            if self.0.patch_buf.capacity() > citadel_core::MAX_INLINE_VALUE_SIZE {
+                self.0.patch_buf = Vec::new();
+            }
         }
     }
     UPDATE_SCRATCH.with(|slot| {
