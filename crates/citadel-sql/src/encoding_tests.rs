@@ -240,6 +240,176 @@ fn row_roundtrip_empty() {
     assert!(decoded.is_empty());
 }
 
+/// Keep framing separate from owned conversion as an oracle for the fused route.
+fn decode_row_push_with_split_framing(
+    data: &[u8],
+    expected: usize,
+    out: &mut Vec<Value>,
+) -> Result<bool> {
+    let (version, count, bitmap, mut pos) = parse_row_header(data)?;
+    if count != expected {
+        return Ok(false);
+    }
+    for col in 0..count {
+        if bitmap[col / 8] & (1 << (col % 8)) != 0 {
+            out.push(Value::Null);
+        } else {
+            let (tag, body, next) = read_cell(data, pos, version)?;
+            out.push(decode_value(tag, body)?);
+            pos = next;
+        }
+    }
+    Ok(true)
+}
+
+fn assert_full_row_decoder_parity(data: &[u8], count: usize) {
+    let prefix = Value::Text("existing output".into());
+    let mut expected = vec![prefix.clone()];
+    let expected_result = decode_row_push_with_split_framing(data, count, &mut expected)
+        .map_err(|error| format!("{error:?}"));
+    let mut actual = vec![prefix];
+    let actual_result =
+        decode_row_push(data, count, &mut actual).map_err(|error| format!("{error:?}"));
+    assert_eq!(actual_result, expected_result, "bytes={data:?}");
+    assert_eq!(actual.len(), expected.len());
+    assert!(actual.iter().zip(&expected).all(|(a, b)| a.bit_eq(b)));
+    match (expected_result, decode_row(data)) {
+        (Ok(true), Ok(values)) => {
+            assert_eq!(values.len(), expected.len() - 1);
+            assert!(values.iter().zip(&expected[1..]).all(|(a, b)| a.bit_eq(b)));
+        }
+        (Err(expected), Err(actual)) => assert_eq!(format!("{actual:?}"), expected),
+        outcomes => panic!("full-row outcomes differ: {outcomes:?}"),
+    }
+}
+
+#[test]
+fn full_row_decoders_preserve_all_payloads_and_truncated_prefixes() {
+    let values = vec![
+        Value::Null,
+        Value::Integer(i64::MIN),
+        Value::Real(f64::from_bits(0x7ff8_0000_0000_0123)),
+        Value::Real(-0.0),
+        Value::Boolean(true),
+        Value::Text("é and text longer than inline storage".into()),
+        Value::Blob(vec![0, 255, 1]),
+        Value::Time(-1),
+        Value::Date(-2),
+        Value::Timestamp(-3),
+        Value::Interval {
+            months: -1,
+            days: 2,
+            micros: -3,
+        },
+        Value::Json("{\"key\":1}".into()),
+        Value::Jsonb(vec![0, 1].into()),
+        Value::TsVector(vec![2, 3].into()),
+        Value::TsQuery(vec![4, 5].into()),
+        arr(vec![Value::Null, arr(vec![Value::Integer(9)])]),
+        Value::Vector(vec![-0.0, f32::from_bits(0x7fc0_0123)].into()),
+        Value::Null,
+    ];
+    for version in [RowVersion::V1, RowVersion::V2] {
+        let data = row_for_layout_patch_test(&values, version);
+        let decoded = decode_row(&data).unwrap();
+        assert_eq!(decoded.len(), values.len());
+        assert!(decoded.iter().zip(&values).all(|(a, b)| a.bit_eq(b)));
+        for end in 0..=data.len() {
+            assert_full_row_decoder_parity(&data[..end], values.len());
+        }
+        let mut trailing = data.clone();
+        trailing.extend_from_slice(&[0xff, 0, 0x7f]);
+        assert_full_row_decoder_parity(&trailing, values.len());
+
+        // A shape mismatch must neither inspect malformed cells nor touch out.
+        let header_end = 2 + values.len().div_ceil(8);
+        let mut out = vec![Value::Integer(77)];
+        assert!(!decode_row_push(&data[..header_end], values.len() + 1, &mut out).unwrap());
+        assert_eq!(out, vec![Value::Integer(77)]);
+    }
+}
+
+#[test]
+fn full_row_decoders_preserve_malformed_payloads_and_error_precedence() {
+    // Every malformed cell follows a successfully decoded value and NULL, so
+    // the parity check also verifies the exact appended prefix on error.
+    let row = |version, tag, payload: &[u8], declared: Option<u32>| {
+        let mut data = row_for_layout_patch_test(&[Value::Integer(41), Value::Null], version);
+        let header = 3u16
+            | if version == RowVersion::V2 {
+                V2_FLAG
+            } else {
+                0
+            };
+        data[..2].copy_from_slice(&header.to_le_bytes());
+        data.push(tag);
+        if version == RowVersion::V1 || fixed_width_size(tag).is_none() {
+            data.extend_from_slice(&declared.unwrap_or(payload.len() as u32).to_le_bytes());
+        }
+        data.extend_from_slice(payload);
+        data
+    };
+    for version in [RowVersion::V1, RowVersion::V2] {
+        for (kind, payload) in [
+            (DataType::Text, vec![0xff]),
+            (DataType::Json, vec![0xff]),
+            (DataType::Array, vec![2, 0, 0, 0, 0xff]),
+            (DataType::Array, vec![1, 0, 0, 0, 1]),
+            (DataType::Array, vec![1, 0, 0, 0, 0]),
+            (DataType::Vector { dim: 0 }, vec![1]),
+            (DataType::Vector { dim: 0 }, vec![2, 0, 0, 0, 0, 0]),
+        ] {
+            let data = row(version, kind.type_tag(), &payload, None);
+            assert!(matches!(decode_row(&data), Err(SqlError::InvalidValue(_))));
+            assert_full_row_decoder_parity(&data, 3);
+        }
+        for tag in [0, 16, 255] {
+            for declared in [0, 1, u32::MAX] {
+                let data = row(version, tag, &[], Some(declared));
+                let expected = if declared == 0 {
+                    format!("unknown column type tag: {tag}")
+                } else {
+                    "truncated column value".into()
+                };
+                assert!(
+                    matches!(decode_row(&data), Err(SqlError::InvalidValue(message)) if message == expected)
+                );
+                // Include missing and incomplete length prefixes for unknown
+                // tags: their framing error must precede the unknown-tag error.
+                for end in data.len() - 4..=data.len() {
+                    assert_full_row_decoder_parity(&data[..end], 3);
+                }
+            }
+        }
+        // Compound decoders intentionally tolerate bytes beyond their declared
+        // element/dimension count. Full-row fusion must not tighten that policy.
+        for (kind, payload) in [
+            (DataType::Array, vec![0, 0, 0, 0, 0xfe]),
+            (DataType::Vector { dim: 0 }, vec![0, 0, 0xfe]),
+        ] {
+            let data = row(version, kind.type_tag(), &payload, None);
+            assert!(decode_row(&data).is_ok());
+            assert_full_row_decoder_parity(&data, 3);
+        }
+    }
+    for (declared, available, expected) in [
+        (7, 7, "invalid fixed-width column length"),
+        (9, 8, "truncated column value"),
+        (9, 9, "invalid fixed-width column length"),
+    ] {
+        let data = row(
+            RowVersion::V1,
+            DataType::Integer.type_tag(),
+            &vec![0; available],
+            Some(declared),
+        );
+        assert!(
+            matches!(decode_row(&data), Err(SqlError::InvalidValue(message)) if message == expected)
+        );
+        assert_full_row_decoder_parity(&data, 3);
+    }
+}
+
 #[test]
 fn row_fixed_width_decoders_preserve_boolean_bytes_and_real_bits() {
     for version in [RowVersion::V1, RowVersion::V2] {
