@@ -1814,33 +1814,32 @@ fn exec_insert_in_txn_impl(
         super::ann_persist::purge_segment(wtx, &table_schema.name)?;
     }
 
-    let default_columns;
-    let insert_columns: &[String] = if stmt.columns.is_empty() {
-        default_columns = table_schema
-            .columns
-            .iter()
-            .map(|c| c.name.clone())
-            .collect::<Vec<_>>();
-        &default_columns
+    let col_indices = if let Some(c) = cache {
+        c.col_indices.as_slice()
     } else {
-        &stmt.columns
-    };
-
-    bufs.col_indices.clear();
-    if let Some(c) = cache {
-        bufs.col_indices.extend_from_slice(&c.col_indices);
-    } else {
-        for name in insert_columns {
+        bufs.col_indices.clear();
+        let mut resolve_column = |name: &str| -> Result<()> {
             bufs.col_indices.push(
                 table_schema
                     .column_index(name)
-                    .ok_or_else(|| SqlError::ColumnNotFound(name.clone()))?,
+                    .ok_or_else(|| SqlError::ColumnNotFound(name.into()))?,
             );
+            Ok(())
+        };
+        if stmt.columns.is_empty() {
+            for column in &table_schema.columns {
+                resolve_column(&column.name)?;
+            }
+        } else {
+            for name in &stmt.columns {
+                resolve_column(name)?;
+            }
         }
-    }
+        bufs.col_indices.as_slice()
+    };
 
     if cache.is_none() {
-        for &ci in &bufs.col_indices {
+        for &ci in col_indices {
             if table_schema.columns[ci].generated_kind.is_some() {
                 return Err(SqlError::CannotInsertIntoGeneratedColumn(
                     table_schema.columns[ci].name.clone(),
@@ -1894,9 +1893,7 @@ fn exec_insert_in_txn_impl(
         table_schema
             .columns
             .iter()
-            .filter(|c| {
-                c.default_expr.is_some() && !bufs.col_indices.contains(&(c.position as usize))
-            })
+            .filter(|c| c.default_expr.is_some() && !col_indices.contains(&(c.position as usize)))
             .map(|c| (c.position as usize, c.default_expr.as_ref().unwrap()))
             .collect()
     } else {
@@ -1972,7 +1969,7 @@ fn exec_insert_in_txn_impl(
                 },
             )?;
             let qr = exec_query_body_write(wtx, schema, &sq.body, &insert_ctes)?;
-            Some(insert_select_rows(qr, insert_columns.len())?)
+            Some(insert_select_rows(qr, col_indices.len())?)
         }
         InsertSource::Values(_) => None,
     };
@@ -2069,10 +2066,10 @@ fn exec_insert_in_txn_impl(
                 }
             } else {
                 let value_row = &value_rows[idx];
-                if value_row.len() != insert_columns.len() {
+                if value_row.len() != col_indices.len() {
                     return Err(SqlError::InvalidValue(format!(
                         "expected {} values, got {}",
-                        insert_columns.len(),
+                        col_indices.len(),
                         value_row.len()
                     )));
                 }
@@ -2085,18 +2082,13 @@ fn exec_insert_in_txn_impl(
                         Expr::Literal(v) => v.clone(),
                         _ => eval_const_expr_with_cancel(expr, cancel.as_ref())?,
                     };
-                    let col_idx = bufs.col_indices[i];
+                    let col_idx = col_indices[i];
                     let col = &table_schema.columns[col_idx];
                     bufs.row[col_idx] = coerce_for_column(val, col, strict)?;
                 }
             }
         } else if let Some(sel) = select_rows.as_mut() {
-            bind_selected_row(
-                &mut sel[idx],
-                &mut bufs.row,
-                &bufs.col_indices,
-                table_schema,
-            )?;
+            bind_selected_row(&mut sel[idx], &mut bufs.row, col_indices, table_schema)?;
         }
 
         if has_defaults {

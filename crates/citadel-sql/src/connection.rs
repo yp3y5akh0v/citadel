@@ -2283,6 +2283,139 @@ mod tests {
     }
 
     #[test]
+    fn insert_column_bindings_preserve_name_generated_and_width_error_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("CREATE TABLE t (k TEXT NOT NULL PRIMARY KEY, c INTEGER, g INTEGER GENERATED ALWAYS AS (c*2) STORED)").unwrap();
+        conn.execute("BEGIN").unwrap();
+        for (sql, expected) in [
+            (
+                "INSERT INTO t(g,missing) VALUES (1/0)",
+                SqlError::ColumnNotFound("missing".into()),
+            ),
+            (
+                "INSERT INTO t(missing,g) VALUES (1/0)",
+                SqlError::ColumnNotFound("missing".into()),
+            ),
+            (
+                "INSERT INTO t VALUES ('bad',1)",
+                SqlError::CannotInsertIntoGeneratedColumn("g".into()),
+            ),
+            (
+                "INSERT INTO t(k,g) VALUES ('bad')",
+                SqlError::CannotInsertIntoGeneratedColumn("g".into()),
+            ),
+            (
+                "INSERT INTO t(k,c) VALUES ('bad',1,1/0)",
+                SqlError::InvalidValue("expected 2 values, got 3".into()),
+            ),
+            (
+                "INSERT INTO t(k,c) VALUES ('bad')",
+                SqlError::InvalidValue("expected 2 values, got 1".into()),
+            ),
+        ] {
+            for prepared in [false, true] {
+                let error = if prepared {
+                    conn.prepare(sql).unwrap().execute(&[]).unwrap_err()
+                } else {
+                    let stmt = parser::parse_sql(sql).unwrap();
+                    conn.inner
+                        .borrow_mut()
+                        .dispatch(&db, &stmt, &[])
+                        .unwrap_err()
+                };
+                assert_eq!(
+                    std::mem::discriminant(&error),
+                    std::mem::discriminant(&expected),
+                    "{sql}; prepared={prepared}: {error}"
+                );
+                assert_eq!(error.to_string(), expected.to_string(), "{sql}");
+            }
+        }
+        // Metadata failures neither write a prefix nor poison the transaction.
+        conn.prepare("INSERT INTO t(k,c) VALUES ($1,$2)")
+            .unwrap()
+            .execute(&[Value::Text("ok".into()), Value::Integer(3)])
+            .unwrap();
+        conn.execute("COMMIT").unwrap();
+        assert_eq!(
+            conn.query("SELECT k,c,g FROM t").unwrap().rows,
+            vec![vec![
+                Value::Text("ok".into()),
+                Value::Integer(3),
+                Value::Integer(6)
+            ]]
+        );
+    }
+
+    #[test]
+    fn insert_column_bindings_reprepare_width_and_preserve_reordered_scratch() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("CREATE TABLE t (k TEXT NOT NULL PRIMARY KEY, c INTEGER)")
+            .unwrap();
+        let implicit = conn.prepare("INSERT INTO t VALUES ($1,$2)").unwrap();
+        let reordered = conn.prepare("INSERT INTO t(c,k) VALUES ($1,$2)").unwrap();
+        conn.execute("BEGIN").unwrap();
+        implicit
+            .execute(&[Value::Text("before".into()), Value::Integer(2)])
+            .unwrap();
+        reordered
+            .execute(&[Value::Integer(3), Value::Text("before_reordered".into())])
+            .unwrap();
+        conn.execute("ALTER TABLE t ADD COLUMN d INTEGER DEFAULT 7")
+            .unwrap();
+        let error = implicit
+            .execute(&[Value::Text("bad_width".into()), Value::Integer(99)])
+            .unwrap_err();
+        assert!(matches!(error, SqlError::InvalidValue(message)
+            if message == "expected 3 values, got 2"));
+        reordered
+            .execute(&[Value::Integer(10), Value::Text("prepared_a".into())])
+            .unwrap();
+        let stmt = parser::parse_sql("INSERT INTO t(d,k,c) VALUES ($1,$2,$3)").unwrap();
+        let uncached = conn.inner.borrow_mut().dispatch(
+            &db,
+            &stmt,
+            &[
+                Value::Integer(50),
+                Value::Text("uncached".into()),
+                Value::Integer(20),
+            ],
+        );
+        assert!(matches!(
+            uncached.unwrap(),
+            ExecutionResult::RowsAffected(1)
+        ));
+        reordered
+            .execute(&[Value::Integer(11), Value::Text("prepared_b".into())])
+            .unwrap();
+        conn.execute("COMMIT").unwrap();
+        let expected: Vec<_> = [
+            ("before", 2, 7),
+            ("before_reordered", 3, 7),
+            ("prepared_a", 10, 7),
+            ("prepared_b", 11, 7),
+            ("uncached", 20, 50),
+        ]
+        .into_iter()
+        .map(|(key, c, d)| {
+            vec![
+                Value::Text(key.into()),
+                Value::Integer(c),
+                Value::Integer(d),
+            ]
+        })
+        .collect();
+        assert_eq!(
+            conn.query("SELECT k,c,d FROM t ORDER BY k").unwrap().rows,
+            expected
+        );
+    }
+
+    #[test]
     fn compiled_insert_context_recompiles_after_default_and_trigger_ddl() {
         use jiff::civil::date;
         let dir = tempfile::tempdir().unwrap();
