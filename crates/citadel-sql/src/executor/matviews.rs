@@ -64,7 +64,7 @@ pub(super) fn exec_create_matview_in_txn(
     );
     TableSchema::validate_column_count(column_names.len())?;
     crate::encoding::validate_row_column_count(column_names.len().saturating_sub(1))?;
-    let columns = derive_columns(&column_names, &rows, &collations);
+    let columns = derive_columns(&column_names, &rows, &collations)?;
     if columns.is_empty() {
         return Err(SqlError::Unsupported(
             "materialized view must project at least one column".into(),
@@ -467,11 +467,16 @@ fn derive_columns(
     column_names: &[String],
     rows: &[Vec<Value>],
     collations: &[crate::types::Collation],
-) -> Vec<ColumnDef> {
+) -> Result<Vec<ColumnDef>> {
+    let mut seen = rustc_hash::FxHashSet::default();
     column_names
         .iter()
         .enumerate()
         .map(|(i, name)| {
+            let lower = name.to_ascii_lowercase();
+            if !seen.insert(lower.clone()) {
+                return Err(SqlError::DuplicateColumn(name.clone()));
+            }
             let data_type = rows
                 .iter()
                 .find_map(|row| {
@@ -483,8 +488,8 @@ fn derive_columns(
                     }
                 })
                 .unwrap_or(DataType::Text);
-            ColumnDef {
-                name: name.to_ascii_lowercase(),
+            Ok(ColumnDef {
+                name: lower,
                 data_type,
                 nullable: i != 0,
                 position: i as u16,
@@ -501,7 +506,7 @@ fn derive_columns(
                     .get(i)
                     .copied()
                     .unwrap_or(crate::types::Collation::Binary),
-            }
+            })
         })
         .collect()
 }

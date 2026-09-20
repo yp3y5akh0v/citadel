@@ -141,6 +141,123 @@ fn create_matview_duplicate_errors() {
 }
 
 #[test]
+fn matview_rejects_duplicate_output_names_before_creating_storage() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE src (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO src VALUES (1, 10)").unwrap();
+
+    for (name, second_alias, suffix, in_txn) in [
+        ("mv_exact", "x", "", false),
+        ("mv_case", "X", "", true),
+        ("mv_empty", "X", " WHERE id < 0", false),
+        ("mv_no_data", "x", " WITH NO DATA", true),
+    ] {
+        if in_txn {
+            conn.execute("BEGIN").unwrap();
+        }
+        let err = conn
+            .execute(&format!(
+                "CREATE MATERIALIZED VIEW {name} AS SELECT id AS x, v AS {second_alias} FROM src{suffix}"
+            ))
+            .unwrap_err();
+        assert!(
+            matches!(err, SqlError::DuplicateColumn(ref column) if column.eq_ignore_ascii_case("x"))
+        );
+        let err = conn
+            .prepare(&format!("SELECT * FROM {name}"))
+            .unwrap()
+            .query_collect(&[])
+            .unwrap_err();
+        assert!(matches!(err, SqlError::TableNotFound(_)));
+        if in_txn {
+            conn.execute("COMMIT").unwrap();
+        }
+        let backing_table = citadel_sql::types::MatviewDef::backing_table_name(name);
+        assert!(db
+            .begin_read()
+            .list_tables()
+            .unwrap()
+            .iter()
+            .all(|(table, _)| table.as_slice() != backing_table.as_bytes()));
+
+        // Neither the backing table nor catalog entry may reserve the rejected name.
+        conn.execute(&format!(
+            "CREATE MATERIALIZED VIEW {name} AS SELECT id, v FROM src"
+        ))
+        .unwrap();
+        let rows = conn
+            .prepare(&format!("SELECT * FROM {name}"))
+            .unwrap()
+            .query_collect(&[])
+            .unwrap()
+            .rows;
+        assert_eq!(rows, vec![vec![Value::Integer(1), Value::Integer(10)]]);
+        conn.execute(&format!("DROP MATERIALIZED VIEW {name}"))
+            .unwrap();
+    }
+}
+
+#[test]
+fn matview_refresh_keeps_stored_names_when_source_labels_become_duplicate() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE src (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO src VALUES (1, 10)").unwrap();
+    conn.execute("CREATE VIEW source_view AS SELECT id, v FROM src")
+        .unwrap();
+    conn.execute("CREATE MATERIALIZED VIEW mv AS SELECT * FROM source_view")
+        .unwrap();
+    conn.execute("CREATE UNIQUE INDEX mv_id ON mv (id)")
+        .unwrap();
+    conn.execute("INSERT INTO src VALUES (2, 20)").unwrap();
+    conn.execute("CREATE OR REPLACE VIEW source_view AS SELECT id AS x, v AS X FROM src")
+        .unwrap();
+
+    // Duplicate result labels remain valid for an ordinary derived relation.
+    let derived = conn
+        .prepare("SELECT * FROM source_view")
+        .unwrap()
+        .query_collect(&[])
+        .unwrap();
+    assert_eq!(derived.columns.len(), 2);
+    assert!(derived.columns[0].eq_ignore_ascii_case(&derived.columns[1]));
+    assert_eq!(derived.rows.len(), 2);
+
+    for (concurrently, in_txn) in [(false, false), (true, false), (false, true), (true, true)] {
+        if in_txn {
+            conn.execute("BEGIN").unwrap();
+        }
+        let sql = if concurrently {
+            "REFRESH MATERIALIZED VIEW CONCURRENTLY mv"
+        } else {
+            "REFRESH MATERIALIZED VIEW mv"
+        };
+        conn.execute(sql).unwrap();
+        if in_txn {
+            conn.execute("COMMIT").unwrap();
+        }
+        let refreshed = conn
+            .prepare("SELECT * FROM mv ORDER BY id")
+            .unwrap()
+            .query_collect(&[])
+            .unwrap();
+        assert_eq!(refreshed.columns, vec!["id", "v"]);
+        assert_eq!(
+            refreshed.rows,
+            vec![
+                vec![Value::Integer(1), Value::Integer(10)],
+                vec![Value::Integer(2), Value::Integer(20)],
+            ]
+        );
+    }
+}
+
+#[test]
 fn create_matview_name_conflicts_with_table() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
