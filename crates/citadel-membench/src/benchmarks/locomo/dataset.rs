@@ -164,6 +164,12 @@ pub fn validate_samples(samples: &[Sample]) -> Result<()> {
         let mut turns = FxHashSet::default();
         let mut sessions = FxHashMap::default();
         for turn in &sample.turns {
+            if turn.speaker.trim().is_empty() {
+                return Err(BenchError::Dataset(format!(
+                    "{}: turn {} speaker must be nonempty",
+                    sample.sample_id, turn.dia_id
+                )));
+            }
             validate_date_time(&turn.date_time, &sample.sample_id, turn.session)?;
             if let Some(previous) = sessions.insert(turn.session, turn.date_time.as_str()) {
                 if previous != turn.date_time {
@@ -259,7 +265,7 @@ fn parse_turn(v: &Value, session: u32, date_time: &str) -> Result<Turn> {
     let speaker = obj
         .get("speaker")
         .and_then(Value::as_str)
-        .unwrap_or("")
+        .ok_or_else(|| BenchError::Dataset("turn speaker must be present and a string".into()))?
         .to_string();
     let dia_id = obj
         .get("dia_id")
@@ -269,7 +275,7 @@ fn parse_turn(v: &Value, session: u32, date_time: &str) -> Result<Turn> {
     let text = obj
         .get("text")
         .and_then(Value::as_str)
-        .unwrap_or("")
+        .ok_or_else(|| BenchError::Dataset("turn text must be present and a string".into()))?
         .to_string();
     let blip_caption = obj
         .get("blip_caption")
@@ -457,6 +463,72 @@ mod identity_tests {
             root[0]["conversation"]["session_1"][1]["dia_id"] = id;
             assert!(parse_root(&root).is_err());
         }
+    }
+
+    #[test]
+    fn missing_or_nonstring_turn_speaker_and_text_are_rejected() {
+        for field in ["speaker", "text"] {
+            let expected = format!("turn {field} must be present and a string");
+            let mut root = fixture();
+            root[0]["conversation"]["session_1"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            assert!(parse_root(&root)
+                .unwrap_err()
+                .to_string()
+                .contains(&expected));
+            for invalid in [Value::Null, json!(42), json!(true), json!([]), json!({})] {
+                let mut root = fixture();
+                root[0]["conversation"]["session_1"][0][field] = invalid;
+                assert!(parse_root(&root)
+                    .unwrap_err()
+                    .to_string()
+                    .contains(&expected));
+            }
+        }
+    }
+
+    #[test]
+    fn blank_speakers_fail_for_loaded_and_manually_constructed_turns() {
+        for speaker in ["", " \t\n", "\u{2003}"] {
+            let mut root = fixture();
+            root[0]["conversation"]["session_1"][0]["speaker"] = json!(speaker);
+            assert!(parse_root(&root)
+                .unwrap_err()
+                .to_string()
+                .contains("conversation: turn D1:1 speaker must be nonempty"));
+
+            let mut samples = parse_root(&fixture()).unwrap();
+            samples[0].turns[0].speaker = speaker.into();
+            assert!(validate_samples(&samples)
+                .unwrap_err()
+                .to_string()
+                .contains("speaker must be nonempty"));
+        }
+    }
+
+    #[test]
+    fn text_only_photo_only_and_explicit_empty_text_turns_are_preserved() {
+        let mut root = fixture();
+        root[0]["conversation"]["session_1"] = json!([
+            {"speaker": " A ", "text": "  words\n", "dia_id": "D1:1"},
+            {"speaker": "B", "text": "", "dia_id": "D1:2",
+                "blip_caption": "a red bicycle", "query": "bicycle in park"},
+            {"speaker": "A", "text": "", "dia_id": "D1:3"}
+        ]);
+        let samples = parse_root(&root).unwrap();
+        let turns = &samples[0].turns;
+        assert_eq!(turns.len(), 3);
+        assert_eq!(turns[0].speaker, " A ");
+        assert_eq!(turns[0].text, "  words\n");
+        assert!(turns[0].blip_caption.is_empty());
+        assert!(turns[0].query.is_empty());
+        assert!(turns[1].text.is_empty());
+        assert_eq!(turns[1].blip_caption, "a red bicycle");
+        assert_eq!(turns[1].query, "bicycle in park");
+        assert!(turns[2].text.is_empty());
+        assert!(validate_samples(&samples).is_ok());
     }
 
     #[test]
