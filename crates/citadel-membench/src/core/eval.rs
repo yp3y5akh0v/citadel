@@ -201,6 +201,7 @@ fn log_retry(attempt: u32, delay_ms: u64, e: &LlmError, spent: Duration, budget:
 /// adjacent turns, deduped, in the configured order. Ingest writes turns in
 /// source order, so ascending atom id restores that order; under
 /// `Relevance` each hit renders as a `[id-r ..= id+r]` snippet by hit rank.
+/// Expansion preserves the first original hit's metadata for every seed ID.
 pub fn reader_view(
     eng: &MemoryEngine,
     region: &str,
@@ -213,67 +214,91 @@ pub fn reader_view(
     })?;
     let mut seen: FxHashSet<AtomId> = FxHashSet::default();
     let mut view: Vec<AtomHit> = Vec::with_capacity(hits.len());
-    for hit in hits {
-        if radius == 0 {
+    let mut seed_sessions = Vec::new();
+    if radius == 0 {
+        for hit in hits {
             if seen.insert(hit.id) {
                 view.push(hit);
             }
-            continue;
         }
-        let start = hit.id.checked_sub(radius).ok_or_else(|| {
-            BenchError::Dataset("neighbor range underflows atom identifiers".into())
-        })?;
-        let end = hit.id.checked_add(radius).ok_or_else(|| {
-            BenchError::Dataset("neighbor range overflows atom identifiers".into())
-        })?;
-        for id in start..=end {
-            if !seen.insert(id) {
-                continue;
+    } else {
+        let mut seed_ids = Vec::with_capacity(hits.len());
+        let mut seeds = FxHashMap::default();
+        let mut seen_sessions = FxHashSet::default();
+        for hit in hits {
+            if let std::collections::hash_map::Entry::Vacant(entry) = seeds.entry(hit.id) {
+                if config.reader_order == ReaderOrder::Sessions {
+                    let session = session_key(&hit)?;
+                    if seen_sessions.insert(session.clone()) {
+                        seed_sessions.push(session);
+                    }
+                }
+                seed_ids.push(hit.id);
+                entry.insert(hit);
             }
-            if id == hit.id {
-                view.push(hit.clone());
-            } else if let Some(neighbor) = eng.fetch_one(region, id)? {
-                view.push(neighbor);
+        }
+        for seed_id in seed_ids {
+            let start = seed_id.checked_sub(radius).ok_or_else(|| {
+                BenchError::Dataset("neighbor range underflows atom identifiers".into())
+            })?;
+            let end = seed_id.checked_add(radius).ok_or_else(|| {
+                BenchError::Dataset("neighbor range overflows atom identifiers".into())
+            })?;
+            for id in start..=end {
+                if !seen.insert(id) {
+                    continue;
+                }
+                // A later-ranked seed can first appear in an earlier window.
+                // Move its original hit rather than replacing its scores with
+                // an unranked fetch; its own window is still expanded later.
+                if let Some(seed) = seeds.remove(&id) {
+                    view.push(seed);
+                } else if let Some(neighbor) = eng.fetch_one(region, id)? {
+                    view.push(neighbor);
+                }
             }
         }
     }
     match config.reader_order {
         ReaderOrder::Chrono => view.sort_by_key(|h| h.id),
         ReaderOrder::Relevance => {}
-        ReaderOrder::Sessions => view = session_grouped(view)?,
+        ReaderOrder::Sessions => view = session_grouped(view, seed_sessions)?,
     }
     Ok(view)
 }
 
-/// The best hit fixes each session's position; turns inside it return to
-/// conversation order. Session metadata is required: there is no flat fallback.
-fn session_grouped(view: Vec<AtomHit>) -> Result<Vec<AtomHit>> {
-    #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-    enum SessionKey {
-        Number(i64),
-        Text(String),
-    }
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum SessionKey {
+    Number(i64),
+    Text(String),
+}
 
-    let mut order = Vec::new();
+fn session_key(hit: &AtomHit) -> Result<SessionKey> {
+    if let Some(session) = hit.payload.get("session").and_then(|value| value.as_i64()) {
+        Ok(SessionKey::Number(session))
+    } else if let Some(session_id) = hit
+        .payload
+        .get("session_id")
+        .and_then(|value| value.as_str())
+    {
+        Ok(SessionKey::Text(session_id.to_owned()))
+    } else {
+        Err(BenchError::Dataset(
+            "session reader order requires numeric payload.session or string payload.session_id on every hit"
+                .into(),
+        ))
+    }
+}
+
+/// Original-hit sessions follow their best hit's rank; neighbor-only sessions
+/// follow in first-encounter order. Turns inside each block return to conversation
+/// order. Session metadata is required: there is no flat fallback.
+fn session_grouped(view: Vec<AtomHit>, mut order: Vec<SessionKey>) -> Result<Vec<AtomHit>> {
+    let mut seen: FxHashSet<SessionKey> = order.iter().cloned().collect();
     let mut blocks: FxHashMap<SessionKey, Vec<AtomHit>> = FxHashMap::default();
     for hit in view {
-        let session = if let Some(session) =
-            hit.payload.get("session").and_then(|value| value.as_i64())
-        {
-            SessionKey::Number(session)
-        } else if let Some(session_id) = hit
-            .payload
-            .get("session_id")
-            .and_then(|value| value.as_str())
-        {
-            SessionKey::Text(session_id.to_owned())
-        } else {
-            return Err(crate::BenchError::Dataset(
-                "session reader order requires numeric payload.session or string payload.session_id on every hit"
-                    .into(),
-            ));
-        };
-        if !blocks.contains_key(&session) {
+        let session = session_key(&hit)?;
+        if seen.insert(session.clone()) {
             order.push(session.clone());
         }
         blocks.entry(session).or_default().push(hit);

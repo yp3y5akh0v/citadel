@@ -242,6 +242,239 @@ fn reader_view_expands_neighbors_dedups_and_orders() {
 }
 
 #[test]
+fn reader_view_expansion_keeps_original_seed_session_rank() {
+    let sample = parse_root(&fixture()).unwrap().remove(0);
+    let (_dir, eng) = open_engine();
+    eng.create_region(&sample.sample_id, Arc::new(MockEmbedder::new(DIM)))
+        .unwrap();
+    let ids = ingest_sample(&eng, &sample.sample_id, &sample).unwrap();
+    let hit = |index: usize| {
+        eng.fetch_one(&sample.sample_id, ids[index])
+            .unwrap()
+            .unwrap()
+    };
+    let config = BenchConfig {
+        reader_order: ReaderOrder::Sessions,
+        neighbor_radius: 1,
+        ..BenchConfig::default()
+    };
+    for (seeds, expected) in [
+        (vec![2], vec![ids[2], ids[3], ids[1]]),
+        (vec![2, 0], vec![ids[2], ids[3], ids[0], ids[1]]),
+    ] {
+        let view = reader_view(
+            &eng,
+            &sample.sample_id,
+            seeds.into_iter().map(hit).collect(),
+            config,
+        )
+        .unwrap();
+        assert_eq!(view.iter().map(|hit| hit.id).collect::<Vec<_>>(), expected);
+        for item in view {
+            let original = eng.fetch_one(&sample.sample_id, item.id).unwrap().unwrap();
+            assert_eq!(item.text, original.text);
+            assert_eq!(item.payload, original.payload);
+        }
+    }
+}
+
+#[test]
+fn reader_view_preserves_first_owned_seed_metadata_in_overlapping_windows() {
+    let sample = parse_root(&fixture()).unwrap().remove(0);
+    let (_dir, eng) = open_engine();
+    eng.create_region(&sample.sample_id, Arc::new(MockEmbedder::new(DIM)))
+        .unwrap();
+    let ids = ingest_sample(&eng, &sample.sample_id, &sample).unwrap();
+    for radius in [0, 1] {
+        for order in [
+            ReaderOrder::Relevance,
+            ReaderOrder::Chrono,
+            ReaderOrder::Sessions,
+        ] {
+            let mut first = eng.fetch_one(&sample.sample_id, ids[2]).unwrap().unwrap();
+            let mut later = eng.fetch_one(&sample.sample_id, ids[1]).unwrap().unwrap();
+            first.relevance = Some(9.25);
+            first.distance = Some(0.125);
+            first.graph_depth = Some(2);
+            later.relevance = Some(7.5);
+            later.distance = Some(0.25);
+            later.graph_depth = Some(3);
+            let expected = [
+                (
+                    first.id,
+                    first.text.as_ptr(),
+                    first.relevance,
+                    first.distance,
+                    first.graph_depth,
+                ),
+                (
+                    later.id,
+                    later.text.as_ptr(),
+                    later.relevance,
+                    later.distance,
+                    later.graph_depth,
+                ),
+            ];
+            // Duplicate seed IDs keep their first original hit. An ignored
+            // duplicate must not replace scores or introduce a metadata error.
+            let mut duplicate = later.clone();
+            duplicate.relevance = Some(999.0);
+            duplicate.payload = json!({});
+            duplicate.text = "ignored duplicate".into();
+            let view = reader_view(
+                &eng,
+                &sample.sample_id,
+                vec![first, later, duplicate],
+                BenchConfig {
+                    reader_order: order,
+                    neighbor_radius: radius,
+                    ..BenchConfig::default()
+                },
+            )
+            .unwrap();
+            for (id, text_ptr, relevance, distance, graph_depth) in expected {
+                let found = view.iter().find(|hit| hit.id == id).unwrap();
+                assert_eq!(found.relevance, relevance);
+                assert_eq!(found.distance, distance);
+                assert_eq!(found.graph_depth, graph_depth);
+                assert_eq!(
+                    found.text.as_ptr(),
+                    text_ptr,
+                    "original seed is moved, not cloned"
+                );
+                let stored = eng.fetch_one(&sample.sample_id, id).unwrap().unwrap();
+                assert_eq!(found.text, stored.text);
+                assert_eq!(found.payload, stored.payload);
+            }
+            let expected_ids = match (radius, order) {
+                (0, ReaderOrder::Chrono) => vec![ids[1], ids[2]],
+                (0, _) => vec![ids[2], ids[1]],
+                (_, ReaderOrder::Relevance) => vec![ids[1], ids[2], ids[3], ids[0]],
+                (_, ReaderOrder::Chrono) => vec![ids[0], ids[1], ids[2], ids[3]],
+                (_, ReaderOrder::Sessions) => vec![ids[2], ids[3], ids[0], ids[1]],
+            };
+            assert_eq!(
+                view.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+                expected_ids
+            );
+        }
+    }
+}
+
+#[test]
+fn reader_view_neighbor_only_sessions_follow_seeded_numeric_and_text_sessions() {
+    for payloads in [
+        [
+            json!({"session":1}),
+            json!({"session":2}),
+            json!({"session":3}),
+            json!({"session":4}),
+        ],
+        [
+            json!({"session_id":"a"}),
+            json!({"session_id":"b"}),
+            json!({"session_id":"c"}),
+            json!({"session_id":"d"}),
+        ],
+        // Numeric and text keys with matching labels remain distinct.
+        [
+            json!({"session":1}),
+            json!({"session_id":"1"}),
+            json!({"session":2}),
+            json!({"session_id":"2"}),
+        ],
+    ] {
+        let (_dir, eng) = open_engine();
+        eng.create_region("sessions", Arc::new(MockEmbedder::new(DIM)))
+            .unwrap();
+        let ids = eng
+            .remember_batch(
+                "sessions",
+                payloads
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, payload)| {
+                        citadel_mem::AtomInput::new("turn", format!("turn {i}"))
+                            .with_payload(payload)
+                    })
+                    .collect(),
+            )
+            .unwrap();
+        let hits = [ids[1], ids[3]]
+            .into_iter()
+            .map(|id| eng.fetch_one("sessions", id).unwrap().unwrap())
+            .collect();
+        let view = reader_view(
+            &eng,
+            "sessions",
+            hits,
+            BenchConfig {
+                reader_order: ReaderOrder::Sessions,
+                neighbor_radius: 1,
+                ..BenchConfig::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            view.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+            vec![ids[1], ids[3], ids[0], ids[2]],
+            "seeded blocks keep rank; neighbor-only blocks keep encounter order"
+        );
+    }
+}
+
+#[test]
+fn reader_view_expansion_still_requires_session_metadata_only_in_sessions_mode() {
+    for invalid in [0, 1] {
+        let (_dir, eng) = open_engine();
+        eng.create_region("metadata", Arc::new(MockEmbedder::new(DIM)))
+            .unwrap();
+        let ids = eng
+            .remember_batch(
+                "metadata",
+                (0..3)
+                    .map(|i| {
+                        let payload = if i == invalid {
+                            json!({"session": "invalid"})
+                        } else {
+                            json!({"session": 1})
+                        };
+                        citadel_mem::AtomInput::new("turn", format!("turn {i}"))
+                            .with_payload(payload)
+                    })
+                    .collect(),
+            )
+            .unwrap();
+        for order in [
+            ReaderOrder::Relevance,
+            ReaderOrder::Chrono,
+            ReaderOrder::Sessions,
+        ] {
+            let hit = eng.fetch_one("metadata", ids[1]).unwrap().unwrap();
+            let result = reader_view(
+                &eng,
+                "metadata",
+                vec![hit],
+                BenchConfig {
+                    reader_order: order,
+                    neighbor_radius: 1,
+                    ..BenchConfig::default()
+                },
+            );
+            if order == ReaderOrder::Sessions {
+                assert!(matches!(result, Err(BenchError::Dataset(ref message))
+                    if message == "session reader order requires numeric payload.session or string payload.session_id on every hit"));
+            } else {
+                assert_eq!(
+                    result.unwrap().iter().map(|hit| hit.id).collect::<Vec<_>>(),
+                    ids
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn session_prompt_rejects_invalid_or_conflicting_metadata() {
     let (_dir, eng) = open_engine();
     eng.create_region("metadata", Arc::new(MockEmbedder::new(DIM)))
