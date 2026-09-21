@@ -207,7 +207,7 @@ fn parse_sample(v: &Value) -> Result<Sample> {
     let mut turns = Vec::new();
     for (key, val) in conversation {
         // A session key is exactly `session_<u32>`; `session_1_date_time` etc. must not match.
-        let Some(session) = session_number(key) else {
+        let Some(session) = session_number(key)? else {
             continue;
         };
         let date_key = format!("session_{session}_date_time");
@@ -244,9 +244,29 @@ fn parse_sample(v: &Value) -> Result<Sample> {
     })
 }
 
-/// `Some(n)` iff `key` is `session_<n>` with `<n>` a bare u32 (no further suffix).
-fn session_number(key: &str) -> Option<u32> {
-    key.strip_prefix("session_")?.parse::<u32>().ok()
+/// Canonical `session_<u32>` keys denote sessions. Non-session siblings are ignored;
+/// numeric aliases and out-of-range numbers fail instead of losing dates or turns.
+fn session_number(key: &str) -> Result<Option<u32>> {
+    let Some(suffix) = key.strip_prefix("session_") else {
+        return Ok(None);
+    };
+    let digits = suffix
+        .strip_prefix('+')
+        .or_else(|| suffix.strip_prefix('-'))
+        .unwrap_or(suffix);
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Ok(None);
+    }
+    let invalid = || {
+        BenchError::Dataset(format!(
+            "noncanonical or out-of-range numeric session key {key:?}; expected session_<u32>"
+        ))
+    };
+    let session = suffix.parse::<u32>().map_err(|_| invalid())?;
+    if suffix != session.to_string() {
+        return Err(invalid());
+    }
+    Ok(Some(session))
 }
 
 fn validate_date_time(date: &str, sample_id: &str, session: u32) -> Result<()> {
@@ -277,16 +297,8 @@ fn parse_turn(v: &Value, session: u32, date_time: &str) -> Result<Turn> {
         .and_then(Value::as_str)
         .ok_or_else(|| BenchError::Dataset("turn text must be present and a string".into()))?
         .to_string();
-    let blip_caption = obj
-        .get("blip_caption")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    let query = obj
-        .get("query")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
+    let blip_caption = optional_turn_text(obj, "blip_caption")?;
+    let query = optional_turn_text(obj, "query")?;
     Ok(Turn {
         session,
         date_time: date_time.to_string(),
@@ -296,6 +308,15 @@ fn parse_turn(v: &Value, session: u32, date_time: &str) -> Result<Turn> {
         blip_caption,
         query,
     })
+}
+
+fn optional_turn_text(obj: &serde_json::Map<String, Value>, field: &str) -> Result<String> {
+    match obj.get(field) {
+        None => Ok(String::new()),
+        Some(value) => value.as_str().map(str::to_owned).ok_or_else(|| {
+            BenchError::Dataset(format!("turn {field} must be a string when present"))
+        }),
+    }
 }
 
 fn parse_qa(v: &Value) -> Result<QaSample> {
@@ -405,6 +426,97 @@ mod identity_tests {
             "qa": [{"question": "q", "category": 1,
                 "evidence": ["D1:1", "D1:1", "D-missing"]}]
         }])
+    }
+
+    #[test]
+    fn numeric_session_aliases_and_overflow_fail_without_losing_source_data() {
+        for key in [
+            "session_01",
+            "session_0001",
+            "session_+1",
+            "session_-1",
+            "session_4294967296",
+            "session_18446744073709551616",
+        ] {
+            let mut root = fixture();
+            let conversation = root[0]["conversation"].as_object_mut().unwrap();
+            let turns = conversation.remove("session_1").unwrap();
+            conversation.insert(key.into(), turns);
+            conversation.insert(format!("{key}_date_time"), json!("9:00 am on 1 May, 2023"));
+            let error = parse_root(&root).unwrap_err().to_string();
+            assert!(error.contains("numeric session key"), "{key}: {error}");
+            assert!(error.contains(key), "{key}: {error}");
+        }
+
+        // An alias must not silently merge into an existing session with distinct turns.
+        let mut root = fixture();
+        root[0]["conversation"]["session_01"] = json!([
+            {"speaker": "C", "text": "different session", "dia_id": "other"}
+        ]);
+        root[0]["conversation"]["session_01_date_time"] = json!("9:00 am on 2 May, 2023");
+        root[0]["conversation"]["session_1_date_time"] = json!("9:00 am on 1 May, 2023");
+        assert!(parse_root(&root)
+            .unwrap_err()
+            .to_string()
+            .contains("numeric session key"));
+    }
+
+    #[test]
+    fn present_nonstring_image_metadata_is_not_silently_discarded() {
+        for field in ["blip_caption", "query"] {
+            for invalid in [Value::Null, json!(42), json!(true), json!([]), json!({})] {
+                let mut root = fixture();
+                root[0]["conversation"]["session_1"][0]["text"] = json!("");
+                root[0]["conversation"]["session_1"][0][field] = invalid;
+                let error = parse_root(&root).unwrap_err().to_string();
+                assert!(error.contains(&format!("turn {field} must be a string when present")));
+            }
+        }
+    }
+
+    #[test]
+    fn valid_sources_keep_dates_order_and_exact_image_text() {
+        let root = json!([{
+            "sample_id": "conversation",
+            "conversation": {
+                "session_2": [{"speaker": "B", "text": "second", "dia_id": "later",
+                    "blip_caption": "", "query": ""}],
+                "session_2_date_time": "10:00 am on 2 May, 2023",
+                "session_1": [
+                    {"speaker": " A ", "text": "  first\n", "dia_id": "first"},
+                    {"speaker": "B", "text": "", "dia_id": "photo",
+                     "blip_caption": " 雪\nblue bowl ", "query": " bowl\tquery "}
+                ],
+                "session_1_date_time": "9:00 am on 1 May, 2023",
+                "session_1_summary": "Ignored metadata must not become a session.",
+                "session_2_summary": {"uninterpreted": true}
+            }
+        }]);
+        let samples = parse_root(&root).unwrap();
+        let turns = &samples[0].turns;
+        assert_eq!(
+            turns.iter().map(|t| t.dia_id.as_str()).collect::<Vec<_>>(),
+            ["first", "photo", "later"]
+        );
+        assert_eq!(turns[0].session, 1);
+        assert_eq!(turns[2].session, 2);
+        assert_eq!(turns[0].date_time, "9:00 am on 1 May, 2023");
+        assert_eq!(turns[2].date_time, "10:00 am on 2 May, 2023");
+        assert!(turns.iter().all(|turn| turn.event_micros().is_some()));
+        assert!(turns[0].blip_caption.is_empty() && turns[0].query.is_empty());
+        assert!(turns[2].blip_caption.is_empty() && turns[2].query.is_empty());
+        assert_eq!(turns[1].blip_caption, " 雪\nblue bowl ");
+        assert_eq!(turns[1].query, " bowl\tquery ");
+        assert_eq!(
+            super::super::ingest::turn_content(&turns[0]),
+            "[9:00 am on 1 May, 2023]  A :   first\n"
+        );
+        assert_eq!(super::super::ingest::turn_content(&turns[1]),
+                   "[9:00 am on 1 May, 2023] B:  [shared a photo:  雪\nblue bowl ] [image search:  bowl\tquery ]");
+        assert_eq!(
+            super::super::ingest::turn_content(&turns[2]),
+            "[10:00 am on 2 May, 2023] B: second"
+        );
     }
 
     #[test]
