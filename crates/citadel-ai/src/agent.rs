@@ -45,6 +45,8 @@ pub enum AgentError {
     #[error(transparent)]
     Graph(#[from] GraphError),
     #[error(transparent)]
+    TracePersistence(Box<TracePersistenceFailure>),
+    #[error(transparent)]
     Llm(#[from] citadel_llm::LlmError),
     #[error(transparent)]
     Budget(#[from] BudgetStop),
@@ -53,6 +55,55 @@ pub enum AgentError {
 }
 
 pub type AgentResult<T> = Result<T, AgentError>;
+
+/// Recoverable call data retained when recording an LLM trace fails. Debug
+/// formatting omits prompt, request, response, and provider-error contents.
+pub struct RetainedLlmCall {
+    pub request: CompletionRequest,
+    pub request_hash: String,
+    pub model_id: String,
+    pub client: citadel_llm::ClientRequestIdentity,
+    pub prompt: ResolvedPrompt,
+    pub attempt: u32,
+    pub outcome: Result<CompletionResponse, LlmError>,
+}
+
+impl std::fmt::Debug for RetainedLlmCall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RetainedLlmCall")
+            .field("request_hash", &self.request_hash)
+            .field("model_id", &self.model_id)
+            .field("attempt", &self.attempt)
+            .field("response_received", &self.outcome.is_ok())
+            .finish_non_exhaustive()
+    }
+}
+
+/// A trace write failed after the calls in `calls` had already been attempted.
+/// `usage` includes all of them exactly once, plus earlier calls in the run.
+///
+/// `confirmed_persisted` is the prefix whose writes returned success. The failed
+/// write may still have persisted; this is not an exactly-once delivery receipt.
+/// All calls are retained for reconciliation without another provider request.
+#[derive(thiserror::Error)]
+#[error("failed to persist LLM traces ({confirmed_persisted} confirmed; {} retained)", .calls.len())]
+pub struct TracePersistenceFailure {
+    #[source]
+    pub source: GraphError,
+    pub usage: BudgetUsage,
+    pub confirmed_persisted: usize,
+    pub calls: Vec<RetainedLlmCall>,
+}
+
+impl std::fmt::Debug for TracePersistenceFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TracePersistenceFailure")
+            .field("usage", &self.usage)
+            .field("confirmed_persisted", &self.confirmed_persisted)
+            .field("retained_calls", &self.calls.len())
+            .finish_non_exhaustive()
+    }
+}
 
 /// One node of the cognition loop. Data travels in the state so the driver is a
 /// pure `fn(state) -> state`.
@@ -323,10 +374,12 @@ impl Agent {
 fn complete_observed(
     llm: &dyn LLMClient,
     req: &CompletionRequest,
-    observe: impl FnOnce(&Result<CompletionResponse, LlmError>) -> AgentResult<()>,
+    observe: impl FnOnce(RecordedCall) -> AgentResult<()>,
 ) -> AgentResult<CompletionResponse> {
+    let model_id = llm.model_id().to_owned();
+    let client = llm.request_identity();
     let outcome = llm.complete(req);
-    observe(&outcome)?;
+    observe(RecordedCall::new(req, model_id, client, &outcome))?;
     outcome.map_err(Into::into)
 }
 
@@ -391,9 +444,8 @@ impl Ctx<'_> {
         self.usage.wall_secs = self.started.elapsed().as_secs();
         self.budget.check_llm_call(&self.usage)?;
         let llm = Arc::clone(&self.llm);
-        let resp = complete_observed(&*llm, &req, |outcome| {
-            let call = RecordedCall::new(&req, 1, outcome);
-            self.accrue_and_record(&call, prompt)?;
+        let resp = complete_observed(&*llm, &req, |call| {
+            self.accrue_and_record(vec![call], prompt)?;
             // Preserve the attempt before stopping; never dispatch tools or
             // spend again when a configured budget cannot be checked.
             self.usage.wall_secs = self.started.elapsed().as_secs();
@@ -417,28 +469,42 @@ impl Ctx<'_> {
         Ok(resp)
     }
 
-    /// Record every provider attempt before enforcing its budget consequences.
+    /// Account for the full attempted batch before any storage write can fail.
     fn accrue_and_record(
         &mut self,
-        call: &RecordedCall,
+        calls: Vec<RecordedCall>,
         prompt: &ResolvedPrompt,
     ) -> AgentResult<()> {
-        call.accrue(&mut self.usage);
-        let hash = request_hash(self.llm.model_id(), &call.req);
+        for call in &calls {
+            call.accrue(&mut self.usage);
+        }
         let provenance = json!({
             "node": prompt.id.as_str(),
             "version": prompt.version,
             "hash": prompt.hash,
             "source": prompt.source.as_str(),
         });
-        self.graph.record_llm_call(
-            &hash,
-            self.llm.model_id(),
-            &call.trace(),
-            call.cost(),
-            Some(&provenance),
-        )?;
-        Ok(())
+        let mut confirmed_persisted = 0;
+        let result = calls.iter().try_for_each(|call| {
+            self.graph.record_llm_call(
+                &request_hash(&call.model_id, &call.req),
+                &call.model_id,
+                &call.trace(),
+                call.cost(),
+                Some(&provenance),
+            )?;
+            confirmed_persisted += 1;
+            Ok::<_, GraphError>(())
+        });
+        result.map_err(|source| {
+            self.usage.wall_secs = self.started.elapsed().as_secs();
+            AgentError::TracePersistence(Box::new(TracePersistenceFailure {
+                source,
+                usage: self.usage,
+                confirmed_persisted,
+                calls: calls.into_iter().map(|call| call.retain(prompt)).collect(),
+            }))
+        })
     }
 
     /// Run repair through the same observed, budgeted channel as proposals.
@@ -469,9 +535,7 @@ impl Ctx<'_> {
             op.repair(&pctx, failed, Box::new(channel))
         };
         let calls: Vec<RecordedCall> = log.borrow_mut().drain(..).collect();
-        for call in &calls {
-            self.accrue_and_record(call, system)?;
-        }
+        self.accrue_and_record(calls, system)?;
         self.usage.wall_secs = self.started.elapsed().as_secs();
         self.budget.check_llm_call(&self.usage)?;
         match fixes {
@@ -1359,52 +1423,64 @@ impl ReplyDigest {
 /// Every provider attempt is buffered, including failures without known usage.
 struct RecordedCall {
     req: CompletionRequest,
+    model_id: String,
+    client: citadel_llm::ClientRequestIdentity,
     attempt: u32,
     outcome: RecordedOutcome,
 }
 
 enum RecordedOutcome {
     Response(CompletionResponse),
-    Failure { error: Value, pre_dispatch: bool },
+    Failure(LlmError),
 }
 
 impl RecordedCall {
     fn new(
         req: &CompletionRequest,
-        attempt: u32,
+        model_id: String,
+        client: citadel_llm::ClientRequestIdentity,
         outcome: &Result<CompletionResponse, LlmError>,
     ) -> Self {
         let outcome = match outcome {
             Ok(response) => RecordedOutcome::Response(response.clone()),
-            Err(error) => RecordedOutcome::Failure {
-                error: error_to_value(error),
-                pre_dispatch: error.is_pre_dispatch(),
-            },
+            Err(error) => RecordedOutcome::Failure(error.clone()),
         };
         Self {
             req: req.clone(),
-            attempt,
+            model_id,
+            client,
+            attempt: 1,
             outcome,
+        }
+    }
+
+    fn retain(self, prompt: &ResolvedPrompt) -> RetainedLlmCall {
+        RetainedLlmCall {
+            request_hash: request_hash(&self.model_id, &self.req),
+            request: self.req,
+            model_id: self.model_id,
+            client: self.client,
+            prompt: prompt.clone(),
+            attempt: self.attempt,
+            outcome: match self.outcome {
+                RecordedOutcome::Response(response) => Ok(response),
+                RecordedOutcome::Failure(error) => Err(error),
+            },
         }
     }
 
     fn response(&self) -> Option<&CompletionResponse> {
         match &self.outcome {
             RecordedOutcome::Response(response) => Some(response),
-            RecordedOutcome::Failure { .. } => None,
+            RecordedOutcome::Failure(_) => None,
         }
     }
 
     fn accrue(&self, usage: &mut BudgetUsage) {
         match &self.outcome {
             RecordedOutcome::Response(response) => usage.accrue(response.usage),
-            RecordedOutcome::Failure {
-                pre_dispatch: false,
-                ..
-            } => usage.accrue(None),
-            RecordedOutcome::Failure {
-                pre_dispatch: true, ..
-            } => {}
+            RecordedOutcome::Failure(error) if error.is_pre_dispatch() => {}
+            RecordedOutcome::Failure(_) => usage.accrue(None),
         }
     }
 
@@ -1413,24 +1489,16 @@ impl RecordedCall {
             RecordedOutcome::Response(response) => {
                 response.usage.and_then(|u| valid_cost(u.cost_usd))
             }
-            RecordedOutcome::Failure {
-                pre_dispatch: true, ..
-            } => Some(0.0),
-            RecordedOutcome::Failure {
-                pre_dispatch: false,
-                ..
-            } => None,
+            RecordedOutcome::Failure(error) if error.is_pre_dispatch() => Some(0.0),
+            RecordedOutcome::Failure(_) => None,
         }
     }
 
     fn trace(&self) -> Value {
         let mut trace = match &self.outcome {
             RecordedOutcome::Response(response) => response_to_value(response),
-            RecordedOutcome::Failure {
-                error,
-                pre_dispatch,
-            } => json!({
-                "error": error, "pre_dispatch": pre_dispatch, "usage": null,
+            RecordedOutcome::Failure(error) => json!({
+                "error": error_to_value(error), "pre_dispatch": error.is_pre_dispatch(), "usage": null,
             }),
         };
         trace["attempt"] = json!(self.attempt);
@@ -1497,8 +1565,7 @@ impl Completer for OwnedChannel {
             .check_llm_call(&self.usage)
             .map_err(|stop| ProposeError::Failed(stop.to_string()))?;
         let llm = Arc::clone(&self.llm);
-        complete_observed(&*llm, req, |outcome| {
-            let call = RecordedCall::new(req, 1, outcome);
+        complete_observed(&*llm, req, |call| {
             call.accrue(&mut self.usage);
             self.log.borrow_mut().push(call);
             self.usage.wall_secs = self.started.elapsed().as_secs();
@@ -1600,11 +1667,11 @@ impl Ctx<'_> {
             // Drain the buffered calls: accrue budget + record the replay trace (the
             // accounting the controller used to do inline), then summarize the last reply.
             let calls: Vec<RecordedCall> = log.borrow_mut().drain(..).collect();
-            let mut last_reply: Option<ReplyDigest> = None;
-            for call in &calls {
-                self.accrue_and_record(call, &system)?;
-                last_reply = call.response().map(ReplyDigest::of);
-            }
+            let last_reply = calls
+                .last()
+                .and_then(RecordedCall::response)
+                .map(ReplyDigest::of);
+            self.accrue_and_record(calls, &system)?;
             self.usage.wall_secs = self.started.elapsed().as_secs();
             if let Err(stop) = self.budget.check_llm_call(&self.usage) {
                 break 'search stop.into();
@@ -3337,5 +3404,340 @@ mod tests {
             assert!(capture.requests().is_empty());
             assert!(agent.graph().load_llm_traces().unwrap().is_empty());
         }
+    }
+
+    /// Fail a selected trace insertion through the real graph/embedding path.
+    /// Other graph atoms and recall queries keep the ordinary mock behavior.
+    struct FailingTraceEmbedder {
+        inner: MockEmbedder,
+        fail_on: u32,
+        traces: Arc<AtomicU32>,
+    }
+
+    impl citadel_mem::Embedder for FailingTraceEmbedder {
+        fn dim(&self) -> usize {
+            64
+        }
+        fn metric(&self) -> citadel_mem::EmbeddingMetric {
+            citadel_mem::EmbeddingMetric::Cosine
+        }
+        fn model_id(&self) -> &str {
+            "trace-failure-fixture"
+        }
+        fn embed_with_cancel(
+            &self,
+            texts: &[&str],
+            cancel: Option<&citadel::CancelToken>,
+        ) -> Result<Vec<Vec<f32>>, citadel_mem::EmbedError> {
+            for text in texts {
+                if text.len() == 64 && text.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    let ordinal = self.traces.fetch_add(1, Ordering::SeqCst) + 1;
+                    if ordinal == self.fail_on {
+                        return Err(citadel_mem::EmbedError::Backend(
+                            "trace storage failed".into(),
+                        ));
+                    }
+                }
+            }
+            self.inner.embed_with_cancel(texts, cancel)
+        }
+    }
+
+    fn trace_failure_region(
+        fail_on: u32,
+    ) -> (tempfile::TempDir, Arc<MemoryEngine>, Arc<AtomicU32>) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DatabaseBuilder::new(dir.path().join("trace.db"))
+            .passphrase(b"test-passphrase")
+            .argon2_profile(Argon2Profile::Iot)
+            .create()
+            .unwrap();
+        let engine = Arc::new(MemoryEngine::open(Arc::new(db)).unwrap());
+        let traces = Arc::new(AtomicU32::new(0));
+        engine
+            .create_region(
+                "agent",
+                Arc::new(FailingTraceEmbedder {
+                    inner: MockEmbedder::new(64),
+                    fail_on,
+                    traces: Arc::clone(&traces),
+                }),
+            )
+            .unwrap();
+        (dir, engine, traces)
+    }
+
+    fn persistence_failure(error: AgentError) -> Box<TracePersistenceFailure> {
+        let debug = format!("{error:?}");
+        let display = error.to_string();
+        for secret in ["private prompt", "private answer", "private provider error"] {
+            assert!(!debug.contains(secret));
+            assert!(!display.contains(secret));
+        }
+        let AgentError::TracePersistence(failure) = error else {
+            panic!("expected recoverable trace failure: {display}")
+        };
+        for call in &failure.calls {
+            let debug = format!("{call:?}");
+            assert!(!debug.contains("private prompt"));
+            assert!(!debug.contains("private answer"));
+            assert!(!debug.contains("private provider error"));
+        }
+        assert!(matches!(&failure.source,
+            GraphError::Mem(MemError::Embed(citadel_mem::EmbedError::Backend(message)))
+            if message == "trace storage failed"));
+        failure
+    }
+
+    #[test]
+    fn cognition_trace_failure_retains_completion_and_stops_before_tools() {
+        struct CountTool(Arc<AtomicU32>);
+        impl Tool for CountTool {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec {
+                    name: "count".into(),
+                    description: "count".into(),
+                    input_schema: json!({"type":"object"}),
+                }
+            }
+            fn call(&self, _: &Value) -> Result<String, ToolError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok("done".into())
+            }
+        }
+        for known in [false, true] {
+            let (_dir, engine, traces) = trace_failure_region(2);
+            let mut response = one_tool_call("count");
+            response.message.content = "private answer".into();
+            if known {
+                response = measured(response);
+            }
+            let capture =
+                testing::capturing(vec![measured(plan_response(&[], &["use count"])), response]);
+            let tool_calls = Arc::new(AtomicU32::new(0));
+            let mut tools = ToolRegistry::new();
+            tools.register(Box::new(CountTool(Arc::clone(&tool_calls))));
+            let agent = Agent::new(
+                capture.client(),
+                BeliefGraph::new(engine, "agent"),
+                tools,
+                AgentBudget::default(),
+                AgentConfig::default(),
+            );
+            let failure = persistence_failure(agent.run("private prompt").unwrap_err());
+            assert_eq!(capture.requests().len(), 2);
+            assert_eq!(traces.load(Ordering::SeqCst), 2);
+            assert_eq!(tool_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(failure.confirmed_persisted, 0);
+            assert_eq!(failure.calls.len(), 1);
+            assert_eq!(failure.usage.tokens, known.then_some(0));
+            assert_eq!(failure.usage.cost_usd, known.then_some(0.0));
+            let call = &failure.calls[0];
+            let response = call.outcome.as_ref().unwrap();
+            assert_eq!(response.message.content, "private answer");
+            assert_eq!(response.message.tool_calls.len(), 1);
+            assert_eq!(response.finish_reason, FinishReason::ToolUse);
+            assert_eq!(response.usage.is_some(), known);
+            assert_eq!(call.prompt.id, PromptId::Execute);
+            assert_eq!(
+                call.request_hash,
+                request_hash(&call.model_id, &call.request)
+            );
+            assert_eq!(call.client, capture.client().request_identity());
+            assert_eq!(call.attempt, 1);
+            assert_eq!(agent.graph().load_llm_traces().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn trace_failure_retains_typed_provider_failure_and_its_spend_classification() {
+        for pre_dispatch in [false, true] {
+            let (_dir, engine, traces) = trace_failure_region(1);
+            let calls = Arc::new(AtomicU32::new(0));
+            let observed = Arc::clone(&calls);
+            let client = citadel_llm::factory::from_fn("trace-error", move |_| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                Err(if pre_dispatch {
+                    LlmError::UnsupportedRequest("private provider error".into())
+                } else {
+                    LlmError::Transport("private provider error".into())
+                })
+            });
+            let agent = Agent::new(
+                client,
+                BeliefGraph::new(engine, "agent"),
+                ToolRegistry::new(),
+                AgentBudget::default(),
+                AgentConfig::default(),
+            );
+            let failure = persistence_failure(agent.run("private prompt").unwrap_err());
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(traces.load(Ordering::SeqCst), 1);
+            assert_eq!(failure.calls.len(), 1);
+            let error = failure.calls[0].outcome.as_ref().unwrap_err();
+            assert_eq!(error.is_pre_dispatch(), pre_dispatch);
+            assert!(
+                matches!(error, LlmError::UnsupportedRequest(message) | LlmError::Transport(message)
+                if message == "private provider error")
+            );
+            assert_eq!(failure.usage.tokens, pre_dispatch.then_some(0));
+            assert_eq!(failure.usage.cost_usd, pre_dispatch.then_some(0.0));
+            assert_eq!(failure.confirmed_persisted, 0);
+            assert!(agent.graph().load_llm_traces().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn buffered_trace_failure_preserves_all_attempts_and_accrues_the_batch_once() {
+        struct ThreeCalls;
+        impl ProposalOperator for ThreeCalls {
+            fn propose(
+                &self,
+                _: &ProposalContext<'_>,
+                mut llm: Box<dyn Completer>,
+            ) -> Result<Vec<Candidate>, ProposeError> {
+                for i in 0..3 {
+                    llm.complete(&CompletionRequest::new(vec![Message::user(format!(
+                        "private prompt {i}"
+                    ))]))?;
+                }
+                Ok(Vec::new())
+            }
+        }
+        for fail_on in [1, 2] {
+            for final_kind in ["known", "unknown", "transport", "unsupported"] {
+                let (_dir, engine, traces) = trace_failure_region(fail_on);
+                let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+                let observed = Arc::clone(&requests);
+                let client = citadel_llm::factory::from_fn("batch-test", move |request| {
+                    let mut requests = observed.lock().unwrap();
+                    requests.push(request.clone());
+                    let i = requests.len() as u32;
+                    if i == 3 {
+                        match final_kind {
+                            "transport" => {
+                                return Err(LlmError::Transport("private provider error".into()))
+                            }
+                            "unsupported" => {
+                                return Err(LlmError::UnsupportedRequest(
+                                    "private provider error".into(),
+                                ))
+                            }
+                            _ => {}
+                        }
+                    }
+                    let mut response = CompletionResponse::text(format!("private answer {i}"));
+                    if i != 3 || final_kind != "unknown" {
+                        response.usage = Some(TokenUsage {
+                            input_tokens: i,
+                            output_tokens: i,
+                            cost_usd: Some(0.25),
+                        });
+                    }
+                    Ok(response)
+                });
+                let agent = Agent::new(
+                    client,
+                    BeliefGraph::new(engine, "agent"),
+                    ToolRegistry::new(),
+                    AgentBudget::default(),
+                    AgentConfig {
+                        verifier: Some(Arc::new(AttestedVerifier(true))),
+                        proposal_operator: Some(Arc::new(ThreeCalls)),
+                        ..Default::default()
+                    },
+                );
+                let error = agent
+                    .run_discovery(DiscoveryGoal {
+                        goal: Goal::new("private prompt"),
+                        kind: VerifiedKind::Construction,
+                        baseline_score: 0.0,
+                        archive_width: 1,
+                        max_idle_rounds: 1,
+                        max_mints: 1,
+                    })
+                    .unwrap_err();
+                let failure = persistence_failure(error);
+                let requests = requests.lock().unwrap();
+                assert_eq!(requests.len(), 3);
+                assert_eq!(
+                    traces.load(Ordering::SeqCst),
+                    fail_on,
+                    "stop writing after the first failure"
+                );
+                assert_eq!(failure.confirmed_persisted, (fail_on - 1) as usize);
+                assert_eq!(
+                    failure.calls.len(),
+                    3,
+                    "retain even the later unpersisted attempts"
+                );
+                let (tokens, cost) = match final_kind {
+                    "known" => (Some(12), Some(0.75)),
+                    "unsupported" => (Some(6), Some(0.5)),
+                    _ => (None, None),
+                };
+                assert_eq!(failure.usage.tokens, tokens);
+                assert_eq!(failure.usage.cost_usd, cost);
+                for (i, call) in failure.calls.iter().enumerate() {
+                    if i == 2 && matches!(final_kind, "transport" | "unsupported") {
+                        let error = call.outcome.as_ref().unwrap_err();
+                        assert_eq!(error.is_pre_dispatch(), final_kind == "unsupported");
+                        assert!(
+                            matches!(error, LlmError::Transport(message) | LlmError::UnsupportedRequest(message)
+                            if message == "private provider error")
+                        );
+                    } else {
+                        assert_eq!(
+                            call.outcome.as_ref().unwrap().message.content,
+                            format!("private answer {}", i + 1)
+                        );
+                    }
+                    assert_eq!(call.prompt.id, PromptId::Proposer);
+                    assert_eq!(
+                        call.request_hash,
+                        request_hash(&call.model_id, &call.request)
+                    );
+                    assert_eq!(
+                        citadel_llm::canonical_json(&call.request),
+                        citadel_llm::canonical_json(&requests[i])
+                    );
+                }
+                assert_eq!(
+                    agent.graph().load_llm_traces().unwrap().len(),
+                    (fail_on - 1) as usize
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_usage_refreshes_elapsed_time_without_a_sleep() {
+        let (_dir, engine, _) = trace_failure_region(1);
+        let capture = testing::capturing(Vec::new());
+        let client = capture.client();
+        let agent = Agent::new(
+            client.clone(),
+            BeliefGraph::new(engine, "agent"),
+            ToolRegistry::new(),
+            AgentBudget::default(),
+            AgentConfig::default(),
+        );
+        let mut ctx = agent.new_ctx("private prompt".into());
+        ctx.started = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(7))
+            .unwrap();
+        assert_eq!(ctx.usage.wall_secs, 0);
+        let request = CompletionRequest::new(vec![Message::user("private prompt")]);
+        let call = RecordedCall::new(
+            &request,
+            client.model_id().to_owned(),
+            client.request_identity(),
+            &Ok(measured(CompletionResponse::text("private answer"))),
+        );
+        let prompt = ctx.config.prompt_library.resolve(PromptId::Execute);
+        let failure = persistence_failure(ctx.accrue_and_record(vec![call], &prompt).unwrap_err());
+        assert!(failure.usage.wall_secs >= 7);
+        assert_eq!(failure.usage.wall_secs, ctx.usage.wall_secs);
+        assert!(capture.requests().is_empty());
     }
 }

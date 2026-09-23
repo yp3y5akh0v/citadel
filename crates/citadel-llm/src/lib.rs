@@ -41,7 +41,7 @@ pub fn known_max_output_tokens(model_id: &str) -> Option<u32> {
     limits::max_output_tokens(model_id)
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum LlmError {
     /// No faithful backend mapping; refused pre-dispatch, so no spend.
     #[error("llm request unsupported: {0}")]

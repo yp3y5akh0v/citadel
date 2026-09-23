@@ -35,6 +35,142 @@ def _region(name="agent", dim=64):
     return mem
 
 
+class _FailTraceEmbedder:
+    dim = 64
+    metric = "cosine"
+    model_id = "python-trace-failure-fixture"
+
+    def __init__(self, fail_on):
+        self.inner = citadeldb.MockEmbedder(self.dim)
+        self.fail_on = fail_on
+        self.traces = 0
+
+    def embed_with_cancel(self, texts, cancel_token):
+        for text in texts:
+            if len(text) == 64 and all(c in "0123456789abcdef" for c in text):
+                self.traces += 1
+                if self.traces == self.fail_on:
+                    raise RuntimeError("private storage cause")
+        return self.inner.embed_with_cancel(texts, cancel_token)
+
+
+def _failing_trace_region(fail_on):
+    mem = citadeldb.connect(key="k").memory()
+    embedder = _FailTraceEmbedder(fail_on)
+    mem.create_region("trace", embedder)
+    return mem, embedder
+
+
+@pytest.mark.parametrize("known", [False, True])
+def test_trace_storage_failure_retains_callback_response_without_running_tools(known):
+    import traceback
+
+    mem, embedder = _failing_trace_region(2)
+
+    class Tool(EchoTool):
+        calls = 0
+
+        def call(self, args):
+            self.calls += 1
+            return "should not run"
+
+    class LLM:
+        model_id = "retained-callback"
+
+        def __init__(self):
+            self.calls = []
+
+        def complete(self, request):
+            self.calls.append(request)
+            if len(self.calls) == 1:
+                return {
+                    "content": "",
+                    "finish_reason": "tool_use",
+                    "usage": {"input_tokens": 3, "output_tokens": 1, "cost_usd": 0.01},
+                    "tool_calls": [{"id": "plan", "name": "submit_plan", "arguments": {
+                        "goal": {"prompt": "private prompt", "acceptance_criteria": [], "constraints": []},
+                        "tasks": [{"description": "use echo", "deps": []}],
+                    }}],
+                }
+            assert len(self.calls) == 2
+            return {
+                "content": "private answer",
+                "finish_reason": "tool_use",
+                "usage": {"input_tokens": 5, "output_tokens": 2, "cost_usd": 0.02} if known else None,
+                "tool_calls": [{"id": "echo", "name": "echo", "arguments": {"text": "private tool input"}}],
+            }
+
+    llm, tool = LLM(), Tool()
+    tools = ag.ToolRegistry()
+    tools.register(tool)
+    agent = citadeldb.Agent(mem, "trace", llm, tools=tools)
+    with pytest.raises(citadeldb.AgentError) as raised:
+        agent.run("private prompt")
+    error = raised.value
+    assert len(llm.calls) == 2 and embedder.traces == 2 and tool.calls == 0
+    assert len(agent.graph().load_llm_traces()) == 1
+    assert isinstance(error.storage_error, citadeldb.OperationalError)
+    assert "private storage cause" in str(error.storage_error)
+    assert error.__cause__ is None
+    rendered = "".join(traceback.format_exception(error))
+    # Only the summary is formatted. Recovery and the storage cause are opt-in.
+    for private in ("private answer", "private storage cause", "private tool input"):
+        assert private not in str(error) and private not in repr(error) and private not in rendered
+    recovery = error.recovery
+    assert recovery["confirmed_persisted"] == 0
+    assert recovery["usage"]["tokens"] == (11 if known else None)
+    assert recovery["usage"]["cost_usd"] == (pytest.approx(0.03) if known else None)
+    assert len(recovery["calls"]) == 1
+    call = recovery["calls"][0]
+    assert call["request"] == llm.calls[1]
+    assert call["request"]["seed"] == 1
+    assert call["attempt"] == 1 and call["model_id"] == llm.model_id
+    assert len(call["request_hash"]) == 64
+    assert call["client"]["provider"] == "in-process"
+    assert len(call["client"]["endpoint_sha256"]) == 64
+    assert len(call["client"]["wire_defaults_sha256"]) == 64
+    assert call["prompt"]["id"] == "execute"
+    assert call["prompt"]["text"] == call["request"]["messages"][0]["content"]
+    assert len(call["prompt"]["hash"]) == 64
+    response = call["outcome"]["response"]
+    assert call["outcome"]["kind"] == "response"
+    assert response["content"] == "private answer" and response["finish_reason"] == "tool_use"
+    assert response["tool_calls"][0]["arguments"] == {"text": "private tool input"}
+    assert response["usage"] == ({"input_tokens": 5, "output_tokens": 2, "cost_usd": 0.02} if known else None)
+
+
+def test_trace_storage_failure_retains_provider_failure_and_unknown_usage():
+    mem, embedder = _failing_trace_region(1)
+
+    class LLM:
+        model_id = "failing-callback"
+        calls = 0
+
+        def complete(self, request):
+            self.calls += 1
+            raise RuntimeError("private provider failure")
+
+    llm = LLM()
+    with pytest.raises(citadeldb.AgentError) as raised:
+        citadeldb.Agent(mem, "trace", llm).run("private prompt")
+    error = raised.value
+    assert llm.calls == 1 and embedder.traces == 1
+    assert error.recovery["usage"]["tokens"] is None
+    assert error.recovery["usage"]["cost_usd"] is None
+    failure = error.recovery["calls"][0]["outcome"]
+    assert failure["kind"] == "error"
+    assert failure["error"] == {"kind": "backend", "message": "RuntimeError: private provider failure", "pre_dispatch": False, "retryable": False}
+    assert "private provider failure" not in str(error)
+
+
+def test_ordinary_agent_errors_have_no_shared_recovery_payload():
+    first, second = citadeldb.AgentError("first"), citadeldb.AgentError("second")
+    assert first.recovery is None and first.storage_error is None
+    assert second.recovery is None and second.storage_error is None
+    first.recovery = {"calls": []}
+    assert second.recovery is None
+
+
 # ---- LLM client ------------------------------------------------------------
 
 

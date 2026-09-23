@@ -16,7 +16,15 @@ class ProgrammingError(CitadelError): ...
 class DataError(CitadelError): ...
 class NotSupportedError(CitadelError): ...
 class LlmError(CitadelError): ...
-class AgentError(CitadelError): ...
+class AgentError(CitadelError):
+    """Agent failure; trace storage failures retain recovery data for inspection.
+
+    Recovery contains cumulative usage, calls, and a confirmed_persisted prefix
+    of acknowledged writes. A failed write may still have persisted, so the
+    prefix is not a safe replay offset. Ordinary failures leave both fields None.
+    """
+    recovery: dict[str, Any] | None
+    storage_error: CitadelError | None
 
 # --- console-script entry points --------------------------------------------
 
