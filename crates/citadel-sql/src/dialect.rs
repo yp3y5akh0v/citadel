@@ -1,5 +1,6 @@
 use sqlparser::ast::{BinaryOperator, Expr as SpExpr, Statement as SpStatement};
 use sqlparser::dialect::{Dialect, GenericDialect, PostgreSqlDialect, Precedence};
+use sqlparser::keywords::Keyword;
 use sqlparser::parser::{Parser, ParserError};
 use sqlparser::tokenizer::Token;
 
@@ -179,6 +180,26 @@ impl Dialect for CitadelDialect {
         precedence: u8,
     ) -> Option<Result<SpExpr, ParserError>> {
         let next = parser.peek_token().token;
+
+        // sqlparser consumes COLLATE after a prefix, but qualified fields and
+        // casts are completed later. Honor the same PostgreSQL precedence for
+        // those expressions without consuming column-definition constraints.
+        // PostgreSQL's public precedence hook supplies the parser-state guard.
+        if matches!(&next, Token::Word(word) if word.keyword == Keyword::COLLATE) {
+            match self.inner.get_next_precedence(parser) {
+                Some(Err(error)) => return Some(Err(error)),
+                Some(Ok(_)) => {
+                    parser.advance_token();
+                    return Some(parser.parse_object_name(false).map(|collation| {
+                        SpExpr::Collate {
+                            expr: Box::new(expr.clone()),
+                            collation,
+                        }
+                    }));
+                }
+                None => {}
+            }
+        }
 
         if matches!(next, Token::Lt) {
             if let Token::HashArrow = parser.peek_nth_token(1).token {
