@@ -14,6 +14,18 @@ use super::scan::*;
 mod keys;
 use keys::ProbeTable;
 
+/// JOIN sources currently support relations and derived tables. Function
+/// arguments must not be discarded by resolving only a same-named relation.
+pub(super) fn validate_join_sources(stmt: &SelectStmt) -> Result<()> {
+    if let Some(join) = stmt.joins.iter().find(|join| join.table.args.is_some()) {
+        return Err(SqlError::Unsupported(format!(
+            "table function on the right side of JOIN: {}",
+            join.table.name
+        )));
+    }
+    Ok(())
+}
+
 /// Amortize cancellation loads across CPU-only join work: building a probe map
 /// and expanding matches can outlast the scan that fed them.
 const JOIN_CANCEL_INTERVAL: usize = 256;

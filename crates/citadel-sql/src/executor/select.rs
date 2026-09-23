@@ -125,6 +125,7 @@ pub(super) fn exec_select_with_read(
     stmt: &SelectStmt,
     ctes: &CteContext,
 ) -> Result<ExecutionResult> {
+    super::join::validate_join_sources(stmt)?;
     // Cloned once so the post-scan phases can hold it without borrowing `rtx`,
     // which stays mutably borrowed for the scan itself.
     let cancel = rtx.cancel_token().cloned();
@@ -5615,6 +5616,9 @@ fn projection_column_names(select_cols: &[SelectColumn], columns: &[ColumnDef]) 
 }
 
 fn build_join_plan_static(schema: &SchemaManager, sel: &SelectStmt) -> Option<JoinPlanStatic> {
+    // The interpreter owns the explicit unsupported-source error. Do not
+    // compile a function source as a same-named ordinary relation.
+    super::join::validate_join_sources(sel).ok()?;
     for join in &sel.joins {
         if join.subquery.is_some() {
             return None;

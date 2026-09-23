@@ -1417,6 +1417,7 @@ pub(super) fn exec_select_in_txn(
     stmt: &SelectStmt,
     ctes: &CteContext,
 ) -> Result<ExecutionResult> {
+    super::join::validate_join_sources(stmt)?;
     let cancel = wtx.cancel_token().cloned();
     let cancel = cancel.as_ref();
     if stmt.from.is_empty() && stmt.from_subquery.is_none() {
