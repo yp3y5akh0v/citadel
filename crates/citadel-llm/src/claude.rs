@@ -255,30 +255,86 @@ fn str_field(v: &Value, key: &str) -> String {
         .to_string()
 }
 
-fn parse_usage(raw: Option<&Value>, model: &str) -> TokenUsage {
-    let field = |name: &str| -> u32 {
-        raw.and_then(|v| v.get(name))
-            .and_then(Value::as_u64)
-            .unwrap_or(0)
-            .min(u64::from(u32::MAX)) as u32
+fn parse_usage(raw: Option<&Value>, model: &str) -> Option<TokenUsage> {
+    let raw = raw?.as_object()?;
+    let field = |name: &str| -> Option<u32> { u32::try_from(raw.get(name)?.as_u64()?).ok() };
+    // Absent optional cache counters mean no cache usage. A present malformed
+    // counter invalidates the report, as does an unrepresentable aggregate.
+    let cache_field = |name: &str| -> Option<u32> {
+        if raw.contains_key(name) {
+            field(name)
+        } else {
+            Some(0)
+        }
     };
-    // input_tokens excludes cached tokens; sum them for true input cost.
-    let input_tokens = field("input_tokens")
-        .saturating_add(field("cache_read_input_tokens"))
-        .saturating_add(field("cache_creation_input_tokens"));
+    // input_tokens excludes cached tokens; retain the existing total-input convention.
+    let input_tokens = field("input_tokens")?
+        .checked_add(cache_field("cache_read_input_tokens")?)?
+        .checked_add(cache_field("cache_creation_input_tokens")?)?;
     let mut usage = TokenUsage {
         input_tokens,
-        output_tokens: field("output_tokens"),
+        output_tokens: field("output_tokens")?,
         cost_usd: None,
     };
     usage.cost_usd = pricing::cost_for(model, &usage);
-    usage
+    Some(usage)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ToolSpec;
+
+    #[test]
+    fn unavailable_usage_preserves_completed_response() {
+        let invalid = [
+            Value::Null,
+            json!([]),
+            json!({}),
+            json!({"input_tokens": 3}),
+            json!({"output_tokens": 2}),
+            json!({"input_tokens": -1, "output_tokens": 2}),
+            json!({"input_tokens": "3", "output_tokens": 2}),
+            json!({"input_tokens": 3, "output_tokens": 2.0}),
+            json!({"input_tokens": 4294967296_u64, "output_tokens": 2}),
+            json!({"input_tokens": 3, "output_tokens": 2, "cache_read_input_tokens": null}),
+            json!({"input_tokens": 3, "output_tokens": 2, "cache_creation_input_tokens": "1"}),
+            json!({"input_tokens": u32::MAX, "output_tokens": 2, "cache_read_input_tokens": 1}),
+            json!({"input_tokens": 0, "output_tokens": 2, "cache_read_input_tokens": u32::MAX, "cache_creation_input_tokens": 1}),
+        ];
+        for usage in std::iter::once(None).chain(invalid.into_iter().map(Some)) {
+            let mut wire = json!({"content": [{"type": "text", "text": "retained"}], "stop_reason": "end_turn"});
+            if let Some(usage) = usage {
+                wire["usage"] = usage;
+            }
+            let response = from_wire(&wire, "claude-opus-4-8").unwrap();
+            assert_eq!(response.message.content, "retained");
+            assert_eq!(response.finish_reason, FinishReason::Stop);
+            assert_eq!(response.usage, None, "{wire}");
+        }
+    }
+
+    #[test]
+    fn reported_usage_distinguishes_zero_and_unknown_pricing() {
+        let zero = json!({"input_tokens": 0, "output_tokens": 0});
+        assert_eq!(
+            parse_usage(Some(&zero), "claude-opus-4-8"),
+            Some(TokenUsage {
+                input_tokens: 0,
+                output_tokens: 0,
+                cost_usd: Some(0.0),
+            })
+        );
+        let counts = json!({"input_tokens": 12, "output_tokens": 4});
+        assert_eq!(
+            parse_usage(Some(&counts), "unlisted-model"),
+            Some(TokenUsage {
+                input_tokens: 12,
+                output_tokens: 4,
+                cost_usd: None,
+            })
+        );
+    }
 
     fn spec() -> ToolSpec {
         ToolSpec {
@@ -410,9 +466,9 @@ mod tests {
         assert_eq!(r.finish_reason, FinishReason::ToolUse);
         assert_eq!(r.message.tool_calls[0].name, "search");
         assert_eq!(r.message.tool_calls[0].arguments, json!({ "q": "x" }));
-        assert_eq!(r.usage.input_tokens, 17, "10 + 5 + 2 cached");
-        assert_eq!(r.usage.output_tokens, 7);
-        assert!(r.usage.cost_usd.is_some(), "known model is priced");
+        assert_eq!(r.usage.unwrap().input_tokens, 17, "10 + 5 + 2 cached");
+        assert_eq!(r.usage.unwrap().output_tokens, 7);
+        assert!(r.usage.unwrap().cost_usd.is_some(), "known model is priced");
     }
 
     #[test]

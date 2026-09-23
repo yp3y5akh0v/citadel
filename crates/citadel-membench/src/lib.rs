@@ -129,7 +129,7 @@ pub struct QuestionResult {
     pub recall_micros: u128,
     pub input_tokens: u64,
     pub output_tokens: u64,
-    /// Failed attempts lacking both measured usage and a no-dispatch guarantee.
+    /// Attempts with unknown usage, including responses without valid counters.
     pub unknown_usage_attempts: u64,
     /// Estimated USD: reader + judge tokens, each at its model's rate.
     pub cost_usd: Option<f64>,

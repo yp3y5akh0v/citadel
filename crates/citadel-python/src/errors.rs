@@ -256,7 +256,7 @@ fn agent_category(e: &EngineAgentError) -> Category {
     match e {
         EngineAgentError::Graph(e) => graph_category(e),
         EngineAgentError::Llm(e) => llm_category(e),
-        EngineAgentError::Other(_) => Agent,
+        EngineAgentError::Budget(_) | EngineAgentError::Other(_) => Agent,
     }
 }
 

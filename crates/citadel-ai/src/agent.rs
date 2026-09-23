@@ -18,7 +18,10 @@ use serde_json::{json, Value};
 
 use citadel_mem::{AtomId, MemError, RecallProfile};
 
-use crate::budget::{AgentBudget, BudgetExceeded, BudgetUsage};
+use crate::budget::{
+    valid_cost, AgentBudget, BudgetExceeded, BudgetInvalid, BudgetStop, BudgetUnavailable,
+    BudgetUsage,
+};
 use crate::graph::{
     BeliefGraph, CoInstantiationCheck, Evidence, Goal, GoalStatus, GraphError, Reflection,
     SelfModel, Task, TaskStatus, Verdict, VerifiedKind, CANDIDATE_KIND,
@@ -43,6 +46,8 @@ pub enum AgentError {
     Graph(#[from] GraphError),
     #[error(transparent)]
     Llm(#[from] citadel_llm::LlmError),
+    #[error(transparent)]
+    Budget(#[from] BudgetStop),
     #[error("agent: {0}")]
     Other(String),
 }
@@ -103,63 +108,19 @@ pub enum TerminatedBy {
     Incomplete,
     DriftExceeded,
     BudgetExceeded(BudgetExceeded),
+    BudgetUnavailable(BudgetUnavailable),
+    InvalidBudget(BudgetInvalid),
 }
 
-/// Capped, jittered backoff for a transient LLM error. No attempt cap: a transient
-/// retries until the run's wall-clock budget (see `retry_complete`); a permanent
-/// error never retries.
-#[derive(Debug, Clone, Copy)]
-pub struct RetryPolicy {
-    /// Base backoff, doubled each subsequent attempt.
-    pub base_ms: u64,
-    /// Ceiling on any single backoff (a server `Retry-After` may still exceed it).
-    pub max_ms: u64,
-}
-
-impl Default for RetryPolicy {
-    fn default() -> Self {
-        Self {
-            base_ms: 200,
-            max_ms: 2_000,
+impl From<BudgetStop> for TerminatedBy {
+    fn from(stop: BudgetStop) -> Self {
+        match stop {
+            BudgetStop::Exceeded(cap) => Self::BudgetExceeded(cap),
+            BudgetStop::UsageUnavailable(reason) => Self::BudgetUnavailable(reason),
+            BudgetStop::InvalidConfiguration(reason) => Self::InvalidBudget(reason),
         }
     }
 }
-
-impl RetryPolicy {
-    /// Backoff before retry `attempt` (1-based): capped exponential from `base_ms`,
-    /// then equal jitter (half fixed + half random) so the delay grows without
-    /// synchronizing or busy-looping at zero. A server `Retry-After` is a hard floor
-    /// and may exceed `max_ms`. Equal jitter, not full jitter: a single sequential
-    /// client needs only the non-zero floor, not fleet load-spreading.
-    fn delay_ms(&self, attempt: u32, retry_after_secs: Option<u64>) -> u64 {
-        let shift = (attempt.saturating_sub(1)).min(16);
-        let exp = self.base_ms.saturating_mul(1u64 << shift).min(self.max_ms);
-        let jittered = exp / 2 + jitter(exp / 2 + 1);
-        let server = retry_after_secs.unwrap_or(0).saturating_mul(1_000);
-        jittered.max(server)
-    }
-}
-
-/// A uniform sample in `[0, bound)` from the wall clock's sub-second nanos. Timing
-/// only, so it decorrelates backoff without perturbing the seed-pinned search
-/// (replay determinism is over candidates, not sleep length).
-fn jitter(bound: u64) -> u64 {
-    if bound <= 1 {
-        return 0;
-    }
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos() as u64 % bound)
-        .unwrap_or(0)
-}
-
-/// Sleep `ms`. No-op on wasm (no blocking sleep; retryable HTTP backends absent).
-#[cfg(not(target_arch = "wasm32"))]
-fn backoff_sleep(ms: u64) {
-    std::thread::sleep(std::time::Duration::from_millis(ms));
-}
-#[cfg(target_arch = "wasm32")]
-fn backoff_sleep(_ms: u64) {}
 
 /// Tunables for a run. `verifier` None = fall back to a bounded audited critic.
 ///
@@ -176,7 +137,6 @@ pub struct AgentConfig {
     /// Recall recipe for the always-on context injected per subtask. Defaults to the
     /// agent-context profile (narrative kinds, recency-disabled for replay stability).
     pub recall_context: RecallProfile,
-    pub retry: RetryPolicy,
     pub verifier: Option<Arc<dyn Verifier>>,
     /// Versioned, overridable prompts for the loop's LLM call sites.
     pub prompt_library: Arc<PromptLibrary>,
@@ -200,7 +160,6 @@ impl Default for AgentConfig {
             max_react_steps: 6,
             recall_context_k: 5,
             recall_context: RecallProfile::agent_context(),
-            retry: RetryPolicy::default(),
             verifier: None,
             prompt_library: Arc::new(PromptLibrary::default()),
             proposal_operator: None,
@@ -300,8 +259,8 @@ impl Agent {
         &self.graph
     }
 
-    /// Drive the loop to a terminal state. Infra/LLM errors are `Err`; every
-    /// graceful end is `Ok`.
+    /// Drive the loop to a terminal state. Infra and proven local LLM errors
+    /// are `Err`; unavailable provider usage produces an explicit budget stop.
     pub fn run(&self, prompt: impl Into<String>) -> AgentResult<AgentReport> {
         let mut ctx = self.new_ctx(prompt.into());
 
@@ -316,12 +275,18 @@ impl Agent {
             if !matches!(state, CognitionState::Converge) {
                 if let Err(cap) = ctx.budget.check(&ctx.usage) {
                     state = CognitionState::Done {
-                        terminated_by: TerminatedBy::BudgetExceeded(cap),
+                        terminated_by: TerminatedBy::from(cap),
                     };
                     continue;
                 }
             }
-            state = ctx.step(state)?;
+            state = match ctx.step(state) {
+                Ok(state) => state,
+                Err(AgentError::Budget(stop)) => CognitionState::Done {
+                    terminated_by: stop.into(),
+                },
+                Err(error) => return Err(error),
+            };
             ctx.usage.steps += 1;
         }
     }
@@ -353,44 +318,16 @@ impl Agent {
     }
 }
 
-/// Call the backend, retrying a transient error with capped, jittered backoff until
-/// the wall-clock deadline, so a network outage does not abort a long run. A
-/// permanent error (auth/malformed) fails fast. The wall-clock budget is the only
-/// bound; this single layer serves the cognition loop and the discovery proposal
-/// channel.
-fn retry_complete(
+/// Record the provider attempt before propagating a response or error. The
+/// mandatory token budget cannot authorize another attempt after unknown spend.
+fn complete_observed(
     llm: &dyn LLMClient,
-    policy: RetryPolicy,
-    started: Instant,
-    max_wall_secs: u64,
     req: &CompletionRequest,
-) -> Result<CompletionResponse, LlmError> {
-    let mut attempt = 1u32;
-    loop {
-        match llm.complete(req) {
-            Ok(resp) => return Ok(resp),
-            Err(e) => {
-                // Permanent errors never succeed; only transient ones are worth waiting on.
-                if !e.is_retryable() {
-                    return Err(e);
-                }
-                let delay = policy.delay_ms(attempt, e.retry_after_secs());
-                // The wall-clock budget, not an attempt count, ends a retry.
-                if would_exceed_wall(started, max_wall_secs, delay) {
-                    return Err(e);
-                }
-                backoff_sleep(delay);
-                attempt = attempt.saturating_add(1);
-            }
-        }
-    }
-}
-
-/// Whether sleeping `delay_ms` would reach the wall-clock cap. Rounds up to whole
-/// seconds so a sub-second backoff cannot slip past the second-granular guard.
-fn would_exceed_wall(started: Instant, max_wall_secs: u64, delay_ms: u64) -> bool {
-    let delay_secs = delay_ms.saturating_add(999) / 1_000;
-    started.elapsed().as_secs().saturating_add(delay_secs) >= max_wall_secs
+    observe: impl FnOnce(&Result<CompletionResponse, LlmError>) -> AgentResult<()>,
+) -> AgentResult<CompletionResponse> {
+    let outcome = llm.complete(req);
+    observe(&outcome)?;
+    outcome.map_err(Into::into)
 }
 
 /// Per-run state plus borrowed handles to the agent's components.
@@ -451,8 +388,18 @@ impl Ctx<'_> {
         // reproducible and schema-adherent across backends.
         req.temperature = Some(self.config.temperature);
         req.seed = self.config.seed;
-        let resp = self.call_with_retry(&req)?;
-        self.accrue_and_record(&req, &resp, prompt)?;
+        self.usage.wall_secs = self.started.elapsed().as_secs();
+        self.budget.check_llm_call(&self.usage)?;
+        let llm = Arc::clone(&self.llm);
+        let resp = complete_observed(&*llm, &req, |outcome| {
+            let call = RecordedCall::new(&req, 1, outcome);
+            self.accrue_and_record(&call, prompt)?;
+            // Preserve the attempt before stopping; never dispatch tools or
+            // spend again when a configured budget cannot be checked.
+            self.usage.wall_secs = self.started.elapsed().as_secs();
+            self.budget.check_llm_call(&self.usage)?;
+            Ok(())
+        })?;
         // A terminal or malformed reply still incurred spend, so trace it.
         let refusal = match resp.finish_reason {
             FinishReason::Stop | FinishReason::Length => None,
@@ -470,29 +417,14 @@ impl Ctx<'_> {
         Ok(resp)
     }
 
-    /// Accrue token/cost usage and record the immutable `llm_trace` for `resp`. Shared
-    /// by the cognition loop and discovery so every call is budgeted/replayed one way.
+    /// Record every provider attempt before enforcing its budget consequences.
     fn accrue_and_record(
         &mut self,
-        req: &CompletionRequest,
-        resp: &CompletionResponse,
+        call: &RecordedCall,
         prompt: &ResolvedPrompt,
     ) -> AgentResult<()> {
-        self.usage.tokens +=
-            u64::from(resp.usage.input_tokens) + u64::from(resp.usage.output_tokens);
-        match resp.usage.cost_usd {
-            Some(cost) => self.usage.cost_usd += cost,
-            // Unpriced response accrues $0, so a cost cap could never engage - fail closed.
-            None if self.budget.max_cost_usd.is_some() => {
-                return Err(AgentError::Other(format!(
-                    "max_cost_usd is set but model '{}' returned an unpriced response; \
-                     add the model to llm pricing or unset the cost cap",
-                    self.llm.model_id()
-                )));
-            }
-            None => {}
-        }
-        let hash = request_hash(self.llm.model_id(), req);
+        call.accrue(&mut self.usage);
+        let hash = request_hash(self.llm.model_id(), &call.req);
         let provenance = json!({
             "node": prompt.id.as_str(),
             "version": prompt.version,
@@ -502,28 +434,16 @@ impl Ctx<'_> {
         self.graph.record_llm_call(
             &hash,
             self.llm.model_id(),
-            &response_to_value(resp),
-            resp.usage.cost_usd,
+            &call.trace(),
+            call.cost(),
             Some(&provenance),
         )?;
         Ok(())
     }
 
-    /// Call the backend, retrying transient errors with bounded backoff (only the
-    /// successful response is traced). Backoff is skipped if it would cross the deadline.
-    fn call_with_retry(&self, req: &CompletionRequest) -> Result<CompletionResponse, LlmError> {
-        retry_complete(
-            &*self.llm,
-            self.config.retry,
-            self.started,
-            self.budget.max_wall_secs,
-            req,
-        )
-    }
-
-    /// Run one repair call through a fresh budgeted/traced channel (same accrual as
-    /// the proposal path), returning the operator's fixes. A transient LLM failure
-    /// yields no fix; a hard error aborts. Operators without repair support no-op.
+    /// Run repair through the same observed, budgeted channel as proposals.
+    /// Preserve every attempt before returning an operator error or budget stop.
+    /// Operators without repair support no-op.
     fn repair_candidate(
         &mut self,
         op: &Arc<dyn ProposalOperator>,
@@ -541,23 +461,24 @@ impl Ctx<'_> {
             };
             let channel = OwnedChannel {
                 llm: Arc::clone(&self.llm),
-                retry: self.config.retry,
                 started: self.started,
-                max_wall_secs: self.budget.max_wall_secs,
-                cost_capped: self.budget.max_cost_usd.is_some(),
+                budget: *self.budget,
+                usage: self.usage,
                 log: Rc::clone(&log),
             };
-            match op.repair(&pctx, failed, Box::new(channel)) {
-                Ok(fixes) => fixes,
-                Err(ProposeError::Llm(e)) if e.is_retryable() => Vec::new(),
-                Err(e) => return Err(AgentError::Other(format!("repair: {e}"))),
-            }
+            op.repair(&pctx, failed, Box::new(channel))
         };
         let calls: Vec<RecordedCall> = log.borrow_mut().drain(..).collect();
         for call in &calls {
-            self.accrue_and_record(&call.req, &call.resp, system)?;
+            self.accrue_and_record(call, system)?;
         }
-        Ok(fixes)
+        self.usage.wall_secs = self.started.elapsed().as_secs();
+        self.budget.check_llm_call(&self.usage)?;
+        match fixes {
+            Ok(fixes) => Ok(fixes),
+            Err(ProposeError::Llm(e)) if e.is_retryable() => Ok(Vec::new()),
+            Err(e) => Err(AgentError::Other(format!("repair: {e}"))),
+        }
     }
 
     fn plan(&mut self) -> AgentResult<CognitionState> {
@@ -1188,9 +1109,10 @@ impl Ctx<'_> {
             let status = match terminated_by {
                 TerminatedBy::Success => None,
                 TerminatedBy::DriftExceeded => Some(GoalStatus::Abandoned),
-                TerminatedBy::Incomplete | TerminatedBy::BudgetExceeded(_) => {
-                    Some(GoalStatus::Active)
-                }
+                TerminatedBy::Incomplete
+                | TerminatedBy::BudgetExceeded(_)
+                | TerminatedBy::BudgetUnavailable(_)
+                | TerminatedBy::InvalidBudget(_) => Some(GoalStatus::Active),
             };
             if let Some(status) = status {
                 self.graph.set_goal_status(goal_id, status)?;
@@ -1434,15 +1356,127 @@ impl ReplyDigest {
     }
 }
 
-/// One buffered proposal LLM call; the controller drains these after `propose` to
-/// accrue budget and record the replay trace.
+/// Every provider attempt is buffered, including failures without known usage.
 struct RecordedCall {
     req: CompletionRequest,
-    resp: CompletionResponse,
+    attempt: u32,
+    outcome: RecordedOutcome,
+}
+
+enum RecordedOutcome {
+    Response(CompletionResponse),
+    Failure { error: Value, pre_dispatch: bool },
+}
+
+impl RecordedCall {
+    fn new(
+        req: &CompletionRequest,
+        attempt: u32,
+        outcome: &Result<CompletionResponse, LlmError>,
+    ) -> Self {
+        let outcome = match outcome {
+            Ok(response) => RecordedOutcome::Response(response.clone()),
+            Err(error) => RecordedOutcome::Failure {
+                error: error_to_value(error),
+                pre_dispatch: error.is_pre_dispatch(),
+            },
+        };
+        Self {
+            req: req.clone(),
+            attempt,
+            outcome,
+        }
+    }
+
+    fn response(&self) -> Option<&CompletionResponse> {
+        match &self.outcome {
+            RecordedOutcome::Response(response) => Some(response),
+            RecordedOutcome::Failure { .. } => None,
+        }
+    }
+
+    fn accrue(&self, usage: &mut BudgetUsage) {
+        match &self.outcome {
+            RecordedOutcome::Response(response) => usage.accrue(response.usage),
+            RecordedOutcome::Failure {
+                pre_dispatch: false,
+                ..
+            } => usage.accrue(None),
+            RecordedOutcome::Failure {
+                pre_dispatch: true, ..
+            } => {}
+        }
+    }
+
+    fn cost(&self) -> Option<f64> {
+        match &self.outcome {
+            RecordedOutcome::Response(response) => {
+                response.usage.and_then(|u| valid_cost(u.cost_usd))
+            }
+            RecordedOutcome::Failure {
+                pre_dispatch: true, ..
+            } => Some(0.0),
+            RecordedOutcome::Failure {
+                pre_dispatch: false,
+                ..
+            } => None,
+        }
+    }
+
+    fn trace(&self) -> Value {
+        let mut trace = match &self.outcome {
+            RecordedOutcome::Response(response) => response_to_value(response),
+            RecordedOutcome::Failure {
+                error,
+                pre_dispatch,
+            } => json!({
+                "error": error, "pre_dispatch": pre_dispatch, "usage": null,
+            }),
+        };
+        trace["attempt"] = json!(self.attempt);
+        trace
+    }
+}
+
+fn error_to_value(error: &LlmError) -> Value {
+    match error {
+        LlmError::UnsupportedRequest(message) => {
+            json!({"kind":"unsupported_request", "message":message})
+        }
+        LlmError::Backend(message) => json!({"kind":"backend", "message":message}),
+        LlmError::Transport(message) => json!({"kind":"transport", "message":message}),
+        LlmError::Http {
+            status,
+            retry_after,
+            message,
+        } => json!({"kind":"http", "status":status, "retry_after":retry_after, "message":message}),
+    }
+}
+
+fn value_to_error(value: &Value) -> LlmError {
+    let message = value
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("recorded provider failure")
+        .to_owned();
+    match value.get("kind").and_then(Value::as_str) {
+        Some("unsupported_request") => LlmError::UnsupportedRequest(message),
+        Some("transport") => LlmError::Transport(message),
+        Some("http") => LlmError::Http {
+            status: value
+                .get("status")
+                .and_then(Value::as_u64)
+                .and_then(|s| u16::try_from(s).ok())
+                .unwrap_or(0),
+            retry_after: value.get("retry_after").and_then(Value::as_u64),
+            message,
+        },
+        _ => LlmError::Backend(message),
+    }
 }
 
 /// The OWNED one-shot LLM channel handed to a proposal operator. It runs each call
-/// through the same retry path as the cognition loop and BUFFERS every
+/// through the same observed attempt path as the cognition loop and BUFFERS every
 /// (request, response) into a shared log; the controller drains the log after
 /// `propose` to accrue budget and record the trace. Decoupled from `Ctx` (the
 /// controller no longer completes inline) so the channel is `'static` and can be
@@ -1450,39 +1484,31 @@ struct RecordedCall {
 /// construction (`Rc`/`RefCell`), matching the sequential discovery loop.
 struct OwnedChannel {
     llm: Arc<dyn LLMClient>,
-    retry: RetryPolicy,
     started: Instant,
-    max_wall_secs: u64,
-    cost_capped: bool,
+    budget: AgentBudget,
+    usage: BudgetUsage,
     log: Rc<RefCell<Vec<RecordedCall>>>,
 }
 
 impl Completer for OwnedChannel {
     fn complete(&mut self, req: &CompletionRequest) -> Result<CompletionResponse, ProposeError> {
-        // The proposal operator OWNS its request's sampling (its explore/exploit
-        // temperature schedule, or its deliberate omission) - pass it untouched.
-        let resp = retry_complete(
-            &*self.llm,
-            self.retry,
-            self.started,
-            self.max_wall_secs,
-            req,
-        )
-        .map_err(ProposeError::Llm)?;
-        // Fail closed PER CALL (as accrue_and_record does): an unpriced response
-        // cannot be cost-capped, so a multi-call operator stops on the first one.
-        if self.cost_capped && resp.usage.cost_usd.is_none() {
-            return Err(ProposeError::Failed(format!(
-                "max_cost_usd is set but model '{}' returned an unpriced response; \
-                 add the model to llm pricing or unset the cost cap",
-                self.llm.model_id()
-            )));
-        }
-        self.log.borrow_mut().push(RecordedCall {
-            req: req.clone(),
-            resp: resp.clone(),
-        });
-        Ok(resp)
+        self.usage.wall_secs = self.started.elapsed().as_secs();
+        self.budget
+            .check_llm_call(&self.usage)
+            .map_err(|stop| ProposeError::Failed(stop.to_string()))?;
+        let llm = Arc::clone(&self.llm);
+        complete_observed(&*llm, req, |outcome| {
+            let call = RecordedCall::new(req, 1, outcome);
+            call.accrue(&mut self.usage);
+            self.log.borrow_mut().push(call);
+            self.usage.wall_secs = self.started.elapsed().as_secs();
+            self.budget.check_llm_call(&self.usage)?;
+            Ok(())
+        })
+        .map_err(|error| match error {
+            AgentError::Llm(error) => ProposeError::Llm(error),
+            error => ProposeError::Failed(error.to_string()),
+        })
     }
 }
 
@@ -1536,7 +1562,7 @@ impl Ctx<'_> {
         let terminated_by = 'search: loop {
             self.usage.wall_secs = self.started.elapsed().as_secs();
             if let Err(cap) = self.budget.check(&self.usage) {
-                break 'search TerminatedBy::BudgetExceeded(cap);
+                break 'search TerminatedBy::from(cap);
             }
 
             let elites: Vec<Elite> = self
@@ -1552,10 +1578,9 @@ impl Ctx<'_> {
 
             self.usage.proposals += 1;
             let log: Rc<RefCell<Vec<RecordedCall>>> = Rc::new(RefCell::new(Vec::new()));
-            // retry_complete waits out a transient proposer error until the wall-clock
-            // budget, so a blip never reaches here. A retryable error that does reach
-            // here (an outage past the wall budget, or one returned directly) folds into
-            // the idle path and the next budget check ends the run. Non-retryable is fatal.
+            // Every channel attempt is recorded. A retryable error returned by the
+            // operator itself can enter the idle path; unknown provider spend stops
+            // the budget check before any candidates or another round are accepted.
             let mut unreachable: Option<String> = None;
             let candidates = {
                 let pctx = ProposalContext {
@@ -1565,29 +1590,33 @@ impl Ctx<'_> {
                 };
                 let channel = OwnedChannel {
                     llm: Arc::clone(&self.llm),
-                    retry: self.config.retry,
                     started: self.started,
-                    max_wall_secs: self.budget.max_wall_secs,
-                    cost_capped: self.budget.max_cost_usd.is_some(),
+                    budget: *self.budget,
+                    usage: self.usage,
                     log: Rc::clone(&log),
                 };
-                match op.propose(&pctx, Box::new(channel)) {
-                    Ok(candidates) => candidates,
-                    Err(ProposeError::Llm(e)) if e.is_retryable() => {
-                        unreachable = Some(e.to_string());
-                        Vec::new()
-                    }
-                    Err(e) => return Err(AgentError::Other(format!("proposer: {e}"))),
-                }
+                op.propose(&pctx, Box::new(channel))
             };
             // Drain the buffered calls: accrue budget + record the replay trace (the
             // accounting the controller used to do inline), then summarize the last reply.
             let calls: Vec<RecordedCall> = log.borrow_mut().drain(..).collect();
             let mut last_reply: Option<ReplyDigest> = None;
             for call in &calls {
-                self.accrue_and_record(&call.req, &call.resp, &system)?;
-                last_reply = Some(ReplyDigest::of(&call.resp));
+                self.accrue_and_record(call, &system)?;
+                last_reply = call.response().map(ReplyDigest::of);
             }
+            self.usage.wall_secs = self.started.elapsed().as_secs();
+            if let Err(stop) = self.budget.check_llm_call(&self.usage) {
+                break 'search stop.into();
+            }
+            let candidates = match candidates {
+                Ok(candidates) => candidates,
+                Err(ProposeError::Llm(e)) if e.is_retryable() => {
+                    unreachable = Some(e.to_string());
+                    Vec::new()
+                }
+                Err(e) => return Err(AgentError::Other(format!("proposer: {e}"))),
+            };
 
             // Barren rounds are LOUD: a $-burning structural failure (every reply
             // unparseable) must be visible per round, not after the budget dies.
@@ -1611,6 +1640,7 @@ impl Ctx<'_> {
                 }
             }
             let mut improved = false;
+            let mut round_stop = None;
             // FIFO worklist: fresh candidates keep proposed order (mint bars are
             // arrival-ordered); a rejected candidate is re-proposed with the kernel error
             // and its fix re-enters with one less repair. No-op for operators without
@@ -1637,7 +1667,7 @@ impl Ctx<'_> {
                             cross_check_failures: &mut cross_check_failures,
                         },
                     )?;
-                    break 'search TerminatedBy::BudgetExceeded(cap);
+                    break 'search TerminatedBy::from(cap);
                 }
                 self.usage.checker_calls += 1;
                 let artifact = serde_json::to_string(&cand.artifact).unwrap_or_default();
@@ -1668,7 +1698,14 @@ impl Ctx<'_> {
                             reason: scored.reason.clone(),
                         };
                         let fixes =
-                            self.repair_candidate(&op, &rejected, &system, &elites, &dgoal)?;
+                            match self.repair_candidate(&op, &rejected, &system, &elites, &dgoal) {
+                                Ok(fixes) => fixes,
+                                Err(AgentError::Budget(stop)) => {
+                                    round_stop = Some(TerminatedBy::from(stop));
+                                    break;
+                                }
+                                Err(error) => return Err(error),
+                            };
                         for fix in fixes {
                             work.push_back((fix, repairs_left - 1));
                         }
@@ -1711,6 +1748,9 @@ impl Ctx<'_> {
                     cross_check_failures: &mut cross_check_failures,
                 },
             )?;
+            if let Some(stop) = round_stop {
+                break 'search stop;
+            }
             // A minted TERMINAL candidate ends a directed search (its proof is stamped).
             if terminal_minted {
                 break 'search TerminatedBy::Success;
@@ -1870,6 +1910,11 @@ fn response_to_value(resp: &CompletionResponse) -> Value {
             "id": c.id, "name": c.name, "arguments": c.arguments,
         })).collect::<Vec<_>>(),
         "finish_reason": format!("{:?}", resp.finish_reason),
+        "usage": resp.usage.map(|usage| json!({
+            "input_tokens": usage.input_tokens,
+            "output_tokens": usage.output_tokens,
+            "cost_usd": valid_cost(usage.cost_usd),
+        })),
     })
 }
 
@@ -1908,7 +1953,13 @@ fn value_to_response(v: &Value) -> CompletionResponse {
             content,
             tool_calls,
         },
-        usage: TokenUsage::default(),
+        usage: v.get("usage").and_then(|usage| {
+            Some(TokenUsage {
+                input_tokens: u32::try_from(usage.get("input_tokens")?.as_u64()?).ok()?,
+                output_tokens: u32::try_from(usage.get("output_tokens")?.as_u64()?).ok()?,
+                cost_usd: valid_cost(usage.get("cost_usd").and_then(Value::as_f64)),
+            })
+        }),
         finish_reason,
     }
 }
@@ -1917,7 +1968,7 @@ fn value_to_response(v: &Value) -> CompletionResponse {
 /// calls). Seed from [`BeliefGraph::load_llm_traces`]; an unrecorded request bumps
 /// [`ReplayClient::misses`] and errors, so a faithful replay has `misses() == 0`.
 pub(crate) struct ReplayClient {
-    responses: FxHashMap<String, CompletionResponse>,
+    responses: FxHashMap<String, Value>,
     model_id: String,
     misses: AtomicU32,
 }
@@ -1925,10 +1976,7 @@ pub(crate) struct ReplayClient {
 impl ReplayClient {
     pub fn from_traces(model_id: impl Into<String>, traces: Vec<(String, Value)>) -> Self {
         Self {
-            responses: traces
-                .into_iter()
-                .map(|(hash, value)| (hash, value_to_response(&value)))
-                .collect(),
+            responses: traces.into_iter().collect(),
             model_id: model_id.into(),
             misses: AtomicU32::new(0),
         }
@@ -1952,7 +2000,10 @@ impl LLMClient for ReplayClient {
     fn complete(&self, req: &CompletionRequest) -> Result<CompletionResponse, LlmError> {
         let hash = request_hash(&self.model_id, req);
         match self.responses.get(&hash) {
-            Some(resp) => Ok(resp.clone()),
+            Some(value) => match value.get("error") {
+                Some(error) => Err(value_to_error(error)),
+                None => Ok(value_to_response(value)),
+            },
             None => {
                 self.misses.fetch_add(1, Ordering::Relaxed);
                 Err(LlmError::Backend(format!(
@@ -1992,13 +2043,32 @@ mod tests {
         (dir, eng)
     }
 
+    // These fixtures model local, explicitly measured zero-cost completions.
+    // Tests of unavailable accounting use the raw testing clients instead.
+    fn measured(mut response: CompletionResponse) -> CompletionResponse {
+        response.usage.get_or_insert(TokenUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cost_usd: Some(0.0),
+        });
+        response
+    }
+
+    fn scripted_measured(responses: Vec<CompletionResponse>) -> Arc<dyn LLMClient> {
+        testing::scripted(responses.into_iter().map(measured).collect())
+    }
+
+    fn capturing_measured(responses: Vec<CompletionResponse>) -> testing::Capture {
+        testing::capturing(responses.into_iter().map(measured).collect())
+    }
+
     fn agent_with(
         responses: Vec<CompletionResponse>,
         budget: AgentBudget,
     ) -> (tempfile::TempDir, Agent) {
         let (dir, eng) = region();
         let graph = BeliefGraph::new(eng, "agent");
-        let llm = testing::scripted(responses);
+        let llm = scripted_measured(responses);
         let agent = Agent::new(
             llm,
             graph,
@@ -2014,7 +2084,7 @@ mod tests {
     #[test]
     fn control_calls_carry_the_configured_seed() {
         let (_dir, eng) = region();
-        let cap = testing::capturing(vec![CompletionResponse::text("done")]);
+        let cap = capturing_measured(vec![CompletionResponse::text("done")]);
         let agent = Agent::new(
             cap.client(),
             BeliefGraph::new(eng, "agent"),
@@ -2040,7 +2110,7 @@ mod tests {
     ) -> (tempfile::TempDir, Agent) {
         let (dir, eng) = region();
         let graph = BeliefGraph::new(eng, "agent");
-        let llm = testing::scripted(responses);
+        let llm = scripted_measured(responses);
         let agent = Agent::new(
             llm,
             graph,
@@ -2071,98 +2141,95 @@ mod tests {
             fail,
             status,
             "flaky",
-            CompletionResponse::text("plain reply, no plan"),
+            measured(CompletionResponse::text("plain reply, no plan")),
         )
     }
 
-    fn fast_retry() -> AgentConfig {
-        AgentConfig {
-            retry: RetryPolicy {
-                base_ms: 0,
-                max_ms: 0,
+    #[test]
+    fn cost_cap_with_an_unpriced_model_stops_with_a_distinct_reason() {
+        let mut response = CompletionResponse::text("hi");
+        response.usage = Some(TokenUsage {
+            input_tokens: 1,
+            output_tokens: 1,
+            cost_usd: None,
+        });
+        let (_dir, agent) = agent_with(
+            vec![response],
+            AgentBudget {
+                max_cost_usd: Some(1.0),
+                ..Default::default()
             },
-            ..Default::default()
+        );
+        let report = agent.run("goal").unwrap();
+        assert_eq!(
+            report.terminated_by,
+            TerminatedBy::BudgetUnavailable(BudgetUnavailable::Cost)
+        );
+        assert_eq!(agent.graph().load_llm_traces().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn potentially_dispatched_failure_stops_without_retry_and_keeps_attempt_context() {
+        for status in [400, 429, 503] {
+            let probe = flaky(2, status);
+            let (_dir, agent) = agent_with_llm(probe.client(), AgentConfig::default());
+            let report = agent.run("do it").unwrap();
+            assert_eq!(
+                report.terminated_by,
+                TerminatedBy::BudgetUnavailable(BudgetUnavailable::Tokens)
+            );
+            assert_eq!(
+                probe.calls(),
+                1,
+                "unknown spend cannot be retried under a token cap"
+            );
+            let traces = agent.graph().load_llm_traces().unwrap();
+            assert_eq!(traces.len(), 1);
+            assert_eq!(traces[0].1["attempt"], 1);
+            assert_eq!(traces[0].1["pre_dispatch"], false);
+            assert_eq!(traces[0].1["error"]["kind"], "http");
+            assert_eq!(traces[0].1["error"]["status"], status);
+            assert!(!traces[0].1["error"]["message"].as_str().unwrap().is_empty());
+            let replay = Arc::new(ReplayClient::from_graph(agent.graph()).unwrap());
+            let (_other_dir, replayed) = agent_with_llm(replay.clone(), AgentConfig::default());
+            assert_eq!(
+                replayed.run("do it").unwrap().terminated_by,
+                report.terminated_by
+            );
+            assert_eq!(replay.misses(), 0);
         }
     }
 
     #[test]
-    fn cost_cap_with_an_unpriced_model_fails_closed() {
-        // An unpriced response accrues $0, so a configured max_cost_usd could
-        // never engage - the run must refuse instead of silently not capping.
-        let budget = AgentBudget {
-            max_cost_usd: Some(1.0),
-            ..Default::default()
-        };
-        let (_dir, agent) = agent_with(vec![CompletionResponse::text("hi")], budget);
-        let err = agent.run("goal").expect_err("unpriced + cost cap refuses");
-        assert!(
-            err.to_string().contains("unpriced"),
-            "the refusal names the cause: {err}"
-        );
-    }
-
-    #[test]
-    fn retry_backoff_is_capped_jittered_and_honors_retry_after() {
-        let p = RetryPolicy {
-            base_ms: 100,
-            max_ms: 1_000,
-        };
-        // Equal jitter: every delay lands in [cap/2, cap] of the capped exponential.
-        for (attempt, lo, hi) in [(1u32, 50u64, 100u64), (2, 100, 200), (3, 200, 400)] {
-            for _ in 0..64 {
-                let d = p.delay_ms(attempt, None);
-                assert!(
-                    (lo..=hi).contains(&d),
-                    "attempt {attempt}: {d} not in [{lo},{hi}]"
-                );
+    fn proven_pre_dispatch_failure_preserves_zero_spend_and_original_error() {
+        struct Unsupported;
+        impl LLMClient for Unsupported {
+            fn complete(&self, _req: &CompletionRequest) -> Result<CompletionResponse, LlmError> {
+                Err(LlmError::UnsupportedRequest("local refusal".into()))
+            }
+            fn model_id(&self) -> &str {
+                "unsupported-test"
+            }
+            fn count_tokens(&self, _messages: &[Message]) -> usize {
+                0
             }
         }
-        // The exponential is capped at max_ms before jitter, so attempt 10 -> [500, 1000].
-        for _ in 0..64 {
-            let d = p.delay_ms(10, None);
-            assert!((500..=1_000).contains(&d), "capped: {d}");
-        }
-        // A 2s Retry-After is a hard floor - honored even above max_ms.
-        assert_eq!(
-            p.delay_ms(1, Some(2)),
-            2_000,
-            "Retry-After is respected even when it exceeds max_ms"
-        );
-    }
-
-    #[test]
-    fn retryable_error_is_retried_until_success() {
-        let (_d, agent) = agent_with_llm(flaky(2, 503).client(), fast_retry());
-        assert!(
-            agent.run("do it").is_ok(),
-            "a transient error must not abort the run when retries cover it"
-        );
-    }
-
-    #[test]
-    fn non_retryable_error_is_not_retried() {
-        let flaky = flaky(1, 400);
-        let (_d, agent) = agent_with_llm(flaky.client(), fast_retry());
-        let err = agent.run("do it").unwrap_err();
-        assert!(matches!(err, AgentError::Llm(_)), "a 4xx propagates");
-        assert_eq!(flaky.calls(), 1, "a terminal error is not retried");
-    }
-
-    #[test]
-    fn a_transient_retries_past_the_old_attempt_cap_until_success() {
-        // No attempt cap: a transient retries until it succeeds (here after 5
-        // failures, past the old cap of 3), bounded only by wall-clock.
-        let flaky = flaky(5, 503);
-        let (_d, agent) = agent_with_llm(flaky.client(), fast_retry());
-        assert!(
-            agent.run("do it").is_ok(),
-            "a persistent-but-recovering transient retries until success"
-        );
-        assert_eq!(
-            flaky.calls(),
-            6,
-            "5 transient failures, then success on the 6th"
-        );
+        let (_dir, agent) = agent_with_llm(Arc::new(Unsupported), AgentConfig::default());
+        let mut ctx = agent.new_ctx("goal".into());
+        let prompt = ctx.config.prompt_library.resolve(PromptId::Execute);
+        let error = ctx
+            .complete(CompletionRequest::new(vec![Message::user("x")]), &prompt)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            AgentError::Llm(LlmError::UnsupportedRequest(_))
+        ));
+        assert_eq!(ctx.usage.tokens, Some(0));
+        assert_eq!(ctx.usage.cost_usd, Some(0.0));
+        let traces = ctx.graph.load_llm_traces().unwrap();
+        assert_eq!(traces.len(), 1);
+        assert_eq!(traces[0].1["pre_dispatch"], true);
+        assert_eq!(traces[0].1["error"]["message"], "local refusal");
     }
 
     /// A verifier with a fixed verdict for every request.
@@ -2330,7 +2397,7 @@ mod tests {
         };
         let (dir, eng) = region();
         let graph = BeliefGraph::new(eng, "agent");
-        let llm = testing::scripted(vec![
+        let llm = scripted_measured(vec![
             plan_response(&["the criterion"], &["t"]),
             CompletionResponse::text("done"),
         ]);
@@ -2569,7 +2636,7 @@ mod tests {
             name: "read_src".into(),
             output: marker.into(),
         }));
-        let cap = testing::capturing(vec![
+        let cap = capturing_measured(vec![
             plan_response(&[], &["diagnose then fix"]),
             one_tool_call("read_src"),
             CompletionResponse::text("fixed it using what the source showed"),
@@ -2640,7 +2707,7 @@ mod tests {
             ..Default::default()
         };
         let (_d, agent) = agent_full(
-            testing::scripted(responses),
+            scripted_measured(responses),
             AgentBudget {
                 max_steps: 100,
                 ..Default::default()
@@ -2673,7 +2740,7 @@ mod tests {
             ..Default::default()
         };
         let (_d, agent) = agent_full(
-            testing::scripted(responses),
+            scripted_measured(responses),
             AgentBudget {
                 max_steps: 4,
                 ..Default::default()
@@ -2704,7 +2771,7 @@ mod tests {
             ..Default::default()
         };
         let (_d, agent) = agent_full(
-            testing::scripted(vec![
+            scripted_measured(vec![
                 plan_full(&[], &["must be polite"], &["t"]),
                 one_tool_call("noop"),
                 CompletionResponse::text("reflecting"),
@@ -2731,7 +2798,7 @@ mod tests {
         tools.register(Box::new(FailingTool {
             name: "always_fails".into(),
         }));
-        let cap = testing::capturing(vec![
+        let cap = capturing_measured(vec![
             plan_response(&[], &["use the tool"]),
             one_tool_call("always_fails"),
             CompletionResponse::text("recovered: proceeding without it"),
@@ -2830,7 +2897,7 @@ mod tests {
             calls: Arc::clone(&calls),
         }));
         let (_d, agent) = agent_full(
-            testing::scripted(vec![
+            scripted_measured(vec![
                 plan_response(&[], &["w"]),
                 one_tool_call("write_thing"),
                 CompletionResponse::text("done without it"),
@@ -2852,12 +2919,12 @@ mod tests {
     fn tool_use_without_dispatchable_calls_is_accounted_then_refused() {
         let mut malformed = CompletionResponse::text("partial provider text");
         malformed.finish_reason = FinishReason::ToolUse;
-        malformed.usage = TokenUsage {
+        malformed.usage = Some(TokenUsage {
             input_tokens: 11,
             output_tokens: 7,
             cost_usd: Some(0.125),
-        };
-        let capture = testing::capturing(vec![malformed]);
+        });
+        let capture = capturing_measured(vec![malformed]);
         let (_dir, agent) = agent_with_llm(capture.client(), AgentConfig::default());
         let mut ctx = agent.new_ctx("goal".into());
         let prompt = ctx.config.prompt_library.resolve(PromptId::Execute);
@@ -2869,8 +2936,8 @@ mod tests {
             .expect_err("empty tool-use batch must fail closed");
         assert!(matches!(err, AgentError::Llm(LlmError::Backend(_))));
         assert_eq!(capture.requests().len(), 1);
-        assert_eq!(ctx.usage.tokens, 18);
-        assert_eq!(ctx.usage.cost_usd, 0.125);
+        assert_eq!(ctx.usage.tokens, Some(18));
+        assert_eq!(ctx.usage.cost_usd, Some(0.125));
 
         let traces = ctx.graph.load_llm_traces().unwrap();
         assert_eq!(traces.len(), 1, "the completed provider call is audited");
@@ -2898,15 +2965,15 @@ mod tests {
                 }]);
                 response.message.content = "tempting partial answer".into();
                 response.finish_reason = *reason;
-                response.usage = TokenUsage {
+                response.usage = Some(TokenUsage {
                     input_tokens: 3,
                     output_tokens: 2,
                     cost_usd: Some(0.025),
-                };
+                });
                 response
             })
             .collect();
-        let capture = testing::capturing(responses);
+        let capture = capturing_measured(responses);
         let (_dir, agent) = agent_with_llm(capture.client(), AgentConfig::default());
         let mut ctx = agent.new_ctx("goal".into());
         let prompt = ctx.config.prompt_library.resolve(PromptId::Execute);
@@ -2924,8 +2991,8 @@ mod tests {
         }
 
         assert_eq!(capture.requests().len(), cases.len());
-        assert_eq!(ctx.usage.tokens, 15);
-        assert!((ctx.usage.cost_usd - 0.075).abs() < 1e-12);
+        assert_eq!(ctx.usage.tokens, Some(15));
+        assert!((ctx.usage.cost_usd.unwrap() - 0.075).abs() < 1e-12);
         let traces = ctx.graph.load_llm_traces().unwrap();
         assert_eq!(traces.len(), cases.len());
         for (trace, (reason, _)) in traces.iter().zip(cases) {
@@ -2949,6 +3016,326 @@ mod tests {
             response.finish_reason = reason;
             let replayed = value_to_response(&response_to_value(&response));
             assert_eq!(replayed.finish_reason, reason);
+        }
+    }
+
+    #[test]
+    fn missing_usage_stops_before_tools_and_preserves_the_completion() {
+        let calls = Arc::new(AtomicU32::new(0));
+        struct CountTool(Arc<AtomicU32>);
+        impl Tool for CountTool {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec {
+                    name: "count".into(),
+                    description: "count".into(),
+                    input_schema: json!({"type":"object"}),
+                }
+            }
+            fn call(&self, _args: &Value) -> Result<String, ToolError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok("done".into())
+            }
+        }
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(CountTool(Arc::clone(&calls))));
+        let mut unknown = one_tool_call("count");
+        unknown.message.content = "useful partial result".into();
+        assert!(unknown.usage.is_none());
+        let capture =
+            testing::capturing(vec![measured(plan_response(&[], &["use count"])), unknown]);
+        let (_dir, agent) = agent_full(
+            capture.client(),
+            AgentBudget::default(),
+            AgentConfig::default(),
+            tools,
+        );
+        let report = agent.run("x").unwrap();
+        assert_eq!(
+            report.terminated_by,
+            TerminatedBy::BudgetUnavailable(BudgetUnavailable::Tokens)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(capture.requests().len(), 2);
+        let traces = agent.graph().load_llm_traces().unwrap();
+        assert_eq!(traces.len(), 2);
+        let received = traces
+            .iter()
+            .find(|(_, value)| value["content"] == "useful partial result")
+            .unwrap();
+        assert!(received.1["usage"].is_null());
+        assert_eq!(received.1["tool_calls"].as_array().unwrap().len(), 1);
+        assert!(report.chain_valid);
+    }
+
+    #[test]
+    fn unusable_cost_stops_after_trace_and_before_another_call() {
+        for cost in [None, Some(-1.0), Some(f64::NAN), Some(f64::INFINITY)] {
+            let mut response = CompletionResponse::text("retained answer");
+            response.usage = Some(TokenUsage {
+                input_tokens: 4,
+                output_tokens: 2,
+                cost_usd: cost,
+            });
+            let capture = testing::capturing(vec![response]);
+            let (_dir, agent) = agent_full(
+                capture.client(),
+                AgentBudget {
+                    max_cost_usd: Some(1.0),
+                    ..Default::default()
+                },
+                AgentConfig::default(),
+                ToolRegistry::new(),
+            );
+            let mut ctx = agent.new_ctx("x".into());
+            let prompt = ctx.config.prompt_library.resolve(PromptId::Execute);
+            let request = CompletionRequest::new(vec![Message::user("x")]);
+            for _ in 0..2 {
+                assert!(matches!(
+                    ctx.complete(request.clone(), &prompt),
+                    Err(AgentError::Budget(BudgetStop::UsageUnavailable(
+                        BudgetUnavailable::Cost
+                    )))
+                ));
+            }
+            assert_eq!(capture.requests().len(), 1);
+            assert_eq!(ctx.usage.tokens, Some(6));
+            assert_eq!(ctx.usage.cost_usd, None);
+            let traces = agent.graph().load_llm_traces().unwrap();
+            assert_eq!(traces.len(), 1);
+            assert_eq!(traces[0].1["content"], "retained answer");
+            assert_eq!(traces[0].1["usage"]["input_tokens"], 4);
+            assert!(traces[0].1["usage"]["cost_usd"].is_null());
+        }
+    }
+
+    #[test]
+    fn replay_preserves_usage_and_never_invents_old_trace_counters() {
+        for usage in [
+            None,
+            Some(TokenUsage {
+                input_tokens: 0,
+                output_tokens: 0,
+                cost_usd: Some(0.0),
+            }),
+            Some(TokenUsage {
+                input_tokens: 5,
+                output_tokens: 9,
+                cost_usd: None,
+            }),
+        ] {
+            let mut response = CompletionResponse::text("recorded answer");
+            response.usage = usage;
+            assert_eq!(
+                value_to_response(&response_to_value(&response)).usage,
+                usage
+            );
+        }
+        let old = json!({"content":"old", "finish_reason":"Stop", "tool_calls":[]});
+        assert!(value_to_response(&old).usage.is_none());
+    }
+
+    #[test]
+    fn proposal_channel_keeps_unknown_response_and_blocks_repeated_attempts() {
+        let capture = testing::capturing(vec![CompletionResponse::text("unknown usage")]);
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut channel = OwnedChannel {
+            llm: capture.client(),
+            started: Instant::now(),
+            budget: AgentBudget::default(),
+            usage: BudgetUsage::default(),
+            log: Rc::clone(&log),
+        };
+        let request = CompletionRequest::new(vec![Message::user("x")]);
+        // An operator that catches the first failure cannot spend again.
+        assert!(channel.complete(&request).is_err());
+        assert!(channel.complete(&request).is_err());
+        assert_eq!(capture.requests().len(), 1);
+        assert_eq!(log.borrow().len(), 1);
+        assert_eq!(
+            log.borrow()[0].response().unwrap().message.content,
+            "unknown usage"
+        );
+        assert!(channel.usage.tokens.is_none());
+    }
+
+    #[test]
+    fn repair_traces_the_last_response_before_accounting_or_operator_failure() {
+        struct FailingRepair;
+        impl ProposalOperator for FailingRepair {
+            fn propose(
+                &self,
+                _ctx: &ProposalContext<'_>,
+                _llm: Box<dyn Completer>,
+            ) -> Result<Vec<Candidate>, ProposeError> {
+                Ok(Vec::new())
+            }
+            fn repair(
+                &self,
+                _ctx: &ProposalContext<'_>,
+                _failed: &RejectedCandidate,
+                mut llm: Box<dyn Completer>,
+            ) -> Result<Vec<Candidate>, ProposeError> {
+                llm.complete(&CompletionRequest::new(vec![Message::user("repair")]))?;
+                Err(ProposeError::Failed(
+                    "operator failed after completion".into(),
+                ))
+            }
+        }
+        for known in [false, true] {
+            let response = CompletionResponse::text("repair evidence");
+            let response = if known { measured(response) } else { response };
+            let capture = testing::capturing(vec![response]);
+            let (_dir, agent) = agent_with_llm(capture.client(), AgentConfig::default());
+            let mut ctx = agent.new_ctx("repair".into());
+            let prompt = ctx.config.prompt_library.resolve(PromptId::Proposer);
+            let op: Arc<dyn ProposalOperator> = Arc::new(FailingRepair);
+            let goal = DiscoveryGoal {
+                goal: Goal::new("repair"),
+                kind: VerifiedKind::Construction,
+                baseline_score: 0.0,
+                archive_width: 8,
+                max_idle_rounds: 1,
+                max_mints: 1,
+            };
+            let error = ctx
+                .repair_candidate(
+                    &op,
+                    &RejectedCandidate {
+                        artifact: json!({}),
+                        reason: "rejected".into(),
+                    },
+                    &prompt,
+                    &[],
+                    &goal,
+                )
+                .unwrap_err();
+            if known {
+                assert!(error
+                    .to_string()
+                    .contains("operator failed after completion"));
+            } else {
+                assert!(matches!(
+                    error,
+                    AgentError::Budget(BudgetStop::UsageUnavailable(BudgetUnavailable::Tokens))
+                ));
+            }
+            let traces = ctx.graph.load_llm_traces().unwrap();
+            assert_eq!(traces.len(), 1);
+            assert_eq!(traces[0].1["content"], "repair evidence");
+        }
+    }
+
+    #[test]
+    fn valid_tokens_allow_an_unpriced_answer_without_a_cost_cap() {
+        let responses = [
+            plan_response(&[], &["answer"]),
+            CompletionResponse::text("useful answer"),
+        ]
+        .into_iter()
+        .map(|mut response| {
+            response.usage = Some(TokenUsage {
+                input_tokens: 4,
+                output_tokens: 2,
+                cost_usd: None,
+            });
+            response
+        })
+        .collect();
+        let capture = testing::capturing(responses);
+        let (_dir, agent) = agent_with_llm(capture.client(), AgentConfig::default());
+        let report = agent.run("answer").unwrap();
+        assert_eq!(report.terminated_by, TerminatedBy::Success);
+        assert_eq!(report.final_answer.as_deref(), Some("useful answer"));
+        let traces = agent.graph().load_llm_traces().unwrap();
+        assert_eq!(traces.len(), 2);
+        assert!(traces.iter().all(|(_, v)| v["usage"]["cost_usd"].is_null()));
+        assert!(traces.iter().all(|(_, v)| v["usage"]["input_tokens"] == 4));
+    }
+
+    #[test]
+    fn transport_failure_invalidates_prior_totals_and_prevents_further_spend() {
+        struct TransportAfterResponse(Arc<AtomicU32>);
+        impl LLMClient for TransportAfterResponse {
+            fn complete(&self, _req: &CompletionRequest) -> Result<CompletionResponse, LlmError> {
+                if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                    let mut response = CompletionResponse::text("first answer");
+                    response.usage = Some(TokenUsage {
+                        input_tokens: 4,
+                        output_tokens: 2,
+                        cost_usd: Some(0.1),
+                    });
+                    Ok(response)
+                } else {
+                    Err(LlmError::Transport("connection lost after send".into()))
+                }
+            }
+            fn model_id(&self) -> &str {
+                "transport-test"
+            }
+            fn count_tokens(&self, _messages: &[Message]) -> usize {
+                0
+            }
+        }
+        let calls = Arc::new(AtomicU32::new(0));
+        let (_dir, agent) = agent_with_llm(
+            Arc::new(TransportAfterResponse(Arc::clone(&calls))),
+            AgentConfig::default(),
+        );
+        let mut ctx = agent.new_ctx("goal".into());
+        let prompt = ctx.config.prompt_library.resolve(PromptId::Execute);
+        let request = CompletionRequest::new(vec![Message::user("x")]);
+        assert_eq!(
+            ctx.complete(request.clone(), &prompt)
+                .unwrap()
+                .message
+                .content,
+            "first answer"
+        );
+        assert_eq!(ctx.usage.tokens, Some(6));
+        for _ in 0..2 {
+            assert!(matches!(
+                ctx.complete(request.clone(), &prompt),
+                Err(AgentError::Budget(BudgetStop::UsageUnavailable(
+                    BudgetUnavailable::Tokens
+                )))
+            ));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(ctx.usage.tokens, None);
+        assert_eq!(ctx.usage.cost_usd, None);
+        let traces = ctx.graph.load_llm_traces().unwrap();
+        assert_eq!(traces.len(), 2);
+        let failed = traces
+            .iter()
+            .find(|(_, value)| value.get("error").is_some())
+            .unwrap();
+        assert_eq!(failed.1["error"]["kind"], "transport");
+        assert_eq!(failed.1["error"]["message"], "connection lost after send");
+        assert_eq!(failed.1["attempt"], 1);
+    }
+
+    #[test]
+    fn invalid_cost_configuration_and_zero_cap_never_dispatch() {
+        for limit in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.1, 0.0] {
+            let capture = testing::capturing(Vec::new());
+            let (_dir, agent) = agent_full(
+                capture.client(),
+                AgentBudget {
+                    max_cost_usd: Some(limit),
+                    ..Default::default()
+                },
+                AgentConfig::default(),
+                ToolRegistry::new(),
+            );
+            let report = agent.run("x").unwrap();
+            let expected = if limit == 0.0 {
+                TerminatedBy::BudgetExceeded(BudgetExceeded::Cost)
+            } else {
+                TerminatedBy::InvalidBudget(BudgetInvalid::Cost)
+            };
+            assert_eq!(report.terminated_by, expected);
+            assert!(capture.requests().is_empty());
+            assert!(agent.graph().load_llm_traces().unwrap().is_empty());
         }
     }
 }

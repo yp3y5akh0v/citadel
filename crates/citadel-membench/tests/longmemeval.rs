@@ -437,11 +437,11 @@ fn agentic_second_call_failure_is_persisted_with_both_receipts() {
     samples.truncate(1);
     samples[0].question = "How many pets did I mention?".into();
     let mut extraction = CompletionResponse::text("[]");
-    extraction.usage = citadel_llm::TokenUsage {
+    extraction.usage = Some(citadel_llm::TokenUsage {
         input_tokens: 31,
         output_tokens: 7,
         cost_usd: Some(0.04),
-    };
+    });
     let reader = testing::capturing(vec![extraction]);
     let cfg = LmevalConfig {
         bench: BenchConfig {
@@ -580,5 +580,7 @@ fn successful_prediction_receipt_survives_observer_failure() {
     assert_eq!(row["completed_output"]["answer"], "Rex");
     assert_eq!(row["calls"].as_array().unwrap().len(), 1);
     assert_eq!(row["calls"][0]["attempts"][0]["status"], "response");
-    assert_eq!(row["accounting"]["unknown_usage_attempts"], 0);
+    assert_eq!(row["accounting"]["unknown_usage_attempts"], 1);
+    assert!(row["calls"][0]["usage"].is_null());
+    assert!(row["accounting"]["estimated_cost_usd"].is_null());
 }

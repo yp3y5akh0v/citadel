@@ -344,7 +344,6 @@ pub struct AnswerOutcome {
     /// Recall plus neighbor-expansion latency: everything the memory system
     /// does to assemble the reader's context.
     pub recall_micros: u128,
-    pub usage: TokenUsage,
     pub retrieved: Vec<String>,
     pub retrieved_atom_ids: Vec<AtomId>,
 }
@@ -372,8 +371,8 @@ pub enum CompletionPurpose {
 pub enum AttemptOutcome {
     Response {
         finish_reason: CompletionFinish,
-        #[serde(serialize_with = "serialize_usage")]
-        usage: TokenUsage,
+        #[serde(serialize_with = "serialize_optional_usage")]
+        usage: Option<TokenUsage>,
         /// Returned logical completion, not the raw provider HTTP response.
         #[serde(serialize_with = "serialize_assistant_message")]
         message: citadel_llm::AssistantMessage,
@@ -402,8 +401,8 @@ pub struct CompletionCallAudit {
     pub input_tokens_estimate: usize,
     pub max_output_tokens: Option<u32>,
     pub rendered_atom_ids: Vec<AtomId>,
-    /// Client-reported usage on a returned response; absent after an error.
-    /// LLMClient does not expose whether upstream usage fields were present.
+    /// Validated client-reported usage; absent after an error or when the
+    /// returned response did not include complete, valid token counters.
     #[serde(serialize_with = "serialize_optional_usage")]
     pub usage: Option<TokenUsage>,
     pub attempts: Vec<CompletionAttempt>,
@@ -413,11 +412,17 @@ impl CompletionCallAudit {
     pub fn unknown_usage_attempts(&self) -> u64 {
         self.attempts
             .iter()
-            .filter(|attempt| matches!(attempt.outcome, AttemptOutcome::FailedUsageUnknown { .. }))
+            .filter(|attempt| {
+                matches!(
+                    attempt.outcome,
+                    AttemptOutcome::FailedUsageUnknown { .. }
+                        | AttemptOutcome::Response { usage: None, .. }
+                )
+            })
             .count() as u64
     }
 
-    /// Estimate from client-reported usage when no failed attempt has unknown spend.
+    /// Estimate from client-reported usage when every dispatched attempt has known usage.
     pub fn estimated_cost_usd(&self) -> Option<f64> {
         if self.unknown_usage_attempts() != 0 {
             return None;
@@ -467,7 +472,7 @@ fn complete_with_audit(
                 source: Box::new(source),
             }))
         })?;
-    audit.usage = Some(response.usage);
+    audit.usage = response.usage;
     Ok((response, audit))
 }
 
@@ -536,14 +541,11 @@ fn read_assembled(
         rendered.atom_ids,
         CompletionPurpose::Reader(ReaderRoute::Direct),
     )?;
-    let mut usage = resp.usage;
-    usage.cost_usd = audit.estimated_cost_usd();
     Ok(AnswerOutcome {
         answer: resp.message.content,
         reader_finish_reasons: vec![resp.finish_reason.into()],
         reader_calls: vec![audit],
         recall_micros,
-        usage,
         retrieved,
         retrieved_atom_ids,
     })
@@ -582,13 +584,6 @@ pub fn answer_question(
         view,
         recall_micros,
     )
-}
-
-/// Accumulate `b` into `a` (tokens add; cost adds when both sides price it).
-fn add_usage(a: &mut TokenUsage, b: &TokenUsage) {
-    a.input_tokens = a.input_tokens.saturating_add(b.input_tokens);
-    a.output_tokens = a.output_tokens.saturating_add(b.output_tokens);
-    a.cost_usd = crate::core::error::sum_costs(a.cost_usd, b.cost_usd);
 }
 
 /// Two-pass agentic read: extract -> dedup/sort/count in code -> answer from
@@ -681,18 +676,11 @@ fn answer_aggregation(
         CompletionPurpose::Reader(route),
     )
     .map_err(|source| reader_failure(ReaderStage::FinalAnswer, vec![receipt], source))?;
-    let mut usage = extracted.usage;
-    add_usage(&mut usage, &resp.usage);
-    usage.cost_usd = crate::core::error::sum_costs(
-        extract_audit.estimated_cost_usd(),
-        answer_audit.estimated_cost_usd(),
-    );
     Ok(AnswerOutcome {
         answer: resp.message.content,
         reader_finish_reasons: vec![extracted.finish_reason.into(), resp.finish_reason.into()],
         reader_calls: vec![extract_audit, answer_audit],
         recall_micros: 0,
-        usage,
         retrieved,
         retrieved_atom_ids,
     })
@@ -739,8 +727,8 @@ pub struct JudgeOutcome {
     pub correct: bool,
     pub response: String,
     pub finish_reason: CompletionFinish,
-    #[serde(serialize_with = "serialize_usage")]
-    pub usage: TokenUsage,
+    #[serde(serialize_with = "serialize_optional_usage")]
+    pub usage: Option<TokenUsage>,
     pub call: CompletionCallAudit,
 }
 
@@ -752,7 +740,9 @@ impl JudgeOutcome {
     ) -> Self {
         let mut usage = response.usage;
         if call.unknown_usage_attempts() != 0 {
-            usage.cost_usd = None;
+            if let Some(usage) = &mut usage {
+                usage.cost_usd = None;
+            }
         }
         Self {
             correct,
@@ -1141,23 +1131,50 @@ mod tests {
     }
 
     #[test]
-    fn summing_usage_does_not_hide_an_unknown_cost() {
-        let mut usage = TokenUsage {
-            input_tokens: u32::MAX,
-            output_tokens: 2,
-            cost_usd: Some(0.1),
-        };
-        add_usage(
-            &mut usage,
-            &TokenUsage {
-                input_tokens: 3,
-                output_tokens: 4,
-                cost_usd: None,
-            },
+    fn successful_responses_preserve_unknown_usage_and_distinguish_measured_zero() {
+        let mut hashes = Vec::new();
+        for known in [false, true] {
+            let mut response = CompletionResponse::text("retained answer");
+            response.finish_reason = FinishReason::Length;
+            if known {
+                response.usage = Some(TokenUsage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cost_usd: Some(0.0),
+                });
+            }
+            let client = citadel_llm::testing::capturing(vec![response]);
+            let request = CompletionRequest::new(vec![Message::user("same request")]);
+            let (response, audit) = complete_with_audit(
+                &Pacer::unbounded(),
+                &*client.client(),
+                &request,
+                vec![7],
+                CompletionPurpose::Reader(ReaderRoute::Direct),
+            )
+            .unwrap();
+            assert_eq!(response.message.content, "retained answer");
+            assert_eq!(response.finish_reason, FinishReason::Length);
+            assert_eq!(audit.usage.is_some(), known);
+            assert_eq!(audit.unknown_usage_attempts(), u64::from(!known));
+            let accounting = crate::core::error::UsageAccounting::from_calls([&audit]);
+            assert_eq!(accounting.observed_input_tokens, 0);
+            assert_eq!(accounting.observed_output_tokens, 0);
+            assert_eq!(accounting.estimated_cost_usd, known.then_some(0.0));
+            let value = serde_json::to_value(&audit).unwrap();
+            assert_eq!(
+                value["attempts"][0]["message"]["content"],
+                "retained answer"
+            );
+            assert_eq!(value["attempts"][0]["finish_reason"], "length");
+            assert_eq!(value["attempts"][0]["usage"].is_null(), !known);
+            assert_eq!(value["usage"].is_null(), !known);
+            hashes.push(audit.request_sha256);
+        }
+        assert_eq!(
+            hashes[0], hashes[1],
+            "response usage cannot alter the request"
         );
-        assert_eq!(usage.input_tokens, u32::MAX);
-        assert_eq!(usage.output_tokens, 6);
-        assert_eq!(usage.cost_usd, None);
     }
 
     #[test]
@@ -1179,11 +1196,11 @@ mod tests {
                     return Err(LlmError::Backend("invalid body".into()));
                 }
                 let mut response = CompletionResponse::text("answer");
-                response.usage = TokenUsage {
+                response.usage = Some(TokenUsage {
                     input_tokens: 40,
                     output_tokens: 9,
                     cost_usd: Some(0.03),
-                };
+                });
                 Ok(response)
             });
             let request = CompletionRequest::new(vec![Message::user("same request")]);

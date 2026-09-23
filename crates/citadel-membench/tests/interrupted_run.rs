@@ -35,7 +35,7 @@ fn engine() -> (tempfile::TempDir, MemoryEngine) {
     (dir, engine)
 }
 
-fn reader() -> Arc<dyn citadel_llm::LLMClient> {
+fn reader(known_usage: bool) -> Arc<dyn citadel_llm::LLMClient> {
     let barrier = Arc::new(Barrier::new(2));
     citadel_llm::factory::from_fn("gpt-4o-mini", move |request| {
         barrier.wait();
@@ -47,16 +47,21 @@ fn reader() -> Arc<dyn citadel_llm::LLMClient> {
             return Err(LlmError::Backend("one failed sibling".into()));
         }
         let mut response = CompletionResponse::text("retained answer");
-        response.usage = TokenUsage {
+        response.usage = known_usage.then_some(TokenUsage {
             input_tokens: 20,
             output_tokens: 4,
             cost_usd: None,
-        };
+        });
         Ok(response)
     })
 }
 
-fn assert_complete_interruption(error: BenchError, journal: Vec<u8>, call_count: usize) {
+fn assert_complete_interruption(
+    error: BenchError,
+    journal: Vec<u8>,
+    call_count: usize,
+    known_reader_usage: bool,
+) {
     let BenchError::Questions(batch) = error else {
         panic!("missing batch receipts")
     };
@@ -65,8 +70,12 @@ fn assert_complete_interruption(error: BenchError, journal: Vec<u8>, call_count:
     assert_eq!(batch.completed[0].output.answer, "retained answer");
     assert_eq!(batch.completed[0].calls.len(), call_count);
     assert_eq!(batch.failures[0].calls.len(), 1);
-    assert_eq!(batch.accounting().observed_input_tokens, 20);
-    assert_eq!(batch.accounting().unknown_usage_attempts, 1);
+    let observed = if known_reader_usage { 20 } else { 0 };
+    // The failed sibling's dispatched attempt, an unknown reader response if
+    // requested, and the LoCoMo judge's successful response without counters.
+    let unknown = 1 + u64::from(!known_reader_usage) + (call_count as u64 - 1);
+    assert_eq!(batch.accounting().observed_input_tokens, observed);
+    assert_eq!(batch.accounting().unknown_usage_attempts, unknown);
     assert_eq!(batch.accounting().estimated_cost_usd, None);
     let rows: Vec<Value> = String::from_utf8(journal)
         .unwrap()
@@ -85,7 +94,8 @@ fn assert_complete_interruption(error: BenchError, journal: Vec<u8>, call_count:
         1
     );
     let serialized = serde_json::to_value(batch).unwrap();
-    assert_eq!(serialized["accounting"]["observed_input_tokens"], 20);
+    assert_eq!(serialized["accounting"]["observed_input_tokens"], observed);
+    assert_eq!(serialized["accounting"]["unknown_usage_attempts"], unknown);
 }
 
 #[test]
@@ -102,28 +112,30 @@ fn locomo_keeps_completed_sibling_and_unconditional_journal() {
             {"question":"FAIL_QUESTION?", "answer":"irrelevant", "category":4, "evidence":["D1:1"]}
         ]
     }])).unwrap();
-    let (_dir, engine) = engine();
-    let reader = reader();
-    let judge = citadel_llm::testing::constant("CORRECT");
-    let mut journal = Vec::new();
-    let error = citadel_membench::run_sample_observed(
-        &engine,
-        &samples[0],
-        Arc::new(MockEmbedder::new(8)),
-        &*reader,
-        &*judge,
-        BenchConfig::default(),
-        false,
-        &Pacer::unbounded(),
-        &mut |event| match event {
-            QuestionEvent::Completed(completed) => {
-                completed.completion_receipt().write_json_line(&mut journal)
-            }
-            QuestionEvent::Failed(failure) => failure.write_json_line(&mut journal),
-        },
-    )
-    .unwrap_err();
-    assert_complete_interruption(error, journal, 2);
+    for known in [false, true] {
+        let (_dir, engine) = engine();
+        let reader = reader(known);
+        let judge = citadel_llm::testing::constant("CORRECT");
+        let mut journal = Vec::new();
+        let error = citadel_membench::run_sample_observed(
+            &engine,
+            &samples[0],
+            Arc::new(MockEmbedder::new(8)),
+            &*reader,
+            &*judge,
+            BenchConfig::default(),
+            false,
+            &Pacer::unbounded(),
+            &mut |event| match event {
+                QuestionEvent::Completed(completed) => {
+                    completed.completion_receipt().write_json_line(&mut journal)
+                }
+                QuestionEvent::Failed(failure) => failure.write_json_line(&mut journal),
+            },
+        )
+        .unwrap_err();
+        assert_complete_interruption(error, journal, 2, known);
+    }
 }
 
 #[test]
@@ -133,29 +145,31 @@ fn longmemeval_keeps_completed_sibling_and_unconditional_journal() {
         {"question_id":"success", "question_type":"single-session-user", "question":"SUCCESS_QUESTION?", "answer":"retained answer", "question_date":"2024/01/02 (Tue) 12:00", "haystack_session_ids":["s1"], "haystack_dates":["2024/01/01 (Mon) 12:00"], "haystack_sessions":[[{"role":"user", "content":"A retained fact.", "has_answer":true}]], "answer_session_ids":["s1"]},
         {"question_id":"failure", "question_type":"single-session-user", "question":"FAIL_QUESTION?", "answer":"irrelevant", "question_date":"2024/01/02 (Tue) 12:00", "haystack_session_ids":["s1"], "haystack_dates":["2024/01/01 (Mon) 12:00"], "haystack_sessions":[[{"role":"user", "content":"A retained fact.", "has_answer":true}]], "answer_session_ids":["s1"]}
     ])).unwrap();
-    let (_dir, engine) = engine();
-    let reader = reader();
-    let cfg = LmevalConfig {
-        bench: BenchConfig::default(),
-        encrypted: false,
-        reuse: false,
-        reader_concurrency: 2,
-    };
-    let mut journal = Vec::new();
-    let error = run(
-        &engine,
-        &samples,
-        Arc::new(MockEmbedder::new(8)),
-        &*reader,
-        &Pacer::unbounded(),
-        &cfg,
-        &mut |event| match event {
-            QuestionEvent::Completed(completed) => {
-                completed.completion_receipt().write_json_line(&mut journal)
-            }
-            QuestionEvent::Failed(failure) => failure.write_json_line(&mut journal),
-        },
-    )
-    .unwrap_err();
-    assert_complete_interruption(error, journal, 1);
+    for known in [false, true] {
+        let (_dir, engine) = engine();
+        let reader = reader(known);
+        let cfg = LmevalConfig {
+            bench: BenchConfig::default(),
+            encrypted: false,
+            reuse: false,
+            reader_concurrency: 2,
+        };
+        let mut journal = Vec::new();
+        let error = run(
+            &engine,
+            &samples,
+            Arc::new(MockEmbedder::new(8)),
+            &*reader,
+            &Pacer::unbounded(),
+            &cfg,
+            &mut |event| match event {
+                QuestionEvent::Completed(completed) => {
+                    completed.completion_receipt().write_json_line(&mut journal)
+                }
+                QuestionEvent::Failed(failure) => failure.write_json_line(&mut journal),
+            },
+        )
+        .unwrap_err();
+        assert_complete_interruption(error, journal, 1, known);
+    }
 }

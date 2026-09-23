@@ -14,9 +14,11 @@ pub use citadel_llm::{AssistantMessage, LLMClient, LlmError, Message, ToolCall, 
 
 pub use agent::{
     Agent, AgentConfig, AgentError, AgentReport, AgentResult, CognitionState, DiscoveryGoal,
-    DiscoveryReport, ReflectReason, RetryPolicy, TerminatedBy,
+    DiscoveryReport, ReflectReason, TerminatedBy,
 };
-pub use budget::{AgentBudget, BudgetExceeded, BudgetUsage};
+pub use budget::{
+    AgentBudget, BudgetExceeded, BudgetInvalid, BudgetStop, BudgetUnavailable, BudgetUsage,
+};
 pub use graph::{
     BeliefGraph, ChainReport, CoInstantiationCheck, Evidence, Goal, GoalStatus, GoalStatusRecord,
     GraphError, GraphResult, Hypothesis, Reflection, SelfModel, Task, TaskStatus,

@@ -459,22 +459,24 @@ fn from_wire(
     })
 }
 
-fn parse_usage(raw: Option<&Value>, model: &str, priced: bool) -> TokenUsage {
-    let field = |name: &str| -> u32 {
-        raw.and_then(|v| v.get(name))
-            .and_then(Value::as_u64)
-            .unwrap_or(0)
-            .min(u64::from(u32::MAX)) as u32
-    };
+fn parse_usage(raw: Option<&Value>, model: &str, priced: bool) -> Option<TokenUsage> {
+    let raw = raw?.as_object()?;
+    let field = |name: &str| -> Option<u32> { u32::try_from(raw.get(name)?.as_u64()?).ok() };
     let mut usage = TokenUsage {
-        input_tokens: field("prompt_tokens"),
-        output_tokens: field("completion_tokens"),
+        input_tokens: field("prompt_tokens")?,
+        output_tokens: field("completion_tokens")?,
         cost_usd: None,
     };
+    if let Some(total) = raw.get("total_tokens") {
+        let expected = u64::from(usage.input_tokens) + u64::from(usage.output_tokens);
+        if total.as_u64()? != expected {
+            return None;
+        }
+    }
     if priced {
         usage.cost_usd = pricing::cost_for(model, &usage);
     }
-    usage
+    Some(usage)
 }
 
 /// Recovers a tool call leaked into `content`: known name, or bare args if one tool.
@@ -538,6 +540,86 @@ fn extract_json_object(s: &str) -> Option<serde_json::Map<String, Value>> {
 mod tests {
     use super::*;
     use crate::ToolSpec;
+
+    #[test]
+    fn unavailable_usage_preserves_completed_response() {
+        let invalid = [
+            Value::Null,
+            json!([]),
+            json!({}),
+            json!({"prompt_tokens": 3}),
+            json!({"completion_tokens": 2}),
+            json!({"prompt_tokens": -1, "completion_tokens": 2}),
+            json!({"prompt_tokens": "3", "completion_tokens": 2}),
+            json!({"prompt_tokens": 3, "completion_tokens": 2.0}),
+            json!({"prompt_tokens": true, "completion_tokens": 2}),
+            json!({"prompt_tokens": 4294967296_u64, "completion_tokens": 2}),
+            json!({"prompt_tokens": 3, "completion_tokens": null}),
+        ];
+        for usage in std::iter::once(None).chain(invalid.into_iter().map(Some)) {
+            let mut wire =
+                json!({"choices": [{"message": {"content": "retained"}, "finish_reason": "stop"}]});
+            if let Some(usage) = usage {
+                wire["usage"] = usage;
+            }
+            let response = from_wire(&wire, "gpt-4o-mini", true, false, &[]).unwrap();
+            assert_eq!(response.message.content, "retained");
+            assert_eq!(response.finish_reason, FinishReason::Stop);
+            assert_eq!(response.usage, None, "{wire}");
+        }
+    }
+
+    #[test]
+    fn reported_usage_distinguishes_zero_and_unknown_pricing() {
+        let zero = json!({"prompt_tokens": 0, "completion_tokens": 0});
+        assert_eq!(
+            parse_usage(Some(&zero), "gpt-4o-mini", true),
+            Some(TokenUsage {
+                input_tokens: 0,
+                output_tokens: 0,
+                cost_usd: Some(0.0),
+            })
+        );
+        let counts = json!({"prompt_tokens": 12, "completion_tokens": 4});
+        for (model, priced) in [("unlisted-model", true), ("gpt-4o-mini", false)] {
+            assert_eq!(
+                parse_usage(Some(&counts), model, priced),
+                Some(TokenUsage {
+                    input_tokens: 12,
+                    output_tokens: 4,
+                    cost_usd: None,
+                })
+            );
+        }
+        let max = json!({"prompt_tokens": u32::MAX, "completion_tokens": u32::MAX});
+        assert!(parse_usage(Some(&max), "gpt-4o-mini", true).is_some());
+    }
+
+    #[test]
+    fn explicitly_reported_total_must_match_without_narrowing() {
+        for total in [
+            json!(null),
+            json!(-1),
+            json!("7"),
+            json!(7.0),
+            json!(true),
+            json!(6),
+        ] {
+            let usage = json!({"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": total});
+            assert_eq!(
+                parse_usage(Some(&usage), "gpt-4o-mini", true),
+                None,
+                "{usage}"
+            );
+        }
+        for (input, output) in [(0, 0), (3, 4), (u32::MAX, u32::MAX)] {
+            let usage = json!({"prompt_tokens": input, "completion_tokens": output,
+                "total_tokens": u64::from(input) + u64::from(output)});
+            let report = parse_usage(Some(&usage), "gpt-4o-mini", true).unwrap();
+            assert_eq!(report.input_tokens, input);
+            assert_eq!(report.output_tokens, output);
+        }
+    }
 
     #[test]
     fn system_is_first_message_and_tools_are_wrapped() {
@@ -1052,9 +1134,13 @@ mod tests {
             json!({ "q": "x" }),
             "string parsed back to object"
         );
-        assert_eq!(r.usage.input_tokens, 12);
-        assert_eq!(r.usage.output_tokens, 4);
-        assert_eq!(r.usage.cost_usd, None, "bare 'gpt' has no confident rate");
+        assert_eq!(r.usage.unwrap().input_tokens, 12);
+        assert_eq!(r.usage.unwrap().output_tokens, 4);
+        assert_eq!(
+            r.usage.unwrap().cost_usd,
+            None,
+            "bare 'gpt' has no confident rate"
+        );
     }
 
     #[test]
@@ -1085,8 +1171,8 @@ mod tests {
                 r.message.tool_calls.is_empty(),
                 "one malformed call makes the whole batch inert"
             );
-            assert_eq!(r.usage.input_tokens, 8);
-            assert_eq!(r.usage.output_tokens, 3);
+            assert_eq!(r.usage.unwrap().input_tokens, 8);
+            assert_eq!(r.usage.unwrap().output_tokens, 3);
         }
     }
 
@@ -1123,8 +1209,8 @@ mod tests {
         assert_eq!(r.finish_reason, FinishReason::Refusal);
         assert_eq!(r.message.content, "I cannot help with that.");
         assert!(r.message.tool_calls.is_empty());
-        assert_eq!(r.usage.input_tokens, 17);
-        assert_eq!(r.usage.output_tokens, 6);
+        assert_eq!(r.usage.unwrap().input_tokens, 17);
+        assert_eq!(r.usage.unwrap().output_tokens, 6);
     }
 
     #[test]
@@ -1148,8 +1234,8 @@ mod tests {
         assert_eq!(r.finish_reason, FinishReason::ContentFilter);
         assert_eq!(r.message.content, "partial");
         assert!(r.message.tool_calls.is_empty(), "filtered calls are inert");
-        assert_eq!(r.usage.input_tokens, 9);
-        assert_eq!(r.usage.output_tokens, 2);
+        assert_eq!(r.usage.unwrap().input_tokens, 9);
+        assert_eq!(r.usage.unwrap().output_tokens, 2);
     }
 
     #[test]

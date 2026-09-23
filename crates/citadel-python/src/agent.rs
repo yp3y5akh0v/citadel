@@ -3,10 +3,10 @@
 use std::sync::Arc;
 
 use citadel_ai::{
-    Agent, AgentBudget, AgentConfig, AgentReport, BeliefGraph, BudgetExceeded, Candidate,
-    Completer, DiscoveryGoal, DiscoveryReport, Elite, Goal, LlmProposer, PromptId, PromptLibrary,
-    ProposalContext, ProposalOperator, ProposeError, RetryPolicy, TerminatedBy, ToolRegistry,
-    VerifiedKind, Verifier,
+    Agent, AgentBudget, AgentConfig, AgentReport, BeliefGraph, BudgetExceeded, BudgetInvalid,
+    BudgetUnavailable, Candidate, Completer, DiscoveryGoal, DiscoveryReport, Elite, Goal,
+    LlmProposer, PromptId, PromptLibrary, ProposalContext, ProposalOperator, ProposeError,
+    TerminatedBy, ToolRegistry, VerifiedKind, Verifier,
 };
 use citadel_mem::{EdgeKind, FusionWeights, GraphExpand, MemoryEngine, RecallProfile};
 use pyo3::exceptions::PyValueError;
@@ -31,6 +31,9 @@ fn terminated_by_category(t: TerminatedBy) -> &'static str {
         TerminatedBy::Incomplete => "incomplete",
         TerminatedBy::DriftExceeded => "drift_exceeded",
         TerminatedBy::BudgetExceeded(_) => "budget_exceeded",
+        TerminatedBy::BudgetUnavailable(BudgetUnavailable::Tokens) => "token_usage_unavailable",
+        TerminatedBy::BudgetUnavailable(BudgetUnavailable::Cost) => "cost_usage_unavailable",
+        TerminatedBy::InvalidBudget(BudgetInvalid::Cost) => "invalid_cost_limit",
     }
 }
 
@@ -349,7 +352,6 @@ pub(crate) struct PyAgentConfig {
     recall_context: RecallProfile,
     temperature: f32,
     seed: Option<u64>,
-    retry: RetryPolicy,
     verifier: Option<Arc<dyn Verifier>>,
     proposal_operator: Option<Arc<dyn ProposalOperator>>,
     max_repairs: u32,
@@ -368,7 +370,6 @@ impl Default for PyAgentConfig {
             recall_context: c.recall_context,
             temperature: c.temperature,
             seed: c.seed,
-            retry: c.retry,
             verifier: c.verifier,
             proposal_operator: c.proposal_operator,
             max_repairs: c.max_repairs,
@@ -386,7 +387,6 @@ impl PyAgentConfig {
             max_react_steps: self.max_react_steps,
             recall_context_k: self.recall_context_k,
             recall_context: self.recall_context.clone(),
-            retry: self.retry,
             verifier: self.verifier.clone(),
             prompt_library: Arc::new(self.prompt_library.clone()),
             proposal_operator: self.proposal_operator.clone(),
@@ -544,12 +544,6 @@ impl PyAgentConfig {
         self.seed = value;
     }
 
-    /// Capped, jittered backoff for transient tool/LLM failures. Transient errors
-    /// retry until the wall-clock budget (no attempt cap); base/ceiling only tune it.
-    fn set_retry(&mut self, base_ms: u64, max_ms: u64) {
-        self.retry = RetryPolicy { base_ms, max_ms };
-    }
-
     /// Set the deterministic verifier (a Python object implementing the verifier
     /// protocol). A verifier with `checker_id`/`checker_version` may mint.
     fn set_verifier(&mut self, verifier: &Bound<'_, PyAny>) -> PyResult<()> {
@@ -677,7 +671,7 @@ impl PyAgentReport {
         self.inner.tasks_done
     }
 
-    /// `success` | `incomplete` | `drift_exceeded` | `budget_exceeded`.
+    /// Completion, drift, cap, unavailable-usage, or invalid-cost-limit status.
     #[getter]
     fn terminated_by(&self) -> &'static str {
         terminated_by_category(self.inner.terminated_by)

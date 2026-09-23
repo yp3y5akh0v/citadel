@@ -12,11 +12,65 @@ use std::sync::Arc;
 use serde_json::json;
 
 use citadel_ai::{AgentBudget, FileWriteTool, Tool};
-use citadel_ai::{AgentReport, TerminatedBy};
+use citadel_ai::{AgentReport, BudgetUnavailable, TerminatedBy};
 use citadel_llm::testing;
-use citadel_llm::{CompletionResponse, LLMClient};
+use citadel_llm::{CompletionResponse, LLMClient, TokenUsage};
 
 use swe_harness::*;
+
+// Synthetic completions in these tests report measured zero tokens and cost.
+fn scripted_local(responses: Vec<CompletionResponse>) -> Arc<dyn LLMClient> {
+    testing::scripted(
+        responses
+            .into_iter()
+            .map(|mut response| {
+                response.usage = Some(TokenUsage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cost_usd: Some(0.0),
+                });
+                response
+            })
+            .collect(),
+    )
+}
+
+#[test]
+fn missing_usage_stops_before_a_requested_file_write() {
+    let id = "off_by_one_window";
+    let scratch = clone_fixture(id);
+    let src_path = scratch.root.join("src").join("lib.rs");
+    let before = fs::read(&src_path).unwrap();
+    let manifest = load_manifest(id);
+    let mut plan = plan_response(&["edit the source"]);
+    plan.usage = Some(TokenUsage {
+        input_tokens: 0,
+        output_tokens: 0,
+        cost_usd: Some(0.0),
+    });
+    let unknown = tool_call(
+        "file_write",
+        json!({
+            "path": src_path.to_str().unwrap(), "contents": "must not be written",
+        }),
+    );
+    assert!(unknown.usage.is_none());
+    let capture = testing::capturing(vec![plan, unknown]);
+    let (_memdir, agent) = build_agent(
+        &scratch,
+        &manifest,
+        capture.client(),
+        AgentBudget::default(),
+    );
+    let report = agent.run(build_prompt(&scratch, &manifest)).unwrap();
+    assert_eq!(
+        report.terminated_by,
+        TerminatedBy::BudgetUnavailable(BudgetUnavailable::Tokens)
+    );
+    assert_eq!(fs::read(&src_path).unwrap(), before);
+    assert_eq!(capture.requests().len(), 2);
+    assert_eq!(agent.graph().load_llm_traces().unwrap().len(), 2);
+}
 
 /// Every task is solvable (gold solves) and genuinely buggy (pristine does not).
 #[test]
@@ -35,7 +89,7 @@ fn mock_smoke_agent_solves_a_task() {
     let src_path = scratch.root.join("src").join("lib.rs");
     let m = load_manifest(id);
 
-    let llm: Arc<dyn LLMClient> = testing::scripted(vec![
+    let llm: Arc<dyn LLMClient> = scripted_local(vec![
         plan_response(&["fix the off-by-one in window_maxes"]),
         tool_call(
             "file_write",
@@ -68,7 +122,7 @@ fn mock_smoke_bad_fix_scores_zero() {
     let m = load_manifest(id);
 
     let bad = "pub fn window_maxes(_xs: &[i32], _k: usize) -> Vec<i32> { Vec::new() }\n";
-    let llm: Arc<dyn LLMClient> = testing::scripted(vec![
+    let llm: Arc<dyn LLMClient> = scripted_local(vec![
         plan_response(&["fix it"]),
         tool_call(
             "file_write",
@@ -116,7 +170,7 @@ fn verifier_converges_on_green_cargo_test() {
     let src_path = scratch.root.join("src").join("lib.rs");
     let m = load_manifest(id);
 
-    let llm: Arc<dyn LLMClient> = testing::scripted(vec![
+    let llm: Arc<dyn LLMClient> = scripted_local(vec![
         plan_response_with_criteria(&["the visible test passes"], &["fix the off-by-one"]),
         tool_call(
             "file_write",
@@ -149,7 +203,7 @@ fn live_budget_converges_on_realistic_trajectory() {
     let p = src_path.to_str().unwrap();
     let m = load_manifest(id);
 
-    let llm: Arc<dyn LLMClient> = testing::scripted(vec![
+    let llm: Arc<dyn LLMClient> = scripted_local(vec![
         plan_response_with_criteria(&["the visible test passes"], &["fix the off-by-one"]),
         tool_call("file_read", json!({ "path": p })),
         tool_call("file_read", json!({ "path": p })),
@@ -188,7 +242,7 @@ fn verified_goal_with_pending_siblings_converges() {
     let src_path = scratch.root.join("src").join("lib.rs");
     let m = load_manifest(id);
 
-    let llm: Arc<dyn LLMClient> = testing::scripted(vec![
+    let llm: Arc<dyn LLMClient> = scripted_local(vec![
         plan_response_with_criteria(
             &["the visible test passes"],
             &["fix the off-by-one", "add docs", "clean up"],

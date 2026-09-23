@@ -91,9 +91,13 @@ mod tests {
         assert_eq!(resp.message.content, "pong from llama");
         assert!(resp.message.tool_calls.is_empty());
         assert_eq!(resp.finish_reason, FinishReason::Stop);
-        assert_eq!(resp.usage.input_tokens, 5);
-        assert_eq!(resp.usage.output_tokens, 3);
-        assert_eq!(resp.usage.cost_usd, None, "local ollama reports no cost");
+        assert_eq!(resp.usage.unwrap().input_tokens, 5);
+        assert_eq!(resp.usage.unwrap().output_tokens, 3);
+        assert_eq!(
+            resp.usage.unwrap().cost_usd,
+            None,
+            "local ollama reports no cost"
+        );
 
         let request = server.join().unwrap();
         let (head, body) = request

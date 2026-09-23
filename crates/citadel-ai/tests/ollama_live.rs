@@ -37,10 +37,7 @@ fn live_ollama_completion() {
     });
 
     println!("reply: {}", resp.message.content);
-    println!(
-        "usage: in={} out={}",
-        resp.usage.input_tokens, resp.usage.output_tokens
-    );
+    println!("usage: {:?}", resp.usage);
     assert!(
         !resp.message.content.trim().is_empty(),
         "expected a non-empty reply from the local model"

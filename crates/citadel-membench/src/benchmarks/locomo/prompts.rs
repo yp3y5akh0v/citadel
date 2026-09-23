@@ -195,7 +195,7 @@ pub fn judge_correct(
     question: &str,
     gold: &str,
     predicted: &str,
-) -> Result<(bool, TokenUsage)> {
+) -> Result<(bool, Option<TokenUsage>)> {
     let outcome = judge_correct_observed(judge, pacer, question, gold, predicted)?;
     Ok((outcome.correct, outcome.usage))
 }
@@ -234,7 +234,7 @@ pub fn judge_abstained(
     pacer: &Pacer,
     question: &str,
     predicted: &str,
-) -> Result<(bool, TokenUsage)> {
+) -> Result<(bool, Option<TokenUsage>)> {
     let outcome = judge_abstained_observed(judge, pacer, question, predicted)?;
     Ok((outcome.correct, outcome.usage))
 }
