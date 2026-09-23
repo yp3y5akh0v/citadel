@@ -1,7 +1,5 @@
 use std::cell::RefCell;
 
-use citadel::Database;
-
 use crate::encoding::{
     decode_column_raw, decode_composite_key, decode_pk_integer, encode_composite_key,
     encode_composite_key_into, patch_column_in_place, patch_row_column, RawColumn, RowLayout,
@@ -295,7 +293,10 @@ fn compiled_target_patch_safe(target: &CompiledTarget) -> bool {
 /// No wildcard arm on purpose: new Expr variants must be classified here.
 fn fast_lane_column_refs(expr: &Expr, out: &mut Vec<String>) -> bool {
     match expr {
-        Expr::Literal(_) | Expr::Parameter(_) | Expr::TypedNullRecord(_) => true,
+        Expr::BoundColumn { .. }
+        | Expr::Literal(_)
+        | Expr::Parameter(_)
+        | Expr::TypedNullRecord(_) => true,
         Expr::Column(name) => {
             out.push(name.to_ascii_lowercase());
             true
@@ -793,7 +794,6 @@ impl CompiledUpdate {
 impl CompiledPlan for CompiledUpdate {
     fn execute(
         &self,
-        db: &Database,
         schema: &SchemaManager,
         stmt: &Statement,
         _params: &[Value],
@@ -809,9 +809,6 @@ impl CompiledPlan for CompiledUpdate {
         };
         use super::compile::ActiveTxnRef;
         match txn {
-            ActiveTxnRef::None => {
-                with_update_scratch(|bufs| exec_update_compiled(db, schema, upd, self, bufs))
-            }
             ActiveTxnRef::Read(_) => Err(SqlError::Unsupported(
                 "cannot execute mutating statement inside a read-only transaction".into(),
             )),
@@ -989,7 +986,6 @@ impl CompiledDelete {
         wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
         fast: &CompiledDeleteFast,
         bufs: &mut UpdateBufs,
-        empty_query_on_zero_match: bool,
     ) -> Result<Option<ExecutionResult>> {
         let result = match &fast.shape {
             DeleteShape::PkLookup(pk) => {
@@ -1002,14 +998,7 @@ impl CompiledDelete {
                 else {
                     return Ok(None);
                 };
-                exec_pk_lookup_delete(
-                    wtx,
-                    &self.table_name_lower,
-                    &pk_value,
-                    fast,
-                    bufs,
-                    empty_query_on_zero_match,
-                )
+                exec_pk_lookup_delete(wtx, &self.table_name_lower, &pk_value, fast, bufs)
             }
             DeleteShape::PkRange(bounds) => {
                 let mut range_conds = Vec::with_capacity(bounds.len());
@@ -1040,7 +1029,6 @@ impl CompiledDelete {
 impl CompiledPlan for CompiledDelete {
     fn execute(
         &self,
-        db: &Database,
         schema: &SchemaManager,
         stmt: &Statement,
         _params: &[Value],
@@ -1068,35 +1056,6 @@ impl CompiledPlan for CompiledDelete {
         };
         use super::compile::ActiveTxnRef;
         match txn {
-            ActiveTxnRef::None => {
-                let Some(fast) = fast else {
-                    return exec_delete(db, schema, del);
-                };
-                let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
-                // No segment purge: this lane compiles only for index-free
-                // tables.
-                schema.mark_dml(&self.table_name_lower);
-                let result = with_update_scratch(|bufs| -> Result<ExecutionResult> {
-                    match self.run_fast(&mut wtx, fast, bufs, true)? {
-                        Some(result) => Ok(result),
-                        None => {
-                            let result = exec_delete_in_txn(&mut wtx, schema, del)?;
-                            match (&result, &fast.returning_fast) {
-                                (ExecutionResult::RowsAffected(0), Some(returning)) => {
-                                    Ok(ExecutionResult::Query(QueryResult {
-                                        columns: returning.col_names.clone(),
-                                        rows: Vec::new(),
-                                    }))
-                                }
-                                _ => Ok(result),
-                            }
-                        }
-                    }
-                })?;
-                super::helpers::drain_deferred_fk_checks(&mut wtx, schema)?;
-                super::commit_with_ann_publication(wtx, schema)?;
-                Ok(result)
-            }
             ActiveTxnRef::Read(_) => Err(SqlError::Unsupported(
                 "cannot execute mutating statement inside a read-only transaction".into(),
             )),
@@ -1106,7 +1065,7 @@ impl CompiledPlan for CompiledDelete {
                 };
                 // No mark_dml: index-free at compile generation, like the
                 // compiled UPDATE in-txn lane; fallbacks mark on their own.
-                with_update_scratch(|bufs| match self.run_fast(outer, fast, bufs, false)? {
+                with_update_scratch(|bufs| match self.run_fast(outer, fast, bufs)? {
                     Some(result) => Ok(result),
                     None => exec_delete_in_txn(outer, schema, del),
                 })
@@ -1121,7 +1080,6 @@ fn exec_pk_lookup_delete(
     pk_value: &Value,
     fast: &CompiledDeleteFast,
     bufs: &mut UpdateBufs,
-    empty_query_on_zero_match: bool,
 ) -> Result<ExecutionResult> {
     let key = crate::encoding::encode_composite_key(std::slice::from_ref(pk_value));
     let Some(rf) = fast.returning_fast.as_ref() else {
@@ -1134,15 +1092,10 @@ fn exec_pk_lookup_delete(
         .table_get(table_name_lower.as_bytes(), &key)
         .map_err(SqlError::Storage)?
     else {
-        // Zero-match RETURNING shape differs per path; pinned by tests.
-        return Ok(if empty_query_on_zero_match {
-            ExecutionResult::Query(QueryResult {
-                columns: rf.col_names.clone(),
-                rows: Vec::new(),
-            })
-        } else {
-            ExecutionResult::RowsAffected(0)
-        });
+        return Ok(ExecutionResult::Query(QueryResult {
+            columns: rf.col_names.clone(),
+            rows: Vec::new(),
+        }));
     };
     bufs.partial_row.clear();
     bufs.partial_row.resize(fast.num_columns, Value::Null);
@@ -1356,30 +1309,6 @@ fn compile_update_impl(schema: &SchemaManager, stmt: &UpdateStmt) -> Result<Comp
     })
 }
 
-fn exec_update_compiled(
-    db: &Database,
-    schema: &SchemaManager,
-    stmt: &UpdateStmt,
-    compiled: &CompiledUpdate,
-    bufs: &mut UpdateBufs,
-) -> Result<ExecutionResult> {
-    if compiled.is_view
-        || compiled.has_correlated_where
-        || compiled.has_subquery
-        || !compiled.can_fast_path
-        || stmt.returning.is_some()
-    {
-        return exec_update(db, schema, stmt);
-    }
-
-    let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
-    schema.mark_dml(&compiled.table_name_lower);
-    let result = exec_update_in_txn_compiled(&mut wtx, schema, stmt, compiled, bufs)?;
-    super::helpers::drain_deferred_fk_checks(&mut wtx, schema)?;
-    super::commit_with_ann_publication(wtx, schema)?;
-    Ok(result)
-}
-
 fn exec_compiled_range_update(
     wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
     schema: &TableSchema,
@@ -1476,580 +1405,6 @@ fn exec_compiled_range_update(
 
     let expanded_count = apply_updated_rows(wtx, &schema.name, &bufs.patched)?;
     Ok(ExecutionResult::RowsAffected(count + expanded_count))
-}
-
-pub(super) fn exec_update(
-    db: &Database,
-    schema: &SchemaManager,
-    stmt: &UpdateStmt,
-) -> Result<ExecutionResult> {
-    let cancel = db.cancel_token();
-    let cancel = cancel.as_ref();
-    let user_name = stmt.table.to_ascii_lowercase();
-    if let Some(view_def) = schema.get_view(&user_name) {
-        if super::triggers::has_instead_of(
-            schema,
-            &user_name,
-            super::triggers::FireEvent::Update {
-                changed_columns: &[],
-            },
-        ) {
-            let aliases = view_def.column_aliases.clone();
-            let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
-            let r =
-                exec_instead_of_view_update_in_txn(&mut wtx, schema, &user_name, &aliases, stmt)?;
-            super::commit_with_ann_publication(wtx, schema)?;
-            return Ok(r);
-        }
-        return Err(SqlError::CannotModifyView(stmt.table.clone()));
-    }
-    if schema.get_matview(&user_name).is_some() {
-        return Err(SqlError::CannotModifyView(format!(
-            "materialized view '{}' is read-only — use REFRESH MATERIALIZED VIEW",
-            stmt.table
-        )));
-    }
-    let table_schema = schema
-        .get(&user_name)
-        .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
-    schema.mark_dml(&table_schema.name);
-    // Use storage name (post-TEMP-alias resolution) for all wtx.* storage calls
-    // below.
-    let lower_name = table_schema.name.clone();
-    let strict = table_schema.is_strict();
-
-    // Correlated subquery in UPDATE WHERE: check BEFORE materialization.
-    let corr_ctx = CorrelationCtx {
-        outer_schema: table_schema,
-        outer_alias: None,
-    };
-    if has_correlated_where(&stmt.where_clause, &corr_ctx, schema) {
-        let select_stmt = SelectStmt {
-            columns: vec![SelectColumn::AllColumns],
-            from: stmt.table.clone(),
-            from_alias: None,
-            from_subquery: None,
-            from_args: None,
-            from_json_table: None,
-            joins: vec![],
-            distinct: false,
-            where_clause: stmt.where_clause.clone(),
-            order_by: vec![],
-            limit: None,
-            offset: None,
-            group_by: vec![],
-            having: None,
-        };
-        let (mut rows, _) = collect_rows_read(db, table_schema, &None, None)?;
-        let remaining =
-            handle_correlated_where_read(db, schema, &select_stmt, &corr_ctx, &mut rows)?;
-
-        if let Some(ref w) = remaining {
-            let col_map = table_schema.column_map();
-            let mut kept = Vec::with_capacity(rows.len());
-            for row in rows {
-                let value = eval_expr(w, &EvalCtx::new(col_map, &row).with_cancel(cancel))?;
-                if is_truthy(&value) {
-                    kept.push(row);
-                }
-            }
-            rows = kept;
-        }
-
-        let pk_indices = table_schema.pk_indices();
-        let pk_values: Vec<Value> = rows.iter().map(|row| row[pk_indices[0]].clone()).collect();
-        let pk_column = &table_schema.columns[pk_indices[0]];
-        let in_set: rustc_hash::FxHashSet<Value> = pk_values.into_iter().collect();
-        let new_where = if in_set.is_empty() {
-            Some(Expr::Literal(Value::Boolean(false)))
-        } else {
-            Some(Expr::InSet {
-                expr: Box::new(Expr::Column(pk_column.name.clone())),
-                values: in_set,
-                has_null: false,
-                negated: false,
-                // The values came out of this very column, so it supplies the collation.
-                collation: pk_column.collation,
-            })
-        };
-
-        let rewritten = UpdateStmt {
-            table: stmt.table.clone(),
-            assignments: stmt.assignments.clone(),
-            where_clause: new_where,
-            returning: stmt.returning.clone(),
-        };
-        return exec_update(db, schema, &rewritten);
-    }
-
-    let materialized;
-    let stmt = if update_has_subquery(stmt) {
-        materialized = materialize_update(stmt, &mut |sub| {
-            exec_subquery_read(db, schema, sub, &CteContext::default())
-        })?;
-        &materialized
-    } else {
-        stmt
-    };
-
-    let col_map = table_schema.column_map();
-    let pk_changed_by_set = stmt.assignments.iter().any(|(col_name, _)| {
-        table_schema
-            .column_index(col_name)
-            .is_some_and(|idx| table_schema.primary_key_columns.contains(&(idx as u16)))
-    });
-
-    let has_fk = !table_schema.foreign_keys.is_empty();
-    let has_indices = !table_schema.indices.is_empty();
-    let has_child_fk = !schema.child_fks_for(&lower_name).is_empty();
-    // Fast paths skip the trigger-firing site at the slow path's tail. Gate on
-    // "no UPDATE triggers" so AFTER UPDATE row triggers always run.
-    let has_update_triggers = super::triggers::has_update_triggers(schema, &table_schema.name);
-    'fast: {
-        if pk_changed_by_set
-            || has_fk
-            || has_indices
-            || has_child_fk
-            || has_update_triggers
-            || table_schema.has_checks()
-            || stmt.returning.is_some()
-        {
-            break 'fast;
-        }
-        let non_pk = table_schema.non_pk_indices();
-        let enc_pos = table_schema.encoding_positions();
-        let num_pk_cols = table_schema.primary_key_columns.len();
-
-        struct AssignTarget {
-            schema_idx: usize,
-            phys_idx: usize,
-            expr: Expr,
-            col: ColumnDef,
-        }
-        let mut targets: Vec<AssignTarget> = Vec::with_capacity(stmt.assignments.len());
-        for (col_name, expr) in &stmt.assignments {
-            let schema_idx = table_schema
-                .column_index(col_name)
-                .ok_or_else(|| SqlError::ColumnNotFound(col_name.clone()))?;
-            let col = &table_schema.columns[schema_idx];
-            if col.generated_kind.is_some() {
-                return Err(SqlError::CannotUpdateGeneratedColumn(col.name.clone()));
-            }
-            let nonpk_order = non_pk
-                .iter()
-                .position(|&i| i == schema_idx)
-                .ok_or_else(|| SqlError::ColumnNotFound(col_name.clone()))?;
-            let phys_idx = enc_pos[nonpk_order] as usize;
-            targets.push(AssignTarget {
-                schema_idx,
-                phys_idx,
-                expr: expr.clone(),
-                col: col.clone(),
-            });
-        }
-
-        let plan = crate::planner::plan_select(table_schema, &stmt.where_clause);
-        let single_int_pk = num_pk_cols == 1
-            && table_schema.columns[table_schema.primary_key_columns[0] as usize].data_type
-                == DataType::Integer;
-
-        let pk_indices_vec = table_schema.pk_indices().to_vec();
-        let set_target_indices: Vec<usize> = targets.iter().map(|t| t.schema_idx).collect();
-        let (gen_targets, gen_extra_cols, rhs_extra_cols) = match (
-            compute_gen_col_targets(table_schema, &set_target_indices, &pk_indices_vec),
-            compute_rhs_extra_cols(
-                table_schema,
-                &stmt.assignments,
-                &set_target_indices,
-                &pk_indices_vec,
-            ),
-        ) {
-            (Some((g, ge)), Some(r)) => (g, ge, r),
-            _ => break 'fast,
-        };
-
-        let set_cols: Vec<ColumnDef> = targets.iter().map(|t| t.col.clone()).collect();
-        let gen_cols: Vec<ColumnDef> = gen_targets.iter().map(|g| g.col.clone()).collect();
-        let patch_safe = pk_range_patch_safe(&set_cols, &gen_cols);
-
-        // No segment purge: this lane requires an index-free table, so an ANN
-        // segment cannot exist.
-        let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
-
-        // `value: &mut [u8]` can't grow; nullable/variable-width fall through.
-        if let (
-            true,
-            crate::planner::ScanPlan::PkRangeScan {
-                start_key,
-                range_conds,
-                full_cover: true,
-                ..
-            },
-        ) = (patch_safe, &plan)
-        {
-            let range_conds = range_conds.clone();
-            let mut partial_row = vec![Value::Null; table_schema.columns.len()];
-            let pk_idx_cache = table_schema.pk_indices().to_vec();
-            let mut patch_buf: Vec<u8> = Vec::with_capacity(256);
-            let mut row_layout = RowLayout::default();
-            let mut materializer = UpdateRowMaterializer::default();
-            let mut expanded_rows = Vec::new();
-
-            let count =
-                wtx.table_update_range(lower_name.as_bytes(), start_key, |key, value| {
-                    if single_int_pk {
-                        let pk_int = Value::Integer(decode_pk_integer(key)?);
-                        for (op, bound) in &range_conds {
-                            match op {
-                                BinOp::Lt if &pk_int >= bound => return Ok(None),
-                                BinOp::LtEq if &pk_int > bound => return Ok(None),
-                                BinOp::Gt if &pk_int <= bound => return Ok(Some(false)),
-                                BinOp::GtEq if &pk_int < bound => return Ok(Some(false)),
-                                _ => {}
-                            }
-                        }
-                    } else {
-                        let pk_vals = decode_composite_key(key, num_pk_cols)?;
-                        for (op, bound) in &range_conds {
-                            match op {
-                                BinOp::Lt if &pk_vals[0] >= bound => return Ok(None),
-                                BinOp::LtEq if &pk_vals[0] > bound => return Ok(None),
-                                BinOp::Gt if &pk_vals[0] <= bound => return Ok(Some(false)),
-                                BinOp::GtEq if &pk_vals[0] < bound => return Ok(Some(false)),
-                                _ => {}
-                            }
-                        }
-                    }
-
-                    if single_int_pk {
-                        partial_row[pk_idx_cache[0]] = Value::Integer(decode_pk_integer(key)?);
-                    } else {
-                        let pk_vals = decode_composite_key(key, num_pk_cols)?;
-                        for (i, &pi) in pk_idx_cache.iter().enumerate() {
-                            partial_row[pi] = pk_vals[i].clone();
-                        }
-                    }
-                    let mut expanded = materializer.expand(table_schema, key, value, cancel)?;
-                    let mut value = UpdateValue::for_range(
-                        value,
-                        &mut expanded,
-                        &mut row_layout,
-                        targets
-                            .iter()
-                            .map(|target| (target.phys_idx, &target.col))
-                            .chain(
-                                gen_targets
-                                    .iter()
-                                    .map(|target| (target.phys_idx, &target.col)),
-                            ),
-                    )?;
-                    for target in &targets {
-                        partial_row[target.schema_idx] = value.decode_column(target.phys_idx)?;
-                    }
-                    value.decode_columns(&rhs_extra_cols, &mut partial_row)?;
-                    for target in &targets {
-                        let new_val = eval_expr(
-                            &target.expr,
-                            &EvalCtx::new(col_map, &partial_row).with_cancel(cancel),
-                        )?;
-                        let coerced = if new_val.is_null() {
-                            if !target.col.nullable {
-                                return Err(SqlError::NotNullViolation(target.col.name.clone()));
-                            }
-                            Value::Null
-                        } else {
-                            coerce_for_column(new_val, &target.col, strict)?
-                        };
-                        value.patch(target.phys_idx, &coerced, &mut patch_buf)?;
-                        if targets.len() == 1 {
-                            partial_row[target.schema_idx] = coerced;
-                        }
-                    }
-                    apply_gen_col_patches(
-                        &mut value,
-                        &mut partial_row,
-                        &gen_targets,
-                        &gen_extra_cols,
-                        col_map,
-                        cancel,
-                        &mut patch_buf,
-                    )?;
-                    if let Some(expanded) = expanded {
-                        expanded_rows.push((key.to_vec(), expanded));
-                        Ok(Some(false))
-                    } else {
-                        Ok(Some(true))
-                    }
-                })?;
-
-            let expanded_count = apply_updated_rows(&mut wtx, &lower_name, &expanded_rows)?;
-            super::commit_with_ann_publication(wtx, schema)?;
-            return Ok(ExecutionResult::RowsAffected(count + expanded_count));
-        }
-
-        let mut kv_pairs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-        {
-            match &plan {
-                crate::planner::ScanPlan::PkLookup { pk_values, .. } => {
-                    let key = crate::encoding::encode_composite_key(pk_values);
-                    if let Some(value) = wtx
-                        .table_get(lower_name.as_bytes(), &key)
-                        .map_err(SqlError::Storage)?
-                    {
-                        kv_pairs.push((key, value));
-                    }
-                }
-                crate::planner::ScanPlan::PkRangeScan {
-                    start_key,
-                    range_conds,
-                    ..
-                } => {
-                    let range_conds = range_conds.clone();
-                    let mut scan_err: Option<SqlError> = None;
-                    wtx.table_scan_from(lower_name.as_bytes(), start_key, |key, value| {
-                        let in_range = range_in_bounds(
-                            key,
-                            single_int_pk,
-                            num_pk_cols,
-                            &range_conds,
-                            &mut scan_err,
-                        );
-                        match in_range {
-                            RangeStatus::Stop => Ok(false),
-                            RangeStatus::Skip => Ok(true),
-                            RangeStatus::Hit => {
-                                kv_pairs.push((key.to_vec(), value.to_vec()));
-                                Ok(true)
-                            }
-                            RangeStatus::Err => Ok(false),
-                        }
-                    })
-                    .map_err(SqlError::Storage)?;
-                    if let Some(e) = scan_err {
-                        return Err(e);
-                    }
-                }
-                _ => {
-                    wtx.table_for_each(lower_name.as_bytes(), |key, value| {
-                        kv_pairs.push((key.to_vec(), value.to_vec()));
-                        Ok(())
-                    })
-                    .map_err(SqlError::Storage)?;
-                }
-            }
-        }
-
-        let mut patch_buf: Vec<u8> = Vec::with_capacity(256);
-        let mut row_layout = RowLayout::default();
-        let mut partial_row = vec![Value::Null; table_schema.columns.len()];
-        let pk_idx_cache = table_schema.pk_indices().to_vec();
-        let mut patched: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(kv_pairs.len());
-        let mut materializer = UpdateRowMaterializer::default();
-
-        for (key, raw_value) in &mut kv_pairs {
-            if let Some(expanded) = materializer.expand(table_schema, key, raw_value, cancel)? {
-                *raw_value = expanded;
-            }
-            if !plan.covers_where() {
-                if let Some(ref w) = stmt.where_clause {
-                    let row = decode_full_row_with_cancel(table_schema, key, raw_value, cancel)?;
-                    let value = eval_expr(w, &EvalCtx::new(col_map, &row).with_cancel(cancel))?;
-                    if !is_truthy(&value) {
-                        continue;
-                    }
-                }
-            }
-            if single_int_pk {
-                partial_row[pk_idx_cache[0]] = Value::Integer(decode_pk_integer(key)?);
-            } else {
-                let pk_vals = decode_composite_key(key, num_pk_cols)?;
-                for (i, &pi) in pk_idx_cache.iter().enumerate() {
-                    partial_row[pi] = pk_vals[i].clone();
-                }
-            }
-            for target in &targets {
-                partial_row[target.schema_idx] =
-                    decode_column_raw(raw_value, target.phys_idx)?.to_value()?;
-            }
-            decode_cols_into(raw_value, &rhs_extra_cols, &mut partial_row)?;
-            for target in &targets {
-                let new_val = eval_expr(
-                    &target.expr,
-                    &EvalCtx::new(col_map, &partial_row).with_cancel(cancel),
-                )?;
-                let coerced = if new_val.is_null() {
-                    if !target.col.nullable {
-                        return Err(SqlError::NotNullViolation(target.col.name.clone()));
-                    }
-                    Value::Null
-                } else {
-                    coerce_for_column(new_val, &target.col, strict)?
-                };
-                if !patch_column_in_place(raw_value, target.phys_idx, &coerced)? {
-                    patch_row_column(raw_value, target.phys_idx, &coerced, &mut patch_buf)?;
-                    std::mem::swap(raw_value, &mut patch_buf);
-                }
-                if targets.len() == 1 {
-                    partial_row[target.schema_idx] = coerced;
-                }
-            }
-            apply_gen_col_patches(
-                &mut UpdateValue::growable(raw_value, &mut row_layout),
-                &mut partial_row,
-                &gen_targets,
-                &gen_extra_cols,
-                col_map,
-                cancel,
-                &mut patch_buf,
-            )?;
-            patched.push((std::mem::take(key), std::mem::take(raw_value)));
-        }
-
-        let count = apply_updated_rows(&mut wtx, &lower_name, &patched)?;
-        super::helpers::drain_deferred_fk_checks(&mut wtx, schema)?;
-        super::commit_with_ann_publication(wtx, schema)?;
-        return Ok(ExecutionResult::RowsAffected(count));
-    }
-
-    let all_candidates = collect_keyed_rows_read(db, table_schema, &stmt.where_clause)?;
-    let matching_rows = filter_keyed_rows(all_candidates, &stmt.where_clause, col_map, cancel)?;
-
-    let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
-    let result =
-        super::row_mutation::update_rows(&mut wtx, schema, table_schema, stmt, matching_rows)?;
-    drain_deferred_fk_checks(&mut wtx, schema)?;
-    super::commit_with_ann_publication(wtx, schema)?;
-    Ok(result)
-}
-
-pub(super) fn exec_delete(
-    db: &Database,
-    schema: &SchemaManager,
-    stmt: &DeleteStmt,
-) -> Result<ExecutionResult> {
-    let cancel = db.cancel_token();
-    let cancel = cancel.as_ref();
-    let user_name = stmt.table.to_ascii_lowercase();
-    if let Some(view_def) = schema.get_view(&user_name) {
-        if super::triggers::has_instead_of(schema, &user_name, super::triggers::FireEvent::Delete) {
-            let aliases = view_def.column_aliases.clone();
-            let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
-            let r =
-                exec_instead_of_view_delete_in_txn(&mut wtx, schema, &user_name, &aliases, stmt)?;
-            super::commit_with_ann_publication(wtx, schema)?;
-            return Ok(r);
-        }
-        return Err(SqlError::CannotModifyView(stmt.table.clone()));
-    }
-    if schema.get_matview(&user_name).is_some() {
-        return Err(SqlError::CannotModifyView(format!(
-            "materialized view '{}' is read-only — use REFRESH MATERIALIZED VIEW",
-            stmt.table
-        )));
-    }
-    let table_schema = schema
-        .get(&user_name)
-        .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
-    schema.mark_dml(&table_schema.name);
-    let lower_name = table_schema.name.clone();
-
-    let corr_ctx = CorrelationCtx {
-        outer_schema: table_schema,
-        outer_alias: None,
-    };
-    if has_correlated_where(&stmt.where_clause, &corr_ctx, schema) {
-        let select_stmt = SelectStmt {
-            columns: vec![SelectColumn::AllColumns],
-            from: stmt.table.clone(),
-            from_alias: None,
-            from_subquery: None,
-            from_args: None,
-            from_json_table: None,
-            joins: vec![],
-            distinct: false,
-            where_clause: stmt.where_clause.clone(),
-            order_by: vec![],
-            limit: None,
-            offset: None,
-            group_by: vec![],
-            having: None,
-        };
-        let (mut rows, _) = collect_rows_read(db, table_schema, &None, None)?;
-        let remaining =
-            handle_correlated_where_read(db, schema, &select_stmt, &corr_ctx, &mut rows)?;
-
-        if let Some(ref w) = remaining {
-            let col_map = table_schema.column_map();
-            let mut kept = Vec::with_capacity(rows.len());
-            for row in rows {
-                let value = eval_expr(w, &EvalCtx::new(col_map, &row).with_cancel(cancel))?;
-                if is_truthy(&value) {
-                    kept.push(row);
-                }
-            }
-            rows = kept;
-        }
-
-        let pk_indices = table_schema.pk_indices();
-        let pk_values: Vec<Value> = rows.iter().map(|row| row[pk_indices[0]].clone()).collect();
-        let pk_column = &table_schema.columns[pk_indices[0]];
-        let in_set: rustc_hash::FxHashSet<Value> = pk_values.into_iter().collect();
-        let new_where = if in_set.is_empty() {
-            Some(Expr::Literal(Value::Boolean(false)))
-        } else {
-            Some(Expr::InSet {
-                expr: Box::new(Expr::Column(pk_column.name.clone())),
-                values: in_set,
-                has_null: false,
-                negated: false,
-                // The values came out of this very column, so it supplies the collation.
-                collation: pk_column.collation,
-            })
-        };
-
-        let rewritten = DeleteStmt {
-            table: stmt.table.clone(),
-            where_clause: new_where,
-            returning: stmt.returning.clone(),
-        };
-        return exec_delete(db, schema, &rewritten);
-    }
-
-    let materialized;
-    let stmt = if delete_has_subquery(stmt) {
-        materialized = materialize_delete(stmt, &mut |sub| {
-            exec_subquery_read(db, schema, sub, &CteContext::default())
-        })?;
-        &materialized
-    } else {
-        stmt
-    };
-
-    let col_map = table_schema.column_map();
-    let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
-    if table_schema.has_ann_index() {
-        super::ann_persist::purge_segment(&mut wtx, &lower_name)?;
-    }
-
-    if let Some(result) = try_truncate_delete(&mut wtx, schema, table_schema, &user_name, stmt)? {
-        super::helpers::drain_deferred_fk_checks(&mut wtx, schema)?;
-        super::commit_with_ann_publication(wtx, schema)?;
-        return Ok(result);
-    }
-
-    let all_candidates = collect_keyed_rows_write(&mut wtx, table_schema, &stmt.where_clause)?;
-    let rows_to_delete = filter_keyed_rows(all_candidates, &stmt.where_clause, col_map, cancel)?;
-
-    let result = super::row_mutation::delete_rows(
-        &mut wtx,
-        schema,
-        table_schema,
-        stmt.returning.clone(),
-        rows_to_delete,
-    )?;
-    drain_deferred_fk_checks(&mut wtx, schema)?;
-    super::commit_with_ann_publication(wtx, schema)?;
-    Ok(result)
 }
 
 fn has_derived_in_stmt(stmt: &SelectStmt) -> bool {
@@ -2226,12 +1581,18 @@ pub(super) fn exec_select_in_txn(
 
     let corr_ctx = CorrelationCtx {
         outer_schema: table_schema,
-        outer_alias: stmt.from_alias.as_deref(),
+        outer_alias: stmt.from_alias.as_deref().or(Some(&stmt.from)),
     };
-    if has_correlated_where(&stmt.where_clause, &corr_ctx, schema) {
+    if mutation_has_correlated_where(wtx, &stmt.where_clause, &corr_ctx, schema)? {
         let (mut rows, _) = collect_rows_write(wtx, table_schema, &None, None)?;
-        let remaining_where =
-            handle_correlated_where_write(wtx, schema, stmt, &corr_ctx, &mut rows)?;
+        let remaining_where = filter_mutation_correlated_rows(
+            wtx,
+            schema,
+            &stmt.where_clause,
+            &corr_ctx,
+            &mut rows,
+            Vec::as_slice,
+        )?;
         let clean_stmt = SelectStmt {
             where_clause: remaining_where,
             columns: stmt.columns.clone(),
@@ -3012,15 +2373,6 @@ pub(super) fn exec_update_in_txn(
     schema: &SchemaManager,
     stmt: &UpdateStmt,
 ) -> Result<ExecutionResult> {
-    let materialized;
-    let stmt = if update_has_subquery(stmt) {
-        materialized = materialize_update(stmt, &mut |sub| {
-            exec_subquery_write(wtx, schema, sub, &CteContext::default())
-        })?;
-        &materialized
-    } else {
-        stmt
-    };
     let cancel = wtx.cancel_token().cloned();
     let cancel = cancel.as_ref();
 
@@ -3047,17 +2399,58 @@ pub(super) fn exec_update_in_txn(
     let table_schema = schema
         .get(&user_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
+    let ctx = CorrelationCtx {
+        outer_schema: table_schema,
+        outer_alias: Some(&stmt.table),
+    };
+    let mut correlated_rows = None;
+    let rewritten;
+    let stmt = if mutation_has_correlated_where(wtx, &stmt.where_clause, &ctx, schema)? {
+        let mut rows = collect_keyed_rows_write(wtx, table_schema, &None)?;
+        let remaining = filter_mutation_correlated_rows(
+            wtx,
+            schema,
+            &stmt.where_clause,
+            &ctx,
+            &mut rows,
+            |(_, row)| row,
+        )?;
+        correlated_rows = Some(rows);
+        rewritten = UpdateStmt {
+            table: stmt.table.clone(),
+            assignments: stmt.assignments.clone(),
+            where_clause: remaining,
+            returning: stmt.returning.clone(),
+        };
+        &rewritten
+    } else {
+        stmt
+    };
+    let materialized;
+    let stmt = if update_has_subquery(stmt) {
+        materialized = materialize_update(stmt, &mut |sub| {
+            exec_subquery_write(wtx, schema, sub, &CteContext::default())
+        })?;
+        &materialized
+    } else {
+        stmt
+    };
     schema.mark_dml(&table_schema.name);
     if table_schema.has_ann_index() {
         super::ann_persist::purge_segment(wtx, &table_schema.name)?;
     }
     let col_map = table_schema.column_map();
 
-    if let Some(result) = try_fast_update_in_txn(wtx, schema, stmt, table_schema, col_map)? {
-        return Ok(result);
+    if correlated_rows.is_none() {
+        if let Some(result) = try_fast_update_in_txn(wtx, schema, stmt, table_schema, col_map)? {
+            return Ok(result);
+        }
     }
 
-    let all_candidates = collect_keyed_rows_write(wtx, table_schema, &stmt.where_clause)?;
+    let all_candidates = match correlated_rows {
+        Some(rows) => rows,
+        None => collect_keyed_rows_write(wtx, table_schema, &stmt.where_clause)?,
+    };
     let matching_rows = filter_keyed_rows(all_candidates, &stmt.where_clause, col_map, cancel)?;
 
     super::row_mutation::update_rows(wtx, schema, table_schema, stmt, matching_rows)
@@ -3126,15 +2519,6 @@ pub(super) fn exec_delete_in_txn(
     schema: &SchemaManager,
     stmt: &DeleteStmt,
 ) -> Result<ExecutionResult> {
-    let materialized;
-    let stmt = if delete_has_subquery(stmt) {
-        materialized = materialize_delete(stmt, &mut |sub| {
-            exec_subquery_write(wtx, schema, sub, &CteContext::default())
-        })?;
-        &materialized
-    } else {
-        stmt
-    };
     let cancel = wtx.cancel_token().cloned();
     let cancel = cancel.as_ref();
 
@@ -3155,17 +2539,57 @@ pub(super) fn exec_delete_in_txn(
     let table_schema = schema
         .get(&user_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
+    let ctx = CorrelationCtx {
+        outer_schema: table_schema,
+        outer_alias: Some(&stmt.table),
+    };
+    let mut correlated_rows = None;
+    let rewritten;
+    let stmt = if mutation_has_correlated_where(wtx, &stmt.where_clause, &ctx, schema)? {
+        let mut rows = collect_keyed_rows_write(wtx, table_schema, &None)?;
+        let remaining = filter_mutation_correlated_rows(
+            wtx,
+            schema,
+            &stmt.where_clause,
+            &ctx,
+            &mut rows,
+            |(_, row)| row,
+        )?;
+        correlated_rows = Some(rows);
+        rewritten = DeleteStmt {
+            table: stmt.table.clone(),
+            where_clause: remaining,
+            returning: stmt.returning.clone(),
+        };
+        &rewritten
+    } else {
+        stmt
+    };
+    let materialized;
+    let stmt = if delete_has_subquery(stmt) {
+        materialized = materialize_delete(stmt, &mut |sub| {
+            exec_subquery_write(wtx, schema, sub, &CteContext::default())
+        })?;
+        &materialized
+    } else {
+        stmt
+    };
     schema.mark_dml(&table_schema.name);
     if table_schema.has_ann_index() {
         super::ann_persist::purge_segment(wtx, &table_schema.name)?;
     }
 
-    if let Some(result) = try_truncate_delete(wtx, schema, table_schema, &user_name, stmt)? {
-        return Ok(result);
+    if correlated_rows.is_none() {
+        if let Some(result) = try_truncate_delete(wtx, schema, table_schema, &user_name, stmt)? {
+            return Ok(result);
+        }
     }
 
     let col_map = table_schema.column_map();
-    let all_candidates = collect_keyed_rows_write(wtx, table_schema, &stmt.where_clause)?;
+    let all_candidates = match correlated_rows {
+        Some(rows) => rows,
+        None => collect_keyed_rows_write(wtx, table_schema, &stmt.where_clause)?,
+    };
     let rows_to_delete = filter_keyed_rows(all_candidates, &stmt.where_clause, col_map, cancel)?;
 
     super::row_mutation::delete_rows(

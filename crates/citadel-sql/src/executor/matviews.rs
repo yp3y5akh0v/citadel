@@ -9,17 +9,6 @@ use crate::parser::{
 use crate::schema::SchemaManager;
 use crate::types::{ColumnDef, DataType, ExecutionResult, MatviewDef, TableSchema, Value};
 
-pub(super) fn exec_create_matview(
-    db: &Database,
-    schema: &mut SchemaManager,
-    stmt: &CreateMatviewStmt,
-) -> Result<ExecutionResult> {
-    let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
-    let r = exec_create_matview_in_txn(&mut wtx, schema, stmt)?;
-    super::commit_with_ann_publication(wtx, schema)?;
-    Ok(r)
-}
-
 pub(super) fn exec_create_matview_in_txn(
     wtx: &mut WriteTxn<'_>,
     schema: &mut SchemaManager,
@@ -106,13 +95,10 @@ pub(super) fn exec_refresh_matview(
     schema: &mut SchemaManager,
     stmt: &RefreshMatviewStmt,
 ) -> Result<ExecutionResult> {
-    if !stmt.concurrently {
-        let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
-        let r = exec_refresh_matview_in_txn(&mut wtx, schema, stmt)?;
-        super::commit_with_ann_publication(wtx, schema)?;
-        return Ok(r);
-    }
-
+    debug_assert!(stmt.concurrently);
+    let mut rtx = db.begin_read();
+    schema.admit_read(db, &mut rtx)?;
+    super::reject_legacy_volatile_schema(schema)?;
     let name_lower = stmt.name.to_ascii_lowercase();
 
     let mv_snapshot = {
@@ -138,6 +124,11 @@ pub(super) fn exec_refresh_matview(
         mv
     };
 
+    let source_mv = mv_snapshot.try_serialize()?;
+    let source_backing = schema
+        .get(&mv_snapshot.backing_table)
+        .ok_or_else(|| SqlError::TableNotFound(mv_snapshot.backing_table.clone()))?
+        .try_serialize()?;
     let parsed = crate::parser::parse_sql(&mv_snapshot.select_sql)?;
     let sq = match parsed {
         crate::parser::Statement::Select(sq) => *sq,
@@ -149,7 +140,6 @@ pub(super) fn exec_refresh_matview(
     };
     reject_non_deterministic(&sq)?;
     let rows = {
-        let mut rtx = db.begin_read();
         let qr = super::cte::exec_select_query_with_read(&mut rtx, schema, &sq)?;
         match qr {
             ExecutionResult::Query(q) => {
@@ -161,7 +151,12 @@ pub(super) fn exec_refresh_matview(
         }
     };
 
+    drop(rtx);
+    #[cfg(test)]
+    catalog_tests::after_refresh_read(db);
     let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
+    schema.admit_write(db, &mut wtx)?;
+    super::reject_legacy_volatile_schema(schema)?;
 
     let mv = schema
         .get_matview(&name_lower)
@@ -170,6 +165,11 @@ pub(super) fn exec_refresh_matview(
     let backing = schema
         .get(&mv.backing_table)
         .ok_or_else(|| SqlError::TableNotFound(mv.backing_table.clone()))?;
+    if mv.try_serialize()? != source_mv || backing.try_serialize()? != source_backing {
+        return Err(SqlError::InvalidValue(
+            "materialized view definition changed during concurrent refresh".into(),
+        ));
+    }
     if !backing.indices.iter().any(|idx| idx.unique) {
         return Err(SqlError::Unsupported(format!(
             "cannot refresh materialized view '{}' concurrently — it requires a UNIQUE index",
@@ -250,17 +250,6 @@ pub(super) fn exec_refresh_matview_in_txn(
     Ok(ExecutionResult::Ok)
 }
 
-pub(super) fn exec_drop_matview(
-    db: &Database,
-    schema: &mut SchemaManager,
-    stmt: &DropMatviewStmt,
-) -> Result<ExecutionResult> {
-    let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
-    let r = exec_drop_matview_in_txn(&mut wtx, schema, stmt)?;
-    super::commit_with_ann_publication(wtx, schema)?;
-    Ok(r)
-}
-
 pub(super) fn exec_drop_matview_in_txn(
     wtx: &mut WriteTxn<'_>,
     schema: &mut SchemaManager,
@@ -332,11 +321,16 @@ pub(super) fn exec_drop_matview_in_txn(
         }
     }
 
-    wtx.drop_table(mv.backing_table.as_bytes())
-        .map_err(SqlError::Storage)?;
+    super::ddl::exec_drop_table_in_txn(
+        wtx,
+        schema,
+        &crate::parser::DropTableStmt {
+            name: mv.backing_table.clone(),
+            if_exists: false,
+        },
+    )?;
     SchemaManager::delete_matview(wtx, &name_lower)?;
     schema.remove_matview(&name_lower);
-    schema.remove(&mv.backing_table);
     Ok(ExecutionResult::Ok)
 }
 
@@ -614,3 +608,84 @@ fn references_matview(sql: &str, name: &str) -> bool {
 #[cfg(test)]
 #[path = "matviews_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod catalog_tests {
+    use super::*;
+    use crate::Connection;
+    use citadel::{Argon2Profile, DatabaseBuilder};
+    type RefreshHook = Box<dyn FnOnce(&Database)>;
+    thread_local! { static AFTER_READ: std::cell::RefCell<Option<RefreshHook>> = const { std::cell::RefCell::new(None) }; }
+    pub(super) fn after_refresh_read(db: &Database) {
+        let hook = AFTER_READ.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook(db);
+        }
+    }
+    fn fixture() -> Database {
+        let db = DatabaseBuilder::new("")
+            .passphrase(b"refresh-catalog")
+            .argon2_profile(Argon2Profile::Iot)
+            .create_in_memory()
+            .unwrap();
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute("CREATE TABLE source (id INTEGER PRIMARY KEY, value INTEGER)")
+                .unwrap();
+            conn.execute("INSERT INTO source VALUES (1, 10)").unwrap();
+            conn.execute("CREATE MATERIALIZED VIEW mv AS SELECT id, value FROM source")
+                .unwrap();
+            conn.execute("CREATE UNIQUE INDEX mv_key ON mv(id)")
+                .unwrap();
+        }
+        db
+    }
+    #[test]
+    fn concurrent_refresh_rechecks_its_backing_definition_before_writes() {
+        let db = fixture();
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("INSERT INTO source VALUES (2, 20)").unwrap();
+        AFTER_READ.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(|db| {
+                let other = Connection::open(db).unwrap();
+                other
+                    .execute("CREATE UNIQUE INDEX mv_value ON mv(value)")
+                    .unwrap();
+            }))
+        });
+        let error = conn
+            .execute("REFRESH MATERIALIZED VIEW CONCURRENTLY mv")
+            .unwrap_err();
+        assert!(error.to_string().contains("definition changed"));
+        assert_eq!(
+            conn.query("SELECT id FROM mv ORDER BY id").unwrap().rows,
+            vec![vec![Value::Integer(1)]]
+        );
+    }
+    #[test]
+    fn concurrent_refresh_keeps_its_read_snapshot_when_only_source_data_changes() {
+        let db = fixture();
+        let conn = Connection::open(&db).unwrap();
+        AFTER_READ.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(|db| {
+                let other = Connection::open(db).unwrap();
+                other.execute("INSERT INTO source VALUES (2, 20)").unwrap();
+            }))
+        });
+        conn.execute("REFRESH MATERIALIZED VIEW CONCURRENTLY mv")
+            .unwrap();
+        assert_eq!(
+            conn.query("SELECT id FROM mv ORDER BY id").unwrap().rows,
+            vec![vec![Value::Integer(1)]]
+        );
+        conn.execute("REFRESH MATERIALIZED VIEW CONCURRENTLY mv")
+            .unwrap();
+        assert_eq!(
+            conn.query("SELECT id FROM mv ORDER BY id")
+                .unwrap()
+                .rows
+                .len(),
+            2
+        );
+    }
+}

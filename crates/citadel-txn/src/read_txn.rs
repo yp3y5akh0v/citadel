@@ -470,6 +470,11 @@ impl<'db> ReadTxn<'db> {
         measurements
     }
 
+    /// Identity of the manager that owns this exact transaction view.
+    pub fn manager_id(&self) -> u64 {
+        self.manager.instance_id()
+    }
+
     pub fn txn_id(&self) -> TxnId {
         self.txn_id
     }

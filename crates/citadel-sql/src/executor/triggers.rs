@@ -1,5 +1,3 @@
-use citadel::Database;
-
 use crate::error::{Result, SqlError};
 use crate::parser::{
     CreateTriggerStmt, DropTriggerStmt, Statement, TriggerEvent, TriggerGranularity, TriggerTiming,
@@ -84,17 +82,6 @@ pub(super) fn has_statement_delete_triggers(schema: &SchemaManager, table: &str)
     })
 }
 
-pub(super) fn exec_create_trigger(
-    db: &Database,
-    schema: &mut SchemaManager,
-    stmt: &CreateTriggerStmt,
-) -> Result<ExecutionResult> {
-    let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
-    let result = exec_create_trigger_in_txn(&mut wtx, schema, stmt)?;
-    super::commit_with_ann_publication(wtx, schema)?;
-    Ok(result)
-}
-
 pub(super) fn exec_create_trigger_in_txn(
     wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
     schema: &mut SchemaManager,
@@ -135,17 +122,6 @@ pub(super) fn exec_create_trigger_in_txn(
     SchemaManager::save_trigger(wtx, &td)?;
     schema.register_trigger(td);
     Ok(ExecutionResult::Ok)
-}
-
-pub(super) fn exec_drop_trigger(
-    db: &Database,
-    schema: &mut SchemaManager,
-    stmt: &DropTriggerStmt,
-) -> Result<ExecutionResult> {
-    let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
-    let result = exec_drop_trigger_in_txn(&mut wtx, schema, stmt)?;
-    super::commit_with_ann_publication(wtx, schema)?;
-    Ok(result)
 }
 
 pub(super) fn exec_drop_trigger_in_txn(
@@ -567,7 +543,7 @@ fn execute_trigger_body(
     for stmt in stmts {
         match &stmt {
             Statement::Insert(ins) => {
-                super::dml::exec_insert_in_txn(wtx, schema, ins, &[])?;
+                super::dml::exec_insert_in_admitted_txn(wtx, schema, ins, &[])?;
             }
             Statement::Update(upd) => {
                 super::write::exec_update_in_txn(wtx, schema, upd)?;

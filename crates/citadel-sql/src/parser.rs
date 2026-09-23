@@ -493,6 +493,13 @@ pub struct OrderByItem {
 #[derive(Debug, Clone)]
 pub enum Expr {
     Literal(Value),
+    /// Runtime correlation binding; never produced by the SQL parser or stored
+    /// in a schema. Retains the source column's implicit comparison collation.
+    #[doc(hidden)]
+    BoundColumn {
+        value: Value,
+        collation: crate::types::Collation,
+    },
     Column(String),
     QualifiedColumn {
         table: String,
@@ -1141,13 +1148,9 @@ pub fn count_params(stmt: &Statement) -> usize {
 
 fn visit_exprs_stmt(stmt: &Statement, visitor: &mut impl FnMut(&Expr)) {
     match stmt {
-        Statement::Select(sq) => {
-            for cte in &sq.ctes {
-                visit_exprs_query_body(&cte.body, visitor);
-            }
-            visit_exprs_query_body(&sq.body, visitor);
-        }
+        Statement::Select(sq) => visit_exprs_query(sq, visitor),
         Statement::Insert(ins) => {
+            visit_returning(&ins.returning, visitor);
             match &ins.source {
                 InsertSource::Values(rows) => {
                     for row in rows {
@@ -1156,12 +1159,7 @@ fn visit_exprs_stmt(stmt: &Statement, visitor: &mut impl FnMut(&Expr)) {
                         }
                     }
                 }
-                InsertSource::Select(sq) => {
-                    for cte in &sq.ctes {
-                        visit_exprs_query_body(&cte.body, visitor);
-                    }
-                    visit_exprs_query_body(&sq.body, visitor);
-                }
+                InsertSource::Select(sq) => visit_exprs_query(sq, visitor),
             }
             if let Some(OnConflictClause {
                 action:
@@ -1181,6 +1179,7 @@ fn visit_exprs_stmt(stmt: &Statement, visitor: &mut impl FnMut(&Expr)) {
             }
         }
         Statement::Update(upd) => {
+            visit_returning(&upd.returning, visitor);
             for (_, e) in &upd.assignments {
                 visit_expr(e, visitor);
             }
@@ -1189,12 +1188,30 @@ fn visit_exprs_stmt(stmt: &Statement, visitor: &mut impl FnMut(&Expr)) {
             }
         }
         Statement::Delete(del) => {
+            visit_returning(&del.returning, visitor);
             if let Some(w) = &del.where_clause {
                 visit_expr(w, visitor);
             }
         }
         Statement::Explain { inner, .. } => visit_exprs_stmt(inner, visitor),
         _ => {}
+    }
+}
+
+fn visit_exprs_query(query: &SelectQuery, visitor: &mut impl FnMut(&Expr)) {
+    for cte in &query.ctes {
+        visit_exprs_query_body(&cte.body, visitor);
+    }
+    visit_exprs_query_body(&query.body, visitor);
+}
+
+fn visit_returning(columns: &Option<Vec<SelectColumn>>, visitor: &mut impl FnMut(&Expr)) {
+    if let Some(columns) = columns {
+        for column in columns {
+            if let SelectColumn::Expr { expr, .. } = column {
+                visit_expr(expr, visitor);
+            }
+        }
     }
 }
 
@@ -1221,12 +1238,31 @@ fn visit_exprs_query_body(body: &QueryBody, visitor: &mut impl FnMut(&Expr)) {
 }
 
 fn visit_exprs_select(sel: &SelectStmt, visitor: &mut impl FnMut(&Expr)) {
+    if let Some(derived) = &sel.from_subquery {
+        visit_exprs_query(&derived.query, visitor);
+    }
+    if let Some(args) = &sel.from_args {
+        for arg in args {
+            visit_expr(arg, visitor);
+        }
+    }
+    if let Some(json_table) = &sel.from_json_table {
+        visit_expr(&json_table.source, visitor);
+    }
     for col in &sel.columns {
         if let SelectColumn::Expr { expr, .. } = col {
             visit_expr(expr, visitor);
         }
     }
     for j in &sel.joins {
+        if let Some(derived) = &j.subquery {
+            visit_exprs_query(&derived.query, visitor);
+        }
+        if let Some(args) = &j.table.args {
+            for arg in args {
+                visit_expr(arg, visitor);
+            }
+        }
         if let Some(on) = &j.on_clause {
             visit_expr(on, visitor);
         }
@@ -1356,7 +1392,8 @@ pub(crate) fn visit_expr(expr: &Expr, visitor: &mut impl FnMut(&Expr)) {
                 QuantifiedRhs::Array(e) => visit_expr(e, visitor),
             }
         }
-        Expr::Literal(_)
+        Expr::BoundColumn { .. }
+        | Expr::Literal(_)
         | Expr::Column(_)
         | Expr::QualifiedColumn { .. }
         | Expr::CountStar

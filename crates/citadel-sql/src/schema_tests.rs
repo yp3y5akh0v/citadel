@@ -145,3 +145,75 @@ fn bump_generation_past_is_strictly_greater() {
     s.bump_generation_past(0);
     assert_eq!(s.generation(), cur);
 }
+
+#[test]
+fn own_commit_binding_keeps_exact_generation_and_external_ddl_is_admitted() {
+    use crate::connection::Connection;
+    use crate::types::Value;
+    let db = citadel::DatabaseBuilder::new("")
+        .passphrase(b"catalog-commit-binding")
+        .argon2_profile(citadel::Argon2Profile::Iot)
+        .create_in_memory()
+        .unwrap();
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, value INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 7)").unwrap();
+    let own_generation = db.manager().commit_generation();
+    assert_eq!(
+        conn.inner
+            .borrow()
+            .schema
+            .catalog_binding
+            .unwrap()
+            .commit_generation,
+        Some(own_generation)
+    );
+    let insert = conn.prepare("INSERT INTO t VALUES ($1, $2)").unwrap();
+    let other = Connection::open(&db).unwrap();
+    other
+        .execute("CREATE UNIQUE INDEX unique_value ON t(value)")
+        .unwrap();
+    let external_generation = db.manager().commit_generation();
+    assert!(external_generation > own_generation);
+    // Publishing an older completed writer cannot claim the later commit.
+    conn.inner
+        .borrow_mut()
+        .schema
+        .bind_committed_catalog(db.manager().instance_id(), own_generation);
+    assert!(insert
+        .execute(&[Value::Integer(2), Value::Integer(7)])
+        .is_err());
+    assert_eq!(
+        conn.query("SELECT COUNT(*) FROM t").unwrap().rows,
+        vec![vec![Value::Integer(1)]]
+    );
+    insert
+        .execute(&[Value::Integer(2), Value::Integer(8)])
+        .unwrap();
+    assert_eq!(
+        conn.inner
+            .borrow()
+            .schema
+            .catalog_binding
+            .unwrap()
+            .commit_generation,
+        Some(db.manager().commit_generation())
+    );
+}
+
+#[test]
+fn commit_binding_does_not_bless_unbound_local_definitions_or_other_owner() {
+    let mut schema = SchemaManager::empty();
+    schema.catalog_origin = Some(7);
+    schema.catalog_stamps = Some([None; 4]);
+    schema.catalog_binding = Some(CatalogBinding {
+        commit_generation: Some(10),
+        local_generation: schema.generation,
+    });
+    schema.bind_committed_catalog(8, 11);
+    assert_eq!(schema.catalog_binding.unwrap().commit_generation, Some(10));
+    schema.bump_generation_past(schema.generation);
+    schema.bind_committed_catalog(7, 12);
+    assert_eq!(schema.catalog_binding.unwrap().commit_generation, Some(10));
+}

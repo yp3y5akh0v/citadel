@@ -34,7 +34,10 @@ fn composite_prefix_seeks_and_stops_at_limit_in_read_and_write_transactions() {
     let db = database();
     let conn = Connection::open(&db).unwrap();
     setup(&conn);
-    for begin in [None, Some("BEGIN READ ONLY"), Some("BEGIN")] {
+    for (mode, begin) in [None, Some("BEGIN READ ONLY"), Some("BEGIN")]
+        .into_iter()
+        .enumerate()
+    {
         if let Some(begin) = begin {
             conn.execute(begin).unwrap();
         }
@@ -42,7 +45,7 @@ fn composite_prefix_seeks_and_stops_at_limit_in_read_and_write_transactions() {
         let rows = conn
             .query_params(
                 "SELECT dst FROM edges WHERE src = $1 LIMIT 3",
-                &[Value::Integer(42)],
+                &[Value::Integer(42 + mode as i64)],
             )
             .unwrap()
             .rows;
@@ -54,7 +57,7 @@ fn composite_prefix_seeks_and_stops_at_limit_in_read_and_write_transactions() {
                 vec![Value::Integer(2)]
             ]
         );
-        assert_eq!(measurement.rows_scanned(), 3);
+        assert_eq!(measurement.rows_scanned(), 3, "transaction mode: {begin:?}");
         drop(measurement);
         if begin.is_some() {
             conn.execute("ROLLBACK").unwrap();
@@ -352,14 +355,18 @@ fn fully_covered_primary_key_prefix_keeps_limits_bounded_with_redundant_indexes(
         .unwrap();
     conn.execute("CREATE INDEX edges_src_dst ON edges (src, dst)")
         .unwrap();
-    for begin in [None, Some("BEGIN READ ONLY"), Some("BEGIN")] {
+    for (mode, begin) in [None, Some("BEGIN READ ONLY"), Some("BEGIN")]
+        .into_iter()
+        .enumerate()
+    {
+        let src = 42 + mode;
         if let Some(begin) = begin {
             conn.execute(begin).unwrap();
         }
         for (condition, expected) in [
-            ("src = 42", vec![0, 1, 2]),
-            ("src = 42 AND dst = 5", vec![5]),
-            ("5 = dst AND 42 = src", vec![5]),
+            (format!("src = {src}"), vec![0, 1, 2]),
+            (format!("src = {src} AND dst = 5"), vec![5]),
+            (format!("5 = dst AND {src} = src"), vec![5]),
         ] {
             let measurement = db.measure_scans();
             let rows = conn
@@ -373,10 +380,14 @@ fn fully_covered_primary_key_prefix_keeps_limits_bounded_with_redundant_indexes(
                     .map(|id| vec![Value::Integer(*id)])
                     .collect::<Vec<_>>()
             );
-            assert_eq!(measurement.rows_scanned(), expected.len() as u64);
+            assert_eq!(
+                measurement.rows_scanned(),
+                expected.len() as u64,
+                "transaction mode: {begin:?}; predicate: {condition}"
+            );
             drop(measurement);
             let schema = conn.table_schema("edges").unwrap();
-            let predicate = Some(citadel_sql::parser::parse_sql_expr(condition).unwrap());
+            let predicate = Some(citadel_sql::parser::parse_sql_expr(&condition).unwrap());
             let plan = plan_select(&schema, &predicate);
             assert!(matches!(plan, ScanPlan::PkPrefixScan { .. }));
             assert!(!plan.covers_where());
@@ -578,4 +589,57 @@ fn partial_primary_key_deletes_recheck_residuals_and_preserve_neighboring_keys()
             assert_eq!(mutation_rows(&Connection::open(&db).unwrap()), expected);
         }
     }
+}
+
+#[test]
+fn prefix_result_cache_is_snapshot_bound_and_never_reused_by_writers() {
+    let db = database();
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
+    let sql = "SELECT dst FROM edges WHERE src = $1 LIMIT 3";
+    let params = [Value::Integer(42)];
+    let cold = db.measure_scans();
+    let expected = conn.query_params(sql, &params).unwrap().rows;
+    assert_eq!(cold.rows_scanned(), 3);
+    drop(cold);
+    for begin in [None, Some("BEGIN READ ONLY")] {
+        if let Some(begin) = begin {
+            conn.execute(begin).unwrap();
+        }
+        let hit = db.measure_scans();
+        assert_eq!(conn.query_params(sql, &params).unwrap().rows, expected);
+        assert_eq!(
+            hit.rows_scanned(),
+            0,
+            "same read snapshot should reuse its result"
+        );
+        drop(hit);
+        if begin.is_some() {
+            conn.execute("COMMIT").unwrap();
+        }
+    }
+    conn.execute("BEGIN").unwrap();
+    let writer = db.measure_scans();
+    assert_eq!(conn.query_params(sql, &params).unwrap().rows, expected);
+    assert_eq!(
+        writer.rows_scanned(),
+        3,
+        "writer must evaluate its own visible rows"
+    );
+    drop(writer);
+    conn.execute("INSERT INTO edges VALUES (42,-1,'edge','new')")
+        .unwrap();
+    let writer = db.measure_scans();
+    assert_eq!(
+        conn.query_params(sql, &params).unwrap().rows,
+        vec![
+            vec![Value::Integer(-1)],
+            vec![Value::Integer(0)],
+            vec![Value::Integer(1)]
+        ]
+    );
+    assert_eq!(writer.rows_scanned(), 3);
+    drop(writer);
+    conn.execute("ROLLBACK").unwrap();
+    assert_eq!(conn.query_params(sql, &params).unwrap().rows, expected);
 }

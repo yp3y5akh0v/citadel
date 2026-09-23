@@ -691,6 +691,12 @@ impl TxnManager {
         ReadTxn::new(self, txn_id, snapshot, resolved_catalog, commit_generation)
     }
 
+    /// Unique process-local identity of this manager instance. It is not a
+    /// persisted database identifier and is never reused during this process.
+    pub fn instance_id(&self) -> u64 {
+        self.id
+    }
+
     pub fn commit_generation(&self) -> u64 {
         self.commit_generation.load(Ordering::Acquire)
     }

@@ -6,7 +6,7 @@ use rustc_hash::FxHashMap;
 
 use crate::connection::Connection;
 use crate::error::{Result, SqlError};
-use crate::executor::compile::RowSourceIter;
+use crate::executor::compile::{RowSourceIter, StreamAttempt};
 use crate::executor::helpers::expr_display_name;
 use crate::executor::{self, CompiledPlan};
 use crate::parser::{QueryBody, SelectColumn, SelectQuery, SelectStmt, Statement};
@@ -106,7 +106,7 @@ impl<'c, 'db> PreparedStatement<'c, 'db> {
 
     /// Execute the statement; returns rows affected (0 for SELECT/DDL).
     pub fn execute(&self, params: &[Value]) -> Result<u64> {
-        match self.run(params)? {
+        match self.run(params, false)? {
             ExecutionResult::RowsAffected(n) => Ok(n),
             ExecutionResult::Query(_) | ExecutionResult::Ok => Ok(0),
         }
@@ -114,37 +114,18 @@ impl<'c, 'db> PreparedStatement<'c, 'db> {
 
     /// Execute and return a stepping `Rows<'_>` iterator.
     pub fn query(&self, params: &[Value]) -> Result<Rows<'_>> {
-        // Fast paths are SELECT-only; run() re-checks arity identically first.
         if self.readonly {
-            if let Some(stream) = self.stream_fast_path(params)? {
-                return Ok(Rows::streaming(stream));
-            }
+            return self.read_rows(params);
         }
-        let (columns, rows) = match self.run(params)? {
-            ExecutionResult::Query(qr) => (qr.columns, qr.rows),
-            ExecutionResult::RowsAffected(_) | ExecutionResult::Ok => {
-                (self.columns.clone(), Vec::new())
-            }
-        };
-        Ok(Rows::materialized(columns, rows))
+        Ok(self.materialized_rows(self.run(params, false)?))
     }
 
     /// Execute and return the fully-materialized `QueryResult`.
     pub fn query_collect(&self, params: &[Value]) -> Result<QueryResult> {
-        if self.readonly {
-            if let Some(qr) = self.collect_fast_path(params)? {
-                return Ok(qr);
-            }
-            if let Some(mut stream) = self.stream_fast_path(params)? {
-                let columns = stream.columns().to_vec();
-                let mut rows = Vec::with_capacity(stream.size_hint());
-                while let Some(row) = stream.next_row()? {
-                    rows.push(row);
-                }
-                return Ok(QueryResult { columns, rows });
-            }
-        }
-        match self.run(params)? {
+        // Fast collection and its buffered fallback use one admitted snapshot.
+        // Streaming shares the same eligibility proof, so probing it after an
+        // unsupported collect would only repeat work.
+        match self.run(params, self.readonly)? {
             ExecutionResult::Query(qr) => Ok(qr),
             ExecutionResult::RowsAffected(n) => Ok(QueryResult {
                 columns: vec!["rows_affected".into()],
@@ -155,6 +136,16 @@ impl<'c, 'db> PreparedStatement<'c, 'db> {
                 rows: vec![],
             }),
         }
+    }
+
+    fn materialized_rows(&self, result: ExecutionResult) -> Rows<'db> {
+        let (columns, rows) = match result {
+            ExecutionResult::Query(qr) => (qr.columns, qr.rows),
+            ExecutionResult::RowsAffected(_) | ExecutionResult::Ok => {
+                (self.columns.clone(), Vec::new())
+            }
+        };
+        Rows::materialized(columns, rows)
     }
 
     /// Run the query and pass the first row to `f`.
@@ -172,72 +163,92 @@ impl<'c, 'db> PreparedStatement<'c, 'db> {
     /// True if the query returns at least one row (DML returns `n > 0`).
     pub fn exists(&self, params: &[Value]) -> Result<bool> {
         if self.readonly {
-            if let Some(mut stream) = self.stream_fast_path(params)? {
-                return Ok(stream.next_row()?.is_some());
-            }
+            return Ok(self.read_rows(params)?.next()?.is_some());
         }
-        match self.run(params)? {
+        match self.run(params, false)? {
             ExecutionResult::Query(qr) => Ok(!qr.rows.is_empty()),
             ExecutionResult::RowsAffected(n) => Ok(n > 0),
             ExecutionResult::Ok => Ok(false),
         }
     }
 
-    fn stream_fast_path(&self, params: &[Value]) -> Result<Option<Box<dyn RowSourceIter + 'db>>> {
+    fn check_params(&self, params: &[Value]) -> Result<()> {
         if params.len() != self.param_count {
             return Err(SqlError::ParameterCountMismatch {
                 expected: self.param_count,
                 got: params.len(),
             });
         }
-        if self.conn.inner.borrow().schema.generation() != self.schema_gen {
-            return Ok(None);
-        }
-        match &self.compiled {
-            Some(plan) => Ok(try_stream_via_plan(self, plan.as_ref(), params)),
-            None => Ok(None),
-        }
+        Ok(())
     }
 
-    /// Zero-copy collect for full scans; `None` falls through to the slower paths.
-    fn collect_fast_path(&self, params: &[Value]) -> Result<Option<QueryResult>> {
-        if params.len() != self.param_count {
-            return Err(SqlError::ParameterCountMismatch {
-                expected: self.param_count,
-                got: params.len(),
-            });
-        }
-        let inner = self.conn.inner.borrow();
-        if inner.schema.generation() != self.schema_gen || inner.active_txn_is_some() {
-            return Ok(None);
-        }
-        match &self.compiled {
-            Some(plan) => plan
-                .try_collect(self.conn.db, &inner.schema, &self.ast, params)
-                .transpose(),
-            None => Ok(None),
-        }
-    }
-
-    fn run(&self, params: &[Value]) -> Result<ExecutionResult> {
-        if params.len() != self.param_count {
-            return Err(SqlError::ParameterCountMismatch {
-                expected: self.param_count,
-                got: params.len(),
-            });
-        }
+    fn read_rows(&self, params: &[Value]) -> Result<Rows<'db>> {
+        self.check_params(params)?;
         let mut inner = self.conn.inner.borrow_mut();
-        if inner.schema.generation() == self.schema_gen {
-            return inner.execute_prepared(self.conn.db, &self.ast, self.compiled.as_ref(), params);
+        if inner.active_txn_is_some() {
+            return Ok(self.materialized_rows(self.run_admitted(&mut inner, params, false)?));
         }
-        let c = compile_inside(&mut inner, &self.sql)?;
+        let mut rtx = self.conn.db.begin_read();
+        inner.schema.admit_read(self.conn.db, &mut rtx)?;
+        let fresh;
+        let (ast, plan) = if inner.schema.generation() == self.schema_gen {
+            (&*self.ast, self.compiled.as_ref())
+        } else {
+            fresh = compile_inside(&mut inner, &self.sql)?;
+            if fresh.param_count != self.param_count {
+                return Err(SqlError::ParameterCountMismatch {
+                    expected: self.param_count,
+                    got: fresh.param_count,
+                });
+            }
+            (&*fresh.ast, fresh.plan.as_ref())
+        };
+        let attempt = match plan {
+            Some(plan) => plan.try_stream(rtx, &inner.schema, ast, params)?,
+            None => StreamAttempt::Buffered(rtx),
+        };
+        match attempt {
+            StreamAttempt::Streaming(stream) => Ok(Rows::streaming(stream)),
+            StreamAttempt::Buffered(rtx) => {
+                let result = inner.with_admitted_read(self.conn.db, ast, rtx, |inner| {
+                    inner.execute_prepared(self.conn.db, ast, plan, params, false)
+                })?;
+                Ok(self.materialized_rows(result))
+            }
+        }
+    }
+
+    fn run(&self, params: &[Value], collect: bool) -> Result<ExecutionResult> {
+        self.check_params(params)?;
+        let mut inner = self.conn.inner.borrow_mut();
+        inner.with_statement_txn(self.conn.db, &self.ast, |inner| {
+            self.run_admitted(inner, params, collect)
+        })
+    }
+
+    fn run_admitted(
+        &self,
+        inner: &mut crate::connection::ConnectionInner<'db>,
+        params: &[Value],
+        collect: bool,
+    ) -> Result<ExecutionResult> {
+        if inner.schema.generation() == self.schema_gen {
+            return inner.execute_prepared(
+                self.conn.db,
+                &self.ast,
+                self.compiled.as_ref(),
+                params,
+                collect,
+            );
+        }
+        let c = compile_inside(inner, &self.sql)?;
         if c.param_count != self.param_count {
             return Err(SqlError::ParameterCountMismatch {
                 expected: self.param_count,
                 got: c.param_count,
             });
         }
-        inner.execute_prepared(self.conn.db, &c.ast, c.plan.as_ref(), params)
+        inner.execute_prepared(self.conn.db, &c.ast, c.plan.as_ref(), params, collect)
     }
 }
 
@@ -361,6 +372,7 @@ impl<'a> Row<'a> {
 
 fn compile_for_sql(conn: &Connection<'_>, sql: &str) -> Result<Compiled> {
     let mut inner = conn.inner.borrow_mut();
+    inner.admit_schema_for_prepare(conn.db)?;
     compile_inside(&mut inner, sql)
 }
 
@@ -404,18 +416,6 @@ fn derive_body_columns(body: &QueryBody, schema: &SchemaManager) -> Vec<String> 
         QueryBody::Compound(cs) => derive_body_columns(&cs.left, schema),
         QueryBody::Insert(_) | QueryBody::Update(_) | QueryBody::Delete(_) => Vec::new(),
     }
-}
-
-fn try_stream_via_plan<'db>(
-    stmt: &PreparedStatement<'_, 'db>,
-    plan: &dyn CompiledPlan,
-    params: &[Value],
-) -> Option<Box<dyn RowSourceIter + 'db>> {
-    let inner = stmt.conn.inner.borrow();
-    if inner.active_txn_is_some() {
-        return None;
-    }
-    plan.try_stream(stmt.conn.db, &inner.schema, &stmt.ast, params)
 }
 
 fn derive_from_select_stmt(sel: &SelectStmt, schema: &SchemaManager) -> Vec<String> {
@@ -606,5 +606,161 @@ mod tests {
                 SqlError::Storage(citadel_core::Error::Interrupted)
             ));
         }
+    }
+
+    struct SnapshotProbe {
+        db: Arc<citadel::Database>,
+        collected: std::sync::atomic::AtomicUsize,
+        streamed: std::sync::atomic::AtomicUsize,
+        executed: std::sync::atomic::AtomicUsize,
+        generation: std::sync::atomic::AtomicU64,
+        stream_error: bool,
+    }
+
+    impl SnapshotProbe {
+        fn commit_after_probe(&self, generation: u64) {
+            use std::sync::atomic::Ordering;
+            self.generation.store(generation, Ordering::Relaxed);
+            let other = Connection::open(&self.db).unwrap();
+            other.execute("INSERT INTO t VALUES (1)").unwrap();
+            assert!(self.db.manager().commit_generation() > generation);
+        }
+    }
+
+    impl CompiledPlan for SnapshotProbe {
+        fn execute(
+            &self,
+            _schema: &SchemaManager,
+            _stmt: &Statement,
+            _params: &[Value],
+            txn: executor::compile::ActiveTxnRef<'_, '_>,
+        ) -> Result<ExecutionResult> {
+            use std::sync::atomic::Ordering;
+            self.executed.fetch_add(1, Ordering::Relaxed);
+            let executor::compile::ActiveTxnRef::Read(rtx) = txn else {
+                panic!("read probe received a writer");
+            };
+            assert_eq!(
+                rtx.commit_generation(),
+                self.generation.load(Ordering::Relaxed)
+            );
+            Ok(ExecutionResult::Query(QueryResult {
+                columns: vec!["snapshot".into()],
+                rows: vec![vec![Value::Integer(rtx.commit_generation() as i64)]],
+            }))
+        }
+
+        fn try_collect(
+            &self,
+            rtx: &mut citadel_txn::read_txn::ReadTxn<'_>,
+            _schema: &SchemaManager,
+            _stmt: &Statement,
+            _params: &[Value],
+        ) -> Option<Result<QueryResult>> {
+            self.collected
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.commit_after_probe(rtx.commit_generation());
+            None
+        }
+
+        fn try_stream<'db>(
+            &self,
+            rtx: citadel_txn::read_txn::ReadTxn<'db>,
+            _schema: &SchemaManager,
+            _stmt: &Statement,
+            _params: &[Value],
+        ) -> Result<StreamAttempt<'db>> {
+            self.streamed
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if self.stream_error {
+                return Err(SqlError::Storage(citadel_core::Error::Interrupted));
+            }
+            self.commit_after_probe(rtx.commit_generation());
+            Ok(StreamAttempt::Buffered(rtx))
+        }
+    }
+
+    fn snapshot_probe_db() -> Arc<citadel::Database> {
+        Arc::new(
+            citadel::DatabaseBuilder::new("")
+                .passphrase(b"prepared-snapshot-probe")
+                .argon2_profile(citadel::Argon2Profile::Iot)
+                .create_in_memory()
+                .unwrap(),
+        )
+    }
+
+    #[test]
+    fn prepared_capability_fallback_keeps_the_admitted_snapshot() {
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+        for mode in ["collect", "query", "exists"] {
+            let db = snapshot_probe_db();
+            let conn = Connection::open(&db).unwrap();
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+                .unwrap();
+            let mut prepared = conn.prepare("SELECT id FROM t WHERE id=1").unwrap();
+            let probe = Arc::new(SnapshotProbe {
+                db: Arc::clone(&db),
+                collected: AtomicUsize::new(0),
+                streamed: AtomicUsize::new(0),
+                executed: AtomicUsize::new(0),
+                generation: AtomicU64::new(0),
+                stream_error: false,
+            });
+            prepared.compiled = Some(probe.clone());
+            match mode {
+                "collect" => {
+                    assert_eq!(prepared.query_collect(&[]).unwrap().rows.len(), 1);
+                }
+                "query" => {
+                    assert_eq!(
+                        prepared.query(&[]).unwrap().collect().unwrap().rows.len(),
+                        1
+                    );
+                }
+                "exists" => assert!(prepared.exists(&[]).unwrap()),
+                _ => unreachable!(),
+            }
+            assert_eq!(probe.executed.load(Ordering::Relaxed), 1);
+            assert_eq!(
+                probe.collected.load(Ordering::Relaxed),
+                usize::from(mode == "collect")
+            );
+            assert_eq!(
+                probe.streamed.load(Ordering::Relaxed),
+                usize::from(mode != "collect")
+            );
+            assert_eq!(db.manager().reader_count(), 0);
+            assert_eq!(
+                conn.query("SELECT COUNT(*) FROM t").unwrap().rows,
+                vec![vec![Value::Integer(1)]]
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_stream_storage_error_does_not_retry_buffered_execution() {
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+        let db = snapshot_probe_db();
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        let mut prepared = conn.prepare("SELECT id FROM t").unwrap();
+        let probe = Arc::new(SnapshotProbe {
+            db: Arc::clone(&db),
+            collected: AtomicUsize::new(0),
+            streamed: AtomicUsize::new(0),
+            executed: AtomicUsize::new(0),
+            generation: AtomicU64::new(0),
+            stream_error: true,
+        });
+        prepared.compiled = Some(probe.clone());
+        assert!(matches!(
+            prepared.query(&[]),
+            Err(SqlError::Storage(citadel_core::Error::Interrupted))
+        ));
+        assert_eq!(probe.streamed.load(Ordering::Relaxed), 1);
+        assert_eq!(probe.executed.load(Ordering::Relaxed), 0);
+        assert_eq!(db.manager().reader_count(), 0);
     }
 }

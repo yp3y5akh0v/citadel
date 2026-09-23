@@ -1539,10 +1539,26 @@ fn empty_result(table_schema: &TableSchema, stmt: &SelectStmt) -> Result<Executi
 /// then replace the segment atomically and warm the shared cache.
 pub(crate) fn persist_ann_index(
     db: &citadel::Database,
-    schema: &SchemaManager,
-    table_schema: &TableSchema,
+    schema: &mut SchemaManager,
+    table: &str,
     column: &str,
 ) -> Result<ann_persist::AnnSegmentInfo> {
+    // Derive the declaration and row decoding from the same snapshot. The
+    // connection may predate a table/index change by another connection.
+    let mut rtx = db.begin_read();
+    schema.admit_read(db, &mut rtx)?;
+    super::reject_legacy_volatile_schema(schema)?;
+    let table = table.to_ascii_lowercase();
+    if schema.resolve_temp(&table) != table {
+        return Err(SqlError::InvalidValue(
+            "persist_ann_index: TEMP tables are not persistable".into(),
+        ));
+    }
+    let table_schema = schema
+        .get(&table)
+        .cloned()
+        .ok_or_else(|| SqlError::TableNotFound(table.clone()))?;
+    let source_declaration = table_schema.try_serialize()?;
     let col_lower = column.to_ascii_lowercase();
     let col_idx = table_schema
         .columns
@@ -1587,7 +1603,6 @@ pub(crate) fn persist_ann_index(
         filter_cols: ann_index.ann_filter_cols.clone(),
     };
 
-    let mut rtx = db.begin_read();
     let cancel = rtx.cancel_token().cloned();
     let cancel = cancel.as_ref();
     check_cancel(cancel)?;
@@ -1596,7 +1611,7 @@ pub(crate) fn persist_ann_index(
         .map_err(SqlError::Storage)?
         .ok_or_else(|| SqlError::InvalidValue("table vanished during ANN persist".into()))?;
     let (source_root, source_root_txn) = source_stamp;
-    let outcome = scan_rows(&mut rtx, table_schema, &spec)?;
+    let outcome = scan_rows(&mut rtx, &table_schema, &spec)?;
     drop(rtx);
     check_cancel(cancel)?;
     if outcome.rows.is_empty() {
@@ -1656,6 +1671,20 @@ pub(crate) fn persist_ann_index(
     check_cancel(cancel)?;
     let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
     check_cancel(cancel)?;
+    schema.admit_write(db, &mut wtx)?;
+    super::reject_legacy_volatile_schema(schema)?;
+    // Catalog-only changes (for example replacing the ANN filter columns) do
+    // not change the base-data root stamp. Refuse that race before any write.
+    let declaration_matches = match schema.get(&table) {
+        Some(live) => live.try_serialize()? == source_declaration,
+        None => false,
+    };
+    if !declaration_matches {
+        return Err(SqlError::InvalidValue(
+            "table definition changed while the ANN index was being built; retry persistence"
+                .into(),
+        ));
+    }
     let live_stamp = wtx
         .table_root_stamp(table_schema.name.as_bytes())
         .map_err(SqlError::Storage)?
@@ -1687,7 +1716,7 @@ pub(crate) fn persist_ann_index(
         dicts: outcome.dicts,
         source: AnnIndexSource::Built { refusal: None },
         cached_gen,
-        identity: spec.cache_identity(table_schema),
+        identity: spec.cache_identity(&table_schema),
     });
     let key = cache_key(&table_schema.name, spec.col_idx, spec.metric);
     let mut guard = schema.sql_caches.lock();
@@ -2625,6 +2654,93 @@ mod thrash_tests {
             rtx.table_get(b"__annseg_t", &0u32.to_be_bytes()),
             Err(citadel_core::Error::TableNotFound(_))
         ));
+    }
+
+    #[test]
+    fn persist_admits_current_declaration_on_a_stale_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path());
+        let stale = Connection::open(&db).unwrap();
+        let writer = Connection::open(&db).unwrap();
+        setup(&writer);
+        insert(&writer, 1, &vec_for(1));
+        build_index(&writer);
+
+        stale.persist_ann_index("t", "v").unwrap();
+        writer.execute("DROP INDEX ix_v ON t").unwrap();
+        writer
+            .execute("CREATE INDEX ix_v ON t USING ann (v) WITH (metric = 'l2', filters = 'score')")
+            .unwrap();
+        stale.persist_ann_index("t", "v").unwrap();
+
+        let mut rtx = db.begin_read();
+        let header = rtx
+            .table_get(b"__annseg_t", &0u32.to_be_bytes())
+            .unwrap()
+            .unwrap();
+        let header = super::ann_persist::SegmentHeader::decode(&header).unwrap();
+        assert_eq!(header.filter_cols, vec![2]);
+    }
+
+    #[test]
+    fn persist_rechecks_catalog_changes_without_rejecting_unrelated_ddl() {
+        for change in ["drop", "replace", "unrelated"] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = fresh_db(dir.path());
+            let conn = Connection::open(&db).unwrap();
+            setup(&conn);
+            for i in 1..=40 {
+                insert(&conn, i, &vec_for(i));
+            }
+            build_index(&conn);
+            let stamp_before = db.begin_read().table_root_stamp(b"t").unwrap();
+            let built = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let resume = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let result = std::thread::scope(|scope| {
+                let persist = scope.spawn({
+                    let built = std::sync::Arc::clone(&built);
+                    let resume = std::sync::Arc::clone(&resume);
+                    || {
+                        let _pause = super::pause_next_ann_build(built, resume);
+                        let persister = Connection::open(&db).unwrap();
+                        persister.persist_ann_index("t", "v")
+                    }
+                });
+                built.wait();
+                let changed = (|| {
+                    let writer = Connection::open(&db)?;
+                    if change == "unrelated" {
+                        writer.execute("CREATE TABLE other (id INTEGER PRIMARY KEY)")?;
+                    } else {
+                        writer.execute("DROP INDEX ix_v ON t")?;
+                        if change == "replace" {
+                            writer.execute("CREATE INDEX ix_v ON t USING ann (v) WITH (metric = 'l2', filters = 'score')")?;
+                        }
+                    }
+                    Ok::<_, crate::error::SqlError>(())
+                })();
+                resume.wait();
+                let result = persist.join().unwrap();
+                changed.unwrap();
+                result
+            });
+            assert_eq!(
+                stamp_before,
+                db.begin_read().table_root_stamp(b"t").unwrap(),
+                "fixture must change only the catalog"
+            );
+            if change == "unrelated" {
+                result.expect("unrelated schema changes do not invalidate this index");
+            } else {
+                let error = result.expect_err("changed ANN declaration must not be persisted");
+                assert!(error.to_string().contains("table definition changed"));
+                assert!(matches!(
+                    db.begin_read()
+                        .table_get(b"__annseg_t", &0u32.to_be_bytes()),
+                    Err(citadel_core::Error::TableNotFound(_))
+                ));
+            }
+        }
     }
 
     /// I2: an in-place vector UPDATE must hard-invalidate (new vector reflected).

@@ -26,7 +26,8 @@ pub(super) fn expr_context_free(expr: &Expr) -> bool {
         | Expr::ScalarSubquery(_)
         | Expr::WindowFunction { .. }
         | Expr::Quantified { .. } => independent = false,
-        Expr::Literal(_)
+        Expr::BoundColumn { .. }
+        | Expr::Literal(_)
         | Expr::Column(_)
         | Expr::QualifiedColumn { .. }
         | Expr::Parameter(_)
@@ -2370,7 +2371,7 @@ pub(super) fn infer_expr_type(expr: &Expr, columns: &[ColumnDef]) -> DataType {
                 .map(|c| c.data_type)
                 .unwrap_or(DataType::Null)
         }
-        Expr::Literal(v) => v.data_type(),
+        Expr::Literal(v) | Expr::BoundColumn { value: v, .. } => v.data_type(),
         Expr::CountStar => DataType::Integer,
         Expr::Function { name, .. } => match name.to_ascii_uppercase().as_str() {
             "COUNT" => DataType::Integer,

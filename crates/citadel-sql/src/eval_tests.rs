@@ -1241,3 +1241,82 @@ fn empty_parameter_scope_restores_outer_after_unwind() {
         assert_eq!(resolve_scoped_param(1).unwrap(), Value::Integer(99));
     });
 }
+
+#[test]
+fn bound_columns_preserve_implicit_collation_without_promoting_it() {
+    use crate::types::Collation;
+    let columns = vec![col("inner", DataType::Text, false, 0)];
+    let map = ColumnMap::new(&columns);
+    let row = vec![Value::Text("A".into())];
+    let context = EvalCtx::new(&map, &row);
+    let bound = |collation| Expr::BoundColumn {
+        value: Value::Text("a".into()),
+        collation,
+    };
+    let equal = |left, right| Expr::BinaryOp {
+        left: Box::new(left),
+        op: BinOp::Eq,
+        right: Box::new(right),
+    };
+    let literal = || Expr::Literal(Value::Text("A".into()));
+    for (expr, expected) in [
+        (equal(bound(Collation::NoCase), literal()), true),
+        (
+            equal(Expr::Column("inner".into()), bound(Collation::NoCase)),
+            false,
+        ),
+        (
+            equal(bound(Collation::NoCase), Expr::Column("inner".into())),
+            true,
+        ),
+        (equal(bound(Collation::Binary), literal()), false),
+        (
+            equal(
+                Expr::Cast {
+                    expr: Box::new(bound(Collation::NoCase)),
+                    data_type: DataType::Text,
+                },
+                literal(),
+            ),
+            true,
+        ),
+        (
+            equal(Expr::Coalesce(vec![bound(Collation::NoCase)]), literal()),
+            false,
+        ),
+        (
+            equal(
+                bound(Collation::NoCase),
+                Expr::Collate {
+                    expr: Box::new(literal()),
+                    collation: Collation::Binary,
+                },
+            ),
+            false,
+        ),
+    ] {
+        assert_eq!(
+            eval_expr(&expr, &context).unwrap(),
+            Value::Boolean(expected),
+            "{expr:?}"
+        );
+        assert_eq!(
+            CompiledExpr::compile(&expr, &map).eval(&context).unwrap(),
+            Value::Boolean(expected)
+        );
+    }
+    assert_eq!(collation_of(&bound(Collation::NoCase)), None);
+    assert_eq!(
+        operand_collation(&bound(Collation::Binary), &map),
+        Some(Collation::Binary)
+    );
+    let case = Expr::Case {
+        operand: None,
+        conditions: vec![(
+            Expr::Literal(Value::Boolean(true)),
+            bound(Collation::NoCase),
+        )],
+        else_result: None,
+    };
+    assert_eq!(compile_collation(&case, &literal(), &map), None);
+}

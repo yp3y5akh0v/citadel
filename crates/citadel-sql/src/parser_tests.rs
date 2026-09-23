@@ -1896,3 +1896,26 @@ fn has_subquery_follows_both_window_frame_bounds() {
         assert!(has_subquery(&expression), "start bound: {use_start}");
     }
 }
+
+#[test]
+fn parameter_visitor_covers_query_inputs_and_returning() {
+    for (sql, expected) in [
+        ("SELECT d.v FROM (SELECT $4 AS v) d", 4),
+        (
+            "SELECT d.v FROM (WITH c AS (SELECT $7 AS v) SELECT v FROM c) d",
+            7,
+        ),
+        ("SELECT value FROM json_array_elements($5)", 5),
+        (
+            "SELECT * FROM JSON_TABLE($6, '$[*]' COLUMNS (v INT PATH '$'))",
+            6,
+        ),
+        ("SELECT 1 FROM t JOIN (SELECT $8 AS v) d ON TRUE", 8),
+        ("SELECT 1 FROM t JOIN json_array_elements($9) j ON TRUE", 9),
+        ("INSERT INTO t VALUES (1) RETURNING $10", 10),
+        ("UPDATE t SET v=1 RETURNING $11", 11),
+        ("DELETE FROM t RETURNING $12", 12),
+    ] {
+        assert_eq!(count_params(&parse_sql(sql).unwrap()), expected, "{sql}");
+    }
+}

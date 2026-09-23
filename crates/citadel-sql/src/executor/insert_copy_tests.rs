@@ -325,7 +325,7 @@ fn encoded_copy_charges_each_source_value_once_and_poisoning_survives_partial_fa
     let budget = citadel_txn::ReadBudget::new(total, total);
     txn.set_read_budget(Some(budget.clone()));
     assert!(matches!(
-        super::super::dml::exec_insert_in_txn(&mut txn, &schema, &statement, &[]).unwrap(),
+        super::super::exec_insert_in_admitted_txn(&mut txn, &schema, &statement, &[]).unwrap(),
         ExecutionResult::RowsAffected(12)
     ));
     assert_eq!(budget.remaining(), 0);
@@ -334,7 +334,7 @@ fn encoded_copy_charges_each_source_value_once_and_poisoning_survives_partial_fa
     let mut txn = db.begin_write().unwrap();
     txn.set_read_budget(Some(citadel_txn::ReadBudget::new(total, total / 2)));
     let error =
-        super::super::dml::exec_insert_in_txn(&mut txn, &schema, &statement, &[]).unwrap_err();
+        super::super::exec_insert_in_admitted_txn(&mut txn, &schema, &statement, &[]).unwrap_err();
     assert!(matches!(
         error,
         SqlError::Storage(citadel_core::Error::ReadBudgetExceeded { .. })
@@ -350,7 +350,7 @@ fn encoded_copy_charges_each_source_value_once_and_poisoning_survives_partial_fa
     cancel.cancel();
     txn.set_cancel(Some(cancel));
     assert!(matches!(
-        super::super::dml::exec_insert_in_txn(&mut txn, &schema, &statement, &[]),
+        super::super::exec_insert_in_admitted_txn(&mut txn, &schema, &statement, &[]),
         Err(SqlError::Storage(citadel_core::Error::Interrupted))
     ));
     txn.set_cancel(None);

@@ -1,4 +1,3 @@
-use citadel::Database;
 use citadel_txn::read_txn::ReadTxn;
 
 use crate::error::{Result, SqlError};
@@ -9,21 +8,6 @@ use crate::types::*;
 
 use super::aggregate::*;
 use super::{CteContext, CteRows};
-
-pub(super) fn exec_select_query(
-    db: &Database,
-    schema: &SchemaManager,
-    sq: &SelectQuery,
-) -> Result<ExecutionResult> {
-    if any_dml_cte(sq) {
-        let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
-        let result = exec_select_query_in_txn(&mut wtx, schema, sq)?;
-        super::commit_with_ann_publication(wtx, schema)?;
-        return Ok(result);
-    }
-    let mut rtx = db.begin_read();
-    exec_select_query_with_read(&mut rtx, schema, sq)
-}
 
 pub(super) fn exec_select_query_with_read(
     rtx: &mut ReadTxn<'_>,

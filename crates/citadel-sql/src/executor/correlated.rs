@@ -1,4 +1,3 @@
-use citadel::Database;
 use citadel_txn::read_txn::ReadTxn;
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -11,6 +10,132 @@ use crate::types::*;
 
 use super::helpers::{check_cancel, check_cancel_at, decode_full_row_with_cancel};
 use super::CteContext;
+
+#[path = "correlated_bind.rs"]
+mod binding;
+
+/// Unlike the conjunct-only decorrelator, mutation predicates may contain a
+/// correlated query under OR, CASE, or another expression.
+pub(super) fn mutation_has_correlated_where(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    predicate: &Option<Expr>,
+    ctx: &CorrelationCtx<'_>,
+    schema: &SchemaManager,
+) -> Result<bool> {
+    let Some(predicate) = predicate else {
+        return Ok(false);
+    };
+    if !super::dml::has_subquery(predicate) {
+        return Ok(false);
+    }
+    binding::bind_predicate(wtx, schema, &mut predicate.clone(), ctx, None)
+}
+
+fn complete_exists_semijoin(
+    predicate: &Expr,
+    ctx: &CorrelationCtx<'_>,
+    schema: &SchemaManager,
+) -> bool {
+    flatten_and_exprs(predicate).into_iter().all(|conjunct| {
+        if !super::dml::has_subquery(conjunct) {
+            return true;
+        }
+        let Expr::Exists {
+            subquery: query, ..
+        } = conjunct
+        else {
+            return false;
+        };
+        if !query.joins.is_empty()
+            || query.from_subquery.is_some()
+            || query.from_args.is_some()
+            || query.from_json_table.is_some()
+            || !query.group_by.is_empty()
+            || query.having.is_some()
+            || !query.order_by.is_empty()
+            || query.limit.is_some()
+            || query.offset.is_some()
+            || !query.columns.iter().all(|column| {
+                matches!(
+                    column,
+                    SelectColumn::Expr {
+                        expr: Expr::Literal(_),
+                        ..
+                    }
+                )
+            })
+        {
+            return false;
+        }
+        let Some(inner) = schema.get(&query.from) else {
+            return false;
+        };
+        let Some(where_clause) = &query.where_clause else {
+            return false;
+        };
+        let (pairs, _) =
+            extract_correlation_predicates(where_clause, ctx, inner, query.from_alias.as_deref());
+        if pairs.is_empty() {
+            return false;
+        }
+        let (inner_where, residual) = strip_correlation_predicates(
+            &query.where_clause,
+            ctx,
+            inner,
+            query.from_alias.as_deref(),
+        );
+        residual.is_empty() && !inner_where.as_ref().is_some_and(super::dml::has_subquery)
+    })
+}
+
+/// Keep physical row locators attached while filtering. Only a complete simple
+/// EXISTS equijoin may use a semijoin; other predicates bind each outer row in
+/// its lexical query scopes and execute against this same writer.
+pub(super) fn filter_mutation_correlated_rows<T>(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    schema: &SchemaManager,
+    predicate: &Option<Expr>,
+    ctx: &CorrelationCtx<'_>,
+    rows: &mut Vec<T>,
+    values: impl Fn(&T) -> &[Value],
+) -> Result<Option<Expr>> {
+    let Some(predicate) = predicate else {
+        return Ok(None);
+    };
+    let predicate = super::dml::materialize_expr_selective(predicate, &mut |query| {
+        let mut candidate = Expr::ScalarSubquery(Box::new(query.clone()));
+        if binding::bind_predicate(wtx, schema, &mut candidate, ctx, None)? {
+            Ok(None)
+        } else {
+            super::dml::exec_subquery_write(wtx, schema, query, &CteContext::default()).map(Some)
+        }
+    })?;
+    if complete_exists_semijoin(&predicate, ctx, schema) {
+        return handle_correlated_where_write(
+            wtx,
+            schema,
+            &Some(predicate.clone()),
+            ctx,
+            rows,
+            values,
+        );
+    }
+    let cancel = wtx.cancel_token().cloned();
+    let columns = ctx.outer_schema.column_map();
+    retain_cancellable(rows, cancel.as_ref(), |item| {
+        let row = values(item);
+        let mut bound = predicate.clone();
+        binding::bind_predicate(wtx, schema, &mut bound, ctx, Some(row))?;
+        let materialized = super::dml::materialize_expr(&bound, &mut |query| {
+            super::dml::exec_subquery_write(wtx, schema, query, &CteContext::default())
+        })?;
+        Ok(is_truthy(&eval_expr(
+            &materialized,
+            &EvalCtx::new(columns, row).with_cancel(cancel.as_ref()),
+        )?))
+    })?;
+    Ok(None)
+}
 
 #[derive(Default)]
 pub(super) struct InValues {
@@ -463,7 +588,6 @@ pub(super) fn is_correlated_subquery(
 
 /// A correlation equality predicate: outer_col = inner_col
 pub(super) struct CorrEqPair {
-    outer_col_name: String,
     outer_col_idx: usize,
     inner_col_name: String,
     /// Collation of the syntactic left operand of the extracted `=` predicate.
@@ -554,7 +678,9 @@ pub(super) fn try_match_corr_pair(
     let outer_col = match maybe_outer {
         Expr::QualifiedColumn { table, column } => {
             let t = table.to_ascii_lowercase();
-            if ctx.matches_outer(&t) {
+            if ctx.matches_outer(&t)
+                && !t.eq_ignore_ascii_case(inner_alias.unwrap_or(&inner_schema.name))
+            {
                 column.to_ascii_lowercase()
             } else {
                 return None;
@@ -573,8 +699,7 @@ pub(super) fn try_match_corr_pair(
     let inner_col = match maybe_inner {
         Expr::QualifiedColumn { table, column } => {
             let t = table.to_ascii_lowercase();
-            let inner_name = inner_schema.name.to_ascii_lowercase();
-            if t == inner_name || inner_alias.is_some_and(|a| a.eq_ignore_ascii_case(&t)) {
+            if t.eq_ignore_ascii_case(inner_alias.unwrap_or(&inner_schema.name)) {
                 column.to_ascii_lowercase()
             } else {
                 return None;
@@ -599,56 +724,33 @@ pub(super) fn try_match_corr_pair(
     };
 
     Some(CorrEqPair {
-        outer_col_name: outer_col,
         outer_col_idx,
         inner_col_name: inner_col,
         collation,
     })
 }
 
-/// Strip correlation predicates from WHERE, returning (inner-only WHERE, non-equality predicates).
+/// Strip exact correlation equalities from WHERE, preserving inner-only and
+/// outer-dependent residual predicates with their original scopes.
 pub(super) fn strip_correlation_predicates(
     where_clause: &Option<Expr>,
-    corr_pairs: &[CorrEqPair],
     ctx: &CorrelationCtx,
     inner_schema: &TableSchema,
+    inner_alias: Option<&str>,
 ) -> (Option<Expr>, Vec<Expr>) {
     let w = match where_clause {
         Some(w) => w,
         None => return (None, vec![]),
     };
     let conjuncts = flatten_and_exprs(w);
-    let corr_outer: FxHashSet<&str> = corr_pairs
-        .iter()
-        .map(|p| p.outer_col_name.as_str())
-        .collect();
-    let corr_inner: FxHashSet<&str> = corr_pairs
-        .iter()
-        .map(|p| p.inner_col_name.as_str())
-        .collect();
-
     let mut inner_only: Vec<Expr> = Vec::new();
     let mut non_eq_corr: Vec<Expr> = Vec::new();
 
     for c in conjuncts {
-        if let Expr::BinaryOp {
-            left,
-            op: BinOp::Eq,
-            right,
-        } = c
-        {
-            let l = col_name_lower(left);
-            let r = col_name_lower(right);
-            let l_is_corr = l
-                .as_deref()
-                .is_some_and(|n| corr_outer.contains(n) || corr_inner.contains(n));
-            let r_is_corr = r
-                .as_deref()
-                .is_some_and(|n| corr_outer.contains(n) || corr_inner.contains(n));
-            if l_is_corr && r_is_corr {
-                // Equality correlation → already a hash key, skip
-                continue;
-            }
+        if try_extract_corr_eq(c, ctx, inner_schema, inner_alias).is_some() {
+            // Remove only the exact qualified inner/outer equalities used as
+            // hash keys. Equal column spellings do not establish correlation.
+            continue;
         }
         let mut refs = Vec::new();
         collect_column_names(c, &mut refs);
@@ -656,6 +758,7 @@ pub(super) fn strip_correlation_predicates(
             if let Some(dot) = name.find('.') {
                 let table_part = &name[..dot];
                 ctx.matches_outer(table_part)
+                    && !table_part.eq_ignore_ascii_case(inner_alias.unwrap_or(&inner_schema.name))
             } else {
                 !resolves_in(name, inner_schema) && resolves_in(name, ctx.outer_schema)
             }
@@ -684,14 +787,6 @@ pub(super) fn strip_correlation_predicates(
     (inner_where, non_eq_corr)
 }
 
-pub(super) fn col_name_lower(expr: &Expr) -> Option<String> {
-    match expr {
-        Expr::Column(n) => Some(n.to_ascii_lowercase()),
-        Expr::QualifiedColumn { column, .. } => Some(column.to_ascii_lowercase()),
-        _ => None,
-    }
-}
-
 /// Replace outer column references in an expression with literal values from the outer row.
 pub(super) fn bind_outer_values_in_expr(
     expr: &Expr,
@@ -706,7 +801,10 @@ pub(super) fn bind_outer_values_in_expr(
         Expr::QualifiedColumn { table, column } => {
             if ctx.matches_outer(&table.to_ascii_lowercase()) {
                 if let Ok(idx) = outer_col_map.resolve(&column.to_ascii_lowercase()) {
-                    return Expr::Literal(outer_row[idx].clone());
+                    return Expr::BoundColumn {
+                        value: outer_row[idx].clone(),
+                        collation: outer_col_map.collation_at(idx),
+                    };
                 }
             }
             expr.clone()
@@ -718,7 +816,10 @@ pub(super) fn bind_outer_values_in_expr(
                 Err(SqlError::ColumnNotFound(_))
             ) {
                 if let Ok(idx) = outer_col_map.resolve(&lower) {
-                    return Expr::Literal(outer_row[idx].clone());
+                    return Expr::BoundColumn {
+                        value: outer_row[idx].clone(),
+                        collation: outer_col_map.collation_at(idx),
+                    };
                 }
             }
             expr.clone()
@@ -863,7 +964,8 @@ pub(super) fn bind_outer_values_in_expr(
                 QuantifiedRhs::Array(expr) => QuantifiedRhs::Array(Box::new(bind(expr))),
             },
         },
-        Expr::Literal(_)
+        Expr::BoundColumn { .. }
+        | Expr::Literal(_)
         | Expr::CountStar
         | Expr::Exists { .. }
         | Expr::ScalarSubquery(_)
@@ -896,15 +998,23 @@ pub(super) fn decorrelate_exists_with_read(
     let inner_name = subquery.from.to_ascii_lowercase();
 
     let (inner_schema_owned, inner_rows) = if let Some(ts) = schema.get(&inner_name) {
-        let (inner_where, _) =
-            strip_correlation_predicates(&subquery.where_clause, corr_pairs, ctx, ts);
+        let (inner_where, _) = strip_correlation_predicates(
+            &subquery.where_clause,
+            ctx,
+            ts,
+            subquery.from_alias.as_deref(),
+        );
         let (rows, _) = super::collect_rows_with_read(rtx, ts, &inner_where, None)?;
         (ts.clone(), rows)
     } else if let Some(vd) = schema.get_view(&inner_name) {
         let vqr = super::exec_view_with_read(rtx, schema, vd)?;
         let vs = super::build_view_schema(&inner_name, &vqr)?;
-        let (inner_where, _) =
-            strip_correlation_predicates(&subquery.where_clause, corr_pairs, ctx, &vs);
+        let (inner_where, _) = strip_correlation_predicates(
+            &subquery.where_clause,
+            ctx,
+            &vs,
+            subquery.from_alias.as_deref(),
+        );
         let col_map = ColumnMap::new(&vs.columns);
         let rows: Vec<Vec<Value>> = if let Some(ref w) = inner_where {
             let mut filtered = Vec::new();
@@ -927,8 +1037,12 @@ pub(super) fn decorrelate_exists_with_read(
     };
     let inner_schema = &inner_schema_owned;
 
-    let (_, non_eq) =
-        strip_correlation_predicates(&subquery.where_clause, corr_pairs, ctx, inner_schema);
+    let (_, non_eq) = strip_correlation_predicates(
+        &subquery.where_clause,
+        ctx,
+        inner_schema,
+        subquery.from_alias.as_deref(),
+    );
 
     let inner_col_indices: Vec<usize> = corr_pairs
         .iter()
@@ -990,8 +1104,12 @@ pub(super) fn decorrelate_in_with_read(
     };
     let in_col_idx = in_subquery_value_column_index(in_expr, inner_schema)?;
 
-    let (inner_where, _non_eq) =
-        strip_correlation_predicates(&subquery.where_clause, corr_pairs, ctx, inner_schema);
+    let (inner_where, _non_eq) = strip_correlation_predicates(
+        &subquery.where_clause,
+        ctx,
+        inner_schema,
+        subquery.from_alias.as_deref(),
+    );
     let (inner_rows, _) = super::collect_rows_with_read(rtx, inner_schema, &inner_where, None)?;
 
     let inner_corr_indices: Vec<usize> = corr_pairs
@@ -1047,8 +1165,12 @@ pub(super) fn decorrelate_scalar_with_read(
         .map(|name| Expr::Column(name.clone()))
         .collect();
 
-    let (inner_where, _non_eq) =
-        strip_correlation_predicates(&subquery.where_clause, corr_pairs, ctx, inner_schema);
+    let (inner_where, _non_eq) = strip_correlation_predicates(
+        &subquery.where_clause,
+        ctx,
+        inner_schema,
+        subquery.from_alias.as_deref(),
+    );
 
     let mut select_cols: Vec<SelectColumn> = corr_col_names
         .iter()
@@ -1120,8 +1242,12 @@ pub(super) fn decorrelate_exists_write(
     let inner_schema = schema
         .get(&inner_name)
         .ok_or_else(|| SqlError::TableNotFound(subquery.from.clone()))?;
-    let (inner_where, _non_eq) =
-        strip_correlation_predicates(&subquery.where_clause, corr_pairs, ctx, inner_schema);
+    let (inner_where, _non_eq) = strip_correlation_predicates(
+        &subquery.where_clause,
+        ctx,
+        inner_schema,
+        subquery.from_alias.as_deref(),
+    );
     let (inner_rows, _) = super::collect_rows_write(wtx, inner_schema, &inner_where, None)?;
     let inner_col_indices: Vec<usize> = corr_pairs
         .iter()
@@ -1161,8 +1287,12 @@ pub(super) fn decorrelate_in_write(
         _ => return Err(SqlError::Unsupported("complex IN subquery column".into())),
     };
     let in_col_idx = in_subquery_value_column_index(in_expr, inner_schema)?;
-    let (inner_where, _non_eq) =
-        strip_correlation_predicates(&subquery.where_clause, corr_pairs, ctx, inner_schema);
+    let (inner_where, _non_eq) = strip_correlation_predicates(
+        &subquery.where_clause,
+        ctx,
+        inner_schema,
+        subquery.from_alias.as_deref(),
+    );
     let (inner_rows, _) = super::collect_rows_write(wtx, inner_schema, &inner_where, None)?;
     let inner_corr_indices: Vec<usize> = corr_pairs
         .iter()
@@ -1210,8 +1340,12 @@ pub(super) fn decorrelate_scalar_write(
         .iter()
         .map(|n| Expr::Column(n.clone()))
         .collect();
-    let (inner_where, _non_eq) =
-        strip_correlation_predicates(&subquery.where_clause, corr_pairs, ctx, inner_schema);
+    let (inner_where, _non_eq) = strip_correlation_predicates(
+        &subquery.where_clause,
+        ctx,
+        inner_schema,
+        subquery.from_alias.as_deref(),
+    );
     let mut select_cols: Vec<SelectColumn> = corr_col_names
         .iter()
         .map(|name| SelectColumn::Expr {
@@ -1263,17 +1397,18 @@ pub(super) fn decorrelate_scalar_write(
 }
 
 /// Write-transaction variant of handle_correlated_where_read.
-pub(super) fn handle_correlated_where_write(
+pub(super) fn handle_correlated_where_write<T>(
     wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
     schema: &SchemaManager,
-    stmt: &SelectStmt,
+    where_clause: &Option<Expr>,
     ctx: &CorrelationCtx,
-    rows: &mut Vec<Vec<Value>>,
+    rows: &mut Vec<T>,
+    row_values: impl Fn(&T) -> &[Value],
 ) -> Result<Option<Expr>> {
     let cancel = wtx.cancel_token().cloned();
     let cancel = cancel.as_ref();
     check_cancel(cancel)?;
-    let where_clause = match &stmt.where_clause {
+    let where_clause = match where_clause {
         Some(w) => w,
         None => return Ok(None),
     };
@@ -1308,7 +1443,8 @@ pub(super) fn handle_correlated_where_write(
                         corr_pairs.iter().map(|p| p.outer_col_idx).collect();
                     let key_collations = correlation_collations(&corr_pairs);
                     let is_negated = *negated;
-                    retain_cancellable(rows, cancel, |row| {
+                    retain_cancellable(rows, cancel, |item| {
+                        let row = row_values(item);
                         let key = correlation_key(row, &outer_col_indices, &key_collations);
                         if key.iter().any(|v| v.is_null()) {
                             return Ok(is_negated);
@@ -1360,7 +1496,8 @@ pub(super) fn handle_correlated_where_write(
                         corr_pairs.iter().map(|p| p.outer_col_idx).collect();
                     let key_collations = correlation_collations(&corr_pairs);
                     let is_negated = *negated;
-                    retain_cancellable(rows, cancel, |row| {
+                    retain_cancellable(rows, cancel, |item| {
+                        let row = row_values(item);
                         let key = correlation_key(row, &outer_col_indices, &key_collations);
                         let in_val =
                             eval_expr(in_expr, &EvalCtx::new(&col_map, row).with_cancel(cancel))?;
@@ -1407,7 +1544,8 @@ pub(super) fn handle_correlated_where_write(
                                 let cmp_op = *op;
                                 let left_expr = left.clone();
                                 let col_map = ColumnMap::new(&ctx.outer_schema.columns);
-                                retain_cancellable(rows, cancel, |row| {
+                                retain_cancellable(rows, cancel, |item| {
+                                    let row = row_values(item);
                                     let key =
                                         correlation_key(row, &outer_col_indices, &key_collations);
                                     let scalar_val =
@@ -1921,17 +2059,6 @@ struct InFilter {
     value_collation: Collation,
     in_expr: Expr,
     negated: bool,
-}
-
-pub(super) fn handle_correlated_where_read(
-    db: &Database,
-    schema: &SchemaManager,
-    stmt: &SelectStmt,
-    ctx: &CorrelationCtx,
-    rows: &mut Vec<Vec<Value>>,
-) -> Result<Option<Expr>> {
-    let mut rtx = db.begin_read();
-    handle_correlated_where_with_read(&mut rtx, schema, stmt, ctx, rows)
 }
 
 pub(super) fn handle_correlated_where_with_read(

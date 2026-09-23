@@ -477,6 +477,47 @@ fn prepared_pk_update_returning_zero_match_keeps_columns() {
 }
 
 #[test]
+fn delete_returning_zero_match_preserves_columns_in_every_transaction_route() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE missing_delete (id INTEGER PRIMARY KEY, note TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO missing_delete VALUES (1, 'keep')")
+        .unwrap();
+
+    for explicit in [false, true] {
+        if explicit {
+            conn.execute("BEGIN").unwrap();
+        }
+        let result = query(
+            &conn,
+            "DELETE FROM missing_delete WHERE id = 999 RETURNING id AS removed, note",
+        );
+        assert_eq!(result.columns, vec!["removed", "note"]);
+        assert!(result.rows.is_empty());
+
+        let prepared = conn
+            .prepare("DELETE FROM missing_delete WHERE id = $1 RETURNING id AS removed, note")
+            .unwrap();
+        // The missing integer exercises the compiled key lookup; the other
+        // values require predicate semantics outside an encoded integer key.
+        for value in [Value::Integer(999), Value::Real(1.5), Value::Null] {
+            let result = prepared.query_collect(&[value]).unwrap();
+            assert_eq!(result.columns, vec!["removed", "note"]);
+            assert!(result.rows.is_empty());
+        }
+        if explicit {
+            conn.execute("COMMIT").unwrap();
+        }
+    }
+    assert_eq!(
+        query(&conn, "SELECT id FROM missing_delete").rows,
+        vec![vec![Value::Integer(1)]]
+    );
+}
+
+#[test]
 fn prepared_pk_update_returning_star() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());

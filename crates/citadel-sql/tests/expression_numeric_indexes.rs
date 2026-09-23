@@ -522,7 +522,12 @@ fn known_text_expression_probes_match_unindexed_results() {
                     "{function} on {data_type}: {probe:?}"
                 );
                 if let Value::Text(text) = &probe[0] {
-                    assert!(measured.rows_scanned() <= expected.len() as u64 + 1);
+                    assert!(
+                        measured.rows_scanned() <= expected.len() as u64 + 1,
+                        "{function} on {data_type}: {probe:?}; scanned={}, expected_rows={}",
+                        measured.rows_scanned(),
+                        expected.len()
+                    );
                     drop(measured);
                     assert_eq!(
                         conn.query(&format!(

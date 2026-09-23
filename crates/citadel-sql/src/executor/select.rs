@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use citadel::{CancelToken, Database};
+use citadel::CancelToken;
 use citadel_txn::read_txn::ReadTxn;
 use rustc_hash::FxHashMap;
 
@@ -5112,7 +5112,6 @@ impl CompiledSelect {
 impl CompiledPlan for CompiledSelect {
     fn execute(
         &self,
-        db: &Database,
         schema: &SchemaManager,
         stmt: &Statement,
         params: &[Value],
@@ -5129,90 +5128,78 @@ impl CompiledPlan for CompiledSelect {
 
         use super::compile::ActiveTxnRef;
 
-        if matches!(txn, ActiveTxnRef::None | ActiveTxnRef::Read(_)) {
-            // Never serve under ActiveTxnRef::Write: read-your-writes.
-            if let Some(slot) = &self.result_cache {
-                return match txn {
-                    ActiveTxnRef::Read(rtx) => {
-                        self.execute_cached_read(schema, sq, params, slot, rtx)
-                    }
-                    _ => {
-                        let mut rtx = db.begin_read();
-                        self.execute_cached_read(schema, sq, params, slot, &mut rtx)
-                    }
-                };
-            }
-            if let Some(lane) = &self.lane {
-                let qr = match txn {
-                    ActiveTxnRef::Read(rtx) => lane.run(rtx)?,
-                    _ => lane.run(&mut db.begin_read())?,
-                };
-                return Ok(ExecutionResult::Query(qr));
-            }
-            if let (Some(plan), Some(cache)) = (&self.compound_plan, &self.compound_cache) {
-                return match txn {
-                    ActiveTxnRef::Read(rtx) => execute_cached_compound_with_read(rtx, plan, cache),
-                    _ => execute_cached_compound(db, plan, cache),
-                };
-            }
-            if let (Some(plan), Some(cache)) = (&self.join_plan, &self.join_cache) {
-                let sel = match &sq.body {
-                    QueryBody::Select(s) => s,
-                    _ => unreachable!("cached plan implies SelectBody::Select"),
-                };
-                return match txn {
-                    ActiveTxnRef::Read(rtx) => execute_cached_join_with_read(rtx, plan, cache, sel),
-                    _ => execute_cached_join(db, plan, cache, sel),
-                };
-            }
-        }
-
         match txn {
-            ActiveTxnRef::None => exec_select_query(db, schema, sq),
-            ActiveTxnRef::Read(rtx) => exec_select_query_with_read(rtx, schema, sq),
+            ActiveTxnRef::Read(rtx) => {
+                if let Some(slot) = &self.result_cache {
+                    return self.execute_cached_read(schema, sq, params, slot, rtx);
+                }
+                if let Some(lane) = &self.lane {
+                    return Ok(ExecutionResult::Query(lane.run(rtx)?));
+                }
+                if let (Some(plan), Some(cache)) = (&self.compound_plan, &self.compound_cache) {
+                    return execute_cached_compound_with_read(rtx, plan, cache);
+                }
+                if let (Some(plan), Some(cache)) = (&self.join_plan, &self.join_cache) {
+                    let sel = match &sq.body {
+                        QueryBody::Select(s) => s,
+                        _ => unreachable!("cached plan implies SelectBody::Select"),
+                    };
+                    return execute_cached_join_with_read(rtx, plan, cache, sel);
+                }
+                exec_select_query_with_read(rtx, schema, sq)
+            }
+            // A writer must observe its own pending changes, never a read cache.
             ActiveTxnRef::Write(outer) => exec_select_query_in_txn(outer, schema, sq),
         }
     }
 
     fn try_stream<'db>(
         &self,
-        db: &'db Database,
+        rtx: ReadTxn<'db>,
         schema: &SchemaManager,
         stmt: &Statement,
         _params: &[Value],
-    ) -> Option<Box<dyn super::compile::RowSourceIter + 'db>> {
-        let (lower, table_schema, proj, columns) = stream_scan_setup(schema, stmt)?;
-        let mut rtx = db.begin_read();
+    ) -> Result<super::compile::StreamAttempt<'db>> {
+        let Some((lower, table_schema, proj, columns)) = stream_scan_setup(schema, stmt) else {
+            return Ok(super::compile::StreamAttempt::Buffered(rtx));
+        };
         let cancel = rtx.cancel_token().cloned();
-        let row_count = rtx.table_entry_count(lower.as_bytes()).unwrap_or(0) as usize;
-        let iter = rtx.into_table_scan_iter(lower.as_bytes(), b"").ok()?;
-        Some(Box::new(StreamingSelect {
-            iter,
-            table_schema: Arc::new(table_schema),
-            proj,
-            columns,
-            scratch: Vec::new(),
-            row_count,
-            cancel,
-        }))
+        let iter = rtx.into_table_scan_iter(lower.as_bytes(), b"")?;
+        Ok(super::compile::StreamAttempt::Streaming(Box::new(
+            StreamingSelect {
+                iter,
+                table_schema: Arc::new(table_schema),
+                proj,
+                columns,
+                scratch: Vec::new(),
+                cancel,
+            },
+        )))
     }
 
     fn try_collect(
         &self,
-        db: &Database,
+        rtx: &mut ReadTxn<'_>,
         schema: &SchemaManager,
         stmt: &Statement,
         _params: &[Value],
     ) -> Option<Result<QueryResult>> {
         let (lower, table_schema, proj, columns) = stream_scan_setup(schema, stmt)?;
         Some(collect_scan(
-            db,
+            rtx,
             &lower,
             &table_schema,
             &proj,
             columns,
             &self.leaf_cache,
         ))
+    }
+
+    fn can_skip_session_context(&self) -> bool {
+        // The existing memo admission proves independence from temporal and
+        // JSONPath session state, including hidden schema expressions and
+        // interpreter fallbacks. Parameters still use their scoped binding.
+        self.result_cache.is_some()
     }
 
     fn needs_txn_clock(&self) -> bool {
@@ -5277,7 +5264,6 @@ struct StreamingSelect<'db> {
     columns: Vec<String>,
     /// Reused decode buffer for projections that build a separate output row.
     scratch: Vec<Value>,
-    row_count: usize,
     cancel: Option<CancelToken>,
 }
 
@@ -5298,10 +5284,6 @@ impl<'db> super::compile::RowSourceIter for StreamingSelect<'db> {
 
     fn columns(&self) -> &[String] {
         &self.columns
-    }
-
-    fn size_hint(&self) -> usize {
-        self.row_count
     }
 }
 
@@ -5413,14 +5395,13 @@ pub(super) fn try_plain_projection_scan(
 
 /// Materialize a full scan off borrowed page cells (no per-row key/value copy).
 fn collect_scan(
-    db: &Database,
+    rtx: &mut ReadTxn<'_>,
     table_lower: &str,
     table_schema: &TableSchema,
     proj: &StreamProj,
     columns: Vec<String>,
     leaf_cache: &LeafScanCache,
 ) -> Result<QueryResult> {
-    let mut rtx = db.begin_read();
     let cancel = rtx.cancel_token().cloned();
     let cancel = cancel.as_ref();
     let gen = rtx.commit_generation();
@@ -5710,16 +5691,6 @@ fn build_join_plan_static(schema: &SchemaManager, sel: &SelectStmt) -> Option<Jo
     })
 }
 
-fn execute_cached_join(
-    db: &Database,
-    plan: &Arc<JoinPlanStatic>,
-    cache: &parking_lot::RwLock<Option<Arc<CachedJoin>>>,
-    sel: &SelectStmt,
-) -> Result<ExecutionResult> {
-    let mut rtx = db.begin_read();
-    execute_cached_join_with_read(&mut rtx, plan, cache, sel)
-}
-
 fn execute_cached_join_with_read(
     rtx: &mut ReadTxn<'_>,
     plan: &Arc<JoinPlanStatic>,
@@ -5996,15 +5967,6 @@ fn compound_branch_columns(schema: &SchemaManager, body: &QueryBody) -> Option<V
         }
     }
     Some(out)
-}
-
-fn execute_cached_compound(
-    db: &Database,
-    plan: &Arc<CompoundPlanStatic>,
-    cache: &parking_lot::RwLock<Option<Arc<CachedCompound>>>,
-) -> Result<ExecutionResult> {
-    let mut rtx = db.begin_read();
-    execute_cached_compound_with_read(&mut rtx, plan, cache)
 }
 
 fn execute_cached_compound_with_read(
