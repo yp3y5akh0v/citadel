@@ -9,7 +9,7 @@ use citadel_mem::{AtomInput, Embedder, FetchQuery, MemoryEngine, MockEmbedder};
 use citadel_membench::benchmarks::longmemeval::{
     dataset, ingest, prompts, retrieval, run, LmevalConfig,
 };
-use citadel_membench::{BenchConfig, BenchError, Pacer};
+use citadel_membench::{BenchConfig, BenchError, Pacer, QuestionEvent};
 use serde_json::json;
 
 const DIM: usize = 64;
@@ -187,7 +187,7 @@ fn reuse_accepts_exact_corpus_without_reingestion() {
             reuse: true,
             reader_concurrency: 1,
         },
-        &mut |_, _, _| Ok(()),
+        &mut |_| Ok(()),
     )
     .unwrap();
     assert_eq!(output.len(), 2);
@@ -245,7 +245,7 @@ fn reuse_rejects_missing_region_empty_corpus_and_legacy_payload_before_reader_ca
                 reuse: true,
                 reader_concurrency: 1,
             },
-            &mut |_, _, _| panic!("invalid cache must not emit"),
+            &mut |_| panic!("invalid cache must not emit"),
         )
         .unwrap_err();
         assert!(
@@ -288,7 +288,11 @@ fn run_emits_one_hypothesis_per_question_in_order() {
         &*reader,
         &pacer,
         &cfg,
-        &mut |_, qid, hyp| {
+        &mut |event| {
+            let QuestionEvent::Completed(result) = event else {
+                panic!("unexpected failure")
+            };
+            let (qid, hyp) = (&result.question_id, &result.outcome);
             assert!(!hyp.reader_calls.is_empty());
             emitted.push((qid.to_string(), hyp.answer.clone()));
             Ok(())
@@ -342,7 +346,7 @@ fn invalid_configuration_and_session_metadata_fail_before_ingestion() {
             &*reader.client(),
             &Pacer::unbounded(),
             &cfg,
-            &mut |_, _, _| panic!("invalid input must not emit"),
+            &mut |_| panic!("invalid input must not emit"),
         )
         .unwrap_err();
         assert!(
@@ -418,9 +422,163 @@ fn agentic_routes_aggregation_and_direct_questions_explicitly() {
         &*reader,
         &Pacer::unbounded(),
         &cfg,
-        &mut |_, _, _| Ok(()),
+        &mut |_| Ok(()),
     )
     .unwrap();
     assert_eq!(out[0].1, "You mentioned 2 pets.", "agentic two-pass answer");
     assert_eq!(out[1].1, "Rex, a golden retriever.", "single-prompt path");
+}
+
+#[test]
+fn agentic_second_call_failure_is_persisted_with_both_receipts() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = engine(dir.path());
+    let mut samples = dataset::parse_root(&fixture()).unwrap();
+    samples.truncate(1);
+    samples[0].question = "How many pets did I mention?".into();
+    let mut extraction = CompletionResponse::text("[]");
+    extraction.usage = citadel_llm::TokenUsage {
+        input_tokens: 31,
+        output_tokens: 7,
+        cost_usd: Some(0.04),
+    };
+    let reader = testing::capturing(vec![extraction]);
+    let cfg = LmevalConfig {
+        bench: BenchConfig {
+            agentic: true,
+            ..BenchConfig::default()
+        },
+        encrypted: false,
+        reuse: false,
+        reader_concurrency: 1,
+    };
+    let mut journal = Vec::new();
+    let error = run(
+        &eng,
+        &samples,
+        Arc::new(MockEmbedder::new(DIM)),
+        &*reader.client(),
+        &Pacer::unbounded(),
+        &cfg,
+        &mut |event| match event {
+            QuestionEvent::Completed(_) => panic!("second call failed"),
+            QuestionEvent::Failed(failure) => failure.write_json_line(&mut journal),
+        },
+    )
+    .unwrap_err();
+    let BenchError::Questions(batch) = error else {
+        panic!("lost question failure")
+    };
+    let failures = &batch.failures;
+    assert_eq!(failures.len(), 1);
+    let row: serde_json::Value = serde_json::from_slice(&journal).unwrap();
+    assert_eq!(row["identity"]["question_id"], "q_first");
+    assert_eq!(row["calls"].as_array().unwrap().len(), 2);
+    assert_eq!(row["calls"][0]["stage"], "extraction");
+    assert_eq!(row["calls"][0]["attempts"][0]["message"]["content"], "[]");
+    assert_eq!(row["calls"][1]["route"], "empty_enumeration");
+    assert_eq!(row["accounting"]["observed_input_tokens"], 31);
+    assert_eq!(row["accounting"]["unknown_usage_attempts"], 1);
+    assert_eq!(
+        row["accounting"]["estimated_cost_usd"],
+        serde_json::Value::Null
+    );
+    assert_eq!(row, serde_json::to_value(&failures[0]).unwrap());
+}
+
+#[test]
+fn concurrent_failures_are_all_retained_when_failure_observer_also_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = engine(dir.path());
+    let samples = dataset::parse_root(&fixture()).unwrap();
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let reader = citadel_llm::factory::from_fn("mock", move |_| {
+        barrier.wait();
+        Err(citadel_llm::LlmError::Backend("original failure".into()))
+    });
+    let cfg = LmevalConfig {
+        bench: BenchConfig::default(),
+        encrypted: false,
+        reuse: false,
+        reader_concurrency: 2,
+    };
+    let mut ids = Vec::new();
+    let error = run(
+        &eng,
+        &samples,
+        Arc::new(MockEmbedder::new(DIM)),
+        &*reader,
+        &Pacer::unbounded(),
+        &cfg,
+        &mut |event| {
+            let QuestionEvent::Failed(failure) = event else {
+                panic!("unexpected success")
+            };
+            ids.push(
+                serde_json::to_value(&failure.identity).unwrap()["question_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+            );
+            Err(std::io::Error::other("journal unavailable").into())
+        },
+    )
+    .unwrap_err();
+    let BenchError::Questions(batch) = error else {
+        panic!("lost failures")
+    };
+    let failures = &batch.failures;
+    assert_eq!(failures.len(), 2);
+    ids.sort();
+    assert_eq!(ids, ["q_first", "q_second_abs"]);
+    for failure in failures {
+        assert!(failure.source.to_string().contains("original failure"));
+        assert_eq!(failure.calls.len(), 1);
+        assert_eq!(failure.accounting().unknown_usage_attempts, 1);
+        assert_eq!(failure.observer_errors.len(), 1);
+        assert!(failure.observer_errors[0].contains("journal unavailable"));
+    }
+}
+
+#[test]
+fn successful_prediction_receipt_survives_observer_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = engine(dir.path());
+    let mut samples = dataset::parse_root(&fixture()).unwrap();
+    samples.truncate(1);
+    let reader = testing::constant("Rex");
+    let cfg = LmevalConfig {
+        bench: BenchConfig::default(),
+        encrypted: false,
+        reuse: false,
+        reader_concurrency: 1,
+    };
+    let mut journal = Vec::new();
+    let error = run(
+        &eng,
+        &samples,
+        Arc::new(MockEmbedder::new(DIM)),
+        &*reader,
+        &Pacer::unbounded(),
+        &cfg,
+        &mut |event| match event {
+            QuestionEvent::Completed(result) => {
+                assert_eq!(result.outcome.answer, "Rex");
+                Err(std::io::Error::other("prediction write failed").into())
+            }
+            QuestionEvent::Failed(failure) => failure.write_json_line(&mut journal),
+        },
+    )
+    .unwrap_err();
+    let BenchError::Questions(batch) = error else {
+        panic!("lost completed receipt")
+    };
+    let failures = &batch.failures;
+    assert_eq!(failures.len(), 1);
+    let row: serde_json::Value = serde_json::from_slice(&journal).unwrap();
+    assert_eq!(row["stage"], "observer");
+    assert_eq!(row["completed_output"]["answer"], "Rex");
+    assert_eq!(row["calls"].as_array().unwrap().len(), 1);
+    assert_eq!(row["calls"][0]["attempts"][0]["status"], "response");
+    assert_eq!(row["accounting"]["unknown_usage_attempts"], 0);
 }

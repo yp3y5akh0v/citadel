@@ -224,7 +224,7 @@ pub(crate) fn judge_correct_observed(
          and WRONG anywhere in your reply.";
     let user = format!("Question: {question}\nGold answer: {gold}\nGenerated answer: {predicted}");
     let (resp, audit) = complete_judge(judge, pacer, system, &user)?;
-    let correct = judge_label(&resp)?;
+    let correct = judge_label(&resp).map_err(|error| error.with_completion_call(audit.clone()))?;
     Ok(JudgeOutcome::from_response(correct, resp, audit))
 }
 
@@ -251,7 +251,8 @@ pub(crate) fn judge_abstained_observed(
          it fabricates a specific answer.";
     let user = format!("Question: {question}\nPredicted answer: {predicted}");
     let (resp, audit) = complete_judge(judge, pacer, system, &user)?;
-    let abstained = abstention_label(&resp)?;
+    let abstained =
+        abstention_label(&resp).map_err(|error| error.with_completion_call(audit.clone()))?;
     Ok(JudgeOutcome::from_response(abstained, resp, audit))
 }
 

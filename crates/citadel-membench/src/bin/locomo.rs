@@ -14,7 +14,7 @@ use citadel_membench::benchmarks::locomo::config::{RunConfig, RunMode};
 use citadel_membench::core::retrieval::{baseline_recall, validate_embeddings};
 use citadel_membench::{
     aggregate, ingest_sample, provenance, run_sample_observed, turn_content, Category,
-    QuestionResult, Sample,
+    QuestionEvent, QuestionResult, Sample,
 };
 use rustc_hash::FxHashMap;
 
@@ -147,6 +147,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         .ok()
         .map(std::fs::File::create_new)
         .transpose()?;
+    let receipt_path = std::env::var("CITADEL_LOCOMO_AUDIT_PATH")
+        .or_else(|_| std::env::var("CITADEL_LOCOMO_LIVE_TRACE"))
+        .map(|path| format!("{path}.events.jsonl"))
+        .unwrap_or_else(|_| "locomo-events.jsonl".into());
+    let mut receipts = std::fs::File::create_new(&receipt_path)?;
+    eprintln!("question receipts: {receipt_path}");
     let total_q: usize = samples.iter().map(|s| s.qa.len()).sum();
     let mut prog = LiveProgress::new(total_q);
 
@@ -167,7 +173,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             config,
             bench_db.reuse,
             &pacer,
-            &mut |r| prog.observe(r, live_trace.as_mut()),
+            &mut |event| match event {
+                QuestionEvent::Completed(result) => {
+                    prog.observe(result, live_trace.as_mut())?;
+                    result.completion_receipt().write_json_line(&mut receipts)
+                }
+                QuestionEvent::Failed(failure) => failure.write_json_line(&mut receipts),
+            },
         )?;
         results.extend(rs);
     }
@@ -250,6 +262,7 @@ impl LiveProgress {
                 "reader_finish_reasons": r.reader_finish_reasons,
                 "reader_calls": r.reader_calls,
                 "judge": r.judge,
+                "unknown_usage_attempts": r.unknown_usage_attempts,
                 "retrieved": r.retrieved,
                 "retrieved_atom_ids": r.retrieved_atom_ids,
                 "gold_evidence": r.gold_evidence,
@@ -257,6 +270,7 @@ impl LiveProgress {
                 "gold_in_view": r.gold_in_view,
             });
             writeln!(w, "{line}")?;
+            w.flush()?;
         }
 
         // Running table every 25 questions (and on the last).
@@ -927,9 +941,14 @@ fn print_summary(report: &citadel_membench::BenchReport) {
         eprintln!("unscorable (empty gold key): {}", report.unscorable_total);
     }
     eprintln!("recall p95: {} us", report.recall_p95_micros);
-    let cost = report
-        .estimated_cost_usd
-        .map_or_else(|| "unknown".to_string(), |cost| format!("~${cost:.4}"));
+    let cost = match report.estimated_cost_usd {
+        Some(cost) => format!("~${cost:.4}"),
+        None if report.unknown_usage_attempts != 0 => format!(
+            "incomplete ({} attempts with unknown usage)",
+            report.unknown_usage_attempts
+        ),
+        None => "unknown".to_string(),
+    };
     eprintln!(
         "tokens: in {} / out {}  est cost {cost}",
         report.total_input_tokens, report.total_output_tokens
