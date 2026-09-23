@@ -6,8 +6,27 @@ Current date/time functions use the connection's session zone and transaction-st
 `STATEMENT_TIMESTAMP()` is statement-stable and `CLOCK_TIMESTAMP()` reads the wall clock.
 `SET TIME ZONE` accepts IANA names, fixed offsets, numeric hours, intervals, `LOCAL`, and `DEFAULT`.
 
+Set-returning JSON functions work as the primary `FROM` source. Function calls as
+joined sources (`... JOIN function(...)`) return an unsupported-feature error.
+
 `CREATE MATERIALIZED VIEW` requires unique output column names after ASCII case
 folding, with or without data. Use distinct aliases for repeated names.
+
+## Collations and constraints
+
+Text primary keys enforce their declared collation: `NOCASE` ignores ASCII case,
+and `RTRIM` ignores trailing spaces. Foreign-key checks and referential actions
+use the referenced parent columns' collations. Column index keys inherit their
+column's collation unless explicitly overridden, including by `COLLATE BINARY`.
+
+Foreign keys require a primary key or a compatible full unique B-tree index on
+the referenced columns; partial and expression indexes do not qualify. An index
+needed to enforce a constraint cannot be dropped without a suitable replacement.
+
+When an older schema lacks required constraint-index definitions, `Connection::open`
+adds them and builds their indexes atomically. Existing primary keys that collide
+under their declared collation cause an error, with no partial upgrade committed.
+A declared index whose storage is missing returns an error.
 
 ## Storage and metadata limits
 
@@ -30,6 +49,16 @@ materializing or comparing borrowed values.
 A failed mutating statement can leave an explicit transaction requiring rollback
 if it already changed storage. Restore a preceding savepoint or roll back the
 transaction before continuing.
+
+## Rust AST
+
+`parser::Expr::BoundColumn { value, collation }` preserves a bound value's
+collation during execution. SQL parsing does not emit this variant, and schema
+expressions cannot store it.
+
+`parser::CreateIndexStmt.collations` is `Vec<Option<Collation>>`. Use `None` to
+inherit a column's collation and `Some(...)` for an explicit override when
+constructing an AST.
 
 This crate is part of the Citadel workspace. Depend on the main [`citadeldb`](https://crates.io/crates/citadeldb) crate instead.
 

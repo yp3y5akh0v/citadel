@@ -15,7 +15,10 @@ crates.io.
 Build the runners with `cargo build --release -p citadeldb-membench --features openai,candle-embed --bins --locked`.
 Use `cuda-embed` instead of `candle-embed` for CUDA execution.
 
-[run.ps1](run.ps1) launches the native benchmark binaries and writes to a new run directory.
+[run.ps1](run.ps1) requires PowerShell 7 or later, launches the native benchmark
+binaries, and writes to a new run directory. Progress appears live on stderr and
+in `run.log`; stdout is saved separately. LongMemEval reports region ingestion
+or reuse progress and elapsed embedding time separately from other preparation work.
 LoCoMo scored runs produce a report and per-question audits:
 
 ```powershell
@@ -38,12 +41,44 @@ embedder, fusion, reranker and encryption mode. They validate reused corpora and
 record the memories rendered into reader requests. Missing model prices are
 reported as unknown. Hosted calls require the selected providers' credentials.
 
+## Temporal context
+
+Add `-TemporalGlosses` to a scored run to enable `conservative-session-v2`
+(default: off). The renderer appends calendar dates to supported English relative
+expressions using the source session date: for example, `Yesterday (5 October
+2022)` in a session dated 6 October 2022. It preserves the original dialogue,
+speaker attribution and image metadata; stored text and retrieval are unchanged.
+
+The policy handles literal day references, last/this/next month or year, and
+counted days/weeks/months/years ago. Weeks ago use an approximate date (`around`);
+months and years retain that precision. Ambiguous periods such as `last week`
+and `this weekend` remain unchanged. It skips quoted text, code and expressions
+after a recognized date anchor in the same sentence. Supported expressions are
+assumed to refer to their session; these lexical checks do not resolve every
+narrative or reported-speech anchor. The flag and policy are recorded in the run audits.
+
+## Requests and failure records
+
+Reader and judge requests use temperature 0 and seed 1. The seed is part of
+request identity; hosted outputs can still vary between runs. Audits record
+request hashes, rendered atom IDs, finish reasons and individual attempts.
+With `-Agentic`, invalid or truncated extraction output fails explicitly;
+only the protocol's `NOT_ENUMERATION` response selects the ordinary reader.
+
+The launcher writes question completion and failure records to
+`audit.json.events.jsonl` for LoCoMo and `hypotheses.jsonl.events.jsonl` for
+LongMemEval. A failed run exits nonzero and retains completed questions and
+available call records. Missing usage remains unknown; reported token totals
+and estimated costs are not billing receipts. A later failure event for the
+same question replaces its earlier completion event for accounting.
+
 ## Verification
 
 ```powershell
 cargo test -p citadeldb-membench --locked
 cargo test -p citadeldb-membench --features openai,candle-embed --all-targets --locked
 pwsh -File crates/citadel-membench/tests/launcher.ps1
+pwsh -File crates/citadel-membench/tests/launcher-progress.ps1
 pwsh -File crates/citadel-membench/tests/audit-scripts.ps1
 ```
 
