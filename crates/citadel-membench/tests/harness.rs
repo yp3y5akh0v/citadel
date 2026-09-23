@@ -745,11 +745,11 @@ fn judge_rejects_abnormal_completions_even_with_valid_labels() {
     ] {
         let mut response = CompletionResponse::text("CORRECT");
         response.finish_reason = finish_reason;
-        response.usage = TokenUsage {
+        response.usage = Some(TokenUsage {
             input_tokens: 12,
             output_tokens: 3,
             cost_usd: Some(0.01),
-        };
+        });
         let expected_usage = response.usage;
         for abstention in [false, true] {
             let judge = testing::scripted(vec![response.clone()]);
@@ -848,19 +848,19 @@ fn run_sample_preserves_reader_and_judge_completion_audit() {
     let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::new(DIM));
     let mut reader_response = CompletionResponse::text("partial answer");
     reader_response.finish_reason = FinishReason::Length;
-    reader_response.usage = TokenUsage {
+    reader_response.usage = Some(TokenUsage {
         input_tokens: 100,
         output_tokens: 20,
         cost_usd: None,
-    };
+    });
     let reader = citadel_llm::factory::from_fn("gpt-4o", move |_| Ok(reader_response.clone()));
     let raw_judge = "The answer is incomplete.\n{\"label\":\"WRONG\"}";
     let mut judge_response = CompletionResponse::text(raw_judge);
-    judge_response.usage = TokenUsage {
+    judge_response.usage = Some(TokenUsage {
         input_tokens: 12,
         output_tokens: 7,
         cost_usd: Some(0.01),
-    };
+    });
     let judge = citadel_llm::factory::from_fn("gpt-4o-mini", move |_| Ok(judge_response.clone()));
 
     let results = run_sample(
@@ -1080,11 +1080,11 @@ fn agentic_invalid_extraction_stops_without_judge_and_retains_receipt() {
         let (_dir, eng) = open_engine();
         let mut extraction = CompletionResponse::text(text);
         extraction.finish_reason = finish;
-        extraction.usage = TokenUsage {
+        extraction.usage = Some(TokenUsage {
             input_tokens: 17,
             output_tokens: 4,
             cost_usd: Some(0.03),
-        };
+        });
         let usage = extraction.usage;
         let reader = testing::capturing(vec![extraction]);
         let judge = testing::capturing(vec![]);
@@ -1106,7 +1106,7 @@ fn agentic_invalid_extraction_stops_without_judge_and_retains_receipt() {
         assert!(judge.requests().is_empty());
         assert_eq!(failure.completed_calls.len(), 1);
         assert_eq!(failure.completed_calls[0].finish_reason, finish.into());
-        assert_eq!(failure.completed_calls[0].call.usage, Some(usage));
+        assert_eq!(failure.completed_calls[0].call.usage, usage);
         assert_eq!(failure.completed_calls[0].call.request_sha256.len(), 64);
     }
 }
@@ -1123,11 +1123,11 @@ fn agentic_second_call_failure_preserves_extraction_and_unknown_failed_usage() {
         sample.qa[0].question = "How many dogs did Alice adopt?".into();
         let (_dir, eng) = open_engine();
         let mut extraction = CompletionResponse::text(text);
-        extraction.usage = TokenUsage {
+        extraction.usage = Some(TokenUsage {
             input_tokens: 31,
             output_tokens: 7,
             cost_usd: Some(0.04),
-        };
+        });
         let usage = extraction.usage;
         let reader = testing::capturing(vec![extraction]); // Second request is recorded, then mock errors.
         let judge = testing::capturing(vec![]);
@@ -1153,7 +1153,7 @@ fn agentic_second_call_failure_preserves_extraction_and_unknown_failed_usage() {
         assert!(judge.requests().is_empty());
         assert_eq!(failure.completed_calls.len(), 1);
         let completed = &failure.completed_calls[0].call;
-        assert_eq!(completed.usage, Some(usage));
+        assert_eq!(completed.usage, usage);
         let BenchError::Completion(failed) = *failure.source else {
             panic!("failed call receipt")
         };
@@ -1198,11 +1198,11 @@ fn agentic_stop_with_tool_payload_and_normalized_total_failure_keep_extraction_r
     });
     for mut extraction in [tools, CompletionResponse::text(text)] {
         assert_eq!(extraction.finish_reason, FinishReason::Stop);
-        extraction.usage = TokenUsage {
+        extraction.usage = Some(TokenUsage {
             input_tokens: 23,
             output_tokens: 9,
             cost_usd: Some(0.05),
-        };
+        });
         let usage = extraction.usage;
         let has_tools = !extraction.message.tool_calls.is_empty();
         let mut sample = parse_root(&fixture()).unwrap().remove(0);
@@ -1226,7 +1226,7 @@ fn agentic_stop_with_tool_payload_and_normalized_total_failure_keep_extraction_r
             panic!("expected typed reader failure")
         };
         assert_eq!(failure.completed_calls.len(), 1);
-        assert_eq!(failure.completed_calls[0].call.usage, Some(usage));
+        assert_eq!(failure.completed_calls[0].call.usage, usage);
         assert_eq!(reader.requests().len(), 1);
         assert!(judge.requests().is_empty());
         if has_tools {
@@ -1603,11 +1603,11 @@ fn failed_judges_persist_prior_reader_and_their_own_receipts() {
         sample.qa.truncate(1);
         let (_dir, eng) = open_engine();
         let mut response = CompletionResponse::text("Rex");
-        response.usage = TokenUsage {
+        response.usage = Some(TokenUsage {
             input_tokens: 11,
             output_tokens: 3,
             cost_usd: Some(0.02),
-        };
+        });
         let reader = testing::scripted(vec![response]);
         let judge = citadel_llm::factory::from_fn("gpt-4o-mini", move |_| match mode {
             "backend" => Err(LlmError::Backend("malformed provider body".into())),
@@ -1647,11 +1647,11 @@ fn failed_judges_persist_prior_reader_and_their_own_receipts() {
         assert_eq!(row["accounting"]["observed_input_tokens"], 11);
         assert_eq!(
             row["accounting"]["unknown_usage_attempts"],
-            if mode == "backend" { 1 } else { 0 }
+            if mode == "unsupported" { 0 } else { 1 }
         );
         assert_eq!(
             row["accounting"]["estimated_cost_usd"].is_null(),
-            mode == "backend"
+            mode != "unsupported"
         );
         if mode == "invalid" {
             assert_eq!(row["failure_detail"]["response"], "INCORRECT");
@@ -1738,16 +1738,22 @@ fn multi_call_accounting_preserves_wide_tokens_and_rejects_cost_overflow() {
         .into_iter()
         .map(|text| {
             let mut response = CompletionResponse::text(text);
-            response.usage = TokenUsage {
+            response.usage = Some(TokenUsage {
                 input_tokens: u32::MAX,
                 output_tokens: u32::MAX,
                 cost_usd: Some(1e308),
-            };
+            });
             response
         })
         .collect();
     let reader = testing::scripted(replies);
-    let judge = testing::constant("CORRECT");
+    let mut judge_response = CompletionResponse::text("CORRECT");
+    judge_response.usage = Some(TokenUsage {
+        input_tokens: 0,
+        output_tokens: 0,
+        cost_usd: Some(0.0),
+    });
+    let judge = testing::scripted(vec![judge_response]);
     let results = run_sample(
         &eng,
         &sample,
@@ -1765,6 +1771,116 @@ fn multi_call_accounting_preserves_wide_tokens_and_rejects_cost_overflow() {
     assert_eq!(results[0].cost_usd, None);
     assert_eq!(results[0].unknown_usage_attempts, 0);
     assert_eq!(aggregate(&results, prov()).estimated_cost_usd, None);
+}
+
+#[test]
+fn successful_reader_and_judge_preserve_unknown_usage_without_changing_score() {
+    for known in [false, true] {
+        let mut sample = parse_root(&fixture()).unwrap().remove(0);
+        sample.qa.truncate(1);
+        let (_dir, eng) = open_engine();
+        let usage = known.then_some(TokenUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cost_usd: Some(0.0),
+        });
+        let mut reader_response = CompletionResponse::text("Rex");
+        reader_response.usage = usage;
+        let mut judge_response = CompletionResponse::text("CORRECT");
+        judge_response.usage = usage;
+        let reader = testing::scripted(vec![reader_response]);
+        let judge = testing::scripted(vec![judge_response]);
+        let results = run_sample(
+            &eng,
+            &sample,
+            Arc::new(MockEmbedder::new(DIM)),
+            &*reader,
+            &*judge,
+            BenchConfig::default(),
+        )
+        .unwrap();
+        let result = &results[0];
+        assert_eq!(result.predicted, "Rex");
+        assert!(result.correct);
+        assert_eq!(result.input_tokens, 0);
+        assert_eq!(result.output_tokens, 0);
+        assert_eq!(result.unknown_usage_attempts, if known { 0 } else { 2 });
+        assert_eq!(result.cost_usd, known.then_some(0.0));
+        let receipt = serde_json::to_value(result.completion_receipt()).unwrap();
+        assert_eq!(receipt["completed_output"]["judge"]["response"], "CORRECT");
+        assert_eq!(
+            receipt["completed_output"]["judge"]["usage"].is_null(),
+            !known
+        );
+        for call in receipt["calls"].as_array().unwrap() {
+            assert_eq!(call["usage"].is_null(), !known);
+            assert_eq!(call["attempts"][0]["usage"].is_null(), !known);
+        }
+        let report = aggregate(&results, prov());
+        assert_eq!(report.overall_correct, 1);
+        assert_eq!(report.estimated_cost_usd, known.then_some(0.0));
+        assert_eq!(report.unknown_usage_attempts, if known { 0 } else { 2 });
+    }
+}
+
+#[test]
+fn agentic_accounting_keeps_known_tokens_when_either_response_has_unknown_usage() {
+    for extraction_known in [false, true] {
+        let mut sample = parse_root(&fixture()).unwrap().remove(0);
+        sample.qa.truncate(1);
+        sample.qa[0].question = "How many pets were mentioned?".into();
+        let (_dir, eng) = open_engine();
+        let replies = ["[]", "Cannot determine"]
+            .into_iter()
+            .enumerate()
+            .map(|(i, text)| {
+                let mut response = CompletionResponse::text(text);
+                if (i == 0) == extraction_known {
+                    response.usage = Some(TokenUsage {
+                        input_tokens: 31,
+                        output_tokens: 7,
+                        cost_usd: Some(0.04),
+                    });
+                }
+                response
+            })
+            .collect();
+        let reader = testing::scripted(replies);
+        let mut judge_response = CompletionResponse::text("CORRECT");
+        judge_response.usage = Some(TokenUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cost_usd: Some(0.0),
+        });
+        let judge = testing::scripted(vec![judge_response]);
+        let results = run_sample(
+            &eng,
+            &sample,
+            Arc::new(MockEmbedder::new(DIM)),
+            &*reader,
+            &*judge,
+            BenchConfig {
+                agentic: true,
+                ..BenchConfig::default()
+            },
+        )
+        .unwrap();
+        let result = &results[0];
+        assert_eq!(result.predicted, "Cannot determine");
+        assert!(result.correct);
+        assert_eq!(result.input_tokens, 31);
+        assert_eq!(result.output_tokens, 7);
+        assert_eq!(result.unknown_usage_attempts, 1);
+        assert_eq!(result.cost_usd, None);
+        let receipt = serde_json::to_value(result.completion_receipt()).unwrap();
+        let calls = receipt["calls"].as_array().unwrap();
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0]["stage"], "extraction");
+        assert_eq!(calls[1]["route"], "empty_enumeration");
+        assert_eq!(calls[0]["attempts"][0]["message"]["content"], "[]");
+        assert_eq!(calls[0]["usage"].is_null(), !extraction_known);
+        assert_eq!(calls[1]["usage"].is_null(), extraction_known);
+    }
 }
 
 #[test]
@@ -1790,11 +1906,11 @@ fn a_partial_journal_success_does_not_duplicate_batch_spend() {
     sample.qa.truncate(1);
     let (_dir, eng) = open_engine();
     let mut response = CompletionResponse::text("Rex");
-    response.usage = TokenUsage {
+    response.usage = Some(TokenUsage {
         input_tokens: 13,
         output_tokens: 2,
         cost_usd: Some(0.01),
-    };
+    });
     let reader = testing::scripted(vec![response]);
     let judge = testing::constant("CORRECT");
     let mut journal = FlushOnce {

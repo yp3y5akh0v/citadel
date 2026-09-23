@@ -9,7 +9,7 @@ use citadel_llm::{
 };
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyBool, PyDict, PyInt};
 use pyo3::IntoPyObjectExt;
 use serde_json::Value as Json;
 
@@ -124,11 +124,15 @@ pub(crate) fn response_to_py(py: Python<'_>, resp: &CompletionResponse) -> PyRes
         "tool_calls",
         tool_calls_to_py(py, &resp.message.tool_calls)?,
     )?;
-    let usage = PyDict::new(py);
-    usage.set_item("input_tokens", resp.usage.input_tokens)?;
-    usage.set_item("output_tokens", resp.usage.output_tokens)?;
-    usage.set_item("cost_usd", resp.usage.cost_usd)?;
-    d.set_item("usage", usage)?;
+    if let Some(reported) = resp.usage {
+        let usage = PyDict::new(py);
+        usage.set_item("input_tokens", reported.input_tokens)?;
+        usage.set_item("output_tokens", reported.output_tokens)?;
+        usage.set_item("cost_usd", reported.cost_usd)?;
+        d.set_item("usage", usage)?;
+    } else {
+        d.set_item("usage", py.None())?;
+    }
     d.set_item("finish_reason", finish_reason_str(resp.finish_reason))?;
     d.into_py_any(py)
 }
@@ -249,20 +253,29 @@ fn tool_choice_from_py(obj: &Bound<'_, PyAny>) -> PyResult<ToolChoice> {
     ))
 }
 
-fn usage_from_py(obj: &Bound<'_, PyAny>) -> PyResult<TokenUsage> {
-    let d = as_dict(obj, "usage")?;
-    Ok(TokenUsage {
-        input_tokens: dict_item(&d, "input_tokens")?
-            .map(|v| v.extract())
-            .transpose()?
-            .unwrap_or(0),
-        output_tokens: dict_item(&d, "output_tokens")?
-            .map(|v| v.extract())
-            .transpose()?
-            .unwrap_or(0),
-        cost_usd: dict_item(&d, "cost_usd")?
-            .map(|v| v.extract())
-            .transpose()?,
+fn usage_from_py(obj: &Bound<'_, PyAny>) -> Option<TokenUsage> {
+    let d = obj.cast::<PyDict>().ok()?;
+    let counter = |name: &str| -> Option<u32> {
+        let value = d.get_item(name).ok()??;
+        // Python bool is an int subclass; it is not a token count.
+        if value.is_instance_of::<PyBool>() || !value.is_instance_of::<PyInt>() {
+            return None;
+        }
+        value.extract().ok()
+    };
+    let cost_usd = d.get_item("cost_usd").ok().flatten().and_then(|value| {
+        if value.is_instance_of::<PyBool>() {
+            return None;
+        }
+        value
+            .extract::<f64>()
+            .ok()
+            .filter(|cost| cost.is_finite() && *cost >= 0.0)
+    });
+    Some(TokenUsage {
+        input_tokens: counter("input_tokens")?,
+        output_tokens: counter("output_tokens")?,
+        cost_usd,
     })
 }
 
@@ -302,10 +315,7 @@ fn response_from_py(obj: &Bound<'_, PyAny>) -> PyResult<CompletionResponse> {
     let d = as_dict(obj, "complete() result (str or dict)")?;
     let content = msg_content(&d)?;
     let tool_calls = tool_calls_from_py(&d)?;
-    let usage = match dict_item(&d, "usage")? {
-        Some(v) => usage_from_py(&v)?,
-        None => TokenUsage::default(),
-    };
+    let usage = dict_item(&d, "usage")?.and_then(|value| usage_from_py(&value));
     let finish_reason = match dict_item(&d, "finish_reason")? {
         Some(v) => parse_finish_reason(&v.extract::<String>()?)?,
         None if tool_calls.is_empty() => FinishReason::Stop,
@@ -544,4 +554,97 @@ pub(crate) fn build_llm(obj: &Bound<'_, PyAny>) -> PyResult<Arc<dyn LLMClient>> 
         return Ok(Arc::clone(&handle.inner));
     }
     Ok(Arc::new(PyLlmCallback::from_object(obj)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn unavailable_python_usage_keeps_the_completed_answer() {
+        Python::initialize();
+        Python::attach(|py| {
+            let invalid = [
+                Json::Null,
+                json!([]),
+                json!({}),
+                json!({"input_tokens": 3}),
+                json!({"output_tokens": 2}),
+                json!({"input_tokens": -1, "output_tokens": 2}),
+                json!({"input_tokens": "3", "output_tokens": 2}),
+                json!({"input_tokens": 3, "output_tokens": 2.0}),
+                json!({"input_tokens": true, "output_tokens": 2}),
+                json!({"input_tokens": 4294967296_u64, "output_tokens": 2}),
+            ];
+            for usage in std::iter::once(None).chain(invalid.into_iter().map(Some)) {
+                let mut value = json!({"content": "retained", "finish_reason": "length"});
+                if let Some(usage) = usage {
+                    value["usage"] = usage;
+                }
+                let input = json_to_py(py, &value).unwrap();
+                let response = response_from_py(input.bind(py)).unwrap();
+                assert_eq!(response.message.content, "retained");
+                assert_eq!(response.finish_reason, FinishReason::Length);
+                assert_eq!(response.usage, None, "{value}");
+                let output = response_to_py(py, &response).unwrap();
+                let output = output.bind(py).cast::<PyDict>().unwrap();
+                assert!(output.get_item("usage").unwrap().unwrap().is_none());
+            }
+            let bare = "retained".into_py_any(py).unwrap();
+            assert_eq!(response_from_py(bare.bind(py)).unwrap().usage, None);
+        });
+    }
+
+    #[test]
+    fn reported_python_usage_round_trips_zero_and_unpriced_counts() {
+        Python::initialize();
+        Python::attach(|py| {
+            for usage in [
+                TokenUsage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cost_usd: Some(0.0),
+                },
+                TokenUsage {
+                    input_tokens: 12,
+                    output_tokens: 4,
+                    cost_usd: None,
+                },
+                TokenUsage {
+                    input_tokens: u32::MAX,
+                    output_tokens: u32::MAX,
+                    cost_usd: Some(0.25),
+                },
+            ] {
+                let mut response = CompletionResponse::text("retained");
+                response.usage = Some(usage);
+                let output = response_to_py(py, &response).unwrap();
+                let restored = response_from_py(output.bind(py)).unwrap();
+                assert_eq!(restored.usage, Some(usage));
+                assert_eq!(restored.message.content, "retained");
+            }
+        });
+    }
+
+    #[test]
+    fn invalid_python_price_does_not_erase_reported_counters() {
+        Python::initialize();
+        Python::attach(|py| {
+            for cost in [f64::NAN, f64::INFINITY, -0.1] {
+                let usage = PyDict::new(py);
+                usage.set_item("input_tokens", 12).unwrap();
+                usage.set_item("output_tokens", 4).unwrap();
+                usage.set_item("cost_usd", cost).unwrap();
+                assert_eq!(
+                    usage_from_py(usage.as_any()),
+                    Some(TokenUsage {
+                        input_tokens: 12,
+                        output_tokens: 4,
+                        cost_usd: None,
+                    })
+                );
+            }
+        });
+    }
 }

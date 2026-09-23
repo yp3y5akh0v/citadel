@@ -228,7 +228,7 @@ pub enum FinishReason {
 pub struct TokenUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
-    /// Set by backends with known pricing; `None` for local models.
+    /// Estimated cost when pricing is available; `None` for local or unpriced models.
     pub cost_usd: Option<f64>,
 }
 
@@ -247,7 +247,10 @@ impl TokenUsage {
 #[derive(Debug, Clone)]
 pub struct CompletionResponse {
     pub message: AssistantMessage,
-    pub usage: TokenUsage,
+    /// Provider-reported counters, when complete and valid. `None` means usage
+    /// is unavailable; an explicitly reported zero is `Some(TokenUsage { .. })`.
+    /// Pricing availability is separate and is represented by `cost_usd`.
+    pub usage: Option<TokenUsage>,
     pub finish_reason: FinishReason,
 }
 
@@ -334,7 +337,7 @@ impl CompletionResponse {
                 content: content.into(),
                 tool_calls: Vec::new(),
             },
-            usage: TokenUsage::default(),
+            usage: None,
             finish_reason: FinishReason::Stop,
         }
     }
@@ -346,7 +349,7 @@ impl CompletionResponse {
                 content: String::new(),
                 tool_calls: calls,
             },
-            usage: TokenUsage::default(),
+            usage: None,
             finish_reason: FinishReason::ToolUse,
         }
     }
@@ -550,6 +553,12 @@ mod canonical_tests {
 #[cfg(test)]
 mod error_tests {
     use super::*;
+
+    #[test]
+    fn response_constructors_do_not_invent_usage() {
+        assert_eq!(CompletionResponse::text("answer").usage, None);
+        assert_eq!(CompletionResponse::tool_calls(Vec::new()).usage, None);
+    }
 
     #[test]
     fn classifies_retryable_errors() {

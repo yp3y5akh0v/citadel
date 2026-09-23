@@ -63,7 +63,7 @@ pub enum QuestionStage {
 
 #[derive(Debug, serde::Serialize)]
 pub struct UsageAccounting {
-    /// Response usage reported by LLMClient, whose API does not expose upstream field presence.
+    /// Known response token counts; incomplete when any attempt has unknown usage.
     pub observed_input_tokens: u64,
     pub observed_output_tokens: u64,
     pub unknown_usage_attempts: u64,
@@ -301,7 +301,7 @@ pub enum BenchError {
         reason: &'static str,
         response: String,
         finish_reason: FinishReason,
-        usage: TokenUsage,
+        usage: Option<TokenUsage>,
         call: Option<Box<CompletionCallAudit>>,
     },
     #[error(transparent)]

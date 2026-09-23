@@ -6,6 +6,15 @@ import citadeldb
 from citadeldb import agent as ag
 
 
+def _reported_reply(content):
+    # These deterministic in-process replies have measured zero provider usage.
+    return {
+        "content": content,
+        "finish_reason": "stop",
+        "usage": {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0},
+    }
+
+
 class ScriptLLM:
     """Deterministic LLM callback that records requests and replies with plain text."""
 
@@ -16,7 +25,7 @@ class ScriptLLM:
 
     def complete(self, request):
         self.calls.append(request)
-        return {"content": "Done.", "finish_reason": "stop"}
+        return _reported_reply("Done.")
 
 
 def _region(name="agent", dim=64):
@@ -39,6 +48,7 @@ def test_mock_client_completes():
     out = llm.complete({"messages": [{"role": "user", "content": "hi"}]})
     assert isinstance(out, dict)
     assert "content" in out and "finish_reason" in out
+    assert out["usage"] is None
 
 
 def test_unknown_provider_errors():
@@ -243,6 +253,65 @@ def test_prompt_library_override():
 # ---- the agent loop --------------------------------------------------------
 
 
+@pytest.mark.parametrize("cost_cap", [-1.0, float("nan"), float("inf"), -float("inf")])
+def test_invalid_cost_limit_stops_before_a_callback(cost_cap):
+    mem = _region("invalid-cost")
+    llm = ScriptLLM()
+    agent = citadeldb.Agent(
+        mem, "invalid-cost", llm, budget=ag.AgentBudget(max_cost_usd=cost_cap)
+    )
+    report = agent.run("Say hello")
+    assert report.terminated_by == "invalid_cost_limit"
+    assert report.budget_exceeded is None
+    assert llm.calls == []
+
+
+def test_zero_cost_limit_is_a_valid_cap():
+    mem = _region("zero-cost")
+    llm = ScriptLLM()
+    agent = citadeldb.Agent(
+        mem, "zero-cost", llm, budget=ag.AgentBudget(max_cost_usd=0.0)
+    )
+    report = agent.run("Say hello")
+    assert report.terminated_by == "budget_exceeded"
+    assert report.budget_exceeded == "cost"
+    assert llm.calls == []
+
+
+@pytest.mark.parametrize(
+    "usage, cost_cap, expected",
+    [
+        (None, None, "token_usage_unavailable"),
+        ({"input_tokens": 3, "output_tokens": 1, "cost_usd": None}, 1.0,
+         "cost_usage_unavailable"),
+    ],
+)
+def test_unavailable_usage_stops_after_preserving_the_response(usage, cost_cap, expected):
+    mem = _region("unavailable")
+
+    class LLM:
+        model_id = "unreported"
+
+        def __init__(self):
+            self.calls = 0
+
+        def complete(self, request):
+            self.calls += 1
+            return {"content": "retained answer", "finish_reason": "stop", "usage": usage}
+
+    llm = LLM()
+    agent = citadeldb.Agent(
+        mem, "unavailable", llm,
+        budget=ag.AgentBudget(max_steps=4, max_cost_usd=cost_cap),
+    )
+    report = agent.run("Say hello")
+    assert report.terminated_by == expected
+    assert llm.calls == 1
+    traces = agent.graph().load_llm_traces()
+    assert len(traces) == 1
+    assert traces[0][1]["content"] == "retained answer"
+
+
 def test_agent_run_invokes_callback_and_reports():
     mem = _region("a")
     llm = ScriptLLM()
@@ -326,7 +395,7 @@ def test_python_proposal_operator_drives_discovery():
 
         def complete(self, request):
             assert "messages" in request
-            return {"content": '{"value": 7}', "finish_reason": "stop"}
+            return _reported_reply('{"value": 7}')
 
     class MyProposer:
         def __init__(self):
@@ -378,7 +447,7 @@ def test_completer_is_poisoned_after_propose():
         model_id = "x"
 
         def complete(self, request):
-            return {"content": "{}", "finish_reason": "stop"}
+            return _reported_reply("{}")
 
     cfg = ag.AgentConfig()
     cfg.set_proposal_operator(StashingProposer())
@@ -414,7 +483,7 @@ def test_python_operator_multi_call_and_multi_candidate():
 
         def complete(self, request):
             self.calls += 1
-            return {"content": '{"x": %d}' % self.calls, "finish_reason": "stop"}
+            return _reported_reply('{"x": %d}' % self.calls)
 
     llm = LLM()
 
@@ -452,7 +521,7 @@ def test_python_operator_exception_propagates():
         model_id = "m"
 
         def complete(self, request):
-            return {"content": "{}", "finish_reason": "stop"}
+            return _reported_reply("{}")
 
     class BadProposer:
         def propose(self, ctx, channel):

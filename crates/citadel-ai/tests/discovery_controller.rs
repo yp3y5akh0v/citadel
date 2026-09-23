@@ -7,15 +7,25 @@ use std::sync::Arc;
 
 use citadel::{Argon2Profile, DatabaseBuilder};
 use citadel_ai::{
-    Agent, AgentBudget, AgentConfig, AgentResult, BeliefGraph, Candidate, CheckerAttestation,
-    Completer, DiscoveryGoal, DiscoveryReport, Goal, ProposalContext, ProposalOperator,
-    ProposeError, RejectedCandidate, ScoredOutcome, TerminatedBy, ToolRegistry, VerifiedKind,
-    Verifier, VerifyError, VerifyOutcome, VerifyRequest,
+    Agent, AgentBudget, AgentConfig, AgentResult, BeliefGraph, BudgetUnavailable, Candidate,
+    CheckerAttestation, Completer, DiscoveryGoal, DiscoveryReport, Goal, ProposalContext,
+    ProposalOperator, ProposeError, RejectedCandidate, ScoredOutcome, TerminatedBy, ToolRegistry,
+    VerifiedKind, Verifier, VerifyError, VerifyOutcome, VerifyRequest,
 };
 use citadel_llm::testing;
-use citadel_llm::{CompletionRequest, CompletionResponse, LlmError, Message};
+use citadel_llm::{CompletionRequest, CompletionResponse, LlmError, Message, TokenUsage};
 use citadel_mem::{MemoryEngine, MockEmbedder};
 use serde_json::json;
+
+fn measured_response(cost_usd: Option<f64>) -> CompletionResponse {
+    let mut response = CompletionResponse::text("{}");
+    response.usage = Some(TokenUsage {
+        input_tokens: 0,
+        output_tokens: 0,
+        cost_usd,
+    });
+    response
+}
 
 /// Accepts every artifact at a fixed score and attests, so it may mint. Carries
 /// no problem semantics - the controller never sees a concrete domain.
@@ -265,7 +275,7 @@ fn proposer_multi_call_is_fully_traced_and_still_mints() {
         ..Default::default()
     };
     let agent = Agent::new(
-        testing::scripted(vec![CompletionResponse::text("{}"); 20]),
+        testing::scripted(vec![measured_response(Some(0.0)); 20]),
         graph,
         ToolRegistry::new(),
         AgentBudget::default(),
@@ -337,7 +347,7 @@ fn discovery_cost_cap_fails_closed_on_the_first_unpriced_call() {
         ..Default::default()
     };
     let agent = Agent::new(
-        testing::scripted(vec![CompletionResponse::text("{}"); 4]),
+        testing::scripted(vec![measured_response(None); 4]),
         graph,
         ToolRegistry::new(),
         budget,
@@ -351,10 +361,17 @@ fn discovery_cost_cap_fails_closed_on_the_first_unpriced_call() {
         max_idle_rounds: 1,
         max_mints: 1,
     });
-    assert!(
-        result.is_err(),
-        "an unpriced response under a cost cap fails closed"
+    assert_eq!(
+        result.unwrap().terminated_by,
+        TerminatedBy::BudgetUnavailable(BudgetUnavailable::Cost),
     );
+    let traces = agent.graph().load_llm_traces().unwrap();
+    assert_eq!(
+        traces.len(),
+        1,
+        "the unpriced completion is retained before stopping"
+    );
+    assert_eq!(traces[0].1["content"], json!("{}"));
     assert_eq!(
         calls.load(Ordering::Relaxed),
         1,
@@ -402,11 +419,9 @@ fn run_with_proposer<P: ProposalOperator + 'static>(
 
 #[test]
 fn transient_proposer_llm_failure_is_idle_not_fatal() {
-    // An operator that returns a retryable error directly (its LLM channel exhausted).
-    // retry_complete already waits out a real transient, so reaching here means the
-    // proposer cannot produce; the run must not abort. Each such round folds into the
-    // idle path and a broken proposer converges to Incomplete (nothing minted) after
-    // max_idle_rounds.
+    // The operator synthesizes a retryable error without dispatching its channel.
+    // These empty rounds follow the idle path until max_idle_rounds; an actual
+    // channel failure instead records unknown spend and stops the token budget.
     struct UnreachableProposer;
     impl ProposalOperator for UnreachableProposer {
         fn propose(
