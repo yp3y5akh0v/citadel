@@ -93,6 +93,7 @@ impl RunConfig {
                 top_k: number(&get, "CITADEL_LONGMEMEVAL_TOP_K", 50, 1)?,
                 reader_order: ReaderOrder::Relevance,
                 neighbor_radius: number(&get, "CITADEL_LONGMEMEVAL_NEIGHBOR_RADIUS", 0, 0)?,
+                temporal_glosses: boolean(&get, "CITADEL_LONGMEMEVAL_TEMPORAL_GLOSSES", false)?,
                 reader_max_tokens: u32::try_from(max_tokens)
                     .map_err(|_| invalid("CITADEL_MEMBENCH_MAX_TOKENS", "a positive u32"))?,
                 agentic: boolean(&get, "CITADEL_LONGMEMEVAL_AGENTIC", false)?,
@@ -119,6 +120,11 @@ impl RunConfig {
         if mode != RunMode::Scored && config.bench.agentic {
             return Err(BenchError::Dataset(
                 "CITADEL_LONGMEMEVAL_AGENTIC requires scored mode".into(),
+            ));
+        }
+        if mode != RunMode::Scored && config.bench.temporal_glosses {
+            return Err(BenchError::Dataset(
+                "CITADEL_LONGMEMEVAL_TEMPORAL_GLOSSES requires scored mode".into(),
             ));
         }
         if mode == RunMode::RetrievalDiag && config.bench.neighbor_radius != 0 {
@@ -148,6 +154,7 @@ mod tests {
         assert_eq!(c.embedder, EmbedderModel::E5Large);
         assert_eq!(c.bench.reader_max_tokens, 800);
         assert!(!c.bench.agentic);
+        assert!(!c.bench.temporal_glosses);
     }
 
     #[test]
@@ -160,6 +167,7 @@ mod tests {
             ("CITADEL_LONGMEMEVAL_EMBEDDER", "bad"),
             ("CITADEL_LONGMEMEVAL_ENCRYPTED", "maybe"),
             ("CITADEL_LONGMEMEVAL_AGENTIC", "maybe"),
+            ("CITADEL_LONGMEMEVAL_TEMPORAL_GLOSSES", "maybe"),
             ("CITADEL_LONGMEMEVAL_MODE", "graph-diag"),
             ("CITADEL_LONGMEMEVAL_RETRIEVAL_DIAG", "0"),
             ("CITADEL_LONGMEMEVAL_MOCK_EMBED", "1"),
@@ -167,6 +175,32 @@ mod tests {
             ("CITADEL_MEMBENCH_MAX_TOKENS", "4294967296"),
         ] {
             assert!(config(&[(key, value)]).is_err(), "accepted {key}={value}");
+        }
+    }
+
+    #[test]
+    fn temporal_glosses_require_scored_mode() {
+        assert!(
+            config(&[("CITADEL_LONGMEMEVAL_TEMPORAL_GLOSSES", "true")])
+                .unwrap()
+                .bench
+                .temporal_glosses
+        );
+        for mode in ["retrieval-diag", "dry-run"] {
+            assert!(config(&[
+                ("CITADEL_LONGMEMEVAL_MODE", mode),
+                ("CITADEL_LONGMEMEVAL_TEMPORAL_GLOSSES", "true"),
+            ])
+            .is_err());
+            assert!(
+                !config(&[
+                    ("CITADEL_LONGMEMEVAL_MODE", mode),
+                    ("CITADEL_LONGMEMEVAL_TEMPORAL_GLOSSES", "false"),
+                ])
+                .unwrap()
+                .bench
+                .temporal_glosses
+            );
         }
     }
 

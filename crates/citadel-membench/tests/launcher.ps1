@@ -10,6 +10,7 @@ if ($FixtureDataset) {
     $presence = @{}
     foreach ($name in @('CITADEL_LOCOMO_GRAPH_DIAG', 'CITADEL_LOCOMO_DUMP_DB',
       'CITADEL_LOCOMO_AGENTIC', 'CITADEL_LOCOMO_DB_PATH', 'CITADEL_LOCOMO_MAX_SAMPLES',
+      'CITADEL_LOCOMO_TEMPORAL_GLOSSES', 'CITADEL_LONGMEMEVAL_TEMPORAL_GLOSSES',
       'CITADEL_LOCOMO_GRAPH_SWEEP_SLOTS', 'CITADEL_MEMBENCH_MAX_TOKENS',
       'CITADEL_GEMINI_REASONING_EFFORT', 'CITADEL_RERANKER_DIR',
       'CITADEL_LONGMEMEVAL_MODE', 'CITADEL_LONGMEMEVAL_DB_PATH')) {
@@ -52,6 +53,7 @@ $work = Join-Path $tempRoot ('citadel-launcher-test-' + [guid]::NewGuid().ToStri
 New-Item -ItemType Directory -Path $work | Out-Null
 $trackedNames = @('CITADEL_LOCOMO_MODE', 'CITADEL_LOCOMO_GRAPH_DIAG', 'CITADEL_LOCOMO_DUMP_DB',
   'CITADEL_LOCOMO_DB_PATH', 'CITADEL_LOCOMO_AGENTIC', 'CITADEL_LOCOMO_GRAPH_SLOTS',
+  'CITADEL_LOCOMO_TEMPORAL_GLOSSES', 'CITADEL_LONGMEMEVAL_TEMPORAL_GLOSSES',
   'CITADEL_LOCOMO_GRAPH_POOL', 'CITADEL_MEMBENCH_MAX_TOKENS', 'CITADEL_GEMINI_REASONING_EFFORT',
   'OPENAI_API_KEY', 'GEMINI_API_KEY', 'CITADEL_LAUNCHER_TEST_EXIT', 'CITADEL_LAUNCHER_TEST_THROW',
   'ANTHROPIC_API_KEY', 'CITADEL_LONGMEMEVAL_MODE', 'CITADEL_LONGMEMEVAL_DB_PATH',
@@ -80,6 +82,8 @@ try {
   $env:CITADEL_LOCOMO_DUMP_DB = '1'
   $env:CITADEL_LOCOMO_DB_PATH = 'untouched-corpus.cdl'
   $env:CITADEL_LOCOMO_AGENTIC = '1'
+  $env:CITADEL_LOCOMO_TEMPORAL_GLOSSES = 'true'
+  $env:CITADEL_LONGMEMEVAL_TEMPORAL_GLOSSES = 'true'
   $env:CITADEL_LOCOMO_GRAPH_SLOTS = 'invalid-inherited'
   $env:CITADEL_LONGMEMEVAL_MODE = 'retrieval-diag'
   $env:CITADEL_LONGMEMEVAL_DB_PATH = 'other-untouched-corpus.cdl'
@@ -113,6 +117,7 @@ try {
   Assert-True (@(Get-ChildItem Env: | Where-Object { [StringComparer]::Ordinal.Equals($_.Name, 'citadel_membench_max_tokens') }).Count -eq 1) 'Original environment key spelling was not restored.'
   Assert-True ($env:CITADEL_LOCOMO_GRAPH_DIAG -eq '1' -and $env:CITADEL_LOCOMO_GRAPH_SLOTS -eq 'invalid-inherited') 'Successful run did not restore the environment.'
   Assert-True ($env:CITADEL_LOCOMO_MODE -eq 'param-sweep') 'Parent mode was modified.'
+  Assert-True ($env:CITADEL_LOCOMO_TEMPORAL_GLOSSES -eq 'true' -and $env:CITADEL_LONGMEMEVAL_TEMPORAL_GLOSSES -eq 'true') 'Inherited temporal-gloss settings were not restored.'
   Assert-True ($env:CITADEL_LONGMEMEVAL_MODE -eq 'retrieval-diag' -and $env:CITADEL_LONGMEMEVAL_DB_PATH -eq 'other-untouched-corpus.cdl') 'Other benchmark settings were not restored.'
   Assert-True (-not (Test-Path Env:CITADEL_LOCOMO_GRAPH_POOL)) 'A previously absent variable became present.'
   Assert-True ($env:CITADEL_MEMBENCH_MAX_TOKENS -eq '123') 'An inherited shared setting was not restored.'
@@ -151,17 +156,20 @@ try {
   Expect-Failure { & $runner @argsCommon -Benchmark longmemeval -GraphSlots 0 } 'LongMemEval silently ignored explicit graph settings.'
   Expect-Failure { & $runner @argsCommon -Benchmark longmemeval -JudgeProvider openai } 'LongMemEval accepted a judge setting.'
   Expect-Failure { & $runner @argsCommon -Mode dry-run -ReaderProvider ollama } 'Offline mode silently ignored an explicit reader provider.'
+  Expect-Failure { & $runner @argsCommon -Mode dry-run -TemporalGlosses } 'Offline LoCoMo accepted temporal glosses.'
+  Expect-Failure { & $runner @argsCommon -Benchmark longmemeval -Mode retrieval-diag -TemporalGlosses } 'LongMemEval retrieval diagnostic accepted temporal glosses.'
   Expect-Failure { & $runner @argsCommon -Mode scored -EmbedderDir $work -RerankDir '' -ReaderProvider claude } 'Non-OpenAI reader silently inherited an OpenAI model.'
   Expect-Failure { & $runner @argsCommon -Mode scored -EmbedderDir $work -RerankDir '' } 'Scored mode ignored missing required credentials.'
   Assert-True (@(Get-ChildItem -LiteralPath $work -Directory).Count -eq $beforeInvalid) 'Invalid launch created an output directory before validation.'
 
-  & $runner @argsCommon -Benchmark longmemeval -Mode scored -EmbedderDir $work -RerankDir '' -ReaderProvider ollama -Reader fixture-local -OnlyQids $fixture -Agentic
+  & $runner @argsCommon -Benchmark longmemeval -Mode scored -EmbedderDir $work -RerankDir '' -ReaderProvider ollama -Reader fixture-local -OnlyQids $fixture -Agentic -TemporalGlosses
   $latest = Get-ChildItem -LiteralPath $work -Directory | Sort-Object Name | Select-Object -Last 1
   $report = Get-Content -LiteralPath (Join-Path $latest.FullName 'output.txt') -Raw | ConvertFrom-Json
   $options = $report.benchmarkEnvironment
   Assert-True ($options.CITADEL_LONGMEMEVAL_READER_PROVIDER -eq 'ollama' -and $options.CITADEL_LONGMEMEVAL_READER_MODEL -eq 'fixture-local') 'LongMemEval reader selection was not forwarded.'
   Assert-True ($options.CITADEL_LONGMEMEVAL_READER_CONCURRENCY -eq '3' -and $options.PSObject.Properties.Name -notcontains 'CITADEL_LONGMEMEVAL_READER_TPM') 'LongMemEval reader defaults changed.'
   Assert-True ($options.CITADEL_LONGMEMEVAL_AGENTIC -eq 'true' -and $options.CITADEL_LONGMEMEVAL_ONLY_QIDS -eq $fixture) 'LongMemEval explicit options were not forwarded.'
+  Assert-True ($options.CITADEL_LONGMEMEVAL_TEMPORAL_GLOSSES -eq 'true') 'LongMemEval temporal glosses were not forwarded.'
   Assert-True ($options.CITADEL_LONGMEMEVAL_OUT -eq (Join-Path $latest.FullName 'hypotheses.jsonl') -and $options.CITADEL_LONGMEMEVAL_AUDIT_PATH -eq (Join-Path $latest.FullName 'audit.jsonl')) 'LongMemEval output paths escaped the unique run directory.'
   Assert-True (-not $report.keyPresent) 'Local-only LongMemEval required an OpenAI judge credential.'
 
@@ -177,9 +185,16 @@ try {
   $latest = Get-ChildItem -LiteralPath $work -Directory | Sort-Object Name | Select-Object -Last 1
   $report = Get-Content -LiteralPath (Join-Path $latest.FullName 'output.txt') -Raw | ConvertFrom-Json
   Assert-True ($report.benchmarkEnvironment.CITADEL_LONGMEMEVAL_READER_MODEL -eq 'gpt-4o') 'LongMemEval did not retain its default reader model.'
-  & $runner @argsCommon -Mode scored -EmbedderDir $work -RerankDir ''
+  Assert-True ($report.benchmarkEnvironment.PSObject.Properties.Name -notcontains 'CITADEL_LONGMEMEVAL_TEMPORAL_GLOSSES') 'Inherited temporal glosses changed the default LongMemEval run.'
+  & $runner @argsCommon -Mode scored -EmbedderDir $work -RerankDir '' -TemporalGlosses
   $latest = Get-ChildItem -LiteralPath $work -Directory | Sort-Object Name | Select-Object -Last 1
   Assert-True (Test-Path -LiteralPath (Join-Path $latest.FullName 'report.json')) 'Scored output did not retain its JSON report name.'
+  $report = Get-Content -LiteralPath (Join-Path $latest.FullName 'report.json') -Raw | ConvertFrom-Json
+  Assert-True ($report.benchmarkEnvironment.CITADEL_LOCOMO_TEMPORAL_GLOSSES -eq 'true') 'LoCoMo temporal glosses were not forwarded.'
+  & $runner @argsCommon -Mode scored -EmbedderDir $work -RerankDir '' -TemporalGlosses:$false
+  $latest = Get-ChildItem -LiteralPath $work -Directory | Sort-Object Name | Select-Object -Last 1
+  $report = Get-Content -LiteralPath (Join-Path $latest.FullName 'report.json') -Raw | ConvertFrom-Json
+  Assert-True ($report.benchmarkEnvironment.PSObject.Properties.Name -notcontains 'CITADEL_LOCOMO_TEMPORAL_GLOSSES') 'Explicit false enabled temporal glosses.'
   Assert-True ($env:OPENAI_API_KEY -eq 'fixture-key-not-a-credential') 'An existing API key was deleted.'
   $env:CITADEL_LAUNCHER_TEST_THROW = '1'
   $PSNativeCommandUseErrorActionPreference = $true

@@ -529,7 +529,7 @@ fn answer_aggregation(
     let rendered = bench.reader_prompt(view, q.text, q.date)?;
     validate_rendered_atoms(view, &rendered.atom_ids)?;
     let mut messages = rendered.messages;
-    let extraction = agentic::extraction_prompt(view, q.text, q.date);
+    let extraction = agentic::extraction_prompt(bench, view, q.text, q.date)?;
     let mut extract = CompletionRequest::new(extraction.messages);
     extract.temperature = Some(0.0);
     extract.seed = Some(SAMPLING_SEED);

@@ -17,15 +17,27 @@ use crate::core::ratelimit::Pacer;
 /// The LoCoMo benchmark plugin.
 pub struct Locomo {
     session_headers: bool,
+    temporal_glosses: bool,
 }
 
 impl Locomo {
     pub(crate) fn new(session_headers: bool) -> Self {
-        Self { session_headers }
+        Self {
+            session_headers,
+            temporal_glosses: false,
+        }
+    }
+
+    pub(crate) fn with_temporal_glosses(mut self, enabled: bool) -> Self {
+        self.temporal_glosses = enabled;
+        self
     }
 }
 
 impl Benchmark for Locomo {
+    fn reader_source_text<'a>(&self, hit: &'a AtomHit) -> Result<std::borrow::Cow<'a, str>> {
+        prompts::source_text(hit, self.temporal_glosses)
+    }
     fn gold_id_key(&self) -> &str {
         "dia_id"
     }
@@ -38,7 +50,12 @@ impl Benchmark for Locomo {
         _current_date: &str,
     ) -> Result<ReaderPrompt> {
         Ok(ReaderPrompt {
-            messages: prompts::build_reader_prompt(hits, question, self.session_headers)?,
+            messages: prompts::build_reader_prompt_with_glosses(
+                hits,
+                question,
+                self.session_headers,
+                self.temporal_glosses,
+            )?,
             atom_ids: hits.iter().map(|hit| hit.id).collect(),
         })
     }

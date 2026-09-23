@@ -27,6 +27,25 @@ pub fn days_from_civil(y: i64, m: i64, d: i64) -> Option<i64> {
     i64::try_from(era * 146_097 + doe - 719_468).ok()
 }
 
+/// Proleptic-Gregorian `(year, month, day)` for an epoch-day count.
+/// Intermediate arithmetic is wider than the input, including at its limits.
+pub fn civil_from_days(days: i64) -> Option<(i64, i64, i64)> {
+    let shifted = i128::from(days) + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let doe = shifted - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    Some((
+        i64::try_from(year + i128::from(month <= 2)).ok()?,
+        i64::try_from(month).ok()?,
+        i64::try_from(day).ok()?,
+    ))
+}
+
 /// UTC-naive epoch microseconds at minute precision, with checked range conversion.
 pub fn datetime_micros(y: i64, m: i64, d: i64, hour: i64, minute: i64) -> Option<i64> {
     if !(0..=23).contains(&hour) || !(0..=59).contains(&minute) {
@@ -55,6 +74,24 @@ mod tests {
         );
         assert!(days_from_civil(1900, 2, 29).is_none());
         assert!(days_from_civil(2000, 2, 29).is_some());
+    }
+
+    #[test]
+    fn inverse_covers_leap_boundaries_and_the_entire_epoch_day_range() {
+        assert_eq!(civil_from_days(0), Some((1970, 1, 1)));
+        assert_eq!(civil_from_days(-1), Some((1969, 12, 31)));
+        for year in [-10_000, -400, -100, -1, 0, 1, 400, 1900, 2000, 2024, 10_000] {
+            for month in 1..=12 {
+                for day in 1..=days_in_month(year, month) {
+                    let epoch = days_from_civil(year, month, day).unwrap();
+                    assert_eq!(civil_from_days(epoch), Some((year, month, day)));
+                }
+            }
+        }
+        for epoch in [i64::MIN, i64::MIN + 1, i64::MAX - 1, i64::MAX] {
+            let (year, month, day) = civil_from_days(epoch).unwrap();
+            assert_eq!(days_from_civil(year, month, day), Some(epoch));
+        }
     }
 
     #[test]
