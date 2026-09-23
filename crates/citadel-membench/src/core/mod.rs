@@ -9,6 +9,7 @@ pub mod db;
 pub mod error;
 pub mod eval;
 pub mod hash;
+pub(crate) mod progress;
 pub mod ratelimit;
 pub mod retrieval;
 pub mod temporal;

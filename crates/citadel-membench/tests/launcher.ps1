@@ -4,7 +4,6 @@ param([string]$FixtureDataset)
 if ($env:CITADEL_LAUNCHER_NATIVE_FIXTURE) { exit ([int]$env:CITADEL_LAUNCHER_TEST_EXIT) }
 
 if ($FixtureDataset) {
-  if ($env:CITADEL_LAUNCHER_TEST_THROW) { throw 'fixture launch failed' }
   $presenceJson = & (Join-Path $PSHOME 'pwsh') -NoProfile -Command {
     $environment = [Environment]::GetEnvironmentVariables('Process')
     $presence = @{}
@@ -39,8 +38,7 @@ if ($FixtureDataset) {
     }
     $_ | ConvertTo-Json -Depth 5 -Compress
   }
-  $global:LASTEXITCODE = if ($env:CITADEL_LAUNCHER_TEST_EXIT) { [int]$env:CITADEL_LAUNCHER_TEST_EXIT } else { 0 }
-  return
+  exit $(if ($env:CITADEL_LAUNCHER_TEST_EXIT) { [int]$env:CITADEL_LAUNCHER_TEST_EXIT } else { 0 })
 }
 
 $ErrorActionPreference = 'Stop'
@@ -55,7 +53,7 @@ $trackedNames = @('CITADEL_LOCOMO_MODE', 'CITADEL_LOCOMO_GRAPH_DIAG', 'CITADEL_L
   'CITADEL_LOCOMO_DB_PATH', 'CITADEL_LOCOMO_AGENTIC', 'CITADEL_LOCOMO_GRAPH_SLOTS',
   'CITADEL_LOCOMO_TEMPORAL_GLOSSES', 'CITADEL_LONGMEMEVAL_TEMPORAL_GLOSSES',
   'CITADEL_LOCOMO_GRAPH_POOL', 'CITADEL_MEMBENCH_MAX_TOKENS', 'CITADEL_GEMINI_REASONING_EFFORT',
-  'OPENAI_API_KEY', 'GEMINI_API_KEY', 'CITADEL_LAUNCHER_TEST_EXIT', 'CITADEL_LAUNCHER_TEST_THROW',
+  'OPENAI_API_KEY', 'GEMINI_API_KEY', 'CITADEL_LAUNCHER_TEST_EXIT',
   'ANTHROPIC_API_KEY', 'CITADEL_LONGMEMEVAL_MODE', 'CITADEL_LONGMEMEVAL_DB_PATH',
   'CITADEL_LAUNCHER_NATIVE_FIXTURE', 'CITADEL_LAUNCHER_RUNNER', 'CITADEL_LAUNCHER_FIXTURE_PATH',
   'CITADEL_LAUNCHER_OUTPUT_ROOT', 'CITADEL_LAUNCHER_NATIVE_EXE',
@@ -196,11 +194,14 @@ try {
   $report = Get-Content -LiteralPath (Join-Path $latest.FullName 'report.json') -Raw | ConvertFrom-Json
   Assert-True ($report.benchmarkEnvironment.PSObject.Properties.Name -notcontains 'CITADEL_LOCOMO_TEMPORAL_GLOSSES') 'Explicit false enabled temporal glosses.'
   Assert-True ($env:OPENAI_API_KEY -eq 'fixture-key-not-a-credential') 'An existing API key was deleted.'
-  $env:CITADEL_LAUNCHER_TEST_THROW = '1'
+  $invalidExecutable = Join-Path $work 'not-an-executable.exe'
+  [IO.File]::WriteAllText($invalidExecutable, 'invalid executable fixture')
+  $badLaunch = $argsCommon.Clone()
+  $badLaunch.Executable = $invalidExecutable
   $PSNativeCommandUseErrorActionPreference = $true
   $launchFailure = $null
-  try { & $runner @argsCommon -Mode dry-run } catch { $launchFailure = $_ }
-  Assert-True ($null -ne $launchFailure -and $launchFailure.Exception.Message -match 'fixture launch failed') 'The original fixture exception was lost.'
+  try { & $runner @badLaunch -Mode dry-run } catch { $launchFailure = $_ }
+  Assert-True ($null -ne $launchFailure -and $launchFailure.Exception.GetBaseException() -is [ComponentModel.Win32Exception]) 'The original process-start exception was lost.'
   $latest = Get-ChildItem -LiteralPath $work -Directory | Sort-Object Name | Select-Object -Last 1
   $terminal = @(Get-Content -LiteralPath (Join-Path $latest.FullName 'run.log') | Where-Object { $_ -match '^EXIT=' })
   Assert-True ($terminal.Count -eq 1 -and $terminal[0] -eq 'EXIT=1') 'Launch exception did not record exactly one failing terminal status.'
@@ -208,7 +209,6 @@ try {
   Assert-True ($env:citadel_LoCoMo_CASE_FIXTURE -eq 'locomo-parent' -and $env:citadel_LongMemEval_CASE_FIXTURE -eq 'longmemeval-parent') 'Failed run did not restore mixed-case settings.'
   Assert-True $PSNativeCommandUseErrorActionPreference 'Failed run did not restore the native-error preference.'
   $PSNativeCommandUseErrorActionPreference = $false
-  Remove-Item -LiteralPath Env:CITADEL_LAUNCHER_TEST_THROW
 
   $env:CITADEL_LAUNCHER_TEST_EXIT = '17'
   & (Join-Path $PSHOME 'pwsh') -NoProfile -File $runner -Mode dry-run -Label exit -Dataset $fixture -Executable $fixture -OutputRoot $work *> $null
@@ -228,6 +228,8 @@ try {
   Assert-True ($LASTEXITCODE -eq 17) "Native child status changed under inherited native-error handling: $nativeOutput"
   $latest = Get-ChildItem -LiteralPath $work -Directory | Sort-Object Name | Select-Object -Last 1
   Assert-True ((Get-Content -LiteralPath (Join-Path $latest.FullName 'run.log') -Raw) -match 'EXIT=17') 'Native failure bypassed the explicit exit-status log.'
+  & (Join-Path $PSScriptRoot 'launcher-progress.ps1')
+  & (Join-Path $PSScriptRoot 'launcher-cancellation.ps1')
   Write-Host "Launcher checks passed: $checks"
 }
 finally {
