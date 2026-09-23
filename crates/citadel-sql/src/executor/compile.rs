@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use citadel::Database;
 use citadel_txn::read_txn::ReadTxn;
 use citadel_txn::write_txn::WriteTxn;
 
@@ -10,37 +9,42 @@ use crate::schema::SchemaManager;
 use crate::types::{ExecutionResult, QueryResult, Value};
 
 pub(crate) enum ActiveTxnRef<'a, 'db: 'a> {
-    None,
     Read(&'a mut ReadTxn<'db>),
     Write(&'a mut WriteTxn<'db>),
+}
+
+/// An unsupported streaming shape returns its exact admitted snapshot so the
+/// buffered executor can continue without reopening a newer view.
+pub(crate) enum StreamAttempt<'db> {
+    Streaming(Box<dyn RowSourceIter + 'db>),
+    Buffered(ReadTxn<'db>),
 }
 
 pub(crate) trait CompiledPlan: Send + Sync {
     fn execute(
         &self,
-        db: &Database,
         schema: &SchemaManager,
         stmt: &Statement,
         params: &[Value],
         txn: ActiveTxnRef<'_, '_>,
     ) -> Result<ExecutionResult>;
 
-    /// Attempt to produce a streaming row source. Returns `None` if this plan
-    /// cannot stream the given statement — caller falls back to `execute`.
+    /// Attempt to stream, retaining the admitted snapshot when unsupported.
+    /// Storage errors are returned; they must not trigger a fresh-snapshot retry.
     fn try_stream<'db>(
         &self,
-        _db: &'db Database,
+        rtx: ReadTxn<'db>,
         _schema: &SchemaManager,
         _stmt: &Statement,
         _params: &[Value],
-    ) -> Option<Box<dyn RowSourceIter + 'db>> {
-        None
+    ) -> Result<StreamAttempt<'db>> {
+        Ok(StreamAttempt::Buffered(rtx))
     }
 
     /// Zero-copy materialized collect; `None` if the plan cannot fast-collect.
     fn try_collect(
         &self,
-        _db: &Database,
+        _rtx: &mut ReadTxn<'_>,
         _schema: &SchemaManager,
         _stmt: &Statement,
         _params: &[Value],
@@ -73,10 +77,6 @@ pub(crate) trait CompiledPlan: Send + Sync {
 pub(crate) trait RowSourceIter {
     fn next_row(&mut self) -> Result<Option<Vec<Value>>>;
     fn columns(&self) -> &[String];
-    /// Upper bound on remaining rows, for output pre-sizing. 0 = unknown.
-    fn size_hint(&self) -> usize {
-        0
-    }
 }
 
 pub(crate) fn compile(schema: &SchemaManager, stmt: &Statement) -> Option<Arc<dyn CompiledPlan>> {

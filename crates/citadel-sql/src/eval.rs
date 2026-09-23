@@ -305,7 +305,7 @@ pub(crate) enum CompiledExpr<'a> {
 impl<'a> CompiledExpr<'a> {
     pub(crate) fn compile(expr: &'a Expr, col_map: &ColumnMap) -> Self {
         match expr {
-            Expr::Literal(v) => CompiledExpr::Const(v.clone()),
+            Expr::Literal(v) | Expr::BoundColumn { value: v, .. } => CompiledExpr::Const(v.clone()),
             Expr::Parameter(n) => CompiledExpr::Param(*n),
             Expr::Column(name) => match col_map.resolve(name) {
                 Ok(idx) => CompiledExpr::Slot(idx),
@@ -360,8 +360,11 @@ pub(crate) fn compile_collation(
 ) -> Option<crate::types::Collation> {
     let left_explicit = collation_of(left);
     let right_explicit = collation_of(right);
-    let needs_check =
-        col_map.has_non_binary_collation() || left_explicit.is_some() || right_explicit.is_some();
+    let needs_check = col_map.has_non_binary_collation()
+        || left_explicit.is_some()
+        || right_explicit.is_some()
+        || bound_column_operand(left)
+        || bound_column_operand(right);
     if !needs_check {
         return None;
     }
@@ -414,7 +417,7 @@ pub fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
 
 fn eval_expr_inner(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
     match expr {
-        Expr::Literal(v) => Ok(v.clone()),
+        Expr::Literal(v) | Expr::BoundColumn { value: v, .. } => Ok(v.clone()),
 
         Expr::Column(name) => {
             let idx = ctx.col_map.resolve(name)?;
@@ -782,7 +785,8 @@ pub(crate) fn collation_of(expr: &Expr) -> Option<crate::types::Collation> {
             QuantifiedRhs::Array(expr) => collation_of(expr),
             QuantifiedRhs::Subquery(_) => None,
         }),
-        Expr::Literal(_)
+        Expr::BoundColumn { .. }
+        | Expr::Literal(_)
         | Expr::Column(_)
         | Expr::QualifiedColumn { .. }
         | Expr::CountStar
@@ -793,8 +797,17 @@ pub(crate) fn collation_of(expr: &Expr) -> Option<crate::types::Collation> {
     }
 }
 
+fn bound_column_operand(expr: &Expr) -> bool {
+    match expr {
+        Expr::BoundColumn { .. } => true,
+        Expr::Cast { expr, .. } => bound_column_operand(expr),
+        _ => false,
+    }
+}
+
 fn column_collation(expr: &Expr, col_map: &ColumnMap) -> Option<crate::types::Collation> {
     match expr {
+        Expr::BoundColumn { collation, .. } => Some(*collation),
         Expr::Column(name) => col_map.resolve(name).ok().map(|i| col_map.collation_at(i)),
         Expr::QualifiedColumn { table, column } => col_map
             .resolve_qualified(table, column)
@@ -2243,7 +2256,7 @@ pub(crate) fn is_session_dependent_jsonpath_function(name_upper: &str, args: &[E
 /// A successful non-NULL result type, when it is fixed without schema binding.
 fn intrinsic_result_type(expr: &Expr) -> Option<DataType> {
     match expr {
-        Expr::Literal(value) => Some(value.data_type()),
+        Expr::Literal(value) | Expr::BoundColumn { value, .. } => Some(value.data_type()),
         Expr::Cast { data_type, .. } => Some(*data_type),
         Expr::Collate { expr, .. } => intrinsic_result_type(expr),
         Expr::Function { name, .. } => {
@@ -2258,7 +2271,10 @@ fn intrinsic_result_type(expr: &Expr) -> Option<DataType> {
 /// forms without a conservative proof must stay in the ordinary evaluator.
 pub(crate) fn is_statement_constant(expr: &Expr) -> bool {
     match expr {
-        Expr::Literal(_) | Expr::Parameter(_) | Expr::TypedNullRecord(_) => true,
+        Expr::BoundColumn { .. }
+        | Expr::Literal(_)
+        | Expr::Parameter(_)
+        | Expr::TypedNullRecord(_) => true,
         Expr::Cast { expr, .. }
         | Expr::Collate { expr, .. }
         | Expr::UnaryOp { expr, .. }
@@ -4042,7 +4058,8 @@ fn collect_column_refs(expr: &Expr, columns: &[ColumnDef], out: &mut Vec<usize>)
                 collect_column_refs(e, columns, out);
             }
         }
-        Expr::Literal(_)
+        Expr::BoundColumn { .. }
+        | Expr::Literal(_)
         | Expr::Parameter(_)
         | Expr::CountStar
         | Expr::Exists { .. }

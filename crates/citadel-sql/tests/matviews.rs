@@ -113,7 +113,10 @@ fn drop_matview_removes_matview() {
         .unwrap()
         .query_collect(&[])
         .unwrap_err();
-    assert!(matches!(err, SqlError::TableNotFound(_)));
+    assert!(
+        matches!(&err, SqlError::TableNotFound(_)),
+        "actual missing-table error: {err:?}"
+    );
 }
 
 #[test]
@@ -171,7 +174,10 @@ fn matview_rejects_duplicate_output_names_before_creating_storage() {
             .unwrap()
             .query_collect(&[])
             .unwrap_err();
-        assert!(matches!(err, SqlError::TableNotFound(_)));
+        assert!(
+            matches!(&err, SqlError::TableNotFound(_)),
+            "actual missing-table error: {err:?}"
+        );
         if in_txn {
             conn.execute("COMMIT").unwrap();
         }
@@ -650,7 +656,10 @@ fn drop_matview_cascade_drops_dependent_view() {
         .unwrap()
         .query_collect(&[])
         .unwrap_err();
-    assert!(matches!(err_mv, SqlError::TableNotFound(_)));
+    assert!(
+        matches!(&err_mv, SqlError::TableNotFound(_)),
+        "actual missing-table error: {err_mv:?}"
+    );
     let err_v = conn
         .prepare("SELECT * FROM v")
         .unwrap()
@@ -694,7 +703,10 @@ fn drop_matview_cascade_chains_through_matviews() {
         .unwrap()
         .query_collect(&[])
         .unwrap_err();
-    assert!(matches!(err_b, SqlError::TableNotFound(_)));
+    assert!(
+        matches!(&err_b, SqlError::TableNotFound(_)),
+        "actual missing-table error: {err_b:?}"
+    );
 }
 
 #[test]
@@ -1658,4 +1670,171 @@ fn prepared_delete_matview_errors() {
     let stmt = conn.prepare("DELETE FROM mv WHERE id = $1").unwrap();
     let err = stmt.execute(&[Value::Integer(1)]).unwrap_err();
     assert!(matches!(err, SqlError::CannotModifyView(_)));
+}
+
+fn assert_dropped_matview_storage(db: &citadel::Database, names: &[(&str, &str)]) {
+    let schema = citadel_sql::schema::SchemaManager::load(db).unwrap();
+    let mut rtx = db.begin_read();
+    let physical = rtx.list_tables().unwrap();
+    for (name, index) in names {
+        let backing = citadel_sql::types::MatviewDef::backing_table_name(name);
+        let index_table = citadel_sql::types::TableSchema::index_table_name(&backing, index);
+        assert!(schema.get(name).is_none(), "orphan schema for {name}");
+        assert!(schema.get_matview(name).is_none(), "orphan view for {name}");
+        assert!(rtx
+            .table_get(b"_schema", backing.as_bytes())
+            .unwrap()
+            .is_none());
+        assert!(rtx
+            .table_get(b"_matviews", name.as_bytes())
+            .unwrap()
+            .is_none());
+        assert!(physical
+            .iter()
+            .all(|(table, _)| table != backing.as_bytes()));
+        assert!(physical.iter().all(|(table, _)| table != &index_table));
+    }
+}
+
+#[test]
+fn matview_drop_removes_persisted_backing_and_indexes_and_allows_name_reuse() {
+    for cascade in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_db(dir.path());
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute("CREATE TABLE src (id INTEGER PRIMARY KEY, v INTEGER)")
+                .unwrap();
+            conn.execute("INSERT INTO src VALUES (1,10),(2,20)")
+                .unwrap();
+            conn.execute("CREATE MATERIALIZED VIEW mv AS SELECT id,v FROM src")
+                .unwrap();
+            conn.execute("CREATE UNIQUE INDEX mv_v ON mv(v)").unwrap();
+            if cascade {
+                conn.execute("CREATE MATERIALIZED VIEW child AS SELECT id,v FROM mv")
+                    .unwrap();
+                conn.execute("CREATE UNIQUE INDEX child_v ON child(v)")
+                    .unwrap();
+                conn.execute("CREATE VIEW dependent AS SELECT id FROM child")
+                    .unwrap();
+            }
+            conn.execute(if cascade {
+                "DROP MATERIALIZED VIEW mv CASCADE"
+            } else {
+                "DROP MATERIALIZED VIEW mv"
+            })
+            .unwrap();
+        }
+        let names = if cascade {
+            vec![("mv", "mv_v"), ("child", "child_v")]
+        } else {
+            vec![("mv", "mv_v")]
+        };
+        assert_dropped_matview_storage(&db, &names);
+        let fresh = Connection::open(&db).unwrap();
+        assert!(matches!(
+            fresh.query("SELECT * FROM mv"),
+            Err(SqlError::TableNotFound(_))
+        ));
+        drop(fresh);
+        drop(db);
+
+        let db = DatabaseBuilder::new(dir.path().join("test.db"))
+            .passphrase(b"test-passphrase")
+            .argon2_profile(Argon2Profile::Iot)
+            .open()
+            .unwrap();
+        assert_dropped_matview_storage(&db, &names);
+        let conn = Connection::open(&db).unwrap();
+        if cascade {
+            assert!(matches!(
+                conn.query("SELECT * FROM dependent"),
+                Err(SqlError::TableNotFound(_))
+            ));
+        }
+        for (name, index) in names {
+            conn.execute(&format!(
+                "CREATE MATERIALIZED VIEW {name} AS SELECT id,v FROM src"
+            ))
+            .unwrap();
+            conn.execute(&format!("CREATE UNIQUE INDEX {index} ON {name}(v)"))
+                .unwrap();
+            assert_eq!(
+                conn.query(&format!("SELECT id FROM {name} WHERE v = 20"))
+                    .unwrap()
+                    .rows,
+                vec![vec![Value::Integer(2)]]
+            );
+        }
+    }
+}
+
+#[test]
+fn matview_drop_savepoint_rollback_restores_backing_catalog_and_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE src (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO src VALUES (1,10),(2,20)")
+        .unwrap();
+    conn.execute("CREATE MATERIALIZED VIEW mv AS SELECT id,v FROM src")
+        .unwrap();
+    conn.execute("CREATE UNIQUE INDEX mv_v ON mv(v)").unwrap();
+    conn.execute("CREATE MATERIALIZED VIEW child AS SELECT id,v FROM mv")
+        .unwrap();
+    conn.execute("CREATE UNIQUE INDEX child_v ON child(v)")
+        .unwrap();
+    let mut before_txn = db.begin_read();
+    let before_tables: Vec<_> = before_txn
+        .list_tables()
+        .unwrap()
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    let before_schema = before_txn.table_get(b"_schema", b"mv").unwrap();
+    let before_child = before_txn.table_get(b"_schema", b"child").unwrap();
+    let before_mv = before_txn.table_get(b"_matviews", b"mv").unwrap();
+    drop(before_txn);
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("SAVEPOINT preserve_mv").unwrap();
+    conn.execute("DROP MATERIALIZED VIEW mv CASCADE").unwrap();
+    assert!(matches!(
+        conn.query("SELECT * FROM mv"),
+        Err(SqlError::TableNotFound(_))
+    ));
+    conn.execute("ROLLBACK TO preserve_mv").unwrap();
+    for name in ["mv", "child"] {
+        assert_eq!(
+            conn.query(&format!("SELECT id FROM {name} WHERE v = 20"))
+                .unwrap()
+                .rows,
+            vec![vec![Value::Integer(2)]]
+        );
+    }
+    conn.execute("COMMIT").unwrap();
+    let mut after = db.begin_read();
+    assert_eq!(
+        after
+            .list_tables()
+            .unwrap()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>(),
+        before_tables
+    );
+    assert_eq!(after.table_get(b"_schema", b"mv").unwrap(), before_schema);
+    assert_eq!(after.table_get(b"_schema", b"child").unwrap(), before_child);
+    assert_eq!(after.table_get(b"_matviews", b"mv").unwrap(), before_mv);
+    drop(after);
+    drop(conn);
+    let fresh = Connection::open(&db).unwrap();
+    assert_eq!(
+        fresh
+            .query("SELECT id FROM child WHERE v = 20")
+            .unwrap()
+            .rows,
+        vec![vec![Value::Integer(2)]]
+    );
 }

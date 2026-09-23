@@ -5,6 +5,7 @@ use crate::parser::{
 };
 use crate::schema::SchemaManager;
 use crate::types::{Collation, ColumnDef, DataType, TableSchema, Value};
+use citadel::Database;
 
 fn col(name: &str, dt: DataType, nullable: bool) -> ColumnDef {
     ColumnDef {
@@ -1156,7 +1157,7 @@ fn compiled_update_nullable_with_added_default_uses_resizing_path() {
 }
 
 #[test]
-fn general_autocommit_update_materializes_added_defaults_in_both_fast_paths() {
+fn general_admitted_update_materializes_added_defaults_in_both_fast_paths() {
     for fixed_width in [true, false] {
         let db = update_database();
         let conn = crate::Connection::open(&db).unwrap();
@@ -1169,7 +1170,7 @@ fn general_autocommit_update_materializes_added_defaults_in_both_fast_paths() {
             .unwrap();
         conn.execute("ALTER TABLE t ADD COLUMN tail TEXT DEFAULT 'keep'")
             .unwrap();
-        let schema = SchemaManager::load(&db).unwrap();
+        let mut schema = SchemaManager::load(&db).unwrap();
         let updates: &[(&str, u64)] = if fixed_width {
             &[("UPDATE t SET a = a + b WHERE id >= 1 AND id <= 2", 2)]
         } else {
@@ -1179,13 +1180,11 @@ fn general_autocommit_update_materializes_added_defaults_in_both_fast_paths() {
             ]
         };
         for &(sql, expected_count) in updates {
-            let Statement::Update(update) = crate::parser::parse_sql(sql).unwrap() else {
-                panic!("expected UPDATE");
-            };
-            // Connection::execute autocompiles autocommit UPDATE. Call this
-            // executor directly to cover its fixed-slice and collected loops.
+            let statement = crate::parser::parse_sql(sql).unwrap();
+            // Use the public interpreted executor: Connection autocompiles
+            // these statements and exercises its compiled path separately.
             assert!(matches!(
-                exec_update(&db, &schema, &update).unwrap(),
+                super::super::execute(&db, &mut schema, &statement, &[]).unwrap(),
                 ExecutionResult::RowsAffected(count) if count == expected_count
             ));
         }

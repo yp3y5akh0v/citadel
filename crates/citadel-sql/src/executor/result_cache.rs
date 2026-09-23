@@ -3,7 +3,7 @@
 //! Sound because commit-generation equality proves identical visible state
 //! (the counter bumps under the snapshot-publishing lock), the slot lives on
 //! a per-connection plan discarded on schema changes, serving is gated to
-//! `ActiveTxnRef::None | Read`, and [`is_result_cacheable`] admits only
+//! `ActiveTxnRef::Read`, and [`is_result_cacheable`] admits only
 //! statements that are a pure function of (statement, params, generation).
 
 use rustc_hash::FxHashSet;
@@ -304,6 +304,11 @@ fn cacheable_select(ctx: &mut WalkCtx<'_>, sel: &SelectStmt) -> bool {
         return false;
     }
     for join in &sel.joins {
+        // Function sources need their own dependency proof even when a real
+        // table or CTE happens to have the same name. Match the FROM policy.
+        if join.table.args.is_some() {
+            return false;
+        }
         if let Some(sub) = &join.subquery {
             if !cacheable_query(ctx, &sub.query) {
                 return false;
@@ -410,7 +415,8 @@ fn cacheable_window_bound(ctx: &mut WalkCtx<'_>, bound: &WindowFrameBound) -> bo
 
 fn cacheable_expr(ctx: &mut WalkCtx<'_>, expr: &Expr) -> bool {
     match expr {
-        Expr::Literal(_)
+        Expr::BoundColumn { .. }
+        | Expr::Literal(_)
         | Expr::Column(_)
         | Expr::QualifiedColumn { .. }
         | Expr::Parameter(_)

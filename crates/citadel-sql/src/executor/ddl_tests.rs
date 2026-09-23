@@ -503,7 +503,9 @@ fn create_table_rejects_repeated_primary_key_columns_without_catalog_changes() {
         let before = db.manager().commit_generation();
         let stmt = repeated_primary_key_statement(columns);
 
-        let error = exec_create_table(&db, &mut schema, &stmt).unwrap_err();
+        let error =
+            super::super::execute(&db, &mut schema, &Statement::CreateTable(stmt.clone()), &[])
+                .unwrap_err();
         assert!(
             matches!(error, SqlError::DuplicateColumn(ref name) if name.eq_ignore_ascii_case("a"))
         );
@@ -514,7 +516,7 @@ fn create_table_rejects_repeated_primary_key_columns_without_catalog_changes() {
 
         let mut valid = stmt;
         valid.primary_key = vec!["a".into(), "z".into()];
-        exec_create_table(&db, &mut schema, &valid).unwrap();
+        super::super::execute(&db, &mut schema, &Statement::CreateTable(valid), &[]).unwrap();
         assert_eq!(schema.get("items").unwrap().primary_key_columns, [0, 1]);
     }
 }

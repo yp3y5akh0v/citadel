@@ -30,7 +30,6 @@ pub(crate) use ann_topk::{ann_cache_status, commit_with_ann_publication, persist
 pub(crate) use compile::{compile, CompiledPlan};
 use cte::*;
 use ddl::*;
-pub use dml::exec_insert_in_txn;
 use dml::*;
 use explain::*;
 use join::*;
@@ -81,7 +80,7 @@ pub(crate) fn stmt_mutates(stmt: &Statement) -> bool {
     }
 }
 
-fn stmt_mutates_schema(stmt: &Statement) -> bool {
+pub(crate) fn stmt_mutates_schema(stmt: &Statement) -> bool {
     match stmt {
         Statement::CreateTable(_)
         | Statement::DropTable(_)
@@ -477,108 +476,60 @@ pub fn execute(
     stmt: &Statement,
     params: &[Value],
 ) -> Result<ExecutionResult> {
-    guard_legacy_volatile_schema(schema, stmt)?;
     check_cancelled(db.cancel_token().as_ref())?;
-    if !stmt_mutates(stmt) {
-        return execute_autocommit_inner(db, schema, stmt, params);
+    if matches!(stmt, Statement::CreateIndex(index) if index.concurrently) {
+        // The concurrent builder admits its own read and short write views.
+        if let Statement::CreateIndex(index) = stmt {
+            return exec_create_index(db, schema, index);
+        }
     }
+    if let Statement::RefreshMaterializedView(refresh) = stmt {
+        if refresh.concurrently {
+            return matviews::exec_refresh_matview(db, schema, refresh);
+        }
+    }
+    if !stmt_mutates(stmt) {
+        let mut rtx = db.begin_read();
+        schema.admit_read(db, &mut rtx)?;
+        return execute_with_admitted_read(&mut rtx, schema, stmt, params);
+    }
+    let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
+    schema.admit_write(db, &mut wtx)?;
     let mut schema_snapshot = stmt_mutates_schema(stmt).then(|| schema.save_snapshot());
     let mut dml_snapshot = Some(schema.save_dml_snapshot());
-    let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        execute_autocommit_inner(db, schema, stmt, params)
-    })) {
-        Ok(outcome) => outcome,
-        Err(payload) => {
-            if let Some(snapshot) = schema_snapshot.take() {
-                schema.restore_snapshot(snapshot);
-            } else if let Some(snapshot) = dml_snapshot.take() {
-                schema.restore_dml_snapshot(snapshot);
-            }
-            std::panic::resume_unwind(payload)
-        }
-    };
-    if outcome.is_err() {
-        if let Some(snapshot) = schema_snapshot {
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let result = execute_in_admitted_txn(&mut wtx, schema, stmt, params)?;
+        helpers::drain_deferred_fk_checks(&mut wtx, schema)?;
+        commit_with_ann_publication(wtx, schema)?;
+        Ok(result)
+    }));
+    if !matches!(&outcome, Ok(Ok(_))) {
+        if let Some(snapshot) = schema_snapshot.take() {
             schema.restore_snapshot(snapshot);
-        } else if let Some(snapshot) = dml_snapshot {
+        } else if let Some(snapshot) = dml_snapshot.take() {
             schema.restore_dml_snapshot(snapshot);
         }
     }
-    outcome
-}
-
-fn execute_autocommit_inner(
-    db: &Database,
-    schema: &mut SchemaManager,
-    stmt: &Statement,
-    params: &[Value],
-) -> Result<ExecutionResult> {
-    match stmt {
-        Statement::CreateTable(ct) => exec_create_table(db, schema, ct),
-        Statement::DropTable(dt) => exec_drop_table(db, schema, dt),
-        Statement::CreateIndex(ci) => exec_create_index(db, schema, ci),
-        Statement::DropIndex(di) => exec_drop_index(db, schema, di),
-        Statement::CreateView(cv) => exec_create_view(db, schema, cv),
-        Statement::DropView(dv) => exec_drop_view(db, schema, dv),
-        Statement::AlterTable(at) => exec_alter_table(db, schema, at),
-        Statement::Insert(ins) => exec_insert(db, schema, ins, params),
-        Statement::Select(sq) => exec_select_query(db, schema, sq),
-        Statement::Update(upd) => exec_update(db, schema, upd),
-        Statement::Delete(del) => exec_delete(db, schema, del),
-        Statement::Truncate(t) => exec_truncate(db, schema, t),
-        Statement::Explain { inner, analyze } => {
-            if *analyze && stmt_mutates(inner) {
-                let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
-                wtx.set_cancel(db.cancel_token());
-                return match execute_in_txn(&mut wtx, schema, stmt, params) {
-                    Ok(result) => {
-                        commit_with_ann_publication(wtx, schema)?;
-                        Ok(result)
-                    }
-                    Err(error) => {
-                        wtx.abort();
-                        Err(error)
-                    }
-                };
-            }
-            let mut rtx = db.begin_read();
-            // Build and validate the plan against the same snapshot ANALYZE
-            // will execute. This also captures estimates before any mutation.
-            let mut plan = explain(
-                &mut ExplainCtx {
-                    schema,
-                    rows: &mut |t: &str| explain_row_count(|| rtx.table_entry_count(t.as_bytes())),
-                },
-                inner,
-            )?;
-            if *analyze {
-                #[cfg(test)]
-                pause_after_explain_plan();
-                let span = Span::open(rtx.measure_scans());
-                let result = execute_with_read(&mut rtx, schema, inner, params)?;
-                let measured = span.close(&result);
-                explain::attach_measurement(&mut plan, &measured);
-            }
-            Ok(plan)
-        }
-        Statement::CreateTrigger(ct) => triggers::exec_create_trigger(db, schema, ct),
-        Statement::DropTrigger(dt) => triggers::exec_drop_trigger(db, schema, dt),
-        Statement::CreateMaterializedView(mv) => matviews::exec_create_matview(db, schema, mv),
-        Statement::RefreshMaterializedView(rmv) => matviews::exec_refresh_matview(db, schema, rmv),
-        Statement::DropMaterializedView(dmv) => matviews::exec_drop_matview(db, schema, dmv),
-        Statement::Begin { .. }
-        | Statement::Commit
-        | Statement::Rollback
-        | Statement::Savepoint(_)
-        | Statement::ReleaseSavepoint(_)
-        | Statement::RollbackTo(_)
-        | Statement::SetTimezone { .. } => Err(SqlError::Unsupported(
-            "transaction / session control handled by Connection".into(),
-        )),
+    match outcome {
+        Ok(result) => result,
+        Err(payload) => std::panic::resume_unwind(payload),
     }
 }
 
+/// Execute against the caller's read snapshot. A stale immutable catalog is
+/// rejected before evaluation; Connection admits it from that same snapshot.
 pub fn execute_with_read(
+    rtx: &mut citadel_txn::read_txn::ReadTxn<'_>,
+    schema: &SchemaManager,
+    stmt: &Statement,
+    params: &[Value],
+) -> Result<ExecutionResult> {
+    check_cancelled(rtx.cancel_token())?;
+    schema.validate_read_catalog(rtx)?;
+    execute_with_admitted_read(rtx, schema, stmt, params)
+}
+
+pub(crate) fn execute_with_admitted_read(
     rtx: &mut citadel_txn::read_txn::ReadTxn<'_>,
     schema: &SchemaManager,
     stmt: &Statement,
@@ -602,8 +553,10 @@ pub fn execute_with_read(
                 inner,
             )?;
             if *analyze {
+                #[cfg(test)]
+                pause_after_explain_plan();
                 let span = Span::open(rtx.measure_scans());
-                let result = execute_with_read(rtx, schema, inner, _params)?;
+                let result = execute_with_admitted_read(rtx, schema, inner, _params)?;
                 let measured = span.close(&result);
                 explain::attach_measurement(&mut plan, &measured);
             }
@@ -639,8 +592,37 @@ pub fn execute_with_read(
     }
 }
 
+/// Insert through an immutable catalog already matching the caller's writer.
+/// Stale catalogs are refused before mutation; `execute_in_txn` can refresh a
+/// mutable catalog from that same writer.
+pub fn exec_insert_in_txn(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    schema: &SchemaManager,
+    stmt: &InsertStmt,
+    params: &[Value],
+) -> Result<ExecutionResult> {
+    wtx.check_usable().map_err(SqlError::Storage)?;
+    check_cancelled(wtx.cancel_token())?;
+    schema.validate_write_catalog(wtx)?;
+    dml::exec_insert_in_admitted_txn(wtx, schema, stmt, params)
+}
+
+pub(crate) use dml::exec_insert_in_admitted_txn;
+
 /// Execute a parsed SQL statement within an existing write transaction.
 pub fn execute_in_txn(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    schema: &mut SchemaManager,
+    stmt: &Statement,
+    params: &[Value],
+) -> Result<ExecutionResult> {
+    wtx.check_usable().map_err(SqlError::Storage)?;
+    check_cancelled(wtx.cancel_token())?;
+    schema.admit_owned_write(wtx)?;
+    execute_in_admitted_txn(wtx, schema, stmt, params)
+}
+
+pub(crate) fn execute_in_admitted_txn(
     wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
     schema: &mut SchemaManager,
     stmt: &Statement,
@@ -662,6 +644,11 @@ pub fn execute_in_txn(
             std::panic::resume_unwind(payload)
         }
     };
+    if outcome.is_ok() && stmt_mutates_schema(stmt) {
+        if let Err(error) = schema.bind_write_catalog(wtx) {
+            outcome = Err(error);
+        }
+    }
     // The caller still owns this uncommitted transaction. Catch a cancel that
     // arrived after the final inner-loop check but before success was returned.
     if outcome.is_ok() {
@@ -704,7 +691,7 @@ fn execute_in_txn_inner(
         Statement::CreateView(cv) => exec_create_view_in_txn(wtx, schema, cv),
         Statement::DropView(dv) => exec_drop_view_in_txn(wtx, schema, dv),
         Statement::AlterTable(at) => exec_alter_table_in_txn(wtx, schema, at),
-        Statement::Insert(ins) => exec_insert_in_txn(wtx, schema, ins, params),
+        Statement::Insert(ins) => exec_insert_in_admitted_txn(wtx, schema, ins, params),
         Statement::Select(sq) => exec_select_query_in_txn(wtx, schema, sq),
         Statement::Update(upd) => exec_update_in_txn(wtx, schema, upd),
         Statement::Delete(del) => exec_delete_in_txn(wtx, schema, del),
@@ -721,7 +708,7 @@ fn execute_in_txn_inner(
             )?;
             if *analyze {
                 let span = Span::open(wtx.measure_scans());
-                let result = execute_in_txn(wtx, schema, inner, params)?;
+                let result = execute_in_admitted_txn(wtx, schema, inner, params)?;
                 let measured = span.close(&result);
                 explain::attach_measurement(&mut plan, &measured);
             }

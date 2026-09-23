@@ -60,27 +60,6 @@ fn resolves_in_unknown_column_false() {
 }
 
 #[test]
-fn col_name_lower_column() {
-    assert_eq!(col_name_lower(&Expr::Column("X".into())), Some("x".into()));
-}
-
-#[test]
-fn col_name_lower_qualified() {
-    assert_eq!(
-        col_name_lower(&Expr::QualifiedColumn {
-            table: "T".into(),
-            column: "Col".into(),
-        }),
-        Some("col".into())
-    );
-}
-
-#[test]
-fn col_name_lower_non_column_returns_none() {
-    assert_eq!(col_name_lower(&Expr::Literal(i(1))), None);
-}
-
-#[test]
 fn collect_column_names_single_column() {
     let mut out = Vec::new();
     collect_column_names(&Expr::Column("X".into()), &mut out);

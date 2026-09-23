@@ -546,10 +546,11 @@ struct TransactionTimezone {
 
 /// Active transaction held by a Connection. `None` outside BEGIN/COMMIT;
 /// `Write` for normal BEGIN (or BEGIN READ WRITE); `Read` for BEGIN READ ONLY.
-#[allow(clippy::large_enum_variant)]
 pub(crate) enum ActiveTxn<'a> {
     None,
-    Write(WriteTxn<'a>),
+    // A writer owns substantial mutation state. Keep it out of the inline
+    // representation moved for every short-lived read statement.
+    Write(Box<WriteTxn<'a>>),
     Read(citadel_txn::read_txn::ReadTxn<'a>),
 }
 
@@ -565,7 +566,7 @@ impl<'a> ActiveTxn<'a> {
     }
     fn as_write_mut(&mut self) -> Option<&mut WriteTxn<'a>> {
         match self {
-            ActiveTxn::Write(w) => Some(w),
+            ActiveTxn::Write(w) => Some(w.as_mut()),
             _ => None,
         }
     }
@@ -592,6 +593,7 @@ impl<'a> ActiveTxn<'a> {
 pub(crate) struct ConnectionInner<'a> {
     pub(crate) schema: SchemaManager,
     active_txn: ActiveTxn<'a>,
+    statement_txn: bool,
     savepoint_stack: Vec<SavepointEntry>,
     pub(crate) stmt_cache: LruCache<String, CacheEntry>,
     txn_start_ts: Option<i64>,
@@ -625,6 +627,7 @@ impl<'a> Connection<'a> {
             inner: RefCell::new(ConnectionInner {
                 schema,
                 active_txn: ActiveTxn::None,
+                statement_txn: false,
                 savepoint_stack: Vec::new(),
                 stmt_cache,
                 txn_start_ts: None,
@@ -656,48 +659,14 @@ impl<'a> Connection<'a> {
             .set_session_timezone_impl(&timezone, false)
     }
 
-    /// A miss that another connection's DDL would explain, so it is worth reloading for.
-    fn is_schema_miss(&self, e: &SqlError) -> bool {
-        matches!(
-            e,
-            SqlError::TableNotFound(_) | SqlError::ColumnNotFound(_) | SqlError::ViewNotFound(_)
-        ) && !self.in_transaction()
-    }
-
-    /// Run `f`, reloading the schema and retrying once if it missed on a name.
-    ///
-    /// The schema is read at open, so reloading only on a miss keeps the happy path
-    /// free of any staleness check.
-    fn with_schema_retry<T>(
-        &self,
-        mut f: impl FnMut(&mut ConnectionInner<'a>) -> Result<T>,
-    ) -> Result<T> {
-        // Bound, not matched on directly: the guard borrows, and the scrutinee's own
-        // borrow would still be live.
-        let first = f(&mut self.inner.borrow_mut());
-        match first {
-            Err(ref e) if self.is_schema_miss(e) => {}
-            other => return other,
-        }
-        // `generation` counts local edits, so the reload is the only check.
-        let mut fresh = SchemaManager::load(self.db)?;
-        {
-            let mut inner = self.inner.borrow_mut();
-            fresh.bump_generation_past(inner.schema.generation());
-            fresh.adopt_temp_aliases(&inner.schema);
-            inner.schema = fresh;
-        }
-        // The retry's own error: it names what is missing from the schema now in force,
-        // where the first names only what was missing from the stale one.
-        f(&mut self.inner.borrow_mut())
-    }
-
     pub fn execute(&self, sql: &str) -> Result<ExecutionResult> {
-        self.with_schema_retry(|inner| inner.execute_impl(self.db, sql))
+        self.inner.borrow_mut().execute_impl(self.db, sql)
     }
 
     pub fn execute_params(&self, sql: &str, params: &[Value]) -> Result<ExecutionResult> {
-        self.with_schema_retry(|inner| inner.execute_params_impl(self.db, sql, params))
+        self.inner
+            .borrow_mut()
+            .execute_params_impl(self.db, sql, params)
     }
 
     /// Execute one internal recovery write without inheriting the database's
@@ -757,7 +726,8 @@ impl<'a> Connection<'a> {
         };
         let mut completed = Vec::with_capacity(stmts.len());
         for stmt in stmts {
-            let result = self.with_schema_retry(|inner| {
+            let result = {
+                let mut inner = self.inner.borrow_mut();
                 if let Some(budget) = budget.filter(|_| {
                     matches!(&stmt, Statement::Select(_)) && !executor::stmt_mutates(&stmt)
                 }) {
@@ -765,7 +735,7 @@ impl<'a> Connection<'a> {
                 } else {
                     inner.dispatch(self.db, &stmt, &[])
                 }
-            });
+            };
             match result {
                 Ok(r) => completed.push(r),
                 Err(e) => {
@@ -783,7 +753,7 @@ impl<'a> Connection<'a> {
     }
 
     pub fn execute_batch(&self, sql: &str) -> Result<Vec<ExecutionResult>> {
-        self.with_schema_retry(|inner| inner.execute_batch_impl(self.db, sql))
+        self.inner.borrow_mut().execute_batch_impl(self.db, sql)
     }
 
     pub fn query(&self, sql: &str) -> Result<QueryResult> {
@@ -819,9 +789,9 @@ impl<'a> Connection<'a> {
         params: &[Value],
         budget: &ReadBudget,
     ) -> Result<QueryResult> {
-        self.with_schema_retry(|inner| {
-            inner.query_params_bounded_impl(self.db, sql, params, budget.clone())
-        })
+        self.inner
+            .borrow_mut()
+            .query_params_bounded_impl(self.db, sql, params, budget.clone())
     }
 
     pub fn prepare(&self, sql: &str) -> Result<PreparedStatement<'_, 'a>> {
@@ -854,12 +824,8 @@ impl<'a> Connection<'a> {
     }
 
     pub fn refresh_schema(&self) -> Result<()> {
-        let mut new_schema = SchemaManager::load(self.db)?;
         let mut inner = self.inner.borrow_mut();
-        new_schema.bump_generation_past(inner.schema.generation());
-        new_schema.adopt_temp_aliases(&inner.schema);
-        inner.schema = new_schema;
-        Ok(())
+        inner.admit_schema_for_prepare(self.db)
     }
 
     /// Freeze the ANN index for `table.column` into a persisted segment: build
@@ -880,19 +846,9 @@ impl<'a> Connection<'a> {
                 "persist_ann_index: not allowed inside an explicit transaction".into(),
             ));
         }
-        let inner = self.inner.borrow();
-        executor::reject_legacy_volatile_schema(&inner.schema)?;
+        let mut inner = self.inner.borrow_mut();
         let lower = table.to_ascii_lowercase();
-        if inner.schema.resolve_temp(&lower) != lower {
-            return Err(SqlError::InvalidValue(
-                "persist_ann_index: TEMP tables are not persistable".into(),
-            ));
-        }
-        let table_schema = inner
-            .schema
-            .get(&lower)
-            .ok_or_else(|| SqlError::TableNotFound(table.to_string()))?;
-        crate::executor::persist_ann_index(self.db, &inner.schema, table_schema, column)
+        crate::executor::persist_ann_index(self.db, &mut inner.schema, &lower, column)
     }
 
     /// The identity of the index currently cached for `table.column`:
@@ -987,33 +943,143 @@ impl<'a> ConnectionInner<'a> {
     }
 
     fn execute_impl(&mut self, db: &'a Database, sql: &str) -> Result<ExecutionResult> {
-        if let Some(rewritten) = rewrite_show_triggers(sql) {
-            return self.execute_params_impl(db, &rewritten, &[]);
-        }
-        if let Some(rewritten) = rewrite_show_matviews(sql) {
+        if let Some(rewritten) = rewrite_show_triggers(sql).or_else(|| rewrite_show_matviews(sql)) {
             return self.execute_params_impl(db, &rewritten, &[]);
         }
         if matches!(sql.as_bytes().first(), Some(b'I' | b'i')) {
             if let Some((normalized_key, extracted)) = try_normalize_insert(sql) {
-                let gen = self.schema.generation();
-                let stmt = if let Some(entry) = self.stmt_cache.get_mut(&normalized_key) {
-                    if entry.schema_gen == gen {
-                        let safe = *entry
-                            .literal_bindings_safe
-                            .get_or_insert_with(|| !self.schema.may_read_scoped_parameters());
-                        safe.then(|| Arc::clone(&entry.stmt))
+                let (stmt, _) = self.get_or_parse(&normalized_key)?;
+                return self.with_statement_txn(db, &stmt, |conn| {
+                    let gen = conn.schema.generation();
+                    let safe = if let Some(entry) = conn.stmt_cache.get_mut(&normalized_key) {
+                        if entry.schema_gen == gen {
+                            *entry
+                                .literal_bindings_safe
+                                .get_or_insert_with(|| !conn.schema.may_read_scoped_parameters())
+                        } else {
+                            conn.parse_and_cache(normalized_key, gen)?.is_some()
+                        }
                     } else {
-                        self.parse_and_cache(normalized_key, gen)?
+                        conn.parse_and_cache(normalized_key, gen)?.is_some()
+                    };
+                    if safe {
+                        conn.dispatch(db, &stmt, &extracted)
+                    } else {
+                        conn.execute_params_impl(db, sql, &[])
                     }
-                } else {
-                    self.parse_and_cache(normalized_key, gen)?
-                };
-                if let Some(stmt) = stmt {
-                    return self.dispatch(db, &stmt, &extracted);
-                }
+                });
             }
         }
         self.execute_params_impl(db, sql, &[])
+    }
+
+    /// Acquire the execution view before any schema-dependent planning. The
+    /// same transaction is then passed to the compiled/interpreted executor.
+    pub(crate) fn with_statement_txn<T>(
+        &mut self,
+        db: &'a Database,
+        stmt: &Statement,
+        run: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        if self.active_txn.is_active()
+            || is_txn_control(stmt)
+            || matches!(stmt, Statement::SetTimezone { .. })
+        {
+            return run(self);
+        }
+        // This operation owns a read prescan and a later short writer itself.
+        if matches!(stmt, Statement::CreateIndex(index) if index.concurrently)
+            || matches!(stmt, Statement::RefreshMaterializedView(refresh) if refresh.concurrently)
+        {
+            self.schema.admit_read(db, &mut db.begin_read())?;
+            return run(self);
+        }
+        let txn = if executor::stmt_mutates(stmt) {
+            let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
+            self.schema.admit_write(db, &mut wtx)?;
+            ActiveTxn::Write(Box::new(wtx))
+        } else {
+            let mut rtx = db.begin_read();
+            self.schema.admit_read(db, &mut rtx)?;
+            ActiveTxn::Read(rtx)
+        };
+        self.with_owned_statement_txn(db, stmt, txn, run)
+    }
+
+    /// Continue a prepared read on the snapshot used to select its capability.
+    pub(crate) fn with_admitted_read<T>(
+        &mut self,
+        db: &'a Database,
+        stmt: &Statement,
+        rtx: citadel_txn::read_txn::ReadTxn<'a>,
+        run: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        debug_assert!(self.active_txn.is_none());
+        self.with_owned_statement_txn(db, stmt, ActiveTxn::Read(rtx), run)
+    }
+
+    fn with_owned_statement_txn<T>(
+        &mut self,
+        db: &'a Database,
+        stmt: &Statement,
+        txn: ActiveTxn<'a>,
+        run: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let mutates = matches!(&txn, ActiveTxn::Write(_));
+        self.active_txn = txn;
+        let mut schema_snapshot =
+            executor::stmt_mutates_schema(stmt).then(|| self.schema.save_snapshot());
+        let mut dml_snapshot =
+            (mutates && schema_snapshot.is_none()).then(|| self.schema.save_dml_snapshot());
+        let temp_len = self.temp_table_names.len();
+        self.statement_txn = true;
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(self)));
+        self.statement_txn = false;
+        let owned = self.active_txn.take();
+        let outcome = match outcome {
+            Ok(Ok(value)) => {
+                let commit = match owned {
+                    ActiveTxn::Write(wtx) => {
+                        let mut wtx = *wtx;
+                        let manager_id = wtx.manager_id();
+                        crate::executor::helpers::drain_deferred_fk_checks(&mut wtx, &self.schema)
+                            .and_then(|()| executor::commit_with_ann_publication(wtx, &self.schema))
+                            .map(|generation| {
+                                self.schema.bind_committed_catalog(manager_id, generation);
+                            })
+                    }
+                    ActiveTxn::Read(_) => Ok(()),
+                    ActiveTxn::None => unreachable!("statement owns its transaction"),
+                };
+                Ok(commit.map(|()| value))
+            }
+            other => {
+                drop(owned);
+                other
+            }
+        };
+        if !matches!(&outcome, Ok(Ok(_))) {
+            if let Some(snapshot) = schema_snapshot.take() {
+                self.schema.restore_snapshot(snapshot);
+            } else if let Some(snapshot) = dml_snapshot.take() {
+                self.schema.restore_dml_snapshot(snapshot);
+            }
+            self.temp_table_names.truncate(temp_len);
+        }
+        try_drain_deferred_temp_drops(db);
+        match outcome {
+            Ok(result) => result,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    pub(crate) fn admit_schema_for_prepare(&mut self, db: &'a Database) -> Result<()> {
+        // An active transaction was admitted when acquired; its local DDL and
+        // savepoint snapshots already update the schema and local generation.
+        if self.active_txn.is_none() {
+            self.schema.admit_read(db, &mut db.begin_read())?;
+        }
+        Ok(())
     }
 
     fn execute_batch_impl(&mut self, db: &'a Database, sql: &str) -> Result<Vec<ExecutionResult>> {
@@ -1030,9 +1096,10 @@ impl<'a> ConnectionInner<'a> {
             ));
         }
 
-        let wtx = db.begin_write().map_err(SqlError::Storage)?;
+        let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
+        self.schema.admit_write(db, &mut wtx)?;
         let ts = crate::datetime::now_micros();
-        self.active_txn = ActiveTxn::Write(wtx);
+        self.active_txn = ActiveTxn::Write(Box::new(wtx));
         self.begin_timezone_transaction();
         self.txn_start_ts = Some(ts);
 
@@ -1049,7 +1116,8 @@ impl<'a> ConnectionInner<'a> {
             }
 
             let commit = match self.active_txn.take() {
-                ActiveTxn::Write(mut wtx) => {
+                ActiveTxn::Write(wtx) => {
+                    let mut wtx = *wtx;
                     match crate::executor::helpers::drain_deferred_fk_checks(&mut wtx, &self.schema)
                     {
                         Ok(()) => {
@@ -1099,7 +1167,7 @@ impl<'a> ConnectionInner<'a> {
 
     fn abort_active_txn(&mut self, db: &'a Database) {
         if let ActiveTxn::Write(wtx) = self.active_txn.take() {
-            wtx.abort();
+            (*wtx).abort();
         }
         if let Ok(mut fresh) = SchemaManager::load_ignoring_cancel(db) {
             fresh.bump_generation_past(self.schema.generation());
@@ -1117,38 +1185,46 @@ impl<'a> ConnectionInner<'a> {
         sql: &str,
         params: &[Value],
     ) -> Result<ExecutionResult> {
-        let gen = self.schema.generation();
-        if self.active_txn.is_none() {
+        // Parsing is schema-independent. Retain the cached syntax and plan in
+        // one lookup, then validate the plan against the admitted snapshot.
+        let (stmt, param_count, cached_gen, cached_plan) =
             if let Some(entry) = self.stmt_cache.get(sql) {
-                if entry.schema_gen == gen && entry.param_count == params.len() {
-                    if let Some(plan) = entry.compiled.as_ref().map(Arc::clone) {
-                        let stmt = Arc::clone(&entry.stmt);
-                        return self.run_compiled(db, &plan, &stmt, params);
-                    }
-                }
-            }
-        }
-
-        let (stmt, param_count) = self.get_or_parse(sql)?;
-
+                (
+                    Arc::clone(&entry.stmt),
+                    entry.param_count,
+                    entry.schema_gen,
+                    entry.compiled.as_ref().map(Arc::clone),
+                )
+            } else {
+                let (stmt, count) = self.get_or_parse(sql)?;
+                (stmt, count, self.schema.generation(), None)
+            };
         if param_count != params.len() {
             return Err(SqlError::ParameterCountMismatch {
                 expected: param_count,
                 got: params.len(),
             });
         }
-
-        if self.active_txn.is_none() {
-            if let Some(plan) = executor::compile(&self.schema, &stmt) {
-                if let Some(e) = self.stmt_cache.get_mut(sql) {
-                    e.compiled = Some(Arc::clone(&plan));
+        self.with_statement_txn(db, &stmt, |conn| {
+            let gen = conn.schema.generation();
+            if cached_gen == gen {
+                if let Some(plan) = cached_plan {
+                    return conn.run_compiled_in_txn(db, &plan, &stmt, params, false);
                 }
-                let stmt_owned = Arc::clone(&stmt);
-                return self.run_compiled(db, &plan, &stmt_owned, params);
             }
-        }
-
-        self.dispatch(db, &stmt, params)
+            if let Some(plan) = executor::compile(&conn.schema, &stmt) {
+                if let Some(entry) = conn.stmt_cache.get_mut(sql) {
+                    if entry.schema_gen != gen {
+                        entry.literal_bindings_safe = None;
+                    }
+                    entry.schema_gen = gen;
+                    entry.compiled = Some(Arc::clone(&plan));
+                }
+                conn.run_compiled_in_txn(db, &plan, &stmt, params, false)
+            } else {
+                conn.dispatch(db, &stmt, params)
+            }
+        })
     }
 
     fn query_params_bounded_impl(
@@ -1204,10 +1280,11 @@ impl<'a> ConnectionInner<'a> {
         let timezone = self.session_timezone.zone.clone();
         let jsonpath_context = self.jsonpath_session_context(statement_timestamp);
         let mut rtx = db.begin_read();
+        self.schema.admit_read(db, &mut rtx)?;
         rtx.set_read_budget(Some(budget));
         let execute = || {
             crate::eval::with_scoped_params(params, || {
-                executor::execute_with_read(&mut rtx, &self.schema, stmt, params)
+                executor::execute_with_admitted_read(&mut rtx, &self.schema, stmt, params)
             })
         };
         crate::datetime::with_session_timezone(timezone, || {
@@ -1273,14 +1350,14 @@ impl<'a> ConnectionInner<'a> {
         if parsed.is_empty() {
             return Ok(Vec::new());
         }
-        executor::reject_legacy_volatile_schema(&self.schema)?;
-
         let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
         // `begin_write` inherits the handle token. Recovery is the exceptional
         // case: clear it before the first storage operation.
         wtx.set_cancel(None);
+        self.schema.admit_write(db, &mut wtx)?;
+        executor::reject_legacy_volatile_schema(&self.schema)?;
         let ts = crate::datetime::now_micros();
-        self.active_txn = ActiveTxn::Write(wtx);
+        self.active_txn = ActiveTxn::Write(Box::new(wtx));
         self.begin_timezone_transaction();
         self.txn_start_ts = Some(ts);
 
@@ -1291,7 +1368,7 @@ impl<'a> ConnectionInner<'a> {
                     Ok(value) => values.push(value),
                     Err(error) => {
                         if let ActiveTxn::Write(wtx) = self.active_txn.take() {
-                            wtx.abort();
+                            (*wtx).abort();
                         }
                         self.finish_timezone_transaction(false);
                         self.reset_txn_state();
@@ -1301,7 +1378,8 @@ impl<'a> ConnectionInner<'a> {
                 }
             }
             let result = match self.active_txn.take() {
-                ActiveTxn::Write(mut wtx) => {
+                ActiveTxn::Write(wtx) => {
+                    let mut wtx = *wtx;
                     match crate::executor::helpers::drain_deferred_fk_checks(&mut wtx, &self.schema)
                     {
                         Ok(()) => {
@@ -1330,39 +1408,6 @@ impl<'a> ConnectionInner<'a> {
                 std::panic::resume_unwind(payload)
             }
         }
-    }
-
-    fn run_compiled(
-        &mut self,
-        db: &'a Database,
-        plan: &Arc<dyn executor::CompiledPlan>,
-        stmt: &Statement,
-        params: &[Value],
-    ) -> Result<ExecutionResult> {
-        use executor::compile::ActiveTxnRef;
-        self.guarded(db, AtTheDoor::Refuse, stmt, |conn| {
-            let statement_timestamp = crate::datetime::now_micros();
-            let transaction_timestamp = conn.txn_start_ts.unwrap_or(statement_timestamp);
-            let timezone = conn.session_timezone.zone.clone();
-            let jsonpath_context = conn.jsonpath_session_context(transaction_timestamp);
-            let schema = &conn.schema;
-            let exec = || {
-                crate::eval::with_scoped_params(params, || {
-                    plan.execute(db, schema, stmt, params, ActiveTxnRef::None)
-                })
-            };
-            crate::datetime::with_session_timezone(timezone, || {
-                crate::datetime::with_statement_clock(Some(statement_timestamp), || {
-                    if plan.needs_txn_clock() {
-                        crate::datetime::with_txn_clock(Some(transaction_timestamp), || {
-                            crate::json::with_jsonpath_session_context(jsonpath_context, exec)
-                        })
-                    } else {
-                        crate::json::with_jsonpath_session_context(jsonpath_context, exec)
-                    }
-                })
-            })
-        })
     }
 
     pub(crate) fn parse_and_cache(
@@ -1431,12 +1476,10 @@ impl<'a> ConnectionInner<'a> {
         stmt: &Statement,
         compiled: Option<&Arc<dyn executor::CompiledPlan>>,
         params: &[Value],
+        collect: bool,
     ) -> Result<ExecutionResult> {
         if let Some(plan) = compiled {
-            if self.active_txn.is_none() {
-                return self.run_compiled(db, plan, stmt, params);
-            }
-            return self.run_compiled_in_txn(db, plan, stmt, params);
+            return self.run_compiled_in_txn(db, plan, stmt, params, collect);
         }
         self.dispatch(db, stmt, params)
     }
@@ -1447,6 +1490,7 @@ impl<'a> ConnectionInner<'a> {
         plan: &Arc<dyn executor::CompiledPlan>,
         stmt: &Statement,
         params: &[Value],
+        collect: bool,
     ) -> Result<ExecutionResult> {
         use executor::compile::ActiveTxnRef;
         self.guarded(db, AtTheDoor::Refuse, stmt, |conn| {
@@ -1455,6 +1499,15 @@ impl<'a> ConnectionInner<'a> {
             // the write transaction just because a savepoint is pending.
             if !conn.savepoint_stack.is_empty() && executor::stmt_mutates(stmt) {
                 conn.capture_pending_snapshots();
+            }
+            // Fast collection proves that all projected and hidden expressions
+            // are independent of the session scope, just like streaming.
+            if collect {
+                if let ActiveTxn::Read(rtx) = &mut conn.active_txn {
+                    if let Some(result) = plan.try_collect(rtx, &conn.schema, stmt, params) {
+                        return result.map(ExecutionResult::Query);
+                    }
+                }
             }
             // Only a positive compiled proof covers every interpreter fallback
             // and schema expression. Other plans retain the full statement scope.
@@ -1474,16 +1527,20 @@ impl<'a> ConnectionInner<'a> {
             };
             let schema = &conn.schema;
             let txn = match &mut conn.active_txn {
-                ActiveTxn::Write(wtx) => ActiveTxnRef::Write(wtx),
+                ActiveTxn::Write(wtx) => ActiveTxnRef::Write(wtx.as_mut()),
                 ActiveTxn::Read(rtx) => ActiveTxnRef::Read(rtx),
-                ActiveTxn::None => ActiveTxnRef::None,
+                ActiveTxn::None => {
+                    return Err(SqlError::InvalidValue(
+                        "compiled statement has no admitted transaction".into(),
+                    ))
+                }
             };
             let execute = || {
                 if !plan.uses_scoped_params() {
-                    plan.execute(db, schema, stmt, params, txn)
+                    plan.execute(schema, stmt, params, txn)
                 } else {
                     crate::eval::with_scoped_params(params, || {
-                        plan.execute(db, schema, stmt, params, txn)
+                        plan.execute(schema, stmt, params, txn)
                     })
                 }
             };
@@ -1530,7 +1587,8 @@ impl<'a> ConnectionInner<'a> {
         // cancelling statements the caller has since moved past.
         let token = db.cancel_token();
         let mutates = executor::stmt_mutates(stmt);
-        let explicit = door == AtTheDoor::Refuse && self.active_txn.is_active();
+        let explicit =
+            door == AtTheDoor::Refuse && self.active_txn.is_active() && !self.statement_txn;
         if door == AtTheDoor::Refuse {
             if let Some(wtx) = self.active_txn.as_write_mut() {
                 wtx.check_usable().map_err(SqlError::Storage)?;
@@ -1621,8 +1679,10 @@ impl<'a> ConnectionInner<'a> {
         } else {
             AtTheDoor::Refuse
         };
-        self.guarded(db, door, stmt, |conn| {
-            conn.dispatch_clocked(db, stmt, params)
+        self.with_statement_txn(db, stmt, |conn| {
+            conn.guarded(db, door, stmt, |conn| {
+                conn.dispatch_clocked(db, stmt, params)
+            })
         })
     }
 
@@ -1663,12 +1723,14 @@ impl<'a> ConnectionInner<'a> {
                 let ts = crate::datetime::now_micros();
                 match access_mode {
                     BeginAccessMode::ReadOnly => {
-                        let rtx = db.begin_read();
+                        let mut rtx = db.begin_read();
+                        self.schema.admit_read(db, &mut rtx)?;
                         self.active_txn = ActiveTxn::Read(rtx);
                     }
                     BeginAccessMode::ReadWrite | BeginAccessMode::Default => {
-                        let wtx = db.begin_write().map_err(SqlError::Storage)?;
-                        self.active_txn = ActiveTxn::Write(wtx);
+                        let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
+                        self.schema.admit_write(db, &mut wtx)?;
+                        self.active_txn = ActiveTxn::Write(Box::new(wtx));
                     }
                 }
                 self.begin_timezone_transaction();
@@ -1678,7 +1740,8 @@ impl<'a> ConnectionInner<'a> {
             Statement::Commit => {
                 let outcome = match self.active_txn.take() {
                     ActiveTxn::None => return Err(SqlError::NoActiveTransaction),
-                    ActiveTxn::Write(mut wtx) => {
+                    ActiveTxn::Write(wtx) => {
+                        let mut wtx = *wtx;
                         match crate::executor::helpers::drain_deferred_fk_checks(
                             &mut wtx,
                             &self.schema,
@@ -1718,7 +1781,7 @@ impl<'a> ConnectionInner<'a> {
                 let reload = match self.active_txn.take() {
                     ActiveTxn::None => return Err(SqlError::NoActiveTransaction),
                     ActiveTxn::Write(wtx) => {
-                        wtx.abort();
+                        (*wtx).abort();
                         Some(SchemaManager::load_ignoring_cancel(db))
                     }
                     ActiveTxn::Read(_rtx) => None,
@@ -1762,7 +1825,12 @@ impl<'a> ConnectionInner<'a> {
                 clone.temporary = false;
                 let stmt_concrete = Statement::CreateTable(clone);
                 let outcome = if let Some(wtx) = self.active_txn.as_write_mut() {
-                    executor::execute_in_txn(wtx, &mut self.schema, &stmt_concrete, params)?
+                    executor::execute_in_admitted_txn(
+                        wtx,
+                        &mut self.schema,
+                        &stmt_concrete,
+                        params,
+                    )?
                 } else {
                     executor::execute(db, &mut self.schema, &stmt_concrete, params)?
                 };
@@ -1774,7 +1842,7 @@ impl<'a> ConnectionInner<'a> {
             Statement::Insert(ins) if self.active_txn.as_write_mut().is_some() => {
                 self.capture_pending_snapshots();
                 let wtx = self.active_txn.as_write_mut().unwrap();
-                executor::exec_insert_in_txn(wtx, &self.schema, ins, params)
+                executor::exec_insert_in_admitted_txn(wtx, &self.schema, ins, params)
             }
             _ => {
                 if self.active_txn.is_read_only() && executor::stmt_mutates(stmt) {
@@ -1787,10 +1855,10 @@ impl<'a> ConnectionInner<'a> {
                 }
                 let outcome = match &mut self.active_txn {
                     ActiveTxn::Write(wtx) => {
-                        executor::execute_in_txn(wtx, &mut self.schema, stmt, params)?
+                        executor::execute_in_admitted_txn(wtx, &mut self.schema, stmt, params)?
                     }
                     ActiveTxn::Read(rtx) => {
-                        executor::execute_with_read(rtx, &self.schema, stmt, params)?
+                        executor::execute_with_admitted_read(rtx, &self.schema, stmt, params)?
                     }
                     ActiveTxn::None => executor::execute(db, &mut self.schema, stmt, params)?,
                 };
@@ -1932,6 +2000,13 @@ mod tests {
     use super::*;
     use citadel::{Argon2Profile, DatabaseBuilder};
 
+    #[test]
+    fn active_transaction_layout_keeps_read_state_inline() {
+        let read_bytes = std::mem::size_of::<citadel_txn::read_txn::ReadTxn<'_>>();
+        let active_bytes = std::mem::size_of::<ActiveTxn<'_>>();
+        assert!(active_bytes <= read_bytes + std::mem::align_of::<ActiveTxn<'_>>());
+    }
+
     fn fresh_db(dir: &std::path::Path) -> citadel::Database {
         DatabaseBuilder::new(dir.join("t.db"))
             .passphrase(b"test-passphrase")
@@ -1955,6 +2030,7 @@ mod tests {
         for sql in [
             "UPDATE t SET a=a+$1 WHERE id=$2",
             "UPDATE t SET a=COALESCE(a,$1) WHERE id >= $2 RETURNING a,d",
+            "SELECT a FROM t",
         ] {
             assert!(compiled_skips_context(&conn, sql), "{sql}");
         }
@@ -1964,7 +2040,7 @@ mod tests {
             "UPDATE t SET a=a+1 WHERE id=1 RETURNING CURRENT_DATE",
             "UPDATE t SET a=(SELECT 1) WHERE id=1",
             "DELETE FROM t WHERE id=1",
-            "SELECT a FROM t",
+            "SELECT CURRENT_DATE FROM t",
             "INSERT INTO t(id,a) SELECT id,a FROM t",
         ] {
             assert!(!compiled_skips_context(&conn, sql), "{sql}");
@@ -3224,7 +3300,8 @@ mod tests {
                     };
                     let _ = crate::executor::exec_insert_in_txn(&mut wtx, &schema, insert, &[]);
                 } else {
-                    let _ = crate::executor::execute_in_txn(&mut wtx, &mut schema, &stmt, &[]);
+                    let _ =
+                        crate::executor::execute_in_admitted_txn(&mut wtx, &mut schema, &stmt, &[]);
                 }
             }))
             .expect_err("the injected comparator panic did not surface");

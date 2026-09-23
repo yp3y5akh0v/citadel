@@ -559,7 +559,7 @@ fn eval_aggregate_expr_with_cancel(
             }
         }
 
-        Expr::Literal(v) => Ok(v.clone()),
+        Expr::Literal(v) | Expr::BoundColumn { value: v, .. } => Ok(v.clone()),
 
         Expr::BinaryOp { left, op, right } => {
             let l = eval_aggregate_expr_with_cancel(left, col_map, group_rows, cancel)?;

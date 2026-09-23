@@ -1065,3 +1065,74 @@ fn text_key_upsert_scratch_isolates_nested_triggers_and_returning() {
         assert!(db.manager().integrity_check().unwrap().is_ok());
     }
 }
+
+#[test]
+fn selective_materialization_evaluates_closed_siblings_once_and_keeps_nested_scopes() {
+    let predicate = crate::parser::parse_sql_expr("(SELECT v FROM fixed) > 0 AND EXISTS (SELECT 1 FROM dependent WHERE dependent.v=outer_t.v AND EXISTS (SELECT 1 FROM nested WHERE nested.v=dependent.v))").unwrap();
+    let mut visits = Vec::new();
+    let closed = materialize_expr_selective(&predicate, &mut |query| {
+        visits.push(query.from.clone());
+        match query.from.as_str() {
+            "fixed" => Ok(Some(CteRows::binary(qr(vec!["v"], vec![vec![i(1)]])))),
+            "dependent" => Ok(None),
+            other => panic!("entered a deferred query's nested scope: {other}"),
+        }
+    })
+    .unwrap();
+    assert_eq!(visits, ["fixed", "dependent"]);
+    let mut dependent_calls = 0;
+    for _ in 0..32 {
+        let result = materialize_expr(&closed, &mut |query| {
+            assert_eq!(query.from, "dependent");
+            dependent_calls += 1;
+            Ok(CteRows::binary(qr(vec!["v"], vec![vec![i(1)]])))
+        })
+        .unwrap();
+        assert!(!has_subquery(&result));
+    }
+    assert_eq!(dependent_calls, 32);
+    assert_eq!(visits.iter().filter(|name| *name == "fixed").count(), 1);
+}
+
+#[test]
+fn selective_materialization_preserves_collation_nulls_and_refusal() {
+    use crate::types::Collation;
+    let predicate = crate::parser::parse_sql_expr("'UPPER' IN (SELECT v FROM fixed)").unwrap();
+    let result = materialize_expr_selective(&predicate, &mut |_| {
+        Ok(Some(CteRows::new(
+            qr(
+                vec!["v"],
+                vec![vec![Value::Text("upper".into())], vec![Value::Null]],
+            ),
+            vec![Collation::NoCase],
+        )))
+    })
+    .unwrap();
+    assert!(matches!(
+        result,
+        Expr::InSet {
+            has_null: true,
+            collation: Collation::NoCase,
+            ..
+        }
+    ));
+    let predicate = crate::parser::parse_sql_expr("(SELECT v FROM fixed) COLLATE NOCASE").unwrap();
+    let result = materialize_expr_selective(&predicate, &mut |_| {
+        Ok(Some(CteRows::binary(qr(
+            vec!["v"],
+            vec![vec![Value::Text("upper".into())]],
+        ))))
+    })
+    .unwrap();
+    assert!(
+        matches!(result, Expr::Collate { expr, collation: Collation::NoCase } if matches!(*expr, Expr::Literal(Value::Text(_))))
+    );
+    let error = materialize_expr_selective(&predicate, &mut |_| {
+        Err(SqlError::Storage(citadel_core::Error::Interrupted))
+    })
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        SqlError::Storage(citadel_core::Error::Interrupted)
+    ));
+}

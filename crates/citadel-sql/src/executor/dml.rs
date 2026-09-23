@@ -1,7 +1,6 @@
 use std::cell::RefCell;
 use std::sync::Arc;
 
-use citadel::Database;
 use citadel_buffer::btree::{UpsertAction, UpsertOutcome};
 use citadel_txn::read_txn::ReadTxn;
 use citadel_txn::write_txn::WriteTxn;
@@ -106,538 +105,6 @@ fn bind_selected_row(
     Ok(())
 }
 
-pub(super) fn exec_insert(
-    db: &Database,
-    schema: &SchemaManager,
-    stmt: &InsertStmt,
-    params: &[Value],
-) -> Result<ExecutionResult> {
-    let empty_ctes = CteContext::default();
-    if let Some(plan) = super::insert_copy::CopyPlan::new(schema, stmt, &empty_ctes) {
-        let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
-        let result = plan.execute(&mut wtx, schema)?;
-        super::commit_with_ann_publication(wtx, schema)?;
-        return Ok(result);
-    }
-    let materialized;
-    let stmt = if insert_has_subquery(stmt) {
-        materialized = materialize_insert(stmt, &mut |sub| {
-            exec_subquery_read(db, schema, sub, &empty_ctes)
-        })?;
-        &materialized
-    } else {
-        stmt
-    };
-
-    let lower_name = stmt.table.to_ascii_lowercase();
-    if let Some(view_def) = schema.get_view(&lower_name) {
-        if super::triggers::has_instead_of(schema, &lower_name, super::triggers::FireEvent::Insert)
-        {
-            let aliases = view_def.column_aliases.clone();
-            return exec_instead_of_view_insert_auto(
-                db,
-                schema,
-                &lower_name,
-                &aliases,
-                stmt,
-                params,
-            );
-        }
-        return Err(SqlError::CannotModifyView(stmt.table.clone()));
-    }
-    if schema.get_matview(&lower_name).is_some() {
-        return Err(SqlError::CannotModifyView(format!(
-            "materialized view '{}' is read-only — use REFRESH MATERIALIZED VIEW",
-            stmt.table
-        )));
-    }
-    let table_schema = schema
-        .get(&lower_name)
-        .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
-
-    let insert_columns = if stmt.columns.is_empty() {
-        table_schema
-            .columns
-            .iter()
-            .map(|c| c.name.clone())
-            .collect::<Vec<_>>()
-    } else {
-        stmt.columns
-            .iter()
-            .map(|c| c.to_ascii_lowercase())
-            .collect()
-    };
-
-    let col_indices: Vec<usize> = insert_columns
-        .iter()
-        .map(|name| {
-            table_schema
-                .column_index(name)
-                .ok_or_else(|| SqlError::ColumnNotFound(name.clone()))
-        })
-        .collect::<Result<_>>()?;
-
-    for &ci in &col_indices {
-        if table_schema.columns[ci].generated_kind.is_some() {
-            return Err(SqlError::CannotInsertIntoGeneratedColumn(
-                table_schema.columns[ci].name.clone(),
-            ));
-        }
-    }
-
-    let defaults: Vec<(usize, &Expr)> = table_schema
-        .columns
-        .iter()
-        .filter(|c| c.default_expr.is_some() && !col_indices.contains(&(c.position as usize)))
-        .map(|c| (c.position as usize, c.default_expr.as_ref().unwrap()))
-        .collect();
-
-    let required_virtuals = required_insert_virtuals(schema, table_schema, stmt);
-    let generated_cols: Vec<(usize, &Expr)> = table_schema
-        .columns
-        .iter()
-        .filter(|c| {
-            matches!(c.generated_kind, Some(crate::parser::GeneratedKind::Stored))
-                || required_virtuals
-                    .before_insert
-                    .contains(&(c.position as usize))
-        })
-        .map(|c| (c.position as usize, c.generated_expr.as_ref().unwrap()))
-        .collect();
-
-    let has_checks = table_schema.has_checks();
-    let strict = table_schema.is_strict();
-    let row_col_map_for_gen = (!generated_cols.is_empty()).then(|| table_schema.column_map());
-    let check_col_map = has_checks.then(|| table_schema.column_map());
-
-    let cancel = db.cancel_token();
-    let mut select_rows = match &stmt.source {
-        InsertSource::Select(sq) => {
-            let insert_ctes = super::materialize_all_ctes(
-                &sq.ctes,
-                sq.recursive,
-                cancel.as_ref(),
-                &mut |body, ctx| {
-                    let result = exec_query_body_read(db, schema, body, ctx)?;
-                    let collations =
-                        body_output_collations(schema, ctx, body, result.columns.len());
-                    Ok(CteRows::new(result, collations))
-                },
-            )?;
-            let qr = exec_query_body_read(db, schema, &sq.body, &insert_ctes)?;
-            Some(insert_select_rows(qr, insert_columns.len())?)
-        }
-        InsertSource::Values(_) => None,
-    };
-
-    let compiled_conflict: Option<Arc<CompiledOnConflict>> = stmt
-        .on_conflict
-        .as_ref()
-        .map(|oc| compile_on_conflict(oc, table_schema).map(Arc::new))
-        .transpose()?;
-
-    let row_col_map = compiled_conflict
-        .as_ref()
-        .map(|_| table_schema.column_map());
-
-    let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
-    // DML invalidates the table's persisted ANN segment in the SAME txn
-    // (rollback restores it; commit makes table-changed-but-segment-survives
-    // unrepresentable for this path).
-    if table_schema.has_ann_index() {
-        super::ann_persist::purge_segment(&mut wtx, &table_schema.name)?;
-    }
-    let mut count: u64 = 0;
-    let mut returning_rows: Option<Vec<super::helpers::ReturningRow>> =
-        stmt.returning.as_ref().map(|_| Vec::new());
-
-    let pk_indices = table_schema.pk_indices();
-    let non_pk = table_schema.non_pk_indices();
-    let enc_pos = table_schema.encoding_positions();
-    let phys_count = table_schema.physical_non_pk_count();
-    let mut row = vec![Value::Null; table_schema.columns.len()];
-    let mut pk_values: Vec<Value> = vec![Value::Null; pk_indices.len()];
-    let mut value_values: Vec<Value> = vec![Value::Null; phys_count];
-    let mut key_buf: Vec<u8> = Vec::with_capacity(64);
-    let mut value_buf: Vec<u8> = Vec::with_capacity(256);
-    let mut fk_key_buf: Vec<u8> = Vec::with_capacity(64);
-    let mut upsert_value_buf = Vec::new();
-
-    let values = match &stmt.source {
-        InsertSource::Values(rows) => Some(rows.as_slice()),
-        InsertSource::Select(_) => None,
-    };
-    let total = match (values, select_rows.as_deref()) {
-        (Some(rows), _) => rows.len(),
-        (_, Some(rows)) => rows.len(),
-        _ => 0,
-    };
-
-    let has_insert_statement_triggers = schema.triggers_for(&table_schema.name).iter().any(|t| {
-        t.enabled
-            && t.granularity == crate::parser::TriggerGranularity::ForEachStatement
-            && t.events
-                .iter()
-                .any(|e| matches!(e, crate::parser::TriggerEvent::Insert))
-    });
-    let mut stmt_new_rows: Vec<Vec<Value>> = if has_insert_statement_triggers {
-        Vec::with_capacity(total)
-    } else {
-        Vec::new()
-    };
-
-    if has_insert_statement_triggers {
-        super::triggers::fire_statement_triggers(
-            &mut wtx,
-            schema,
-            &table_schema.name,
-            crate::parser::TriggerTiming::Before,
-            super::triggers::FireEvent::Insert,
-            &table_schema.columns,
-            &[],
-            &[],
-        )?;
-    }
-
-    let plain_insert = compiled_conflict.is_none();
-    let single_int_pk = is_single_int_pk(table_schema);
-    let mut min_inserted_pk: Option<i64> = None;
-    let (has_before_insert_triggers, has_after_insert_triggers, has_after_update_triggers) =
-        row_insert_trigger_flags(schema, &table_schema.name);
-    let capture_insert_row =
-        returning_rows.is_some() || has_insert_statement_triggers || has_after_insert_triggers;
-
-    // The autocommit twin of the in-transaction row loop, and cancellable for
-    // the same reason: neither reaches a scan.
-    for idx in 0..total {
-        if let Some(t) = &cancel {
-            t.check().map_err(SqlError::Storage)?;
-        }
-        for v in row.iter_mut() {
-            *v = Value::Null;
-        }
-
-        if let Some(value_rows) = values {
-            let value_row = &value_rows[idx];
-            if value_row.len() != insert_columns.len() {
-                return Err(SqlError::InvalidValue(format!(
-                    "expected {} values, got {}",
-                    insert_columns.len(),
-                    value_row.len()
-                )));
-            }
-            for (i, expr) in value_row.iter().enumerate() {
-                let val = if let Expr::Parameter(n) = expr {
-                    params
-                        .get(n - 1)
-                        .cloned()
-                        .ok_or_else(|| SqlError::Parse(format!("unbound parameter ${n}")))?
-                } else {
-                    eval_const_expr_with_cancel(expr, cancel.as_ref())?
-                };
-                let col_idx = col_indices[i];
-                let col = &table_schema.columns[col_idx];
-                row[col_idx] = if val.is_null() {
-                    Value::Null
-                } else {
-                    coerce_for_column(val, col, strict)?
-                };
-            }
-        } else if let Some(sel) = select_rows.as_mut() {
-            bind_selected_row(&mut sel[idx], &mut row, &col_indices, table_schema)?;
-        }
-
-        for &(pos, def_expr) in &defaults {
-            let val = eval_const_expr_with_cancel(def_expr, cancel.as_ref())?;
-            let col = &table_schema.columns[pos];
-            if !val.is_null() {
-                row[pos] = coerce_for_column(val, col, strict)?;
-            }
-        }
-
-        if let Some(gen_map) = row_col_map_for_gen {
-            for &(pos, gen_expr) in &generated_cols {
-                let val = eval_expr(
-                    gen_expr,
-                    &EvalCtx::new(gen_map, &row).with_cancel(cancel.as_ref()),
-                )?;
-                let col = &table_schema.columns[pos];
-                row[pos] = if val.is_null() {
-                    Value::Null
-                } else {
-                    coerce_for_column(val, col, strict)?
-                };
-            }
-        }
-
-        for col in &table_schema.columns {
-            if !col.nullable && row[col.position as usize].is_null() {
-                return Err(SqlError::NotNullViolation(col.name.clone()));
-            }
-        }
-
-        if let Some(col_map) = check_col_map {
-            for col in &table_schema.columns {
-                if let Some(ref check) = col.check_expr {
-                    let result = eval_expr(
-                        check,
-                        &EvalCtx::new(col_map, &row).with_cancel(cancel.as_ref()),
-                    )?;
-                    if !is_truthy(&result) && !result.is_null() {
-                        let name = col.check_name.as_deref().unwrap_or(&col.name);
-                        return Err(SqlError::CheckViolation(name.to_string()));
-                    }
-                }
-            }
-            for tc in &table_schema.check_constraints {
-                let result = eval_expr(
-                    &tc.expr,
-                    &EvalCtx::new(col_map, &row).with_cancel(cancel.as_ref()),
-                )?;
-                if !is_truthy(&result) && !result.is_null() {
-                    let name = tc.name.as_deref().unwrap_or(&tc.sql);
-                    return Err(SqlError::CheckViolation(name.to_string()));
-                }
-            }
-        }
-
-        for fk in &table_schema.foreign_keys {
-            super::fk::check_row_reference(
-                &mut wtx,
-                schema,
-                table_schema,
-                fk,
-                &row,
-                &mut fk_key_buf,
-            )?;
-        }
-
-        if has_before_insert_triggers {
-            super::triggers::fire_row_triggers(
-                &mut wtx,
-                schema,
-                &table_schema.name,
-                crate::parser::TriggerTiming::Before,
-                super::triggers::FireEvent::Insert,
-                None,
-                Some(row.clone()),
-                &table_schema.columns,
-            )?;
-        }
-
-        for (j, &i) in pk_indices.iter().enumerate() {
-            pk_values[j] = std::mem::replace(&mut row[i], Value::Null);
-        }
-        encode_composite_key_into(&pk_values, &mut key_buf);
-        if plain_insert && single_int_pk {
-            if let Value::Integer(id) = &pk_values[0] {
-                min_inserted_pk = Some(min_inserted_pk.map_or(*id, |m| m.min(*id)));
-            }
-        }
-
-        for (j, &i) in non_pk.iter().enumerate() {
-            let col = &table_schema.columns[i];
-            if matches!(
-                col.generated_kind,
-                Some(crate::parser::GeneratedKind::Virtual)
-            ) {
-                value_values[enc_pos[j] as usize] = Value::Null;
-            } else {
-                value_values[enc_pos[j] as usize] = std::mem::replace(&mut row[i], Value::Null);
-            }
-        }
-        encode_row_into(&value_values, &mut value_buf);
-
-        if key_buf.len() > citadel_core::MAX_KEY_SIZE {
-            return Err(SqlError::KeyTooLarge {
-                size: key_buf.len(),
-                max: citadel_core::MAX_KEY_SIZE,
-            });
-        }
-        if value_buf.len() > citadel_core::MAX_VALUE_SIZE {
-            return Err(SqlError::RowTooLarge {
-                size: value_buf.len(),
-                max: citadel_core::MAX_VALUE_SIZE,
-            });
-        }
-
-        match compiled_conflict.as_ref() {
-            None => {
-                let is_new = wtx
-                    .table_insert_if_absent(table_schema.name.as_bytes(), &key_buf, &value_buf)
-                    .map_err(SqlError::Storage)?;
-                if !is_new {
-                    return Err(SqlError::DuplicateKey);
-                }
-                if !table_schema.indices.is_empty() || capture_insert_row {
-                    restore_insert_row(table_schema, &pk_values, &mut value_values, &mut row);
-                    if !table_schema.indices.is_empty() {
-                        insert_index_entries(&mut wtx, table_schema, &row, &pk_values)?;
-                    }
-                }
-                if capture_insert_row {
-                    materialize_insert_result_virtuals(
-                        table_schema,
-                        &required_virtuals.after_insert,
-                        &mut row,
-                        cancel.as_ref(),
-                    )?;
-                }
-                if has_after_insert_triggers {
-                    super::triggers::fire_row_triggers(
-                        &mut wtx,
-                        schema,
-                        &table_schema.name,
-                        crate::parser::TriggerTiming::After,
-                        super::triggers::FireEvent::Insert,
-                        None,
-                        Some(row.clone()),
-                        &table_schema.columns,
-                    )?;
-                }
-                if has_insert_statement_triggers {
-                    stmt_new_rows.push(row.clone());
-                }
-                count += 1;
-                if let Some(buf) = returning_rows.as_mut() {
-                    buf.push((None, Some(row.clone())));
-                }
-            }
-            Some(oc) => {
-                let oc_ref: &CompiledOnConflict = oc;
-                let needs_row = upsert_needs_row(oc_ref, table_schema);
-                if needs_row {
-                    restore_insert_row(table_schema, &pk_values, &mut value_values, &mut row);
-                }
-                let outcome = apply_insert_with_conflict(
-                    &mut wtx,
-                    schema,
-                    table_schema,
-                    &key_buf,
-                    &value_buf,
-                    &mut upsert_value_buf,
-                    &row,
-                    &pk_values,
-                    oc_ref,
-                    row_col_map.unwrap(),
-                    cancel.as_ref(),
-                    // Trigger dispatch needs the Updated outcome's rows too.
-                    stmt.returning.is_some() || has_after_update_triggers,
-                )?;
-                match outcome {
-                    InsertRowOutcome::Inserted => {
-                        if capture_insert_row {
-                            if !needs_row {
-                                restore_insert_row(
-                                    table_schema,
-                                    &pk_values,
-                                    &mut value_values,
-                                    &mut row,
-                                );
-                            }
-                            materialize_insert_result_virtuals(
-                                table_schema,
-                                &required_virtuals.after_insert,
-                                &mut row,
-                                cancel.as_ref(),
-                            )?;
-                        }
-                        count += 1;
-                        if let Some(buf) = returning_rows.as_mut() {
-                            buf.push((None, Some(row.clone())));
-                        }
-                        if has_insert_statement_triggers {
-                            stmt_new_rows.push(row.clone());
-                        }
-                        if has_after_insert_triggers {
-                            super::triggers::fire_row_triggers(
-                                &mut wtx,
-                                schema,
-                                &table_schema.name,
-                                crate::parser::TriggerTiming::After,
-                                super::triggers::FireEvent::Insert,
-                                None,
-                                Some(row.clone()),
-                                &table_schema.columns,
-                            )?;
-                        }
-                    }
-                    InsertRowOutcome::Updated { rows } => {
-                        count += 1;
-                        if let Some((old, new)) = rows {
-                            if let Some(buf) = returning_rows.as_mut() {
-                                buf.push((Some(old.clone()), Some(new.clone())));
-                            }
-                            if has_after_update_triggers {
-                                let changed_cols: Vec<String> = match oc_ref {
-                                    CompiledOnConflict::DoUpdate { assignments, .. } => assignments
-                                        .iter()
-                                        .map(|(col_idx, _)| {
-                                            table_schema.columns[*col_idx].name.clone()
-                                        })
-                                        .collect(),
-                                    _ => Vec::new(),
-                                };
-                                super::triggers::fire_row_triggers(
-                                    &mut wtx,
-                                    schema,
-                                    &table_schema.name,
-                                    crate::parser::TriggerTiming::After,
-                                    super::triggers::FireEvent::Update {
-                                        changed_columns: &changed_cols,
-                                    },
-                                    Some(old),
-                                    Some(new),
-                                    &table_schema.columns,
-                                )?;
-                            }
-                        }
-                    }
-                    InsertRowOutcome::Skipped => {}
-                }
-            }
-        }
-    }
-
-    if has_insert_statement_triggers {
-        super::triggers::fire_statement_triggers(
-            &mut wtx,
-            schema,
-            &table_schema.name,
-            crate::parser::TriggerTiming::After,
-            super::triggers::FireEvent::Insert,
-            &table_schema.columns,
-            &[],
-            &stmt_new_rows,
-        )?;
-    }
-
-    mark_insert_dml(
-        schema,
-        &table_schema.name,
-        !plain_insert,
-        single_int_pk,
-        min_inserted_pk,
-        count,
-    );
-
-    if let (Some(returning_cols), Some(rows)) = (stmt.returning.as_ref(), returning_rows) {
-        let qr = super::helpers::project_returning(
-            table_schema,
-            returning_cols,
-            &rows,
-            wtx.cancel_token(),
-        )?;
-        super::helpers::drain_deferred_fk_checks(&mut wtx, schema)?;
-        super::commit_with_ann_publication(wtx, schema)?;
-        return Ok(ExecutionResult::Query(qr));
-    }
-
-    super::helpers::drain_deferred_fk_checks(&mut wtx, schema)?;
-    super::commit_with_ann_publication(wtx, schema)?;
-    Ok(ExecutionResult::RowsAffected(count))
-}
-
 pub(super) fn has_subquery(expr: &Expr) -> bool {
     crate::parser::has_subquery(expr)
 }
@@ -684,14 +151,30 @@ pub(super) fn materialize_expr(
     expr: &Expr,
     exec_sub: &mut dyn FnMut(&SelectStmt) -> Result<CteRows>,
 ) -> Result<Expr> {
+    materialize_expr_selective(expr, &mut |query| exec_sub(query).map(Some))
+}
+
+/// Returning None keeps that query node intact, including its nested scopes.
+/// This lets a statement materialize only closed subquery siblings before
+/// binding an outer row, using the same reductions as ordinary materialization.
+pub(super) fn materialize_expr_selective(
+    expr: &Expr,
+    exec_sub: &mut dyn FnMut(&SelectStmt) -> Result<Option<CteRows>>,
+) -> Result<Expr> {
     match expr {
         Expr::InSubquery {
             expr: e,
             subquery,
             negated,
         } => {
-            let inner = materialize_expr(e, exec_sub)?;
-            let selected = exec_sub(subquery)?;
+            let inner = materialize_expr_selective(e, exec_sub)?;
+            let Some(selected) = exec_sub(subquery)? else {
+                return Ok(Expr::InSubquery {
+                    expr: Box::new(inner),
+                    subquery: subquery.clone(),
+                    negated: *negated,
+                });
+            };
             let qr = &selected.result;
             if !qr.columns.is_empty() && qr.columns.len() != 1 {
                 return Err(SqlError::SubqueryMultipleColumns);
@@ -716,7 +199,10 @@ pub(super) fn materialize_expr(
             })
         }
         Expr::ScalarSubquery(subquery) => {
-            let qr = exec_sub(subquery)?.result;
+            let Some(selected) = exec_sub(subquery)? else {
+                return Ok(expr.clone());
+            };
+            let qr = selected.result;
             if qr.rows.len() > 1 {
                 return Err(SqlError::SubqueryMultipleRows);
             }
@@ -728,7 +214,10 @@ pub(super) fn materialize_expr(
             Ok(Expr::Literal(val))
         }
         Expr::Exists { subquery, negated } => {
-            let qr = exec_sub(subquery)?.result;
+            let Some(selected) = exec_sub(subquery)? else {
+                return Ok(expr.clone());
+            };
+            let qr = selected.result;
             let exists = !qr.rows.is_empty();
             let result = if *negated { !exists } else { exists };
             Ok(Expr::Literal(Value::Boolean(result)))
@@ -738,10 +227,10 @@ pub(super) fn materialize_expr(
             list,
             negated,
         } => {
-            let inner = materialize_expr(e, exec_sub)?;
+            let inner = materialize_expr_selective(e, exec_sub)?;
             let items = list
                 .iter()
-                .map(|item| materialize_expr(item, exec_sub))
+                .map(|item| materialize_expr_selective(item, exec_sub))
                 .collect::<Result<Vec<_>>>()?;
             Ok(Expr::InList {
                 expr: Box::new(inner),
@@ -750,16 +239,20 @@ pub(super) fn materialize_expr(
             })
         }
         Expr::BinaryOp { left, op, right } => Ok(Expr::BinaryOp {
-            left: Box::new(materialize_expr(left, exec_sub)?),
+            left: Box::new(materialize_expr_selective(left, exec_sub)?),
             op: *op,
-            right: Box::new(materialize_expr(right, exec_sub)?),
+            right: Box::new(materialize_expr_selective(right, exec_sub)?),
         }),
         Expr::UnaryOp { op, expr: e } => Ok(Expr::UnaryOp {
             op: *op,
-            expr: Box::new(materialize_expr(e, exec_sub)?),
+            expr: Box::new(materialize_expr_selective(e, exec_sub)?),
         }),
-        Expr::IsNull(e) => Ok(Expr::IsNull(Box::new(materialize_expr(e, exec_sub)?))),
-        Expr::IsNotNull(e) => Ok(Expr::IsNotNull(Box::new(materialize_expr(e, exec_sub)?))),
+        Expr::IsNull(e) => Ok(Expr::IsNull(Box::new(materialize_expr_selective(
+            e, exec_sub,
+        )?))),
+        Expr::IsNotNull(e) => Ok(Expr::IsNotNull(Box::new(materialize_expr_selective(
+            e, exec_sub,
+        )?))),
         Expr::InSet {
             expr: e,
             values,
@@ -767,7 +260,7 @@ pub(super) fn materialize_expr(
             negated,
             collation,
         } => Ok(Expr::InSet {
-            expr: Box::new(materialize_expr(e, exec_sub)?),
+            expr: Box::new(materialize_expr_selective(e, exec_sub)?),
             values: values.clone(),
             has_null: *has_null,
             negated: *negated,
@@ -779,9 +272,9 @@ pub(super) fn materialize_expr(
             high,
             negated,
         } => Ok(Expr::Between {
-            expr: Box::new(materialize_expr(e, exec_sub)?),
-            low: Box::new(materialize_expr(low, exec_sub)?),
-            high: Box::new(materialize_expr(high, exec_sub)?),
+            expr: Box::new(materialize_expr_selective(e, exec_sub)?),
+            low: Box::new(materialize_expr_selective(low, exec_sub)?),
+            high: Box::new(materialize_expr_selective(high, exec_sub)?),
             negated: *negated,
         }),
         Expr::IsDistinctFrom {
@@ -789,8 +282,8 @@ pub(super) fn materialize_expr(
             right,
             negated,
         } => Ok(Expr::IsDistinctFrom {
-            left: Box::new(materialize_expr(left, exec_sub)?),
-            right: Box::new(materialize_expr(right, exec_sub)?),
+            left: Box::new(materialize_expr_selective(left, exec_sub)?),
+            right: Box::new(materialize_expr_selective(right, exec_sub)?),
             negated: *negated,
         }),
         Expr::Like {
@@ -801,11 +294,11 @@ pub(super) fn materialize_expr(
         } => {
             let esc = escape
                 .as_ref()
-                .map(|es| materialize_expr(es, exec_sub).map(Box::new))
+                .map(|es| materialize_expr_selective(es, exec_sub).map(Box::new))
                 .transpose()?;
             Ok(Expr::Like {
-                expr: Box::new(materialize_expr(e, exec_sub)?),
-                pattern: Box::new(materialize_expr(pattern, exec_sub)?),
+                expr: Box::new(materialize_expr_selective(e, exec_sub)?),
+                pattern: Box::new(materialize_expr_selective(pattern, exec_sub)?),
                 escape: esc,
                 negated: *negated,
             })
@@ -817,20 +310,20 @@ pub(super) fn materialize_expr(
         } => {
             let op = operand
                 .as_ref()
-                .map(|e| materialize_expr(e, exec_sub).map(Box::new))
+                .map(|e| materialize_expr_selective(e, exec_sub).map(Box::new))
                 .transpose()?;
             let conds = conditions
                 .iter()
                 .map(|(c, r)| {
                     Ok((
-                        materialize_expr(c, exec_sub)?,
-                        materialize_expr(r, exec_sub)?,
+                        materialize_expr_selective(c, exec_sub)?,
+                        materialize_expr_selective(r, exec_sub)?,
                     ))
                 })
                 .collect::<Result<Vec<_>>>()?;
             let else_r = else_result
                 .as_ref()
-                .map(|e| materialize_expr(e, exec_sub).map(Box::new))
+                .map(|e| materialize_expr_selective(e, exec_sub).map(Box::new))
                 .transpose()?;
             Ok(Expr::Case {
                 operand: op,
@@ -841,12 +334,16 @@ pub(super) fn materialize_expr(
         Expr::Coalesce(args) => {
             let materialized = args
                 .iter()
-                .map(|a| materialize_expr(a, exec_sub))
+                .map(|a| materialize_expr_selective(a, exec_sub))
                 .collect::<Result<Vec<_>>>()?;
             Ok(Expr::Coalesce(materialized))
         }
+        Expr::Collate { expr: e, collation } => Ok(Expr::Collate {
+            expr: Box::new(materialize_expr_selective(e, exec_sub)?),
+            collation: *collation,
+        }),
         Expr::Cast { expr: e, data_type } => Ok(Expr::Cast {
-            expr: Box::new(materialize_expr(e, exec_sub)?),
+            expr: Box::new(materialize_expr_selective(e, exec_sub)?),
             data_type: *data_type,
         }),
         Expr::Function {
@@ -856,7 +353,7 @@ pub(super) fn materialize_expr(
         } => {
             let materialized = args
                 .iter()
-                .map(|a| materialize_expr(a, exec_sub))
+                .map(|a| materialize_expr_selective(a, exec_sub))
                 .collect::<Result<Vec<_>>>()?;
             Ok(Expr::Function {
                 name: name.clone(),
@@ -946,16 +443,6 @@ pub(super) fn materialize_stmt(
         group_by,
         having,
     })
-}
-
-pub(super) fn exec_subquery_read(
-    db: &Database,
-    schema: &SchemaManager,
-    stmt: &SelectStmt,
-    ctes: &CteContext,
-) -> Result<CteRows> {
-    let mut rtx = db.begin_read();
-    exec_subquery_with_read(&mut rtx, schema, stmt, ctes)
 }
 
 /// A subquery's rows carry the collation of the columns they were selected from, because
@@ -1147,16 +634,6 @@ pub(super) fn exec_query_body_in_txn(
         QueryBody::Update(upd) => super::exec_update_in_txn(wtx, schema, upd),
         QueryBody::Delete(del) => super::exec_delete_in_txn(wtx, schema, del),
     }
-}
-
-pub(super) fn exec_query_body_read(
-    db: &Database,
-    schema: &SchemaManager,
-    body: &QueryBody,
-    ctes: &CteContext,
-) -> Result<QueryResult> {
-    let mut rtx = db.begin_read();
-    exec_query_body_with_read_qr(&mut rtx, schema, body, ctes)
 }
 
 pub(super) fn exec_query_body_with_read_qr(
@@ -1675,14 +1152,14 @@ impl UpsertBufs {
     }
 }
 
-pub fn exec_insert_in_txn(
+pub(crate) fn exec_insert_in_admitted_txn(
     wtx: &mut WriteTxn<'_>,
     schema: &SchemaManager,
     stmt: &InsertStmt,
     params: &[Value],
 ) -> Result<ExecutionResult> {
-    // This public lane is also called directly, without `Connection::guarded`
-    // or `execute_in_txn` around it.
+    // Compiled and trigger lanes also call this admitted helper directly,
+    // without the outer statement guard.
     super::reject_legacy_volatile_schema(schema)?;
     wtx.check_usable().map_err(SqlError::Storage)?;
     super::check_cancelled(wtx.cancel_token())?;
@@ -1711,7 +1188,7 @@ pub fn exec_insert_in_txn(
             outcome = Err(err);
         }
     }
-    // `Connection` reaches this public lane directly. A later duplicate,
+    // `Connection` reaches this admitted lane directly. A later duplicate,
     // trigger, or cancellation error must not leave an earlier row committable.
     if wtx.mutated_since(mutation_marker) {
         if let Err(error) = &outcome {
@@ -4282,7 +3759,6 @@ impl CompiledInsert {
 impl CompiledPlan for CompiledInsert {
     fn execute(
         &self,
-        db: &Database,
         schema: &SchemaManager,
         stmt: &Statement,
         params: &[Value],
@@ -4298,7 +3774,6 @@ impl CompiledPlan for CompiledInsert {
         };
         use super::compile::ActiveTxnRef;
         match txn {
-            ActiveTxnRef::None => exec_insert(db, schema, ins, params),
             ActiveTxnRef::Read(_) => Err(SqlError::Unsupported(
                 "cannot execute mutating statement inside a read-only transaction".into(),
             )),
@@ -4319,7 +3794,7 @@ impl CompiledPlan for CompiledInsert {
                     }
                 }
                 Some(c) => exec_insert_in_txn_cached(outer, schema, ins, params, c),
-                None => exec_insert_in_txn(outer, schema, ins, params),
+                None => exec_insert_in_admitted_txn(outer, schema, ins, params),
             },
         }
     }
@@ -4336,20 +3811,6 @@ impl CompiledPlan for CompiledInsert {
             None => true,
         }
     }
-}
-
-fn exec_instead_of_view_insert_auto(
-    db: &Database,
-    schema: &SchemaManager,
-    view_name: &str,
-    aliases: &[String],
-    stmt: &InsertStmt,
-    params: &[Value],
-) -> Result<ExecutionResult> {
-    let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
-    let r = exec_instead_of_view_insert_in_txn(&mut wtx, schema, view_name, aliases, stmt, params)?;
-    super::commit_with_ann_publication(wtx, schema)?;
-    Ok(r)
 }
 
 fn exec_instead_of_view_insert_in_txn(

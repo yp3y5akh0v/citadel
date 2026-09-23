@@ -257,8 +257,8 @@ fn resolve_primary_key_columns(columns: &[ColumnDef], names: &[String]) -> Resul
         .collect()
 }
 
-pub(super) fn exec_create_table(
-    db: &Database,
+pub(super) fn exec_create_table_in_txn(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
     schema: &mut SchemaManager,
     stmt: &CreateTableStmt,
 ) -> Result<ExecutionResult> {
@@ -267,189 +267,6 @@ pub(super) fn exec_create_table(
     if schema.get_view(&lower_name).is_some() {
         return Err(SqlError::ViewAlreadyExists(stmt.name.clone()));
     }
-
-    if schema.contains(&lower_name) {
-        if stmt.if_not_exists {
-            return Ok(ExecutionResult::Ok);
-        }
-        return Err(SqlError::TableAlreadyExists(stmt.name.clone()));
-    }
-
-    if stmt.primary_key.is_empty() {
-        return Err(SqlError::PrimaryKeyRequired);
-    }
-
-    let mut seen = rustc_hash::FxHashSet::default();
-    for col in &stmt.columns {
-        let lower = col.name.to_ascii_lowercase();
-        if !seen.insert(lower.clone()) {
-            return Err(SqlError::DuplicateColumn(col.name.clone()));
-        }
-    }
-
-    TableSchema::validate_column_count(stmt.columns.len())?;
-    let columns: Vec<ColumnDef> = stmt
-        .columns
-        .iter()
-        .enumerate()
-        .map(|(i, c)| ColumnDef {
-            name: c.name.to_ascii_lowercase(),
-            data_type: c.data_type,
-            nullable: c.nullable,
-            position: i as u16,
-            default_expr: c.default_expr.clone(),
-            default_sql: c.default_sql.clone(),
-            check_expr: c.check_expr.clone(),
-            check_sql: c.check_sql.clone(),
-            check_name: c.check_name.clone(),
-            is_with_timezone: false,
-            generated_expr: c.generated_expr.clone(),
-            generated_sql: c.generated_sql.clone(),
-            generated_kind: c.generated_kind,
-            collation: c.collation,
-        })
-        .collect();
-
-    validate_no_chained_generated(&columns)?;
-
-    let primary_key_columns = resolve_primary_key_columns(&columns, &stmt.primary_key)?;
-    crate::encoding::validate_row_column_count(columns.len() - primary_key_columns.len())?;
-
-    let check_constraints: Vec<TableCheckDef> = stmt
-        .check_constraints
-        .iter()
-        .map(|tc| TableCheckDef {
-            name: tc.name.clone(),
-            expr: tc.expr.clone(),
-            sql: tc.sql.clone(),
-        })
-        .collect();
-
-    let foreign_keys: Vec<ForeignKeySchemaEntry> = stmt
-        .foreign_keys
-        .iter()
-        .map(|fk| {
-            let col_indices: Vec<u16> = fk
-                .columns
-                .iter()
-                .map(|cn| {
-                    let lower = cn.to_ascii_lowercase();
-                    columns
-                        .iter()
-                        .position(|c| c.name == lower)
-                        .map(|i| i as u16)
-                        .ok_or_else(|| SqlError::ColumnNotFound(cn.clone()))
-                })
-                .collect::<Result<_>>()?;
-            Ok(ForeignKeySchemaEntry {
-                name: fk.name.clone(),
-                columns: col_indices,
-                foreign_table: fk.foreign_table.to_ascii_lowercase(),
-                referred_columns: fk
-                    .referred_columns
-                    .iter()
-                    .map(|s| s.to_ascii_lowercase())
-                    .collect(),
-                on_delete: fk.on_delete,
-                on_update: fk.on_update,
-                deferrable: fk.deferrable,
-                initially_deferred: fk.initially_deferred,
-            })
-        })
-        .collect::<Result<_>>()?;
-
-    let mut table_schema = TableSchema::new(
-        lower_name.clone(),
-        columns,
-        primary_key_columns,
-        vec![],
-        check_constraints,
-        foreign_keys,
-    );
-    if stmt.strict {
-        table_schema.flags |= crate::types::TABLE_FLAG_STRICT;
-    }
-
-    let table_schema = add_unique_auto_indices(table_schema, stmt)?;
-    validate_foreign_keys(schema, &table_schema, &table_schema.foreign_keys)?;
-
-    let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
-    SchemaManager::ensure_schema_table(&mut wtx)?;
-    wtx.create_table(lower_name.as_bytes())
-        .map_err(SqlError::Storage)?;
-
-    create_unique_index_tables(&mut wtx, &table_schema)?;
-    let table_schema = create_fk_auto_indices(&mut wtx, table_schema)?;
-
-    SchemaManager::save_schema(&mut wtx, &table_schema)?;
-    super::commit_with_ann_publication(wtx, schema)?;
-
-    schema.register(table_schema);
-    Ok(ExecutionResult::Ok)
-}
-
-pub(super) fn exec_drop_table(
-    db: &Database,
-    schema: &mut SchemaManager,
-    stmt: &DropTableStmt,
-) -> Result<ExecutionResult> {
-    let lower_name = stmt.name.to_ascii_lowercase();
-
-    if !schema.contains(&lower_name) {
-        if stmt.if_exists {
-            return Ok(ExecutionResult::Ok);
-        }
-        return Err(SqlError::TableNotFound(stmt.name.clone()));
-    }
-
-    // FK guard: reject if another table's FK references this table
-    for (child_table, _fk) in schema.child_fks_for(&lower_name) {
-        if child_table != lower_name {
-            return Err(SqlError::ForeignKeyViolation(format!(
-                "cannot drop table '{}': referenced by foreign key in '{}'",
-                lower_name, child_table
-            )));
-        }
-    }
-
-    let table_schema = schema.get(&lower_name).unwrap();
-    let storage_name = table_schema.name.clone();
-    let idx_tables: Vec<Vec<u8>> = table_schema
-        .indices
-        .iter()
-        .map(|idx| TableSchema::index_table_name(&storage_name, &idx.name))
-        .collect();
-
-    let trigger_names: Vec<String> = schema
-        .triggers_for(&storage_name)
-        .iter()
-        .map(|t| t.name.clone())
-        .collect();
-
-    let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
-    super::ann_persist::purge_segment(&mut wtx, &storage_name)?;
-    for idx_table in &idx_tables {
-        wtx.drop_table(idx_table).map_err(SqlError::Storage)?;
-    }
-    wtx.drop_table(storage_name.as_bytes())
-        .map_err(SqlError::Storage)?;
-    for tname in &trigger_names {
-        SchemaManager::delete_trigger(&mut wtx, tname)?;
-    }
-    SchemaManager::delete_schema(&mut wtx, &storage_name)?;
-    super::commit_with_ann_publication(wtx, schema)?;
-
-    schema.remove_triggers_for(&storage_name);
-    schema.remove(&storage_name);
-    Ok(ExecutionResult::Ok)
-}
-
-pub(super) fn exec_create_table_in_txn(
-    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
-    schema: &mut SchemaManager,
-    stmt: &CreateTableStmt,
-) -> Result<ExecutionResult> {
-    let lower_name = stmt.name.to_ascii_lowercase();
 
     if schema.contains(&lower_name) {
         if stmt.if_not_exists {
@@ -622,17 +439,6 @@ pub(super) fn exec_drop_table_in_txn(
     Ok(ExecutionResult::Ok)
 }
 
-pub(super) fn exec_truncate(
-    db: &Database,
-    schema: &SchemaManager,
-    stmt: &TruncateStmt,
-) -> Result<ExecutionResult> {
-    let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
-    let count = truncate_tables(&mut wtx, schema, stmt)?;
-    super::commit_with_ann_publication(wtx, schema)?;
-    Ok(ExecutionResult::RowsAffected(count))
-}
-
 pub(super) fn exec_truncate_in_txn(
     wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
     schema: &SchemaManager,
@@ -796,13 +602,15 @@ pub(super) fn exec_create_index(
     let cancel = cancel.as_ref();
     let lower_table = stmt.table_name.to_ascii_lowercase();
     let lower_idx = stmt.index_name.to_ascii_lowercase();
-    let storage_table = schema
-        .get(&lower_table)
-        .map(|table| table.name.clone())
-        .unwrap_or_else(|| schema.resolve_temp(&lower_table));
 
     let prescan = if stmt.concurrently {
         let mut rtx = db.begin_read();
+        schema.admit_read(db, &mut rtx)?;
+        super::reject_legacy_volatile_schema(schema)?;
+        let storage_table = schema
+            .get(&lower_table)
+            .map(|table| table.name.clone())
+            .unwrap_or_else(|| schema.resolve_temp(&lower_table));
         let generation = rtx.commit_generation();
         let table_schema =
             SchemaManager::load_table(&storage_table, |table, key| rtx.table_get(table, key))?
@@ -824,6 +632,12 @@ pub(super) fn exec_create_index(
     };
 
     let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
+    schema.admit_write(db, &mut wtx)?;
+    super::reject_legacy_volatile_schema(schema)?;
+    let storage_table = schema
+        .get(&lower_table)
+        .map(|table| table.name.clone())
+        .unwrap_or_else(|| schema.resolve_temp(&lower_table));
     let mut table_schema =
         SchemaManager::load_table(&storage_table, |table, key| wtx.table_get(table, key))?
             .ok_or_else(|| SqlError::TableNotFound(stmt.table_name.clone()))?;
@@ -880,46 +694,6 @@ fn ensure_drop_index_keeps_fk_backing(table_schema: &TableSchema, idx_lower: &st
         }
     }
     Ok(())
-}
-
-pub(super) fn exec_drop_index(
-    db: &Database,
-    schema: &mut SchemaManager,
-    stmt: &DropIndexStmt,
-) -> Result<ExecutionResult> {
-    let lower_idx = stmt.index_name.to_ascii_lowercase();
-
-    let (table_name, _idx_pos) = match find_index_in_schemas(schema, &lower_idx) {
-        Some(found) => found,
-        None => {
-            if stmt.if_exists {
-                return Ok(ExecutionResult::Ok);
-            }
-            return Err(SqlError::IndexNotFound(stmt.index_name.clone()));
-        }
-    };
-
-    ensure_drop_index_keeps_fk_backing(schema.get(&table_name).unwrap(), &lower_idx)?;
-    let idx_table = TableSchema::index_table_name(&table_name, &lower_idx);
-
-    let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
-    wtx.drop_table(&idx_table).map_err(SqlError::Storage)?;
-
-    let table_schema = schema.get(&table_name).unwrap();
-    // Dropping the ANN index orphans its persisted segment - drop it with us.
-    if table_schema
-        .index_by_name(&lower_idx)
-        .is_some_and(|ix| matches!(ix.kind, IndexKind::Inverted(InvertedKind::Ann { .. })))
-    {
-        super::ann_persist::purge_segment(&mut wtx, &table_name)?;
-    }
-    let mut updated_schema = table_schema.clone();
-    updated_schema.indices.retain(|i| i.name != lower_idx);
-    SchemaManager::save_schema(&mut wtx, &updated_schema)?;
-    super::commit_with_ann_publication(wtx, schema)?;
-
-    schema.register(updated_schema);
-    Ok(ExecutionResult::Ok)
 }
 
 pub(super) fn exec_create_index_in_txn(
@@ -1002,54 +776,6 @@ pub(super) fn exec_drop_index_in_txn(
     Ok(ExecutionResult::Ok)
 }
 
-pub(super) fn exec_create_view(
-    db: &Database,
-    schema: &mut SchemaManager,
-    stmt: &CreateViewStmt,
-) -> Result<ExecutionResult> {
-    let lower_name = stmt.name.to_ascii_lowercase();
-
-    if schema.contains(&lower_name) {
-        return Err(SqlError::TableAlreadyExists(stmt.name.clone()));
-    }
-
-    let replacing = if let Some(existing) = schema.get_view(&lower_name) {
-        if stmt.or_replace {
-            true
-        } else if stmt.if_not_exists {
-            return Ok(ExecutionResult::Ok);
-        } else {
-            return Err(SqlError::ViewAlreadyExists(existing.name.clone()));
-        }
-    } else {
-        false
-    };
-
-    let parsed = crate::parser::parse_sql(&stmt.sql)?;
-    if !matches!(parsed, Statement::Select(_)) {
-        return Err(SqlError::Parse(
-            "view body must be a SELECT statement".into(),
-        ));
-    }
-
-    let view_def = ViewDef {
-        name: lower_name.clone(),
-        sql: stmt.sql.clone(),
-        column_aliases: stmt.column_aliases.clone(),
-    };
-
-    let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
-    SchemaManager::ensure_views_table(&mut wtx)?;
-    if replacing {
-        SchemaManager::delete_view(&mut wtx, &lower_name)?;
-    }
-    SchemaManager::save_view(&mut wtx, &view_def)?;
-    super::commit_with_ann_publication(wtx, schema)?;
-
-    schema.register_view(view_def);
-    Ok(ExecutionResult::Ok)
-}
-
 pub(super) fn exec_create_view_in_txn(
     wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
     schema: &mut SchemaManager,
@@ -1096,28 +822,6 @@ pub(super) fn exec_create_view_in_txn(
     Ok(ExecutionResult::Ok)
 }
 
-pub(super) fn exec_drop_view(
-    db: &Database,
-    schema: &mut SchemaManager,
-    stmt: &DropViewStmt,
-) -> Result<ExecutionResult> {
-    let lower_name = stmt.name.to_ascii_lowercase();
-
-    if schema.get_view(&lower_name).is_none() {
-        if stmt.if_exists {
-            return Ok(ExecutionResult::Ok);
-        }
-        return Err(SqlError::ViewNotFound(stmt.name.clone()));
-    }
-
-    let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
-    SchemaManager::delete_view(&mut wtx, &lower_name)?;
-    super::commit_with_ann_publication(wtx, schema)?;
-
-    schema.remove_view(&lower_name);
-    Ok(ExecutionResult::Ok)
-}
-
 pub(super) fn exec_drop_view_in_txn(
     wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
     schema: &mut SchemaManager,
@@ -1135,18 +839,6 @@ pub(super) fn exec_drop_view_in_txn(
     SchemaManager::delete_view(wtx, &lower_name)?;
 
     schema.remove_view(&lower_name);
-    Ok(ExecutionResult::Ok)
-}
-
-pub(super) fn exec_alter_table(
-    db: &Database,
-    schema: &mut SchemaManager,
-    stmt: &AlterTableStmt,
-) -> Result<ExecutionResult> {
-    let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
-    SchemaManager::ensure_schema_table(&mut wtx)?;
-    alter_table_impl(&mut wtx, schema, stmt)?;
-    super::commit_with_ann_publication(wtx, schema)?;
     Ok(ExecutionResult::Ok)
 }
 

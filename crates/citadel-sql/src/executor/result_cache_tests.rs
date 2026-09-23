@@ -382,3 +382,69 @@ fn cacheability_resolves_views_without_the_callers_cte_namespace() {
         "WITH t AS (SELECT 1 AS v) SELECT a.x, t.v FROM pure_view a JOIN t ON a.x=t.v"
     ));
 }
+
+#[test]
+fn compiled_select_context_proof_includes_fallbacks_and_hidden_dependencies() {
+    let capability = |schema: &SchemaManager, sql: &str| {
+        let stmt = crate::parser::parse_sql(sql).unwrap();
+        super::super::compile::compile(schema, &stmt).is_some_and(|plan| {
+            // Pure read proof never permits skipping parameter binding.
+            assert!(plan.uses_scoped_params());
+            plan.can_skip_session_context()
+        })
+    };
+    let schema = schema_with_t();
+    for sql in [
+        "SELECT v FROM t WHERE id = $1",
+        "SELECT SUM(v) FROM t WHERE v > $1",
+        "WITH x AS (SELECT v FROM t) SELECT v FROM x UNION SELECT $1",
+        "SELECT v FROM t WHERE EXISTS (SELECT 1 FROM t AS i WHERE i.id = t.id)",
+    ] {
+        assert!(capability(&schema, sql), "{sql}");
+    }
+    for sql in [
+        "SELECT CURRENT_DATE FROM t",
+        "SELECT v FROM t WHERE v > RANDOM()",
+        "WITH x AS (SELECT CURRENT_DATE AS d) SELECT d FROM x",
+        "SELECT v FROM t ORDER BY CLOCK_TIMESTAMP()",
+        "SELECT ROW_NUMBER() OVER (ORDER BY NOW()) FROM t",
+        r#"SELECT JSONB_PATH_QUERY_FIRST('"2024-01-01T00:00:00+00:00"'::JSONB, '$.time_tz()')"#,
+    ] {
+        assert!(!capability(&schema, sql), "{sql}");
+    }
+    for generated in [false, true] {
+        let mut schema = schema_with_t();
+        let mut table = schema.get("t").unwrap().clone();
+        let expr = crate::parser::parse_sql_expr("CURRENT_DATE").unwrap();
+        if generated {
+            table.columns[1].generated_expr = Some(expr);
+        } else {
+            table.columns[1].default_expr = Some(expr);
+        }
+        schema.register(table);
+        assert!(!capability(&schema, "SELECT v FROM t"));
+        assert!(!capability(
+            &schema,
+            "WITH x AS (SELECT v FROM t) SELECT v FROM x"
+        ));
+    }
+}
+
+#[test]
+fn joined_function_sources_are_not_admitted_as_same_named_tables_or_ctes() {
+    let mut schema = schema_with_t();
+    let mut table = schema.get("t").unwrap().clone();
+    table.name = "json_array_elements".into();
+    schema.register(table);
+    for sql in [
+        "SELECT t.id FROM t JOIN json_array_elements(JSON_ARRAY(CURRENT_DATE)) j ON true",
+        "WITH json_array_elements AS (SELECT 1 AS id) SELECT t.id FROM t JOIN json_array_elements(JSON_ARRAY(CURRENT_DATE)) j ON true",
+    ] {
+        let query = parse_query(sql);
+        let QueryBody::Select(select) = &query.body else { unreachable!() };
+        assert!(select.joins[0].table.args.is_some());
+        assert!(!is_result_cacheable(&schema, &query), "{sql}");
+        let plan = super::super::compile::compile(&schema, &Statement::Select(Box::new(query)));
+        assert!(!plan.is_some_and(|plan| plan.can_skip_session_context()), "{sql}");
+    }
+}

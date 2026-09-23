@@ -19,6 +19,60 @@ const VIEWS_TABLE: &[u8] = b"_views";
 const TRIGGERS_TABLE: &[u8] = b"_triggers";
 const MATVIEWS_TABLE: &[u8] = b"_matviews";
 
+type CatalogStamps = [Option<(citadel_core::PageId, citadel_core::TxnId)>; 4];
+type CatalogVisitor<'a> = dyn FnMut(&[u8], &[u8]) -> citadel_core::Result<()> + 'a;
+const CATALOGS: [&[u8]; 4] = [SCHEMA_TABLE, VIEWS_TABLE, TRIGGERS_TABLE, MATVIEWS_TABLE];
+
+trait CatalogReader {
+    fn manager_id(&self) -> u64;
+    fn stamp(
+        &mut self,
+        table: &[u8],
+    ) -> citadel_core::Result<Option<(citadel_core::PageId, citadel_core::TxnId)>>;
+    fn scan(&mut self, table: &[u8], visit: &mut CatalogVisitor<'_>) -> citadel_core::Result<()>;
+}
+
+macro_rules! catalog_reader {
+    ($ty:ty) => {
+        impl CatalogReader for $ty {
+            fn manager_id(&self) -> u64 {
+                self.manager_id()
+            }
+            fn stamp(
+                &mut self,
+                table: &[u8],
+            ) -> citadel_core::Result<Option<(citadel_core::PageId, citadel_core::TxnId)>> {
+                self.table_root_stamp(table)
+            }
+            fn scan(
+                &mut self,
+                table: &[u8],
+                visit: &mut CatalogVisitor<'_>,
+            ) -> citadel_core::Result<()> {
+                self.table_for_each(table, visit)
+            }
+        }
+    };
+}
+catalog_reader!(citadel_txn::read_txn::ReadTxn<'_>);
+catalog_reader!(citadel_txn::write_txn::WriteTxn<'_>);
+
+fn catalog_stamps(txn: &mut impl CatalogReader) -> Result<CatalogStamps> {
+    let mut stamps = [None; 4];
+    for (stamp, name) in stamps.iter_mut().zip(CATALOGS) {
+        *stamp = txn.stamp(name)?;
+    }
+    Ok(stamps)
+}
+
+// A writer can prove the local schema and catalog roots before its commit
+// generation is known. Keep that proof distinct from an unbound cache.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct CatalogBinding {
+    commit_generation: Option<u64>,
+    local_generation: u64,
+}
+
 /// Whether a schema load may be stopped by the database's cancel token.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Cancellable {
@@ -92,6 +146,11 @@ pub struct SchemaManager {
     /// from inside `&self` methods. Bounded by `(active triggers × transition aliases)`.
     transition_schemas: std::cell::RefCell<FxHashMap<String, &'static TableSchema>>,
     generation: u64,
+    /// Persisted catalogs admitted from one exact storage snapshot. Local DDL
+    /// invalidates the generation shortcut until the next admission.
+    catalog_origin: Option<u64>,
+    catalog_stamps: Option<CatalogStamps>,
+    catalog_binding: Option<CatalogBinding>,
     /// First volatile persisted expression from a legacy catalog. Maintained
     /// with table registration/removal so executor entry points can reject in
     /// O(1) without rescanning every schema on the statement hot path.
@@ -126,6 +185,10 @@ pub struct SchemaSnapshot {
     dml_dirty_tables: FxHashSet<String>,
     dml_append_tables: FxHashMap<String, i64>,
     generation: u64,
+    sql_caches: SqlCacheHandle,
+    catalog_origin: Option<u64>,
+    catalog_stamps: Option<CatalogStamps>,
+    catalog_binding: Option<CatalogBinding>,
 }
 
 pub(crate) struct DmlSnapshot {
@@ -144,6 +207,9 @@ impl SchemaManager {
             temp_aliases: FxHashMap::default(),
             transition_schemas: std::cell::RefCell::new(FxHashMap::default()),
             generation: 0,
+            catalog_origin: None,
+            catalog_stamps: None,
+            catalog_binding: None,
             legacy_volatile_definition: None,
             sql_caches: Arc::new(Mutex::new(FxHashMap::default())),
             dml_dirty_tables: std::cell::RefCell::new(FxHashSet::default()),
@@ -249,6 +315,20 @@ impl SchemaManager {
         Self::load_inner(db, Cancellable::Yes)
     }
 
+    /// Load all SQL catalogs from an already-owned read snapshot.
+    pub fn load_with_read(
+        db: &Database,
+        rtx: &mut citadel_txn::read_txn::ReadTxn<'_>,
+    ) -> Result<Self> {
+        if rtx.manager_id() != db.manager().instance_id() {
+            return Err(SqlError::InvalidValue(
+                "read transaction belongs to a different database manager".into(),
+            ));
+        }
+        let generation = rtx.commit_generation();
+        Self::load_catalogs(db.sql_cache_handle(), rtx, Some(generation))
+    }
+
     /// Load one table from the caller's transaction snapshot.
     pub(crate) fn load_table(
         name: &str,
@@ -272,11 +352,20 @@ impl SchemaManager {
     }
 
     fn load_inner(db: &Database, cancellable: Cancellable) -> Result<Self> {
-        let mut tables = FxHashMap::default();
-
         let mut rtx = schema_read(db, cancellable);
+        let generation = rtx.commit_generation();
+        Self::load_catalogs(db.sql_cache_handle(), &mut rtx, Some(generation))
+    }
+
+    fn load_catalogs(
+        sql_caches: SqlCacheHandle,
+        txn: &mut impl CatalogReader,
+        generation: Option<u64>,
+    ) -> Result<Self> {
+        let stamps = catalog_stamps(txn)?;
+        let mut tables = FxHashMap::default();
         let mut parse_err: Option<crate::error::SqlError> = None;
-        let scan_result = rtx.table_for_each(SCHEMA_TABLE, |_key, value| {
+        let scan_result = txn.scan(SCHEMA_TABLE, &mut |_key, value| {
             match TableSchema::deserialize(value) {
                 Ok(schema) => {
                     tables.insert(schema.name.clone(), schema);
@@ -298,9 +387,8 @@ impl SchemaManager {
         }
 
         let mut views = FxHashMap::default();
-        let mut rtx2 = schema_read(db, cancellable);
         let mut view_err: Option<crate::error::SqlError> = None;
-        let view_scan = rtx2.table_for_each(VIEWS_TABLE, |_key, value| {
+        let view_scan = txn.scan(VIEWS_TABLE, &mut |_key, value| {
             match ViewDef::deserialize(value) {
                 Ok(vd) => {
                     views.insert(vd.name.clone(), vd);
@@ -322,9 +410,8 @@ impl SchemaManager {
         }
 
         let mut triggers: FxHashMap<String, Vec<crate::types::TriggerDef>> = FxHashMap::default();
-        let mut rtx3 = schema_read(db, cancellable);
         let mut trig_err: Option<crate::error::SqlError> = None;
-        let trig_scan = rtx3.table_for_each(TRIGGERS_TABLE, |_key, value| {
+        let trig_scan = txn.scan(TRIGGERS_TABLE, &mut |_key, value| {
             match crate::types::TriggerDef::deserialize(value) {
                 Ok(td) => {
                     triggers
@@ -352,9 +439,8 @@ impl SchemaManager {
         }
 
         let mut matviews: FxHashMap<String, crate::types::MatviewDef> = FxHashMap::default();
-        let mut rtx4 = schema_read(db, cancellable);
         let mut mv_err: Option<crate::error::SqlError> = None;
-        let mv_scan = rtx4.table_for_each(MATVIEWS_TABLE, |_key, value| {
+        let mv_scan = txn.scan(MATVIEWS_TABLE, &mut |_key, value| {
             match crate::types::MatviewDef::deserialize(value) {
                 Ok(mv) => {
                     matviews.insert(mv.name.to_ascii_lowercase(), mv);
@@ -386,14 +472,219 @@ impl SchemaManager {
             temp_aliases: FxHashMap::default(),
             transition_schemas: std::cell::RefCell::new(FxHashMap::default()),
             generation: 0,
+            catalog_origin: Some(txn.manager_id()),
+            catalog_stamps: Some(stamps),
+            catalog_binding: Some(CatalogBinding {
+                commit_generation: generation,
+                local_generation: 0,
+            }),
             legacy_volatile_definition,
-            sql_caches: db.sql_cache_handle(),
+            sql_caches,
             dml_dirty_tables: std::cell::RefCell::new(FxHashSet::default()),
             dml_append_tables: std::cell::RefCell::new(FxHashMap::default()),
             fk_children_cache: std::cell::RefCell::new(None),
         };
         system_tables::register_builtins(&mut mgr);
         Ok(mgr)
+    }
+
+    /// Admit an immutable read snapshot before compiling or executing SQL.
+    pub(crate) fn admit_read(
+        &mut self,
+        db: &Database,
+        rtx: &mut citadel_txn::read_txn::ReadTxn<'_>,
+    ) -> Result<()> {
+        let generation = rtx.commit_generation();
+        self.admit_catalogs(db, rtx, generation)
+    }
+
+    /// Called immediately after acquiring the exclusive writer, before any SQL
+    /// mutation. Its committed generation cannot change while the writer is held.
+    pub(crate) fn admit_write(
+        &mut self,
+        db: &Database,
+        wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    ) -> Result<()> {
+        self.admit_catalogs(db, wtx, db.manager().commit_generation())
+    }
+
+    fn admit_catalogs(
+        &mut self,
+        db: &Database,
+        txn: &mut impl CatalogReader,
+        generation: u64,
+    ) -> Result<()> {
+        if txn.manager_id() != db.manager().instance_id() {
+            return Err(SqlError::InvalidValue(
+                "transaction belongs to a different database manager".into(),
+            ));
+        }
+        if self.catalog_origin == Some(txn.manager_id())
+            && self.catalog_binding
+                == Some(CatalogBinding {
+                    commit_generation: Some(generation),
+                    local_generation: self.generation,
+                })
+        {
+            return Ok(());
+        }
+        let stamps = catalog_stamps(txn)?;
+        if self.catalog_origin != Some(txn.manager_id())
+            || self.catalog_stamps != Some(stamps)
+            || self
+                .catalog_binding
+                .is_none_or(|binding| binding.local_generation != self.generation)
+        {
+            let mut fresh = Self::load_catalogs(db.sql_cache_handle(), txn, Some(generation))?;
+            fresh.bump_generation_past(self.generation);
+            if self.catalog_origin == Some(txn.manager_id()) {
+                fresh.adopt_temp_aliases(self);
+                fresh.restore_dml_snapshot(self.save_dml_snapshot());
+                fresh.virtual_tables.extend(
+                    self.virtual_tables
+                        .iter()
+                        .map(|(name, table)| (name.clone(), Arc::clone(table))),
+                );
+            } else if self.catalog_origin.is_none() {
+                // User virtual tables registered before first admission have
+                // no prior database provenance. Persisted/local dirty state
+                // is never carried from a different manager.
+                fresh.virtual_tables.extend(
+                    self.virtual_tables
+                        .iter()
+                        .map(|(name, table)| (name.clone(), Arc::clone(table))),
+                );
+            }
+            *self = fresh;
+        }
+        self.catalog_stamps = Some(stamps);
+        self.catalog_binding = Some(CatalogBinding {
+            commit_generation: Some(generation),
+            local_generation: self.generation,
+        });
+        Ok(())
+    }
+
+    /// Publish only the generation returned by this admitted writer's commit.
+    /// A later concurrent commit must still differ when its snapshot is admitted.
+    pub(crate) fn bind_committed_catalog(&mut self, manager_id: u64, generation: u64) {
+        if self.catalog_origin == Some(manager_id) && self.catalog_stamps.is_some() {
+            if let Some(binding) = &mut self.catalog_binding {
+                if binding.local_generation == self.generation {
+                    binding.commit_generation = Some(generation);
+                }
+            }
+        }
+    }
+
+    /// A public caller can alternate caches inside one writer, whose catalog
+    /// pages can change in place without a new root stamp. Compare exact
+    /// persisted definitions here; Connection's admitted route skips this scan.
+    pub(crate) fn admit_owned_write(
+        &mut self,
+        wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    ) -> Result<()> {
+        self.check_writer_origin(wtx)?;
+        let mut fresh = Self::load_catalogs(self.sql_caches.clone(), wtx, None)?;
+        if self.catalog_origin.is_none() || self.catalog_records()? != fresh.catalog_records()? {
+            fresh.bump_generation_past(self.generation);
+            fresh.adopt_temp_aliases(self);
+            fresh.virtual_tables.extend(
+                self.virtual_tables
+                    .iter()
+                    .map(|(name, table)| (name.clone(), Arc::clone(table))),
+            );
+            fresh.restore_dml_snapshot(self.save_dml_snapshot());
+            *self = fresh;
+        } else {
+            self.catalog_origin = fresh.catalog_origin;
+            self.catalog_stamps = fresh.catalog_stamps;
+        }
+        self.catalog_binding = Some(CatalogBinding {
+            commit_generation: None,
+            local_generation: self.generation,
+        });
+        Ok(())
+    }
+
+    fn check_writer_origin(&self, wtx: &citadel_txn::write_txn::WriteTxn<'_>) -> Result<()> {
+        if self
+            .catalog_origin
+            .is_some_and(|origin| origin != wtx.manager_id())
+        {
+            return Err(SqlError::InvalidValue(
+                "SQL schema belongs to a different database manager".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn catalog_records(&self) -> Result<[std::collections::BTreeMap<String, Vec<u8>>; 4]> {
+        let mut records: [std::collections::BTreeMap<String, Vec<u8>>; 4] = Default::default();
+        for (name, table) in &self.tables {
+            records[0].insert(name.clone(), table.try_serialize()?);
+        }
+        for (name, view) in &self.views {
+            records[1].insert(name.clone(), view.try_serialize()?);
+        }
+        for trigger in self.triggers.values().flatten() {
+            records[2].insert(trigger.name.clone(), trigger.try_serialize()?);
+        }
+        for (name, view) in &self.matviews {
+            records[3].insert(name.clone(), view.try_serialize()?);
+        }
+        Ok(records)
+    }
+
+    pub(crate) fn bind_write_catalog(
+        &mut self,
+        wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    ) -> Result<()> {
+        self.catalog_stamps = Some(catalog_stamps(wtx)?);
+        self.catalog_binding = Some(CatalogBinding {
+            commit_generation: None,
+            local_generation: self.generation,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn validate_write_catalog(
+        &self,
+        wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    ) -> Result<()> {
+        self.check_writer_origin(wtx)?;
+        let fresh = Self::load_catalogs(self.sql_caches.clone(), wtx, None)?;
+        if self.catalog_records()? == fresh.catalog_records()? {
+            Ok(())
+        } else {
+            Err(SqlError::InvalidValue("SQL schema does not match the supplied write snapshot; execute_in_txn admits a mutable schema before mutation".into()))
+        }
+    }
+
+    pub(crate) fn validate_read_catalog(
+        &self,
+        rtx: &mut citadel_txn::read_txn::ReadTxn<'_>,
+    ) -> Result<()> {
+        if self.catalog_origin != Some(rtx.manager_id()) {
+            return Err(SqlError::InvalidValue(
+                "SQL schema belongs to a different database manager".into(),
+            ));
+        }
+        let generation = rtx.commit_generation();
+        if let Some(binding) = self.catalog_binding {
+            if binding.local_generation == self.generation
+                && (binding.commit_generation == Some(generation)
+                    || self.catalog_stamps == Some(catalog_stamps(rtx)?))
+            {
+                return Ok(());
+            }
+        }
+        let fresh = Self::load_catalogs(self.sql_caches.clone(), rtx, Some(generation))?;
+        if self.catalog_records()? == fresh.catalog_records()? {
+            Ok(())
+        } else {
+            Err(SqlError::InvalidValue("SQL schema does not match the supplied read snapshot; load that snapshot before execution".into()))
+        }
     }
 
     pub fn get_virtual(&self, name: &str) -> Option<&Arc<dyn VirtualTable>> {
@@ -825,6 +1116,10 @@ impl SchemaManager {
             dml_dirty_tables: self.dml_dirty_tables.borrow().clone(),
             dml_append_tables: self.dml_append_tables.borrow().clone(),
             generation: self.generation,
+            sql_caches: self.sql_caches.clone(),
+            catalog_origin: self.catalog_origin,
+            catalog_stamps: self.catalog_stamps,
+            catalog_binding: self.catalog_binding,
         }
     }
 
@@ -847,6 +1142,10 @@ impl SchemaManager {
         if self.generation != snap.generation {
             self.generation = self.generation.max(snap.generation) + 1;
         }
+        self.sql_caches = snap.sql_caches;
+        self.catalog_origin = snap.catalog_origin;
+        self.catalog_stamps = snap.catalog_stamps;
+        self.catalog_binding = snap.catalog_binding;
         self.tables = snap.tables;
         self.refresh_legacy_volatile_definition();
         self.views = snap.views;

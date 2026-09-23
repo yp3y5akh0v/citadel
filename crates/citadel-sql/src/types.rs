@@ -1910,6 +1910,40 @@ impl TableSchema {
 
     /// Serialize without truncating text lengths or collection counts.
     pub fn try_serialize(&self) -> crate::error::Result<Vec<u8>> {
+        let mut bound = false;
+        let mut check = |expr: &Expr| {
+            crate::parser::visit_expr(expr, &mut |node| {
+                bound |= matches!(node, Expr::BoundColumn { .. });
+            })
+        };
+        for column in &self.columns {
+            for expr in column
+                .default_expr
+                .iter()
+                .chain(column.generated_expr.iter())
+                .chain(column.check_expr.iter())
+            {
+                check(expr);
+            }
+        }
+        for constraint in &self.check_constraints {
+            check(&constraint.expr);
+        }
+        for index in &self.indices {
+            if let Some(expr) = &index.predicate_expr {
+                check(expr);
+            }
+            for key in &index.keys {
+                if let IndexKey::Expr { expr, .. } = key {
+                    check(expr);
+                }
+            }
+        }
+        if bound {
+            return Err(crate::error::SqlError::InvalidValue(
+                "runtime-bound columns cannot be stored in schema definitions".into(),
+            ));
+        }
         self.validate_storage_layout()?;
         let mut buf = Vec::new();
         buf.push(SCHEMA_VERSION);
