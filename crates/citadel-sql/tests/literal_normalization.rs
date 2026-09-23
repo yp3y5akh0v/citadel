@@ -171,6 +171,40 @@ fn literal_admission_rechecks_trigger_enable_disable() {
 fn literal_values_do_not_bind_referenced_parent_lazy_parameters() {
     let db = database();
     let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY, code TEXT COLLATE BINARY)")
+        .unwrap();
+    conn.execute("CREATE UNIQUE INDEX parent_code ON parent(code COLLATE NOCASE)")
+        .unwrap();
+    conn.execute("INSERT INTO parent VALUES (1, 'Alpha')")
+        .unwrap();
+    conn.execute("ALTER TABLE parent ADD COLUMN d INTEGER DEFAULT $1")
+        .unwrap();
+    conn.execute("ALTER TABLE parent ADD COLUMN v INTEGER GENERATED ALWAYS AS (d + 1) VIRTUAL")
+        .unwrap();
+    conn.execute("CREATE TABLE child (id INTEGER PRIMARY KEY, code TEXT REFERENCES parent(code))")
+        .unwrap();
+    let parent = conn.table_schema("parent").unwrap();
+    assert_eq!(parent.indices.len(), 1);
+    let index = &parent.indices[0];
+    assert!(index.unique && index.is_full_column_btree(&[1]));
+    assert_eq!(
+        parent.columns[1].collation,
+        citadel_sql::types::Collation::Binary
+    );
+    assert_eq!(index.collation_at(0), citadel_sql::types::Collation::NoCase);
+    // The broader index must recheck the parent's Binary equality, decoding
+    // its physically missing default and dependent virtual column.
+    rejects_both(&conn, "INSERT INTO child VALUES (2, 'Alpha')", 1);
+    assert_eq!(
+        conn.query("SELECT COUNT(*) FROM child").unwrap().rows,
+        vec![vec![Value::Integer(0)]]
+    );
+}
+
+#[test]
+fn exact_parent_equality_index_skips_unrelated_lazy_parameters() {
+    let db = database();
+    let conn = Connection::open(&db).unwrap();
     conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY, code TEXT COLLATE NOCASE UNIQUE)")
         .unwrap();
     conn.execute("INSERT INTO parent VALUES (1, 'Alpha')")
@@ -181,13 +215,28 @@ fn literal_values_do_not_bind_referenced_parent_lazy_parameters() {
         .unwrap();
     conn.execute("CREATE TABLE child (id INTEGER PRIMARY KEY, code TEXT REFERENCES parent(code))")
         .unwrap();
-    // The nonbinary UNIQUE reference rechecks the decoded parent row, including
-    // its physically missing default and dependent virtual column.
-    rejects_both(&conn, "INSERT INTO child VALUES (2, 'Alpha')", 1);
+    // Both literal-normalized and explicit empty-binding routes can prove
+    // parent membership without materializing unrelated parent columns.
+    conn.execute("INSERT INTO child VALUES (2, 'ALPHA')")
+        .unwrap();
+    conn.execute_params("INSERT INTO child VALUES (3, 'alpha')", &[])
+        .unwrap();
     assert_eq!(
-        conn.query("SELECT COUNT(*) FROM child").unwrap().rows,
-        vec![vec![Value::Integer(0)]]
+        conn.query("SELECT id,code FROM child ORDER BY id")
+            .unwrap()
+            .rows,
+        vec![
+            vec![Value::Integer(2), Value::Text("ALPHA".into())],
+            vec![Value::Integer(3), Value::Text("alpha".into())],
+        ]
     );
+    assert!(matches!(
+        conn.query("SELECT d FROM parent"),
+        Err(SqlError::ParameterCountMismatch {
+            expected: 1,
+            got: 0
+        })
+    ));
 }
 
 #[test]

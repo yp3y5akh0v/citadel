@@ -88,37 +88,10 @@ pub(super) fn validate_foreign_keys(
             })?
         };
 
-        let ref_col_indices: Vec<u16> = fk
-            .referred_columns
-            .iter()
-            .map(|rc| {
-                parent
-                    .column_index(rc)
-                    .map(|i| i as u16)
-                    .ok_or_else(|| SqlError::ColumnNotFound(rc.clone()))
-            })
-            .collect::<Result<_>>()?;
-
-        if fk.columns.len() != ref_col_indices.len() {
-            return Err(SqlError::Unsupported(format!(
-                "FOREIGN KEY on '{}': column count mismatch",
-                table_schema.name
-            )));
-        }
-
-        let is_pk = parent.primary_key_columns == ref_col_indices;
-        let has_unique = !is_pk
-            && parent
-                .indices
-                .iter()
-                .any(|idx| idx.unique && idx.is_full_column_btree(&ref_col_indices));
-
-        if !is_pk && !has_unique {
-            return Err(SqlError::Unsupported(format!(
-                "FOREIGN KEY on '{}': referred columns in '{}' are not PRIMARY KEY or UNIQUE",
-                table_schema.name, fk.foreign_table
-            )));
-        }
+        super::fk::validate_parent_reference(parent, fk).map_err(|error| match error {
+            SqlError::ForeignKeyViolation(message) => SqlError::Unsupported(message),
+            other => other,
+        })?;
     }
     Ok(())
 }
@@ -204,45 +177,20 @@ pub(super) fn create_index_tables(
 /// Create auto-index on child FK columns. Returns updated schema with new indices.
 pub(super) fn create_fk_auto_indices(
     wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    schema: &SchemaManager,
     mut table_schema: TableSchema,
 ) -> Result<TableSchema> {
-    let fks: Vec<(Vec<u16>, String)> = table_schema
-        .foreign_keys
-        .iter()
-        .enumerate()
-        .map(|(i, fk)| {
-            let name = fk
-                .name
-                .as_ref()
-                .map(|n| format!("__fk_{}_{}", table_schema.name, n))
-                .unwrap_or_else(|| format!("__fk_{}_{}", table_schema.name, i));
-            (fk.columns.clone(), name)
-        })
-        .collect();
-
-    for (cols, idx_name) in fks {
-        // The FK probe needs all rows and the exact ordered column key.
-        let already_covered = table_schema
-            .indices
-            .iter()
-            .any(|idx| idx.is_full_column_btree(&cols));
-        if already_covered {
-            continue;
-        }
-
-        let idx_def = IndexDef::from_column_lists(
-            idx_name.clone(),
-            cols,
-            vec![],
-            false,
-            None,
-            None,
-            IndexKind::default(),
-        );
-        let idx_table = TableSchema::index_table_name(&table_schema.name, &idx_name);
-        wtx.create_table(&idx_table).map_err(SqlError::Storage)?;
-        // Table is empty at CREATE TABLE time - no rows to populate
-        table_schema.indices.push(idx_def);
+    let cancel = wtx.cancel_token().cloned();
+    for index in super::fk::child_indexes_to_add(schema, &table_schema, |_| false)? {
+        let name = TableSchema::index_table_name(&table_schema.name, &index.name);
+        let plan = IndexBuildPlan::new(&table_schema, &index, cancel.as_ref())?;
+        // CREATE TABLE is empty. ALTER ADD COLUMN may already have rows whose
+        // decoded default value participates in the new foreign key index.
+        let entries =
+            plan.collect(|visit| wtx.table_scan_from(table_schema.name.as_bytes(), b"", visit))?;
+        wtx.create_table(&name).map_err(SqlError::Storage)?;
+        plan.insert(wtx, &name, entries)?;
+        table_schema.indices.push(index);
     }
     Ok(table_schema)
 }
@@ -386,7 +334,7 @@ pub(super) fn exec_create_table_in_txn(
         .map_err(SqlError::Storage)?;
 
     create_index_tables(wtx, &table_schema)?;
-    let table_schema = create_fk_auto_indices(wtx, table_schema)?;
+    let table_schema = create_fk_auto_indices(wtx, schema, table_schema)?;
 
     SchemaManager::save_schema(wtx, &table_schema)?;
 
@@ -703,8 +651,16 @@ pub(super) fn exec_create_index(
     }
 }
 
-/// Refuse to drop the last index backing a logical constraint.
-fn ensure_drop_index_keeps_constraints(table_schema: &TableSchema, idx_lower: &str) -> Result<()> {
+/// Refuse to remove the last complete child lookup or compatible parent key.
+fn ensure_drop_index_keeps_constraints(
+    schema: &SchemaManager,
+    table_schema: &TableSchema,
+    idx_lower: &str,
+) -> Result<()> {
+    let mut remaining = table_schema.clone();
+    remaining
+        .indices
+        .retain(|index| !index.name.eq_ignore_ascii_case(idx_lower));
     let Some(dropped) = table_schema.index_by_name(idx_lower) else {
         return Ok(());
     };
@@ -719,19 +675,32 @@ fn ensure_drop_index_keeps_constraints(table_schema: &TableSchema, idx_lower: &s
         )));
     }
     for fk in &table_schema.foreign_keys {
-        if !dropped.is_full_column_btree(&fk.columns) {
-            continue;
-        }
-        let other_covers = table_schema
+        let parent = if fk.foreign_table == table_schema.name {
+            &remaining
+        } else {
+            schema
+                .get(&fk.foreign_table)
+                .ok_or_else(|| SqlError::TableNotFound(fk.foreign_table.clone()))?
+        };
+        let reference = super::fk::ReferenceKey::new(parent, fk)?;
+        if !remaining
             .indices
             .iter()
-            .any(|i| i.name != idx_lower && i.is_full_column_btree(&fk.columns));
-        if !other_covers {
+            .any(|index| reference.covered_by(index, &fk.columns))
+        {
             return Err(SqlError::Unsupported(format!(
                 "cannot drop index '{}': required to enforce a foreign key on '{}'",
                 idx_lower, table_schema.name
             )));
         }
+    }
+    for (_, fk) in schema.child_fks_for(&table_schema.name) {
+        super::fk::validate_parent_reference(&remaining, fk).map_err(|_| {
+            SqlError::Unsupported(format!(
+                "cannot drop index '{}': required by a reference to '{}'",
+                idx_lower, table_schema.name
+            ))
+        })?;
     }
     Ok(())
 }
@@ -796,7 +765,7 @@ pub(super) fn exec_drop_index_in_txn(
         }
     };
 
-    ensure_drop_index_keeps_constraints(schema.get(&table_name).unwrap(), &lower_idx)?;
+    ensure_drop_index_keeps_constraints(schema, schema.get(&table_name).unwrap(), &lower_idx)?;
     let idx_table = TableSchema::index_table_name(&table_name, &lower_idx);
     wtx.drop_table(&idx_table).map_err(SqlError::Storage)?;
 
@@ -1085,7 +1054,9 @@ pub(super) fn alter_add_column(
     super::ann_persist::purge_segment(wtx, table_name)?;
     if fk_def.is_some() {
         validate_foreign_keys(schema, &new_schema, &new_schema.foreign_keys)?;
-        new_schema = create_fk_auto_indices(wtx, new_schema)?;
+        new_schema = create_fk_auto_indices(wtx, schema, new_schema)?;
+        let added = new_schema.foreign_keys.last().expect("added foreign key");
+        super::fk::check_table_references(wtx, schema, &new_schema, &[added])?;
     }
 
     SchemaManager::save_schema(wtx, &new_schema)?;

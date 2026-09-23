@@ -1124,7 +1124,10 @@ fn fk_index_scan_budget_excludes_the_next_parent() {
 
     let schema = crate::schema::SchemaManager::load(&db).unwrap();
     let child = schema.get("child").unwrap();
-    let index = find_cascading_idx(child, &child.foreign_keys[0]).unwrap();
+    let reference =
+        super::super::fk::ReferenceKey::new(schema.get("parent").unwrap(), &child.foreign_keys[0])
+            .unwrap();
+    let index = find_cascading_idx(child, &child.foreign_keys[0], &reference).unwrap();
     assert!(index.unique);
     let parent_key = encode_composite_key(&[i(1)]);
     let child_key = encode_composite_key(&[i(10)]);
@@ -1135,7 +1138,7 @@ fn fk_index_scan_budget_excludes_the_next_parent() {
     let budget = citadel_txn::ReadBudget::new(child_key.len(), child_key.len());
     wtx.set_read_budget(Some(budget.clone()));
     let mut hits = FkChildHits::default();
-    scan_fk_index_keys(&mut wtx, child, index, &parent_key, &mut hits).unwrap();
+    scan_fk_index_keys(&mut wtx, child, index, &reference, &parent_key, &mut hits).unwrap();
     let entries = hits.entries().collect::<Vec<_>>();
     assert_eq!(entries, vec![(parent_key.as_slice(), child_key.as_slice())]);
     assert_eq!(budget.remaining(), 0);
@@ -1150,6 +1153,7 @@ fn fk_index_scan_budget_excludes_the_next_parent() {
             &mut wtx,
             child,
             index,
+            &reference,
             &parent_key,
             &mut FkChildHits::default()
         ),
@@ -1165,6 +1169,7 @@ fn fk_index_scan_budget_excludes_the_next_parent() {
         &mut wtx,
         child,
         index,
+        &reference,
         &encode_composite_key(&[i(0)]),
         &mut hits,
     )
