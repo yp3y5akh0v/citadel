@@ -360,7 +360,7 @@ fn invalid_configuration_and_session_metadata_fail_before_ingestion() {
 /// dedup/count -> answer (two reader calls); a non-aggregation question keeps
 /// the single-prompt path. Scripted responses assert the call sequence.
 #[test]
-fn agentic_routes_aggregation_and_falls_back_cleanly() {
+fn agentic_routes_aggregation_and_direct_questions_explicitly() {
     let dir = tempfile::tempdir().unwrap();
     let eng = engine(dir.path());
     let samples = dataset::parse_root(&json!([
@@ -397,7 +397,7 @@ fn agentic_routes_aggregation_and_falls_back_cleanly() {
     // (extraction JSON + final), q_plain the third (single-prompt).
     let reader = testing::scripted(vec![
         citadel_llm::CompletionResponse::text(
-            "[{\"item\":\"dog Rex\",\"date\":\"2023/05/01\"},{\"item\":\"cat Mia\",\"date\":\"2023/05/01\"}]",
+            r#"[{"item":"dog Rex","date":"2023/05/01","evidence":"My dog Rex and my cat Mia are pals.","amount":null},{"item":"cat Mia","date":"2023/05/01","evidence":"My dog Rex and my cat Mia are pals.","amount":null}]"#,
         ),
         citadel_llm::CompletionResponse::text("You mentioned 2 pets."),
         citadel_llm::CompletionResponse::text("Rex, a golden retriever."),

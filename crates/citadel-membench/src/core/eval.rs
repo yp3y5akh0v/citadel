@@ -16,7 +16,9 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::core::agentic;
 use crate::core::benchmark::Benchmark;
-use crate::core::error::{BenchError, Result};
+use crate::core::error::{
+    BenchError, CompletedReaderCall, CompletionFailure, ReaderFailure, ReaderStage, Result,
+};
 use crate::core::ratelimit::Pacer;
 use crate::core::retrieval::baseline_recall;
 use crate::{BenchConfig, ReaderOrder};
@@ -339,8 +341,9 @@ pub struct CompletionCallAudit {
     pub input_tokens_estimate: usize,
     pub max_output_tokens: Option<u32>,
     pub rendered_atom_ids: Vec<AtomId>,
-    #[serde(serialize_with = "serialize_usage")]
-    pub usage: TokenUsage,
+    /// Observed usage when a response was returned; absent after an error.
+    #[serde(serialize_with = "serialize_optional_usage")]
+    pub usage: Option<TokenUsage>,
 }
 
 fn complete_with_audit(
@@ -365,10 +368,15 @@ fn complete_with_audit(
         input_tokens_estimate: reader.count_tokens(&request.messages),
         max_output_tokens: request.max_tokens,
         rendered_atom_ids,
-        usage: TokenUsage::default(),
+        usage: None,
     };
-    let response = paced_complete(pacer, reader, request)?;
-    audit.usage = response.usage;
+    let response = paced_complete(pacer, reader, request).map_err(|source| {
+        BenchError::Completion(Box::new(CompletionFailure {
+            call: audit.clone(),
+            source: Box::new(source),
+        }))
+    })?;
+    audit.usage = Some(response.usage);
     Ok((response, audit))
 }
 
@@ -459,30 +467,12 @@ pub fn answer_question(
     let view = reader_view(eng, region, hits, config)?;
     let recall_micros = started.elapsed().as_micros();
     if config.agentic && agentic::is_aggregation_question(q.text) {
-        match answer_aggregation(bench, reader, pacer, q, config.reader_max_tokens, &view)? {
-            Aggregation::Answered(outcome) => {
-                return Ok(AnswerOutcome {
-                    recall_micros,
-                    ..outcome
-                })
-            }
-            // Unusable extraction: fall back, but keep its spend on the ledger.
-            Aggregation::FellBack(spent, finish_reason, audit) => {
-                let mut out = read_assembled(
-                    bench,
-                    reader,
-                    pacer,
-                    q,
-                    config.reader_max_tokens,
-                    view,
-                    recall_micros,
-                )?;
-                add_usage(&mut out.usage, &spent);
-                out.reader_finish_reasons.insert(0, finish_reason);
-                out.reader_calls.insert(0, audit);
-                return Ok(out);
-            }
-        }
+        return answer_aggregation(bench, reader, pacer, q, config.reader_max_tokens, &view).map(
+            |outcome| AnswerOutcome {
+                recall_micros,
+                ..outcome
+            },
+        );
     }
     read_assembled(
         bench,
@@ -493,13 +483,6 @@ pub fn answer_question(
         view,
         recall_micros,
     )
-}
-
-/// Outcome of the agentic attempt: an answer, or a fallback carrying the tokens
-/// the discarded extraction call already spent.
-enum Aggregation {
-    Answered(AnswerOutcome),
-    FellBack(TokenUsage, CompletionFinish, CompletionCallAudit),
 }
 
 /// Accumulate `b` into `a` (tokens add; cost adds when both sides price it).
@@ -513,7 +496,7 @@ fn add_usage(a: &mut TokenUsage, b: &TokenUsage) {
 }
 
 /// Two-pass agentic read: extract -> dedup/sort/count in code -> answer from
-/// the list. `None` (unparseable) falls back to the single-prompt path. Same
+/// the list. Only an explicit NOT_ENUMERATION selects the ordinary prompt. Same
 /// retrieval/view/isolation as [`read_assembled`]: reader sees only the
 /// retrieved memories and the question, never gold.
 fn answer_aggregation(
@@ -523,37 +506,70 @@ fn answer_aggregation(
     q: Question,
     reader_max_tokens: u32,
     view: &[AtomHit],
-) -> Result<Aggregation> {
+) -> Result<AnswerOutcome> {
     let retrieved = retrieved_ids(bench, view)?;
     let retrieved_atom_ids: Vec<_> = view.iter().map(|hit| hit.id).collect();
     let rendered = bench.reader_prompt(view, q.text, q.date)?;
     validate_rendered_atoms(view, &rendered.atom_ids)?;
     let mut messages = rendered.messages;
     let extraction = agentic::extraction_prompt(bench, view, q.text, q.date)?;
+    validate_rendered_atoms(view, &extraction.atom_ids)?;
+    let output_cap = max_output_tokens(reader_max_tokens)?;
     let mut extract = CompletionRequest::new(extraction.messages);
     extract.temperature = Some(0.0);
     extract.seed = Some(SAMPLING_SEED);
-    extract.max_tokens = Some(max_output_tokens(reader_max_tokens)?);
+    extract.max_tokens = Some(output_cap);
     let (extracted, extract_audit) =
-        complete_with_audit(pacer, reader, &extract, extraction.atom_ids)?;
-    let Some(items) = agentic::parse_items(&extracted.message.content) else {
-        return Ok(Aggregation::FellBack(
-            extracted.usage,
-            extracted.finish_reason.into(),
-            extract_audit,
-        ));
+        complete_with_audit(pacer, reader, &extract, extraction.atom_ids)
+            .map_err(|source| reader_failure(ReaderStage::Extraction, Vec::new(), source))?;
+    let receipt = CompletedReaderCall {
+        call: extract_audit.clone(),
+        finish_reason: extracted.finish_reason.into(),
     };
-    let items = agentic::dedup_and_sort(items);
-
-    messages.push(agentic::anchor_message(&items));
+    if extracted.finish_reason != FinishReason::Stop || !extracted.message.tool_calls.is_empty() {
+        return Err(reader_failure(
+            ReaderStage::ExtractionValidation,
+            vec![receipt],
+            BenchError::InvalidExtractionCompletion {
+                reason: "extraction requires a normal stop and no tool calls",
+                response: extracted.message.content,
+                finish_reason: extracted.finish_reason,
+            },
+        ));
+    }
+    let decision = agentic::parse_extraction(&extracted.message.content).map_err(|source| {
+        reader_failure(
+            ReaderStage::ExtractionValidation,
+            vec![receipt.clone()],
+            BenchError::InvalidExtraction {
+                response: extracted.message.content.clone(),
+                source,
+            },
+        )
+    })?;
+    if let agentic::ExtractionDecision::Items(items) = decision {
+        let anchor =
+            agentic::anchor_message(&agentic::dedup_and_sort(items)).map_err(|source| {
+                reader_failure(
+                    ReaderStage::ExtractionValidation,
+                    vec![receipt.clone()],
+                    BenchError::InvalidExtraction {
+                        response: extracted.message.content.clone(),
+                        source,
+                    },
+                )
+            })?;
+        messages.push(anchor);
+    }
     let mut answer = CompletionRequest::new(messages);
     answer.temperature = Some(0.0);
     answer.seed = Some(SAMPLING_SEED);
-    answer.max_tokens = Some(max_output_tokens(reader_max_tokens)?);
-    let (resp, answer_audit) = complete_with_audit(pacer, reader, &answer, rendered.atom_ids)?;
+    answer.max_tokens = Some(output_cap);
+    let (resp, answer_audit) = complete_with_audit(pacer, reader, &answer, rendered.atom_ids)
+        .map_err(|source| reader_failure(ReaderStage::FinalAnswer, vec![receipt], source))?;
     let mut usage = extracted.usage;
     add_usage(&mut usage, &resp.usage);
-    Ok(Aggregation::Answered(AnswerOutcome {
+    Ok(AnswerOutcome {
         answer: resp.message.content,
         reader_finish_reasons: vec![extracted.finish_reason.into(), resp.finish_reason.into()],
         reader_calls: vec![extract_audit, answer_audit],
@@ -561,6 +577,18 @@ fn answer_aggregation(
         usage,
         retrieved,
         retrieved_atom_ids,
+    })
+}
+
+fn reader_failure(
+    stage: ReaderStage,
+    completed_calls: Vec<CompletedReaderCall>,
+    source: BenchError,
+) -> BenchError {
+    BenchError::Reader(Box::new(ReaderFailure {
+        stage,
+        completed_calls,
+        source: Box::new(source),
     }))
 }
 
@@ -625,6 +653,16 @@ fn serialize_usage<S: serde::Serializer>(
     fields.serialize_field("output_tokens", &usage.output_tokens)?;
     fields.serialize_field("cost_usd", &usage.cost_usd)?;
     fields.end()
+}
+
+fn serialize_optional_usage<S: serde::Serializer>(
+    usage: &Option<TokenUsage>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    match usage {
+        Some(usage) => serialize_usage(usage, serializer),
+        None => serializer.serialize_none(),
+    }
 }
 
 pub(crate) fn complete_judge(

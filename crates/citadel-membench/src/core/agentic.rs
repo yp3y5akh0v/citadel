@@ -31,14 +31,35 @@ pub fn is_aggregation_question(text: &str) -> bool {
 /// One extracted item; `date` is `YYYY/MM/DD` when the chats state it, else the
 /// session date. `amount` only for spend/total questions.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExtractedItem {
     pub item: String,
-    #[serde(default)]
     pub date: String,
-    #[serde(default)]
     pub evidence: String,
-    #[serde(default)]
+    #[serde(deserialize_with = "required_amount")]
     pub amount: Option<f64>,
+}
+
+fn required_amount<'de, D: serde::Deserializer<'de>>(
+    de: D,
+) -> std::result::Result<Option<f64>, D::Error> {
+    Option::<f64>::deserialize(de)
+}
+
+#[derive(Debug)]
+pub enum ExtractionDecision {
+    NotEnumeration,
+    Items(Vec<ExtractedItem>),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ExtractionParseError {
+    #[error("expected exactly NOT_ENUMERATION or a complete JSON item array: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("item {index}: {reason}")]
+    InvalidItem { index: usize, reason: &'static str },
+    #[error("the extracted amount total is not finite")]
+    InvalidTotal,
 }
 
 /// Pass 1: ask the reader to mine every distinct relevant item from the
@@ -86,6 +107,9 @@ fn extraction_from_sources(
          real-world items (events, activities, purchases, visits...), extract EVERY \
          such item as a JSON array. Each element: {{\"item\": \"short name\", \"date\": \
          \"YYYY/MM/DD\", \"evidence\": \"short quote\", \"amount\": number-or-null}}. \
+         Include all four fields and no extra fields. Names and evidence must be \
+         nonempty. Use an empty date string if no date is available, and null for \
+         an inapplicable amount. If no supported items can be extracted, output []. \
          Use the stated date when the text gives one, else the memory's bracketed date. \
          Merge repeated mentions of the SAME real-world item into one element. Include \
          only items the memories explicitly support; `amount` only for money/quantity \
@@ -101,25 +125,54 @@ fn extraction_from_sources(
     }
 }
 
-/// Parse the extraction reply (tolerates a ```json fence). `None` = unusable;
-/// caller falls back to the single-prompt reader.
-pub fn parse_items(reply: &str) -> Option<Vec<ExtractedItem>> {
+/// Parse the complete extraction protocol without repairing or discarding output.
+pub fn parse_extraction(
+    reply: &str,
+) -> std::result::Result<ExtractionDecision, ExtractionParseError> {
     let body = reply.trim();
-    let body = body
-        .strip_prefix("```json")
-        .or_else(|| body.strip_prefix("```"))
-        .map(|s| s.trim_end_matches("```"))
-        .unwrap_or(body)
-        .trim();
-    let start = body.find('[')?;
-    let end = body.rfind(']').filter(|&e| e > start)?;
-    let items: Vec<ExtractedItem> = serde_json::from_str(&body[start..=end]).ok()?;
-    let items: Vec<ExtractedItem> = items.into_iter().filter(|i| !i.item.is_empty()).collect();
-    if items.is_empty() {
-        None
-    } else {
-        Some(items)
+    if body == "NOT_ENUMERATION" {
+        return Ok(ExtractionDecision::NotEnumeration);
     }
+    let items: Vec<ExtractedItem> = serde_json::from_str(body)?;
+    for (index, item) in items.iter().enumerate() {
+        let reason = if item.item.trim().is_empty() {
+            Some("item name must be nonempty")
+        } else if item.evidence.trim().is_empty() {
+            Some("evidence must be nonempty")
+        } else if !item.date.is_empty() && calendar_date(&item.date).is_none() {
+            Some("date must be empty or a valid YYYY/MM/DD calendar date")
+        } else if item.amount.is_some_and(|amount| !amount.is_finite()) {
+            Some("amount must be finite")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            return Err(ExtractionParseError::InvalidItem { index, reason });
+        }
+    }
+    Ok(ExtractionDecision::Items(items))
+}
+
+fn calendar_date(date: &str) -> Option<(i64, i64, i64)> {
+    let bytes = date.as_bytes();
+    if bytes.len() != 10
+        || bytes[4] != b'/'
+        || bytes[7] != b'/'
+        || bytes
+            .iter()
+            .enumerate()
+            .any(|(i, b)| i != 4 && i != 7 && !b.is_ascii_digit())
+    {
+        return None;
+    }
+    let year = date[..4].parse().ok()?;
+    let month = date[5..7].parse().ok()?;
+    let day = date[8..].parse().ok()?;
+    if year == 0 {
+        return None;
+    }
+    crate::core::civil::days_from_civil(year, month, day)?;
+    Some((year, month, day))
 }
 
 /// Dedup on (folded name, date), then date-sort (dated first, undated last).
@@ -143,24 +196,25 @@ pub fn dedup_and_sort(items: Vec<ExtractedItem>) -> Vec<ExtractedItem> {
     kept
 }
 
-/// Sort key for a `YYYY/MM/DD...` prefix; unparsable dates sort last.
+/// Calendar-date sort key; missing or invalid dates sort last.
 fn date_key(date: &str) -> (i64, i64, i64) {
-    let mut parts = date.split(&['/', ' '][..]);
-    let parse = |s: Option<&str>| s.and_then(|v| v.parse::<i64>().ok());
-    match (
-        parse(parts.next()),
-        parse(parts.next()),
-        parse(parts.next()),
-    ) {
-        (Some(y), Some(m), Some(d)) => (y, m, d),
-        _ => (i64::MAX, 0, 0),
-    }
+    calendar_date(date).unwrap_or((i64::MAX, 0, 0))
 }
 
 /// Pass 2 anchor, appended to the ordinary reader prompt: the full history
 /// stays in view (a list-only prompt loses evidence). The list anchors
 /// counting/ordering; the history stays the evidence.
-pub fn anchor_message(items: &[ExtractedItem]) -> Message {
+pub fn anchor_message(
+    items: &[ExtractedItem],
+) -> std::result::Result<Message, ExtractionParseError> {
+    if items.is_empty() {
+        return Ok(Message::user(
+            "No supported candidates were extracted from the history. This does not \
+             establish that the answer or count is zero. Recheck the history for evidence \
+             answering the question; if it is insufficient, say that you cannot determine \
+             the answer from the available history.",
+        ));
+    }
     let mut list = String::new();
     for (i, it) in items.iter().enumerate() {
         list.push_str(&format!("{}. [{}] {}", i + 1, it.date, it.item));
@@ -173,20 +227,24 @@ pub fn anchor_message(items: &[ExtractedItem]) -> Message {
         list.push('\n');
     }
     let total: f64 = items.iter().filter_map(|i| i.amount).sum();
+    if !total.is_finite() {
+        return Err(ExtractionParseError::InvalidTotal);
+    }
     let amount_line = if items.iter().any(|i| i.amount.is_some()) {
         format!("Sum of listed amounts: {total}.\n")
     } else {
         String::new()
     };
-    Message::user(format!(
-        "Aid for counting and ordering: this de-duplicated, date-ordered candidate list \
-         was extracted programmatically from the SAME history chats above:\n\n{list}\n\
+    Ok(Message::user(format!(
+        "Aid for counting and ordering: the reader extracted these candidates from \
+         the SAME history chats above, then code de-duplicated and date-sorted them. \
+         The candidates still require verification against that history:\n\n{list}\n\
          Candidate count: {}.\n{amount_line}Cross-check the list against the history; \
          drop candidates the question's constraints exclude and add anything the list \
          missed. Anchor any final count, order, or total on that verification, then \
          answer the question.",
         items.len()
-    ))
+    )))
 }
 
 #[cfg(test)]
@@ -205,21 +263,57 @@ mod tests {
     }
 
     #[test]
-    fn parse_tolerates_fence_and_rejects_garbage() {
-        let fenced = "```json\n[{\"item\":\"Science Museum\",\"date\":\"2023/01/15\"}]\n```";
-        assert_eq!(parse_items(fenced).unwrap().len(), 1);
-        let prose = "Here are the items: [{\"item\":\"a\"},{\"item\":\"b\"}] as requested";
-        assert_eq!(parse_items(prose).unwrap().len(), 2);
-        assert!(parse_items("no json here").is_none());
-        assert!(parse_items("[]").is_none());
-        assert!(
-            parse_items("NOT_ENUMERATION").is_none(),
-            "self-classified non-enumeration falls back to the standard prompt"
-        );
-        assert!(
-            parse_items("] stray then [ later").is_none(),
-            "']' before '[' must not slice out of order"
-        );
+    fn extraction_distinguishes_explicit_routing_from_empty_and_nonempty_items() {
+        assert!(matches!(
+            parse_extraction(" \nNOT_ENUMERATION ").unwrap(),
+            ExtractionDecision::NotEnumeration
+        ));
+        let ExtractionDecision::Items(empty) = parse_extraction(" [] ").unwrap() else {
+            panic!("items")
+        };
+        assert!(empty.is_empty());
+        let ExtractionDecision::Items(items) = parse_extraction(
+            r#"[{"item":"museum","date":"2024/02/29","evidence":"visited a museum","amount":null}]"#,
+        ).unwrap() else { panic!("items") };
+        assert_eq!(items.len(), 1);
+        assert!(items[0].amount.is_none());
+    }
+
+    #[test]
+    fn extraction_rejects_surrounding_garbage_and_invalid_fields_without_filtering() {
+        for text in [
+            "not_enumeration",
+            "NOT_ENUMERATION because...",
+            "\"NOT_ENUMERATION\"",
+            "before []",
+            "[] after",
+            "[] []",
+            "```json\n[]\n```",
+            "[",
+            "] stray then [",
+            r#"[{"item":"museum"}]"#,
+            r#"[{"item":"museum","date":"","evidence":"visited"}]"#,
+            r#"[{"item":"museum","date":"","evidence":"visited","amount":null,"extra":1}]"#,
+            r#"[{"item":"museum","item":"other","date":"","evidence":"visited","amount":null}]"#,
+            r#"[{"item":" \t ","date":"","evidence":"visited","amount":null}]"#,
+            r#"[{"item":"museum","date":"","evidence":" ","amount":null}]"#,
+            r#"[{"item":"museum","date":"2023/02/29","evidence":"visited","amount":null}]"#,
+            r#"[{"item":"museum","date":"0000/01/01","evidence":"visited","amount":null}]"#,
+            r#"[{"item":"museum","date":"2024/1/1","evidence":"visited","amount":null}]"#,
+            r#"[{"item":"museum","date":"","evidence":"visited","amount":1e309}]"#,
+        ] {
+            assert!(parse_extraction(text).is_err(), "must reject {text}");
+        }
+    }
+
+    #[test]
+    fn empty_candidate_aid_does_not_assert_a_zero_answer() {
+        let Message::User(text) = anchor_message(&[]).unwrap() else {
+            panic!("user message")
+        };
+        assert!(text.contains("does not establish"));
+        assert!(text.contains("insufficient"));
+        assert!(!text.contains("Candidate count: 0"));
     }
 
     #[test]
@@ -262,11 +356,55 @@ mod tests {
                 amount: Some(22.5),
             },
         ];
-        let Message::User(text) = &anchor_message(&items) else {
+        let Message::User(text) = &anchor_message(&items).unwrap() else {
             panic!("expected user message");
         };
         assert!(text.contains("Candidate count: 2."));
         assert!(text.contains("Sum of listed amounts: 42.5."));
         assert!(text.contains("[2023/01/01] gift A (amount: 20)"));
+    }
+
+    #[test]
+    fn amount_total_is_validated_after_the_actual_deduplication_and_sort() {
+        let item = |name: &str, day: u8, amount: f64| ExtractedItem {
+            item: name.into(),
+            date: format!("2024/01/{day:02}"),
+            evidence: name.into(),
+            amount: Some(amount),
+        };
+        let dedup_overflow = vec![
+            item("A", 1, 1e308),
+            item("D", 1, -1e308),
+            item("D", 1, -1e308),
+            item("B", 1, 1e308),
+            item("C", 1, 1e308),
+        ];
+        let sort_overflow = vec![
+            item("A", 1, 1e308),
+            item("B", 3, -1e308),
+            item("C", 2, 1e308),
+        ];
+        for input in [dedup_overflow, sort_overflow] {
+            assert!(input
+                .iter()
+                .filter_map(|i| i.amount)
+                .sum::<f64>()
+                .is_finite());
+            assert!(matches!(
+                anchor_message(&dedup_and_sort(input)),
+                Err(ExtractionParseError::InvalidTotal)
+            ));
+        }
+        let finite_normalized = vec![
+            item("A", 1, 1e308),
+            item("B", 3, 1e308),
+            item("C", 2, -1e308),
+        ];
+        assert!(!finite_normalized
+            .iter()
+            .filter_map(|i| i.amount)
+            .sum::<f64>()
+            .is_finite());
+        assert!(anchor_message(&dedup_and_sort(finite_normalized)).is_ok());
     }
 }
