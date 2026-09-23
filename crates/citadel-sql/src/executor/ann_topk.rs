@@ -1671,74 +1671,87 @@ pub(crate) fn persist_ann_index(
     check_cancel(cancel)?;
     let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
     check_cancel(cancel)?;
-    schema.admit_write(db, &mut wtx)?;
-    super::reject_legacy_volatile_schema(schema)?;
-    // Catalog-only changes (for example replacing the ANN filter columns) do
-    // not change the base-data root stamp. Refuse that race before any write.
-    let declaration_matches = match schema.get(&table) {
-        Some(live) => live.try_serialize()? == source_declaration,
-        None => false,
-    };
-    if !declaration_matches {
-        return Err(SqlError::InvalidValue(
-            "table definition changed while the ANN index was being built; retry persistence"
-                .into(),
-        ));
-    }
-    let live_stamp = wtx
-        .table_root_stamp(table_schema.name.as_bytes())
-        .map_err(SqlError::Storage)?
-        .ok_or_else(|| SqlError::InvalidValue("table vanished during ANN persist".into()))?;
-    if live_stamp != (source_root, source_root_txn) {
-        return Err(SqlError::InvalidValue(
-            "table changed while the ANN index was being built; retry persistence".into(),
-        ));
-    }
-    let seg_table = ann_persist::segment_table_name(&table_schema.name);
-    check_cancel(cancel)?;
-    ann_persist::purge_segment(&mut wtx, &table_schema.name)?;
-    wtx.create_table(&seg_table).map_err(SqlError::Storage)?;
-    wtx.table_insert(&seg_table, &ann_persist::segment_key(0), &header_bytes)
-        .map_err(SqlError::Storage)?;
-    for (chunk_no, chunk) in ann_persist::chunks(&body) {
-        check_cancel_at(cancel, chunk_no as usize)?;
-        wtx.table_insert(&seg_table, &ann_persist::segment_key(chunk_no), chunk)
+    let admission_snapshot = schema.admit_write(db, &mut wtx)?;
+    let mut committed = false;
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        super::reject_legacy_volatile_schema(schema)?;
+        // Catalog-only changes (for example replacing the ANN filter columns) do
+        // not change the base-data root stamp. Refuse that race before any write.
+        let declaration_matches = match schema.get(&table) {
+            Some(live) => live.try_serialize()? == source_declaration,
+            None => false,
+        };
+        if !declaration_matches {
+            return Err(SqlError::InvalidValue(
+                "table definition changed while the ANN index was being built; retry persistence"
+                    .into(),
+            ));
+        }
+        let live_stamp = wtx
+            .table_root_stamp(table_schema.name.as_bytes())
+            .map_err(SqlError::Storage)?
+            .ok_or_else(|| SqlError::InvalidValue("table vanished during ANN persist".into()))?;
+        if live_stamp != (source_root, source_root_txn) {
+            return Err(SqlError::InvalidValue(
+                "table changed while the ANN index was being built; retry persistence".into(),
+            ));
+        }
+        let seg_table = ann_persist::segment_table_name(&table_schema.name);
+        check_cancel(cancel)?;
+        ann_persist::purge_segment(&mut wtx, &table_schema.name)?;
+        wtx.create_table(&seg_table).map_err(SqlError::Storage)?;
+        wtx.table_insert(&seg_table, &ann_persist::segment_key(0), &header_bytes)
             .map_err(SqlError::Storage)?;
-    }
-    check_cancel(cancel)?;
-    let cached_gen = wtx.commit_with_generation().map_err(SqlError::Storage)?;
+        for (chunk_no, chunk) in ann_persist::chunks(&body) {
+            check_cancel_at(cancel, chunk_no as usize)?;
+            wtx.table_insert(&seg_table, &ann_persist::segment_key(chunk_no), chunk)
+                .map_err(SqlError::Storage)?;
+        }
+        check_cancel(cancel)?;
+        let cached_gen = wtx.commit_with_generation().map_err(SqlError::Storage)?;
+        committed = true;
 
-    // Warm the shared cache with the exact generation returned by this commit.
-    // Sampling the manager after commit can mislabel this index with a later
-    // writer's generation and let it survive that writer's invalidation marker.
-    let cached: Arc<CachedAnnIndex> = Arc::new(CachedAnnIndex {
-        index,
-        dicts: outcome.dicts,
-        source: AnnIndexSource::Built { refusal: None },
-        cached_gen,
-        identity: spec.cache_identity(&table_schema),
-    });
-    let key = cache_key(&table_schema.name, spec.col_idx, spec.metric);
-    let mut guard = schema.sql_caches.lock();
-    if cached_passes_dml_barriers_locked(&guard, &table_schema.name, &cached) {
-        let keep_newer = guard
-            .get(&key)
-            .and_then(|entry| entry.downcast_ref::<CachedAnnIndex>())
-            .is_some_and(|existing| existing.cached_gen > cached.cached_gen);
-        if !keep_newer {
-            let as_any: Arc<dyn Any + Send + Sync> = cached;
-            guard.insert(key, as_any);
+        // Warm the shared cache with the exact generation returned by this commit.
+        // Sampling the manager after commit can mislabel this index with a later
+        // writer's generation and let it survive that writer's invalidation marker.
+        let cached: Arc<CachedAnnIndex> = Arc::new(CachedAnnIndex {
+            index,
+            dicts: outcome.dicts,
+            source: AnnIndexSource::Built { refusal: None },
+            cached_gen,
+            identity: spec.cache_identity(&table_schema),
+        });
+        let key = cache_key(&table_schema.name, spec.col_idx, spec.metric);
+        let mut guard = schema.sql_caches.lock();
+        if cached_passes_dml_barriers_locked(&guard, &table_schema.name, &cached) {
+            let keep_newer = guard
+                .get(&key)
+                .and_then(|entry| entry.downcast_ref::<CachedAnnIndex>())
+                .is_some_and(|existing| existing.cached_gen > cached.cached_gen);
+            if !keep_newer {
+                let as_any: Arc<dyn Any + Send + Sync> = cached;
+                guard.insert(key, as_any);
+            }
+        }
+
+        Ok(ann_persist::AnnSegmentInfo {
+            segment_b3,
+            content_fingerprint: header.content_fingerprint,
+            n,
+            dim: spec.dim,
+            metric_tag: header.metric_tag,
+            chunk_count: header.chunk_count,
+        })
+    }));
+    if !committed {
+        if let Some(snapshot) = admission_snapshot {
+            schema.restore_snapshot(snapshot);
         }
     }
-
-    Ok(ann_persist::AnnSegmentInfo {
-        segment_b3,
-        content_fingerprint: header.content_fingerprint,
-        n,
-        dim: spec.dim,
-        metric_tag: header.metric_tag,
-        chunk_count: header.chunk_count,
-    })
+    match outcome {
+        Ok(result) => result,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
 }
 
 /// The queryable identity of the index currently cached for `table.column`:

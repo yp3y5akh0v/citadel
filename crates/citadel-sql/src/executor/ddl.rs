@@ -125,6 +125,7 @@ pub(super) fn validate_foreign_keys(
 
 /// Add inline UNIQUE definitions before validating self-referencing foreign keys.
 fn add_unique_auto_indices(
+    schema: &SchemaManager,
     mut table_schema: TableSchema,
     stmt: &CreateTableStmt,
 ) -> Result<TableSchema> {
@@ -179,10 +180,17 @@ fn add_unique_auto_indices(
             crate::types::IndexKind::default(),
         ));
     }
+    if let Some(index) =
+        super::constraint_indexes::primary_key_index_to_add(&table_schema, |name| {
+            find_index_in_schemas(schema, name).is_some()
+        })
+    {
+        table_schema.indices.push(index);
+    }
     Ok(table_schema)
 }
 
-fn create_unique_index_tables(
+pub(super) fn create_index_tables(
     wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
     table_schema: &TableSchema,
 ) -> Result<()> {
@@ -370,14 +378,14 @@ pub(super) fn exec_create_table_in_txn(
         table_schema.flags |= crate::types::TABLE_FLAG_STRICT;
     }
 
-    let table_schema = add_unique_auto_indices(table_schema, stmt)?;
+    let table_schema = add_unique_auto_indices(schema, table_schema, stmt)?;
     validate_foreign_keys(schema, &table_schema, &table_schema.foreign_keys)?;
 
     SchemaManager::ensure_schema_table(wtx)?;
     wtx.create_table(lower_name.as_bytes())
         .map_err(SqlError::Storage)?;
 
-    create_unique_index_tables(wtx, &table_schema)?;
+    create_index_tables(wtx, &table_schema)?;
     let table_schema = create_fk_auto_indices(wtx, table_schema)?;
 
     SchemaManager::save_schema(wtx, &table_schema)?;
@@ -639,52 +647,77 @@ pub(super) fn exec_create_index(
     };
 
     let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
-    schema.admit_write(db, &mut wtx)?;
-    super::reject_legacy_volatile_schema(schema)?;
-    let storage_table = schema
-        .get(&lower_table)
-        .map(|table| table.name.clone())
-        .unwrap_or_else(|| schema.resolve_temp(&lower_table));
-    let mut table_schema =
-        SchemaManager::load_table(&storage_table, |table, key| wtx.table_get(table, key))?
-            .ok_or_else(|| SqlError::TableNotFound(stmt.table_name.clone()))?;
-    if table_schema.index_by_name(&lower_idx).is_some() {
-        if stmt.if_not_exists {
-            schema.register(table_schema);
-            return Ok(ExecutionResult::Ok);
+    let admission_snapshot = schema.admit_write(db, &mut wtx)?;
+    let mut committed = false;
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        super::reject_legacy_volatile_schema(schema)?;
+        let storage_table = schema
+            .get(&lower_table)
+            .map(|table| table.name.clone())
+            .unwrap_or_else(|| schema.resolve_temp(&lower_table));
+        let mut table_schema =
+            SchemaManager::load_table(&storage_table, |table, key| wtx.table_get(table, key))?
+                .ok_or_else(|| SqlError::TableNotFound(stmt.table_name.clone()))?;
+        if table_schema.index_by_name(&lower_idx).is_some() {
+            if stmt.if_not_exists {
+                schema.register(table_schema);
+                return Ok(ExecutionResult::Ok);
+            }
+            return Err(SqlError::IndexAlreadyExists(stmt.index_name.clone()));
         }
-        return Err(SqlError::IndexAlreadyExists(stmt.index_name.clone()));
+        let idx_def = build_index_def_for_create(stmt, &table_schema, lower_idx.clone())?;
+        let plan = IndexBuildPlan::new(&table_schema, &idx_def, cancel)?;
+        let idx_table = TableSchema::index_table_name(&table_schema.name, &lower_idx);
+
+        SchemaManager::ensure_schema_table(&mut wtx)?;
+        wtx.create_table(&idx_table).map_err(SqlError::Storage)?;
+
+        // A commit after the read snapshot invalidates the collected entries.
+        let entries = match prescan {
+            Some((entries, generation)) if db.manager().commit_generation() == generation => {
+                entries
+            }
+            stale => {
+                drop(stale);
+                plan.collect(|visit| wtx.table_scan_from(table_schema.name.as_bytes(), b"", visit))?
+            }
+        };
+        plan.insert(&mut wtx, &idx_table, entries)?;
+
+        table_schema.indices.push(idx_def);
+        SchemaManager::save_schema(&mut wtx, &table_schema)?;
+        super::commit_with_ann_publication(wtx, schema)?;
+        committed = true;
+
+        schema.register(table_schema);
+        Ok(ExecutionResult::Ok)
+    }));
+    if !committed {
+        if let Some(snapshot) = admission_snapshot {
+            schema.restore_snapshot(snapshot);
+        }
     }
-    let idx_def = build_index_def_for_create(stmt, &table_schema, lower_idx.clone())?;
-    let plan = IndexBuildPlan::new(&table_schema, &idx_def, cancel)?;
-    let idx_table = TableSchema::index_table_name(&table_schema.name, &lower_idx);
-
-    SchemaManager::ensure_schema_table(&mut wtx)?;
-    wtx.create_table(&idx_table).map_err(SqlError::Storage)?;
-
-    // A commit after the read snapshot invalidates the collected entries.
-    let entries = match prescan {
-        Some((entries, generation)) if db.manager().commit_generation() == generation => entries,
-        stale => {
-            drop(stale);
-            plan.collect(|visit| wtx.table_scan_from(table_schema.name.as_bytes(), b"", visit))?
-        }
-    };
-    plan.insert(&mut wtx, &idx_table, entries)?;
-
-    table_schema.indices.push(idx_def);
-    SchemaManager::save_schema(&mut wtx, &table_schema)?;
-    super::commit_with_ann_publication(wtx, schema)?;
-
-    schema.register(table_schema);
-    Ok(ExecutionResult::Ok)
+    match outcome {
+        Ok(result) => result,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
 }
 
-/// Refuse to drop the last index backing an FK (the cascade scan needs it).
-fn ensure_drop_index_keeps_fk_backing(table_schema: &TableSchema, idx_lower: &str) -> Result<()> {
+/// Refuse to drop the last index backing a logical constraint.
+fn ensure_drop_index_keeps_constraints(table_schema: &TableSchema, idx_lower: &str) -> Result<()> {
     let Some(dropped) = table_schema.index_by_name(idx_lower) else {
         return Ok(());
     };
+    if table_schema.is_primary_key_equality_index(dropped)
+        && !table_schema.indices.iter().any(|index| {
+            index.name != idx_lower && table_schema.is_primary_key_equality_index(index)
+        })
+    {
+        return Err(SqlError::Unsupported(format!(
+            "cannot drop index '{}': required to enforce the primary key of '{}'",
+            idx_lower, table_schema.name
+        )));
+    }
     for fk in &table_schema.foreign_keys {
         if !dropped.is_full_column_btree(&fk.columns) {
             continue;
@@ -763,7 +796,7 @@ pub(super) fn exec_drop_index_in_txn(
         }
     };
 
-    ensure_drop_index_keeps_fk_backing(schema.get(&table_name).unwrap(), &lower_idx)?;
+    ensure_drop_index_keeps_constraints(schema.get(&table_name).unwrap(), &lower_idx)?;
     let idx_table = TableSchema::index_table_name(&table_name, &lower_idx);
     wtx.drop_table(&idx_table).map_err(SqlError::Storage)?;
 

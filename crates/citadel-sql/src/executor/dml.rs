@@ -2543,6 +2543,43 @@ pub(super) fn apply_insert_with_conflict(
 ) -> Result<InsertRowOutcome> {
     let table_bytes = table_schema.name.as_bytes();
 
+    // An explicit arbiter selects the row before unrelated proposed values
+    // are inserted. Its UPDATE must then satisfy all constraints on the final
+    // row. The unindexed Binary-PK path below keeps its fused storage operation.
+    let target = match on_conflict {
+        CompiledOnConflict::DoNothing { target } => target.as_ref(),
+        CompiledOnConflict::DoUpdate { target, .. } => Some(target),
+    };
+    let index_target = target.and_then(|target| match target {
+        ConflictKind::PrimaryKey => table_schema.primary_key_equality_index(),
+        ConflictKind::UniqueIndex { index_idx } => Some(*index_idx),
+    });
+    if let Some(index_idx) = index_target {
+        if let Some(existing_pk) =
+            find_unique_index_pk(wtx, table_schema, index_idx, row, pk_values)?
+        {
+            return match on_conflict {
+                CompiledOnConflict::DoNothing { .. } => Ok(InsertRowOutcome::Skipped),
+                CompiledOnConflict::DoUpdate {
+                    assignments,
+                    where_clause,
+                    ..
+                } => apply_do_update(
+                    wtx,
+                    schema,
+                    table_schema,
+                    &existing_pk,
+                    row,
+                    assignments,
+                    where_clause.as_ref(),
+                    col_map,
+                    cancel,
+                    capture_returning,
+                ),
+            };
+        }
+    }
+
     if let CompiledOnConflict::DoNothing { target } = on_conflict {
         let pk_target = matches!(target, None | Some(ConflictKind::PrimaryKey));
         if pk_target && table_schema.indices.is_empty() && table_schema.foreign_keys.is_empty() {
@@ -2602,8 +2639,12 @@ pub(super) fn apply_insert_with_conflict(
             )? {
                 None => Ok(InsertRowOutcome::Inserted),
                 Some(conflicting_idx) => {
+                    let primary_collision = table_schema
+                        .is_primary_key_equality_index(&table_schema.indices[conflicting_idx]);
                     let matches_target =
                         matches!(on_conflict, CompiledOnConflict::DoNothing { target: None })
+                            || (primary_collision
+                                && matches!(target, Some(ConflictKind::PrimaryKey)))
                             || matches!(
                                 on_conflict,
                                 CompiledOnConflict::DoNothing {
@@ -2615,8 +2656,9 @@ pub(super) fn apply_insert_with_conflict(
                             );
                     undo_partial_insert(wtx, table_schema, key_buf, &inserted_keys)?;
                     if !matches_target {
-                        return Err(SqlError::UniqueViolation(
-                            table_schema.indices[conflicting_idx].name.clone(),
+                        return Err(index_conflict_error(
+                            table_schema,
+                            &table_schema.indices[conflicting_idx],
                         ));
                     }
                     match on_conflict {
@@ -2626,8 +2668,18 @@ pub(super) fn apply_insert_with_conflict(
                             where_clause,
                             ..
                         } => {
-                            let existing_pk =
-                                fetch_unique_index_pk(wtx, table_schema, conflicting_idx, row)?;
+                            let existing_pk = find_unique_index_pk(
+                                wtx,
+                                table_schema,
+                                conflicting_idx,
+                                row,
+                                pk_values,
+                            )?
+                            .ok_or_else(|| {
+                                SqlError::InvalidValue(
+                                    "unique index missing expected collision entry".into(),
+                                )
+                            })?;
                             apply_do_update(
                                 wtx,
                                 schema,
@@ -2937,26 +2989,31 @@ fn apply_do_update_fused(
     }
 }
 
-fn fetch_unique_index_pk(
+fn find_unique_index_pk(
     wtx: &mut WriteTxn<'_>,
     table_schema: &TableSchema,
     index_idx: usize,
     row: &[Value],
-) -> Result<Vec<u8>> {
+    pk_values: &[Value],
+) -> Result<Option<Vec<u8>>> {
     let idx = &table_schema.indices[index_idx];
+    if !row_matches_partial_with_cancel(idx, row, table_schema.column_map(), wtx.cancel_token())? {
+        return Ok(None);
+    }
+    let mut key = Vec::new();
+    let contains_null = encode_index_key_into_with_schema_and_cancel(
+        idx,
+        row,
+        pk_values,
+        table_schema,
+        &mut key,
+        wtx.cancel_token(),
+    )?;
+    if contains_null {
+        return Ok(None);
+    }
     let idx_table = TableSchema::index_table_name(&table_schema.name, &idx.name);
-    let indexed: Vec<Value> = idx
-        .column_positions_iter()
-        .map(|col_idx| row[col_idx as usize].clone())
-        .collect();
-    let key = crate::encoding::encode_composite_key(&indexed);
-    let value = wtx
-        .table_get(&idx_table, &key)
-        .map_err(SqlError::Storage)?
-        .ok_or_else(|| {
-            SqlError::InvalidValue("unique index missing expected collision entry".into())
-        })?;
-    Ok(value)
+    wtx.table_get(&idx_table, &key).map_err(SqlError::Storage)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3189,7 +3246,7 @@ fn apply_do_update_with_old_row(
                         .column_positions_iter()
                         .any(|c| new_row[c as usize].is_null());
                     if !any_null {
-                        return Err(SqlError::UniqueViolation(idx.name.clone()));
+                        return Err(index_conflict_error(table_schema, idx));
                     }
                 }
             }
@@ -3240,7 +3297,7 @@ fn apply_do_update_with_old_row(
                         .column_positions_iter()
                         .any(|c| new_row[c as usize].is_null());
                     if !any_null {
-                        return Err(SqlError::UniqueViolation(idx.name.clone()));
+                        return Err(index_conflict_error(table_schema, idx));
                     }
                 }
             }

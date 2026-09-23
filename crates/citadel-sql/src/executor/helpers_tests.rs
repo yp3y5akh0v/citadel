@@ -43,6 +43,87 @@ fn i(n: i64) -> Value {
 }
 
 #[test]
+fn unique_encoder_reports_null_and_retains_exact_collated_keys() {
+    let table = schema(
+        "t",
+        cols(&[("id", DataType::Integer), ("body", DataType::Text)]),
+        vec![0],
+    );
+    let index = IndexDef::from_column_lists(
+        "uq".into(),
+        vec![1],
+        vec![Collation::NoCase],
+        true,
+        None,
+        None,
+        crate::types::IndexKind::BTree,
+    );
+    for body in [Value::Text("MiXeD".into()), Value::Null] {
+        let row = [i(7), body];
+        let mut expected = Vec::new();
+        crate::encoding::encode_key_value_collated_into(&row[1], Collation::NoCase, &mut expected);
+        if row[1].is_null() {
+            crate::encoding::encode_key_value_into(&row[0], &mut expected);
+        }
+        let mut encoded = vec![0xff];
+        let null = encode_index_key_into_with_schema_and_cancel(
+            &index,
+            &row,
+            &row[..1],
+            &table,
+            &mut encoded,
+            None,
+        )
+        .unwrap();
+        assert_eq!(null, row[1].is_null());
+        assert_eq!(encoded, expected);
+    }
+}
+
+#[test]
+fn unique_expression_encoder_reports_evaluated_null_and_errors() {
+    let table = schema(
+        "t",
+        cols(&[("id", DataType::Integer), ("body", DataType::Text)]),
+        vec![0],
+    );
+    let index = |sql: &str| IndexDef {
+        name: "uq".into(),
+        keys: vec![IndexKey::Expr {
+            expr: crate::parser::parse_sql_expr(sql).unwrap(),
+            original_sql: sql.into(),
+        }],
+        unique: true,
+        predicate_sql: None,
+        predicate_expr: None,
+        kind: crate::types::IndexKind::BTree,
+        ann_filter_cols: Vec::new(),
+    };
+    let row = [i(7), Value::Text("text".into())];
+    let mut encoded = Vec::new();
+    let null = encode_index_key_into_with_schema_and_cancel(
+        &index("NULLIF(body,'text')"),
+        &row,
+        &row[..1],
+        &table,
+        &mut encoded,
+        None,
+    )
+    .unwrap();
+    assert!(null);
+    assert_eq!(encoded, encode_composite_key(&[Value::Null, i(7)]));
+    assert!(encode_index_key_into_with_schema_and_cancel(
+        &index("CAST(body AS INTEGER)"),
+        &row,
+        &row[..1],
+        &table,
+        &mut encoded,
+        None
+    )
+    .is_err());
+}
+
+#[test]
 fn full_row_decode_rejects_truncated_headers_without_panicking() {
     let table = schema(
         "t",

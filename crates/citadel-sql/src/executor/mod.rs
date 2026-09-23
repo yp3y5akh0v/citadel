@@ -4,6 +4,7 @@ mod aggregate;
 pub(crate) mod ann_persist;
 mod ann_topk;
 pub(crate) mod compile;
+pub(crate) mod constraint_indexes;
 mod correlated;
 mod cte;
 mod ddl;
@@ -494,8 +495,9 @@ pub fn execute(
         return execute_with_admitted_read(&mut rtx, schema, stmt, params);
     }
     let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
-    schema.admit_write(db, &mut wtx)?;
-    let mut schema_snapshot = stmt_mutates_schema(stmt).then(|| schema.save_snapshot());
+    let admission_snapshot = schema.admit_write(db, &mut wtx)?;
+    let mut schema_snapshot =
+        admission_snapshot.or_else(|| stmt_mutates_schema(stmt).then(|| schema.save_snapshot()));
     let mut dml_snapshot = Some(schema.save_dml_snapshot());
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let result = execute_in_admitted_txn(&mut wtx, schema, stmt, params)?;
@@ -604,6 +606,7 @@ pub fn exec_insert_in_txn(
     wtx.check_usable().map_err(SqlError::Storage)?;
     check_cancelled(wtx.cancel_token())?;
     schema.validate_write_catalog(wtx)?;
+    constraint_indexes::require_primary_key_indexes(schema)?;
     dml::exec_insert_in_admitted_txn(wtx, schema, stmt, params)
 }
 

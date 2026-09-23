@@ -2383,17 +2383,6 @@ pub(super) fn infer_expr_type(expr: &Expr, columns: &[ColumnDef]) -> DataType {
     }
 }
 
-pub(super) fn encode_index_key_with_schema(
-    idx: &IndexDef,
-    row: &[Value],
-    pk_values: &[Value],
-    schema: &TableSchema,
-) -> Vec<u8> {
-    let mut buf = Vec::new();
-    encode_index_key_into_with_schema(idx, row, pk_values, Some(schema), &mut buf);
-    buf
-}
-
 pub(super) fn encode_index_key_with_schema_and_cancel(
     idx: &IndexDef,
     row: &[Value],
@@ -2401,31 +2390,24 @@ pub(super) fn encode_index_key_with_schema_and_cancel(
     schema: &TableSchema,
     cancel: Option<&citadel::CancelToken>,
 ) -> Result<Vec<u8>> {
-    if idx.is_pure_column_index() {
-        return Ok(encode_index_key_with_schema(idx, row, pk_values, schema));
-    }
     let mut buf = Vec::new();
-    encode_index_key_into_with_schema_and_cancel(
-        idx,
-        row,
-        pk_values,
-        Some(schema),
-        &mut buf,
-        cancel,
-    )?;
+    encode_index_key_into_with_schema_and_cancel(idx, row, pk_values, schema, &mut buf, cancel)?;
     Ok(buf)
 }
 
-/// If the index has expression keys but `schema` is None, expression results are NULL.
-pub(super) fn encode_index_key_into_with_schema(
+/// Encode once and return whether a UNIQUE key contains NULL (and therefore
+/// carries a physical-PK suffix rather than identifying a uniqueness conflict).
+/// Pure columns are borrowed directly; expression errors and cancellation are
+/// propagated from the required schema-bound evaluator.
+pub(super) fn encode_index_key_into_with_schema_and_cancel(
     idx: &IndexDef,
     row: &[Value],
     pk_values: &[Value],
-    schema: Option<&TableSchema>,
+    schema: &TableSchema,
     buf: &mut Vec<u8>,
-) {
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<bool> {
     buf.clear();
-    // Encode straight from `row` (no Vec<Value>); byte-identical to the Expr path.
     if idx.is_pure_column_index() {
         let mut any_null = false;
         for (i, key) in idx.keys.iter().enumerate() {
@@ -2437,50 +2419,23 @@ pub(super) fn encode_index_key_into_with_schema(
             encode_index_key_component(value, idx.collation_at(i), buf);
         }
         if !idx.unique || any_null {
-            for v in pk_values {
-                crate::encoding::encode_key_value_into(v, buf);
+            for value in pk_values {
+                crate::encoding::encode_key_value_into(value, buf);
             }
         }
-        return;
+        return Ok(any_null);
     }
-    let key_values = materialize_index_key_values(idx, row, schema);
-    let any_null = idx.unique && key_values.iter().any(|v| v.is_null());
-    let include_pk = !idx.unique || any_null;
-    for (i, value) in key_values.iter().enumerate() {
-        encode_index_key_component(value, idx.collation_at(i), buf);
-    }
-    if include_pk {
-        for v in pk_values {
-            crate::encoding::encode_key_value_into(v, buf);
-        }
-    }
-}
-
-pub(super) fn encode_index_key_into_with_schema_and_cancel(
-    idx: &IndexDef,
-    row: &[Value],
-    pk_values: &[Value],
-    schema: Option<&TableSchema>,
-    buf: &mut Vec<u8>,
-    cancel: Option<&citadel::CancelToken>,
-) -> Result<()> {
-    if idx.is_pure_column_index() {
-        encode_index_key_into_with_schema(idx, row, pk_values, schema, buf);
-        return Ok(());
-    }
-    buf.clear();
     let key_values = materialize_index_key_values_with_cancel(idx, row, schema, cancel)?;
     let any_null = idx.unique && key_values.iter().any(Value::is_null);
-    let include_pk = !idx.unique || any_null;
     for (i, value) in key_values.iter().enumerate() {
         encode_index_key_component(value, idx.collation_at(i), buf);
     }
-    if include_pk {
+    if !idx.unique || any_null {
         for value in pk_values {
             crate::encoding::encode_key_value_into(value, buf);
         }
     }
-    Ok(())
+    Ok(any_null)
 }
 
 #[inline]
@@ -2492,48 +2447,23 @@ fn encode_index_key_component(value: &Value, coll: crate::types::Collation, buf:
     }
 }
 
-/// Expression eval errors (or missing schema) materialize as `Value::Null` - PG semantics.
-pub(super) fn materialize_index_key_values(
-    idx: &IndexDef,
-    row: &[Value],
-    schema: Option<&TableSchema>,
-) -> Vec<Value> {
-    let col_map = schema.map(|s| s.column_map());
-    idx.keys
-        .iter()
-        .map(|key| match key {
-            crate::types::IndexKey::Column { idx: col_idx, .. } => row[*col_idx as usize].clone(),
-            crate::types::IndexKey::Expr { expr, .. } => match col_map.as_ref() {
-                Some(cm) => {
-                    let ctx = crate::eval::EvalCtx::new(cm, row);
-                    crate::eval::eval_expr(expr, &ctx).unwrap_or(Value::Null)
-                }
-                None => Value::Null,
-            },
-        })
-        .collect()
-}
-
 pub(super) fn materialize_index_key_values_with_cancel(
     idx: &IndexDef,
     row: &[Value],
-    schema: Option<&TableSchema>,
+    schema: &TableSchema,
     cancel: Option<&citadel::CancelToken>,
 ) -> Result<Vec<Value>> {
-    let col_map = schema.map(TableSchema::column_map);
+    let col_map = schema.column_map();
     idx.keys
         .iter()
         .map(|key| match key {
             crate::types::IndexKey::Column { idx: col_idx, .. } => {
                 Ok(row[*col_idx as usize].clone())
             }
-            crate::types::IndexKey::Expr { expr, .. } => match col_map.as_ref() {
-                Some(cm) => crate::eval::eval_expr(
-                    expr,
-                    &crate::eval::EvalCtx::new(cm, row).with_cancel(cancel),
-                ),
-                None => Ok(Value::Null),
-            },
+            crate::types::IndexKey::Expr { expr, .. } => crate::eval::eval_expr(
+                expr,
+                &crate::eval::EvalCtx::new(col_map, row).with_cancel(cancel),
+            ),
         })
         .collect()
 }
@@ -2550,6 +2480,14 @@ pub(super) fn encode_index_value(idx: &IndexDef, row: &[Value], pk_values: &[Val
         }
     }
     vec![]
+}
+
+pub(super) fn index_conflict_error(table: &TableSchema, index: &IndexDef) -> SqlError {
+    if table.is_primary_key_equality_index(index) {
+        SqlError::DuplicateKey
+    } else {
+        SqlError::UniqueViolation(index.name.clone())
+    }
 }
 
 thread_local! {
@@ -2595,7 +2533,7 @@ pub(super) fn insert_index_entries(
                     idx,
                     row,
                     pk_values,
-                    Some(table_schema),
+                    table_schema,
                     &mut key_buf,
                     cancel,
                 )?;
@@ -2610,7 +2548,7 @@ pub(super) fn insert_index_entries(
                         .column_positions_iter()
                         .any(|c| row[c as usize].is_null());
                     if !any_null {
-                        return Err(SqlError::UniqueViolation(idx.name.clone()));
+                        return Err(index_conflict_error(table_schema, idx));
                     }
                 }
             }
@@ -2938,14 +2876,10 @@ pub(super) fn insert_index_entry(
         .table_insert_index(&idx_table, &key, &value)
         .map_err(SqlError::Storage)?;
     if idx.unique && !inserted {
-        let values = materialize_index_key_values_with_cancel(
-            idx,
-            row,
-            Some(table_schema),
-            wtx.cancel_token(),
-        )?;
+        let values =
+            materialize_index_key_values_with_cancel(idx, row, table_schema, wtx.cancel_token())?;
         if !values.iter().any(Value::is_null) {
-            return Err(SqlError::UniqueViolation(idx.name.clone()));
+            return Err(index_conflict_error(table_schema, idx));
         }
     }
     Ok(())

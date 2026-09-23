@@ -619,7 +619,8 @@ impl<'a> Connection<'a> {
         // the single-writer slot. Opening a connection is a deterministic
         // writer-free retry point, and cleanup ignores the user token.
         try_drain_deferred_temp_drops(db);
-        let schema = SchemaManager::load(db)?;
+        let mut schema = SchemaManager::load(db)?;
+        executor::constraint_indexes::reconcile_primary_key_indexes(db, &mut schema)?;
         let stmt_cache = LruCache::new(NonZeroUsize::new(DEFAULT_CACHE_CAPACITY).unwrap());
         let temp_id = generate_temp_id();
         Ok(Self {
@@ -994,16 +995,17 @@ impl<'a> ConnectionInner<'a> {
             self.schema.admit_read(db, &mut db.begin_read())?;
             return run(self);
         }
+        let mut admission_snapshot = None;
         let txn = if executor::stmt_mutates(stmt) {
             let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
-            self.schema.admit_write(db, &mut wtx)?;
+            admission_snapshot = self.schema.admit_write(db, &mut wtx)?;
             ActiveTxn::Write(Box::new(wtx))
         } else {
             let mut rtx = db.begin_read();
             self.schema.admit_read(db, &mut rtx)?;
             ActiveTxn::Read(rtx)
         };
-        self.with_owned_statement_txn(db, stmt, txn, run)
+        self.with_owned_statement_txn(db, stmt, txn, admission_snapshot, run)
     }
 
     /// Continue a prepared read on the snapshot used to select its capability.
@@ -1015,7 +1017,7 @@ impl<'a> ConnectionInner<'a> {
         run: impl FnOnce(&mut Self) -> Result<T>,
     ) -> Result<T> {
         debug_assert!(self.active_txn.is_none());
-        self.with_owned_statement_txn(db, stmt, ActiveTxn::Read(rtx), run)
+        self.with_owned_statement_txn(db, stmt, ActiveTxn::Read(rtx), None, run)
     }
 
     fn with_owned_statement_txn<T>(
@@ -1023,12 +1025,13 @@ impl<'a> ConnectionInner<'a> {
         db: &'a Database,
         stmt: &Statement,
         txn: ActiveTxn<'a>,
+        admission_snapshot: Option<SchemaSnapshot>,
         run: impl FnOnce(&mut Self) -> Result<T>,
     ) -> Result<T> {
         let mutates = matches!(&txn, ActiveTxn::Write(_));
         self.active_txn = txn;
-        let mut schema_snapshot =
-            executor::stmt_mutates_schema(stmt).then(|| self.schema.save_snapshot());
+        let mut schema_snapshot = admission_snapshot
+            .or_else(|| executor::stmt_mutates_schema(stmt).then(|| self.schema.save_snapshot()));
         let mut dml_snapshot =
             (mutates && schema_snapshot.is_none()).then(|| self.schema.save_dml_snapshot());
         let temp_len = self.temp_table_names.len();
@@ -1097,7 +1100,7 @@ impl<'a> ConnectionInner<'a> {
         }
 
         let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
-        self.schema.admit_write(db, &mut wtx)?;
+        let mut admission_snapshot = self.schema.admit_write(db, &mut wtx)?;
         let ts = crate::datetime::now_micros();
         self.active_txn = ActiveTxn::Write(Box::new(wtx));
         self.begin_timezone_transaction();
@@ -1148,6 +1151,11 @@ impl<'a> ConnectionInner<'a> {
                 }
             }
         }));
+        if matches!(&execution, Ok(Err(_))) {
+            if let Some(snapshot) = admission_snapshot.take() {
+                self.schema.restore_snapshot(snapshot);
+            }
+        }
         match execution {
             Ok(result) => result,
             Err(payload) => {
@@ -1155,6 +1163,9 @@ impl<'a> ConnectionInner<'a> {
                 // unwinds, release that writer and discard its prefix before preserving the
                 // original panic for the caller.
                 self.abort_active_txn(db);
+                if let Some(snapshot) = admission_snapshot {
+                    self.schema.restore_snapshot(snapshot);
+                }
                 std::panic::resume_unwind(payload)
             }
         }
@@ -1354,8 +1365,14 @@ impl<'a> ConnectionInner<'a> {
         // `begin_write` inherits the handle token. Recovery is the exceptional
         // case: clear it before the first storage operation.
         wtx.set_cancel(None);
-        self.schema.admit_write(db, &mut wtx)?;
-        executor::reject_legacy_volatile_schema(&self.schema)?;
+        let mut admission_snapshot = self.schema.admit_write(db, &mut wtx)?;
+        if let Err(error) = executor::reject_legacy_volatile_schema(&self.schema) {
+            drop(wtx);
+            if let Some(snapshot) = admission_snapshot {
+                self.schema.restore_snapshot(snapshot);
+            }
+            return Err(error);
+        }
         let ts = crate::datetime::now_micros();
         self.active_txn = ActiveTxn::Write(Box::new(wtx));
         self.begin_timezone_transaction();
@@ -1398,6 +1415,11 @@ impl<'a> ConnectionInner<'a> {
             try_drain_deferred_temp_drops(db);
             result
         }));
+        if matches!(&execution, Ok(Err(_))) {
+            if let Some(snapshot) = admission_snapshot.take() {
+                self.schema.restore_snapshot(snapshot);
+            }
+        }
         match execution {
             Ok(result) => result,
             Err(payload) => {
@@ -1405,6 +1427,9 @@ impl<'a> ConnectionInner<'a> {
                 // executor bugs. Never leave its private transaction or session
                 // state reachable if a caller catches the original unwind.
                 self.abort_active_txn(db);
+                if let Some(snapshot) = admission_snapshot {
+                    self.schema.restore_snapshot(snapshot);
+                }
                 std::panic::resume_unwind(payload)
             }
         }
@@ -1729,7 +1754,7 @@ impl<'a> ConnectionInner<'a> {
                     }
                     BeginAccessMode::ReadWrite | BeginAccessMode::Default => {
                         let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
-                        self.schema.admit_write(db, &mut wtx)?;
+                        let _ = self.schema.admit_write(db, &mut wtx)?;
                         self.active_txn = ActiveTxn::Write(Box::new(wtx));
                     }
                 }

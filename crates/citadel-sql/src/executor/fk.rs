@@ -94,6 +94,48 @@ pub(super) fn check_row_reference(
     check_row_reference_now(wtx, schema, fk, row, key_buf)
 }
 
+/// Validate newly admitted references against the same writer in bounded row
+/// batches. Physical scan cursors remain raw; deferred checks keep raw child IDs.
+pub(super) fn check_table_references(
+    wtx: &mut WriteTxn<'_>,
+    schema: &SchemaManager,
+    child: &TableSchema,
+    foreign_keys: &[&ForeignKeySchemaEntry],
+) -> Result<()> {
+    const ROW_BATCH: usize = 256;
+    let mut cursor: Option<Vec<u8>> = None;
+    let mut reference_key = Vec::new();
+    loop {
+        let mut batch = Vec::with_capacity(ROW_BATCH);
+        wtx.table_scan_from(
+            child.name.as_bytes(),
+            cursor.as_deref().unwrap_or(b""),
+            |key, value| {
+                if cursor.as_deref() == Some(key) {
+                    return Ok(true);
+                }
+                batch.push((key.to_vec(), value.to_vec()));
+                Ok(batch.len() < ROW_BATCH)
+            },
+        )
+        .map_err(SqlError::Storage)?;
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let full = batch.len() == ROW_BATCH;
+        cursor = batch.last().map(|(key, _)| key.clone());
+        for (key, value) in batch {
+            let row = decode_full_row_with_cancel(child, &key, &value, wtx.cancel_token())?;
+            for fk in foreign_keys {
+                check_row_reference(wtx, schema, child, fk, &row, &mut reference_key)?;
+            }
+        }
+        if !full {
+            return Ok(());
+        }
+    }
+}
+
 /// Queue the child identity, so commit checks its final surviving reference.
 pub(super) fn defer_row_reference(
     wtx: &mut WriteTxn<'_>,
