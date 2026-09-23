@@ -1,4 +1,4 @@
-//! Logical primary-key equality backed by the ordinary UNIQUE index machinery.
+//! Constraint equality and complete child lookups backed by ordinary B-tree indexes.
 
 use citadel::Database;
 use citadel_txn::write_txn::WriteTxn;
@@ -40,11 +40,11 @@ pub(super) fn primary_key_index_to_add(
 
 /// Read-only admission is sufficient when the catalog already has the required
 /// definitions. The rare upgrade uses the same admitted writer as SQL mutation.
-pub(crate) fn reconcile_primary_key_indexes(
+pub(crate) fn reconcile_constraint_indexes(
     db: &Database,
     schema: &mut SchemaManager,
 ) -> Result<()> {
-    if schema.missing_primary_key_index().is_none() {
+    if schema.missing_constraint_index().is_none() {
         return Ok(());
     }
     let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
@@ -62,11 +62,11 @@ pub(crate) fn reconcile_primary_key_indexes(
 /// atomic unit even for public caller-owned writers. The returned catalog is
 /// from that admitted snapshot, before any backfill; an owned writer's caller
 /// restores it if a later statement or commit aborts the transaction.
-pub(crate) fn reconcile_primary_key_indexes_in_txn(
+pub(crate) fn reconcile_constraint_indexes_in_txn(
     wtx: &mut WriteTxn<'_>,
     schema: &mut SchemaManager,
 ) -> Result<Option<SchemaSnapshot>> {
-    if schema.missing_primary_key_index().is_none() {
+    if schema.missing_constraint_index().is_none() {
         return Ok(None);
     }
     let snapshot = schema.save_snapshot();
@@ -76,33 +76,50 @@ pub(crate) fn reconcile_primary_key_indexes_in_txn(
         tables.sort_unstable_by(|a, b| a.name.cmp(&b.name));
         let cancel = wtx.cancel_token().cloned();
         let mut updated = Vec::new();
-        for table in &tables {
-            let Some(index) = primary_key_index_to_add(table, |candidate| {
+        for original in &tables {
+            let mut table = original.clone();
+            let mut additions = Vec::new();
+            if let Some(index) = primary_key_index_to_add(&table, |candidate| {
                 tables
                     .iter()
                     .chain(updated.iter())
                     .any(|other: &TableSchema| other.index_by_name(candidate).is_some())
-            }) else {
-                continue;
-            };
-            let storage = TableSchema::index_table_name(&table.name, &index.name);
-            let plan = IndexBuildPlan::new(table, &index, cancel.as_ref())?;
-            let entries =
-                plan.collect(|visit| wtx.table_scan_from(table.name.as_bytes(), b"", visit))?;
-            // A name collision in physical storage is corruption, not a request
-            // to adopt or overwrite an undeclared index tree.
-            wtx.create_table(&storage).map_err(SqlError::Storage)?;
-            if let Err(error) = plan.insert(wtx, &storage, entries) {
-                return Err(match error {
-                    SqlError::UniqueViolation(_) => SqlError::UniqueViolation(format!(
-                        "primary key of '{}' under its declared collation",
-                        table.name
-                    )),
-                    other => other,
-                });
+            }) {
+                table.indices.push(index.clone());
+                additions.push(index);
             }
-            let mut table = table.clone();
-            table.indices.push(index);
+            let child_indexes = super::fk::child_indexes_to_add(schema, &table, |candidate| {
+                updated
+                    .iter()
+                    .any(|other: &TableSchema| other.index_by_name(candidate).is_some())
+            })?;
+            table.indices.extend(child_indexes.iter().cloned());
+            additions.extend(child_indexes);
+            if additions.is_empty() {
+                continue;
+            }
+            for index in &additions {
+                let storage = TableSchema::index_table_name(&table.name, &index.name);
+                let plan = IndexBuildPlan::new(&table, index, cancel.as_ref())?;
+                let entries =
+                    plan.collect(|visit| wtx.table_scan_from(table.name.as_bytes(), b"", visit))?;
+                // A physical collision is corruption, never permission to adopt
+                // or overwrite an undeclared tree.
+                wtx.create_table(&storage).map_err(SqlError::Storage)?;
+                if let Err(error) = plan.insert(wtx, &storage, entries) {
+                    return Err(match error {
+                        SqlError::UniqueViolation(_)
+                            if table.is_primary_key_equality_index(index) =>
+                        {
+                            SqlError::UniqueViolation(format!(
+                                "primary key of '{}' under its declared collation",
+                                table.name
+                            ))
+                        }
+                        other => other,
+                    });
+                }
+            }
             SchemaManager::save_schema(wtx, &table)?;
             updated.push(table);
             #[cfg(test)]
@@ -115,6 +132,17 @@ pub(crate) fn reconcile_primary_key_indexes_in_txn(
         for table in updated {
             schema.register(table);
         }
+        // Missing child trees can be built, but an incompatible declared
+        // parent UNIQUE key is not authority to add a new uniqueness constraint.
+        for table in schema.all_schemas() {
+            for fk in &table.foreign_keys {
+                let parent = schema
+                    .get(&fk.foreign_table)
+                    .ok_or_else(|| SqlError::TableNotFound(fk.foreign_table.clone()))?;
+                super::fk::validate_parent_reference(parent, fk)?;
+            }
+        }
+        require_constraint_indexes(schema)?;
         schema.bind_write_catalog(wtx)?;
         Ok(())
     }));
@@ -132,13 +160,21 @@ pub(crate) fn reconcile_primary_key_indexes_in_txn(
     }
 }
 
-pub(crate) fn require_primary_key_indexes(schema: &SchemaManager) -> Result<()> {
-    match schema.missing_primary_key_index() {
+pub(crate) fn require_constraint_indexes(schema: &SchemaManager) -> Result<()> {
+    match schema.missing_constraint_index() {
         Some(table) => Err(SqlError::InvalidValue(format!(
-            "primary key of '{table}' requires its declared-collation index; use mutable SQL admission to build it before insertion"
+            "constraints on '{table}' require equality indexes; use mutable SQL admission to build them before insertion"
         ))),
         None => Ok(()),
     }
+}
+
+/// Recomputed only when table metadata changes, not on the statement hot path.
+pub(crate) fn first_missing_foreign_key_index(schema: &SchemaManager) -> Option<String> {
+    schema
+        .all_schemas()
+        .find(|table| !super::fk::has_complete_foreign_key_indexes(schema, table))
+        .map(|table| table.name.clone())
 }
 
 #[cfg(test)]
@@ -259,7 +295,7 @@ mod tests {
         for path in storage {
             assert!(wtx.table_root_stamp(&path).unwrap().is_none());
         }
-        assert!(schema.missing_primary_key_index().is_some());
+        assert!(schema.missing_constraint_index().is_some());
         assert!(schema.get("a").unwrap().indices.is_empty());
         wtx.commit().unwrap();
     }

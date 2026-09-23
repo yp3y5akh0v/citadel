@@ -3074,44 +3074,60 @@ impl FkChildHits {
 pub(super) fn find_cascading_idx<'a>(
     child_schema: &'a TableSchema,
     fk: &ForeignKeySchemaEntry,
+    reference: &super::fk::ReferenceKey,
 ) -> Option<&'a IndexDef> {
     child_schema
         .indices
         .iter()
-        .find(|idx| idx.is_full_column_btree(&fk.columns))
+        .find(|idx| reference.covered_by(idx, &fk.columns))
 }
 
 pub(super) fn scan_fk_index_keys(
     wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
     child_schema: &TableSchema,
     cascading_idx: &IndexDef,
-    parent_pk_key: &[u8],
+    reference: &super::fk::ReferenceKey,
+    parent_key: &[u8],
     out: &mut FkChildHits,
 ) -> Result<()> {
     let idx_table = TableSchema::index_table_name(&child_schema.name, &cascading_idx.name);
     let folded = (0..cascading_idx.keys.len())
         .any(|i| cascading_idx.collation_at(i) != crate::types::Collation::Binary);
+    let residual = !reference.exact_index_equality(cascading_idx);
+    let values = (folded || residual)
+        .then(|| decode_composite_key(parent_key, cascading_idx.keys.len()))
+        .transpose()?;
     let mut prefix_buf = Vec::new();
     let prefix = if folded {
-        let values = decode_composite_key(parent_pk_key, cascading_idx.keys.len())?;
-        for (i, value) in values.iter().enumerate() {
+        for (i, value) in values.as_ref().unwrap().iter().enumerate() {
             encode_index_key_component(value, cascading_idx.collation_at(i), &mut prefix_buf);
         }
         prefix_buf.as_slice()
     } else {
-        parent_pk_key
+        parent_key
     };
     let mut candidates = FkChildHits::default();
-    let target = if folded { &mut candidates } else { &mut *out };
+    let target = if residual { &mut candidates } else { &mut *out };
     wtx.table_scan_prefix(&idx_table, prefix, |key, value| {
         let owned_pk = (cascading_idx.unique && !value.is_empty()).then_some(value);
         target.push(key, owned_pk, prefix.len() as u32);
         Ok(true)
     })
     .map_err(SqlError::Storage)?;
-    if folded {
-        // A collated index narrows candidates, but references retain the parent
-        // key's equality. Recheck rows so a folded sibling is never cascaded.
+    if residual {
+        // Coverage proves there are no missing matches. A broader index may
+        // still return siblings that differ under the parent's equality.
+        let mut expected_key = Vec::new();
+        reference.encode_values(values.as_ref().unwrap(), &mut expected_key);
+        let columns = cascading_idx
+            .keys
+            .iter()
+            .map(|key| match key {
+                crate::types::IndexKey::Column { idx, .. } => *idx,
+                _ => unreachable!("FK backing indexes contain only columns"),
+            })
+            .collect::<Vec<_>>();
+        let mut actual_key = Vec::new();
         for (index_key, pk) in candidates.entries() {
             check_cancel(wtx.cancel_token())?;
             let Some(value) = wtx
@@ -3121,15 +3137,8 @@ pub(super) fn scan_fk_index_keys(
                 continue;
             };
             let row = decode_full_row_with_cancel(child_schema, pk, &value, wtx.cancel_token())?;
-            let values = cascading_idx
-                .keys
-                .iter()
-                .map(|key| match key {
-                    crate::types::IndexKey::Column { idx, .. } => row[*idx as usize].clone(),
-                    _ => unreachable!("FK backing indexes contain only columns"),
-                })
-                .collect::<Vec<_>>();
-            if encode_composite_key(&values) == parent_pk_key {
+            reference.encode_row(&columns, &row, &mut actual_key);
+            if actual_key == expected_key {
                 out.push(index_key, Some(pk), 0);
             }
         }

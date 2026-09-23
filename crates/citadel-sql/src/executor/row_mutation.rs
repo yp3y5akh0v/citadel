@@ -417,8 +417,9 @@ fn reference_changed(
     let Some(old) = old else {
         return Ok(true);
     };
+    let reference = super::fk::ReferenceKey::new(table, fk)?;
     let mut changed = new.is_none();
-    for name in &fk.referred_columns {
+    for (position, name) in fk.referred_columns.iter().enumerate() {
         let i = table
             .column_index(name)
             .ok_or_else(|| SqlError::ColumnNotFound(name.clone()))?;
@@ -426,7 +427,7 @@ fn reference_changed(
         if old[i].is_null() {
             return Ok(false);
         }
-        changed |= new.is_some_and(|row| !old[i].bit_eq(&row[i]));
+        changed |= new.is_some_and(|row| !reference.value_equal(position, &old[i], &row[i]));
     }
     Ok(changed)
 }
@@ -451,14 +452,15 @@ fn check_restrict(
         let child = schema
             .get(child_name)
             .ok_or_else(|| SqlError::TableNotFound(child_name.into()))?;
-        let index = find_cascading_idx(child, fk).ok_or_else(|| {
+        let reference_key = super::fk::ReferenceKey::new(table, fk)?;
+        let index = find_cascading_idx(child, fk, &reference_key).ok_or_else(|| {
             SqlError::ForeignKeyViolation(format!(
                 "no index backs the foreign key on '{child_name}'"
             ))
         })?;
         let reference = referenced_key(table, fk, key, old)?;
         let mut hits = FkChildHits::default();
-        scan_fk_index_keys(wtx, child, index, &reference, &mut hits)?;
+        scan_fk_index_keys(wtx, child, index, &reference_key, &reference, &mut hits)?;
         // Deleting a self-referencing row removes its own reference.
         let references_other_row = hits
             .entries()
@@ -603,14 +605,15 @@ fn run<'a>(
                 let child = schema
                     .get(child_name)
                     .ok_or_else(|| SqlError::TableNotFound(child_name.into()))?;
-                let index = find_cascading_idx(child, fk).ok_or_else(|| {
+                let reference_key = super::fk::ReferenceKey::new(parent.table, fk)?;
+                let index = find_cascading_idx(child, fk, &reference_key).ok_or_else(|| {
                     SqlError::ForeignKeyViolation(format!(
                         "no index backs the foreign key on '{child_name}'"
                     ))
                 })?;
                 let key = referenced_key(parent.table, fk, &parent.key, parent.old.as_deref())?;
                 let mut hits = FkChildHits::default();
-                scan_fk_index_keys(wtx, child, index, &key, &mut hits)?;
+                scan_fk_index_keys(wtx, child, index, &reference_key, &key, &mut hits)?;
                 let action = if parent.new.is_some() {
                     fk.on_update
                 } else {
@@ -621,7 +624,7 @@ fn run<'a>(
                     continue;
                 }
                 if action == ReferentialAction::NoAction {
-                    no_action_checks.push((child, fk, key));
+                    no_action_checks.push((child, fk, reference_key, key));
                     work.push(Work::ForeignKeys(parent, position + 1));
                     continue;
                 }
@@ -698,15 +701,15 @@ fn run<'a>(
             }
         }
     }
-    for (child, fk, key) in no_action_checks {
-        let index = find_cascading_idx(child, fk).ok_or_else(|| {
+    for (child, fk, reference_key, key) in no_action_checks {
+        let index = find_cascading_idx(child, fk, &reference_key).ok_or_else(|| {
             SqlError::ForeignKeyViolation(format!(
                 "no index backs the foreign key on '{}'",
                 child.name
             ))
         })?;
         let mut hits = FkChildHits::default();
-        scan_fk_index_keys(wtx, child, index, &key, &mut hits)?;
+        scan_fk_index_keys(wtx, child, index, &reference_key, &key, &mut hits)?;
         let mut reference_key = Vec::new();
         for (_, row) in fetch_child_rows(wtx, child, &hits)? {
             super::fk::check_row_reference(wtx, schema, child, fk, &row, &mut reference_key)?;

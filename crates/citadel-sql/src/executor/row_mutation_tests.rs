@@ -34,7 +34,12 @@ fn complete_child_coverage_uses_no_value_budget_and_keeps_singletons_keyed() {
         conn.execute("COMMIT").unwrap();
         let schema = SchemaManager::load(&db).unwrap();
         let child = schema.get("child").unwrap();
-        let index = find_cascading_idx(child, &child.foreign_keys[0]).unwrap();
+        let reference = super::super::fk::ReferenceKey::new(
+            schema.get("parent").unwrap(),
+            &child.foreign_keys[0],
+        )
+        .unwrap();
+        let index = find_cascading_idx(child, &child.foreign_keys[0], &reference).unwrap();
         let index_table = TableSchema::index_table_name("child", &index.name);
         let mut wtx = db.begin_write().unwrap();
         let mut hits = FkChildHits::default();
@@ -42,6 +47,7 @@ fn complete_child_coverage_uses_no_value_budget_and_keeps_singletons_keyed() {
             &mut wtx,
             child,
             index,
+            &reference,
             &encode_composite_key(&[Value::Integer(1)]),
             &mut hits,
         )
@@ -89,7 +95,12 @@ fn folded_child_coverage_keeps_exact_scan_budget_and_rechecks_folded_siblings() 
         }
         let schema = SchemaManager::load(&db).unwrap();
         let child = schema.get("child").unwrap();
-        let index = find_cascading_idx(child, &child.foreign_keys[0]).unwrap();
+        let reference = super::super::fk::ReferenceKey::new(
+            schema.get("parent").unwrap(),
+            &child.foreign_keys[0],
+        )
+        .unwrap();
+        let index = find_cascading_idx(child, &child.foreign_keys[0], &reference).unwrap();
         let index_table = TableSchema::index_table_name("child", &index.name);
         let mut sizes = Vec::new();
         db.begin_read()
@@ -106,7 +117,8 @@ fn folded_child_coverage_keeps_exact_scan_budget_and_rechecks_folded_siblings() 
             wtx.set_read_budget(Some(budget.clone()));
             let marker = wtx.mutation_marker();
             let mut hits = FkChildHits::default();
-            let scanned = scan_fk_index_keys(&mut wtx, child, index, &parent_key, &mut hits);
+            let scanned =
+                scan_fk_index_keys(&mut wtx, child, index, &reference, &parent_key, &mut hits);
             if allowance < total {
                 assert!(matches!(
                     scanned,

@@ -606,7 +606,7 @@ pub fn exec_insert_in_txn(
     wtx.check_usable().map_err(SqlError::Storage)?;
     check_cancelled(wtx.cancel_token())?;
     schema.validate_write_catalog(wtx)?;
-    constraint_indexes::require_primary_key_indexes(schema)?;
+    constraint_indexes::require_constraint_indexes(schema)?;
     dml::exec_insert_in_admitted_txn(wtx, schema, stmt, params)
 }
 

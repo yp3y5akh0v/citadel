@@ -157,6 +157,7 @@ pub struct SchemaManager {
     legacy_volatile_definition: Option<String>,
     /// Derived catalog invariant; sound writes do not rescan table metadata.
     missing_primary_key_index: Option<String>,
+    missing_foreign_key_index: Option<String>,
     /// Per-Database shared cache (e.g. ANN indexes). Cloned from the Database
     /// when the Connection opens; all Connections to the same DB share entries.
     /// Tests created via `empty()` get their own isolated cache.
@@ -214,6 +215,7 @@ impl SchemaManager {
             catalog_binding: None,
             legacy_volatile_definition: None,
             missing_primary_key_index: None,
+            missing_foreign_key_index: None,
             sql_caches: Arc::new(Mutex::new(FxHashMap::default())),
             dml_dirty_tables: std::cell::RefCell::new(FxHashSet::default()),
             dml_append_tables: std::cell::RefCell::new(FxHashMap::default()),
@@ -490,11 +492,13 @@ impl SchemaManager {
             }),
             legacy_volatile_definition,
             missing_primary_key_index,
+            missing_foreign_key_index: None,
             sql_caches,
             dml_dirty_tables: std::cell::RefCell::new(FxHashSet::default()),
             dml_append_tables: std::cell::RefCell::new(FxHashMap::default()),
             fk_children_cache: std::cell::RefCell::new(None),
         };
+        mgr.refresh_table_invariants();
         system_tables::register_builtins(&mut mgr);
         Ok(mgr)
     }
@@ -517,7 +521,7 @@ impl SchemaManager {
         wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
     ) -> Result<Option<SchemaSnapshot>> {
         self.admit_catalogs(db, wtx, db.manager().commit_generation())?;
-        crate::executor::constraint_indexes::reconcile_primary_key_indexes_in_txn(wtx, self)
+        crate::executor::constraint_indexes::reconcile_constraint_indexes_in_txn(wtx, self)
     }
 
     fn admit_catalogs(
@@ -619,7 +623,7 @@ impl SchemaManager {
         // The public caller owns the surrounding writer and its eventual
         // commit/rollback; backfill itself restores both snapshots on failure.
         let _ =
-            crate::executor::constraint_indexes::reconcile_primary_key_indexes_in_txn(wtx, self)?;
+            crate::executor::constraint_indexes::reconcile_constraint_indexes_in_txn(wtx, self)?;
         Ok(())
     }
 
@@ -803,10 +807,14 @@ impl SchemaManager {
                     && table.primary_key_equality_index().is_none()
             })
             .map(|table| table.name.clone());
+        self.missing_foreign_key_index =
+            crate::executor::constraint_indexes::first_missing_foreign_key_index(self);
     }
 
-    pub(crate) fn missing_primary_key_index(&self) -> Option<&str> {
-        self.missing_primary_key_index.as_deref()
+    pub(crate) fn missing_constraint_index(&self) -> Option<&str> {
+        self.missing_primary_key_index
+            .as_deref()
+            .or(self.missing_foreign_key_index.as_deref())
     }
 
     pub fn register(&mut self, schema: TableSchema) {

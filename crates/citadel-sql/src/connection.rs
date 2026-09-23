@@ -620,7 +620,7 @@ impl<'a> Connection<'a> {
         // writer-free retry point, and cleanup ignores the user token.
         try_drain_deferred_temp_drops(db);
         let mut schema = SchemaManager::load(db)?;
-        executor::constraint_indexes::reconcile_primary_key_indexes(db, &mut schema)?;
+        executor::constraint_indexes::reconcile_constraint_indexes(db, &mut schema)?;
         let stmt_cache = LruCache::new(NonZeroUsize::new(DEFAULT_CACHE_CAPACITY).unwrap());
         let temp_id = generate_temp_id();
         Ok(Self {
