@@ -113,6 +113,7 @@ fn request_to_py<'py>(
         },
     )?;
     d.set_item("stop", req.stop.clone())?;
+    d.set_item("seed", req.seed)?;
     d.set_item("model_id", model_id)?;
     Ok(d)
 }
@@ -560,6 +561,79 @@ pub(crate) fn build_llm(obj: &Bound<'_, PyAny>) -> PyResult<Arc<dyn LLMClient>> 
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn python_request_round_trip_preserves_configured_options_and_identity() {
+        Python::initialize();
+        Python::attach(|py| {
+            for seed in [0, u64::MAX] {
+                let request = CompletionRequest {
+                    messages: vec![Message::system("policy"), Message::user("question")],
+                    tools: vec![ToolSpec {
+                        name: "lookup".into(),
+                        description: "Find a fact".into(),
+                        input_schema: json!({"type": "object", "properties": {}}),
+                    }],
+                    tool_choice: ToolChoice::Tool("lookup".into()),
+                    max_tokens: Some(123),
+                    temperature: Some(0.25),
+                    effort: Some(Effort::High),
+                    output_schema: Some(json!({"type": "object", "additionalProperties": false})),
+                    stop: vec!["done".into()],
+                    seed: Some(seed),
+                };
+                let rendered = request_to_py(py, &request, "callback-model").unwrap();
+                assert_eq!(
+                    rendered
+                        .get_item("seed")
+                        .unwrap()
+                        .unwrap()
+                        .extract::<u64>()
+                        .unwrap(),
+                    seed
+                );
+                let restored = request_from_py(rendered.as_any()).unwrap();
+                assert_eq!(
+                    citadel_llm::canonical_json(&restored),
+                    citadel_llm::canonical_json(&request)
+                );
+                assert_eq!(
+                    citadel_llm::request_hash("callback-model", &restored),
+                    citadel_llm::request_hash("callback-model", &request)
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn python_request_round_trip_preserves_unset_options() {
+        Python::initialize();
+        Python::attach(|py| {
+            let request = CompletionRequest::new(vec![Message::user("question")]);
+            let rendered = request_to_py(py, &request, "callback-model").unwrap();
+            for name in [
+                "max_tokens",
+                "temperature",
+                "effort",
+                "output_schema",
+                "seed",
+            ] {
+                assert!(
+                    rendered.get_item(name).unwrap().unwrap().is_none(),
+                    "{name}"
+                );
+            }
+            let restored = request_from_py(rendered.as_any()).unwrap();
+            assert_eq!(
+                citadel_llm::canonical_json(&restored),
+                citadel_llm::canonical_json(&request)
+            );
+            assert_eq!(
+                citadel_llm::request_hash("callback-model", &restored),
+                citadel_llm::request_hash("callback-model", &request)
+            );
+        });
+    }
 
     #[test]
     fn unavailable_python_usage_keeps_the_completed_answer() {
