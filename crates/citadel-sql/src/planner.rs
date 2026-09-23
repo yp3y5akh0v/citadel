@@ -4,16 +4,6 @@ use crate::encoding::encode_composite_key;
 use crate::parser::{BinOp, Expr};
 use crate::types::{DataType, IndexDef, IndexKey, IndexKind, InvertedKind, TableSchema, Value};
 
-/// Primary keys store text verbatim; non-binary comparison must use a path
-/// that evaluates the declared collation instead of seeking the raw key.
-pub(crate) fn primary_key_has_binary_collation(schema: &TableSchema) -> bool {
-    schema.primary_key_columns.iter().all(|&column| {
-        let definition = &schema.columns[column as usize];
-        definition.data_type != DataType::Text
-            || definition.collation == crate::types::Collation::Binary
-    })
-}
-
 /// Normalize comparison bounds for typed key encoding.
 pub(crate) fn key_predicate(
     data_type: DataType,
@@ -580,7 +570,7 @@ fn try_pk_range_scan(
     range_preds: &[SimplePredicate],
     full_cover: bool,
 ) -> Option<ScanPlan> {
-    if schema.primary_key_columns.len() != 1 || !primary_key_has_binary_collation(schema) {
+    if schema.primary_key_columns.len() != 1 || !schema.primary_key_has_binary_collation() {
         return None;
     }
     let pk_col = schema.primary_key_columns[0] as usize;
@@ -737,7 +727,7 @@ fn try_pk_prefix_scan(
 fn try_pk_lookup(schema: &TableSchema, predicates: &[Option<SimplePredicate>]) -> Option<ScanPlan> {
     let pk_cols = &schema.primary_key_columns;
     // No PK → fall through to SeqScan. An empty-key PkLookup would silently match 0 rows.
-    if pk_cols.is_empty() || !primary_key_has_binary_collation(schema) {
+    if pk_cols.is_empty() || !schema.primary_key_has_binary_collation() {
         return None;
     }
     let mut pk_values: Vec<Option<Value>> = vec![None; pk_cols.len()];

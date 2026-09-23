@@ -1,9 +1,75 @@
 use super::*;
+use crate::encoding::encode_composite_key;
 use crate::parser::{
     CompoundSelect, DeleteStmt, Expr, InsertSource, InsertStmt, QueryBody, SelectColumn,
     SelectStmt, SetOp, UpdateStmt,
 };
 use crate::types::{ExecutionResult, QueryResult, Value};
+
+#[test]
+fn unique_probe_evaluates_expression_key_once_and_keeps_partial_predicate() {
+    use citadel::{Argon2Profile, DatabaseBuilder};
+    let db = DatabaseBuilder::new("")
+        .passphrase(b"unique-expression-probe")
+        .argon2_profile(Argon2Profile::Iot)
+        .create_in_memory()
+        .unwrap();
+    let conn = crate::Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY,body TEXT,active INTEGER)")
+        .unwrap();
+    conn.execute("CREATE UNIQUE INDEX docs_terms ON docs(TO_TSVECTOR(body)) WHERE active=1")
+        .unwrap();
+    conn.execute("INSERT INTO docs VALUES (1,'word',1)")
+        .unwrap();
+    let table = conn.table_schema("docs").unwrap();
+    let mut wtx = db.begin_write().unwrap();
+    let token = citadel::CancelToken::new();
+    wtx.set_cancel(Some(token.clone()));
+    // "word" performs four normalization steps and one token step. A
+    // second evaluation would hit the sixth step and cancel the request.
+    let _hook = crate::fts::cancel_tokenize_after(token.clone(), 6);
+    let row = [i(2), Value::Text("word".into()), i(1)];
+    assert_eq!(
+        find_unique_index_pk(&mut wtx, &table, 0, &row, &row[..1]).unwrap(),
+        Some(encode_composite_key(&[i(1)]))
+    );
+    assert!(!token.is_cancelled());
+    let excluded = [i(2), Value::Text("word".into()), i(0)];
+    assert!(
+        find_unique_index_pk(&mut wtx, &table, 0, &excluded, &excluded[..1])
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        !token.is_cancelled(),
+        "partial predicate must exclude before evaluating the key"
+    );
+}
+
+#[test]
+fn unique_probe_propagates_expression_cancellation() {
+    use citadel::{Argon2Profile, DatabaseBuilder};
+    let db = DatabaseBuilder::new("")
+        .passphrase(b"cancel-expression-probe")
+        .argon2_profile(Argon2Profile::Iot)
+        .create_in_memory()
+        .unwrap();
+    let conn = crate::Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY,body TEXT)")
+        .unwrap();
+    conn.execute("CREATE UNIQUE INDEX docs_terms ON docs(TO_TSVECTOR(body))")
+        .unwrap();
+    let table = conn.table_schema("docs").unwrap();
+    let mut wtx = db.begin_write().unwrap();
+    let token = citadel::CancelToken::new();
+    wtx.set_cancel(Some(token.clone()));
+    let _hook = crate::fts::cancel_tokenize_after(token, 1);
+    let row = [i(2), Value::Text("word".into())];
+    assert!(matches!(
+        find_unique_index_pk(&mut wtx, &table, 0, &row, &row[..1]),
+        Err(SqlError::Storage(citadel_core::Error::Interrupted))
+    ));
+}
 
 fn empty_select(from: &str) -> SelectStmt {
     SelectStmt {

@@ -2524,6 +2524,38 @@ impl TableSchema {
         &self.pk_idx_cache
     }
 
+    /// Physical primary keys store text verbatim, so only Binary text
+    /// comparison can be answered by seeking that key directly.
+    pub(crate) fn primary_key_has_binary_collation(&self) -> bool {
+        self.primary_key_columns.iter().all(|&column| {
+            let definition = &self.columns[column as usize];
+            definition.data_type != DataType::Text || definition.collation == Collation::Binary
+        })
+    }
+
+    /// A collated primary key's logical identity requires exactly its declared
+    /// equality. A broader UNIQUE index is a separate constraint, not this one.
+    pub(crate) fn is_primary_key_equality_index(&self, index: &IndexDef) -> bool {
+        !self.primary_key_has_binary_collation()
+            && index.unique
+            && index.is_full_column_btree(&self.primary_key_columns)
+            && self
+                .primary_key_columns
+                .iter()
+                .enumerate()
+                .all(|(position, &column)| {
+                    let definition = &self.columns[column as usize];
+                    definition.data_type != DataType::Text
+                        || index.collation_at(position) == definition.collation
+                })
+    }
+
+    pub(crate) fn primary_key_equality_index(&self) -> Option<usize> {
+        self.indices
+            .iter()
+            .position(|index| self.is_primary_key_equality_index(index))
+    }
+
     pub fn index_by_name(&self, name: &str) -> Option<&IndexDef> {
         let lower = name.to_ascii_lowercase();
         self.indices.iter().find(|i| i.name == lower)

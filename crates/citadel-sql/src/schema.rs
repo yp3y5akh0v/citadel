@@ -155,6 +155,8 @@ pub struct SchemaManager {
     /// with table registration/removal so executor entry points can reject in
     /// O(1) without rescanning every schema on the statement hot path.
     legacy_volatile_definition: Option<String>,
+    /// Derived catalog invariant; sound writes do not rescan table metadata.
+    missing_primary_key_index: Option<String>,
     /// Per-Database shared cache (e.g. ANN indexes). Cloned from the Database
     /// when the Connection opens; all Connections to the same DB share entries.
     /// Tests created via `empty()` get their own isolated cache.
@@ -211,6 +213,7 @@ impl SchemaManager {
             catalog_stamps: None,
             catalog_binding: None,
             legacy_volatile_definition: None,
+            missing_primary_key_index: None,
             sql_caches: Arc::new(Mutex::new(FxHashMap::default())),
             dml_dirty_tables: std::cell::RefCell::new(FxHashSet::default()),
             dml_append_tables: std::cell::RefCell::new(FxHashMap::default()),
@@ -463,6 +466,13 @@ impl SchemaManager {
         let legacy_volatile_definition = tables
             .values()
             .find_map(TableSchema::volatile_persisted_expression);
+        let missing_primary_key_index = tables
+            .values()
+            .find(|table| {
+                !table.primary_key_has_binary_collation()
+                    && table.primary_key_equality_index().is_none()
+            })
+            .map(|table| table.name.clone());
         let mut mgr = Self {
             tables,
             views,
@@ -479,6 +489,7 @@ impl SchemaManager {
                 local_generation: 0,
             }),
             legacy_volatile_definition,
+            missing_primary_key_index,
             sql_caches,
             dml_dirty_tables: std::cell::RefCell::new(FxHashSet::default()),
             dml_append_tables: std::cell::RefCell::new(FxHashMap::default()),
@@ -504,8 +515,9 @@ impl SchemaManager {
         &mut self,
         db: &Database,
         wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
-    ) -> Result<()> {
-        self.admit_catalogs(db, wtx, db.manager().commit_generation())
+    ) -> Result<Option<SchemaSnapshot>> {
+        self.admit_catalogs(db, wtx, db.manager().commit_generation())?;
+        crate::executor::constraint_indexes::reconcile_primary_key_indexes_in_txn(wtx, self)
     }
 
     fn admit_catalogs(
@@ -604,6 +616,10 @@ impl SchemaManager {
             commit_generation: None,
             local_generation: self.generation,
         });
+        // The public caller owns the surrounding writer and its eventual
+        // commit/rollback; backfill itself restores both snapshots on failure.
+        let _ =
+            crate::executor::constraint_indexes::reconcile_primary_key_indexes_in_txn(wtx, self)?;
         Ok(())
     }
 
@@ -774,17 +790,29 @@ impl SchemaManager {
         self.legacy_volatile_definition.as_deref()
     }
 
-    fn refresh_legacy_volatile_definition(&mut self) {
+    fn refresh_table_invariants(&mut self) {
         self.legacy_volatile_definition = self
             .tables
             .values()
             .find_map(TableSchema::volatile_persisted_expression);
+        self.missing_primary_key_index = self
+            .tables
+            .values()
+            .find(|table| {
+                !table.primary_key_has_binary_collation()
+                    && table.primary_key_equality_index().is_none()
+            })
+            .map(|table| table.name.clone());
+    }
+
+    pub(crate) fn missing_primary_key_index(&self) -> Option<&str> {
+        self.missing_primary_key_index.as_deref()
     }
 
     pub fn register(&mut self, schema: TableSchema) {
         let lower = schema.name.to_ascii_lowercase();
         self.tables.insert(lower, schema);
-        self.refresh_legacy_volatile_definition();
+        self.refresh_table_invariants();
         self.generation += 1;
     }
 
@@ -792,7 +820,7 @@ impl SchemaManager {
         let lower = name.to_ascii_lowercase();
         let result = self.tables.remove(&lower);
         if result.is_some() {
-            self.refresh_legacy_volatile_definition();
+            self.refresh_table_invariants();
             self.generation += 1;
         }
         result
@@ -1147,7 +1175,7 @@ impl SchemaManager {
         self.catalog_stamps = snap.catalog_stamps;
         self.catalog_binding = snap.catalog_binding;
         self.tables = snap.tables;
-        self.refresh_legacy_volatile_definition();
+        self.refresh_table_invariants();
         self.views = snap.views;
         self.triggers = snap.triggers;
         self.matviews = snap.matviews;

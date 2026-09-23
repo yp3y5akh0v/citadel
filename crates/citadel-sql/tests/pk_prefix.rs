@@ -246,8 +246,21 @@ fn prefix_planning_refuses_coercions_collations_and_volatile_bounds() {
         .unwrap();
     let schema = conn.table_schema("names").unwrap();
     let predicate = Some(citadel_sql::parser::parse_sql_expr("a = 'x'").unwrap());
+    // The logical equality index supports NOCASE; the raw primary tree does not.
+    assert_eq!(schema.indices.len(), 1);
+    let index = &schema.indices[0];
+    assert!(index.unique && index.is_full_column_btree(&schema.primary_key_columns));
+    assert_eq!(index.collation_at(0), citadel_sql::types::Collation::NoCase);
+    let logical_index = &index.name;
+    let plan = plan_select(&schema, &predicate);
     assert!(matches!(
-        plan_select(&schema, &predicate),
+        &plan,
+        ScanPlan::IndexScan { index_name, .. } if index_name == logical_index
+    ));
+    let mut without_equality_index = schema.clone();
+    without_equality_index.indices.clear();
+    assert!(matches!(
+        plan_select(&without_equality_index, &predicate),
         ScanPlan::SeqScan
     ));
 }

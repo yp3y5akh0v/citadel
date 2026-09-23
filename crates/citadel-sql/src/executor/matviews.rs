@@ -60,7 +60,7 @@ pub(super) fn exec_create_matview_in_txn(
         ));
     }
     // First column = PK. Non-unique → DuplicateKey at populate; user reorders/projects.
-    let backing_schema = TableSchema::new(
+    let mut backing_schema = TableSchema::new(
         backing_table.clone(),
         columns,
         vec![0],
@@ -69,25 +69,36 @@ pub(super) fn exec_create_matview_in_txn(
         vec![],
     );
 
-    wtx.create_table(backing_table.as_bytes())
-        .map_err(SqlError::Storage)?;
-    SchemaManager::save_schema(wtx, &backing_schema)?;
-    schema.register(backing_schema);
-
-    if stmt.with_data {
-        populate_backing_table(wtx, &backing_table, &rows)?;
+    if let Some(index) =
+        super::constraint_indexes::primary_key_index_to_add(&backing_schema, |name| {
+            schema
+                .all_schemas()
+                .any(|table| table.index_by_name(name).is_some())
+        })
+    {
+        backing_schema.indices.push(index);
     }
 
-    let mv = MatviewDef {
-        name: name_lower.clone(),
-        select_sql: stmt.select_sql.clone(),
-        backing_table: backing_table.clone(),
-        with_data: stmt.with_data,
-        created_at_micros: crate::datetime::txn_or_clock_micros(),
-    };
-    SchemaManager::save_matview(wtx, &mv)?;
-    schema.register_matview(mv);
-    Ok(ExecutionResult::Ok)
+    with_matview_savepoint(wtx, schema, |wtx, schema| {
+        wtx.create_table(backing_table.as_bytes())
+            .map_err(SqlError::Storage)?;
+        super::ddl::create_index_tables(wtx, &backing_schema)?;
+        if stmt.with_data {
+            populate_backing_table(wtx, &backing_schema, &rows)?;
+        }
+        SchemaManager::save_schema(wtx, &backing_schema)?;
+        schema.register(backing_schema);
+        let mv = MatviewDef {
+            name: name_lower.clone(),
+            select_sql: stmt.select_sql.clone(),
+            backing_table,
+            with_data: stmt.with_data,
+            created_at_micros: crate::datetime::txn_or_clock_micros(),
+        };
+        SchemaManager::save_matview(wtx, &mv)?;
+        schema.register_matview(mv);
+        Ok(ExecutionResult::Ok)
+    })
 }
 
 pub(super) fn exec_refresh_matview(
@@ -155,31 +166,51 @@ pub(super) fn exec_refresh_matview(
     #[cfg(test)]
     catalog_tests::after_refresh_read(db);
     let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
-    schema.admit_write(db, &mut wtx)?;
-    super::reject_legacy_volatile_schema(schema)?;
+    let admission_snapshot = schema.admit_write(db, &mut wtx)?;
+    let dml_snapshot = schema.save_dml_snapshot();
+    let mut committed = false;
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        super::reject_legacy_volatile_schema(schema)?;
 
-    let mv = schema
-        .get_matview(&name_lower)
-        .ok_or_else(|| SqlError::TableNotFound(stmt.name.clone()))?
-        .clone();
-    let backing = schema
-        .get(&mv.backing_table)
-        .ok_or_else(|| SqlError::TableNotFound(mv.backing_table.clone()))?;
-    if mv.try_serialize()? != source_mv || backing.try_serialize()? != source_backing {
-        return Err(SqlError::InvalidValue(
-            "materialized view definition changed during concurrent refresh".into(),
-        ));
-    }
-    if !backing.indices.iter().any(|idx| idx.unique) {
-        return Err(SqlError::Unsupported(format!(
-            "cannot refresh materialized view '{}' concurrently — it requires a UNIQUE index",
-            stmt.name
-        )));
-    }
+        let mv = schema
+            .get_matview(&name_lower)
+            .ok_or_else(|| SqlError::TableNotFound(stmt.name.clone()))?
+            .clone();
+        let backing = schema
+            .get(&mv.backing_table)
+            .ok_or_else(|| SqlError::TableNotFound(mv.backing_table.clone()))?;
+        if mv.try_serialize()? != source_mv || backing.try_serialize()? != source_backing {
+            return Err(SqlError::InvalidValue(
+                "materialized view definition changed during concurrent refresh".into(),
+            ));
+        }
+        if !backing.indices.iter().any(|idx| idx.unique) {
+            return Err(SqlError::Unsupported(format!(
+                "cannot refresh materialized view '{}' concurrently — it requires a UNIQUE index",
+                stmt.name
+            )));
+        }
 
-    diff_merge_concurrent(&mut wtx, &mv, &rows)?;
-    super::commit_with_ann_publication(wtx, schema)?;
-    Ok(ExecutionResult::Ok)
+        let backing = backing.clone();
+        with_matview_savepoint(&mut wtx, schema, |wtx, schema| {
+            diff_merge_concurrent(wtx, schema, &backing, &rows)
+        })?;
+        super::helpers::drain_deferred_fk_checks(&mut wtx, schema)?;
+        super::commit_with_ann_publication(wtx, schema)?;
+        committed = true;
+        Ok(ExecutionResult::Ok)
+    }));
+    if !committed {
+        if let Some(snapshot) = admission_snapshot {
+            schema.restore_snapshot(snapshot);
+        } else {
+            schema.restore_dml_snapshot(dml_snapshot);
+        }
+    }
+    match outcome {
+        Ok(result) => result,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
 }
 
 pub(super) fn exec_refresh_matview_in_txn(
@@ -232,22 +263,40 @@ pub(super) fn exec_refresh_matview_in_txn(
         _ => Vec::new(),
     };
 
-    if stmt.concurrently {
-        diff_merge_concurrent(wtx, &mv, &rows)?;
-    } else {
-        wtx.table_truncate(mv.backing_table.as_bytes())
-            .map_err(SqlError::Storage)?;
-        populate_backing_table(wtx, &mv.backing_table, &rows)?;
-    }
-
-    if !mv.with_data {
-        let mut updated = mv.clone();
-        updated.with_data = true;
-        SchemaManager::save_matview(wtx, &updated)?;
-        schema.register_matview(updated);
-    }
-
-    Ok(ExecutionResult::Ok)
+    let backing = schema
+        .get(&mv.backing_table)
+        .ok_or_else(|| SqlError::TableNotFound(mv.backing_table.clone()))?
+        .clone();
+    with_matview_savepoint(wtx, schema, |wtx, schema| {
+        if stmt.concurrently {
+            diff_merge_concurrent(wtx, schema, &backing, &rows)?;
+        } else {
+            let had_rows = wtx
+                .table_entry_count(backing.name.as_bytes())
+                .map_err(SqlError::Storage)?
+                != 0;
+            mark_backing_changed(wtx, schema, &backing)?;
+            wtx.table_truncate(backing.name.as_bytes())
+                .map_err(SqlError::Storage)?;
+            for index in &backing.indices {
+                wtx.table_truncate(&TableSchema::index_table_name(&backing.name, &index.name))
+                    .map_err(SqlError::Storage)?;
+            }
+            #[cfg(test)]
+            mutation_tests::after_removal();
+            populate_backing_table(wtx, &backing, &rows)?;
+            if had_rows {
+                check_inbound_references(wtx, schema, &backing)?;
+            }
+        }
+        if !mv.with_data {
+            let mut updated = mv.clone();
+            updated.with_data = true;
+            SchemaManager::save_matview(wtx, &updated)?;
+            schema.register_matview(updated);
+        }
+        Ok(ExecutionResult::Ok)
+    })
 }
 
 pub(super) fn exec_drop_matview_in_txn(
@@ -334,34 +383,110 @@ pub(super) fn exec_drop_matview_in_txn(
     Ok(ExecutionResult::Ok)
 }
 
+/// Keep the backing rows, all index trees, and catalog publication atomic even
+/// when called with a public caller-owned writer.
+fn with_matview_savepoint<T>(
+    wtx: &mut WriteTxn<'_>,
+    schema: &mut SchemaManager,
+    mutate: impl FnOnce(&mut WriteTxn<'_>, &mut SchemaManager) -> Result<T>,
+) -> Result<T> {
+    let catalog = schema.save_snapshot();
+    let savepoint = wtx.begin_savepoint();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let result = mutate(wtx, schema)?;
+        super::helpers::check_cancel(wtx.cancel_token())?;
+        Ok(result)
+    }));
+    match outcome {
+        Ok(Ok(result)) => Ok(result),
+        failure => {
+            wtx.restore_snapshot(savepoint);
+            schema.restore_snapshot(catalog);
+            match failure {
+                Ok(Err(error)) => Err(error),
+                Err(payload) => std::panic::resume_unwind(payload),
+                Ok(Ok(_)) => unreachable!(),
+            }
+        }
+    }
+}
+
+fn row_primary_key<'a>(table: &TableSchema, row: &'a [Value]) -> Result<&'a Value> {
+    if row.len() != table.columns.len() {
+        return Err(SqlError::InvalidValue(
+            "materialized view row width changed".into(),
+        ));
+    }
+    let key = row
+        .first()
+        .ok_or_else(|| SqlError::Unsupported("matview row has no columns".into()))?;
+    if key.is_null() {
+        return Err(SqlError::NotNullViolation(
+            "matview primary-key column produced NULL — first column of SELECT must be NOT NULL"
+                .into(),
+        ));
+    }
+    Ok(key)
+}
+
 fn populate_backing_table(
     wtx: &mut WriteTxn<'_>,
-    backing_table: &str,
+    backing: &TableSchema,
     rows: &[Vec<Value>],
 ) -> Result<()> {
     let mut key_buf = Vec::with_capacity(32);
     let mut value_buf = Vec::with_capacity(256);
     for row in rows {
-        let pk_val = row
-            .first()
-            .ok_or_else(|| SqlError::Unsupported("matview row has no columns".into()))?;
-        if pk_val.is_null() {
-            return Err(SqlError::NotNullViolation(
-                "matview primary-key column produced NULL — first column of SELECT must be NOT NULL"
-                    .into(),
-            ));
-        }
+        super::helpers::check_cancel(wtx.cancel_token())?;
+        let pk_val = row_primary_key(backing, row)?;
         encode_pk_key(pk_val, &mut key_buf);
-        let non_pk: Vec<Value> = row.iter().skip(1).cloned().collect();
-        crate::encoding::encode_row_into(&non_pk, &mut value_buf);
-        let inserted = wtx
-            .table_insert(backing_table.as_bytes(), &key_buf, &value_buf)
-            .map_err(SqlError::Storage)?;
-        if !inserted {
+        crate::encoding::encode_row_into(&row[1..], &mut value_buf);
+        if !wtx
+            .table_insert(backing.name.as_bytes(), &key_buf, &value_buf)
+            .map_err(SqlError::Storage)?
+        {
             return Err(SqlError::DuplicateKey);
         }
-        key_buf.clear();
-        value_buf.clear();
+        super::helpers::insert_index_entries(wtx, backing, row, std::slice::from_ref(pk_val))?;
+    }
+    Ok(())
+}
+
+fn mark_backing_changed(
+    wtx: &mut WriteTxn<'_>,
+    schema: &SchemaManager,
+    backing: &TableSchema,
+) -> Result<()> {
+    super::helpers::check_cancel(wtx.cancel_token())?;
+    schema.mark_dml(&backing.name);
+    if backing.has_ann_index() {
+        super::ann_persist::purge_segment(wtx, &backing.name)?;
+    }
+    Ok(())
+}
+
+/// REFRESH replaces a relation, rather than applying row-level referential
+/// actions. Check surviving references against the complete final relation.
+/// Initially-deferred constraints retain their ordinary commit-time semantics.
+fn check_inbound_references(
+    wtx: &mut WriteTxn<'_>,
+    schema: &SchemaManager,
+    backing: &TableSchema,
+) -> Result<()> {
+    let mut checked = rustc_hash::FxHashSet::default();
+    for (name, _) in schema.child_fks_for(&backing.name) {
+        if !checked.insert(name) {
+            continue;
+        }
+        let child = schema
+            .get(name)
+            .ok_or_else(|| SqlError::TableNotFound(name.into()))?;
+        let foreign_keys = child
+            .foreign_keys
+            .iter()
+            .filter(|fk| fk.foreign_table == backing.name)
+            .collect::<Vec<_>>();
+        super::fk::check_table_references(wtx, schema, child, &foreign_keys)?;
     }
     Ok(())
 }
@@ -376,67 +501,83 @@ fn encode_pk_key(val: &Value, buf: &mut Vec<u8>) {
 
 fn diff_merge_concurrent(
     wtx: &mut WriteTxn<'_>,
-    mv: &MatviewDef,
+    schema: &SchemaManager,
+    backing: &TableSchema,
     new_rows: &[Vec<Value>],
 ) -> Result<()> {
     use rustc_hash::FxHashMap;
-
     let mut new_by_key: FxHashMap<Vec<u8>, &Vec<Value>> = FxHashMap::default();
     let mut key_buf = Vec::with_capacity(32);
     for row in new_rows {
-        let pk_val = row
-            .first()
-            .ok_or_else(|| SqlError::Unsupported("matview row has no columns".into()))?;
-        if pk_val.is_null() {
-            return Err(SqlError::NotNullViolation(
-                "matview PK column produced NULL".into(),
-            ));
+        super::helpers::check_cancel(wtx.cancel_token())?;
+        encode_pk_key(row_primary_key(backing, row)?, &mut key_buf);
+        if new_by_key.insert(key_buf.clone(), row).is_some() {
+            return Err(SqlError::DuplicateKey);
         }
-        encode_pk_key(pk_val, &mut key_buf);
-        new_by_key.insert(key_buf.clone(), row);
-        key_buf.clear();
     }
 
-    let mut deletes: Vec<Vec<u8>> = Vec::new();
-    let mut updates: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    let mut decode_err: Option<SqlError> = None;
-    wtx.table_for_each(mv.backing_table.as_bytes(), |key, value| {
+    // Preserve unchanged rows and their index entries. Retain the old image for
+    // changed rows so every obsolete UNIQUE value is removed before any final
+    // value is inserted (a valid swap must not fail on an intermediate state).
+    let mut changes = Vec::new();
+    let mut decode_error = None;
+    wtx.table_scan_from(backing.name.as_bytes(), b"", |key, value| {
         match decode_existing_row(key, value) {
-            Ok(existing) => match new_by_key.remove(key) {
-                None => deletes.push(key.to_vec()),
-                Some(new_row) => {
-                    if new_row != &existing {
-                        let non_pk: Vec<Value> = new_row.iter().skip(1).cloned().collect();
-                        let mut buf = Vec::new();
-                        crate::encoding::encode_row_into(&non_pk, &mut buf);
-                        updates.push((key.to_vec(), buf));
-                    }
+            Ok(existing) => {
+                let replacement = new_by_key.remove(key);
+                if replacement != Some(&existing) {
+                    changes.push((key.to_vec(), existing, replacement));
                 }
-            },
-            Err(e) => decode_err = Some(e),
+            }
+            Err(error) => {
+                decode_error = Some(error);
+                return Ok(false);
+            }
         }
-        Ok(())
+        Ok(true)
     })
     .map_err(SqlError::Storage)?;
-    if let Some(e) = decode_err {
-        return Err(e);
+    if let Some(error) = decode_error {
+        return Err(error);
+    }
+    if changes.is_empty() && new_by_key.is_empty() {
+        return Ok(());
     }
 
-    for storage_key in &deletes {
-        wtx.table_delete(mv.backing_table.as_bytes(), storage_key)
-            .map_err(SqlError::Storage)?;
+    mark_backing_changed(wtx, schema, backing)?;
+    for (key, old, replacement) in &changes {
+        super::helpers::check_cancel(wtx.cancel_token())?;
+        super::helpers::delete_index_entries(wtx, backing, old, &old[..1])?;
+        if replacement.is_none() {
+            wtx.table_delete(backing.name.as_bytes(), key)
+                .map_err(SqlError::Storage)?;
+        }
     }
-    for (storage_key, value) in &updates {
-        wtx.table_insert(mv.backing_table.as_bytes(), storage_key, value)
-            .map_err(SqlError::Storage)?;
+    #[cfg(test)]
+    mutation_tests::after_removal();
+    let mut value_buf = Vec::new();
+    for (key, _, replacement) in &changes {
+        if let Some(row) = replacement {
+            super::helpers::check_cancel(wtx.cancel_token())?;
+            crate::encoding::encode_row_into(&row[1..], &mut value_buf);
+            wtx.table_insert(backing.name.as_bytes(), key, &value_buf)
+                .map_err(SqlError::Storage)?;
+            super::helpers::insert_index_entries(wtx, backing, row, &row[..1])?;
+        }
     }
-    let mut val_buf = Vec::new();
-    for (storage_key, row) in &new_by_key {
-        let non_pk: Vec<Value> = row.iter().skip(1).cloned().collect();
-        crate::encoding::encode_row_into(&non_pk, &mut val_buf);
-        wtx.table_insert(mv.backing_table.as_bytes(), storage_key, &val_buf)
-            .map_err(SqlError::Storage)?;
-        val_buf.clear();
+    for (key, row) in new_by_key {
+        super::helpers::check_cancel(wtx.cancel_token())?;
+        crate::encoding::encode_row_into(&row[1..], &mut value_buf);
+        if !wtx
+            .table_insert(backing.name.as_bytes(), &key, &value_buf)
+            .map_err(SqlError::Storage)?
+        {
+            return Err(SqlError::DuplicateKey);
+        }
+        super::helpers::insert_index_entries(wtx, backing, row, &row[..1])?;
+    }
+    if !changes.is_empty() {
+        check_inbound_references(wtx, schema, backing)?;
     }
     Ok(())
 }
@@ -689,3 +830,7 @@ mod catalog_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "matviews_mutation_tests.rs"]
+mod mutation_tests;
