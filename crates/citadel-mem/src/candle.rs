@@ -359,26 +359,20 @@ pub struct CandleEmbedder {
     model_id: String,
 }
 
-/// Inference device: GPU 0 with `cuda-embed` (CPU fallback at runtime), else
-/// CPU.
+/// Use the explicitly compiled inference backend. CUDA initialization errors
+/// propagate to the caller; CPU inference requires a build without `cuda-embed`.
 #[cfg(feature = "cuda-embed")]
-fn select_device() -> Device {
-    // cuda-embed was requested, so warn rather than silently drop to CPU.
-    match Device::new_cuda(0) {
-        Ok(d) => {
-            eprintln!("[citadel-mem] cuda-embed: using CUDA GPU 0");
-            d
-        }
-        Err(e) => {
-            eprintln!("[citadel-mem] cuda-embed enabled but GPU init failed; using CPU: {e}");
-            Device::Cpu
-        }
-    }
+fn select_device() -> Result<Device, EmbedError> {
+    let device = Device::new_cuda(0).map_err(|error| {
+        EmbedError::Backend(format!("cuda-embed requires CUDA GPU 0: {error}"))
+    })?;
+    eprintln!("[citadel-mem] cuda-embed: using CUDA GPU 0");
+    Ok(device)
 }
 
 #[cfg(not(feature = "cuda-embed"))]
-fn select_device() -> Device {
-    Device::Cpu
+fn select_device() -> Result<Device, EmbedError> {
+    Ok(Device::Cpu)
 }
 
 impl CandleEmbedder {
@@ -402,7 +396,7 @@ impl CandleEmbedder {
         let fingerprint = candle_pipeline_fingerprint(config_json, tokenizer_json, &weights, &cfg);
         let model_id = content_bound_model_id(&model_label, fingerprint, CANDLE_PIPELINE_REVISION);
 
-        let device = select_device();
+        let device = select_device()?;
         // f32 GEMM via TF32 tensor cores (Ampere+); full f32 range. No-op on
         // CPU.
         if matches!(device, Device::Cuda(_)) {
@@ -684,7 +678,7 @@ impl CrossEncoder {
         model_id: impl Into<String>,
         max_length: usize,
     ) -> Result<Self, EmbedError> {
-        let device = select_device();
+        let device = select_device()?;
         let config: Config = serde_json::from_slice(config_json).map_err(backend)?;
         let hidden = config.hidden_size;
 
