@@ -1,3 +1,4 @@
+#requires -Version 7.0
 <#
 .SYNOPSIS
 Runs LoCoMo or LongMemEval through the native benchmark executable.
@@ -194,8 +195,86 @@ try {
   "benchmark=$Benchmark mode=$Mode label=$Label started=$(Get-Date -Format o)" | Set-Content -LiteralPath $log
   Write-Host "run dir: $dir"
   $started = Get-Date
-  & $Executable $Dataset 1> $stdout 2>> $log
-  $code = $LASTEXITCODE
+  $startInfo = [Diagnostics.ProcessStartInfo]::new()
+  $startInfo.UseShellExecute = $false
+  $startInfo.CreateNoWindow = $true
+  $startInfo.WorkingDirectory = $ExecutionContext.SessionState.Path.CurrentFileSystemLocation.Path
+  $startInfo.RedirectStandardOutput = $true
+  $startInfo.RedirectStandardError = $true
+  $startInfo.StandardErrorEncoding = [Text.UTF8Encoding]::new($false)
+  if ([IO.Path]::GetExtension($Executable) -eq '.ps1') {
+    $startInfo.FileName = (Join-Path $PSHOME 'pwsh')
+    foreach ($argument in @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $Executable)) {
+      $startInfo.ArgumentList.Add($argument)
+    }
+  } else {
+    $startInfo.FileName = $Executable
+  }
+  $startInfo.ArgumentList.Add($Dataset)
+  $process = [Diagnostics.Process]::new()
+  $process.StartInfo = $startInfo
+  $outputFile = $null
+  $logWriter = $null
+  $launched = $false
+  $nativeFailure = $null
+  $cleanupFailure = $null
+  try {
+    $outputFile = [IO.File]::Open($stdout, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+    $logWriter = [IO.StreamWriter]::new($log, $true, [Text.UTF8Encoding]::new($false))
+    $logWriter.AutoFlush = $true
+    $launched = $process.Start()
+    if (-not $launched) { throw 'Native process did not start.' }
+    # Copy stdout as bytes on its own task: no decoding, formatting, or pipe deadlock.
+    $outputCopy = $process.StandardOutput.BaseStream.CopyToAsync($outputFile)
+    while ($true) {
+      $lineTask = $process.StandardError.ReadLineAsync()
+      while (-not $lineTask.IsCompleted) {
+        if ($outputCopy.IsFaulted) { $null = $outputCopy.GetAwaiter().GetResult() }
+        $null = $lineTask.Wait(100)
+      }
+      $line = $lineTask.GetAwaiter().GetResult()
+      if ($null -eq $line) { break }
+      $logWriter.WriteLine($line)
+      [Console]::Error.WriteLine($line)
+    }
+    $null = $outputCopy.GetAwaiter().GetResult()
+    $process.WaitForExit()
+    $code = $process.ExitCode
+    $global:LASTEXITCODE = $code
+  }
+  catch { $nativeFailure = $_ }
+  finally {
+    # Cleanup must not mask the original stream/launch failure, and a failed
+    # process cleanup must not skip closing the files.
+    try {
+      if ($launched -and -not $process.HasExited) {
+        $process.Kill($true)
+        $process.WaitForExit()
+      }
+    }
+    catch {
+      $failure = $_
+      $alreadyExited = $false
+      if ($failure.Exception.GetBaseException() -is [InvalidOperationException]) {
+        try { $alreadyExited = $process.HasExited } catch { }
+      }
+      if (-not $alreadyExited) { $cleanupFailure = $failure }
+    }
+    foreach ($resource in @($logWriter, $outputFile, $process)) {
+      if ($resource) {
+        try { $resource.Dispose() }
+        catch { if (-not $cleanupFailure) { $cleanupFailure = $_ } }
+      }
+    }
+  }
+  if ($nativeFailure) {
+    if ($cleanupFailure) {
+      $nativeFailure.Exception.Data['NativeCleanupFailure'] = $cleanupFailure.Exception
+      Write-Warning 'Native process cleanup also failed; the original launch or stream failure is preserved.' -WarningAction Continue
+    }
+    throw $nativeFailure
+  }
+  if ($cleanupFailure) { throw $cleanupFailure }
   "EXIT=$code WALL_SEC=$([math]::Round(((Get-Date) - $started).TotalSeconds))" | Add-Content -LiteralPath $log
 }
 catch {

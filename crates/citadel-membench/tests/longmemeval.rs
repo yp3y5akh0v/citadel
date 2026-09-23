@@ -161,6 +161,83 @@ fn invalid_or_inconsistent_dates_fail_before_ingestion_or_reuse() {
 }
 
 #[test]
+fn progress_preparation_preserves_corpus_and_reader_prompt_without_reembedding_reuse() {
+    use citadel_mem::{EmbedError, EmbeddingMetric};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct CheckedEmbedder {
+        inner: MockEmbedder,
+        forbid_passages: AtomicBool,
+    }
+    impl Embedder for CheckedEmbedder {
+        fn dim(&self) -> usize {
+            self.inner.dim()
+        }
+        fn metric(&self) -> EmbeddingMetric {
+            self.inner.metric()
+        }
+        fn model_id(&self) -> &str {
+            self.inner.model_id()
+        }
+        fn embed_with_cancel(
+            &self,
+            texts: &[&str],
+            cancel: Option<&citadel::CancelToken>,
+        ) -> Result<Vec<Vec<f32>>, EmbedError> {
+            assert!(
+                !self.forbid_passages.load(Ordering::Relaxed),
+                "reuse must not embed passages"
+            );
+            self.inner.embed_with_cancel(texts, cancel)
+        }
+    }
+
+    let expected_dir = tempfile::tempdir().unwrap();
+    let observed_dir = tempfile::tempdir().unwrap();
+    let expected = engine(expected_dir.path());
+    let observed = engine(observed_dir.path());
+    let samples = dataset::parse_root(&fixture()).unwrap();
+    let embedder = Arc::new(CheckedEmbedder {
+        inner: MockEmbedder::new(DIM),
+        forbid_passages: AtomicBool::new(false),
+    });
+    for sample in &samples {
+        expected
+            .create_region(&sample.question_id, embedder.clone())
+            .unwrap();
+        ingest::ingest_sample(&expected, &sample.question_id, sample).unwrap();
+    }
+    ingest::prepare_regions(&observed, &samples, embedder.clone(), false, false).unwrap();
+    embedder.forbid_passages.store(true, Ordering::Relaxed);
+    ingest::prepare_regions(&observed, &samples, embedder, false, true).unwrap();
+    for sample in &samples {
+        let left = expected
+            .fetch_range(&sample.question_id, &FetchQuery::new(100))
+            .unwrap();
+        let right = observed
+            .fetch_range(&sample.question_id, &FetchQuery::new(100))
+            .unwrap();
+        assert_eq!(left.len(), right.len());
+        for (a, b) in left.iter().zip(&right) {
+            assert_eq!(a.id, b.id);
+            assert_eq!(a.text, b.text);
+            assert_eq!(a.payload, b.payload);
+            assert_eq!(a.created_at, b.created_at);
+        }
+        let expected =
+            prompts::build_reader_prompt(&left, &sample.question, &sample.question_date).unwrap();
+        let observed =
+            prompts::build_reader_prompt(&right, &sample.question, &sample.question_date).unwrap();
+        let ([Message::User(expected)], [Message::User(observed)]) =
+            (expected.as_slice(), observed.as_slice())
+        else {
+            panic!("expected the stock single-user reader prompt");
+        };
+        assert_eq!(expected, observed);
+    }
+}
+
+#[test]
 fn reuse_accepts_exact_corpus_without_reingestion() {
     let dir = tempfile::tempdir().unwrap();
     let eng = engine(dir.path());

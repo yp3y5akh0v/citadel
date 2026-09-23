@@ -10,7 +10,6 @@ use citadel_mem::{Embedder, MemoryEngine};
 
 use super::dataset::LmSample;
 use super::{ingest, LongMemEval};
-use crate::core::db::attach_reused_region;
 use crate::core::error::{
     observe_failure, BenchError, CompletedOutput, QuestionBatchFailure, QuestionCompletion,
     QuestionEvent, QuestionFailure, QuestionIdentity, QuestionObserver, QuestionStage, Result,
@@ -105,7 +104,6 @@ pub fn run(
             "reader_concurrency must be positive".into(),
         ));
     }
-    super::dataset::validate_samples(samples)?;
     if samples.is_empty() {
         return Ok(Vec::new());
     }
@@ -113,36 +111,14 @@ pub fn run(
     // Phase 1: ingest each question's private haystack into its own region.
     // Writes are single-writer, so this stays sequential; questions then fan
     // out as reads.
-    let t_ingest = Instant::now();
-    let n = samples.len();
-    for (i, s) in samples.iter().enumerate() {
-        if cfg.reuse {
-            attach_reused_region(eng, &s.question_id, Arc::clone(&embedder), cfg.encrypted)?;
-            ingest::validate_reuse(eng, &s.question_id, s)?;
-        } else {
-            if cfg.encrypted {
-                eng.create_encrypted_region(&s.question_id, Arc::clone(&embedder))?;
-            } else {
-                eng.create_region(&s.question_id, Arc::clone(&embedder))?;
-            }
-            ingest::ingest_sample(eng, &s.question_id, s)?;
-        }
-        if (i + 1) % 25 == 0 || i + 1 == n {
-            let verb = if cfg.reuse { "re-attached" } else { "ingested" };
-            eprintln!("  {verb} {}/{n}", i + 1);
-        }
-    }
-    eprintln!(
-        "  phase 1 ({} {n}) {:.1}s",
-        if cfg.reuse { "re-attach" } else { "ingest" },
-        t_ingest.elapsed().as_secs_f64()
-    );
+    ingest::prepare_regions(eng, samples, embedder, cfg.encrypted, cfg.reuse)?;
 
     // Phase 2: answer each question concurrently; results returned in sample
     // order.
     let t_answer = Instant::now();
     let bench = LongMemEval::new(cfg.bench.temporal_glosses);
     let total = samples.len();
+    eprintln!("phase 2: answer {total} questions: started");
     let workers = cfg.reader_concurrency.max(1);
     let gate = Gate::new(workers);
     let next = AtomicUsize::new(0);

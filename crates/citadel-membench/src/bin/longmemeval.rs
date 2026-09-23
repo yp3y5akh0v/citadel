@@ -88,15 +88,24 @@ fn main() -> Result<(), Box<dyn Error>> {
         None
     };
     let reranker = match std::env::var("CITADEL_RERANKER_DIR") {
-        Ok(dir) => Some(Arc::new(
-            CrossEncoder::ms_marco_minilm_l6(&dir).map_err(|e| format!("reranker model: {e}"))?,
-        )),
+        Ok(dir) => {
+            eprintln!("reranker: loading");
+            let started = Instant::now();
+            let model = CrossEncoder::ms_marco_minilm_l6(&dir)
+                .map_err(|e| format!("reranker model: {e}"))?;
+            eprintln!(
+                "reranker: loaded in {:.1}s",
+                started.elapsed().as_secs_f64()
+            );
+            Some(Arc::new(model))
+        }
         Err(std::env::VarError::NotPresent) => None,
         Err(_) => return Err("CITADEL_RERANKER_DIR must be Unicode text".into()),
     };
     let t_embed = Instant::now();
     let model_dir =
         std::env::var("CITADEL_EMBEDDER_DIR").map_err(|_| "CITADEL_EMBEDDER_DIR not set")?;
+    eprintln!("embedder: loading");
     let embedder: Arc<dyn Embedder> = Arc::new(launch.embedder.load(&model_dir)?);
     eprintln!(
         "embedder: {} loaded in {:.1}s",
@@ -278,33 +287,12 @@ fn run_retrieval_diag(
     // Ingest all regions first (a complete, reusable cache), then recall in a
     // separate pass: each write purges the ANN segment, so pass 2 builds it
     // once on first recall.
-    let t_ing = std::time::Instant::now();
-    for s in samples {
-        if reuse {
-            citadel_membench::core::db::attach_reused_region(
-                eng,
-                &s.question_id,
-                Arc::clone(&embedder),
-                encrypted,
-            )?;
-            ingest::validate_reuse(eng, &s.question_id, s)?;
-        } else {
-            if encrypted {
-                eng.create_encrypted_region(&s.question_id, Arc::clone(&embedder))?;
-            } else {
-                eng.create_region(&s.question_id, Arc::clone(&embedder))?;
-            }
-            ingest::ingest_sample(eng, &s.question_id, s)?;
-        }
-    }
-    eprintln!(
-        "  {} {} regions in {:.1}s",
-        if reuse { "re-attached" } else { "ingested" },
-        samples.len(),
-        t_ing.elapsed().as_secs_f64()
-    );
+    ingest::prepare_regions(eng, samples, Arc::clone(&embedder), encrypted, reuse)?;
 
     // Pass 2: recall + score (no writes between, so the ANN segment is stable).
+    let recall_started = Instant::now();
+    let mut last_progress = recall_started;
+    eprintln!("phase 2: recall {} questions: started", scored.len());
     let (mut win_rc, mut win_rs, mut win_n) = (0u128, 0u128, 0usize);
     for (done, &s) in scored.iter().enumerate() {
         let t = std::time::Instant::now();
@@ -359,18 +347,25 @@ fn run_retrieval_diag(
             .record_has_answer(&hits_sem, total_answer, ks);
 
         win_n += 1;
-        if win_n == 50 || done + 1 == scored.len() {
+        if win_n == 50 || last_progress.elapsed().as_secs() >= 10 || done + 1 == scored.len() {
             eprintln!(
-                "  recalled {}/{}  [/q ms: recall {:.0}  recall_sem {:.0}]",
+                "  recalled {}/{}  [/q ms: recall {:.0}  recall_sem {:.0}]; phase elapsed {:.1}s",
                 done + 1,
                 scored.len(),
                 win_rc as f64 / 1e3 / win_n as f64,
-                win_rs as f64 / 1e3 / win_n as f64
+                win_rs as f64 / 1e3 / win_n as f64,
+                recall_started.elapsed().as_secs_f64()
             );
             (win_rc, win_rs, win_n) = (0, 0, 0);
+            last_progress = Instant::now();
         }
     }
 
+    eprintln!(
+        "phase 2: recall {} questions: finished in {:.1}s",
+        scored.len(),
+        recall_started.elapsed().as_secs_f64()
+    );
     print_diag("session-level (answer_session_ids)", &sess, &labels, ks);
     print_diag(
         "turn-level, configured recall (has_answer)",
