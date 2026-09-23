@@ -12,6 +12,20 @@ build one. To serve Citadel memory over MCP, use
 
 This crate is part of the Citadel workspace.
 
+`BudgetUsage.tokens` and `cost_usd` are optional cumulative totals. Unknown token
+usage stops the run with `TerminatedBy::BudgetUnavailable`; unknown cost does so
+when a cost cap is configured. A configured cost cap must be finite and nonnegative.
+The agent does not automatically retry LLM requests.
+
+`AgentBudget::check` returns `BudgetStop`, distinguishing exceeded caps,
+unavailable usage, and invalid configuration.
+
+If recording an LLM trace fails, `AgentError::TracePersistence` retains the
+affected calls' requests, identities, responses or provider errors, cumulative
+usage, and the storage error. Its `confirmed_persisted` field counts the prefix of
+acknowledged writes. The failed write may also have persisted, so reconcile the
+retained calls with stored traces before retrying persistence or making new calls.
+
 ## License
 
 Apache-2.0

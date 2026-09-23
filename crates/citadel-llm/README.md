@@ -6,6 +6,14 @@ the `LLMClient` trait, request/response types, canonical request hashing
 feature-gated Claude / OpenAI / Ollama / Gemini backends behind a single
 factory (`factory::from_env` / `factory::build`).
 
+`CompletionResponse.usage` is `Option<TokenUsage>`: `None` means complete, valid
+token counts were unavailable; `Some` with zero counts means zero was reported.
+The response message and finish reason are retained either way. `cost_usd` is a
+separate optional estimate and can be unavailable even when token counts are known.
+Handle `None` without treating it as zero usage.
+
+Canonical request hashes include `seed`, including `null` when unset.
+
 ## Features
 
 - `claude`, `openai`, `ollama`, `gemini` - HTTP backends (native only)

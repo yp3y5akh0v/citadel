@@ -201,6 +201,27 @@ finally:
     db.set_cancel(None)
 ```
 
+## Agents and LLM clients
+
+`LLMClient.complete()` returns a response dictionary whose `usage` can be `None`.
+Custom clients should return both `input_tokens` and `output_tokens` as nonnegative
+integer counts inside `usage`; omitted or invalid counts mean usage is unavailable.
+Explicit zero counts remain zero. `usage["cost_usd"]` is an optional estimate.
+Returning only a string leaves usage unavailable. Callback request dictionaries
+include `seed`, with `None` when unset; replay hashes include this field.
+
+Agents do not automatically retry LLM requests. A run stops with
+`terminated_by == "token_usage_unavailable"` when token accounting is unknown,
+or `"cost_usage_unavailable"` when a configured cost cap
+cannot be checked. A nonfinite or negative cost cap gives `"invalid_cost_limit"`.
+
+On trace-storage failure, `AgentError.recovery` contains `usage`, `calls`, and
+`confirmed_persisted`; each call retains its request, identities, and response or
+provider error. `AgentError.storage_error` holds the original storage exception.
+Both attributes are `None` for other agent errors. The confirmed prefix counts
+acknowledged writes; a failed write may still have persisted. Reconcile the retained
+calls with stored traces before retrying persistence or making new calls.
+
 ## MCP
 
 `pip install citadeldb-mcp` installs the server executable for Claude Desktop,

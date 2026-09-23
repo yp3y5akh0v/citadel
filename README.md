@@ -468,6 +468,8 @@ executable hashes, and per-run results are in
 
 **Constraints** - PRIMARY KEY, NOT NULL, UNIQUE, DEFAULT, CHECK (column + table level), FOREIGN KEY with full referential actions (`ON DELETE` / `ON UPDATE` `CASCADE` / `SET NULL` / `SET DEFAULT` / `RESTRICT` / `NO ACTION`), GENERATED ALWAYS AS (...) STORED|VIRTUAL
 
+**Collations** - `BINARY`, `NOCASE` (ASCII case-insensitive), and `RTRIM` (ignores trailing spaces). Text primary keys use their declared collation; foreign keys use the referenced columns' collation. Column index keys inherit their column's collation unless overridden with `COLLATE`.
+
 **Types** - INTEGER, REAL, TEXT, BLOB, BOOLEAN, DATE, TIME, TIMESTAMP (WITH TIME ZONE), INTERVAL, JSON, JSONB, TSVECTOR, TSQUERY, ARRAY
 
 **JSON / JSONB** - Postgres operators plus SQL/JSON path functions and the SQL:2023 item methods `.bigint()`, `.decimal()`, `.integer()`, `.number()`, `.string()`, `.boolean()`, `.date()`, `.time()`, `.time_tz()`, `.timestamp()`, and `.timestamp_tz()`. Time-zone-dependent evaluation uses the connection's transactional `SET [LOCAL] TIME ZONE` context.
