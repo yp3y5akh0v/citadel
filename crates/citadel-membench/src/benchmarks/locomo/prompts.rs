@@ -3,10 +3,66 @@
 use citadel_llm::{LLMClient, Message, TokenUsage};
 use citadel_mem::AtomHit;
 use rustc_hash::FxHashMap;
+use std::borrow::Cow;
 
+use super::dataset::parse_locomo_datetime;
 use crate::core::error::{BenchError, Result};
 use crate::core::eval::{abstention_label, complete_judge, judge_label, JudgeOutcome};
 use crate::core::ratelimit::Pacer;
+use crate::core::temporal;
+
+/// Annotate only the dialogue body, preserving its attribution and image metadata.
+pub(crate) fn source_text(hit: &AtomHit, enabled: bool) -> Result<Cow<'_, str>> {
+    if !enabled {
+        return Ok(Cow::Borrowed(&hit.text));
+    }
+    let metadata = |key: &str| -> Result<&str> {
+        hit.payload
+            .get(key)
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                BenchError::Dataset(format!(
+                    "LoCoMo atom {} lacks string {key} metadata",
+                    hit.id
+                ))
+            })
+    };
+    let date = metadata("date_time")?;
+    if date.is_empty() {
+        return Ok(Cow::Borrowed(&hit.text));
+    }
+    let anchor = parse_locomo_datetime(date).ok_or_else(|| {
+        BenchError::Dataset(format!(
+            "LoCoMo atom {} has an invalid session date",
+            hit.id
+        ))
+    })?;
+    let prefix = format!("[{date}] {}: ", metadata("speaker")?);
+    let mut suffix = String::new();
+    for (key, label) in [
+        ("blip_caption", "shared a photo"),
+        ("query", "image search"),
+    ] {
+        let value = metadata(key)?;
+        if !value.is_empty() {
+            suffix.push_str(&format!(" [{label}: {value}]"));
+        }
+    }
+    let body = hit
+        .text
+        .strip_prefix(&prefix)
+        .and_then(|s| s.strip_suffix(&suffix))
+        .ok_or_else(|| {
+            BenchError::Dataset(format!(
+                "LoCoMo atom {} text conflicts with its source metadata; rebuild its cached corpus",
+                hit.id
+            ))
+        })?;
+    match temporal::annotate(body, anchor) {
+        Cow::Borrowed(_) => Ok(Cow::Borrowed(&hit.text)),
+        Cow::Owned(body) => Ok(Cow::Owned(format!("{prefix}{body}{suffix}"))),
+    }
+}
 
 /// Evaluation protocol and limitations included in each report.
 pub(crate) const KNOWN_FLAWS: &str = "Accuracy uses an LLM correctness judge rather than \
@@ -31,6 +87,15 @@ pub fn build_reader_prompt(
     hits: &[AtomHit],
     question: &str,
     session_headers: bool,
+) -> Result<Vec<Message>> {
+    build_reader_prompt_with_glosses(hits, question, session_headers, false)
+}
+
+pub(crate) fn build_reader_prompt_with_glosses(
+    hits: &[AtomHit],
+    question: &str,
+    session_headers: bool,
+    temporal_glosses: bool,
 ) -> Result<Vec<Message>> {
     let system = "You answer the question using ONLY the provided memories. Each \
          memory is a line from a past conversation, prefixed with the date it was \
@@ -111,7 +176,11 @@ pub fn build_reader_prompt(
                 last_session = Some(session);
             }
         }
-        user.push_str(&format!("{}. {}\n", rank + 1, hit.text));
+        user.push_str(&format!(
+            "{}. {}\n",
+            rank + 1,
+            source_text(hit, temporal_glosses)?
+        ));
     }
     user.push_str(&format!("\nQuestion: {question}"));
 
@@ -184,4 +253,73 @@ pub(crate) fn judge_abstained_observed(
     let (resp, audit) = complete_judge(judge, pacer, system, &user)?;
     let abstained = abstention_label(&resp)?;
     Ok(JudgeOutcome::from_response(abstained, resp, audit))
+}
+
+#[cfg(test)]
+mod temporal_tests {
+    use super::*;
+    use crate::benchmarks::locomo::Locomo;
+    use crate::core::{agentic, benchmark::Benchmark};
+    use serde_json::json;
+
+    fn hit() -> AtomHit {
+        AtomHit {
+            id: 7, kind: "turn".into(),
+            text: "[1:00 pm on 1 March, 2024] Tomorrow: Yesterday I visited. [shared a photo: yesterday] [image search: tomorrow]".into(),
+            payload: json!({"session": 1, "date_time": "1:00 pm on 1 March, 2024", "speaker": "Tomorrow", "blip_caption": "yesterday", "query": "tomorrow"}),
+            importance: 0.0, confidence: 1.0, relevance: None, distance: None,
+            graph_depth: None, created_at: 0, expires_at: None, immutable: false,
+        }
+    }
+
+    #[test]
+    fn glosses_preserve_attribution_media_and_original_atoms_in_both_reader_passes() {
+        let hit = hit();
+        let original = hit.text.clone();
+        let expected = original.replace("Yesterday I", "Yesterday (29 February 2024) I");
+        assert_eq!(source_text(&hit, true).unwrap(), expected);
+        assert!(matches!(
+            source_text(&hit, false).unwrap(),
+            Cow::Borrowed(_)
+        ));
+        let hits = [hit];
+        let bench = Locomo::new(true).with_temporal_glosses(true);
+        let final_prompt = bench
+            .reader_prompt(&hits, "What happened yesterday?", "")
+            .unwrap();
+        let extraction =
+            agentic::extraction_prompt(&bench, &hits, "How many visits yesterday?", "").unwrap();
+        for prompt in [final_prompt, extraction] {
+            assert_eq!(prompt.atom_ids, [7]);
+            assert!(prompt
+                .messages
+                .iter()
+                .any(|m| matches!(m, Message::User(text) if text.contains(&expected))));
+        }
+        assert_eq!(hits[0].text, original);
+        let raw = build_reader_prompt(&hits, "Q", true).unwrap();
+        let disabled = Locomo::new(true).reader_prompt(&hits, "Q", "").unwrap();
+        assert_eq!(format!("{raw:?}"), format!("{:?}", disabled.messages));
+    }
+
+    #[test]
+    fn missing_dates_are_not_replaced_with_ingestion_time_and_bad_metadata_is_rejected() {
+        let mut hit = hit();
+        hit.payload["date_time"] = json!("");
+        hit.text = "Tomorrow: Yesterday I visited.".into();
+        assert_eq!(source_text(&hit, true).unwrap(), hit.text);
+        hit.payload["date_time"] = json!("invalid");
+        assert!(source_text(&hit, true).is_err());
+        hit = self::hit();
+        hit.payload["speaker"] = json!("Other");
+        assert!(source_text(&hit, true).is_err());
+        hit = self::hit();
+        hit.payload["blip_caption"] = json!("mismatch");
+        assert!(source_text(&hit, true).is_err());
+        for key in ["blip_caption", "query"] {
+            hit = self::hit();
+            hit.payload.as_object_mut().unwrap().remove(key);
+            assert!(source_text(&hit, true).is_err());
+        }
+    }
 }

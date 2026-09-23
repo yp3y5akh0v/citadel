@@ -27,6 +27,7 @@ param(
   [ValidateSet('sessions', 'chrono', 'relevance')] [string]$ReaderOrder = 'sessions',
   [ValidateRange(0, [int]::MaxValue)] [int]$NeighborRadius = 0,
   [switch]$Agentic,
+  [switch]$TemporalGlosses,
   [string]$Dataset = '',
   [ValidateScript({ -not [string]::IsNullOrWhiteSpace($_) })] [string]$OnlyQids = '',
   [string]$DbPath = '',
@@ -61,7 +62,7 @@ if ($Benchmark -eq 'longmemeval') {
 }
 if ($Mode -ne 'scored') {
   foreach ($name in @('Reader', 'Judge', 'ReaderProvider', 'JudgeProvider', 'ReaderConcurrency',
-      'JudgeConcurrency', 'ReaderTpm', 'JudgeTpm', 'ReaderOrder', 'Agentic', 'MaxTokens', 'ReasoningEffort')) {
+      'JudgeConcurrency', 'ReaderTpm', 'JudgeTpm', 'ReaderOrder', 'Agentic', 'TemporalGlosses', 'MaxTokens', 'ReasoningEffort')) {
     if ($PSBoundParameters.ContainsKey($name)) { throw "-$name requires scored mode." }
   }
 } else {
@@ -174,6 +175,7 @@ try {
     $values["${prefix}_READER_CONCURRENCY"] = "$ReaderConcurrency"
     if ($Benchmark -eq 'locomo' -or $PSBoundParameters.ContainsKey('ReaderTpm')) { $values["${prefix}_READER_TPM"] = "$ReaderTpm" }
     if ($Agentic) { $values["${prefix}_AGENTIC"] = 'true' }
+    if ($TemporalGlosses) { $values["${prefix}_TEMPORAL_GLOSSES"] = 'true' }
     if ($Benchmark -eq 'locomo') {
       $values.CITADEL_LOCOMO_READER_ORDER = $ReaderOrder
       $values.CITADEL_LOCOMO_JUDGE_MODEL = $Judge

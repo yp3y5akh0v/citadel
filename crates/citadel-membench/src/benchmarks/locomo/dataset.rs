@@ -371,7 +371,7 @@ fn render_answer(v: Option<&Value>) -> String {
 
 /// Parse LoCoMo's `H:MM am|pm on D Month, YYYY` session stamp to epoch micros.
 /// Strict on purpose: a deviating string returns `None` rather than a guess.
-fn parse_locomo_datetime(s: &str) -> Option<i64> {
+pub(super) fn parse_locomo_datetime(s: &str) -> Option<i64> {
     let (clock, date) = s.split_once(" on ")?;
     let (hm, ampm) = clock.trim().rsplit_once(' ')?;
     let (h, m) = hm.split_once(':')?;

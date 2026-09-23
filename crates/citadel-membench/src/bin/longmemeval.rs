@@ -183,7 +183,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             writeln!(predictions, "{prediction}")?;
             predictions.flush()?;
             if let Some(file) = audit.as_mut() {
-                let record = serde_json::json!({
+                let mut record = serde_json::json!({
                     "question_id": qid,
                     "question": samples[index].question,
                     "hypothesis": outcome.answer,
@@ -198,9 +198,14 @@ fn main() -> Result<(), Box<dyn Error>> {
                     "top_k": launch.bench.top_k,
                     "neighbor_radius": launch.bench.neighbor_radius,
                     "agentic": launch.bench.agentic,
+                    "temporal_glosses": launch.bench.temporal_glosses,
                     "rerank_strategy": format!("{:?}", launch.rerank_strategy),
                     "reranker_model": reranker_model,
                 });
+                if launch.bench.temporal_glosses {
+                    record["temporal_gloss_policy"] =
+                        serde_json::json!(citadel_membench::core::temporal::POLICY);
+                }
                 writeln!(file, "{record}")?;
                 file.flush()?;
             }

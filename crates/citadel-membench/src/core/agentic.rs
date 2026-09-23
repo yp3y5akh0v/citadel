@@ -7,8 +7,10 @@
 use citadel_llm::Message;
 use citadel_mem::AtomHit;
 use serde::Deserialize;
+use std::borrow::Cow;
 
-use crate::core::benchmark::ReaderPrompt;
+use crate::core::benchmark::{Benchmark, ReaderPrompt};
+use crate::core::error::Result;
 
 /// Question shapes that need multi-item aggregation: counting, ordering,
 /// totaling. Conservative on purpose; a false negative just keeps the standard
@@ -43,21 +45,40 @@ pub struct ExtractedItem {
 /// retrieved memories as a JSON array. Memories render date-sorted and flat
 /// (extraction wants a scannable list, not conversation flow).
 pub fn extraction_messages(hits: &[AtomHit], question: &str, current_date: &str) -> Vec<Message> {
-    extraction_prompt(hits, question, current_date).messages
+    extraction_from_sources(
+        hits.iter()
+            .map(|hit| (hit, Cow::Borrowed(hit.text.as_str())))
+            .collect(),
+        question,
+        current_date,
+    )
+    .messages
 }
 
 pub(crate) fn extraction_prompt(
+    bench: &dyn Benchmark,
     hits: &[AtomHit],
     question: &str,
     current_date: &str,
+) -> Result<ReaderPrompt> {
+    let sources = hits
+        .iter()
+        .map(|hit| Ok((hit, bench.reader_source_text(hit)?)))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(extraction_from_sources(sources, question, current_date))
+}
+
+fn extraction_from_sources(
+    mut sorted: Vec<(&AtomHit, Cow<'_, str>)>,
+    question: &str,
+    current_date: &str,
 ) -> ReaderPrompt {
-    let mut sorted: Vec<&AtomHit> = hits.iter().collect();
-    sorted.sort_by_key(|h| h.created_at);
+    sorted.sort_by_key(|(hit, _)| hit.created_at);
     let mut memories = String::new();
     let mut atom_ids = Vec::with_capacity(sorted.len());
-    for h in sorted {
+    for (h, source) in sorted {
         atom_ids.push(h.id);
-        memories.push_str(&format!("- {}\n", h.text));
+        memories.push_str(&format!("- {source}\n"));
     }
     let prompt = format!(
         "I will give you memories from past chats between you and a user, plus a \

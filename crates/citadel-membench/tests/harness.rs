@@ -855,6 +855,69 @@ fn run_sample_preserves_reader_and_judge_completion_audit() {
 }
 
 #[test]
+fn temporal_glosses_reach_native_reader_without_mutating_retrieval_or_storage() {
+    for agentic in [false, true] {
+        let mut sample = parse_root(&fixture()).unwrap().remove(0);
+        sample.qa.truncate(1);
+        sample.qa[0].question = "How many dogs did Alice adopt?".into();
+        sample.turns[0].text = "Yesterday I adopted a dog named Rex.".into();
+        let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::new(DIM));
+        let mut seen_ids = None;
+        for enabled in [false, true] {
+            let (_dir, eng) = open_engine();
+            let replies = if agentic {
+                vec!["NOT_ENUMERATION", "One"]
+            } else {
+                vec!["One"]
+            };
+            let reader =
+                testing::capturing(replies.into_iter().map(CompletionResponse::text).collect());
+            let judge = testing::reply_once("CORRECT");
+            let config = BenchConfig {
+                agentic,
+                temporal_glosses: enabled,
+                ..BenchConfig::default()
+            };
+            let result = run_sample(
+                &eng,
+                &sample,
+                Arc::clone(&embedder),
+                &*reader.client(),
+                &*judge,
+                config,
+            )
+            .unwrap();
+            let ids = result[0]
+                .reader_calls
+                .last()
+                .unwrap()
+                .rendered_atom_ids
+                .clone();
+            if let Some(ref raw_ids) = seen_ids {
+                assert_eq!(&ids, raw_ids);
+            }
+            seen_ids = Some(ids);
+            for request in reader.requests() {
+                let text = render(&request.messages);
+                assert_eq!(
+                    text.contains("Yesterday (31 December 2023) I adopted"),
+                    enabled
+                );
+                assert_eq!(text.contains("Yesterday I adopted"), !enabled);
+            }
+            for &id in &result[0].reader_calls[0].rendered_atom_ids {
+                assert!(!eng
+                    .fetch_one(&sample.sample_id, id)
+                    .unwrap()
+                    .unwrap()
+                    .text
+                    .contains("(31 December 2023)"));
+            }
+        }
+    }
+}
+
+#[test]
 fn agentic_audit_preserves_both_completions_including_fallback() {
     for (extraction, extraction_finish, answer_finish) in [
         (

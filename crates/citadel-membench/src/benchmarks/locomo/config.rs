@@ -134,6 +134,7 @@ impl RunConfig {
                 top_k,
                 reader_order,
                 neighbor_radius: number(&get, "CITADEL_LOCOMO_NEIGHBOR_RADIUS", 0, 0)?,
+                temporal_glosses: boolean(&get, "CITADEL_LOCOMO_TEMPORAL_GLOSSES", false)?,
                 agentic: boolean(&get, "CITADEL_LOCOMO_AGENTIC", false)?,
                 reader_max_tokens,
             },
@@ -152,6 +153,11 @@ impl RunConfig {
         if mode != RunMode::Scored && config.bench.agentic {
             return Err(BenchError::Dataset(
                 "CITADEL_LOCOMO_AGENTIC requires scored mode".into(),
+            ));
+        }
+        if mode != RunMode::Scored && config.bench.temporal_glosses {
+            return Err(BenchError::Dataset(
+                "CITADEL_LOCOMO_TEMPORAL_GLOSSES requires scored mode".into(),
             ));
         }
         if matches!(mode, RunMode::RetrievalDiag | RunMode::ParamSweep)
@@ -181,6 +187,7 @@ mod tests {
         let c = config(&[]).unwrap();
         assert_eq!(c.mode, RunMode::Scored);
         assert_eq!(c.embedder, EmbedderModel::E5Large);
+        assert!(!c.bench.temporal_glosses);
     }
 
     #[test]
@@ -192,6 +199,7 @@ mod tests {
             ("CITADEL_LOCOMO_READER_CONCURRENCY", "0"),
             ("CITADEL_LOCOMO_READER_TPM", "no"),
             ("CITADEL_LOCOMO_ENCRYPTED", "maybe"),
+            ("CITADEL_LOCOMO_TEMPORAL_GLOSSES", "maybe"),
             ("CITADEL_LOCOMO_RERANK_STRATEGY", "unknown"),
             ("CITADEL_LOCOMO_EMBEDDER", "unknown"),
             ("CITADEL_LOCOMO_READER_ORDER", "unknown"),
@@ -200,6 +208,38 @@ mod tests {
             ("CITADEL_LOCOMO_MOCK_EMBED", "1"),
         ] {
             assert!(config(&[(key, value)]).is_err(), "accepted {key}={value}");
+        }
+    }
+
+    #[test]
+    fn temporal_glosses_require_scored_mode() {
+        assert!(
+            config(&[("CITADEL_LOCOMO_TEMPORAL_GLOSSES", "true")])
+                .unwrap()
+                .bench
+                .temporal_glosses
+        );
+        for mode in [
+            "retrieval-diag",
+            "param-sweep",
+            "dump",
+            "erasure",
+            "dry-run",
+        ] {
+            assert!(config(&[
+                ("CITADEL_LOCOMO_MODE", mode),
+                ("CITADEL_LOCOMO_TEMPORAL_GLOSSES", "true"),
+            ])
+            .is_err());
+            assert!(
+                !config(&[
+                    ("CITADEL_LOCOMO_MODE", mode),
+                    ("CITADEL_LOCOMO_TEMPORAL_GLOSSES", "false"),
+                ])
+                .unwrap()
+                .bench
+                .temporal_glosses
+            );
         }
     }
 

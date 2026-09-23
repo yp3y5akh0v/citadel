@@ -69,6 +69,9 @@ pub struct BenchConfig {
     pub reader_order: ReaderOrder,
     /// Adjacent turns rendered around each hit (0 disables expansion).
     pub neighbor_radius: usize,
+    /// Add deterministic relative-date annotations when rendering reader evidence.
+    /// Stored content and retrieval are unchanged.
+    pub temporal_glosses: bool,
     /// Reader output-token cap; raise for a chain-of-thought reader (env
     /// override: `CITADEL_MEMBENCH_MAX_TOKENS`).
     pub reader_max_tokens: u32,
@@ -85,6 +88,7 @@ impl Default for BenchConfig {
             top_k: 50,
             reader_order: ReaderOrder::Relevance,
             neighbor_radius: 0,
+            temporal_glosses: false,
             reader_max_tokens: 512,
             agentic: false,
         }
@@ -170,6 +174,11 @@ pub struct Provenance {
     pub neighbor_radius: usize,
     /// Whether the optional multi-call aggregation reader was enabled.
     pub agentic: bool,
+    /// Whether deterministic relative-date annotations were rendered.
+    pub temporal_glosses: bool,
+    /// Identifies the annotation rules for a run that enabled temporal glosses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temporal_gloss_policy: Option<&'static str>,
     pub temperature: f32,
     /// Sampling seed sent with every reader/judge request (best-effort on the
     /// provider side); pinned so paired runs are comparable.
@@ -443,7 +452,8 @@ fn process_one_question(
         });
     }
 
-    let bench = Locomo::new(config.reader_order == ReaderOrder::Sessions);
+    let bench = Locomo::new(config.reader_order == ReaderOrder::Sessions)
+        .with_temporal_glosses(config.temporal_glosses);
     let outcome = {
         let _permit = reader_gate.acquire();
         let q = Question {
@@ -607,6 +617,8 @@ pub fn provenance(
         reader_order: config.reader_order.label().to_string(),
         neighbor_radius: config.neighbor_radius,
         agentic: config.agentic,
+        temporal_glosses: config.temporal_glosses,
+        temporal_gloss_policy: config.temporal_glosses.then_some(core::temporal::POLICY),
         temperature: 0.0,
         sampling_seed: core::eval::SAMPLING_SEED,
         fusion_semantic: w.semantic,
@@ -689,6 +701,33 @@ mod cost_tests {
     #[test]
     fn token_cost_scales_input_and_output_independently() {
         assert!((token_cost("gpt-4o-mini", 2_000_000, 500_000).unwrap() - 0.60).abs() < 1e-9);
+    }
+}
+
+#[cfg(test)]
+mod provenance_tests {
+    use super::*;
+
+    #[test]
+    fn temporal_policy_is_recorded_only_when_enabled() {
+        assert!(!BenchConfig::default().temporal_glosses);
+        for enabled in [false, true] {
+            let config = BenchConfig {
+                temporal_glosses: enabled,
+                ..BenchConfig::default()
+            };
+            let report = serde_json::to_value(provenance(
+                "reader", "judge", "embedder", config, "fixture", "hash",
+            ))
+            .unwrap();
+            assert_eq!(report["temporal_glosses"], enabled);
+            assert_eq!(
+                report.get("temporal_gloss_policy"),
+                enabled
+                    .then(|| serde_json::Value::String(core::temporal::POLICY.into()))
+                    .as_ref(),
+            );
+        }
     }
 }
 

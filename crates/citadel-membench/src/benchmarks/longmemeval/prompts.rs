@@ -3,10 +3,50 @@
 use citadel_llm::Message;
 use citadel_mem::{AtomHit, AtomId};
 use rustc_hash::FxHashMap;
+use std::borrow::Cow;
 
 use super::dataset::parse_lmeval_datetime;
 use crate::core::benchmark::ReaderPrompt;
 use crate::core::error::{BenchError, Result};
+use crate::core::temporal;
+
+/// Use the supplied session date, never an atom's ingestion timestamp.
+pub(crate) fn source_text(hit: &AtomHit, enabled: bool) -> Result<Cow<'_, str>> {
+    if !enabled {
+        return Ok(Cow::Borrowed(&hit.text));
+    }
+    let (date, body) = split_turn(&hit.text);
+    if date.is_empty() {
+        return Ok(Cow::Borrowed(&hit.text));
+    }
+    let anchor = parse_lmeval_datetime(date).ok_or_else(|| {
+        BenchError::Dataset(format!(
+            "LongMemEval atom {} has an invalid session date",
+            hit.id
+        ))
+    })?;
+    let role = hit
+        .payload
+        .get("role")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            BenchError::Dataset(format!(
+                "LongMemEval atom {} lacks string role metadata",
+                hit.id
+            ))
+        })?;
+    let prefix = format!("{role}: ");
+    let content = body.strip_prefix(&prefix).ok_or_else(|| {
+        BenchError::Dataset(format!(
+            "LongMemEval atom {} text conflicts with its role metadata; rebuild its cached corpus",
+            hit.id
+        ))
+    })?;
+    match temporal::annotate(content, anchor) {
+        Cow::Borrowed(_) => Ok(Cow::Borrowed(&hit.text)),
+        Cow::Owned(content) => Ok(Cow::Owned(format!("[{date}] {prefix}{content}"))),
+    }
+}
 
 /// Evaluation protocol and limitations included in each report.
 pub(crate) const KNOWN_FLAWS: &str = "The runner emits question_id and hypothesis \
@@ -51,6 +91,15 @@ pub fn render_reader_prompt(
     question: &str,
     current_date: &str,
 ) -> Result<ReaderPrompt> {
+    render_reader_prompt_with_glosses(hits, question, current_date, false)
+}
+
+pub(crate) fn render_reader_prompt_with_glosses(
+    hits: &[AtomHit],
+    question: &str,
+    current_date: &str,
+    temporal_glosses: bool,
+) -> Result<ReaderPrompt> {
     let mut by_occurrence: FxHashMap<u64, usize> = FxHashMap::default();
     let mut sessions: Vec<SessionBlock> = Vec::new();
     for hit in hits {
@@ -64,7 +113,8 @@ pub fn render_reader_prompt(
                     hit.id
                 ))
             })?;
-        let (date, body) = split_turn(&hit.text);
+        let source = source_text(hit, temporal_glosses)?;
+        let (date, body) = split_turn(&source);
         let event_micros = parse_lmeval_datetime(date);
         if !date.is_empty() && event_micros.is_none() {
             return Err(BenchError::Dataset(format!(
@@ -123,6 +173,58 @@ pub fn render_reader_prompt(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn temporal_rendering_uses_source_date_and_preserves_question_and_session_identity() {
+        use crate::benchmarks::longmemeval::LongMemEval;
+        use crate::core::{agentic, benchmark::Benchmark};
+        let hits = [hit(
+            7,
+            "[2024/03/01 (Fri) 09:00] user: Yesterday I visited.",
+            "s",
+            0,
+            0,
+        )];
+        let original = hits[0].text.clone();
+        let bench = LongMemEval::new(true);
+        let rendered = bench
+            .reader_prompt(&hits, "What happened yesterday?", "2025/01/01")
+            .unwrap();
+        let Message::User(text) = &rendered.messages[0] else {
+            panic!("user prompt");
+        };
+        assert!(text.contains("user: Yesterday (29 February 2024) I visited."));
+        assert!(text.contains("Question: What happened yesterday?"));
+        assert!(text.contains("Current Date: 2025/01/01"));
+        assert_eq!(rendered.atom_ids, [7]);
+        let extraction =
+            agentic::extraction_prompt(&bench, &hits, "How many visits?", "2025/01/01").unwrap();
+        let Message::User(text) = &extraction.messages[0] else {
+            panic!("user prompt");
+        };
+        assert!(
+            text.contains("[2024/03/01 (Fri) 09:00] user: Yesterday (29 February 2024) I visited.")
+        );
+        assert_eq!(hits[0].text, original);
+        let undated = hit(
+            1,
+            "user: Yesterday I visited.",
+            "s",
+            0,
+            1_709_294_400_000_000,
+        );
+        assert_eq!(source_text(&undated, true).unwrap(), undated.text);
+        let invalid = hit(1, "[invalid] user: Yesterday", "s", 0, 0);
+        assert!(source_text(&invalid, true).is_err());
+        let invalid_role = hit(
+            1,
+            "[2024/03/01 (Fri) 09:00] assistant: Yesterday",
+            "s",
+            0,
+            0,
+        );
+        assert!(source_text(&invalid_role, true).is_err());
+    }
 
     fn hit(id: i64, text: &str, sid: &str, occurrence: u64, created_at: i64) -> AtomHit {
         AtomHit {

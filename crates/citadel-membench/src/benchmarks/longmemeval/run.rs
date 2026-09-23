@@ -102,7 +102,7 @@ pub fn run(
     // Phase 2: answer each question concurrently; results returned in sample
     // order.
     let t_answer = Instant::now();
-    let bench = LongMemEval;
+    let bench = LongMemEval::new(cfg.bench.temporal_glosses);
     let total = samples.len();
     let workers = cfg.reader_concurrency.max(1);
     let gate = Gate::new(workers);
