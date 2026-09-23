@@ -4585,7 +4585,7 @@ fn detect_pk_point_sources(
     table_schema: &TableSchema,
 ) -> Option<Vec<PointSource>> {
     let pk_cols = &table_schema.primary_key_columns;
-    if pk_cols.is_empty() {
+    if pk_cols.is_empty() || !crate::planner::primary_key_has_binary_collation(table_schema) {
         return None;
     }
     let mut sources: Vec<Option<PointSource>> = (0..pk_cols.len()).map(|_| None).collect();
@@ -4889,7 +4889,7 @@ fn detect_outer_point_sources(
     unqualified_is_ambiguous: &dyn Fn(&str) -> bool,
 ) -> Option<Vec<PointSource>> {
     let pk_cols = &outer_schema.primary_key_columns;
-    if pk_cols.is_empty() {
+    if pk_cols.is_empty() || !crate::planner::primary_key_has_binary_collation(outer_schema) {
         return None;
     }
     let pk_pos = |e: &Expr| -> Option<usize> {

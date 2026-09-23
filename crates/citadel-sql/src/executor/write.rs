@@ -229,7 +229,7 @@ fn detect_pk_lookup_fast(
     table_schema: &TableSchema,
 ) -> Option<PkLookupFast> {
     let pk = &table_schema.primary_key_columns;
-    if pk.len() != 1 {
+    if pk.len() != 1 || !crate::planner::primary_key_has_binary_collation(table_schema) {
         return None;
     }
     let pk_idx = pk[0] as usize;
@@ -856,7 +856,7 @@ fn detect_pk_range_fast(
     table_schema: &TableSchema,
 ) -> Option<Vec<(BinOp, PkLookupSource)>> {
     let pk = &table_schema.primary_key_columns;
-    if pk.len() != 1 {
+    if pk.len() != 1 || !crate::planner::primary_key_has_binary_collation(table_schema) {
         return None;
     }
     let pk_name = table_schema.columns[pk[0] as usize]
