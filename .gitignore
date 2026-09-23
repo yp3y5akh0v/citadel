@@ -1,4 +1,5 @@
 /target
+/tmp/
 **/*.rs.bk
 *.swp
 *.swo
@@ -9,6 +10,7 @@ site/data/release.json
 site/static/wasm/*.wasm
 site/static/wasm/*.js
 /notes/
+/.venv/
 __pycache__/
 *.py[cod]
 # maturin build output; the .pyd is caught by the line above only by accident.
