@@ -14,7 +14,7 @@ use citadel_membench::benchmarks::longmemeval::retrieval::{
 };
 use citadel_membench::benchmarks::longmemeval::{dataset, ingest, run, LmevalConfig};
 use citadel_membench::core::retrieval::baseline_recall;
-use citadel_membench::{default_tpm_for_model, Pacer};
+use citadel_membench::{default_tpm_for_model, Pacer, QuestionEvent, UsageAccounting};
 
 const DEFAULT_READER_MODEL: &str = "gpt-4o";
 
@@ -168,6 +168,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         .ok()
         .map(std::fs::File::create_new)
         .transpose()?;
+    let receipt_path = format!("{out_path}.events.jsonl");
+    let mut receipts = std::fs::File::create_new(&receipt_path)?;
+    eprintln!("question receipts: {receipt_path}");
     let total = samples.len();
     let mut done = 0usize;
     let pairs = run(
@@ -177,7 +180,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         reader.as_ref(),
         &pacer,
         &cfg,
-        &mut |index, qid, outcome| {
+        &mut |event| {
+            let completed = match event {
+                QuestionEvent::Completed(completed) => completed,
+                QuestionEvent::Failed(failure) => return failure.write_json_line(&mut receipts),
+            };
+            let (index, qid, outcome) =
+                (completed.index, &completed.question_id, &completed.outcome);
             let prediction =
                 serde_json::json!({ "question_id": qid, "hypothesis": outcome.answer });
             writeln!(predictions, "{prediction}")?;
@@ -191,6 +200,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     "retrieved_atom_ids": outcome.retrieved_atom_ids,
                     "reader_finish_reasons": outcome.reader_finish_reasons,
                     "reader_calls": outcome.reader_calls,
+                    "accounting": UsageAccounting::from_calls(&outcome.reader_calls),
                     "recall_micros": outcome.recall_micros,
                     "dataset_sha256": dataset_sha256,
                     "embedder_model": embedder.model_id(),
@@ -209,6 +219,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 writeln!(file, "{record}")?;
                 file.flush()?;
             }
+            completed
+                .completion_receipt()
+                .write_json_line(&mut receipts)?;
             done += 1;
             if done.is_multiple_of(10) || done == total {
                 eprintln!("  answered {done}/{total} ({qid})");

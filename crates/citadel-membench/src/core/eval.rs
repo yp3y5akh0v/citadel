@@ -99,6 +99,7 @@ fn paced_complete(
     pacer: &Pacer,
     client: &dyn LLMClient,
     req: &CompletionRequest,
+    attempts: &mut Vec<CompletionAttempt>,
 ) -> Result<CompletionResponse> {
     let cfg = RetryConfig::get();
     let model = client.model_id();
@@ -113,7 +114,24 @@ fn paced_complete(
     let mut attempt: u32 = 0;
     loop {
         pacer.acquire(model, cost); // pace submission BEFORE firing
-        match client.complete(req) {
+        let result = client.complete(req);
+        attempts.push(CompletionAttempt {
+            ordinal: attempt + 1,
+            outcome: match &result {
+                Ok(response) => AttemptOutcome::Response {
+                    finish_reason: response.finish_reason.into(),
+                    usage: response.usage,
+                    message: response.message.clone(),
+                },
+                Err(error) if error.is_pre_dispatch() => AttemptOutcome::NotDispatched {
+                    error: error.to_string(),
+                },
+                Err(error) => AttemptOutcome::FailedUsageUnknown {
+                    error: error.to_string(),
+                },
+            },
+        });
+        match result {
             Ok(resp) => return Ok(resp),
             Err(e) if e.is_retryable() => {
                 pacer.penalize(model); // whole pool backs off in unison
@@ -332,8 +350,51 @@ pub struct AnswerOutcome {
 }
 
 /// Configured client identity and measured usage for one completion call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReaderRoute {
+    Direct,
+    NotEnumeration,
+    EmptyEnumeration,
+    Enumeration,
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[serde(tag = "stage", content = "route", rename_all = "snake_case")]
+pub enum CompletionPurpose {
+    Extraction,
+    Reader(ReaderRoute),
+    Judge,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum AttemptOutcome {
+    Response {
+        finish_reason: CompletionFinish,
+        #[serde(serialize_with = "serialize_usage")]
+        usage: TokenUsage,
+        /// Returned logical completion, not the raw provider HTTP response.
+        #[serde(serialize_with = "serialize_assistant_message")]
+        message: citadel_llm::AssistantMessage,
+    },
+    /// The client guarantees that no provider dispatch or spend occurred.
+    NotDispatched { error: String },
+    /// Transport, malformed response, and other errors do not prove zero spend.
+    FailedUsageUnknown { error: String },
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CompletionAttempt {
+    pub ordinal: u32,
+    #[serde(flatten)]
+    pub outcome: AttemptOutcome,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CompletionCallAudit {
+    #[serde(flatten)]
+    pub purpose: CompletionPurpose,
     pub request_sha256: String,
     /// Configured client model; the client interface does not expose returned snapshots.
     pub model_id: String,
@@ -341,9 +402,35 @@ pub struct CompletionCallAudit {
     pub input_tokens_estimate: usize,
     pub max_output_tokens: Option<u32>,
     pub rendered_atom_ids: Vec<AtomId>,
-    /// Observed usage when a response was returned; absent after an error.
+    /// Client-reported usage on a returned response; absent after an error.
+    /// LLMClient does not expose whether upstream usage fields were present.
     #[serde(serialize_with = "serialize_optional_usage")]
     pub usage: Option<TokenUsage>,
+    pub attempts: Vec<CompletionAttempt>,
+}
+
+impl CompletionCallAudit {
+    pub fn unknown_usage_attempts(&self) -> u64 {
+        self.attempts
+            .iter()
+            .filter(|attempt| matches!(attempt.outcome, AttemptOutcome::FailedUsageUnknown { .. }))
+            .count() as u64
+    }
+
+    /// Estimate from client-reported usage when no failed attempt has unknown spend.
+    pub fn estimated_cost_usd(&self) -> Option<f64> {
+        if self.unknown_usage_attempts() != 0 {
+            return None;
+        }
+        match self.usage {
+            Some(usage) => {
+                crate::token_cost(&self.model_id, usage.input_tokens, usage.output_tokens)
+                    .or(usage.cost_usd)
+                    .filter(|cost| cost.is_finite() && *cost >= 0.0)
+            }
+            None => Some(0.0), // No returned response and no unknown-dispatch attempt.
+        }
+    }
 }
 
 fn complete_with_audit(
@@ -351,6 +438,7 @@ fn complete_with_audit(
     reader: &dyn LLMClient,
     request: &CompletionRequest,
     rendered_atom_ids: Vec<AtomId>,
+    purpose: CompletionPurpose,
 ) -> Result<(CompletionResponse, CompletionCallAudit)> {
     let model_id = reader.model_id().to_owned();
     let client = reader.request_identity();
@@ -362,6 +450,7 @@ fn complete_with_audit(
         "seed": request.seed,
     }))?;
     let mut audit = CompletionCallAudit {
+        purpose,
         request_sha256: crate::sha256_hex(&encoded),
         model_id,
         client,
@@ -369,13 +458,15 @@ fn complete_with_audit(
         max_output_tokens: request.max_tokens,
         rendered_atom_ids,
         usage: None,
+        attempts: Vec::new(),
     };
-    let response = paced_complete(pacer, reader, request).map_err(|source| {
-        BenchError::Completion(Box::new(CompletionFailure {
-            call: audit.clone(),
-            source: Box::new(source),
-        }))
-    })?;
+    let response =
+        paced_complete(pacer, reader, request, &mut audit.attempts).map_err(|source| {
+            BenchError::Completion(Box::new(CompletionFailure {
+                call: audit.clone(),
+                source: Box::new(source),
+            }))
+        })?;
     audit.usage = Some(response.usage);
     Ok((response, audit))
 }
@@ -438,13 +529,21 @@ fn read_assembled(
     req.temperature = Some(0.0);
     req.seed = Some(SAMPLING_SEED);
     req.max_tokens = Some(max_output_tokens(reader_max_tokens)?);
-    let (resp, audit) = complete_with_audit(pacer, reader, &req, rendered.atom_ids)?;
+    let (resp, audit) = complete_with_audit(
+        pacer,
+        reader,
+        &req,
+        rendered.atom_ids,
+        CompletionPurpose::Reader(ReaderRoute::Direct),
+    )?;
+    let mut usage = resp.usage;
+    usage.cost_usd = audit.estimated_cost_usd();
     Ok(AnswerOutcome {
         answer: resp.message.content,
         reader_finish_reasons: vec![resp.finish_reason.into()],
         reader_calls: vec![audit],
         recall_micros,
-        usage: resp.usage,
+        usage,
         retrieved,
         retrieved_atom_ids,
     })
@@ -489,10 +588,7 @@ pub fn answer_question(
 fn add_usage(a: &mut TokenUsage, b: &TokenUsage) {
     a.input_tokens = a.input_tokens.saturating_add(b.input_tokens);
     a.output_tokens = a.output_tokens.saturating_add(b.output_tokens);
-    a.cost_usd = match (a.cost_usd, b.cost_usd) {
-        (Some(x), Some(y)) => Some(x + y),
-        _ => None,
-    };
+    a.cost_usd = crate::core::error::sum_costs(a.cost_usd, b.cost_usd);
 }
 
 /// Two-pass agentic read: extract -> dedup/sort/count in code -> answer from
@@ -519,9 +615,14 @@ fn answer_aggregation(
     extract.temperature = Some(0.0);
     extract.seed = Some(SAMPLING_SEED);
     extract.max_tokens = Some(output_cap);
-    let (extracted, extract_audit) =
-        complete_with_audit(pacer, reader, &extract, extraction.atom_ids)
-            .map_err(|source| reader_failure(ReaderStage::Extraction, Vec::new(), source))?;
+    let (extracted, extract_audit) = complete_with_audit(
+        pacer,
+        reader,
+        &extract,
+        extraction.atom_ids,
+        CompletionPurpose::Extraction,
+    )
+    .map_err(|source| reader_failure(ReaderStage::Extraction, Vec::new(), source))?;
     let receipt = CompletedReaderCall {
         call: extract_audit.clone(),
         finish_reason: extracted.finish_reason.into(),
@@ -547,6 +648,13 @@ fn answer_aggregation(
             },
         )
     })?;
+    let route = match &decision {
+        agentic::ExtractionDecision::NotEnumeration => ReaderRoute::NotEnumeration,
+        agentic::ExtractionDecision::Items(items) if items.is_empty() => {
+            ReaderRoute::EmptyEnumeration
+        }
+        agentic::ExtractionDecision::Items(_) => ReaderRoute::Enumeration,
+    };
     if let agentic::ExtractionDecision::Items(items) = decision {
         let anchor =
             agentic::anchor_message(&agentic::dedup_and_sort(items)).map_err(|source| {
@@ -565,10 +673,20 @@ fn answer_aggregation(
     answer.temperature = Some(0.0);
     answer.seed = Some(SAMPLING_SEED);
     answer.max_tokens = Some(output_cap);
-    let (resp, answer_audit) = complete_with_audit(pacer, reader, &answer, rendered.atom_ids)
-        .map_err(|source| reader_failure(ReaderStage::FinalAnswer, vec![receipt], source))?;
+    let (resp, answer_audit) = complete_with_audit(
+        pacer,
+        reader,
+        &answer,
+        rendered.atom_ids,
+        CompletionPurpose::Reader(route),
+    )
+    .map_err(|source| reader_failure(ReaderStage::FinalAnswer, vec![receipt], source))?;
     let mut usage = extracted.usage;
     add_usage(&mut usage, &resp.usage);
+    usage.cost_usd = crate::core::error::sum_costs(
+        extract_audit.estimated_cost_usd(),
+        answer_audit.estimated_cost_usd(),
+    );
     Ok(AnswerOutcome {
         answer: resp.message.content,
         reader_finish_reasons: vec![extracted.finish_reason.into(), resp.finish_reason.into()],
@@ -632,11 +750,15 @@ impl JudgeOutcome {
         response: CompletionResponse,
         call: CompletionCallAudit,
     ) -> Self {
+        let mut usage = response.usage;
+        if call.unknown_usage_attempts() != 0 {
+            usage.cost_usd = None;
+        }
         Self {
             correct,
             response: response.message.content,
             finish_reason: response.finish_reason.into(),
-            usage: response.usage,
+            usage,
             call,
         }
     }
@@ -653,6 +775,20 @@ fn serialize_usage<S: serde::Serializer>(
     fields.serialize_field("output_tokens", &usage.output_tokens)?;
     fields.serialize_field("cost_usd", &usage.cost_usd)?;
     fields.end()
+}
+
+fn serialize_assistant_message<S: serde::Serializer>(
+    message: &citadel_llm::AssistantMessage,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    use serde::Serialize;
+    serde_json::json!({
+        "content": message.content,
+        "tool_calls": message.tool_calls.iter().map(|call| serde_json::json!({
+            "id": call.id, "name": call.name, "arguments": call.arguments,
+        })).collect::<Vec<_>>(),
+    })
+    .serialize(serializer)
 }
 
 fn serialize_optional_usage<S: serde::Serializer>(
@@ -678,12 +814,13 @@ pub(crate) fn complete_judge(
     req.temperature = Some(0.0);
     req.seed = Some(SAMPLING_SEED);
     req.max_tokens = Some(max_output_tokens(DEFAULT_MAX_TOKENS)?);
-    let (response, audit) = complete_with_audit(pacer, judge, &req, Vec::new())?;
+    let (response, audit) =
+        complete_with_audit(pacer, judge, &req, Vec::new(), CompletionPurpose::Judge)?;
     if response.finish_reason != FinishReason::Stop {
-        return Err(invalid_judge_response(
-            &response,
-            "completion did not finish normally",
-        ));
+        return Err(
+            invalid_judge_response(&response, "completion did not finish normally")
+                .with_completion_call(audit),
+        );
     }
     Ok((response, audit))
 }
@@ -755,6 +892,7 @@ fn invalid_judge_response(response: &CompletionResponse, reason: &'static str) -
         response: response.message.content.clone(),
         finish_reason: response.finish_reason,
         usage: response.usage,
+        call: None,
     }
 }
 
@@ -940,9 +1078,15 @@ mod tests {
         request.max_tokens = Some(17);
         request.seed = Some(1);
         let audit = |request: &CompletionRequest| {
-            complete_with_audit(&Pacer::unbounded(), &*reader, request, vec![7, 9])
-                .unwrap()
-                .1
+            complete_with_audit(
+                &Pacer::unbounded(),
+                &*reader,
+                request,
+                vec![7, 9],
+                CompletionPurpose::Reader(ReaderRoute::Direct),
+            )
+            .unwrap()
+            .1
         };
         let baseline = audit(&request);
         assert_eq!(baseline.request_sha256, audit(&request).request_sha256);
@@ -981,10 +1125,16 @@ mod tests {
         let hash = |model: &str| {
             let client =
                 citadel_llm::factory::from_fn(model, |_| Ok(CompletionResponse::text("answer")));
-            complete_with_audit(&Pacer::unbounded(), &*client, &request, Vec::new())
-                .unwrap()
-                .1
-                .request_sha256
+            complete_with_audit(
+                &Pacer::unbounded(),
+                &*client,
+                &request,
+                Vec::new(),
+                CompletionPurpose::Reader(ReaderRoute::Direct),
+            )
+            .unwrap()
+            .1
+            .request_sha256
         };
         assert_eq!(hash("reader-a"), hash("reader-a"));
         assert_ne!(hash("reader-a"), hash("reader-b"));
@@ -1008,5 +1158,97 @@ mod tests {
         assert_eq!(usage.input_tokens, u32::MAX);
         assert_eq!(usage.output_tokens, 6);
         assert_eq!(usage.cost_usd, None);
+    }
+
+    #[test]
+    fn retries_preserve_each_attempt_and_do_not_price_unknown_spend() {
+        for succeeds in [true, false] {
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let observed = seen.clone();
+            let client = citadel_llm::factory::from_fn("gpt-4o-mini", move |request| {
+                let mut seen = observed.lock().unwrap();
+                seen.push(citadel_llm::canonical_json(request));
+                if seen.len() == 1 {
+                    return Err(LlmError::Http {
+                        status: 429,
+                        retry_after: None,
+                        message: "try again in 1ms".into(),
+                    });
+                }
+                if !succeeds {
+                    return Err(LlmError::Backend("invalid body".into()));
+                }
+                let mut response = CompletionResponse::text("answer");
+                response.usage = TokenUsage {
+                    input_tokens: 40,
+                    output_tokens: 9,
+                    cost_usd: Some(0.03),
+                };
+                Ok(response)
+            });
+            let request = CompletionRequest::new(vec![Message::user("same request")]);
+            let result = complete_with_audit(
+                &Pacer::unbounded(),
+                &*client,
+                &request,
+                vec![7],
+                CompletionPurpose::Judge,
+            );
+            let audit = match result {
+                Ok((_, audit)) => {
+                    assert!(succeeds);
+                    audit
+                }
+                Err(BenchError::Completion(failure)) => {
+                    assert!(!succeeds);
+                    failure.call
+                }
+                _ => panic!("unexpected retry outcome"),
+            };
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 2);
+            assert_eq!(seen[0], seen[1], "retries preserve the exact request");
+            assert_eq!(
+                audit.attempts.iter().map(|a| a.ordinal).collect::<Vec<_>>(),
+                [1, 2]
+            );
+            assert_eq!(audit.unknown_usage_attempts(), if succeeds { 1 } else { 2 });
+            assert_eq!(audit.estimated_cost_usd(), None);
+            assert_eq!(audit.usage.is_some(), succeeds);
+            let accounting = crate::core::error::UsageAccounting::from_calls([&audit]);
+            assert_eq!(
+                accounting.observed_input_tokens,
+                if succeeds { 40 } else { 0 }
+            );
+            assert_eq!(accounting.estimated_cost_usd, None);
+        }
+    }
+
+    #[test]
+    fn pre_dispatch_failure_has_a_request_receipt_but_no_unknown_spend() {
+        let client = citadel_llm::factory::from_fn("gpt-4o-mini", |_| {
+            Err(LlmError::UnsupportedRequest("schema unsupported".into()))
+        });
+        let request = CompletionRequest::new(vec![Message::user("question")]);
+        let error = complete_with_audit(
+            &Pacer::unbounded(),
+            &*client,
+            &request,
+            vec![],
+            CompletionPurpose::Reader(ReaderRoute::Direct),
+        )
+        .unwrap_err();
+        let BenchError::Completion(failure) = error else {
+            panic!("missing call receipt")
+        };
+        assert_eq!(failure.call.attempts.len(), 1);
+        assert!(matches!(
+            failure.call.attempts[0].outcome,
+            AttemptOutcome::NotDispatched { .. }
+        ));
+        assert_eq!(failure.call.unknown_usage_attempts(), 0);
+        assert_eq!(failure.call.estimated_cost_usd(), Some(0.0));
+        assert_eq!(failure.call.request_sha256.len(), 64);
+        assert!(failure.call.usage.is_none());
     }
 }

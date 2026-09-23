@@ -17,6 +17,44 @@ use serde_json::{json, Value};
 
 const DIM: usize = 64;
 
+static ENVIRONMENT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct EnvGuard {
+    previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl EnvGuard {
+    fn new(values: &[(&'static str, &str)]) -> Self {
+        let lock = ENVIRONMENT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = values
+            .iter()
+            .map(|(key, value)| {
+                let old = std::env::var_os(key);
+                std::env::set_var(key, value);
+                (*key, old)
+            })
+            .collect();
+        Self {
+            previous,
+            _lock: lock,
+        }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (key, value) in &self.previous {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
+
 /// A 3-session conversation with QA in every category (incl. adversarial), one
 /// non-string answer (scalar rendering), and sibling `_date_time`/`_summary`
 /// keys the loader must not treat as sessions.
@@ -772,6 +810,7 @@ fn invalid_judge_response_aborts_run_without_emitting_a_score() {
     let reader = testing::constant("golden retriever");
     let judge = testing::constant("INCORRECT");
     let mut observed = 0;
+    let mut failures = Vec::new();
     let result = run_sample_observed(
         &eng,
         &sample,
@@ -781,16 +820,24 @@ fn invalid_judge_response_aborts_run_without_emitting_a_score() {
         BenchConfig::default(),
         false,
         &Pacer::unbounded(),
-        &mut |_| {
-            observed += 1;
+        &mut |event| {
+            match event {
+                citadel_membench::QuestionEvent::Completed(_) => observed += 1,
+                citadel_membench::QuestionEvent::Failed(failure) => {
+                    failures.push(serde_json::to_value(failure).unwrap())
+                }
+            }
             Ok(())
         },
     );
     assert!(matches!(
-        result,
-        Err(BenchError::InvalidJudgeResponse { .. })
+        single_question_source(result.unwrap_err()),
+        BenchError::InvalidJudgeResponse { .. }
     ));
     assert_eq!(observed, 0);
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0]["calls"].as_array().unwrap().len(), 2);
+    assert_eq!(failures[0]["stage"], "judge");
 }
 
 #[test]
@@ -957,6 +1004,19 @@ fn agentic_audit_preserves_both_completions_for_explicit_routes() {
         );
         assert_eq!(results[0].predicted, "One dog.");
         assert_eq!(results[0].reader_calls.len(), 2);
+        let audit = serde_json::to_value(&results[0].reader_calls).unwrap();
+        assert_eq!(audit[0]["stage"], "extraction");
+        assert_eq!(audit[1]["stage"], "reader");
+        assert_eq!(
+            audit[1]["route"],
+            if extraction == "[]" {
+                "empty_enumeration"
+            } else if extraction == "NOT_ENUMERATION" {
+                "not_enumeration"
+            } else {
+                "enumeration"
+            }
+        );
         assert_ne!(
             results[0].reader_calls[0].request_sha256,
             results[0].reader_calls[1].request_sha256
@@ -1039,7 +1099,7 @@ fn agentic_invalid_extraction_stops_without_judge_and_retains_receipt() {
                 ..BenchConfig::default()
             },
         );
-        let Err(BenchError::Reader(failure)) = result else {
+        let BenchError::Reader(failure) = single_question_source(result.unwrap_err()) else {
             panic!("expected typed reader failure")
         };
         assert_eq!(reader.requests().len(), 1);
@@ -1082,7 +1142,7 @@ fn agentic_second_call_failure_preserves_extraction_and_unknown_failed_usage() {
                 ..BenchConfig::default()
             },
         );
-        let Err(BenchError::Reader(failure)) = result else {
+        let BenchError::Reader(failure) = single_question_source(result.unwrap_err()) else {
             panic!("expected typed reader failure")
         };
         assert!(matches!(
@@ -1162,7 +1222,7 @@ fn agentic_stop_with_tool_payload_and_normalized_total_failure_keep_extraction_r
                 ..BenchConfig::default()
             },
         );
-        let Err(BenchError::Reader(failure)) = result else {
+        let BenchError::Reader(failure) = single_question_source(result.unwrap_err()) else {
             panic!("expected typed reader failure")
         };
         assert_eq!(failure.completed_calls.len(), 1);
@@ -1170,6 +1230,11 @@ fn agentic_stop_with_tool_payload_and_normalized_total_failure_keep_extraction_r
         assert_eq!(reader.requests().len(), 1);
         assert!(judge.requests().is_empty());
         if has_tools {
+            let receipt = serde_json::to_value(&failure.completed_calls[0]).unwrap();
+            assert_eq!(
+                receipt["call"]["attempts"][0]["message"]["tool_calls"][0]["id"],
+                "unexpected"
+            );
             assert!(matches!(
                 *failure.source,
                 BenchError::InvalidExtractionCompletion { .. }
@@ -1403,7 +1468,7 @@ fn observer_fires_once_per_question_and_error_aborts() {
     let judge = testing::constant("CORRECT");
 
     // Happy path under concurrency: one callback per question, run completes.
-    std::env::set_var("CITADEL_LOCOMO_CONCURRENCY", "8");
+    let concurrency = EnvGuard::new(&[("CITADEL_LOCOMO_CONCURRENCY", "8")]);
     let (_dir, eng) = open_engine();
     let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::new(DIM));
     let seen = std::sync::atomic::AtomicUsize::new(0);
@@ -1422,7 +1487,7 @@ fn observer_fires_once_per_question_and_error_aborts() {
         },
     )
     .unwrap();
-    std::env::remove_var("CITADEL_LOCOMO_CONCURRENCY");
+    drop(concurrency);
     assert_eq!(out.len(), s.qa.len(), "a result per question");
     assert_eq!(
         seen.load(std::sync::atomic::Ordering::Relaxed),
@@ -1453,10 +1518,12 @@ fn observer_fires_once_per_question_and_error_aborts() {
 fn paced_complete_rides_out_a_429_storm() {
     // Tiny backoff so 40 retries finish fast; config is read fresh per call so
     // these overrides apply. MAX_ELAPSED is a hard ceiling against a hang.
-    std::env::set_var("CITADEL_MEMBENCH_RETRY_BASE_MS", "1");
-    std::env::set_var("CITADEL_MEMBENCH_RETRY_CAP_MS", "2");
-    std::env::set_var("CITADEL_MEMBENCH_RETRY_MAX_ELAPSED_SECS", "30");
-    std::env::set_var("CITADEL_MEMBENCH_RETRY_MAX_ATTEMPTS", "100");
+    let _environment = EnvGuard::new(&[
+        ("CITADEL_MEMBENCH_RETRY_BASE_MS", "1"),
+        ("CITADEL_MEMBENCH_RETRY_CAP_MS", "2"),
+        ("CITADEL_MEMBENCH_RETRY_MAX_ELAPSED_SECS", "30"),
+        ("CITADEL_MEMBENCH_RETRY_MAX_ATTEMPTS", "100"),
+    ]);
 
     // 40 consecutive 429s then success; the body carries a "try again in"
     // phrase so the Retry-After body-parse path is exercised.
@@ -1469,11 +1536,6 @@ fn paced_complete_rides_out_a_429_storm() {
     let client = storm.client();
     let pacer = citadel_membench::Pacer::unbounded();
     let res = judge_correct(&*client, &pacer, "q", "gold", "pred");
-
-    std::env::remove_var("CITADEL_MEMBENCH_RETRY_BASE_MS");
-    std::env::remove_var("CITADEL_MEMBENCH_RETRY_CAP_MS");
-    std::env::remove_var("CITADEL_MEMBENCH_RETRY_MAX_ELAPSED_SECS");
-    std::env::remove_var("CITADEL_MEMBENCH_RETRY_MAX_ATTEMPTS");
 
     let (correct, _) = res.expect("a 40-deep 429 storm must be ridden out, not fatal");
     assert!(correct, "the eventual CORRECT response is returned");
@@ -1498,7 +1560,7 @@ fn concurrent_questions_match_serial_byte_for_byte() {
     let s = &samples[0];
 
     let run = |concurrency: &str| -> Vec<QuestionResult> {
-        std::env::set_var("CITADEL_LOCOMO_CONCURRENCY", concurrency);
+        let _environment = EnvGuard::new(&[("CITADEL_LOCOMO_CONCURRENCY", concurrency)]);
         let (_dir, eng) = open_engine();
         let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::new(DIM));
         let reader = testing::constant("golden retriever");
@@ -1508,8 +1570,6 @@ fn concurrent_questions_match_serial_byte_for_byte() {
 
     let serial = run("1");
     let concurrent = run("8");
-    std::env::remove_var("CITADEL_LOCOMO_CONCURRENCY");
-
     assert_eq!(serial.len(), concurrent.len(), "same question count");
     for (a, b) in serial.iter().zip(&concurrent) {
         // Field-by-field; recall_micros excluded (latency varies, not a score).
@@ -1536,6 +1596,258 @@ fn concurrent_questions_match_serial_byte_for_byte() {
     assert!((ra.overall_accuracy - rb.overall_accuracy).abs() < 1e-12);
 }
 
+#[test]
+fn failed_judges_persist_prior_reader_and_their_own_receipts() {
+    for mode in ["backend", "unsupported", "invalid"] {
+        let mut sample = parse_root(&fixture()).unwrap().remove(0);
+        sample.qa.truncate(1);
+        let (_dir, eng) = open_engine();
+        let mut response = CompletionResponse::text("Rex");
+        response.usage = TokenUsage {
+            input_tokens: 11,
+            output_tokens: 3,
+            cost_usd: Some(0.02),
+        };
+        let reader = testing::scripted(vec![response]);
+        let judge = citadel_llm::factory::from_fn("gpt-4o-mini", move |_| match mode {
+            "backend" => Err(LlmError::Backend("malformed provider body".into())),
+            "unsupported" => Err(LlmError::UnsupportedRequest("unsupported schema".into())),
+            _ => Ok(CompletionResponse::text("INCORRECT")),
+        });
+        let mut journal = Vec::new();
+        let result = run_sample_observed(
+            &eng,
+            &sample,
+            Arc::new(MockEmbedder::new(DIM)),
+            &*reader,
+            &*judge,
+            BenchConfig::default(),
+            false,
+            &Pacer::unbounded(),
+            &mut |event| match event {
+                citadel_membench::QuestionEvent::Completed(_) => {
+                    panic!("must not score a failed judge")
+                }
+                citadel_membench::QuestionEvent::Failed(failure) => {
+                    failure.write_json_line(&mut journal)
+                }
+            },
+        );
+        let BenchError::Questions(batch) = result.unwrap_err() else {
+            panic!("lost question failure")
+        };
+        let failures = &batch.failures;
+        assert_eq!(failures.len(), 1);
+        let row: Value = serde_json::from_slice(&journal).unwrap();
+        assert_eq!(row["stage"], "judge");
+        assert_eq!(row["completed_output"]["answer"], "Rex");
+        assert_eq!(row["calls"].as_array().unwrap().len(), 2);
+        assert_eq!(row["calls"][0]["stage"], "reader");
+        assert_eq!(row["calls"][1]["stage"], "judge");
+        assert_eq!(row["accounting"]["observed_input_tokens"], 11);
+        assert_eq!(
+            row["accounting"]["unknown_usage_attempts"],
+            if mode == "backend" { 1 } else { 0 }
+        );
+        assert_eq!(
+            row["accounting"]["estimated_cost_usd"].is_null(),
+            mode == "backend"
+        );
+        if mode == "invalid" {
+            assert_eq!(row["failure_detail"]["response"], "INCORRECT");
+        }
+        assert_eq!(row, serde_json::to_value(&failures[0]).unwrap());
+    }
+}
+
+#[test]
+fn observer_errors_retain_completed_receipts_and_original_error() {
+    for reader_fails in [true, false] {
+        let mut sample = parse_root(&fixture()).unwrap().remove(0);
+        sample.qa.truncate(1);
+        let (_dir, eng) = open_engine();
+        let reader = citadel_llm::factory::from_fn("gpt-4o-mini", move |_| {
+            if reader_fails {
+                Err(LlmError::Backend("original failure".into()))
+            } else {
+                Ok(CompletionResponse::text("Rex"))
+            }
+        });
+        let judge = testing::constant("CORRECT");
+        let mut events = Vec::new();
+        let error = run_sample_observed(
+            &eng,
+            &sample,
+            Arc::new(MockEmbedder::new(DIM)),
+            &*reader,
+            &*judge,
+            BenchConfig::default(),
+            false,
+            &Pacer::unbounded(),
+            &mut |event| {
+                let failure = matches!(event, citadel_membench::QuestionEvent::Failed(_));
+                events.push(failure);
+                Err(std::io::Error::other(if failure {
+                    "failure journal unavailable"
+                } else {
+                    "success journal unavailable"
+                })
+                .into())
+            },
+        )
+        .unwrap_err();
+        let BenchError::Questions(batch) = error else {
+            panic!("lost observer failure")
+        };
+        let failures = &batch.failures;
+        assert_eq!(failures.len(), 1);
+        let failure = &failures[0];
+        assert_eq!(failure.calls.len(), if reader_fails { 1 } else { 2 });
+        assert_eq!(failure.completed_output.is_some(), !reader_fails);
+        if !reader_fails {
+            let output = failure.completed_output.as_ref().unwrap();
+            assert_eq!(output.answer, "Rex");
+            assert!(output.judge.as_ref().unwrap().correct);
+            assert_eq!(output.judge.as_ref().unwrap().response, "CORRECT");
+        }
+        assert_eq!(failure.observer_errors.len(), 1);
+        assert!(failure.observer_errors[0].contains("failure journal unavailable"));
+        assert!(failure.source.to_string().contains(if reader_fails {
+            "original failure"
+        } else {
+            "success journal unavailable"
+        }));
+        assert_eq!(
+            events,
+            if reader_fails {
+                vec![true]
+            } else {
+                vec![false, true]
+            }
+        );
+    }
+}
+
+#[test]
+fn multi_call_accounting_preserves_wide_tokens_and_rejects_cost_overflow() {
+    let mut sample = parse_root(&fixture()).unwrap().remove(0);
+    sample.qa.truncate(1);
+    sample.qa[0].question = "How many pets were mentioned?".into();
+    let (_dir, eng) = open_engine();
+    let replies = ["[]", "Cannot determine"]
+        .into_iter()
+        .map(|text| {
+            let mut response = CompletionResponse::text(text);
+            response.usage = TokenUsage {
+                input_tokens: u32::MAX,
+                output_tokens: u32::MAX,
+                cost_usd: Some(1e308),
+            };
+            response
+        })
+        .collect();
+    let reader = testing::scripted(replies);
+    let judge = testing::constant("CORRECT");
+    let results = run_sample(
+        &eng,
+        &sample,
+        Arc::new(MockEmbedder::new(DIM)),
+        &*reader,
+        &*judge,
+        BenchConfig {
+            agentic: true,
+            ..BenchConfig::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(results[0].input_tokens, 2 * u64::from(u32::MAX));
+    assert_eq!(results[0].output_tokens, 2 * u64::from(u32::MAX));
+    assert_eq!(results[0].cost_usd, None);
+    assert_eq!(results[0].unknown_usage_attempts, 0);
+    assert_eq!(aggregate(&results, prov()).estimated_cost_usd, None);
+}
+
+#[test]
+fn a_partial_journal_success_does_not_duplicate_batch_spend() {
+    struct FlushOnce {
+        bytes: Vec<u8>,
+        flushed: bool,
+    }
+    impl std::io::Write for FlushOnce {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            if std::mem::replace(&mut self.flushed, true) {
+                Ok(())
+            } else {
+                Err(std::io::Error::other("first flush failed"))
+            }
+        }
+    }
+    let mut sample = parse_root(&fixture()).unwrap().remove(0);
+    sample.qa.truncate(1);
+    let (_dir, eng) = open_engine();
+    let mut response = CompletionResponse::text("Rex");
+    response.usage = TokenUsage {
+        input_tokens: 13,
+        output_tokens: 2,
+        cost_usd: Some(0.01),
+    };
+    let reader = testing::scripted(vec![response]);
+    let judge = testing::constant("CORRECT");
+    let mut journal = FlushOnce {
+        bytes: Vec::new(),
+        flushed: false,
+    };
+    let error = run_sample_observed(
+        &eng,
+        &sample,
+        Arc::new(MockEmbedder::new(DIM)),
+        &*reader,
+        &*judge,
+        BenchConfig::default(),
+        false,
+        &Pacer::unbounded(),
+        &mut |event| match event {
+            citadel_membench::QuestionEvent::Completed(completed) => {
+                completed.completion_receipt().write_json_line(&mut journal)
+            }
+            citadel_membench::QuestionEvent::Failed(failure) => {
+                failure.write_json_line(&mut journal)
+            }
+        },
+    )
+    .unwrap_err();
+    let BenchError::Questions(batch) = error else {
+        panic!("missing batch")
+    };
+    assert_eq!(batch.failures.len(), 1);
+    assert!(batch.completed.is_empty());
+    assert_eq!(batch.accounting().observed_input_tokens, 13);
+    let rows: Vec<Value> = String::from_utf8(journal.bytes)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["event"], "completed");
+    assert_eq!(rows[1]["event"], "failed");
+    assert_eq!(rows[0]["identity"], rows[1]["identity"]);
+    assert_eq!(rows[1]["accounting"]["observed_input_tokens"], 13);
+    assert_eq!(rows[1]["calls"], rows[0]["calls"]);
+}
+
+fn single_question_source(error: BenchError) -> BenchError {
+    let BenchError::Questions(mut batch) = error else {
+        panic!("expected question failure: {error:?}")
+    };
+    let failures = &batch.failures;
+    assert_eq!(failures.len(), 1);
+    *batch.failures.remove(0).source
+}
+
 fn res(category: Category, correct: bool) -> QuestionResult {
     QuestionResult {
         sample_id: "fixture".into(),
@@ -1546,6 +1858,7 @@ fn res(category: Category, correct: bool) -> QuestionResult {
         recall_micros: 10,
         input_tokens: 5,
         output_tokens: 3,
+        unknown_usage_attempts: 0,
         cost_usd: Some(0.0),
         retrieved: Vec::new(),
         retrieved_atom_ids: Vec::new(),
@@ -1572,6 +1885,7 @@ fn unscorable(category: Category) -> QuestionResult {
         recall_micros: 0,
         input_tokens: 0,
         output_tokens: 0,
+        unknown_usage_attempts: 0,
         cost_usd: Some(0.0),
         retrieved: Vec::new(),
         retrieved_atom_ids: Vec::new(),

@@ -22,6 +22,10 @@ pub use benchmarks::locomo::ingest::{ingest_sample, turn_content};
 pub use benchmarks::locomo::prompts::{build_reader_prompt, judge_abstained, judge_correct};
 pub use core::db::{open_bench_db, BenchDb};
 pub use core::error::{BenchError, Result};
+pub use core::error::{
+    CompletedOutput, QuestionBatchFailure, QuestionCompletion, QuestionEvent, QuestionFailure,
+    QuestionIdentity, QuestionObserver, QuestionStage, UsageAccounting,
+};
 pub use core::eval::{answer_question, reader_view, AnswerOutcome, Question};
 pub use core::hash::sha256_hex;
 pub use core::ratelimit::{default_tpm_for_model, Gate, Pacer};
@@ -123,8 +127,10 @@ pub struct QuestionResult {
     /// abstained.
     pub correct: bool,
     pub recall_micros: u128,
-    pub input_tokens: u32,
-    pub output_tokens: u32,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    /// Failed attempts lacking both measured usage and a no-dispatch guarantee.
+    pub unknown_usage_attempts: u64,
     /// Estimated USD: reader + judge tokens, each at its model's rate.
     pub cost_usd: Option<f64>,
     /// Evidence IDs in reader-view order. Annotation coverage alone does not
@@ -149,6 +155,27 @@ pub struct QuestionResult {
     pub reader_calls: Vec<core::eval::CompletionCallAudit>,
     /// Absent only when an unscorable question made no judge call.
     pub judge: Option<core::eval::JudgeOutcome>,
+}
+
+impl QuestionResult {
+    pub fn completion_receipt(&self) -> QuestionCompletion {
+        QuestionCompletion {
+            identity: QuestionIdentity::Locomo {
+                sample_id: self.sample_id.clone(),
+                qa_index: self.qa_index,
+            },
+            calls: self
+                .reader_calls
+                .iter()
+                .cloned()
+                .chain(self.judge.iter().map(|judge| judge.call.clone()))
+                .collect(),
+            output: CompletedOutput {
+                answer: self.predicted.clone(),
+                judge: self.judge.clone(),
+            },
+        }
+    }
 }
 
 /// Per-category roll-up (scored categories only).
@@ -219,6 +246,7 @@ pub struct BenchReport {
     pub recall_p95_micros: u128,
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
+    pub unknown_usage_attempts: u64,
     pub estimated_cost_usd: Option<f64>,
 }
 
@@ -268,7 +296,7 @@ pub fn run_sample(
     )
 }
 
-/// Like [`run_sample`] but invokes `on_result` per question as it scores
+/// Like [`run_sample`] but invokes `on_result` for each completed or failed question
 /// (live tracing); scoring is identical. `reuse = true` validates the persisted
 /// corpus before recalling without ingestion.
 #[allow(clippy::too_many_arguments)]
@@ -281,7 +309,7 @@ pub fn run_sample_observed(
     config: BenchConfig,
     reuse: bool,
     pacer: &Pacer,
-    on_result: &mut (dyn FnMut(&QuestionResult) -> Result<()> + Send),
+    on_result: &mut QuestionObserver<'_, QuestionResult>,
 ) -> Result<Vec<QuestionResult>> {
     benchmarks::locomo::dataset::validate_samples(std::slice::from_ref(sample))?;
     config.validate()?;
@@ -325,7 +353,7 @@ pub fn run_sample_observed(
     let next = std::sync::atomic::AtomicUsize::new(0);
     let failed = std::sync::atomic::AtomicBool::new(false);
     let observed = std::sync::Mutex::new(on_result);
-    let err_slot: std::sync::Mutex<Option<BenchError>> = std::sync::Mutex::new(None);
+    let err_slot: std::sync::Mutex<Vec<QuestionFailure>> = std::sync::Mutex::new(Vec::new());
     let (tx, rx) = std::sync::mpsc::channel::<(usize, QuestionResult)>();
     let (rg, jg) = (&reader_gate, &judge_gate);
     let gi = &gold_index;
@@ -360,21 +388,39 @@ pub fn run_sample_observed(
                         Ok(r) => {
                             // Run the observer under its lock, then send: never
                             // hold two locks at once.
-                            let observe = (*observed_r.lock().expect("observer poisoned"))(&r);
+                            let observe = {
+                                let mut observer = observed_r.lock().expect("observer poisoned");
+                                (*observer)(QuestionEvent::Completed(&r))
+                            };
                             match observe {
                                 Ok(()) => {
                                     let _ = tx.send((i, r));
                                 }
                                 Err(e) => {
-                                    *err_r.lock().expect("err slot poisoned") = Some(e);
                                     failed_r.store(true, Relaxed);
+                                    let failure = QuestionFailure::new(
+                                        QuestionIdentity::Locomo {
+                                            sample_id: sample.sample_id.clone(),
+                                            qa_index: i,
+                                        },
+                                        QuestionStage::Observer,
+                                        e,
+                                    )
+                                    .prepend_calls(
+                                        r.reader_calls
+                                            .iter()
+                                            .cloned()
+                                            .chain(r.judge.iter().map(|j| j.call.clone())),
+                                    )
+                                    .with_completed_output(r.predicted, r.judge);
+                                    core::error::observe_failure(failure, observed_r, err_r);
                                     break;
                                 }
                             }
                         }
                         Err(e) => {
-                            *err_r.lock().expect("err slot poisoned") = Some(e);
                             failed_r.store(true, Relaxed);
+                            core::error::observe_failure(e, observed_r, err_r);
                             break;
                         }
                     }
@@ -384,8 +430,17 @@ pub fn run_sample_observed(
         drop(tx); // drop the original sender so `rx` closes once all workers finish
     });
 
-    if let Some(e) = err_slot.into_inner().expect("err slot poisoned") {
-        return Err(e);
+    let failures = err_slot.into_inner().expect("err slot poisoned");
+    if !failures.is_empty() {
+        let mut completed: Vec<_> = rx.into_iter().collect();
+        completed.sort_by_key(|(index, _)| *index);
+        return Err(BenchError::Questions(Box::new(QuestionBatchFailure {
+            failures,
+            completed: completed
+                .into_iter()
+                .map(|(_, result)| result.completion_receipt())
+                .collect(),
+        })));
     }
     let mut slots: Vec<Option<QuestionResult>> = (0..total).map(|_| None).collect();
     for (i, r) in rx {
@@ -423,7 +478,11 @@ fn process_one_question(
     pacer: &Pacer,
     reader_gate: &Gate,
     judge_gate: &Gate,
-) -> Result<QuestionResult> {
+) -> std::result::Result<QuestionResult, QuestionFailure> {
+    let identity = QuestionIdentity::Locomo {
+        sample_id: region.to_owned(),
+        qa_index,
+    };
     // Empty gold on a scored question = malformed key: record unscorable (no
     // LLM call) rather than grading it wrong. Returns before acquiring any
     // gate/pacer.
@@ -437,6 +496,7 @@ fn process_one_question(
             recall_micros: 0,
             input_tokens: 0,
             output_tokens: 0,
+            unknown_usage_attempts: 0,
             cost_usd: Some(0.0),
             retrieved: Vec::new(),
             retrieved_atom_ids: Vec::new(),
@@ -460,19 +520,26 @@ fn process_one_question(
             text: &qa.question,
             date: "",
         };
-        answer_question(&bench, reader, pacer, eng, region, q, config)?
+        answer_question(&bench, reader, pacer, eng, region, q, config)
+            .map_err(|error| QuestionFailure::new(identity.clone(), QuestionStage::Reader, error))?
     };
 
     let judge_outcome = {
         let _permit = judge_gate.acquire();
-        bench.judge(
-            judge,
-            pacer,
-            qa.category.is_scored(),
-            &qa.question,
-            &qa.gold,
-            &outcome.answer,
-        )?
+        bench
+            .judge(
+                judge,
+                pacer,
+                qa.category.is_scored(),
+                &qa.question,
+                &qa.gold,
+                &outcome.answer,
+            )
+            .map_err(|error| {
+                QuestionFailure::new(identity.clone(), QuestionStage::Judge, error)
+                    .prepend_calls(outcome.reader_calls.clone())
+                    .with_completed_output(outcome.answer.clone(), None)
+            })?
     };
 
     // Gold instrumentation computed before `outcome.retrieved` is moved into
@@ -480,6 +547,12 @@ fn process_one_question(
     let gold_in_view = gold_in_view_flags(&qa.evidence, &outcome.retrieved);
     let gold_turn_texts = resolve_gold_texts(&qa.evidence, gold_index);
 
+    let accounting = UsageAccounting::from_calls(
+        outcome
+            .reader_calls
+            .iter()
+            .chain(std::iter::once(&judge_outcome.call)),
+    );
     Ok(QuestionResult {
         sample_id: region.to_owned(),
         qa_index,
@@ -487,25 +560,10 @@ fn process_one_question(
         scorable: true,
         correct: judge_outcome.correct,
         recall_micros: outcome.recall_micros,
-        input_tokens: outcome
-            .usage
-            .input_tokens
-            .saturating_add(judge_outcome.usage.input_tokens),
-        output_tokens: outcome
-            .usage
-            .output_tokens
-            .saturating_add(judge_outcome.usage.output_tokens),
-        cost_usd: token_cost(
-            reader.model_id(),
-            outcome.usage.input_tokens,
-            outcome.usage.output_tokens,
-        )
-        .zip(token_cost(
-            judge.model_id(),
-            judge_outcome.usage.input_tokens,
-            judge_outcome.usage.output_tokens,
-        ))
-        .map(|(reader, judge)| reader + judge),
+        input_tokens: accounting.observed_input_tokens,
+        output_tokens: accounting.observed_output_tokens,
+        unknown_usage_attempts: accounting.unknown_usage_attempts,
+        cost_usd: accounting.estimated_cost_usd,
         retrieved: outcome.retrieved,
         retrieved_atom_ids: outcome.retrieved_atom_ids,
         gold_evidence: qa.evidence.clone(),
@@ -532,15 +590,15 @@ pub fn aggregate(results: &[QuestionResult], provenance: Provenance) -> BenchRep
 
     let mut total_input_tokens = 0u64;
     let mut total_output_tokens = 0u64;
+    let mut unknown_usage_attempts = 0u64;
     let mut total_cost_usd = Some(0.0f64);
     let mut latencies = Vec::with_capacity(results.len());
 
     for r in results {
-        total_input_tokens += u64::from(r.input_tokens);
-        total_output_tokens += u64::from(r.output_tokens);
-        total_cost_usd = total_cost_usd
-            .zip(r.cost_usd)
-            .map(|(total, cost)| total + cost);
+        total_input_tokens = total_input_tokens.saturating_add(r.input_tokens);
+        total_output_tokens = total_output_tokens.saturating_add(r.output_tokens);
+        unknown_usage_attempts = unknown_usage_attempts.saturating_add(r.unknown_usage_attempts);
+        total_cost_usd = core::error::sum_costs(total_cost_usd, r.cost_usd);
         // Unscorable questions skip recall (latency 0); excluding keeps p95
         // honest.
         if r.scorable {
@@ -591,6 +649,7 @@ pub fn aggregate(results: &[QuestionResult], provenance: Provenance) -> BenchRep
         recall_p95_micros: p95(&mut latencies),
         total_input_tokens,
         total_output_tokens,
+        unknown_usage_attempts,
         estimated_cost_usd,
     }
 }
