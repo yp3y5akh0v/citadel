@@ -14,7 +14,7 @@ pub use citadel_llm::{AssistantMessage, LLMClient, LlmError, Message, ToolCall, 
 
 pub use agent::{
     Agent, AgentConfig, AgentError, AgentReport, AgentResult, CognitionState, DiscoveryGoal,
-    DiscoveryReport, ReflectReason, TerminatedBy,
+    DiscoveryReport, ReflectReason, RetainedLlmCall, TerminatedBy, TracePersistenceFailure,
 };
 pub use budget::{
     AgentBudget, BudgetExceeded, BudgetInvalid, BudgetStop, BudgetUnavailable, BudgetUsage,

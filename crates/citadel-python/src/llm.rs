@@ -83,7 +83,7 @@ fn tool_choice_to_py(py: Python<'_>, tc: &ToolChoice) -> PyResult<Py<PyAny>> {
 }
 
 /// Render a request as the dict handed to a Python `complete`.
-fn request_to_py<'py>(
+pub(crate) fn request_to_py<'py>(
     py: Python<'py>,
     req: &CompletionRequest,
     model_id: &str,
