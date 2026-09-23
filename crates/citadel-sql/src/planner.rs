@@ -371,6 +371,9 @@ fn plan_select_inner(
         &range_preds,
         pk_range_full_cover(schema, &predicates, &simple),
     ) {
+        if let Some(narrower) = try_narrower_pk_index(schema, where_expr, &simple, &plan) {
+            return narrower;
+        }
         return plan;
     }
 
@@ -793,6 +796,78 @@ fn try_best_index(
     }
 
     best_plan
+}
+
+/// A fixed secondary-index prefix followed by the same PK bounds visits a
+/// subset of the primary range. Do not trade away any primary bound merely
+/// because an unrelated index has more equality predicates.
+fn try_narrower_pk_index(
+    schema: &TableSchema,
+    where_expr: &Expr,
+    predicates: &[Option<SimplePredicate>],
+    primary: &ScanPlan,
+) -> Option<ScanPlan> {
+    let ScanPlan::PkRangeScan {
+        range_conds: primary_bounds,
+        full_cover: false,
+        ..
+    } = primary
+    else {
+        return None;
+    };
+    let conjuncts = flatten_and(where_expr);
+    let mut best = None;
+    for index in &schema.indices {
+        if !partial_predicate_implied(index, where_expr, &conjuncts) {
+            continue;
+        }
+        let Some((score, plan)) = try_index_scan(schema, index, predicates) else {
+            continue;
+        };
+        let ScanPlan::IndexScan {
+            num_prefix_cols,
+            range_conds,
+            ..
+        } = &plan
+        else {
+            continue;
+        };
+        if *num_prefix_cols == 0
+            || !index_scan_preserves_pk_order(schema, &plan)
+            || range_conds != primary_bounds
+        {
+            continue;
+        }
+        if best.as_ref().is_none_or(|(previous, _)| score > *previous) {
+            best = Some((score, plan));
+        }
+    }
+    best.map(|(_, plan)| plan)
+}
+
+/// Prove the index emits rows in ascending single-column PK order. A fixed
+/// prefix followed by the unique PK leaves no ties for later keys to reorder.
+pub(crate) fn index_scan_preserves_pk_order(schema: &TableSchema, plan: &ScanPlan) -> bool {
+    let [primary] = schema.primary_key_columns.as_slice() else {
+        return false;
+    };
+    let ScanPlan::IndexScan {
+        index_name,
+        num_prefix_cols,
+        index_columns,
+        ..
+    } = plan
+    else {
+        return false;
+    };
+    let Some(index) = schema.index_by_name(index_name) else {
+        return false;
+    };
+    index.kind == IndexKind::BTree
+        && index.is_pure_column_index()
+        && index_columns.get(*num_prefix_cols) == Some(primary)
+        && schema.columns[*primary as usize].collation == crate::types::Collation::Binary
+        && index.collation_at(*num_prefix_cols) == crate::types::Collation::Binary
 }
 
 /// Proven non-NULL result types whose equality probes use typed key encoding.

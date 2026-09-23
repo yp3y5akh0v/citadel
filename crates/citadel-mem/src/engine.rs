@@ -1719,6 +1719,13 @@ impl MemoryEngine {
                         .into(),
                 ));
             }
+            // Upgrade existing sealed tables once as well as indexing new ones.
+            // This index contains only the already-public region and atom IDs.
+            for table in conn.tables() {
+                if parse_encrypted_atoms_table(&table).is_some() {
+                    ensure_region_cursor_index(&conn, &table)?;
+                }
+            }
         } // drop the connection's borrow before moving `db`
         let regions = Arc::new(Mutex::new(FxHashMap::<String, RegionState>::default()));
         let weak_regions = Arc::downgrade(&regions);
@@ -9319,6 +9326,7 @@ impl MemoryEngine {
         // The payload filter runs after decryption, so page by id until
         // `limit` is met or drained; the id cursor doubles as the watermark.
         let page_param = params.len() + 1;
+        let limit_param = page_param + 1;
         let (cmp, dir) = if q.newest {
             ("<", "DESC")
         } else {
@@ -9329,7 +9337,7 @@ impl MemoryEngine {
              key_slot, key_gen \
              FROM {table} \
              WHERE region_id = $1{preds} AND id {cmp} ${page_param} \
-             ORDER BY id {dir} LIMIT {EXACT_SCAN_LIMIT}",
+              ORDER BY id {dir} LIMIT ${limit_param}",
             table = h.table
         );
 
@@ -9341,8 +9349,14 @@ impl MemoryEngine {
         };
         'pages: loop {
             check_cancel(cancel)?;
+            let page_limit = if q.payload_filter.is_some() || q.newest {
+                EXACT_SCAN_LIMIT
+            } else {
+                (q.limit - out.len()).min(EXACT_SCAN_LIMIT)
+            };
             let mut page_params = params.clone();
             page_params.push(Value::Integer(last_id));
+            page_params.push(Value::Integer(page_limit as i64));
             let qr = conn.query_params(&sql, &page_params)?;
             if qr.rows.is_empty() {
                 break;
@@ -9384,7 +9398,7 @@ impl MemoryEngine {
                     break 'pages;
                 }
             }
-            if batch < EXACT_SCAN_LIMIT {
+            if batch < page_limit {
                 break;
             }
         }
@@ -11937,6 +11951,7 @@ fn ensure_atoms_table(
                      (pre-per-atom-erasure schema); recreate the database"
                 )));
             }
+            ensure_region_cursor_index(conn, &t)?;
         }
         return Ok(());
     }
@@ -11961,6 +11976,7 @@ fn ensure_atoms_table(
         conn.execute(&format!(
             "CREATE INDEX IF NOT EXISTS {t}_rk ON {t} (region_id, kind)"
         ))?;
+        ensure_region_cursor_index(conn, &t)?;
         return Ok(());
     }
     let tag = metric_tag(metric);
@@ -11990,6 +12006,42 @@ fn ensure_atoms_table(
     conn.execute(&format!(
         "CREATE INDEX IF NOT EXISTS {t}_jsonb ON {t} USING gin (payload) WITH (ops = 'jsonb_path_ops')"
     ))?;
+    Ok(())
+}
+
+/// The equality prefix and ID range support bounded, ordered region scans.
+/// A reserved name with a different definition is not a successful upgrade.
+fn ensure_region_cursor_index(conn: &Connection<'_>, table: &str) -> Result<()> {
+    let name = format!("{table}_ri");
+    let valid = |schema: &citadel_sql::TableSchema| {
+        let Some(region) = schema.column_index("region_id") else {
+            return false;
+        };
+        let Some(id) = schema.column_index("id") else {
+            return false;
+        };
+        schema.index_by_name(&name).is_some_and(|index| {
+            index.is_full_column_btree(&[region as u16, id as u16])
+                && index.collation_at(0) == citadel_sql::types::Collation::Binary
+                && index.collation_at(1) == citadel_sql::types::Collation::Binary
+        })
+    };
+    let schema = conn
+        .table_schema(table)
+        .ok_or_else(|| MemError::Invalid(format!("atom table '{table}' is missing")))?;
+    if schema.index_by_name(&name).is_none() {
+        conn.execute(&format!(
+            "CREATE INDEX IF NOT EXISTS {name} ON {table} (region_id, id)"
+        ))?;
+    }
+    if !conn
+        .table_schema(table)
+        .is_some_and(|schema| valid(&schema))
+    {
+        return Err(MemError::Invalid(format!(
+            "atom cursor index '{name}' must cover (region_id, id) without a predicate"
+        )));
+    }
     Ok(())
 }
 

@@ -30,6 +30,87 @@ fn index_scan_start(prefix: &[u8], range_conds: &[(BinOp, Value)]) -> Option<Vec
         .max()
 }
 
+type IndexKeyVisitor<'a> = dyn FnMut(&[u8], &[u8]) -> citadel_core::Result<bool> + 'a;
+// Amortize seeks when a small LIMIT has a selective residual predicate.
+const INDEX_KEY_MIN_BATCH_SIZE: usize = 32;
+const INDEX_KEY_BATCH_SIZE: usize = 256;
+
+struct IndexKeyBatch {
+    keys: Vec<Vec<u8>>,
+    resume: Option<Vec<u8>>,
+}
+
+/// Collect a bounded group of row keys without borrowing the transaction while
+/// their base rows are filtered. The exact index key resumes the same snapshot;
+/// the inclusive seek skips only that previously visited key.
+fn collect_index_key_batch(
+    schema: &TableSchema,
+    plan: &ScanPlan,
+    resume: Option<&[u8]>,
+    limit: Option<usize>,
+    scan: impl FnOnce(&[u8], &[u8], &mut IndexKeyVisitor<'_>) -> citadel_core::Result<()>,
+) -> Result<IndexKeyBatch> {
+    let ScanPlan::IndexScan {
+        index_name,
+        idx_table,
+        prefix,
+        num_prefix_cols,
+        range_conds,
+        is_unique,
+        index_columns,
+        ..
+    } = plan
+    else {
+        unreachable!("index-key collection requires an index scan")
+    };
+    let num_pk_cols = schema.primary_key_columns.len();
+    let num_index_cols = schema
+        .index_by_name(index_name)
+        .map_or(index_columns.len(), |index| index.keys.len());
+    let lower = index_scan_start(prefix, range_conds);
+    let start = resume.unwrap_or_else(|| lower.as_deref().unwrap_or(prefix));
+    let mut batch = IndexKeyBatch {
+        keys: Vec::new(),
+        resume: None,
+    };
+    let mut error = None;
+    scan(idx_table, start, &mut |key, value| {
+        if !key.starts_with(prefix) {
+            return Ok(false);
+        }
+        if resume == Some(key) {
+            return Ok(true);
+        }
+        match check_range_conditions(key, *num_prefix_cols, range_conds, num_index_cols) {
+            Ok(RangeCheck::ExceedsUpper) => return Ok(false),
+            Ok(RangeCheck::BelowLower) => return Ok(true),
+            Ok(RangeCheck::Match) => {}
+            Err(cause) => {
+                error = Some(cause);
+                return Ok(false);
+            }
+        }
+        match extract_pk_key(key, value, *is_unique, num_index_cols, num_pk_cols) {
+            Ok(pk) => batch.keys.push(pk),
+            Err(cause) => {
+                error = Some(cause);
+                return Ok(false);
+            }
+        }
+        if limit.is_some_and(|limit| batch.keys.len() >= limit) {
+            batch.resume = Some(key.to_vec());
+            Ok(false)
+        } else {
+            Ok(true)
+        }
+    })
+    .map_err(SqlError::Storage)?;
+    if let Some(error) = error {
+        return Err(error);
+    }
+    Ok(batch)
+}
+
 /// Column index -> key-component position when the index covers every need.
 pub(super) fn covered_index_components(
     table_schema: &TableSchema,
@@ -804,64 +885,42 @@ pub(super) fn collect_rows_with_read_decoded(
             Ok((rows, true))
         }
 
-        ScanPlan::IndexScan {
-            index_name,
-            idx_table,
-            prefix,
-            num_prefix_cols,
-            range_conds,
-            is_unique,
-            index_columns,
-            ..
-        } => {
-            let num_pk_cols = table_schema.primary_key_columns.len();
-            let num_index_cols = table_schema
-                .index_by_name(&index_name)
-                .map_or(index_columns.len(), |idx| idx.keys.len());
-            let mut pk_keys: Vec<Vec<u8>> = Vec::new();
-
-            {
-                let start = index_scan_start(&prefix, &range_conds);
-                let start: &[u8] = start.as_deref().unwrap_or(&prefix);
-                let mut scan_err: Option<SqlError> = None;
-                rtx.table_scan_from_fast(&idx_table, start, |key, value| {
-                    if !key.starts_with(&prefix) {
-                        return Ok(false);
-                    }
-                    match check_range_conditions(key, num_prefix_cols, &range_conds, num_index_cols)
-                    {
-                        Ok(RangeCheck::ExceedsUpper) => return Ok(false),
-                        Ok(RangeCheck::BelowLower) => return Ok(true),
-                        Ok(RangeCheck::Match) => {}
-                        Err(e) => {
-                            scan_err = Some(e);
-                            return Ok(false);
-                        }
-                    }
-                    match extract_pk_key(key, value, is_unique, num_index_cols, num_pk_cols) {
-                        Ok(pk) => pk_keys.push(pk),
-                        Err(e) => {
-                            scan_err = Some(e);
-                            return Ok(false);
-                        }
-                    }
-                    Ok(true)
-                })
-                .map_err(SqlError::Storage)?;
-                if let Some(e) = scan_err {
-                    return Err(e);
-                }
-            }
-
+        ScanPlan::IndexScan { .. } => {
+            // Other index orders must still collect fully before ORDER BY.
+            let ordered_limit =
+                limit.filter(|_| planner::index_scan_preserves_pk_order(table_schema, &plan));
             let mut rows = Vec::new();
-            for pk_key in &pk_keys {
-                if let Some(value) = rtx
-                    .table_get(lower_name.as_bytes(), pk_key)
-                    .map_err(SqlError::Storage)?
-                {
-                    if let Some(row) = read_row(pk_key, &value, where_clause.as_ref())? {
-                        rows.push(row);
+            let mut resume = None;
+            loop {
+                let remaining = ordered_limit.map(|limit| limit.saturating_sub(rows.len()));
+                if remaining == Some(0) {
+                    break;
+                }
+                let batch = collect_index_key_batch(
+                    table_schema,
+                    &plan,
+                    resume.as_deref(),
+                    remaining.map(|remaining| {
+                        remaining.clamp(INDEX_KEY_MIN_BATCH_SIZE, INDEX_KEY_BATCH_SIZE)
+                    }),
+                    |table, start, visit| rtx.table_scan_from_fast(table, start, visit),
+                )?;
+                for pk_key in &batch.keys {
+                    if let Some(value) = rtx
+                        .table_get(lower_name.as_bytes(), pk_key)
+                        .map_err(SqlError::Storage)?
+                    {
+                        if let Some(row) = read_row(pk_key, &value, where_clause.as_ref())? {
+                            rows.push(row);
+                            if ordered_limit.is_some_and(|limit| rows.len() >= limit) {
+                                break;
+                            }
+                        }
                     }
+                }
+                resume = batch.resume;
+                if resume.is_none() {
+                    break;
                 }
             }
             Ok((rows, where_clause.is_some()))
@@ -1218,64 +1277,42 @@ fn collect_rows_write_decoded(
             Ok((rows, true))
         }
 
-        ScanPlan::IndexScan {
-            index_name,
-            idx_table,
-            prefix,
-            num_prefix_cols,
-            range_conds,
-            is_unique,
-            index_columns,
-            ..
-        } => {
-            let num_pk_cols = table_schema.primary_key_columns.len();
-            let num_index_cols = table_schema
-                .index_by_name(&index_name)
-                .map_or(index_columns.len(), |idx| idx.keys.len());
-            let mut pk_keys: Vec<Vec<u8>> = Vec::new();
-
-            {
-                let start = index_scan_start(&prefix, &range_conds);
-                let start: &[u8] = start.as_deref().unwrap_or(&prefix);
-                let mut scan_err: Option<SqlError> = None;
-                wtx.table_scan_from(&idx_table, start, |key, value| {
-                    if !key.starts_with(&prefix) {
-                        return Ok(false);
-                    }
-                    match check_range_conditions(key, num_prefix_cols, &range_conds, num_index_cols)
-                    {
-                        Ok(RangeCheck::ExceedsUpper) => return Ok(false),
-                        Ok(RangeCheck::BelowLower) => return Ok(true),
-                        Ok(RangeCheck::Match) => {}
-                        Err(e) => {
-                            scan_err = Some(e);
-                            return Ok(false);
-                        }
-                    }
-                    match extract_pk_key(key, value, is_unique, num_index_cols, num_pk_cols) {
-                        Ok(pk) => pk_keys.push(pk),
-                        Err(e) => {
-                            scan_err = Some(e);
-                            return Ok(false);
-                        }
-                    }
-                    Ok(true)
-                })
-                .map_err(SqlError::Storage)?;
-                if let Some(e) = scan_err {
-                    return Err(e);
-                }
-            }
-
+        ScanPlan::IndexScan { .. } => {
+            // Other index orders must still collect fully before ORDER BY.
+            let ordered_limit =
+                limit.filter(|_| planner::index_scan_preserves_pk_order(table_schema, &plan));
             let mut rows = Vec::new();
-            for pk_key in &pk_keys {
-                if let Some(value) = wtx
-                    .table_get(lower_name.as_bytes(), pk_key)
-                    .map_err(SqlError::Storage)?
-                {
-                    if let Some(row) = read_row(pk_key, &value, where_clause.as_ref())? {
-                        rows.push(row);
+            let mut resume = None;
+            loop {
+                let remaining = ordered_limit.map(|limit| limit.saturating_sub(rows.len()));
+                if remaining == Some(0) {
+                    break;
+                }
+                let batch = collect_index_key_batch(
+                    table_schema,
+                    &plan,
+                    resume.as_deref(),
+                    remaining.map(|remaining| {
+                        remaining.clamp(INDEX_KEY_MIN_BATCH_SIZE, INDEX_KEY_BATCH_SIZE)
+                    }),
+                    |table, start, visit| wtx.table_scan_from(table, start, visit),
+                )?;
+                for pk_key in &batch.keys {
+                    if let Some(value) = wtx
+                        .table_get(lower_name.as_bytes(), pk_key)
+                        .map_err(SqlError::Storage)?
+                    {
+                        if let Some(row) = read_row(pk_key, &value, where_clause.as_ref())? {
+                            rows.push(row);
+                            if ordered_limit.is_some_and(|limit| rows.len() >= limit) {
+                                break;
+                            }
+                        }
                     }
+                }
+                resume = batch.resume;
+                if resume.is_none() {
+                    break;
                 }
             }
             Ok((rows, where_clause.is_some()))
