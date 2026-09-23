@@ -363,10 +363,14 @@ pub struct CandleEmbedder {
 /// propagate to the caller; CPU inference requires a build without `cuda-embed`.
 #[cfg(feature = "cuda-embed")]
 fn select_device() -> Result<Device, EmbedError> {
-    let device = Device::new_cuda(0).map_err(|error| {
-        EmbedError::Backend(format!("cuda-embed requires CUDA GPU 0: {error}"))
-    })?;
+    let device = Device::new_cuda(0)
+        .map_err(|error| EmbedError::Backend(format!("cuda-embed requires CUDA GPU 0: {error}")))?;
     eprintln!("[citadel-mem] cuda-embed: using CUDA GPU 0");
+    // Candle's f32 GEMM mode is process-global. Both inference constructors
+    // establish the same CUDA policy, independent of which model loads first.
+    // Standalone reranking uses the embedder-plus-reranker TF32 policy too.
+    candle_core::cuda::set_gemm_reduced_precision_f32(true);
+    eprintln!("[citadel-mem] cuda-embed: TF32 f32 GEMM enabled (tensor cores)");
     Ok(device)
 }
 
@@ -397,12 +401,6 @@ impl CandleEmbedder {
         let model_id = content_bound_model_id(&model_label, fingerprint, CANDLE_PIPELINE_REVISION);
 
         let device = select_device()?;
-        // f32 GEMM via TF32 tensor cores (Ampere+); full f32 range. No-op on
-        // CPU.
-        if matches!(device, Device::Cuda(_)) {
-            candle_core::cuda::set_gemm_reduced_precision_f32(true);
-            eprintln!("[citadel-mem] cuda-embed: TF32 f32 GEMM enabled (tensor cores)");
-        }
 
         let mut padding = PaddingParams {
             strategy: PaddingStrategy::BatchLongest,
