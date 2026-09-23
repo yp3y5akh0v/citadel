@@ -839,8 +839,8 @@ fn run_sample_preserves_reader_and_judge_completion_audit() {
     assert_eq!(judge_audit.model_id, "gpt-4o-mini");
     assert_eq!(judge_audit.request_sha256.len(), 64);
     assert!(judge_audit.rendered_atom_ids.is_empty());
-    assert_eq!(judge_audit.usage.input_tokens, 12);
-    assert_eq!(judge_audit.usage.output_tokens, 7);
+    assert_eq!(judge_audit.usage.unwrap().input_tokens, 12);
+    assert_eq!(judge_audit.usage.unwrap().output_tokens, 7);
     assert!((result.cost_usd.unwrap() - 0.000456).abs() < 1e-12);
     let row = serde_json::to_value(result).unwrap();
     assert_eq!(row["reader_finish_reasons"], json!(["length"]));
@@ -918,18 +918,15 @@ fn temporal_glosses_reach_native_reader_without_mutating_retrieval_or_storage() 
 }
 
 #[test]
-fn agentic_audit_preserves_both_completions_including_fallback() {
+fn agentic_audit_preserves_both_completions_for_explicit_routes() {
     for (extraction, extraction_finish, answer_finish) in [
         (
-            r#"[{"item":"Rex"}]"#,
-            FinishReason::Length,
+            r#"[{"item":"Rex","date":"2024/01/01","evidence":"I adopted a dog named Rex.","amount":null}]"#,
+            FinishReason::Stop,
             FinishReason::Stop,
         ),
-        (
-            "NOT_ENUMERATION",
-            FinishReason::ContentFilter,
-            FinishReason::Length,
-        ),
+        ("NOT_ENUMERATION", FinishReason::Stop, FinishReason::Length),
+        ("[]", FinishReason::Stop, FinishReason::Stop),
     ] {
         let mut sample = parse_root(&fixture()).unwrap().remove(0);
         sample.qa.truncate(1);
@@ -983,6 +980,209 @@ fn agentic_audit_preserves_both_completions_including_fallback() {
             assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
         }
         assert!(results[0].judge.as_ref().unwrap().correct);
+        let second = render(&requests[1].messages);
+        if extraction == "[]" {
+            assert!(second.contains("No supported candidates were extracted"));
+            assert!(second.contains("cannot determine the answer"));
+            assert!(!second.contains("Candidate count: 0"));
+        } else if extraction == "NOT_ENUMERATION" {
+            let hits: Vec<_> = results[0].reader_calls[1]
+                .rendered_atom_ids
+                .iter()
+                .map(|id| eng.fetch_one(&sample.sample_id, *id).unwrap().unwrap())
+                .collect();
+            let ordinary = build_reader_prompt(&hits, &sample.qa[0].question, false).unwrap();
+            let mut expected = requests[1].clone();
+            expected.messages = ordinary;
+            assert_eq!(
+                citadel_llm::canonical_json(&requests[1]),
+                citadel_llm::canonical_json(&expected),
+                "explicit route uses the unchanged ordinary prompt"
+            );
+        }
+    }
+}
+
+#[test]
+fn agentic_invalid_extraction_stops_without_judge_and_retains_receipt() {
+    for (text, finish) in [
+        ("[]", FinishReason::Length),
+        ("NOT_ENUMERATION", FinishReason::ContentFilter),
+        ("[]", FinishReason::Refusal),
+        ("[]", FinishReason::ToolUse),
+        ("[]", FinishReason::Error),
+        ("before []", FinishReason::Stop),
+        (r#"[{"item":"Rex"}]"#, FinishReason::Stop),
+    ] {
+        let mut sample = parse_root(&fixture()).unwrap().remove(0);
+        sample.qa.truncate(1);
+        sample.qa[0].question = "How many dogs did Alice adopt?".into();
+        let (_dir, eng) = open_engine();
+        let mut extraction = CompletionResponse::text(text);
+        extraction.finish_reason = finish;
+        extraction.usage = TokenUsage {
+            input_tokens: 17,
+            output_tokens: 4,
+            cost_usd: Some(0.03),
+        };
+        let usage = extraction.usage;
+        let reader = testing::capturing(vec![extraction]);
+        let judge = testing::capturing(vec![]);
+        let result = run_sample(
+            &eng,
+            &sample,
+            Arc::new(MockEmbedder::new(DIM)),
+            &*reader.client(),
+            &*judge.client(),
+            BenchConfig {
+                agentic: true,
+                ..BenchConfig::default()
+            },
+        );
+        let Err(BenchError::Reader(failure)) = result else {
+            panic!("expected typed reader failure")
+        };
+        assert_eq!(reader.requests().len(), 1);
+        assert!(judge.requests().is_empty());
+        assert_eq!(failure.completed_calls.len(), 1);
+        assert_eq!(failure.completed_calls[0].finish_reason, finish.into());
+        assert_eq!(failure.completed_calls[0].call.usage, Some(usage));
+        assert_eq!(failure.completed_calls[0].call.request_sha256.len(), 64);
+    }
+}
+
+#[test]
+fn agentic_second_call_failure_preserves_extraction_and_unknown_failed_usage() {
+    for text in [
+        "NOT_ENUMERATION",
+        "[]",
+        r#"[{"item":"Rex","date":"","evidence":"I adopted a dog named Rex.","amount":null}]"#,
+    ] {
+        let mut sample = parse_root(&fixture()).unwrap().remove(0);
+        sample.qa.truncate(1);
+        sample.qa[0].question = "How many dogs did Alice adopt?".into();
+        let (_dir, eng) = open_engine();
+        let mut extraction = CompletionResponse::text(text);
+        extraction.usage = TokenUsage {
+            input_tokens: 31,
+            output_tokens: 7,
+            cost_usd: Some(0.04),
+        };
+        let usage = extraction.usage;
+        let reader = testing::capturing(vec![extraction]); // Second request is recorded, then mock errors.
+        let judge = testing::capturing(vec![]);
+        let result = run_sample(
+            &eng,
+            &sample,
+            Arc::new(MockEmbedder::new(DIM)),
+            &*reader.client(),
+            &*judge.client(),
+            BenchConfig {
+                agentic: true,
+                ..BenchConfig::default()
+            },
+        );
+        let Err(BenchError::Reader(failure)) = result else {
+            panic!("expected typed reader failure")
+        };
+        assert!(matches!(
+            failure.stage,
+            citadel_membench::core::error::ReaderStage::FinalAnswer
+        ));
+        assert_eq!(reader.requests().len(), 2);
+        assert!(judge.requests().is_empty());
+        assert_eq!(failure.completed_calls.len(), 1);
+        let completed = &failure.completed_calls[0].call;
+        assert_eq!(completed.usage, Some(usage));
+        let BenchError::Completion(failed) = *failure.source else {
+            panic!("failed call receipt")
+        };
+        assert!(
+            failed.call.usage.is_none(),
+            "unknown spend is not a zero-token receipt"
+        );
+        assert_eq!(
+            serde_json::to_value(&failed.call).unwrap()["usage"],
+            Value::Null
+        );
+        assert_ne!(completed.request_sha256, failed.call.request_sha256);
+        assert_eq!(failed.call.max_output_tokens, Some(512));
+    }
+}
+
+#[test]
+fn agentic_stop_with_tool_payload_and_normalized_total_failure_keep_extraction_receipts() {
+    let amounts = [
+        ("A", 1e308),
+        ("D", -1e308),
+        ("D", -1e308),
+        ("B", 1e308),
+        ("C", 1e308),
+    ];
+    let text = serde_json::to_string(
+        &amounts
+            .into_iter()
+            .map(|(name, amount)| {
+                json!({
+                    "item": name, "date": "2024/01/01", "evidence": name, "amount": amount
+                })
+            })
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let mut tools = CompletionResponse::text("[]");
+    tools.message.tool_calls.push(citadel_llm::ToolCall {
+        id: "unexpected".into(),
+        name: "unexpected".into(),
+        arguments: json!({}),
+    });
+    for mut extraction in [tools, CompletionResponse::text(text)] {
+        assert_eq!(extraction.finish_reason, FinishReason::Stop);
+        extraction.usage = TokenUsage {
+            input_tokens: 23,
+            output_tokens: 9,
+            cost_usd: Some(0.05),
+        };
+        let usage = extraction.usage;
+        let has_tools = !extraction.message.tool_calls.is_empty();
+        let mut sample = parse_root(&fixture()).unwrap().remove(0);
+        sample.qa.truncate(1);
+        sample.qa[0].question = "How many dogs did Alice adopt?".into();
+        let (_dir, eng) = open_engine();
+        let reader = testing::capturing(vec![extraction]);
+        let judge = testing::capturing(vec![]);
+        let result = run_sample(
+            &eng,
+            &sample,
+            Arc::new(MockEmbedder::new(DIM)),
+            &*reader.client(),
+            &*judge.client(),
+            BenchConfig {
+                agentic: true,
+                ..BenchConfig::default()
+            },
+        );
+        let Err(BenchError::Reader(failure)) = result else {
+            panic!("expected typed reader failure")
+        };
+        assert_eq!(failure.completed_calls.len(), 1);
+        assert_eq!(failure.completed_calls[0].call.usage, Some(usage));
+        assert_eq!(reader.requests().len(), 1);
+        assert!(judge.requests().is_empty());
+        if has_tools {
+            assert!(matches!(
+                *failure.source,
+                BenchError::InvalidExtractionCompletion { .. }
+            ));
+        } else {
+            assert!(matches!(
+                *failure.source,
+                BenchError::InvalidExtraction {
+                    source: citadel_membench::core::agentic::ExtractionParseError::InvalidTotal,
+                    ..
+                }
+            ));
+        }
     }
 }
 
