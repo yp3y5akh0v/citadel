@@ -1102,6 +1102,10 @@ mod tests {
         request.messages.reverse();
         assert_ne!(baseline.request_sha256, audit(&request).request_sha256);
         request.messages.reverse();
+        request.seed = None;
+        let unset = audit(&request).request_sha256;
+        request.seed = Some(0);
+        assert_ne!(unset, audit(&request).request_sha256);
         request.seed = Some(2);
         assert_ne!(baseline.request_sha256, audit(&request).request_sha256);
         request.seed = Some(1);

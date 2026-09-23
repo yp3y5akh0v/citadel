@@ -384,6 +384,8 @@ pub trait LLMClient: Send + Sync {
 }
 
 /// Deterministic replay-key encoding; message order semantic, tools name-sorted.
+/// Sampling seed is explicit, including `null` when unset. Keys that omitted
+/// the seed cannot establish request identity and are not reused.
 pub fn canonical_json(req: &CompletionRequest) -> String {
     let mut tools: Vec<&ToolSpec> = req.tools.iter().collect();
     tools.sort_by(|a, b| a.name.cmp(&b.name));
@@ -393,11 +395,12 @@ pub fn canonical_json(req: &CompletionRequest) -> String {
         "tool_choice": tool_choice_to_value(&req.tool_choice),
         "max_tokens": req.max_tokens,
         "temperature": req.temperature,
+        "seed": req.seed,
         "effort": req.effort.map(Effort::as_str),
         "output_schema": req.output_schema,
         "stop": req.stop,
     });
-    serde_json::to_string(&value).unwrap_or_default()
+    value.to_string()
 }
 
 /// BLAKE3 over `model_id` + the canonical request. The replay cache key.
@@ -530,8 +533,36 @@ mod canonical_tests {
         };
         assert_eq!(
             request_hash("gpt-4o-mini-2024-07-18", &req),
-            "0c81c2092b7a67417f5c403f9c26fd1f7875746e68934bdfa5e14ebaa9c33f12"
+            "1ec2fb84e79c581227b7b20de97fc1bbd23a41c1afa160692567eb6fa08cc471"
         );
+    }
+
+    #[test]
+    fn sampling_seed_is_explicit_and_part_of_the_key() {
+        let mut hashes = std::collections::HashSet::new();
+        for seed in [None, Some(0), Some(1), Some(u64::MAX)] {
+            let request = CompletionRequest {
+                seed,
+                ..CompletionRequest::new(vec![Message::user("same question")])
+            };
+            let encoded = canonical_json(&request);
+            let mut value: Value = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(value.get("seed"), Some(&json!(seed)));
+            let hash = request_hash("model", &request);
+            assert_eq!(hash, request_hash("model", &request.clone()));
+            assert!(
+                hashes.insert(hash.clone()),
+                "different seeds must not collide"
+            );
+
+            // Reconstruct the old encoding only to prove it is never reused,
+            // even for a request whose current seed is explicitly unset.
+            value.as_object_mut().unwrap().remove("seed");
+            let mut old = blake3::Hasher::new();
+            old.update(b"model\0");
+            old.update(value.to_string().as_bytes());
+            assert_ne!(hash, old.finalize().to_hex().to_string());
+        }
     }
 
     #[test]

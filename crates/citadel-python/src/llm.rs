@@ -606,6 +606,26 @@ mod tests {
     }
 
     #[test]
+    fn python_request_round_trip_preserves_seed_identity_separation() {
+        Python::initialize();
+        Python::attach(|py| {
+            let mut hashes = std::collections::HashSet::new();
+            for seed in [None, Some(0), Some(1), Some(u64::MAX)] {
+                let request = CompletionRequest {
+                    seed,
+                    ..CompletionRequest::new(vec![Message::user("same question")])
+                };
+                let rendered = request_to_py(py, &request, "callback-model").unwrap();
+                let restored = request_from_py(rendered.as_any()).unwrap();
+                assert_eq!(restored.seed, seed);
+                let hash = citadel_llm::request_hash("callback-model", &restored);
+                assert_eq!(hash, citadel_llm::request_hash("callback-model", &request));
+                assert!(hashes.insert(hash));
+            }
+        });
+    }
+
+    #[test]
     fn python_request_round_trip_preserves_unset_options() {
         Python::initialize();
         Python::attach(|py| {

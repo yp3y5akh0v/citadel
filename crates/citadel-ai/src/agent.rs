@@ -2146,8 +2146,70 @@ mod tests {
         (dir, agent)
     }
 
-    /// Temperature 0 alone does not make a backend reply reproducible, so a control call
-    /// that omits the seed is not deterministic however the doc reads.
+    #[test]
+    fn replay_separates_seeded_responses_and_rejects_unrecorded_seeds() {
+        let request = |seed| CompletionRequest {
+            seed,
+            ..CompletionRequest::new(vec![Message::user("same question")])
+        };
+        let seeds = [None, Some(0), Some(1), Some(u64::MAX)];
+        let traces = seeds
+            .iter()
+            .enumerate()
+            .map(|(index, &seed)| {
+                (
+                    request_hash("model", &request(seed)),
+                    response_to_value(&CompletionResponse::text(format!("answer {index}"))),
+                )
+            })
+            .collect();
+        let replay = ReplayClient::from_traces("model", traces);
+        for (index, seed) in seeds.into_iter().enumerate() {
+            for _ in 0..2 {
+                assert_eq!(
+                    replay.complete(&request(seed)).unwrap().message.content,
+                    format!("answer {index}")
+                );
+            }
+        }
+        assert_eq!(replay.misses(), 0);
+        assert!(matches!(
+            replay.complete(&request(Some(2))),
+            Err(LlmError::Backend(_))
+        ));
+        assert_eq!(replay.misses(), 1);
+    }
+
+    #[test]
+    fn replay_does_not_accept_traces_that_omitted_seed_identity() {
+        let base = CompletionRequest::new(vec![Message::user("same question")]);
+        let mut old_value: Value =
+            serde_json::from_str(&citadel_llm::canonical_json(&base)).unwrap();
+        old_value.as_object_mut().unwrap().remove("seed");
+        let mut old_hasher = blake3::Hasher::new();
+        old_hasher.update(b"model\0");
+        old_hasher.update(old_value.to_string().as_bytes());
+        let old_hash = old_hasher.finalize().to_hex().to_string();
+        let replay = ReplayClient::from_traces(
+            "model",
+            vec![(
+                old_hash,
+                response_to_value(&CompletionResponse::text("unproven answer")),
+            )],
+        );
+        for seed in [None, Some(0), Some(1), Some(u64::MAX)] {
+            let request = CompletionRequest {
+                seed,
+                ..base.clone()
+            };
+            let error = replay.complete(&request).unwrap_err();
+            assert!(
+                matches!(error, LlmError::Backend(ref text) if text.starts_with("replay: no recorded response for "))
+            );
+        }
+        assert_eq!(replay.misses(), 4);
+    }
+
     #[test]
     fn control_calls_carry_the_configured_seed() {
         let (_dir, eng) = region();
