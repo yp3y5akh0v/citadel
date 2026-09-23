@@ -495,6 +495,17 @@ fn build_index_def_for_create(
     let mut keys: Vec<crate::types::IndexKey> = Vec::with_capacity(stmt.columns.len());
     for (i, raw_name) in stmt.columns.iter().enumerate() {
         if let Some(Some((expr, sql))) = stmt.key_exprs.get(i) {
+            if stmt
+                .collations
+                .get(i)
+                .copied()
+                .flatten()
+                .is_some_and(|collation| collation != crate::types::Collation::Binary)
+            {
+                return Err(SqlError::Unsupported(
+                    "expression index keys require BINARY collation".into(),
+                ));
+            }
             keys.push(crate::types::IndexKey::Expr {
                 expr: expr.clone(),
                 original_sql: sql.clone(),
@@ -515,16 +526,12 @@ fn build_index_def_for_create(
                 table_schema.columns[col_idx as usize].name
             )));
         }
-        let explicit_collate = stmt
+        let collate = stmt
             .collations
             .get(i)
             .copied()
-            .unwrap_or(crate::types::Collation::Binary);
-        let collate = if explicit_collate != crate::types::Collation::Binary {
-            explicit_collate
-        } else {
-            table_schema.columns[col_idx as usize].collation
-        };
+            .flatten()
+            .unwrap_or(table_schema.columns[col_idx as usize].collation);
         keys.push(crate::types::IndexKey::Column {
             idx: col_idx,
             collate,

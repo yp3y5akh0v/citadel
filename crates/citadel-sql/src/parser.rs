@@ -202,7 +202,9 @@ pub struct CreateIndexStmt {
     pub if_not_exists: bool,
     pub predicate_sql: Option<String>,
     pub predicate_expr: Option<Expr>,
-    pub collations: Vec<crate::types::Collation>,
+    /// Per-key explicit collation. None inherits a column's declared collation;
+    /// Some(Binary) is an explicit override, not an omitted clause.
+    pub collations: Vec<Option<crate::types::Collation>>,
     pub kind: crate::types::IndexKind,
     /// ANN-only: filter-column names from `WITH (filters = '...')`, resolved to
     /// schema column indices in `build_index_def_for_create`. Empty otherwise.
@@ -2212,7 +2214,7 @@ fn convert_create_index(ci: sp::CreateIndex) -> Result<Statement> {
     let table_name = object_name_to_string(&ci.table_name);
 
     let mut columns: Vec<String> = Vec::with_capacity(ci.columns.len());
-    let mut collations: Vec<crate::types::Collation> = Vec::with_capacity(ci.columns.len());
+    let mut collations: Vec<Option<crate::types::Collation>> = Vec::with_capacity(ci.columns.len());
     let mut key_exprs: Vec<Option<(Expr, String)>> = Vec::with_capacity(ci.columns.len());
     for idx_col in &ci.columns {
         let mut key_expr = &idx_col.column.expr;
@@ -2220,9 +2222,7 @@ fn convert_create_index(ci: sp::CreateIndex) -> Result<Statement> {
             key_expr = inner;
         }
         let (name, coll, expr_entry) = match key_expr {
-            sp::Expr::Identifier(ident) => {
-                (ident.value.clone(), crate::types::Collation::Binary, None)
-            }
+            sp::Expr::Identifier(ident) => (ident.value.clone(), None, None),
             sp::Expr::Collate {
                 expr: inner,
                 collation,
@@ -2234,7 +2234,7 @@ fn convert_create_index(ci: sp::CreateIndex) -> Result<Statement> {
                     ))
                 })?;
                 match inner.as_ref() {
-                    sp::Expr::Identifier(ident) => (ident.value.clone(), coll, None),
+                    sp::Expr::Identifier(ident) => (ident.value.clone(), Some(coll), None),
                     inner_expr => {
                         if coll != crate::types::Collation::Binary {
                             return Err(SqlError::Unsupported(
@@ -2243,18 +2243,14 @@ fn convert_create_index(ci: sp::CreateIndex) -> Result<Statement> {
                         }
                         let sql = inner_expr.to_string();
                         let expr = convert_expr(inner_expr)?;
-                        (sql.clone(), coll, Some((expr, sql)))
+                        (sql.clone(), Some(coll), Some((expr, sql)))
                     }
                 }
             }
             other => {
                 let sql = other.to_string();
                 let expr = convert_expr(other)?;
-                (
-                    sql.clone(),
-                    crate::types::Collation::Binary,
-                    Some((expr, sql)),
-                )
+                (sql.clone(), None, Some((expr, sql)))
             }
         };
         if let Some((expr, _)) = &expr_entry {
