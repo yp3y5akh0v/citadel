@@ -2106,3 +2106,186 @@ fn converter_rejects_implicit_projection_from_ast() {
         Err(SqlError::Unsupported(_))
     ));
 }
+
+fn upstream_function(sql: &str) -> sp::Function {
+    let sp::Statement::Query(query) = upstream_statement(&format!("SELECT {sql}")) else {
+        panic!("expected query");
+    };
+    let sp::SetExpr::Select(mut select) = *query.body else {
+        panic!("expected SELECT");
+    };
+    let sp::SelectItem::UnnamedExpr(sp::Expr::Function(function)) = select.projection.remove(0)
+    else {
+        panic!("expected function: {sql}");
+    };
+    function
+}
+
+#[test]
+fn converter_rejects_unsupported_function_modifiers() {
+    for sql in [
+        "COUNT(*) FILTER (WHERE false)",
+        "SUM(id) FILTER (WHERE id > 0)",
+        "FIRST_VALUE(id) IGNORE NULLS OVER (ORDER BY id)",
+        "SUM(id) RESPECT NULLS OVER (ORDER BY id)",
+        "NTH_VALUE(id, 1) RESPECT NULLS OVER (ORDER BY id)",
+        "SUM(id) WITHIN GROUP (ORDER BY id DESC)",
+        "SUM(0.5)(id)",
+        "SUM(id ORDER BY id DESC)",
+        "SUM(id LIMIT 1)",
+        "FIRST_VALUE(id IGNORE NULLS) OVER (ORDER BY id)",
+        "SUM(id HAVING MAX id)",
+        "GROUP_CONCAT(id SEPARATOR ';')",
+        "SUM(id ON OVERFLOW ERROR)",
+        "JSON_AGG(id ABSENT ON NULL)",
+        "JSON_AGG(id RETURNING TEXT)",
+    ] {
+        let result = convert_function(&upstream_function(sql));
+        assert!(
+            matches!(result, Err(SqlError::Unsupported(_))),
+            "{sql}: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn converter_checks_function_only_ast_options() {
+    let mut function = upstream_function("ABS(-1)");
+    function.uses_odbc_syntax = true;
+    let Expr::Function {
+        name,
+        args,
+        distinct,
+    } = convert_function(&function).unwrap()
+    else {
+        panic!("expected function");
+    };
+    assert_eq!(name, "ABS");
+    assert!(!distinct);
+    assert!(
+        matches!(args.as_slice(), [Expr::UnaryOp { op: UnaryOp::Neg, expr }]
+        if matches!(**expr, Expr::Literal(Value::Integer(1))))
+    );
+
+    let mut function = upstream_function("SUM(id)");
+    function.parameters = sp::FunctionArguments::List(sp::FunctionArgumentList {
+        duplicate_treatment: None,
+        args: vec![],
+        clauses: vec![],
+    });
+    assert!(matches!(
+        convert_function(&function),
+        Err(SqlError::Unsupported(_))
+    ));
+}
+
+#[test]
+fn converter_rejects_distinct_when_result_cannot_represent_it() {
+    for sql in [
+        "SUM(DISTINCT id) OVER ()",
+        "COUNT(DISTINCT id) OVER (ORDER BY id)",
+        "COUNT(DISTINCT *)",
+        "COALESCE(DISTINCT id, 0)",
+        "NULLIF(DISTINCT id, 0)",
+        "IIF(DISTINCT id > 0, 1, 0)",
+        "COUNT(*, id)",
+        "COUNT(id, *)",
+    ] {
+        let result = convert_function(&upstream_function(sql));
+        assert!(
+            matches!(result, Err(SqlError::Unsupported(_))),
+            "{sql}: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn converter_rejects_named_base_windows() {
+    for sql in [
+        "SUM(id) OVER base_window",
+        "SUM(id) OVER (base_window)",
+        "SUM(id) OVER (base_window ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)",
+    ] {
+        let result = convert_function(&upstream_function(sql));
+        assert!(
+            matches!(result, Err(SqlError::Unsupported(_))),
+            "{sql}: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn supported_aggregate_and_window_options_remain_represented() {
+    for name in ["COUNT", "SUM", "AVG", "MIN", "MAX", "JSON_AGG"] {
+        let expr = parse_sql_expr(&format!("{name}(DISTINCT id)")).unwrap();
+        assert!(
+            matches!(expr, Expr::Function { distinct: true, .. }),
+            "{name}: {expr:?}"
+        );
+        let expr = parse_sql_expr(&format!("{name}(ALL id)")).unwrap();
+        assert!(
+            matches!(
+                expr,
+                Expr::Function {
+                    distinct: false,
+                    ..
+                }
+            ),
+            "{name}: {expr:?}"
+        );
+    }
+    for sql in ["COUNT(*)", "COUNT(ALL *)", "COUNT()"] {
+        assert!(
+            matches!(parse_sql_expr(sql).unwrap(), Expr::CountStar),
+            "{sql}"
+        );
+    }
+    let Expr::WindowFunction { name, args, spec } = parse_sql_expr(
+        "SUM(ALL id) OVER (PARTITION BY bucket ORDER BY id DESC ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)",
+    ).unwrap() else { panic!("expected window function"); };
+    assert_eq!(name, "SUM");
+    assert_eq!(args.len(), 1);
+    assert_eq!(spec.partition_by.len(), 1);
+    assert!(spec.order_by[0].descending);
+    assert!(matches!(
+        spec.frame,
+        Some(WindowFrame {
+            units: WindowFrameUnits::Rows,
+            start: WindowFrameBound::Preceding(_),
+            end: WindowFrameBound::CurrentRow
+        })
+    ));
+    let Expr::WindowFunction { name, args, .. } = parse_sql_expr("COUNT(*) OVER ()").unwrap()
+    else {
+        panic!("expected window function");
+    };
+    assert_eq!(name, "COUNT");
+    assert!(args.is_empty());
+}
+
+#[test]
+fn explicit_respect_nulls_matches_supported_value_windows() {
+    for name in ["FIRST_VALUE", "LAST_VALUE", "LAG", "LEAD"] {
+        for sql in [
+            format!("{name}(id) OVER (ORDER BY id)"),
+            format!("{name}(id) RESPECT NULLS OVER (ORDER BY id)"),
+            format!("{name}(id RESPECT NULLS) OVER (ORDER BY id)"),
+        ] {
+            let Expr::WindowFunction {
+                name: converted_name,
+                args,
+                spec,
+            } = convert_function(&upstream_function(&sql)).unwrap()
+            else {
+                panic!("expected window function: {sql}");
+            };
+            assert_eq!(converted_name, name);
+            assert!(matches!(args.as_slice(), [Expr::Column(column)] if column == "id"));
+            assert!(spec.partition_by.is_empty());
+            assert!(spec.frame.is_none());
+            assert_eq!(spec.order_by.len(), 1);
+            assert!(matches!(&spec.order_by[0].expr, Expr::Column(column) if column == "id"));
+            assert!(!spec.order_by[0].descending);
+        }
+    }
+}
