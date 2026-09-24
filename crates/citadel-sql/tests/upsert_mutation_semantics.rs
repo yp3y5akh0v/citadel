@@ -106,6 +106,44 @@ fn upsert_runs_before_update_once_with_old_and_excluded_values() {
 }
 
 #[test]
+fn unique_conflict_update_keeps_assigned_names_for_update_of_triggers() {
+    with_connection(|conn| {
+        conn.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE, v INTEGER, other INTEGER)",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a', 10, 20)")
+            .unwrap();
+        conn.execute("CREATE TABLE audit (id INTEGER PRIMARY KEY, calls INTEGER)")
+            .unwrap();
+        conn.execute("INSERT INTO audit VALUES (1, 0)").unwrap();
+        conn.execute("CREATE TRIGGER count_v AFTER UPDATE OF v ON t FOR EACH ROW BEGIN UPDATE audit SET calls = calls + 1 WHERE id = 1; END").unwrap();
+        for assignment in ["v = v", "other = other + 1"] {
+            let sql = format!("INSERT INTO t VALUES ($1, 'a', 0, 0) ON CONFLICT (email) DO UPDATE SET {assignment}");
+            assert_eq!(
+                conn.prepare(&sql)
+                    .unwrap()
+                    .execute(&[Value::Integer(9)])
+                    .unwrap(),
+                1
+            );
+        }
+        assert_eq!(
+            conn.query("SELECT calls FROM audit").unwrap().rows,
+            vec![vec![Value::Integer(1)]]
+        );
+        assert_eq!(
+            conn.query("SELECT id, v, other FROM t").unwrap().rows,
+            vec![vec![
+                Value::Integer(1),
+                Value::Integer(10),
+                Value::Integer(21)
+            ]]
+        );
+    });
+}
+
+#[test]
 fn upsert_statement_triggers_capture_only_their_actual_rows_once() {
     with_connection(|conn| {
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
