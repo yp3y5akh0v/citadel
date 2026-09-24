@@ -113,6 +113,13 @@ impl ColumnMap {
             }
             None => {}
         }
+        // A derived projection can have a literal name such as `t.id`.
+        // Qualifying that name as d."t.id" must retain the complete label.
+        match self.exact.get(column) {
+            Some(ShortMatch::Unique(idx)) => return Ok(*idx),
+            Some(ShortMatch::Ambiguous) => return Err(SqlError::AmbiguousColumn(qualified)),
+            None => {}
+        }
         match self.short.get(column) {
             Some(ShortMatch::Unique(idx)) => Ok(*idx),
             _ => Err(SqlError::ColumnNotFound(format!("{table}.{column}"))),

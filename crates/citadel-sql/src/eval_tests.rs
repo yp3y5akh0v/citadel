@@ -490,6 +490,33 @@ fn test_columns() -> Vec<ColumnDef> {
     ]
 }
 
+#[test]
+fn qualified_lookup_preserves_literal_output_names_and_ambiguity() {
+    let map = ColumnMap::new(&[
+        col("t.id", DataType::Integer, false, 0),
+        col("d.t.id", DataType::Integer, false, 1),
+    ]);
+    assert_eq!(map.resolve_qualified("d", "t.id").unwrap(), 1);
+    assert_eq!(map.resolve_qualified("result", "t.id").unwrap(), 0);
+
+    let map = ColumnMap::new(&[
+        col("t.id", DataType::Integer, false, 0),
+        col("t.id", DataType::Integer, false, 1),
+    ]);
+    assert!(
+        matches!(map.resolve_qualified("result", "t.id"), Err(SqlError::AmbiguousColumn(name)) if name == "result.t.id")
+    );
+
+    let map = ColumnMap::new(&[
+        col("d.t.id", DataType::Integer, false, 0),
+        col("d.t.id", DataType::Integer, false, 1),
+        col("t.id", DataType::Integer, false, 2),
+    ]);
+    assert!(
+        matches!(map.resolve_qualified("d", "t.id"), Err(SqlError::AmbiguousColumn(name)) if name == "d.t.id")
+    );
+}
+
 fn test_row() -> Vec<Value> {
     vec![
         Value::Integer(1),
