@@ -1034,22 +1034,31 @@ fn count_params_insert_conflict_where() {
 
 #[test]
 fn count_params_insert_conflict_nested_subqueries() {
-    for (sql, expected) in [
+    for (assignment, predicate, expected) in [
         (
-            "INSERT INTO t VALUES ($1, $2) \
-             ON CONFLICT (id) DO UPDATE SET v = COALESCE($3, (SELECT $6)) \
-             WHERE EXISTS (SELECT 1 FROM gate WHERE mark = $4)",
+            "COALESCE($3, (SELECT $6))",
+            "EXISTS (SELECT 1 FROM gate WHERE mark = $4)",
             6,
         ),
         (
-            "INSERT INTO t VALUES ($1, $2) \
-             ON CONFLICT (id) DO UPDATE SET v = COALESCE($3, (SELECT $4)) \
-             WHERE EXISTS (SELECT 1 FROM gate WHERE mark = $7)",
+            "COALESCE($3, (SELECT $4))",
+            "EXISTS (SELECT 1 FROM gate WHERE mark = $7)",
             7,
         ),
     ] {
-        let stmt = parse_sql(sql).unwrap();
-        assert_eq!(count_params(&stmt), expected, "{sql}");
+        // Parameter traversal covers the public AST even when execution does
+        // not support a particular expression in ON CONFLICT.
+        let mut stmt =
+            parse_sql("INSERT INTO t VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET v = $3")
+                .unwrap();
+        let Statement::Insert(insert) = &mut stmt else {
+            panic!("expected INSERT")
+        };
+        insert.on_conflict.as_mut().unwrap().action = OnConflictAction::DoUpdate {
+            assignments: vec![("v".into(), parse_sql_expr(assignment).unwrap())],
+            where_clause: Some(parse_sql_expr(predicate).unwrap()),
+        };
+        assert_eq!(count_params(&stmt), expected, "{assignment}; {predicate}");
     }
 }
 
@@ -1937,12 +1946,10 @@ fn converter_rejects_unsupported_dml_fields() {
         "UPDATE q SET n = 1 LIMIT 1",
         "UPDATE OR IGNORE q SET n = 1",
         "UPDATE q JOIN other ON q.id = other.id SET n = 1",
-        "UPDATE q AS target SET n = 1",
         "DELETE FROM q LIMIT 1",
         "DELETE FROM q ORDER BY id",
         "DELETE FROM q USING other",
         "DELETE FROM q JOIN other ON q.id = other.id",
-        "DELETE FROM q AS target",
         "INSERT OR IGNORE INTO q VALUES (1)",
         "INSERT OR REPLACE INTO q VALUES (1)",
         "INSERT IGNORE INTO q VALUES (1)",
@@ -1966,10 +1973,6 @@ fn converter_rejects_dialect_specific_semantic_modifiers() {
         (
             "DELETE q FROM q JOIN other ON q.id = other.id",
             &sqlparser::dialect::MySqlDialect {} as &dyn sqlparser::dialect::Dialect,
-        ),
-        (
-            "INSERT INTO q AS target VALUES (1)",
-            &sqlparser::dialect::PostgreSqlDialect {} as &dyn sqlparser::dialect::Dialect,
         ),
         (
             "WITH t AS MATERIALIZED (SELECT 1) SELECT * FROM t",

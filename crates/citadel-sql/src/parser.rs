@@ -5,6 +5,12 @@ use sqlparser::ast as sp;
 use crate::error::{Result, SqlError};
 use crate::types::{DataType, Value};
 
+mod dml_aliases;
+mod expr_name;
+pub(crate) use expr_name::expr_display_name;
+#[cfg(test)]
+pub(crate) use expr_name::op_symbol;
+
 #[derive(Debug, Clone)]
 pub enum Statement {
     CreateTable(CreateTableStmt),
@@ -2766,10 +2772,7 @@ fn convert_insert(insert: sp::Insert) -> Result<Statement> {
         (ignore, "INSERT IGNORE"),
         (overwrite, "INSERT OVERWRITE"),
         (replace_into, "REPLACE INTO"),
-        (
-            table_alias.is_some() || insert_alias.is_some(),
-            "INSERT aliases",
-        ),
+        (insert_alias.is_some(), "INSERT proposed-row aliases"),
         (!assignments.is_empty(), "INSERT SET assignments"),
         (
             partitioned.is_some() || !after_columns.is_empty(),
@@ -2832,15 +2835,18 @@ fn convert_insert(insert: sp::Insert) -> Result<Statement> {
     };
 
     let on_conflict = on.as_ref().map(convert_on_insert).transpose()?;
-    let returning = convert_returning(returning.as_deref())?;
+    let alias = table_alias.as_ref().map(|alias| alias.value.as_str());
+    let returning = dml_aliases::convert_returning(returning.as_deref(), alias)?;
 
-    Ok(Statement::Insert(InsertStmt {
+    let mut stmt = InsertStmt {
         table,
         columns,
         source,
         on_conflict,
         returning,
-    }))
+    };
+    dml_aliases::lower_insert(&mut stmt, alias)?;
+    Ok(Statement::Insert(stmt))
 }
 
 fn convert_on_insert(on: &sp::OnInsert) -> Result<OnConflictClause> {
@@ -3529,7 +3535,10 @@ fn convert_join(join: &sp::Join) -> Result<JoinClause> {
     })
 }
 
-fn convert_dml_target(target: &sp::TableWithJoins, operation: &str) -> Result<String> {
+fn convert_dml_target(
+    target: &sp::TableWithJoins,
+    operation: &str,
+) -> Result<(String, Option<String>)> {
     if !target.joins.is_empty() {
         return Err(SqlError::Unsupported(format!(
             "{operation} with joined target"
@@ -3541,12 +3550,12 @@ fn convert_dml_target(target: &sp::TableWithJoins, operation: &str) -> Result<St
         )));
     }
     let (name, alias, _, args, _) = convert_from_relation(&target.relation)?;
-    if alias.is_some() || args.is_some() {
+    if args.is_some() {
         return Err(SqlError::Unsupported(format!(
-            "{operation} target alias or function arguments"
+            "{operation} target function arguments"
         )));
     }
-    Ok(name)
+    Ok((name, alias))
 }
 
 fn convert_update(update: sp::Update) -> Result<Statement> {
@@ -3567,7 +3576,7 @@ fn convert_update(update: sp::Update) -> Result<Statement> {
         (or.is_some(), "UPDATE OR conflict policy"),
         (limit.is_some(), "UPDATE LIMIT"),
     ])?;
-    let table = convert_dml_target(&table, "UPDATE")?;
+    let (table, alias) = convert_dml_target(&table, "UPDATE")?;
 
     let assignments = assignments
         .iter()
@@ -3582,14 +3591,16 @@ fn convert_update(update: sp::Update) -> Result<Statement> {
         .collect::<Result<_>>()?;
 
     let where_clause = selection.as_ref().map(convert_expr).transpose()?;
-    let returning = convert_returning(returning.as_deref())?;
+    let returning = dml_aliases::convert_returning(returning.as_deref(), alias.as_deref())?;
 
-    Ok(Statement::Update(UpdateStmt {
+    let mut stmt = UpdateStmt {
         table,
         assignments,
         where_clause,
         returning,
-    }))
+    };
+    dml_aliases::lower_update(&mut stmt, alias.as_deref())?;
+    Ok(Statement::Update(stmt))
 }
 
 fn convert_truncate(t: sp::Truncate) -> Result<Statement> {
@@ -3643,15 +3654,17 @@ fn convert_delete(delete: sp::Delete) -> Result<Statement> {
     let [target] = tables.as_slice() else {
         return Err(SqlError::Unsupported("multi-table DELETE".into()));
     };
-    let table = convert_dml_target(target, "DELETE")?;
+    let (table, alias) = convert_dml_target(target, "DELETE")?;
     let where_clause = selection.as_ref().map(convert_expr).transpose()?;
-    let returning = convert_returning(returning.as_deref())?;
+    let returning = dml_aliases::convert_returning(returning.as_deref(), alias.as_deref())?;
 
-    Ok(Statement::Delete(DeleteStmt {
+    let mut stmt = DeleteStmt {
         table,
         where_clause,
         returning,
-    }))
+    };
+    dml_aliases::lower_delete(&mut stmt, alias.as_deref())?;
+    Ok(Statement::Delete(stmt))
 }
 
 fn convert_expr(expr: &sp::Expr) -> Result<Expr> {
@@ -4422,19 +4435,6 @@ fn convert_window_frame_bound(b: &sp::WindowFrameBound) -> Result<WindowFrameBou
         sp::WindowFrameBound::Following(None) => Ok(WindowFrameBound::UnboundedFollowing),
         sp::WindowFrameBound::Following(Some(e)) => {
             Ok(WindowFrameBound::Following(Box::new(convert_expr(e)?)))
-        }
-    }
-}
-
-fn convert_returning(items: Option<&[sp::SelectItem]>) -> Result<Option<Vec<SelectColumn>>> {
-    match items {
-        None => Ok(None),
-        Some(items) => {
-            let cols = items
-                .iter()
-                .map(convert_returning_item)
-                .collect::<Result<Vec<_>>>()?;
-            Ok(Some(cols))
         }
     }
 }
