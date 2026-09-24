@@ -134,7 +134,7 @@ impl Drop for TransitionGuard {
 pub struct SchemaManager {
     tables: FxHashMap<String, TableSchema>,
     views: FxHashMap<String, ViewDef>,
-    virtual_tables: FxHashMap<String, Arc<dyn VirtualTable>>,
+    virtual_tables: FxHashMap<String, VirtualTableEntry>,
     /// Within a `(target, timing, event)` group, triggers fire in name order.
     triggers: FxHashMap<String, Vec<crate::types::TriggerDef>>,
     /// Matview catalog. Backing table shares the matview's name in `tables`; this map
@@ -170,6 +170,12 @@ pub struct SchemaManager {
     dml_append_tables: std::cell::RefCell<FxHashMap<String, i64>>,
     /// Reverse FK index, rebuilt lazily whenever the schema generation changes.
     fk_children_cache: FkChildrenCache,
+}
+
+#[derive(Clone)]
+struct VirtualTableEntry {
+    table: Arc<dyn VirtualTable>,
+    columns: Option<&'static [&'static str]>,
 }
 
 /// DML since the last commit, classified for cache invalidation.
@@ -559,7 +565,7 @@ impl SchemaManager {
                 fresh.virtual_tables.extend(
                     self.virtual_tables
                         .iter()
-                        .map(|(name, table)| (name.clone(), Arc::clone(table))),
+                        .map(|(name, table)| (name.clone(), table.clone())),
                 );
             } else if self.catalog_origin.is_none() {
                 // User virtual tables registered before first admission have
@@ -568,7 +574,7 @@ impl SchemaManager {
                 fresh.virtual_tables.extend(
                     self.virtual_tables
                         .iter()
-                        .map(|(name, table)| (name.clone(), Arc::clone(table))),
+                        .map(|(name, table)| (name.clone(), table.clone())),
                 );
             }
             *self = fresh;
@@ -608,7 +614,7 @@ impl SchemaManager {
             fresh.virtual_tables.extend(
                 self.virtual_tables
                     .iter()
-                    .map(|(name, table)| (name.clone(), Arc::clone(table))),
+                    .map(|(name, table)| (name.clone(), table.clone())),
             );
             fresh.restore_dml_snapshot(self.save_dml_snapshot());
             *self = fresh;
@@ -708,12 +714,40 @@ impl SchemaManager {
     }
 
     pub fn get_virtual(&self, name: &str) -> Option<&Arc<dyn VirtualTable>> {
-        self.virtual_tables.get(name)
+        self.virtual_tables.get(name).map(|entry| &entry.table)
     }
 
     pub fn register_virtual(&mut self, vt: Arc<dyn VirtualTable>) {
         let name = vt.name().to_ascii_lowercase();
-        self.virtual_tables.insert(name, vt);
+        self.virtual_tables.insert(
+            name,
+            VirtualTableEntry {
+                table: vt,
+                columns: None,
+            },
+        );
+    }
+
+    pub(crate) fn register_builtin_virtual(
+        &mut self,
+        vt: Arc<dyn VirtualTable>,
+        columns: &'static [&'static str],
+    ) {
+        let name = vt.name().to_ascii_lowercase();
+        self.virtual_tables.insert(
+            name,
+            VirtualTableEntry {
+                table: vt,
+                columns: Some(columns),
+            },
+        );
+    }
+
+    /// Static columns belong to this registration, never merely its name.
+    pub(crate) fn virtual_columns(&self, name: &str) -> Option<&'static [&'static str]> {
+        self.virtual_tables
+            .get(name)
+            .and_then(|entry| entry.columns)
     }
 
     pub fn get(&self, name: &str) -> Option<&TableSchema> {

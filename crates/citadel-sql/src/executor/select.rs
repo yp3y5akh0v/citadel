@@ -26,20 +26,6 @@ use super::view::*;
 use super::window::*;
 use super::{CteContext, CteRows, SelectCtx};
 
-fn try_virtual_table(
-    name: &str,
-    schema: &SchemaManager,
-    cancel: Option<&CancelToken>,
-) -> Option<Result<QueryResult>> {
-    let canonical = match name {
-        "timezone_names" => "pg_timezone_names",
-        "timezone_abbrevs" => "pg_timezone_abbrevs",
-        other => other,
-    };
-    let vt = schema.get_virtual(canonical)?;
-    Some(vt.scan(schema, cancel))
-}
-
 /// Which strategy a single-table SELECT actually takes.
 ///
 /// One decision procedure, consulted by the executor and by EXPLAIN, so the two
@@ -159,39 +145,21 @@ pub(super) fn exec_select_with_read(
 
     let lower_name = stmt.from.to_ascii_lowercase();
 
-    if let Some(vt_result) = try_virtual_table(&lower_name, schema, cancel) {
-        let vt_result = CteRows::binary(vt_result?);
+    if let Some(cte_result) = super::materialized_source(&lower_name, schema, ctes, cancel)? {
         if stmt.joins.is_empty() {
             return exec_select_from_cte(
-                &vt_result,
-                stmt,
-                &mut |sub| exec_subquery_with_read(rtx, schema, sub, ctes),
-                cancel,
-            );
-        }
-        let mut vt_ctes = ctes.clone();
-        vt_ctes.insert(lower_name.clone(), vt_result.shared());
-        return super::exec_select_join_with_ctes(
-            stmt,
-            &vt_ctes,
-            &mut |name| super::scan_table_with_read_or_view(rtx, schema, name),
-            cancel,
-        );
-    }
-
-    if let Some(cte_result) = ctes.get(&lower_name) {
-        if stmt.joins.is_empty() {
-            return exec_select_from_cte(
-                cte_result,
+                &cte_result,
                 stmt,
                 &mut |sub| exec_subquery_with_read(rtx, schema, sub, ctes),
                 cancel,
             );
         } else {
+            let mut sources = ctes.clone();
+            sources.insert(lower_name.clone(), cte_result);
             return super::exec_select_join_with_ctes(
                 stmt,
-                ctes,
-                &mut |name| super::scan_table_with_read(rtx, schema, name),
+                &sources,
+                &mut |name| super::scan_table_with_read_or_view(rtx, schema, name),
                 cancel,
             );
         }
@@ -266,12 +234,11 @@ pub(super) fn exec_select_with_read(
         }
     }
 
-    let any_join_view = stmt.joins.iter().any(|j| {
-        schema
-            .get_view(&j.table.name.to_ascii_lowercase())
-            .is_some()
+    let has_view_or_virtual_join = stmt.joins.iter().any(|j| {
+        let name = j.table.name.to_ascii_lowercase();
+        schema.get_view(&name).is_some() || super::virtual_table(&name, schema).is_some()
     });
-    if any_join_view {
+    if has_view_or_virtual_join {
         let mut view_ctes = ctes.clone();
         for j in &stmt.joins {
             let jname = j.table.name.to_ascii_lowercase();
@@ -285,7 +252,7 @@ pub(super) fn exec_select_with_read(
         return super::exec_select_join_with_ctes(
             stmt,
             &view_ctes,
-            &mut |name| super::scan_table_with_read(rtx, schema, name),
+            &mut |name| super::scan_table_with_read_or_view(rtx, schema, name),
             cancel,
         );
     }

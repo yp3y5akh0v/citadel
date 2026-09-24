@@ -1,5 +1,5 @@
 use citadel::{Argon2Profile, Database, DatabaseBuilder};
-use citadel_sql::{Connection, SqlError, Value, executor, parser, schema::SchemaManager};
+use citadel_sql::{executor, parser, schema::SchemaManager, Connection, SqlError, Value};
 
 fn database() -> Database {
     DatabaseBuilder::new("")
@@ -41,12 +41,10 @@ fn unsupported_when_conditions_never_register_a_trigger() {
                  WHEN ({condition}) BEGIN SELECT 1; END"
             );
             rejects_when_subquery(conn.execute(&sql));
-            assert!(
-                SchemaManager::load(&db)
-                    .unwrap()
-                    .find_trigger("invalid_when")
-                    .is_none()
-            );
+            assert!(SchemaManager::load(&db)
+                .unwrap()
+                .find_trigger("invalid_when")
+                .is_none());
         }
     }
     conn.execute("INSERT INTO parent VALUES (1)").unwrap();
@@ -69,12 +67,10 @@ fn prepared_create_rejects_when_subquery_before_registration() {
         )
         .unwrap();
     rejects_when_subquery(prepared.execute(&[]));
-    assert!(
-        SchemaManager::load(&db)
-            .unwrap()
-            .find_trigger("invalid_when")
-            .is_none()
-    );
+    assert!(SchemaManager::load(&db)
+        .unwrap()
+        .find_trigger("invalid_when")
+        .is_none());
     conn.execute("INSERT INTO parent VALUES (1)").unwrap();
 }
 
@@ -111,12 +107,10 @@ fn public_ast_validates_both_when_representations() {
         assert!(schema.find_trigger("invalid_when").is_none());
         write.abort();
     }
-    assert!(
-        SchemaManager::load(&db)
-            .unwrap()
-            .find_trigger("invalid_when")
-            .is_none()
-    );
+    assert!(SchemaManager::load(&db)
+        .unwrap()
+        .find_trigger("invalid_when")
+        .is_none());
 }
 
 #[test]

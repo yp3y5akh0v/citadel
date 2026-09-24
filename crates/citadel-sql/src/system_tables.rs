@@ -39,23 +39,36 @@ fn check_cancel_at(cancel: Option<&citadel::CancelToken>, work: usize) -> Result
 }
 
 pub fn register_builtins(schema: &mut SchemaManager) {
-    let entries: [Arc<dyn VirtualTable>; 9] = [
-        Arc::new(PgTimezoneNames),
-        Arc::new(PgTimezoneAbbrevs),
-        Arc::new(InfoSchemaTables),
-        Arc::new(InfoSchemaColumns),
-        Arc::new(InfoSchemaKeyColumnUsage),
-        Arc::new(InfoSchemaTableConstraints),
-        Arc::new(InfoSchemaTriggers),
-        Arc::new(CitadelTriggersStatus),
-        Arc::new(PgMatviews),
+    let entries: [(Arc<dyn VirtualTable>, &[&str]); 9] = [
+        (Arc::new(PgTimezoneNames), PgTimezoneNames::COLUMNS),
+        (Arc::new(PgTimezoneAbbrevs), PgTimezoneAbbrevs::COLUMNS),
+        (Arc::new(InfoSchemaTables), InfoSchemaTables::COLUMNS),
+        (Arc::new(InfoSchemaColumns), InfoSchemaColumns::COLUMNS),
+        (
+            Arc::new(InfoSchemaKeyColumnUsage),
+            InfoSchemaKeyColumnUsage::COLUMNS,
+        ),
+        (
+            Arc::new(InfoSchemaTableConstraints),
+            InfoSchemaTableConstraints::COLUMNS,
+        ),
+        (Arc::new(InfoSchemaTriggers), InfoSchemaTriggers::COLUMNS),
+        (
+            Arc::new(CitadelTriggersStatus),
+            CitadelTriggersStatus::COLUMNS,
+        ),
+        (Arc::new(PgMatviews), PgMatviews::COLUMNS),
     ];
-    for vt in entries {
-        schema.register_virtual(vt);
+    for (vt, columns) in entries {
+        schema.register_builtin_virtual(vt, columns);
     }
 }
 
 pub struct PgTimezoneNames;
+impl PgTimezoneNames {
+    const COLUMNS: &[&str] = &["name", "utc_offset", "is_dst"];
+}
+
 impl VirtualTable for PgTimezoneNames {
     fn name(&self) -> &str {
         "pg_timezone_names"
@@ -66,11 +79,10 @@ impl VirtualTable for PgTimezoneNames {
         cancel: Option<&citadel::CancelToken>,
     ) -> Result<QueryResult> {
         check_cancel(cancel)?;
-        let columns = vec![
-            "name".to_string(),
-            "utc_offset".to_string(),
-            "is_dst".to_string(),
-        ];
+        let columns = Self::COLUMNS
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect();
         let now = jiff::Timestamp::now();
         let db = jiff::tz::db();
         let mut rows = Vec::new();
@@ -96,6 +108,10 @@ impl VirtualTable for PgTimezoneNames {
 }
 
 pub struct PgTimezoneAbbrevs;
+impl PgTimezoneAbbrevs {
+    const COLUMNS: &[&str] = &["abbrev", "utc_offset", "is_dst"];
+}
+
 impl VirtualTable for PgTimezoneAbbrevs {
     fn name(&self) -> &str {
         "pg_timezone_abbrevs"
@@ -106,11 +122,10 @@ impl VirtualTable for PgTimezoneAbbrevs {
         cancel: Option<&citadel::CancelToken>,
     ) -> Result<QueryResult> {
         check_cancel(cancel)?;
-        let columns = vec![
-            "abbrev".to_string(),
-            "utc_offset".to_string(),
-            "is_dst".to_string(),
-        ];
+        let columns = Self::COLUMNS
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect();
         let now = jiff::Timestamp::now();
         let db = jiff::tz::db();
         let mut seen: FxHashSet<String> = FxHashSet::default();
@@ -141,6 +156,10 @@ impl VirtualTable for PgTimezoneAbbrevs {
 }
 
 pub struct InfoSchemaTables;
+impl InfoSchemaTables {
+    const COLUMNS: &[&str] = &["table_catalog", "table_schema", "table_name", "table_type"];
+}
+
 impl VirtualTable for InfoSchemaTables {
     fn name(&self) -> &str {
         "information_schema.tables"
@@ -151,12 +170,10 @@ impl VirtualTable for InfoSchemaTables {
         cancel: Option<&citadel::CancelToken>,
     ) -> Result<QueryResult> {
         check_cancel(cancel)?;
-        let columns = vec![
-            "table_catalog".to_string(),
-            "table_schema".to_string(),
-            "table_name".to_string(),
-            "table_type".to_string(),
-        ];
+        let columns = Self::COLUMNS
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect();
         let mut rows = Vec::new();
         let mut work = 0;
         for ts in schema.all_schemas() {
@@ -203,6 +220,19 @@ impl VirtualTable for InfoSchemaTables {
 }
 
 pub struct InfoSchemaColumns;
+impl InfoSchemaColumns {
+    const COLUMNS: &[&str] = &[
+        "table_catalog",
+        "table_schema",
+        "table_name",
+        "column_name",
+        "ordinal_position",
+        "column_default",
+        "is_nullable",
+        "data_type",
+    ];
+}
+
 impl VirtualTable for InfoSchemaColumns {
     fn name(&self) -> &str {
         "information_schema.columns"
@@ -213,16 +243,10 @@ impl VirtualTable for InfoSchemaColumns {
         cancel: Option<&citadel::CancelToken>,
     ) -> Result<QueryResult> {
         check_cancel(cancel)?;
-        let columns = vec![
-            "table_catalog".to_string(),
-            "table_schema".to_string(),
-            "table_name".to_string(),
-            "column_name".to_string(),
-            "ordinal_position".to_string(),
-            "column_default".to_string(),
-            "is_nullable".to_string(),
-            "data_type".to_string(),
-        ];
+        let columns = Self::COLUMNS
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect();
         let mut rows = Vec::new();
         let schemas: Vec<_> = schema.all_schemas().collect();
         let schemas = sort_vec_by(schemas, cancel, |a, b| a.name.cmp(&b.name))?;
@@ -256,6 +280,21 @@ impl VirtualTable for InfoSchemaColumns {
 }
 
 pub struct InfoSchemaKeyColumnUsage;
+impl InfoSchemaKeyColumnUsage {
+    const COLUMNS: &[&str] = &[
+        "constraint_catalog",
+        "constraint_schema",
+        "constraint_name",
+        "table_catalog",
+        "table_schema",
+        "table_name",
+        "column_name",
+        "ordinal_position",
+        "referenced_table_name",
+        "referenced_column_name",
+    ];
+}
+
 impl VirtualTable for InfoSchemaKeyColumnUsage {
     fn name(&self) -> &str {
         "information_schema.key_column_usage"
@@ -266,18 +305,10 @@ impl VirtualTable for InfoSchemaKeyColumnUsage {
         cancel: Option<&citadel::CancelToken>,
     ) -> Result<QueryResult> {
         check_cancel(cancel)?;
-        let columns = vec![
-            "constraint_catalog".to_string(),
-            "constraint_schema".to_string(),
-            "constraint_name".to_string(),
-            "table_catalog".to_string(),
-            "table_schema".to_string(),
-            "table_name".to_string(),
-            "column_name".to_string(),
-            "ordinal_position".to_string(),
-            "referenced_table_name".to_string(),
-            "referenced_column_name".to_string(),
-        ];
+        let columns = Self::COLUMNS
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect();
         let mut rows = Vec::new();
         let schemas: Vec<_> = schema.all_schemas().collect();
         let schemas = sort_vec_by(schemas, cancel, |a, b| a.name.cmp(&b.name))?;
@@ -331,6 +362,18 @@ impl VirtualTable for InfoSchemaKeyColumnUsage {
 }
 
 pub struct InfoSchemaTableConstraints;
+impl InfoSchemaTableConstraints {
+    const COLUMNS: &[&str] = &[
+        "constraint_catalog",
+        "constraint_schema",
+        "constraint_name",
+        "table_catalog",
+        "table_schema",
+        "table_name",
+        "constraint_type",
+    ];
+}
+
 impl VirtualTable for InfoSchemaTableConstraints {
     fn name(&self) -> &str {
         "information_schema.table_constraints"
@@ -341,15 +384,10 @@ impl VirtualTable for InfoSchemaTableConstraints {
         cancel: Option<&citadel::CancelToken>,
     ) -> Result<QueryResult> {
         check_cancel(cancel)?;
-        let columns = vec![
-            "constraint_catalog".to_string(),
-            "constraint_schema".to_string(),
-            "constraint_name".to_string(),
-            "table_catalog".to_string(),
-            "table_schema".to_string(),
-            "table_name".to_string(),
-            "constraint_type".to_string(),
-        ];
+        let columns = Self::COLUMNS
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect();
         let mut rows = Vec::new();
         let schemas: Vec<_> = schema.all_schemas().collect();
         let schemas = sort_vec_by(schemas, cancel, |a, b| a.name.cmp(&b.name))?;
@@ -441,6 +479,28 @@ fn data_type_name(dt: &DataType) -> &'static str {
 
 /// One row per event for multi-event triggers (per SQL spec).
 pub struct InfoSchemaTriggers;
+impl InfoSchemaTriggers {
+    const COLUMNS: &[&str] = &[
+        "trigger_catalog",
+        "trigger_schema",
+        "trigger_name",
+        "event_manipulation",
+        "event_object_catalog",
+        "event_object_schema",
+        "event_object_table",
+        "action_order",
+        "action_condition",
+        "action_statement",
+        "action_orientation",
+        "action_timing",
+        "action_reference_old_table",
+        "action_reference_new_table",
+        "action_reference_old_row",
+        "action_reference_new_row",
+        "created",
+    ];
+}
+
 impl VirtualTable for InfoSchemaTriggers {
     fn name(&self) -> &str {
         "information_schema.triggers"
@@ -451,25 +511,10 @@ impl VirtualTable for InfoSchemaTriggers {
         cancel: Option<&citadel::CancelToken>,
     ) -> Result<QueryResult> {
         check_cancel(cancel)?;
-        let columns = vec![
-            "trigger_catalog".to_string(),
-            "trigger_schema".to_string(),
-            "trigger_name".to_string(),
-            "event_manipulation".to_string(),
-            "event_object_catalog".to_string(),
-            "event_object_schema".to_string(),
-            "event_object_table".to_string(),
-            "action_order".to_string(),
-            "action_condition".to_string(),
-            "action_statement".to_string(),
-            "action_orientation".to_string(),
-            "action_timing".to_string(),
-            "action_reference_old_table".to_string(),
-            "action_reference_new_table".to_string(),
-            "action_reference_old_row".to_string(),
-            "action_reference_new_row".to_string(),
-            "created".to_string(),
-        ];
+        let columns = Self::COLUMNS
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect();
         let all: Vec<&crate::types::TriggerDef> = schema.all_triggers().collect();
         let all = sort_vec_by(all, cancel, |a, b| {
             a.target.cmp(&b.target).then(a.name.cmp(&b.name))
@@ -549,6 +594,10 @@ impl VirtualTable for InfoSchemaTriggers {
 
 /// Surfaces `enabled` status — PG hides this from `information_schema.triggers`.
 pub struct CitadelTriggersStatus;
+impl CitadelTriggersStatus {
+    const COLUMNS: &[&str] = &["trigger_name", "table_name", "enabled"];
+}
+
 impl VirtualTable for CitadelTriggersStatus {
     fn name(&self) -> &str {
         "citadel_triggers_status"
@@ -559,11 +608,10 @@ impl VirtualTable for CitadelTriggersStatus {
         cancel: Option<&citadel::CancelToken>,
     ) -> Result<QueryResult> {
         check_cancel(cancel)?;
-        let columns = vec![
-            "trigger_name".to_string(),
-            "table_name".to_string(),
-            "enabled".to_string(),
-        ];
+        let columns = Self::COLUMNS
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect();
         let all: Vec<&crate::types::TriggerDef> = schema.all_triggers().collect();
         let all = sort_vec_by(all, cancel, |a, b| {
             a.target.cmp(&b.target).then(a.name.cmp(&b.name))
@@ -584,6 +632,18 @@ impl VirtualTable for CitadelTriggersStatus {
 
 /// `matviewowner` and `tablespace` are constants — citadel has no permission/storage concept.
 pub struct PgMatviews;
+impl PgMatviews {
+    const COLUMNS: &[&str] = &[
+        "schemaname",
+        "matviewname",
+        "matviewowner",
+        "tablespace",
+        "hasindexes",
+        "ispopulated",
+        "definition",
+    ];
+}
+
 impl VirtualTable for PgMatviews {
     fn name(&self) -> &str {
         "pg_matviews"
@@ -594,15 +654,10 @@ impl VirtualTable for PgMatviews {
         cancel: Option<&citadel::CancelToken>,
     ) -> Result<QueryResult> {
         check_cancel(cancel)?;
-        let columns = vec![
-            "schemaname".to_string(),
-            "matviewname".to_string(),
-            "matviewowner".to_string(),
-            "tablespace".to_string(),
-            "hasindexes".to_string(),
-            "ispopulated".to_string(),
-            "definition".to_string(),
-        ];
+        let columns = Self::COLUMNS
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect();
         let entries: Vec<&crate::types::MatviewDef> = schema.all_matviews().collect();
         let entries = sort_vec_by(entries, cancel, |a, b| a.name.cmp(&b.name))?;
         let mut rows = Vec::with_capacity(entries.len());
@@ -624,5 +679,76 @@ impl VirtualTable for PgMatviews {
         }
         check_cancel(cancel)?;
         Ok(QueryResult { columns, rows })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TimezoneOverride;
+
+    impl VirtualTable for TimezoneOverride {
+        fn name(&self) -> &str {
+            "PG_TIMEZONE_NAMES"
+        }
+
+        fn scan(
+            &self,
+            _schema: &SchemaManager,
+            _cancel: Option<&citadel::CancelToken>,
+        ) -> Result<QueryResult> {
+            panic!("schema admission must not scan virtual data")
+        }
+    }
+
+    #[test]
+    fn replacing_a_builtin_clears_its_columns_across_catalog_admission() {
+        let db = citadel::DatabaseBuilder::new("")
+            .passphrase(b"virtual-column-metadata")
+            .argon2_profile(citadel::Argon2Profile::Iot)
+            .create_in_memory()
+            .unwrap();
+        let conn = crate::Connection::open(&db).unwrap();
+        let mut schema = SchemaManager::empty();
+        register_builtins(&mut schema);
+        assert_eq!(
+            schema.virtual_columns("pg_timezone_names"),
+            Some(PgTimezoneNames::COLUMNS)
+        );
+        let replacement: Arc<dyn VirtualTable> = Arc::new(TimezoneOverride);
+        schema.register_virtual(Arc::clone(&replacement));
+        assert!(schema.virtual_columns("pg_timezone_names").is_none());
+
+        // The first admission merges locally registered sources into the
+        // persisted schema; the second reloads a changed catalog snapshot.
+        for statement in [
+            "CREATE TABLE first_table (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE second_table (id INTEGER PRIMARY KEY)",
+        ] {
+            conn.execute(statement).unwrap();
+            let mut read = db.begin_read();
+            schema.admit_read(&db, &mut read).unwrap();
+            assert!(Arc::ptr_eq(
+                schema.get_virtual("pg_timezone_names").unwrap(),
+                &replacement,
+            ));
+            assert!(schema.virtual_columns("pg_timezone_names").is_none());
+            assert_eq!(
+                schema.virtual_columns("information_schema.tables"),
+                Some(InfoSchemaTables::COLUMNS)
+            );
+        }
+
+        conn.execute("CREATE TABLE third_table (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        let mut write = db.begin_write().unwrap();
+        schema.admit_owned_write(&mut write).unwrap();
+        assert!(Arc::ptr_eq(
+            schema.get_virtual("pg_timezone_names").unwrap(),
+            &replacement,
+        ));
+        assert!(schema.virtual_columns("pg_timezone_names").is_none());
+        write.abort();
     }
 }

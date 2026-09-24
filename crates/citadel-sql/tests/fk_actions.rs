@@ -646,7 +646,10 @@ fn same_row_before_trigger_mutation_fails_atomically_without_stale_indexes() {
                 conn.execute("BEGIN").unwrap();
             }
             let error = conn.execute("DELETE FROM parent WHERE id = 1").unwrap_err();
-            assert!(matches!(&error, SqlError::Unsupported(reason) if reason == "a BEFORE trigger cannot modify or delete the row being processed"), "{error:?}");
+            assert!(
+                matches!(&error, SqlError::Unsupported(reason) if reason == "a BEFORE trigger cannot modify or delete the row being processed"),
+                "{error:?}"
+            );
             if explicit {
                 conn.execute("ROLLBACK").unwrap();
             }

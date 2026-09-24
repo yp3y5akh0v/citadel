@@ -740,16 +740,43 @@ fn execute_in_txn_inner(
     }
 }
 
-pub(super) fn scan_table_with_read(
-    rtx: &mut ReadTxn<'_>,
-    schema: &SchemaManager,
+fn virtual_table<'a>(
     name: &str,
-) -> Result<(TableSchema, Vec<Vec<Value>>)> {
-    let table_schema = schema
-        .get(name)
-        .ok_or_else(|| SqlError::TableNotFound(name.to_string()))?;
-    let (rows, _) = collect_rows_with_read(rtx, table_schema, &None, None)?;
-    Ok((table_schema.clone(), rows))
+    schema: &'a SchemaManager,
+) -> Option<&'a Arc<dyn crate::system_tables::VirtualTable>> {
+    if schema.get(name).is_some() || schema.get_view(name).is_some() {
+        return None;
+    }
+    let canonical = match name {
+        "timezone_names" => "pg_timezone_names",
+        "timezone_abbrevs" => "pg_timezone_abbrevs",
+        other => other,
+    };
+    schema.get_virtual(canonical)
+}
+
+fn try_virtual_table(
+    name: &str,
+    schema: &SchemaManager,
+    cancel: Option<&citadel::CancelToken>,
+) -> Option<Result<QueryResult>> {
+    Some(virtual_table(name, schema)?.scan(schema, cancel))
+}
+
+/// CTEs and stored relations shadow builtins. Readers and writers resolve
+/// virtual tables against their admitted schema in the current transaction.
+fn materialized_source(
+    name: &str,
+    schema: &SchemaManager,
+    ctes: &CteContext,
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<Option<Arc<CteRows>>> {
+    if let Some(rows) = ctes.get(name) {
+        return Ok(Some(Arc::clone(rows)));
+    }
+    try_virtual_table(name, schema, cancel)
+        .map(|result| result.map(|rows| CteRows::binary(rows).shared()))
+        .transpose()
 }
 
 pub(super) fn scan_table_with_read_or_view(
@@ -766,26 +793,14 @@ pub(super) fn scan_table_with_read_or_view(
         let vs = build_view_schema(name, &qr)?;
         return Ok((vs, qr.result.rows));
     }
-    if let Some(vt) = schema.get_virtual(name) {
+    if let Some(result) = try_virtual_table(name, schema, rtx.cancel_token()) {
         // A virtual table invents its columns rather than reading them from a relation, so
         // none of them carries a collation.
-        let rows = CteRows::binary(vt.scan(schema, rtx.cancel_token())?);
+        let rows = CteRows::binary(result?);
         let vs = build_view_schema(name, &rows)?;
         return Ok((vs, rows.result.rows));
     }
     Err(SqlError::TableNotFound(name.to_string()))
-}
-
-pub(super) fn scan_table_write(
-    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
-    schema: &SchemaManager,
-    name: &str,
-) -> Result<(TableSchema, Vec<Vec<Value>>)> {
-    let table_schema = schema
-        .get(name)
-        .ok_or_else(|| SqlError::TableNotFound(name.to_string()))?;
-    let (rows, _) = collect_rows_write(wtx, table_schema, &None, None)?;
-    Ok((table_schema.clone(), rows))
 }
 
 pub(super) fn scan_table_write_or_view(
@@ -801,6 +816,11 @@ pub(super) fn scan_table_write_or_view(
         let qr = exec_view_write(wtx, schema, vd)?;
         let vs = build_view_schema(name, &qr)?;
         return Ok((vs, qr.result.rows));
+    }
+    if let Some(result) = try_virtual_table(name, schema, wtx.cancel_token()) {
+        let rows = CteRows::binary(result?);
+        let vs = build_view_schema(name, &rows)?;
+        return Ok((vs, rows.result.rows));
     }
     Err(SqlError::TableNotFound(name.to_string()))
 }

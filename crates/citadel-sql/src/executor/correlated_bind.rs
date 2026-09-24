@@ -109,9 +109,13 @@ impl Binder<'_> {
             other => other,
         };
         if self.schema.get_virtual(canonical).is_some() {
-            // VirtualTable has no schema-only API. A qualified local name is
-            // still unambiguous; an outer-looking bare name cannot be guessed.
-            return Ok(None);
+            // Builtins publish their columns with the registered instance.
+            // A custom source without metadata still needs qualified names to
+            // distinguish its columns from an enclosing mutation row.
+            return Ok(self
+                .schema
+                .virtual_columns(canonical)
+                .map(|columns| columns.iter().map(|name| (*name).to_owned()).collect()));
         }
         Err(SqlError::TableNotFound(name.to_owned()))
     }
@@ -421,7 +425,11 @@ impl Binder<'_> {
                                 .alias
                                 .is_some_and(|alias| table.eq_ignore_ascii_case(alias))) =>
                 {
-                    self.outer.column_index(column)
+                    Some(
+                        self.outer
+                            .column_index(column)
+                            .ok_or_else(|| SqlError::ColumnNotFound(format!("{table}.{column}")))?,
+                    )
                 }
                 _ => None,
             }

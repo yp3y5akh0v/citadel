@@ -184,7 +184,9 @@ fn validate_trigger_shape(stmt: &CreateTriggerStmt, schema: &SchemaManager) -> R
         .when_expr
         .as_ref()
         .is_some_and(crate::parser::has_subquery)
-        || stored_when.as_ref().is_some_and(crate::parser::has_subquery)
+        || stored_when
+            .as_ref()
+            .is_some_and(crate::parser::has_subquery)
     {
         return Err(SqlError::Unsupported(
             "subqueries are not supported in trigger WHEN conditions".into(),
