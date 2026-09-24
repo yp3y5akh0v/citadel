@@ -627,7 +627,7 @@ fn null_unique_parent_values_do_not_match_unrelated_null_child_references() {
 fn same_row_before_trigger_mutation_fails_atomically_without_stale_indexes() {
     for trigger_action in [
         "UPDATE child SET p = 2 WHERE id = OLD.id",
-        "DELETE FROM child WHERE id = OLD.id",
+        "UPDATE child SET p = 2 WHERE id = OLD.id; DELETE FROM child WHERE id = OLD.id",
     ] {
         for explicit in [false, true] {
             let dir = tempfile::tempdir().unwrap();
@@ -638,15 +638,15 @@ fn same_row_before_trigger_mutation_fails_atomically_without_stale_indexes() {
             conn.execute("CREATE TABLE child (id INTEGER PRIMARY KEY, p INTEGER REFERENCES parent(id) ON DELETE CASCADE)").unwrap();
             conn.execute("INSERT INTO parent VALUES (1), (2)").unwrap();
             conn.execute("INSERT INTO child VALUES (10, 1)").unwrap();
-            // The WHEN guard prevents the nested DELETE case recursing forever.
+            // Changing p makes the nested DELETE skip this scalar WHEN guard.
             conn.execute("CREATE TABLE guard (id INTEGER PRIMARY KEY)")
                 .unwrap();
-            conn.execute(&format!("CREATE TRIGGER change_current BEFORE DELETE ON child FOR EACH ROW WHEN (SELECT COUNT(*) FROM guard) = 0 BEGIN INSERT INTO guard VALUES (1); {trigger_action}; END")).unwrap();
+            conn.execute(&format!("CREATE TRIGGER change_current BEFORE DELETE ON child FOR EACH ROW WHEN OLD.p = 1 BEGIN INSERT INTO guard VALUES (1); {trigger_action}; END")).unwrap();
             if explicit {
                 conn.execute("BEGIN").unwrap();
             }
             let error = conn.execute("DELETE FROM parent WHERE id = 1").unwrap_err();
-            assert!(matches!(error, SqlError::Unsupported(_)), "{error:?}");
+            assert!(matches!(&error, SqlError::Unsupported(reason) if reason == "a BEFORE trigger cannot modify or delete the row being processed"), "{error:?}");
             if explicit {
                 conn.execute("ROLLBACK").unwrap();
             }
