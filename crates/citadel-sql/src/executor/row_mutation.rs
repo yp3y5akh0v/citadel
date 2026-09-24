@@ -20,19 +20,25 @@ struct RowChange {
     new: Option<Vec<Value>>,
 }
 
+enum Mutation {
+    Delete,
+    Update(Vec<(String, Expr)>),
+    /// Conflict expressions have already been evaluated against OLD/EXCLUDED.
+    EvaluatedUpdate,
+}
+
 struct Operation<'a> {
     table: &'a TableSchema,
     changed_columns: Vec<String>,
-    assignments: Option<Vec<(String, Expr)>>,
+    mutation: Mutation,
     refresh_rows: bool,
     has_children: bool,
     has_triggers: bool,
     rows: std::vec::IntoIter<RowChange>,
     old_rows: Vec<Vec<Value>>,
     new_rows: Vec<Vec<Value>>,
-    returning: Option<Vec<SelectColumn>>,
+    capture_rows: bool,
     returning_rows: Vec<ReturningRow>,
-    is_update: bool,
     statement_triggers: bool,
     count: u64,
     root: bool,
@@ -40,13 +46,163 @@ struct Operation<'a> {
 
 impl Operation<'_> {
     fn event(&self) -> FireEvent<'_> {
-        if self.is_update {
+        if !matches!(self.mutation, Mutation::Delete) {
             FireEvent::Update {
                 changed_columns: &self.changed_columns,
             }
         } else {
             FireEvent::Delete
         }
+    }
+}
+
+struct MutationResult {
+    count: u64,
+    rows: Vec<ReturningRow>,
+}
+
+impl MutationResult {
+    fn project(
+        self,
+        table: &TableSchema,
+        returning: Option<&[SelectColumn]>,
+        cancel: Option<&citadel::CancelToken>,
+    ) -> Result<ExecutionResult> {
+        match returning {
+            Some(columns) => Ok(ExecutionResult::Query(project_returning(
+                table, columns, &self.rows, cancel,
+            )?)),
+            None => Ok(ExecutionResult::RowsAffected(self.count)),
+        }
+    }
+}
+
+struct NoActionCheck<'a> {
+    child: &'a TableSchema,
+    fk: &'a ForeignKeySchemaEntry,
+    reference: super::fk::ReferenceKey,
+    key: Vec<u8>,
+}
+
+/// The UPDATE half of one INSERT ... ON CONFLICT statement. Rows enter the
+/// mutation engine immediately, while transitions and NO ACTION checks retain
+/// statement scope across all input rows.
+pub(super) struct ConflictUpdates<'a> {
+    schema: &'a SchemaManager,
+    table: &'a TableSchema,
+    changed_columns: Vec<String>,
+    has_children: bool,
+    has_triggers: bool,
+    statement_triggers: bool,
+    old_rows: Vec<Vec<Value>>,
+    new_rows: Vec<Vec<Value>>,
+    no_action_checks: Vec<NoActionCheck<'a>>,
+}
+
+impl<'a> ConflictUpdates<'a> {
+    pub(super) fn begin(
+        wtx: &mut WriteTxn<'_>,
+        schema: &'a SchemaManager,
+        table: &'a TableSchema,
+        changed_columns: Vec<String>,
+    ) -> Result<Self> {
+        let updates = Self {
+            schema,
+            table,
+            changed_columns,
+            has_children: !schema.child_fks_for(&table.name).is_empty(),
+            has_triggers: triggers::has_update_triggers(schema, &table.name),
+            statement_triggers: triggers::has_statement_update_triggers(schema, &table.name),
+            old_rows: Vec::new(),
+            new_rows: Vec::new(),
+            no_action_checks: Vec::new(),
+        };
+        updates.fire_statement(wtx, TriggerTiming::Before)?;
+        Ok(updates)
+    }
+
+    pub(super) fn can_fuse(&self) -> bool {
+        !self.has_children && !self.has_triggers
+    }
+
+    pub(super) fn apply(
+        &mut self,
+        wtx: &mut WriteTxn<'_>,
+        key: &[u8],
+        old: &[Value],
+        new: Vec<Value>,
+        capture_rows: bool,
+    ) -> Result<Option<(Vec<Value>, Vec<Value>)>> {
+        self.schema.mark_dml(&self.table.name);
+        let capture = capture_rows || self.statement_triggers;
+        let operation = Operation {
+            table: self.table,
+            changed_columns: self.changed_columns.clone(),
+            mutation: Mutation::EvaluatedUpdate,
+            // The conflict lookup immediately precedes expression evaluation.
+            // BEFORE row triggers are checked for same-row changes in apply_row.
+            refresh_rows: false,
+            has_children: self.has_children,
+            has_triggers: self.has_triggers,
+            rows: vec![RowChange {
+                key: key.to_vec(),
+                old: old.to_vec(),
+                new: Some(new),
+            }]
+            .into_iter(),
+            old_rows: Vec::new(),
+            new_rows: Vec::new(),
+            capture_rows: capture,
+            returning_rows: Vec::new(),
+            statement_triggers: false,
+            count: 0,
+            root: true,
+        };
+        let mut result = run(wtx, self.schema, operation, &mut self.no_action_checks)?;
+        if !capture {
+            return Ok(None);
+        }
+        let Some((Some(old), Some(new))) = result.rows.pop() else {
+            return Err(SqlError::Unsupported(
+                "conflict update did not produce a row".into(),
+            ));
+        };
+        if self.statement_triggers {
+            if !capture_rows {
+                self.old_rows.push(old);
+                self.new_rows.push(new);
+                return Ok(None);
+            }
+            self.old_rows.push(old.clone());
+            self.new_rows.push(new.clone());
+        }
+        Ok(capture_rows.then_some((old, new)))
+    }
+
+    pub(super) fn after_rows(&self, wtx: &mut WriteTxn<'_>) -> Result<()> {
+        self.fire_statement(wtx, TriggerTiming::After)
+    }
+
+    pub(super) fn finish(self, wtx: &mut WriteTxn<'_>) -> Result<()> {
+        check_no_action(wtx, self.schema, self.no_action_checks)
+    }
+
+    fn fire_statement(&self, wtx: &mut WriteTxn<'_>, timing: TriggerTiming) -> Result<()> {
+        if self.statement_triggers {
+            triggers::fire_statement_triggers(
+                wtx,
+                self.schema,
+                &self.table.name,
+                timing,
+                FireEvent::Update {
+                    changed_columns: &self.changed_columns,
+                },
+                &self.table.columns,
+                &self.old_rows,
+                &self.new_rows,
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -75,11 +231,14 @@ pub(super) fn update_rows(
         schema,
         table,
         Some(&stmt.assignments),
-        stmt.returning.clone(),
+        stmt.returning.is_some(),
         rows,
         true,
     )?;
-    run(wtx, schema, operation)
+    let mut checks = Vec::new();
+    let result = run(wtx, schema, operation, &mut checks)?;
+    check_no_action(wtx, schema, checks)?;
+    result.project(table, stmt.returning.as_deref(), wtx.cancel_token())
 }
 
 pub(super) fn delete_rows(
@@ -89,8 +248,11 @@ pub(super) fn delete_rows(
     returning: Option<Vec<SelectColumn>>,
     rows: Vec<KeyedRow>,
 ) -> Result<ExecutionResult> {
-    let operation = prepare_operation(wtx, schema, table, None, returning, rows, true)?;
-    run(wtx, schema, operation)
+    let operation = prepare_operation(wtx, schema, table, None, returning.is_some(), rows, true)?;
+    let mut checks = Vec::new();
+    let result = run(wtx, schema, operation, &mut checks)?;
+    check_no_action(wtx, schema, checks)?;
+    result.project(table, returning.as_deref(), wtx.cancel_token())
 }
 
 fn prepare_operation<'a>(
@@ -98,7 +260,7 @@ fn prepare_operation<'a>(
     schema: &SchemaManager,
     table: &'a TableSchema,
     assignments: Option<&[(String, Expr)]>,
-    returning: Option<Vec<SelectColumn>>,
+    capture_rows: bool,
     rows: Vec<KeyedRow>,
     root: bool,
 ) -> Result<Operation<'a>> {
@@ -141,7 +303,7 @@ fn prepare_operation<'a>(
     let operation = Operation {
         table,
         changed_columns,
-        assignments: assignments.map(<[_]>::to_vec),
+        mutation: assignments.map_or(Mutation::Delete, |a| Mutation::Update(a.to_vec())),
         refresh_rows: has_children || has_triggers || !table.foreign_keys.is_empty(),
         has_children,
         has_triggers,
@@ -149,9 +311,8 @@ fn prepare_operation<'a>(
         rows: changes.into_iter(),
         old_rows,
         new_rows,
-        returning,
+        capture_rows,
         returning_rows: Vec::new(),
-        is_update,
         statement_triggers,
         root,
     };
@@ -273,7 +434,20 @@ fn apply_row(
     row: &RowChange,
 ) -> Result<()> {
     let table = operation.table;
-    if operation.has_triggers {
+    if operation.has_triggers
+        && triggers::has_row_triggers(
+            schema,
+            &table.name,
+            TriggerTiming::Before,
+            operation.event(),
+        )
+    {
+        // OLD can contain an evaluated default for a field absent on disk.
+        // Compare physical rows so checking trigger side effects does not
+        // evaluate volatile defaults a second time.
+        let before = wtx
+            .table_get(table.name.as_bytes(), &row.key)
+            .map_err(SqlError::Storage)?;
         triggers::fire_row_triggers(
             wtx,
             schema,
@@ -284,25 +458,10 @@ fn apply_row(
             row.new.clone(),
             &table.columns,
         )?;
-    }
-    if operation.has_triggers {
-        let current = wtx
+        let after = wtx
             .table_get(table.name.as_bytes(), &row.key)
             .map_err(SqlError::Storage)?;
-        let changed = match current {
-            None => true,
-            Some(bytes) => {
-                let current =
-                    decode_full_row_with_cancel(table, &row.key, &bytes, wtx.cancel_token())?;
-                table.columns.iter().enumerate().any(|(i, column)| {
-                    !matches!(
-                        column.generated_kind,
-                        Some(crate::parser::GeneratedKind::Virtual)
-                    ) && !current[i].bit_eq(&row.old[i])
-                })
-            }
-        };
-        if changed {
+        if before.is_none() || before != after {
             return Err(SqlError::Unsupported(
                 "a BEFORE trigger cannot modify or delete the row being processed".into(),
             ));
@@ -342,6 +501,20 @@ fn apply_row(
         Some(new) => {
             let new_pk: Vec<Value> = table.pk_indices().iter().map(|&i| new[i].clone()).collect();
             let new_key = encode_composite_key(&new_pk);
+            if new_key.len() > citadel_core::MAX_KEY_SIZE {
+                return Err(SqlError::KeyTooLarge {
+                    size: new_key.len(),
+                    max: citadel_core::MAX_KEY_SIZE,
+                });
+            }
+            let mut values = Vec::new();
+            let bytes = encode_stored_row(table, new, &mut values);
+            if bytes.len() > citadel_core::MAX_VALUE_SIZE {
+                return Err(SqlError::RowTooLarge {
+                    size: bytes.len(),
+                    max: citadel_core::MAX_VALUE_SIZE,
+                });
+            }
             let pk_changed = new_key != row.key;
             let col_map = any_partial_index(table).then(|| table.column_map());
             let actions = table
@@ -368,8 +541,6 @@ fn apply_row(
                 wtx.table_delete(table.name.as_bytes(), &row.key)
                     .map_err(SqlError::Storage)?;
             }
-            let mut values = Vec::new();
-            let bytes = encode_stored_row(table, new, &mut values);
             let inserted = wtx
                 .table_insert(table.name.as_bytes(), &new_key, &bytes)
                 .map_err(SqlError::Storage)?;
@@ -479,10 +650,10 @@ fn run<'a>(
     wtx: &mut WriteTxn<'_>,
     schema: &'a SchemaManager,
     operation: Operation<'a>,
-) -> Result<ExecutionResult> {
+    no_action_checks: &mut Vec<NoActionCheck<'a>>,
+) -> Result<MutationResult> {
     let mut work = vec![Work::Row(operation)];
     let mut completed = None;
-    let mut no_action_checks = Vec::new();
     while let Some(task) = work.pop() {
         check_cancel(wtx.cancel_token())?;
         match task {
@@ -507,29 +678,24 @@ fn run<'a>(
                         if current.len() != row.old.len()
                             || current.iter().zip(&row.old).any(|(a, b)| !a.bit_eq(b))
                         {
-                            row.new = operation
-                                .assignments
-                                .as_ref()
-                                .map(|assignments| {
-                                    evaluate_update(
-                                        operation.table,
-                                        assignments,
-                                        &current,
-                                        wtx.cancel_token(),
-                                    )
-                                })
-                                .transpose()?;
+                            row.new = match &operation.mutation {
+                                Mutation::Delete => None,
+                                Mutation::Update(assignments) => Some(evaluate_update(
+                                    operation.table,
+                                    assignments,
+                                    &current,
+                                    wtx.cancel_token(),
+                                )?),
+                                Mutation::EvaluatedUpdate => {
+                                    return Err(SqlError::Unsupported(
+                                        "conflict row changed after expression evaluation".into(),
+                                    ))
+                                }
+                            };
                             row.old = current;
                         }
                     }
                     apply_row(wtx, schema, &operation, &row)?;
-                    if operation.statement_triggers {
-                        let position = operation.count as usize;
-                        operation.old_rows[position] = row.old.clone();
-                        if let Some(new) = &row.new {
-                            operation.new_rows[position] = new.clone();
-                        }
-                    }
                     operation.count += 1;
                     let parent = operation.has_children.then(|| ParentChange {
                         table: operation.table,
@@ -557,20 +723,50 @@ fn run<'a>(
                         )?;
                     }
                     if operation.root {
-                        completed = Some(if let Some(columns) = operation.returning {
-                            ExecutionResult::Query(project_returning(
-                                operation.table,
-                                &columns,
-                                &operation.returning_rows,
-                                wtx.cancel_token(),
-                            )?)
-                        } else {
-                            ExecutionResult::RowsAffected(operation.count)
+                        completed = Some(MutationResult {
+                            count: operation.count,
+                            rows: operation.returning_rows,
                         });
                     }
                 }
             }
-            Work::AfterRow(mut operation, row) => {
+            Work::AfterRow(mut operation, mut row) => {
+                // A self-referencing cascade can update this row again. Expose
+                // that stored result to AFTER triggers, transitions and RETURNING.
+                if operation.has_children
+                    && (operation.capture_rows
+                        || operation.statement_triggers
+                        || operation.has_triggers)
+                {
+                    if let Some(new) = &row.new {
+                        let key = encode_composite_key(
+                            &operation
+                                .table
+                                .pk_indices()
+                                .iter()
+                                .map(|&i| new[i].clone())
+                                .collect::<Vec<_>>(),
+                        );
+                        if let Some(value) = wtx
+                            .table_get(operation.table.name.as_bytes(), &key)
+                            .map_err(SqlError::Storage)?
+                        {
+                            row.new = Some(decode_full_row_with_cancel(
+                                operation.table,
+                                &key,
+                                &value,
+                                wtx.cancel_token(),
+                            )?);
+                        }
+                    }
+                }
+                if operation.statement_triggers {
+                    let position = operation.count as usize - 1;
+                    operation.old_rows[position] = row.old.clone();
+                    if let Some(new) = &row.new {
+                        operation.new_rows[position] = new.clone();
+                    }
+                }
                 if operation.has_triggers {
                     triggers::fire_row_triggers(
                         wtx,
@@ -583,7 +779,7 @@ fn run<'a>(
                         &operation.table.columns,
                     )?;
                 }
-                if operation.returning.is_some() {
+                if operation.capture_rows {
                     operation.returning_rows.push((Some(row.old), row.new));
                 }
                 work.push(Work::Row(operation));
@@ -624,7 +820,12 @@ fn run<'a>(
                     continue;
                 }
                 if action == ReferentialAction::NoAction {
-                    no_action_checks.push((child, fk, reference_key, key));
+                    no_action_checks.push(NoActionCheck {
+                        child,
+                        fk,
+                        reference: reference_key,
+                        key,
+                    });
                     work.push(Work::ForeignKeys(parent, position + 1));
                     continue;
                 }
@@ -692,7 +893,7 @@ fn run<'a>(
                     schema,
                     child,
                     assignments.as_deref(),
-                    None,
+                    false,
                     rows,
                     false,
                 )?;
@@ -701,7 +902,21 @@ fn run<'a>(
             }
         }
     }
-    for (child, fk, reference_key, key) in no_action_checks {
+    completed.ok_or_else(|| SqlError::Unsupported("row mutation did not complete".into()))
+}
+
+fn check_no_action(
+    wtx: &mut WriteTxn<'_>,
+    schema: &SchemaManager,
+    checks: Vec<NoActionCheck<'_>>,
+) -> Result<()> {
+    for NoActionCheck {
+        child,
+        fk,
+        reference: reference_key,
+        key,
+    } in checks
+    {
         let index = find_cascading_idx(child, fk, &reference_key).ok_or_else(|| {
             SqlError::ForeignKeyViolation(format!(
                 "no index backs the foreign key on '{}'",
@@ -715,7 +930,7 @@ fn run<'a>(
             super::fk::check_row_reference(wtx, schema, child, fk, &row, &mut reference_key)?;
         }
     }
-    completed.ok_or_else(|| SqlError::Unsupported("row mutation did not complete".into()))
+    Ok(())
 }
 
 /// The caller has excluded child triggers, descendants and additional indexes.

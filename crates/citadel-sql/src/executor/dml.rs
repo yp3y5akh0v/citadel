@@ -18,31 +18,21 @@ use super::compile::CompiledPlan;
 use super::helpers::*;
 use super::{CteContext, CteRows};
 
-/// (before-insert, after-insert, after-update) row-trigger presence, hoisted once.
-fn row_insert_trigger_flags(schema: &SchemaManager, table_name: &str) -> (bool, bool, bool) {
+/// (before-insert, after-insert) row-trigger presence, hoisted once.
+fn row_insert_trigger_flags(schema: &SchemaManager, table_name: &str) -> (bool, bool) {
     use crate::parser::{TriggerEvent, TriggerGranularity, TriggerTiming};
     let triggers = schema.triggers_for(table_name);
     let row =
         |t: &crate::types::TriggerDef| t.enabled && t.granularity == TriggerGranularity::ForEachRow;
-    let ev = |t: &crate::types::TriggerDef, update: bool| {
-        t.events.iter().any(|e| {
-            if update {
-                matches!(e, TriggerEvent::Update(_))
-            } else {
-                matches!(e, TriggerEvent::Insert)
-            }
-        })
-    };
+    let ev =
+        |t: &crate::types::TriggerDef| t.events.iter().any(|e| matches!(e, TriggerEvent::Insert));
     (
         triggers
             .iter()
-            .any(|t| row(t) && t.timing == TriggerTiming::Before && ev(t, false)),
+            .any(|t| row(t) && t.timing == TriggerTiming::Before && ev(t)),
         triggers
             .iter()
-            .any(|t| row(t) && t.timing == TriggerTiming::After && ev(t, false)),
-        triggers
-            .iter()
-            .any(|t| row(t) && t.timing == TriggerTiming::After && ev(t, true)),
+            .any(|t| row(t) && t.timing == TriggerTiming::After && ev(t)),
     )
 }
 
@@ -1495,7 +1485,21 @@ fn exec_insert_in_txn_impl(
         )?;
     }
 
-    let (has_before_insert_triggers, has_after_insert_triggers, has_after_update_triggers) =
+    let mut conflict_updates = match compiled_conflict.as_deref() {
+        Some(CompiledOnConflict::DoUpdate { assignments, .. }) => {
+            Some(super::row_mutation::ConflictUpdates::begin(
+                wtx,
+                schema,
+                table_schema,
+                assignments
+                    .iter()
+                    .map(|(i, _)| table_schema.columns[*i].name.clone())
+                    .collect(),
+            )?)
+        }
+        _ => None,
+    };
+    let (has_before_insert_triggers, has_after_insert_triggers) =
         row_insert_trigger_flags(schema, &table_schema.name);
 
     let capture_insert_row =
@@ -1780,7 +1784,10 @@ fn exec_insert_in_txn_impl(
             }
             Some(oc) => {
                 let oc_ref: &CompiledOnConflict = oc;
-                let needs_row = upsert_needs_row(oc_ref, table_schema);
+                let needs_row = upsert_needs_row(oc_ref, table_schema)
+                    || conflict_updates
+                        .as_ref()
+                        .is_some_and(|updates| !updates.can_fuse());
                 if needs_row {
                     restore_insert_row(
                         table_schema,
@@ -1791,7 +1798,7 @@ fn exec_insert_in_txn_impl(
                 }
                 let outcome = apply_insert_with_conflict(
                     wtx,
-                    schema,
+                    conflict_updates.as_mut(),
                     table_schema,
                     &bufs.key_buf,
                     &bufs.value_buf,
@@ -1801,8 +1808,7 @@ fn exec_insert_in_txn_impl(
                     oc_ref,
                     row_col_map.unwrap(),
                     cancel.as_ref(),
-                    // Trigger dispatch needs the Updated outcome's rows too.
-                    stmt.returning.is_some() || has_after_update_triggers,
+                    stmt.returning.is_some(),
                 )?;
                 match outcome {
                     InsertRowOutcome::Inserted => {
@@ -1846,30 +1852,7 @@ fn exec_insert_in_txn_impl(
                         count += 1;
                         if let Some((old, new)) = rows {
                             if let Some(buf) = returning_rows.as_mut() {
-                                buf.push((Some(old.clone()), Some(new.clone())));
-                            }
-                            if has_after_update_triggers {
-                                let changed_cols: Vec<String> = match oc_ref {
-                                    CompiledOnConflict::DoUpdate { assignments, .. } => assignments
-                                        .iter()
-                                        .map(|(col_idx, _)| {
-                                            table_schema.columns[*col_idx].name.clone()
-                                        })
-                                        .collect(),
-                                    _ => Vec::new(),
-                                };
-                                super::triggers::fire_row_triggers(
-                                    wtx,
-                                    schema,
-                                    &table_schema.name,
-                                    crate::parser::TriggerTiming::After,
-                                    super::triggers::FireEvent::Update {
-                                        changed_columns: &changed_cols,
-                                    },
-                                    Some(old),
-                                    Some(new),
-                                    &table_schema.columns,
-                                )?;
+                                buf.push((Some(old), Some(new)));
                             }
                         }
                     }
@@ -1888,27 +1871,9 @@ fn exec_insert_in_txn_impl(
         count,
     );
 
-    if let (Some(returning_cols), Some(rows)) = (stmt.returning.as_ref(), returning_rows) {
-        if has_insert_statement_triggers_impl {
-            super::triggers::fire_statement_triggers(
-                wtx,
-                schema,
-                &table_schema.name,
-                crate::parser::TriggerTiming::After,
-                super::triggers::FireEvent::Insert,
-                &table_schema.columns,
-                &[],
-                &stmt_new_rows_impl,
-            )?;
-        }
-        return Ok(ExecutionResult::Query(super::helpers::project_returning(
-            table_schema,
-            returning_cols,
-            &rows,
-            wtx.cancel_token(),
-        )?));
+    if let Some(updates) = conflict_updates.as_ref() {
+        updates.after_rows(wtx)?;
     }
-
     if has_insert_statement_triggers_impl {
         super::triggers::fire_statement_triggers(
             wtx,
@@ -1920,6 +1885,17 @@ fn exec_insert_in_txn_impl(
             &[],
             &stmt_new_rows_impl,
         )?;
+    }
+    if let Some(updates) = conflict_updates {
+        updates.finish(wtx)?;
+    }
+    if let (Some(returning_cols), Some(rows)) = (stmt.returning.as_ref(), returning_rows) {
+        return Ok(ExecutionResult::Query(super::helpers::project_returning(
+            table_schema,
+            returning_cols,
+            &rows,
+            wtx.cancel_token(),
+        )?));
     }
 
     Ok(ExecutionResult::RowsAffected(count))
@@ -2529,7 +2505,7 @@ pub(super) enum InsertRowOutcome {
 #[inline]
 pub(super) fn apply_insert_with_conflict(
     wtx: &mut WriteTxn<'_>,
-    schema: &SchemaManager,
+    updates: Option<&mut super::row_mutation::ConflictUpdates<'_>>,
     table_schema: &TableSchema,
     key_buf: &[u8],
     value_buf: &[u8],
@@ -2566,7 +2542,7 @@ pub(super) fn apply_insert_with_conflict(
                     ..
                 } => apply_do_update(
                     wtx,
-                    schema,
+                    updates.expect("DO UPDATE statement state"),
                     table_schema,
                     &existing_pk,
                     row,
@@ -2601,7 +2577,9 @@ pub(super) fn apply_insert_with_conflict(
         fast_paths,
     } = on_conflict
     {
-        if can_fuse_do_update(table_schema, assignments) {
+        if can_fuse_do_update(table_schema, assignments)
+            && updates.as_ref().is_some_and(|updates| updates.can_fuse())
+        {
             return apply_do_update_fused(
                 wtx,
                 table_schema,
@@ -2682,7 +2660,7 @@ pub(super) fn apply_insert_with_conflict(
                             })?;
                             apply_do_update(
                                 wtx,
-                                schema,
+                                updates.expect("DO UPDATE statement state"),
                                 table_schema,
                                 &existing_pk,
                                 row,
@@ -2723,7 +2701,7 @@ pub(super) fn apply_insert_with_conflict(
                         decode_full_row_with_cancel(table_schema, key_buf, &old_bytes, cancel)?;
                     apply_do_update_with_old_row(
                         wtx,
-                        schema,
+                        updates.expect("DO UPDATE statement state"),
                         table_schema,
                         key_buf,
                         &old_row,
@@ -3019,7 +2997,7 @@ fn find_unique_index_pk(
 #[allow(clippy::too_many_arguments)]
 fn apply_do_update(
     wtx: &mut WriteTxn<'_>,
-    schema: &SchemaManager,
+    updates: &mut super::row_mutation::ConflictUpdates<'_>,
     table_schema: &TableSchema,
     pk_key: &[u8],
     proposed_row: &[Value],
@@ -3036,7 +3014,7 @@ fn apply_do_update(
     let old_row = decode_full_row_with_cancel(table_schema, pk_key, &old_value, cancel)?;
     apply_do_update_with_old_row(
         wtx,
-        schema,
+        updates,
         table_schema,
         pk_key,
         &old_row,
@@ -3052,7 +3030,7 @@ fn apply_do_update(
 #[allow(clippy::too_many_arguments)]
 fn apply_do_update_with_old_row(
     wtx: &mut WriteTxn<'_>,
-    schema: &SchemaManager,
+    updates: &mut super::row_mutation::ConflictUpdates<'_>,
     table_schema: &TableSchema,
     old_pk_key: &[u8],
     old_row: &[Value],
@@ -3112,200 +3090,8 @@ fn apply_do_update_with_old_row(
         }
     }
 
-    let pk_indices = table_schema.pk_indices();
-    let assigned_pk = assignments.iter().any(|(ci, _)| pk_indices.contains(ci));
-    let pk_changed = assigned_pk && pk_indices.iter().any(|&i| !old_row[i].bit_eq(&new_row[i]));
-
-    for (assigned_idx, _) in assignments {
-        let col = &table_schema.columns[*assigned_idx];
-        if !col.nullable && new_row[col.position as usize].is_null() {
-            return Err(SqlError::NotNullViolation(col.name.clone()));
-        }
-    }
-    if table_schema.has_checks() {
-        for col in &table_schema.columns {
-            if let Some(ref check) = col.check_expr {
-                let ctx = EvalCtx::new(col_map, &new_row).with_cancel(cancel);
-                let result = eval_expr(check, &ctx)?;
-                if !is_truthy(&result) && !result.is_null() {
-                    let name = col.check_name.as_deref().unwrap_or(&col.name);
-                    return Err(SqlError::CheckViolation(name.to_string()));
-                }
-            }
-        }
-        for tc in &table_schema.check_constraints {
-            let ctx = EvalCtx::new(col_map, &new_row).with_cancel(cancel);
-            let result = eval_expr(&tc.expr, &ctx)?;
-            if !is_truthy(&result) && !result.is_null() {
-                let name = tc.name.as_deref().unwrap_or(&tc.sql);
-                return Err(SqlError::CheckViolation(name.to_string()));
-            }
-        }
-    }
-    let mut fk_key = Vec::new();
-    for fk in &table_schema.foreign_keys {
-        if pk_changed
-            || fk
-                .columns
-                .iter()
-                .any(|&ci| !old_row[ci as usize].bit_eq(&new_row[ci as usize]))
-        {
-            super::fk::check_row_reference(wtx, schema, table_schema, fk, &new_row, &mut fk_key)?;
-        }
-    }
-
-    let has_indices = !table_schema.indices.is_empty();
-    let old_pk_values: Vec<Value> = if has_indices || pk_changed {
-        pk_indices.iter().map(|&i| old_row[i].clone()).collect()
-    } else {
-        Vec::new()
-    };
-    let new_pk_values: Vec<Value> = if has_indices || pk_changed {
-        pk_indices.iter().map(|&i| new_row[i].clone()).collect()
-    } else {
-        Vec::new()
-    };
-
-    let non_pk = table_schema.non_pk_indices();
-    let enc_pos = table_schema.encoding_positions();
-    let phys_count = table_schema.physical_non_pk_count();
-    let dropped = table_schema.dropped_non_pk_slots();
-    let mut value_values: Vec<Value> = vec![Value::Null; phys_count];
-    for &slot in dropped {
-        value_values[slot as usize] = Value::Null;
-    }
-    for (j, &i) in non_pk.iter().enumerate() {
-        let col = &table_schema.columns[i];
-        value_values[enc_pos[j] as usize] = if matches!(
-            col.generated_kind,
-            Some(crate::parser::GeneratedKind::Virtual)
-        ) {
-            Value::Null
-        } else {
-            new_row[i].clone()
-        };
-    }
-    let mut new_value_buf = Vec::with_capacity(256);
-    crate::encoding::encode_row_into(&value_values, &mut new_value_buf);
-
-    if new_value_buf.len() > citadel_core::MAX_VALUE_SIZE {
-        return Err(SqlError::RowTooLarge {
-            size: new_value_buf.len(),
-            max: citadel_core::MAX_VALUE_SIZE,
-        });
-    }
-
-    let col_map_partial = any_partial_index(table_schema).then(|| table_schema.column_map());
-    if pk_changed {
-        let new_pk_key = crate::encoding::encode_composite_key(&new_pk_values);
-        let inserted = wtx
-            .table_insert(table_schema.name.as_bytes(), &new_pk_key, &new_value_buf)
-            .map_err(SqlError::Storage)?;
-        if !inserted {
-            return Err(SqlError::DuplicateKey);
-        }
-        wtx.table_delete(table_schema.name.as_bytes(), old_pk_key)
-            .map_err(SqlError::Storage)?;
-        for idx in &table_schema.indices {
-            let cols_changed = index_columns_changed(idx, old_row, &new_row, table_schema);
-            let (del, ins) = partial_idx_update_actions_with_cancel(
-                idx,
-                old_row,
-                &new_row,
-                cols_changed,
-                true,
-                col_map_partial,
-                cancel,
-            )?;
-            let idx_table = TableSchema::index_table_name(&table_schema.name, &idx.name);
-            if del {
-                let old_idx_key = encode_index_key_with_schema_and_cancel(
-                    idx,
-                    old_row,
-                    &old_pk_values,
-                    table_schema,
-                    cancel,
-                )?;
-                wtx.table_delete(&idx_table, &old_idx_key)
-                    .map_err(SqlError::Storage)?;
-            }
-            if ins {
-                let new_idx_key = encode_index_key_with_schema_and_cancel(
-                    idx,
-                    &new_row,
-                    &new_pk_values,
-                    table_schema,
-                    cancel,
-                )?;
-                let new_idx_val = encode_index_value(idx, &new_row, &new_pk_values);
-                let is_new = wtx
-                    .table_insert(&idx_table, &new_idx_key, &new_idx_val)
-                    .map_err(SqlError::Storage)?;
-                if idx.unique && !is_new {
-                    let any_null = idx
-                        .column_positions_iter()
-                        .any(|c| new_row[c as usize].is_null());
-                    if !any_null {
-                        return Err(index_conflict_error(table_schema, idx));
-                    }
-                }
-            }
-        }
-    } else {
-        wtx.table_update_sorted(
-            table_schema.name.as_bytes(),
-            &[(old_pk_key, new_value_buf.as_slice())],
-        )
-        .map_err(SqlError::Storage)?;
-        for idx in &table_schema.indices {
-            let cols_changed = index_columns_changed(idx, old_row, &new_row, table_schema);
-            let (del, ins) = partial_idx_update_actions_with_cancel(
-                idx,
-                old_row,
-                &new_row,
-                cols_changed,
-                false,
-                col_map_partial,
-                cancel,
-            )?;
-            let idx_table = TableSchema::index_table_name(&table_schema.name, &idx.name);
-            if del {
-                let old_idx_key = encode_index_key_with_schema_and_cancel(
-                    idx,
-                    old_row,
-                    &old_pk_values,
-                    table_schema,
-                    cancel,
-                )?;
-                wtx.table_delete(&idx_table, &old_idx_key)
-                    .map_err(SqlError::Storage)?;
-            }
-            if ins {
-                let new_idx_key = encode_index_key_with_schema_and_cancel(
-                    idx,
-                    &new_row,
-                    &new_pk_values,
-                    table_schema,
-                    cancel,
-                )?;
-                let new_idx_val = encode_index_value(idx, &new_row, &new_pk_values);
-                let is_new = wtx
-                    .table_insert(&idx_table, &new_idx_key, &new_idx_val)
-                    .map_err(SqlError::Storage)?;
-                if idx.unique && !is_new {
-                    let any_null = idx
-                        .column_positions_iter()
-                        .any(|c| new_row[c as usize].is_null());
-                    if !any_null {
-                        return Err(index_conflict_error(table_schema, idx));
-                    }
-                }
-            }
-        }
-    }
-
     Ok(InsertRowOutcome::Updated {
-        rows: capture_returning.then(|| (old_row.to_vec(), new_row)),
+        rows: updates.apply(wtx, old_pk_key, old_row, new_row, capture_returning)?,
     })
 }
 
@@ -3727,9 +3513,10 @@ impl CompiledInsert {
                 && row_fully_overwritten
                 && single_int_pk
                 && !super::triggers::has_insert_triggers(schema, &ts.name)
-                // A DO UPDATE dup hit fires UPDATE row triggers on the slow path.
-                && (stmt.on_conflict.is_none()
-                    || !super::triggers::has_update_triggers(schema, &ts.name))
+                // Only DO UPDATE needs UPDATE triggers and parent FK actions.
+                && (!matches!(on_conflict.as_deref(), Some(CompiledOnConflict::DoUpdate { .. }))
+                    || (!super::triggers::has_update_triggers(schema, &ts.name)
+                        && schema.child_fks_for(&ts.name).is_empty()))
                 && generated_fast_evals
                     .iter()
                     .all(|fe| !matches!(fe, FastGenEval::None));
