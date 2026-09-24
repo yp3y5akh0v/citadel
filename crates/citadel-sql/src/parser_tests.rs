@@ -1919,3 +1919,190 @@ fn parameter_visitor_covers_query_inputs_and_returning() {
         assert_eq!(count_params(&parse_sql(sql).unwrap()), expected, "{sql}");
     }
 }
+
+fn upstream_statement(sql: &str) -> sp::Statement {
+    upstream_statement_in(sql, &sqlparser::dialect::GenericDialect {})
+}
+
+fn upstream_statement_in(sql: &str, dialect: &dyn sqlparser::dialect::Dialect) -> sp::Statement {
+    sqlparser::parser::Parser::parse_sql(dialect, sql)
+        .unwrap_or_else(|error| panic!("upstream parser rejected {sql}: {error}"))
+        .remove(0)
+}
+
+#[test]
+fn converter_rejects_unsupported_dml_fields() {
+    for sql in [
+        "UPDATE q SET n = 1 FROM other",
+        "UPDATE q SET n = 1 LIMIT 1",
+        "UPDATE OR IGNORE q SET n = 1",
+        "UPDATE q JOIN other ON q.id = other.id SET n = 1",
+        "UPDATE q AS target SET n = 1",
+        "DELETE FROM q LIMIT 1",
+        "DELETE FROM q ORDER BY id",
+        "DELETE FROM q USING other",
+        "DELETE FROM q JOIN other ON q.id = other.id",
+        "DELETE FROM q AS target",
+        "INSERT OR IGNORE INTO q VALUES (1)",
+        "INSERT OR REPLACE INTO q VALUES (1)",
+        "INSERT IGNORE INTO q VALUES (1)",
+        "REPLACE INTO q VALUES (1)",
+        "INSERT OVERWRITE TABLE q VALUES (1)",
+        "INSERT INTO q VALUES (1), (2) LIMIT 1",
+        "INSERT INTO q VALUES (1), (2) ORDER BY 1",
+        "INSERT INTO q VALUES (1) RETURNING * EXCLUDE (id)",
+    ] {
+        let result = convert_statement(upstream_statement(sql));
+        assert!(
+            matches!(result, Err(SqlError::Unsupported(_))),
+            "{sql}: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn converter_rejects_dialect_specific_semantic_modifiers() {
+    for (sql, dialect) in [
+        (
+            "DELETE q FROM q JOIN other ON q.id = other.id",
+            &sqlparser::dialect::MySqlDialect {} as &dyn sqlparser::dialect::Dialect,
+        ),
+        (
+            "INSERT INTO q AS target VALUES (1)",
+            &sqlparser::dialect::PostgreSqlDialect {} as &dyn sqlparser::dialect::Dialect,
+        ),
+        (
+            "WITH t AS MATERIALIZED (SELECT 1) SELECT * FROM t",
+            &sqlparser::dialect::PostgreSqlDialect {} as &dyn sqlparser::dialect::Dialect,
+        ),
+    ] {
+        let result = convert_statement(upstream_statement_in(sql, dialect));
+        assert!(
+            matches!(result, Err(SqlError::Unsupported(_))),
+            "{sql}: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn converter_rejects_unsupported_query_and_source_fields() {
+    for sql in [
+        "SELECT TOP 1 id FROM q",
+        "SELECT id FROM q FETCH FIRST 1 ROWS ONLY",
+        "SELECT id FROM q QUALIFY id = 1",
+        "SELECT id INTO backup FROM q",
+        "SELECT id FROM q FOR UPDATE",
+        "SELECT id FROM q PREWHERE id = 1",
+        "SELECT id FROM q GROUP BY id WITH ROLLUP",
+        "SELECT id FROM q WINDOW w AS (ORDER BY id)",
+        "SELECT * EXCLUDE (id) FROM q",
+        "SELECT * REPLACE (1 AS id) FROM q",
+        "SELECT * FROM q AS renamed (id)",
+        "SELECT * FROM (SELECT id FROM q) AS renamed (other_id)",
+        "SELECT * FROM q TABLESAMPLE (10)",
+        "SELECT * FROM q LEFT SEMI JOIN other ON q.id = other.id",
+        "SELECT * FROM q LEFT ANTI JOIN other ON q.id = other.id",
+        "SELECT * FROM q RIGHT SEMI JOIN other ON q.id = other.id",
+        "SELECT * FROM q RIGHT ANTI JOIN other ON q.id = other.id",
+        "SELECT * FROM q GLOBAL JOIN other ON q.id = other.id",
+        "SELECT id FROM q LIMIT 1 BY id",
+        "SELECT id FROM q ORDER BY id WITH FILL",
+        "WITH t AS (WITH u AS (SELECT 1) SELECT * FROM u) SELECT * FROM t",
+    ] {
+        let result = convert_statement(upstream_statement(sql));
+        assert!(
+            matches!(result, Err(SqlError::Unsupported(_))),
+            "{sql}: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn converter_rejects_unenforced_unique_null_semantics() {
+    for sql in [
+        "CREATE UNIQUE INDEX uq ON q (id) NULLS NOT DISTINCT",
+        "CREATE TABLE q (id INT, UNIQUE NULLS NOT DISTINCT (id))",
+    ] {
+        let result = convert_statement(upstream_statement(sql));
+        assert!(
+            matches!(result, Err(SqlError::Unsupported(_))),
+            "{sql}: {result:?}"
+        );
+    }
+    for sql in [
+        "CREATE UNIQUE INDEX uq ON q (id) NULLS DISTINCT",
+        "CREATE TABLE q (id INT, UNIQUE NULLS DISTINCT (id))",
+    ] {
+        assert!(convert_statement(upstream_statement(sql)).is_ok(), "{sql}");
+    }
+}
+
+#[test]
+fn converter_checks_column_unique_null_option_from_ast() {
+    // The upstream AST can represent this option on a column even though its
+    // parser currently accepts the syntax only on table constraints.
+    for nulls_distinct in [
+        sp::NullsDistinctOption::NotDistinct,
+        sp::NullsDistinctOption::Distinct,
+    ] {
+        let sp::Statement::CreateTable(mut table) =
+            upstream_statement("CREATE TABLE q (id INT UNIQUE)")
+        else {
+            panic!("expected CREATE TABLE");
+        };
+        let sp::ColumnOption::Unique(unique) = &mut table.columns[0].options[0].option else {
+            panic!("expected UNIQUE");
+        };
+        unique.nulls_distinct = nulls_distinct;
+        let result = convert_create_table(table);
+        if nulls_distinct == sp::NullsDistinctOption::NotDistinct {
+            assert!(matches!(result, Err(SqlError::Unsupported(_))));
+        } else {
+            assert!(result.is_ok());
+        }
+    }
+}
+
+#[test]
+fn converter_checks_query_options_on_values_and_nested_statements() {
+    let sp::Statement::Query(mut query) = upstream_statement("SELECT 1 FETCH FIRST 1 ROWS ONLY")
+    else {
+        panic!("expected query");
+    };
+    let sp::Statement::Insert(mut insert) = upstream_statement("INSERT INTO q VALUES (1)") else {
+        panic!("expected insert");
+    };
+    insert.source.as_mut().unwrap().fetch = query.fetch.take();
+    assert!(matches!(
+        convert_insert(insert),
+        Err(SqlError::Unsupported(_))
+    ));
+
+    let sp::Statement::Query(mut query) = upstream_statement("SELECT 1") else {
+        panic!("expected query");
+    };
+    let sp::SetExpr::Select(select) = query.body.as_mut() else {
+        panic!("expected SELECT");
+    };
+    select.qualify = Some(sp::Expr::Value(sp::Value::Boolean(false).into()));
+    assert!(matches!(
+        convert_query(*query),
+        Err(SqlError::Unsupported(_))
+    ));
+}
+
+#[test]
+fn converter_rejects_implicit_projection_from_ast() {
+    let sp::Statement::Query(mut query) = upstream_statement("SELECT * FROM q") else {
+        panic!("expected query");
+    };
+    let sp::SetExpr::Select(select) = query.body.as_mut() else {
+        panic!("expected SELECT");
+    };
+    select.projection.clear();
+    select.flavor = sp::SelectFlavor::FromFirstNoSelect;
+    assert!(matches!(
+        convert_query(*query),
+        Err(SqlError::Unsupported(_))
+    ));
+}

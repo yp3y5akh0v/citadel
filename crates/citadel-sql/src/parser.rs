@@ -1793,7 +1793,10 @@ fn convert_column_def(
                 is_primary_key = true;
                 nullable = false;
             }
-            sp::ColumnOption::Unique(_) => is_unique = true,
+            sp::ColumnOption::Unique(unique) => {
+                validate_unique_nulls(unique)?;
+                is_unique = true;
+            }
             sp::ColumnOption::Default(expr) => {
                 default_sql = Some(expr.to_string());
                 default_expr = Some(convert_expr(expr)?);
@@ -2066,6 +2069,7 @@ fn convert_create_table(ct: sp::CreateTable) -> Result<Statement> {
                 });
             }
             sp::TableConstraint::Unique(u) => {
+                validate_unique_nulls(u)?;
                 let cols: Vec<String> = u
                     .columns
                     .iter()
@@ -2204,7 +2208,18 @@ fn convert_fk_characteristics(ch: &Option<sp::ConstraintCharacteristics>) -> (bo
     (deferrable, initially_deferred)
 }
 
+fn validate_unique_nulls(unique: &sp::UniqueConstraint) -> Result<()> {
+    reject_unsupported_clauses(&[(
+        unique.nulls_distinct == sp::NullsDistinctOption::NotDistinct,
+        "UNIQUE NULLS NOT DISTINCT",
+    )])
+}
+
 fn convert_create_index(ci: sp::CreateIndex) -> Result<Statement> {
+    reject_unsupported_clauses(&[(
+        ci.nulls_distinct == Some(false),
+        "UNIQUE NULLS NOT DISTINCT",
+    )])?;
     let index_name = ci
         .name
         .as_ref()
@@ -2710,24 +2725,87 @@ fn parse_select_query(sql: &str) -> Result<SelectQuery> {
     }
 }
 
+// Classify upstream AST fields explicitly at the conversion boundary. Unsupported
+// semantics must never disappear when building our smaller executable AST.
+fn reject_unsupported_clauses(clauses: &[(bool, &str)]) -> Result<()> {
+    for &(present, clause) in clauses {
+        if present {
+            return Err(SqlError::Unsupported(clause.into()));
+        }
+    }
+    Ok(())
+}
+
 fn convert_insert(insert: sp::Insert) -> Result<Statement> {
-    let table = match &insert.table {
+    let sp::Insert {
+        insert_token: _,
+        optimizer_hint,
+        or,
+        ignore,
+        into: _,
+        table,
+        table_alias,
+        columns,
+        overwrite,
+        source,
+        assignments,
+        partitioned,
+        after_columns,
+        has_table_keyword: _,
+        on,
+        returning,
+        replace_into,
+        priority,
+        insert_alias,
+        settings,
+        format_clause,
+    } = insert;
+    reject_unsupported_clauses(&[
+        (optimizer_hint.is_some(), "INSERT optimizer hints"),
+        (or.is_some(), "INSERT OR conflict policy"),
+        (ignore, "INSERT IGNORE"),
+        (overwrite, "INSERT OVERWRITE"),
+        (replace_into, "REPLACE INTO"),
+        (
+            table_alias.is_some() || insert_alias.is_some(),
+            "INSERT aliases",
+        ),
+        (!assignments.is_empty(), "INSERT SET assignments"),
+        (
+            partitioned.is_some() || !after_columns.is_empty(),
+            "INSERT PARTITION",
+        ),
+        (priority.is_some(), "INSERT priority"),
+        (settings.is_some(), "INSERT SETTINGS"),
+        (format_clause.is_some(), "INSERT FORMAT"),
+    ])?;
+    let table = match &table {
         sp::TableObject::TableName(name) => object_name_to_string(name).to_ascii_lowercase(),
         _ => return Err(SqlError::Unsupported("INSERT into non-table object".into())),
     };
 
-    let columns: Vec<String> = insert
-        .columns
+    let columns: Vec<String> = columns
         .iter()
         .map(|c| c.value.to_ascii_lowercase())
         .collect();
 
-    let query = insert
-        .source
-        .ok_or_else(|| SqlError::Parse("INSERT requires VALUES or SELECT".into()))?;
+    let query = source.ok_or_else(|| SqlError::Parse("INSERT requires VALUES or SELECT".into()))?;
 
+    validate_query_clauses(&query)?;
     let source = match *query.body {
-        sp::SetExpr::Values(sp::Values { rows, .. }) => {
+        sp::SetExpr::Values(sp::Values {
+            explicit_row: _,
+            value_keyword: _,
+            rows,
+        }) => {
+            reject_unsupported_clauses(&[
+                (query.with.is_some(), "WITH on INSERT VALUES"),
+                (query.order_by.is_some(), "ORDER BY on INSERT VALUES"),
+                (
+                    query.limit_clause.is_some(),
+                    "LIMIT/OFFSET on INSERT VALUES",
+                ),
+            ])?;
             let mut result = Vec::new();
             for row in rows {
                 let mut exprs = Vec::new();
@@ -2753,8 +2831,8 @@ fn convert_insert(insert: sp::Insert) -> Result<Statement> {
         }
     };
 
-    let on_conflict = insert.on.as_ref().map(convert_on_insert).transpose()?;
-    let returning = convert_returning(insert.returning.as_deref())?;
+    let on_conflict = on.as_ref().map(convert_on_insert).transpose()?;
+    let returning = convert_returning(returning.as_deref())?;
 
     Ok(Statement::Insert(InsertStmt {
         table,
@@ -2833,6 +2911,52 @@ fn convert_on_conflict_action(action: &sp::OnConflictAction) -> Result<OnConflic
 }
 
 fn convert_select_body(select: &sp::Select) -> Result<SelectStmt> {
+    let sp::Select {
+        select_token: _,
+        optimizer_hint,
+        distinct: _,
+        select_modifiers,
+        top,
+        top_before_distinct: _,
+        projection: _,
+        exclude,
+        into,
+        from: _,
+        lateral_views,
+        prewhere,
+        selection: _,
+        connect_by,
+        group_by: _,
+        cluster_by,
+        distribute_by,
+        sort_by,
+        having: _,
+        named_window,
+        qualify,
+        window_before_qualify: _,
+        value_table_mode,
+        flavor,
+    } = select;
+    reject_unsupported_clauses(&[
+        (optimizer_hint.is_some(), "SELECT optimizer hints"),
+        (select_modifiers.is_some(), "SELECT modifiers"),
+        (top.is_some(), "SELECT TOP"),
+        (exclude.is_some(), "SELECT EXCLUDE"),
+        (into.is_some(), "SELECT INTO"),
+        (!lateral_views.is_empty(), "LATERAL VIEW"),
+        (prewhere.is_some(), "PREWHERE"),
+        (!connect_by.is_empty(), "CONNECT BY"),
+        (!cluster_by.is_empty(), "CLUSTER BY"),
+        (!distribute_by.is_empty(), "DISTRIBUTE BY"),
+        (!sort_by.is_empty(), "SORT BY"),
+        (!named_window.is_empty(), "WINDOW definitions"),
+        (qualify.is_some(), "QUALIFY"),
+        (value_table_mode.is_some(), "SELECT value table mode"),
+        (
+            matches!(flavor, sp::SelectFlavor::FromFirstNoSelect),
+            "FROM without SELECT",
+        ),
+    ])?;
     let distinct = match &select.distinct {
         Some(sp::Distinct::Distinct) => true,
         Some(sp::Distinct::On(_)) => {
@@ -2904,7 +3028,8 @@ fn convert_select_body(select: &sp::Select) -> Result<SelectStmt> {
     let where_clause = select.selection.as_ref().map(convert_expr).transpose()?;
 
     let group_by = match &select.group_by {
-        sp::GroupByExpr::Expressions(exprs, _) => {
+        sp::GroupByExpr::Expressions(exprs, modifiers) => {
+            reject_unsupported_clauses(&[(!modifiers.is_empty(), "GROUP BY modifiers")])?;
             exprs.iter().map(convert_expr).collect::<Result<_>>()?
         }
         sp::GroupByExpr::All(_) => {
@@ -2940,15 +3065,45 @@ type FromRelation = (
     Option<Box<JsonTableSpec>>,
 );
 
+fn validate_table_alias(alias: Option<&sp::TableAlias>) -> Result<()> {
+    reject_unsupported_clauses(&[(
+        alias.is_some_and(|alias| !alias.columns.is_empty()),
+        "table column aliases",
+    )])
+}
+
 fn convert_from_relation(relation: &sp::TableFactor) -> Result<FromRelation> {
     match relation {
         sp::TableFactor::Table {
-            name, alias, args, ..
+            name,
+            alias,
+            args,
+            with_hints,
+            version,
+            with_ordinality,
+            partitions,
+            json_path,
+            sample,
+            index_hints,
         } => {
+            reject_unsupported_clauses(&[
+                (!with_hints.is_empty(), "table hints"),
+                (version.is_some(), "table version"),
+                (*with_ordinality, "WITH ORDINALITY"),
+                (!partitions.is_empty(), "table partitions"),
+                (json_path.is_some(), "table JSON path"),
+                (sample.is_some(), "TABLESAMPLE"),
+                (!index_hints.is_empty(), "table index hints"),
+            ])?;
+            validate_table_alias(alias.as_ref())?;
             let table_name = object_name_to_string(name);
             let alias_str = alias.as_ref().map(|a| a.name.value.clone());
             let args_converted = match args {
                 Some(table_args) => {
+                    reject_unsupported_clauses(&[(
+                        table_args.settings.is_some(),
+                        "table function SETTINGS",
+                    )])?;
                     let mut converted = Vec::with_capacity(table_args.args.len());
                     for arg in &table_args.args {
                         match arg {
@@ -2972,8 +3127,10 @@ fn convert_from_relation(relation: &sp::TableFactor) -> Result<FromRelation> {
             lateral,
             subquery,
             alias,
-            ..
+            sample,
         } => {
+            reject_unsupported_clauses(&[(sample.is_some(), "TABLESAMPLE")])?;
+            validate_table_alias(alias.as_ref())?;
             let alias_name = match alias {
                 Some(a) => a.name.value.clone(),
                 None => return Err(SqlError::Unsupported("derived table requires alias".into())),
@@ -3002,6 +3159,7 @@ fn convert_from_relation(relation: &sp::TableFactor) -> Result<FromRelation> {
             columns,
             alias,
         } => {
+            validate_table_alias(alias.as_ref())?;
             let alias_name = match alias {
                 Some(a) => a.name.value.clone(),
                 None => "json_table".to_string(),
@@ -3110,7 +3268,41 @@ fn convert_set_expr(set_expr: &sp::SetExpr) -> Result<QueryBody> {
     }
 }
 
+fn validate_query_clauses(query: &sp::Query) -> Result<()> {
+    let sp::Query {
+        with: _,
+        body: _,
+        order_by,
+        limit_clause,
+        fetch,
+        locks,
+        for_clause,
+        settings,
+        format_clause,
+        pipe_operators,
+    } = query;
+    reject_unsupported_clauses(&[
+        (fetch.is_some(), "FETCH"),
+        (!locks.is_empty(), "query locking clause"),
+        (for_clause.is_some(), "query FOR clause"),
+        (settings.is_some(), "query SETTINGS"),
+        (format_clause.is_some(), "query FORMAT"),
+        (!pipe_operators.is_empty(), "query pipe operators"),
+        (
+            order_by
+                .as_ref()
+                .is_some_and(|order| order.interpolate.is_some()),
+            "ORDER BY INTERPOLATE",
+        ),
+        (
+            matches!(limit_clause, Some(sp::LimitClause::LimitOffset { limit_by, .. }) if !limit_by.is_empty()),
+            "LIMIT BY",
+        ),
+    ])
+}
+
 fn convert_query_body(query: &sp::Query) -> Result<QueryBody> {
+    validate_query_clauses(query)?;
     let mut body = convert_set_expr(&query.body)?;
 
     /// Rewrite `ORDER BY <name>` into the select-list expression `<name>` names.
@@ -3260,6 +3452,11 @@ fn convert_with(with: &sp::With) -> Result<(Vec<CteDefinition>, bool)> {
     let mut names = rustc_hash::FxHashSet::default();
     let mut ctes = Vec::new();
     for cte in &with.cte_tables {
+        reject_unsupported_clauses(&[
+            (cte.from.is_some(), "CTE FROM"),
+            (cte.materialized.is_some(), "CTE materialization directive"),
+            (cte.query.with.is_some(), "nested WITH in CTE body"),
+        ])?;
         let name = cte.alias.name.value.to_ascii_lowercase();
         if !names.insert(name.clone()) {
             return Err(SqlError::DuplicateCteName(name));
@@ -3300,16 +3497,13 @@ fn convert_select_query(query: &sp::Query) -> Result<SelectQuery> {
 }
 
 fn convert_join(join: &sp::Join) -> Result<JoinClause> {
+    reject_unsupported_clauses(&[(join.global, "GLOBAL JOIN")])?;
     let (join_type, constraint) = match &join.join_operator {
         sp::JoinOperator::Inner(c) => (JoinType::Inner, Some(c)),
         sp::JoinOperator::Join(c) => (JoinType::Inner, Some(c)),
         sp::JoinOperator::CrossJoin(c) => (JoinType::Cross, Some(c)),
         sp::JoinOperator::Left(c) | sp::JoinOperator::LeftOuter(c) => (JoinType::Left, Some(c)),
-        sp::JoinOperator::LeftSemi(c) => (JoinType::Left, Some(c)),
-        sp::JoinOperator::LeftAnti(c) => (JoinType::Left, Some(c)),
         sp::JoinOperator::Right(c) | sp::JoinOperator::RightOuter(c) => (JoinType::Right, Some(c)),
-        sp::JoinOperator::RightSemi(c) => (JoinType::Right, Some(c)),
-        sp::JoinOperator::RightAnti(c) => (JoinType::Right, Some(c)),
         sp::JoinOperator::FullOuter(c) => (JoinType::FullOuter, Some(c)),
         other => return Err(SqlError::Unsupported(format!("join type: {other:?}"))),
     };
@@ -3335,14 +3529,47 @@ fn convert_join(join: &sp::Join) -> Result<JoinClause> {
     })
 }
 
-fn convert_update(update: sp::Update) -> Result<Statement> {
-    let table = match &update.table.relation {
-        sp::TableFactor::Table { name, .. } => object_name_to_string(name),
-        _ => return Err(SqlError::Unsupported("non-table UPDATE target".into())),
-    };
+fn convert_dml_target(target: &sp::TableWithJoins, operation: &str) -> Result<String> {
+    if !target.joins.is_empty() {
+        return Err(SqlError::Unsupported(format!(
+            "{operation} with joined target"
+        )));
+    }
+    if !matches!(target.relation, sp::TableFactor::Table { .. }) {
+        return Err(SqlError::Unsupported(format!(
+            "non-table {operation} target"
+        )));
+    }
+    let (name, alias, _, args, _) = convert_from_relation(&target.relation)?;
+    if alias.is_some() || args.is_some() {
+        return Err(SqlError::Unsupported(format!(
+            "{operation} target alias or function arguments"
+        )));
+    }
+    Ok(name)
+}
 
-    let assignments = update
-        .assignments
+fn convert_update(update: sp::Update) -> Result<Statement> {
+    let sp::Update {
+        update_token: _,
+        optimizer_hint,
+        table,
+        assignments,
+        from,
+        selection,
+        returning,
+        or,
+        limit,
+    } = update;
+    reject_unsupported_clauses(&[
+        (optimizer_hint.is_some(), "UPDATE optimizer hints"),
+        (from.is_some(), "UPDATE FROM"),
+        (or.is_some(), "UPDATE OR conflict policy"),
+        (limit.is_some(), "UPDATE LIMIT"),
+    ])?;
+    let table = convert_dml_target(&table, "UPDATE")?;
+
+    let assignments = assignments
         .iter()
         .map(|a| {
             let col = match &a.target {
@@ -3354,8 +3581,8 @@ fn convert_update(update: sp::Update) -> Result<Statement> {
         })
         .collect::<Result<_>>()?;
 
-    let where_clause = update.selection.as_ref().map(convert_expr).transpose()?;
-    let returning = convert_returning(update.returning.as_deref())?;
+    let where_clause = selection.as_ref().map(convert_expr).transpose()?;
+    let returning = convert_returning(returning.as_deref())?;
 
     Ok(Statement::Update(UpdateStmt {
         table,
@@ -3394,32 +3621,34 @@ fn convert_truncate(t: sp::Truncate) -> Result<Statement> {
 }
 
 fn convert_delete(delete: sp::Delete) -> Result<Statement> {
-    let table_name = match &delete.from {
-        sp::FromTable::WithFromKeyword(tables) => {
-            if tables.len() != 1 {
-                return Err(SqlError::Unsupported("multi-table DELETE".into()));
-            }
-            match &tables[0].relation {
-                sp::TableFactor::Table { name, .. } => object_name_to_string(name),
-                _ => return Err(SqlError::Unsupported("non-table DELETE target".into())),
-            }
-        }
-        sp::FromTable::WithoutKeyword(tables) => {
-            if tables.len() != 1 {
-                return Err(SqlError::Unsupported("multi-table DELETE".into()));
-            }
-            match &tables[0].relation {
-                sp::TableFactor::Table { name, .. } => object_name_to_string(name),
-                _ => return Err(SqlError::Unsupported("non-table DELETE target".into())),
-            }
-        }
+    let sp::Delete {
+        delete_token: _,
+        optimizer_hint,
+        tables,
+        from,
+        using,
+        selection,
+        returning,
+        order_by,
+        limit,
+    } = delete;
+    reject_unsupported_clauses(&[
+        (optimizer_hint.is_some(), "DELETE optimizer hints"),
+        (!tables.is_empty(), "multi-target DELETE"),
+        (using.is_some(), "DELETE USING"),
+        (!order_by.is_empty(), "DELETE ORDER BY"),
+        (limit.is_some(), "DELETE LIMIT"),
+    ])?;
+    let (sp::FromTable::WithFromKeyword(tables) | sp::FromTable::WithoutKeyword(tables)) = from;
+    let [target] = tables.as_slice() else {
+        return Err(SqlError::Unsupported("multi-table DELETE".into()));
     };
-
-    let where_clause = delete.selection.as_ref().map(convert_expr).transpose()?;
-    let returning = convert_returning(delete.returning.as_deref())?;
+    let table = convert_dml_target(target, "DELETE")?;
+    let where_clause = selection.as_ref().map(convert_expr).transpose()?;
+    let returning = convert_returning(returning.as_deref())?;
 
     Ok(Statement::Delete(DeleteStmt {
-        table: table_name,
+        table,
         where_clause,
         returning,
     }))
@@ -4139,9 +4368,30 @@ fn convert_returning(items: Option<&[sp::SelectItem]>) -> Result<Option<Vec<Sele
     }
 }
 
+fn validate_wildcard_options(options: &sp::WildcardAdditionalOptions) -> Result<()> {
+    let sp::WildcardAdditionalOptions {
+        wildcard_token: _,
+        opt_ilike,
+        opt_exclude,
+        opt_except,
+        opt_replace,
+        opt_rename,
+    } = options;
+    reject_unsupported_clauses(&[
+        (opt_ilike.is_some(), "wildcard ILIKE"),
+        (opt_exclude.is_some(), "wildcard EXCLUDE"),
+        (opt_except.is_some(), "wildcard EXCEPT"),
+        (opt_replace.is_some(), "wildcard REPLACE"),
+        (opt_rename.is_some(), "wildcard RENAME"),
+    ])
+}
+
 fn convert_returning_item(item: &sp::SelectItem) -> Result<SelectColumn> {
     match item {
-        sp::SelectItem::Wildcard(_) => Ok(SelectColumn::AllColumns),
+        sp::SelectItem::Wildcard(options) => {
+            validate_wildcard_options(options)?;
+            Ok(SelectColumn::AllColumns)
+        }
         sp::SelectItem::UnnamedExpr(e) => {
             reject_aggregate_or_window(e, "RETURNING")?;
             Ok(SelectColumn::Expr {
@@ -4156,23 +4406,26 @@ fn convert_returning_item(item: &sp::SelectItem) -> Result<SelectColumn> {
                 alias: Some(alias.value.clone()),
             })
         }
-        sp::SelectItem::QualifiedWildcard(kind, _) => match kind {
-            sp::SelectItemQualifiedWildcardKind::ObjectName(name) => {
-                let s = object_name_to_string(name);
-                if s.eq_ignore_ascii_case("old") {
-                    Ok(SelectColumn::AllFromOld)
-                } else if s.eq_ignore_ascii_case("new") {
-                    Ok(SelectColumn::AllFromNew)
-                } else {
-                    Err(SqlError::Unsupported(format!(
-                        "RETURNING {s}.* — only old.* and new.* qualified wildcards allowed"
-                    )))
+        sp::SelectItem::QualifiedWildcard(kind, options) => {
+            validate_wildcard_options(options)?;
+            match kind {
+                sp::SelectItemQualifiedWildcardKind::ObjectName(name) => {
+                    let s = object_name_to_string(name);
+                    if s.eq_ignore_ascii_case("old") {
+                        Ok(SelectColumn::AllFromOld)
+                    } else if s.eq_ignore_ascii_case("new") {
+                        Ok(SelectColumn::AllFromNew)
+                    } else {
+                        Err(SqlError::Unsupported(format!(
+                            "RETURNING {s}.* — only old.* and new.* qualified wildcards allowed"
+                        )))
+                    }
+                }
+                sp::SelectItemQualifiedWildcardKind::Expr(_) => {
+                    Err(SqlError::Unsupported("expression.* in RETURNING".into()))
                 }
             }
-            sp::SelectItemQualifiedWildcardKind::Expr(_) => {
-                Err(SqlError::Unsupported("expression.* in RETURNING".into()))
-            }
-        },
+        }
     }
 }
 
@@ -4265,7 +4518,10 @@ fn walk_function_args(f: &sp::Function) -> Vec<&sp::Expr> {
 
 fn convert_select_item(item: &sp::SelectItem) -> Result<SelectColumn> {
     match item {
-        sp::SelectItem::Wildcard(_) => Ok(SelectColumn::AllColumns),
+        sp::SelectItem::Wildcard(options) => {
+            validate_wildcard_options(options)?;
+            Ok(SelectColumn::AllColumns)
+        }
         sp::SelectItem::UnnamedExpr(e) => {
             let expr = convert_expr(e)?;
             Ok(SelectColumn::Expr { expr, alias: None })
@@ -4284,6 +4540,7 @@ fn convert_select_item(item: &sp::SelectItem) -> Result<SelectColumn> {
 }
 
 fn convert_order_by_expr(expr: &sp::OrderByExpr) -> Result<OrderByItem> {
+    reject_unsupported_clauses(&[(expr.with_fill.is_some(), "ORDER BY WITH FILL")])?;
     // SQLite treats unary `+1` like the integer ordinal `1`, while `+1.0`
     // remains an ordinary constant. Unary plus is otherwise unsupported by
     // the expression evaluator, so accept it here only for numeric literals.
