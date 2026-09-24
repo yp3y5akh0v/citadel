@@ -1489,19 +1489,21 @@ pub(super) fn exec_select_in_txn(
 
     let lower_name = stmt.from.to_ascii_lowercase();
 
-    if let Some(cte_result) = ctes.get(&lower_name) {
+    if let Some(cte_result) = super::materialized_source(&lower_name, schema, ctes, cancel)? {
         if stmt.joins.is_empty() {
             return super::exec_select_from_cte(
-                cte_result,
+                &cte_result,
                 stmt,
                 &mut |sub| exec_subquery_write(wtx, schema, sub, ctes),
                 cancel,
             );
         } else {
+            let mut sources = ctes.clone();
+            sources.insert(lower_name.clone(), cte_result);
             return super::exec_select_join_with_ctes(
                 stmt,
-                ctes,
-                &mut |name| super::scan_table_write(wtx, schema, name),
+                &sources,
+                &mut |name| super::scan_table_write_or_view(wtx, schema, name),
                 cancel,
             );
         }
@@ -1546,12 +1548,11 @@ pub(super) fn exec_select_in_txn(
         }
     }
 
-    let any_join_view = stmt.joins.iter().any(|j| {
-        schema
-            .get_view(&j.table.name.to_ascii_lowercase())
-            .is_some()
+    let has_view_or_virtual_join = stmt.joins.iter().any(|j| {
+        let name = j.table.name.to_ascii_lowercase();
+        schema.get_view(&name).is_some() || super::virtual_table(&name, schema).is_some()
     });
-    if any_join_view {
+    if has_view_or_virtual_join {
         let mut view_ctes = ctes.clone();
         for j in &stmt.joins {
             let jname = j.table.name.to_ascii_lowercase();
@@ -1565,7 +1566,7 @@ pub(super) fn exec_select_in_txn(
         return super::exec_select_join_with_ctes(
             stmt,
             &view_ctes,
-            &mut |name| super::scan_table_write(wtx, schema, name),
+            &mut |name| super::scan_table_write_or_view(wtx, schema, name),
             cancel,
         );
     }
@@ -2404,6 +2405,16 @@ pub(super) fn exec_update_in_txn(
         outer_schema: table_schema,
         outer_alias: Some(&stmt.table),
     };
+    // SET subqueries are materialized once below, not evaluated per target row.
+    // Reject captures before materialization can mistake an outer column for a
+    // similarly named local column and silently apply the wrong value.
+    for (_, expr) in &stmt.assignments {
+        if mutation_has_correlated_expr(wtx, expr, &ctx, schema)? {
+            return Err(SqlError::Unsupported(
+                "correlated subqueries in UPDATE SET expressions".into(),
+            ));
+        }
+    }
     let mut correlated_rows = None;
     let rewritten;
     let stmt = if mutation_has_correlated_where(wtx, &stmt.where_clause, &ctx, schema)? {

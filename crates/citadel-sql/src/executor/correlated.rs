@@ -25,10 +25,21 @@ pub(super) fn mutation_has_correlated_where(
     let Some(predicate) = predicate else {
         return Ok(false);
     };
-    if !super::dml::has_subquery(predicate) {
+    mutation_has_correlated_expr(wtx, predicate, ctx, schema)
+}
+
+/// Resolve nested names against their local scopes before identifying a capture
+/// of the row being mutated. SET and WHERE must use the same binding rules.
+pub(super) fn mutation_has_correlated_expr(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    expr: &Expr,
+    ctx: &CorrelationCtx<'_>,
+    schema: &SchemaManager,
+) -> Result<bool> {
+    if !super::dml::has_subquery(expr) {
         return Ok(false);
     }
-    binding::bind_predicate(wtx, schema, &mut predicate.clone(), ctx, None)
+    binding::bind_predicate(wtx, schema, &mut expr.clone(), ctx, None)
 }
 
 fn complete_exists_semijoin(
@@ -571,7 +582,7 @@ pub(super) fn is_correlated_subquery(
         if let Some(dot) = name.find('.') {
             let table_part = &name[..dot];
             let col_part = &name[dot + 1..];
-            if table_part == inner_name || inner_alias.as_deref() == Some(table_part) {
+            if table_part == inner_alias.as_deref().unwrap_or(&inner_name) {
                 continue;
             }
             if ctx.matches_outer(table_part) && resolves_in(col_part, ctx.outer_schema) {
