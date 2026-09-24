@@ -563,6 +563,7 @@ fn join_scale_100x1000() {
         "CREATE TABLE orders (id INTEGER NOT NULL PRIMARY KEY, uid INTEGER NOT NULL, amt INTEGER NOT NULL)"
     ).unwrap());
 
+    conn.execute("BEGIN").unwrap();
     for i in 0..100 {
         conn.execute(&format!(
             "INSERT INTO users (id, name) VALUES ({i}, 'user_{i}')"
@@ -577,6 +578,7 @@ fn join_scale_100x1000() {
         ))
         .unwrap();
     }
+    conn.execute("COMMIT").unwrap();
 
     let qr = query(
         &conn,

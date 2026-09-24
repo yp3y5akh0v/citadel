@@ -113,6 +113,7 @@ fn large_cross_table() {
             .unwrap(),
     );
 
+    assert_ok(conn.execute("BEGIN").unwrap());
     for i in 1..=1000 {
         conn.execute(&format!(
             "INSERT INTO src VALUES ({i}, 'row_{i}', {})",
@@ -120,6 +121,7 @@ fn large_cross_table() {
         ))
         .unwrap();
     }
+    assert_ok(conn.execute("COMMIT").unwrap());
     assert_eq!(count_rows(&conn, "src"), 1000);
 
     assert_rows_affected(
