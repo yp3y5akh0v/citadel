@@ -41,6 +41,7 @@ fn bulk_insert_with_defaults_1000_rows() {
         "CREATE TABLE items (id INTEGER NOT NULL PRIMARY KEY, name TEXT DEFAULT 'unnamed', score REAL DEFAULT 0.0, active BOOLEAN DEFAULT TRUE)"
     ).unwrap());
 
+    assert_ok(conn.execute("BEGIN").unwrap());
     for i in 0..1000 {
         assert_rows_affected(
             conn.execute(&format!("INSERT INTO items (id) VALUES ({i})"))
@@ -48,6 +49,7 @@ fn bulk_insert_with_defaults_1000_rows() {
             1,
         );
     }
+    assert_ok(conn.execute("COMMIT").unwrap());
 
     let rows = get_rows(
         conn.execute("SELECT COUNT(*) FROM items WHERE name = 'unnamed'")
@@ -1316,6 +1318,7 @@ fn unique_large_scale_1000_distinct() {
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL UNIQUE)")
             .unwrap(),
     );
+    assert_ok(conn.execute("BEGIN").unwrap());
     for i in 0..1000 {
         assert_rows_affected(
             conn.execute(&format!("INSERT INTO t VALUES ({i}, {i})"))
@@ -1323,6 +1326,7 @@ fn unique_large_scale_1000_distinct() {
             1,
         );
     }
+    assert_ok(conn.execute("COMMIT").unwrap());
     // Any duplicate in a large set is still rejected.
     let err = conn
         .execute("INSERT INTO t VALUES (5000, 500)")

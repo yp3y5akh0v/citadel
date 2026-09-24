@@ -63,6 +63,7 @@ fn truncate_resource_cycling() {
         .unwrap();
 
     for cycle in 0..50 {
+        assert_ok(conn.execute("BEGIN").unwrap());
         for i in 0..100 {
             assert_rows(
                 conn.execute(&format!("INSERT INTO cycle VALUES ({i}, 'c{cycle}_{i}')"))
@@ -70,6 +71,7 @@ fn truncate_resource_cycling() {
                 1,
             );
         }
+        assert_ok(conn.execute("COMMIT").unwrap());
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM cycle"), 100);
         assert_rows(conn.execute("TRUNCATE TABLE cycle").unwrap(), 100);
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM cycle"), 0);

@@ -203,6 +203,7 @@ fn bulk_insert_all_findable_via_inverted_index() {
     let (_d, db) = conn();
     let conn = Connection::open(&db).unwrap();
     create_docs_table(&conn);
+    conn.execute("BEGIN").unwrap();
     for i in 0..500i64 {
         let text = if i == 42 {
             "alpha beta gamma needle delta".to_string()
@@ -215,6 +216,7 @@ fn bulk_insert_all_findable_via_inverted_index() {
         )
         .unwrap();
     }
+    conn.execute("COMMIT").unwrap();
     assert_eq!(count_match(&conn, "'alpha'"), 500);
     assert_eq!(count_match(&conn, "'needle'"), 1);
     assert_eq!(count_match(&conn, "'nonexistent'"), 0);
