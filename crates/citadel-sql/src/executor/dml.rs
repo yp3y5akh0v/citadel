@@ -1491,10 +1491,7 @@ fn exec_insert_in_txn_impl(
                 wtx,
                 schema,
                 table_schema,
-                assignments
-                    .iter()
-                    .map(|(i, _)| table_schema.columns[*i].name.clone())
-                    .collect(),
+                assignments.iter().map(|(i, _)| *i),
             )?)
         }
         _ => None,
@@ -2704,7 +2701,7 @@ pub(super) fn apply_insert_with_conflict(
                         updates.expect("DO UPDATE statement state"),
                         table_schema,
                         key_buf,
-                        &old_row,
+                        old_row,
                         row,
                         assignments,
                         where_clause.as_ref(),
@@ -3017,7 +3014,7 @@ fn apply_do_update(
         updates,
         table_schema,
         pk_key,
-        &old_row,
+        old_row,
         proposed_row,
         assignments,
         where_clause,
@@ -3033,7 +3030,7 @@ fn apply_do_update_with_old_row(
     updates: &mut super::row_mutation::ConflictUpdates<'_>,
     table_schema: &TableSchema,
     old_pk_key: &[u8],
-    old_row: &[Value],
+    old_row: Vec<Value>,
     proposed_row: &[Value],
     assignments: &[(usize, Expr)],
     where_clause: Option<&Expr>,
@@ -3054,7 +3051,7 @@ fn apply_do_update_with_old_row(
         }
     };
     let mut ctx =
-        EvalCtx::with_excluded(col_map, old_row, col_map, proposed_row).with_cancel(cancel);
+        EvalCtx::with_excluded(col_map, &old_row, col_map, proposed_row).with_cancel(cancel);
     if table_schema.has_virtual_columns() {
         ctx = ctx.with_excluded_resolver(&resolve_excluded);
     }

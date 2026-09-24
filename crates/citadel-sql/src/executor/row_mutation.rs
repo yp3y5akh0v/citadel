@@ -104,14 +104,24 @@ impl<'a> ConflictUpdates<'a> {
         wtx: &mut WriteTxn<'_>,
         schema: &'a SchemaManager,
         table: &'a TableSchema,
-        changed_columns: Vec<String>,
+        assigned_columns: impl Iterator<Item = usize>,
     ) -> Result<Self> {
+        let has_triggers = triggers::has_update_triggers(schema, &table.name);
+        // Only UPDATE OF triggers and explicitly reassigned child references
+        // need column names. Parent actions and indexes compare OLD/NEW values.
+        let changed_columns = if has_triggers || !table.foreign_keys.is_empty() {
+            assigned_columns
+                .map(|i| table.columns[i].name.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
         let updates = Self {
             schema,
             table,
             changed_columns,
             has_children: !schema.child_fks_for(&table.name).is_empty(),
-            has_triggers: triggers::has_update_triggers(schema, &table.name),
+            has_triggers,
             statement_triggers: triggers::has_statement_update_triggers(schema, &table.name),
             old_rows: Vec::new(),
             new_rows: Vec::new(),
@@ -129,7 +139,7 @@ impl<'a> ConflictUpdates<'a> {
         &mut self,
         wtx: &mut WriteTxn<'_>,
         key: &[u8],
-        old: &[Value],
+        old: Vec<Value>,
         new: Vec<Value>,
         capture_rows: bool,
     ) -> Result<Option<(Vec<Value>, Vec<Value>)>> {
@@ -146,7 +156,7 @@ impl<'a> ConflictUpdates<'a> {
             has_triggers: self.has_triggers,
             rows: vec![RowChange {
                 key: key.to_vec(),
-                old: old.to_vec(),
+                old,
                 new: Some(new),
             }]
             .into_iter(),
