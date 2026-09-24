@@ -301,12 +301,26 @@ pub(crate) fn view_columns_from_aliases(aliases: &[String]) -> Vec<crate::types:
 }
 
 pub(crate) fn has_instead_of(schema: &SchemaManager, target: &str, event: FireEvent<'_>) -> bool {
-    schema.triggers_for(target).iter().any(|t| {
-        t.enabled
-            && t.timing == TriggerTiming::InsteadOf
-            && t.granularity == TriggerGranularity::ForEachRow
-            && t.events.iter().any(|e| event_matches(e, event))
-    })
+    has_row_triggers(schema, target, TriggerTiming::InsteadOf, event)
+}
+
+fn row_trigger_matches(trigger: &TriggerDef, timing: TriggerTiming, event: FireEvent<'_>) -> bool {
+    trigger.enabled
+        && trigger.timing == timing
+        && trigger.granularity == TriggerGranularity::ForEachRow
+        && trigger.events.iter().any(|e| event_matches(e, event))
+}
+
+pub(super) fn has_row_triggers(
+    schema: &SchemaManager,
+    target: &str,
+    timing: TriggerTiming,
+    event: FireEvent<'_>,
+) -> bool {
+    schema
+        .triggers_for(target)
+        .iter()
+        .any(|t| row_trigger_matches(t, timing, event))
 }
 
 /// Returns `Ok(true)` if an INSTEAD OF trigger handled the event — caller skips real DML.
@@ -327,12 +341,7 @@ pub(crate) fn fire_row_triggers(
     let candidates: Vec<TriggerDef> = schema
         .triggers_for(target)
         .iter()
-        .filter(|t| {
-            t.enabled
-                && t.timing == timing
-                && t.granularity == TriggerGranularity::ForEachRow
-                && t.events.iter().any(|e| event_matches(e, event))
-        })
+        .filter(|t| row_trigger_matches(t, timing, event))
         .cloned()
         .collect();
 
