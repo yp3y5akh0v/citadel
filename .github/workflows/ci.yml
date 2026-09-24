@@ -42,6 +42,10 @@ jobs:
       # --all-targets builds citadeldb-studio and its render tests, which link eframe.
       - uses: ./.github/actions/studio-deps
       - uses: Swatinem/rust-cache@v2
+        with:
+          # PRs restore master's caches without filling the shared cache quota
+          # with copies that other branches cannot reuse.
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Verify generated C header is current
         run: |
@@ -63,6 +67,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: msrv
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - run: cargo +1.95 check --workspace --locked
 
   test:
@@ -110,6 +115,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.name }}
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install Nextest
         if: matrix.name != 'linux-fips'
         uses: taiki-e/install-action@7b8d4719ee4aaa279bdf55df38dacb9ebfe12a6c # v2.87.6
@@ -120,12 +126,11 @@ jobs:
       - name: Test integrations
         if: matrix.name != 'linux-fips'
         run: cargo nextest run --workspace --locked ${{ matrix.features }} --profile ci -E 'kind(test) & not binary(=shots) & not binary(=pg_jsonb_jsonpath)'
-      - name: Test libraries and binaries
+      # Keep all workspace libraries selected so the special test targets reuse
+      # the same dependency profiles as Nextest (especially build deps on Windows).
+      - name: Test libraries, binaries, rendering and JSONPath corpus
         if: matrix.name != 'linux-fips'
-        run: cargo test --workspace --locked ${{ matrix.features }} --lib --bins
-      - name: Test Studio rendering and JSONPath corpus
-        if: matrix.name != 'linux-fips'
-        run: cargo test --workspace --locked ${{ matrix.features }} --test shots --test pg_jsonb_jsonpath
+        run: cargo test --workspace --locked ${{ matrix.features }} --lib --bins --test shots --test pg_jsonb_jsonpath
       - name: Test documentation
         if: matrix.name != 'linux-fips'
         run: cargo test --workspace --locked ${{ matrix.features }} --doc
@@ -147,6 +152,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ai-backends
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       # citadel-llm is its own published crate; do not let its coverage depend on
       # another crate happening to enable its backend features.
       - name: citadel-llm standalone (all features, mock-only, and wasm)
@@ -182,6 +188,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: wasm
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install WASM tooling
         run: |
           cargo install wasm-pack --version 0.14.0 --locked
@@ -207,6 +214,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: python
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
