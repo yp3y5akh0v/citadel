@@ -173,6 +173,24 @@ fn validate_trigger_shape(stmt: &CreateTriggerStmt, schema: &SchemaManager) -> R
         }
     }
 
+    // Public AST callers can supply the expression and persisted SQL separately.
+    // Validate both: trigger execution reparses the stored SQL when it fires.
+    let stored_when = stmt
+        .when_sql
+        .as_deref()
+        .map(crate::parser::parse_sql_expr)
+        .transpose()?;
+    if stmt
+        .when_expr
+        .as_ref()
+        .is_some_and(crate::parser::has_subquery)
+        || stored_when.as_ref().is_some_and(crate::parser::has_subquery)
+    {
+        return Err(SqlError::Unsupported(
+            "subqueries are not supported in trigger WHEN conditions".into(),
+        ));
+    }
+
     for body_stmt in &stmt.body {
         match body_stmt {
             Statement::Insert(_)
