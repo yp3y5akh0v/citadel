@@ -85,22 +85,32 @@ fn source_edge_read_limits_work_with_a_redundant_secondary_index() {
         }
         conn.execute("COMMIT").unwrap();
         for begin in [None, Some("BEGIN READ ONLY"), Some("BEGIN")] {
+            // Start each transaction mode with a cold statement/result cache.
+            let conn = Connection::open(&db).unwrap();
             if let Some(begin) = begin {
                 conn.execute(begin).unwrap();
             }
-            let mut budget = GraphEdgeBudget::new();
-            budget.limit = 4;
-            let measured = db.measure_scans();
-            let error = source_edge_rows(&conn, 1, &mut budget).unwrap_err();
-            assert!(matches!(
-                error,
-                MemError::WorkLimitExceeded {
-                    operation: "graph edge inspection",
-                    limit: 4
-                }
-            ));
-            assert_eq!(measured.rows_scanned(), 5, "indexed={indexed}, {begin:?}");
-            drop(measured);
+            // A repeated read can reuse SQL rows, but must still enforce the
+            // graph budget. Writers always read their own transaction state.
+            let repeat_scans = if begin == Some("BEGIN") { 5 } else { 0 };
+            for expected_scans in [5, repeat_scans] {
+                let mut budget = GraphEdgeBudget::new();
+                budget.limit = 4;
+                let measured = db.measure_scans();
+                let error = source_edge_rows(&conn, 1, &mut budget).unwrap_err();
+                assert!(matches!(
+                    error,
+                    MemError::WorkLimitExceeded {
+                        operation: "graph edge inspection",
+                        limit: 4
+                    }
+                ));
+                assert_eq!(
+                    measured.rows_scanned(),
+                    expected_scans,
+                    "indexed={indexed}, {begin:?}"
+                );
+            }
             if begin.is_some() {
                 conn.execute("ROLLBACK").unwrap();
             }
