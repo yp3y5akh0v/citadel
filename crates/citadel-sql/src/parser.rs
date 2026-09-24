@@ -4190,29 +4190,82 @@ fn convert_bin_op(op: &sp::BinaryOperator) -> Result<BinOp> {
 }
 
 fn convert_function(func: &sp::Function) -> Result<Expr> {
-    let name = object_name_to_string(&func.name).to_ascii_uppercase();
-
-    let (args, is_count_star, distinct) = match &func.args {
-        sp::FunctionArguments::List(list) => {
-            let distinct = matches!(
-                list.duplicate_treatment,
-                Some(sp::DuplicateTreatment::Distinct)
-            );
-            if list.args.is_empty() && name == "COUNT" {
+    let sp::Function {
+        name,
+        uses_odbc_syntax: _, // An ODBC escape wrapper preserves the function call.
+        parameters,
+        args,
+        filter,
+        null_treatment,
+        over,
+        within_group,
+    } = func;
+    let name = object_name_to_string(name).to_ascii_uppercase();
+    // These value windows include NULL rows in their frame/offset selection.
+    let respects_nulls =
+        over.is_some() && matches!(name.as_str(), "FIRST_VALUE" | "LAST_VALUE" | "LAG" | "LEAD");
+    reject_unsupported_clauses(&[
+        (
+            !matches!(parameters, sp::FunctionArguments::None),
+            "parametric functions",
+        ),
+        (filter.is_some(), "aggregate FILTER"),
+        (
+            null_treatment.as_ref().is_some_and(|treatment| {
+                !respects_nulls || !matches!(treatment, sp::NullTreatment::RespectNulls)
+            }),
+            "function NULL treatment",
+        ),
+        (!within_group.is_empty(), "WITHIN GROUP"),
+    ])?;
+    let (args, is_count_star, distinct) = match args {
+        sp::FunctionArguments::List(sp::FunctionArgumentList {
+            duplicate_treatment,
+            args,
+            clauses,
+        }) => {
+            for clause in clauses {
+                let clause = match clause {
+                    sp::FunctionArgumentClause::IgnoreOrRespectNulls(
+                        sp::NullTreatment::RespectNulls,
+                    ) if respects_nulls => continue,
+                    sp::FunctionArgumentClause::IgnoreOrRespectNulls(_) => {
+                        "function argument NULL treatment"
+                    }
+                    sp::FunctionArgumentClause::OrderBy(_) => "function argument ORDER BY",
+                    sp::FunctionArgumentClause::Limit(_) => "function argument LIMIT",
+                    sp::FunctionArgumentClause::OnOverflow(_) => "function argument ON OVERFLOW",
+                    sp::FunctionArgumentClause::Having(_) => "function argument HAVING",
+                    sp::FunctionArgumentClause::Separator(_) => "function argument SEPARATOR",
+                    sp::FunctionArgumentClause::JsonNullClause(_) => {
+                        "function argument JSON NULL clause"
+                    }
+                    sp::FunctionArgumentClause::JsonReturningClause(_) => {
+                        "function argument JSON RETURNING"
+                    }
+                };
+                return Err(SqlError::Unsupported(clause.into()));
+            }
+            let distinct = match duplicate_treatment {
+                Some(sp::DuplicateTreatment::Distinct) => true,
+                Some(sp::DuplicateTreatment::All) | None => false,
+            };
+            if args.is_empty() && name == "COUNT" {
                 (vec![], true, distinct)
             } else {
                 let mut count_star = false;
-                let args = list
-                    .args
+                let args = args
                     .iter()
                     .map(|arg| match arg {
                         sp::FunctionArg::Unnamed(sp::FunctionArgExpr::Expr(e)) => convert_expr(e),
                         sp::FunctionArg::Unnamed(sp::FunctionArgExpr::Wildcard) => {
-                            if name == "COUNT" {
+                            if name == "COUNT" && args.len() == 1 {
                                 count_star = true;
                                 Ok(Expr::CountStar)
                             } else {
-                                Err(SqlError::Unsupported(format!("{name}(*)")))
+                                Err(SqlError::Unsupported(format!(
+                                    "wildcard must be the sole argument of COUNT, got {name}"
+                                )))
                             }
                         }
                         _ => Err(SqlError::Unsupported(format!(
@@ -4239,7 +4292,16 @@ fn convert_function(func: &sp::Function) -> Result<Expr> {
         }
     };
 
-    if let Some(over) = &func.over {
+    reject_unsupported_clauses(&[
+        (distinct && over.is_some(), "DISTINCT window functions"),
+        (distinct && is_count_star, "COUNT(DISTINCT *)"),
+        (
+            distinct && matches!(name.as_str(), "COALESCE" | "NULLIF" | "IIF"),
+            "DISTINCT on scalar expressions",
+        ),
+    ])?;
+
+    if let Some(over) = over {
         let spec = match over {
             sp::WindowType::WindowSpec(ws) => convert_window_spec(ws)?,
             sp::WindowType::NamedWindow(_) => {
@@ -4303,18 +4365,22 @@ fn convert_function(func: &sp::Function) -> Result<Expr> {
 }
 
 fn convert_window_spec(ws: &sp::WindowSpec) -> Result<WindowSpec> {
-    let partition_by = ws
-        .partition_by
+    let sp::WindowSpec {
+        window_name,
+        partition_by,
+        order_by,
+        window_frame,
+    } = ws;
+    reject_unsupported_clauses(&[(window_name.is_some(), "named base windows")])?;
+    let partition_by = partition_by
         .iter()
         .map(convert_expr)
         .collect::<Result<Vec<_>>>()?;
-    let order_by = ws
-        .order_by
+    let order_by = order_by
         .iter()
         .map(convert_order_by_expr)
         .collect::<Result<Vec<_>>>()?;
-    let frame = ws
-        .window_frame
+    let frame = window_frame
         .as_ref()
         .map(convert_window_frame)
         .transpose()?;
@@ -4326,15 +4392,20 @@ fn convert_window_spec(ws: &sp::WindowSpec) -> Result<WindowSpec> {
 }
 
 fn convert_window_frame(wf: &sp::WindowFrame) -> Result<WindowFrame> {
-    let units = match wf.units {
+    let sp::WindowFrame {
+        units,
+        start_bound,
+        end_bound,
+    } = wf;
+    let units = match units {
         sp::WindowFrameUnits::Rows => WindowFrameUnits::Rows,
         sp::WindowFrameUnits::Range => WindowFrameUnits::Range,
         sp::WindowFrameUnits::Groups => {
             return Err(SqlError::Unsupported("GROUPS window frame".into()));
         }
     };
-    let start = convert_window_frame_bound(&wf.start_bound)?;
-    let end = match &wf.end_bound {
+    let start = convert_window_frame_bound(start_bound)?;
+    let end = match end_bound {
         Some(b) => convert_window_frame_bound(b)?,
         None => WindowFrameBound::CurrentRow,
     };
