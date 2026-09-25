@@ -1275,24 +1275,50 @@ pub(super) fn collect_rows_partial_write_with_ctx(
     Ok(rows)
 }
 
+/// A join's base tables in row order, each with the name that qualifies its
+/// columns.
+pub(super) fn join_tables<'a>(
+    schema: &'a SchemaManager,
+    stmt: &SelectStmt,
+) -> Result<Vec<(String, &'a TableSchema)>> {
+    let mut all_tables = Vec::with_capacity(stmt.joins.len() + 1);
+    all_tables.push((
+        table_alias_or_name(&stmt.from, &stmt.from_alias),
+        resolve_table_name(schema, &stmt.from)?,
+    ));
+    for join in &stmt.joins {
+        all_tables.push((
+            table_alias_or_name(&join.table.name, &join.table.alias),
+            resolve_table_name(schema, &join.table.name)?,
+        ));
+    }
+    Ok(all_tables)
+}
+
 pub(super) fn exec_select_join_with_read(
     rtx: &mut ReadTxn<'_>,
     schema: &SchemaManager,
     stmt: &SelectStmt,
 ) -> Result<ExecutionResult> {
     let cancel = rtx.cancel_token().cloned();
-    let cancel = cancel.as_ref();
-    let from_schema = resolve_table_name(schema, &stmt.from)?;
-    let from_alias = table_alias_or_name(&stmt.from, &stmt.from_alias);
+    let all_tables = join_tables(schema, stmt)?;
+    let plan = compute_join_needed_columns(stmt, &all_tables);
+    let (rows, columns) = join_rows_with_read(rtx, stmt, &all_tables, plan)?;
+    super::process_select(rows, super::SelectCtx::new(&columns, stmt, cancel.as_ref()))
+}
 
-    let mut all_tables: Vec<(String, &TableSchema)> = Vec::with_capacity(stmt.joins.len() + 1);
-    all_tables.push((from_alias, from_schema));
-    for join in &stmt.joins {
-        let inner_schema = resolve_table_name(schema, &join.table.name)?;
-        let inner_alias = table_alias_or_name(&join.table.name, &join.table.alias);
-        all_tables.push((inner_alias, inner_schema));
-    }
-    let (needed_per_table, output_combined) = match compute_join_needed_columns(stmt, &all_tables) {
+/// The joined rows with the columns that describe them. A plan limits the
+/// decoded columns to the ones the statement reads.
+pub(super) fn join_rows_with_read(
+    rtx: &mut ReadTxn<'_>,
+    stmt: &SelectStmt,
+    all_tables: &[(String, &TableSchema)],
+    plan: Option<JoinColumnPlan>,
+) -> Result<(Vec<Vec<Value>>, Vec<ColumnDef>)> {
+    let cancel = rtx.cancel_token().cloned();
+    let cancel = cancel.as_ref();
+    let from_schema = all_tables[0].1;
+    let (needed_per_table, output_combined) = match plan {
         Some(plan) => (Some(plan.per_table), Some(plan.output_combined)),
         None => (None, None),
     };
@@ -1357,17 +1383,10 @@ pub(super) fn exec_select_join_with_read(
     if let Some(ref oc) = output_combined {
         let actual_width = outer_rows.first().map_or(0, |r| r.len());
         if actual_width == oc.len() {
-            let projected_cols = build_projected_columns(&combined_cols, oc);
-            return super::process_select(
-                outer_rows,
-                super::SelectCtx::new(&projected_cols, stmt, cancel),
-            );
+            return Ok((outer_rows, build_projected_columns(&combined_cols, oc)));
         }
     }
-    super::process_select(
-        outer_rows,
-        super::SelectCtx::new(&combined_cols, stmt, cancel),
-    )
+    Ok((outer_rows, combined_cols))
 }
 
 pub(super) fn exec_select_join_in_txn(
@@ -1376,18 +1395,24 @@ pub(super) fn exec_select_join_in_txn(
     stmt: &SelectStmt,
 ) -> Result<ExecutionResult> {
     let cancel = wtx.cancel_token().cloned();
-    let cancel = cancel.as_ref();
-    let from_schema = resolve_table_name(schema, &stmt.from)?;
-    let from_alias = table_alias_or_name(&stmt.from, &stmt.from_alias);
+    let all_tables = join_tables(schema, stmt)?;
+    let plan = compute_join_needed_columns(stmt, &all_tables);
+    let (rows, columns) = join_rows_in_txn(wtx, stmt, &all_tables, plan)?;
+    super::process_select(rows, super::SelectCtx::new(&columns, stmt, cancel.as_ref()))
+}
 
-    let mut all_tables: Vec<(String, &TableSchema)> = Vec::with_capacity(stmt.joins.len() + 1);
-    all_tables.push((from_alias, from_schema));
-    for join in &stmt.joins {
-        let inner_schema = resolve_table_name(schema, &join.table.name)?;
-        let inner_alias = table_alias_or_name(&join.table.name, &join.table.alias);
-        all_tables.push((inner_alias, inner_schema));
-    }
-    let (needed_per_table, output_combined) = match compute_join_needed_columns(stmt, &all_tables) {
+/// The joined rows with the columns that describe them. A plan limits the
+/// decoded columns to the ones the statement reads.
+pub(super) fn join_rows_in_txn(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    stmt: &SelectStmt,
+    all_tables: &[(String, &TableSchema)],
+    plan: Option<JoinColumnPlan>,
+) -> Result<(Vec<Vec<Value>>, Vec<ColumnDef>)> {
+    let cancel = wtx.cancel_token().cloned();
+    let cancel = cancel.as_ref();
+    let from_schema = all_tables[0].1;
+    let (needed_per_table, output_combined) = match plan {
         Some(plan) => (Some(plan.per_table), Some(plan.output_combined)),
         None => (None, None),
     };
@@ -1454,17 +1479,10 @@ pub(super) fn exec_select_join_in_txn(
     if let Some(ref oc) = output_combined {
         let actual_width = outer_rows.first().map_or(0, |r| r.len());
         if actual_width == oc.len() {
-            let projected_cols = build_projected_columns(&combined_cols, oc);
-            return super::process_select(
-                outer_rows,
-                super::SelectCtx::new(&projected_cols, stmt, cancel),
-            );
+            return Ok((outer_rows, build_projected_columns(&combined_cols, oc)));
         }
     }
-    super::process_select(
-        outer_rows,
-        super::SelectCtx::new(&combined_cols, stmt, cancel),
-    )
+    Ok((outer_rows, combined_cols))
 }
 
 #[allow(clippy::too_many_arguments)]

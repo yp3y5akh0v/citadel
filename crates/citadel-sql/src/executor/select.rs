@@ -148,21 +148,17 @@ pub(super) fn exec_select_with_read(
     if let Some(cte_result) = super::materialized_source(&lower_name, schema, ctes, cancel)? {
         if stmt.joins.is_empty() {
             return exec_select_from_cte(
+                schema,
+                ctes,
                 &cte_result,
                 stmt,
                 &mut |sub| exec_subquery_with_read(rtx, schema, sub, ctes),
                 cancel,
             );
-        } else {
-            let mut sources = ctes.clone();
-            sources.insert(lower_name.clone(), cte_result);
-            return super::exec_select_join_with_ctes(
-                stmt,
-                &sources,
-                &mut |name| super::scan_table_with_read_or_view(rtx, schema, name),
-                cancel,
-            );
         }
+        let mut sources = ctes.clone();
+        sources.insert(lower_name.clone(), cte_result);
+        return exec_join_sources_with_read(rtx, schema, stmt, &sources, ctes);
     }
 
     if !ctes.is_empty()
@@ -171,12 +167,7 @@ pub(super) fn exec_select_with_read(
             .iter()
             .any(|j| ctes.contains_key(&j.table.name.to_ascii_lowercase()))
     {
-        return super::exec_select_join_with_ctes(
-            stmt,
-            ctes,
-            &mut |name| super::scan_table_with_read_or_view(rtx, schema, name),
-            cancel,
-        );
+        return exec_join_sources_with_read(rtx, schema, stmt, ctes, ctes);
     }
 
     if let Some(view_def) = schema.get_view(&lower_name) {
@@ -186,52 +177,11 @@ pub(super) fn exec_select_with_read(
         }
         let view_qr = exec_view_with_read(rtx, schema, view_def)?;
         if stmt.joins.is_empty() {
-            let view_schema = build_view_schema(&lower_name, &view_qr)?;
-            let view_ctx = CorrelationCtx {
-                outer_schema: &view_schema,
-                outer_alias: stmt.from_alias.as_deref(),
-            };
-            if has_correlated_where(&stmt.where_clause, &view_ctx, schema) {
-                let mut rows = super::clone_cte_rows_with_cancel(&view_qr.result.rows, cancel)?;
-                let remaining =
-                    handle_correlated_where_with_read(rtx, schema, stmt, &view_ctx, &mut rows)?;
-                let clean_stmt = SelectStmt {
-                    where_clause: remaining,
-                    columns: stmt.columns.clone(),
-                    from: stmt.from.clone(),
-                    from_alias: stmt.from_alias.clone(),
-                    from_subquery: stmt.from_subquery.clone(),
-                    from_args: stmt.from_args.clone(),
-                    from_json_table: stmt.from_json_table.clone(),
-                    joins: vec![],
-                    distinct: stmt.distinct,
-                    order_by: stmt.order_by.clone(),
-                    limit: stmt.limit.clone(),
-                    offset: stmt.offset.clone(),
-                    group_by: stmt.group_by.clone(),
-                    having: stmt.having.clone(),
-                };
-                return process_select(
-                    rows,
-                    SelectCtx::new(&view_schema.columns, &clean_stmt, cancel),
-                );
-            }
-            return exec_select_from_cte(
-                &view_qr,
-                stmt,
-                &mut |sub| exec_subquery_with_read(rtx, schema, sub, ctes),
-                cancel,
-            );
-        } else {
-            let mut view_ctes = ctes.clone();
-            view_ctes.insert(lower_name.clone(), view_qr.shared());
-            return super::exec_select_join_with_ctes(
-                stmt,
-                &view_ctes,
-                &mut |name| super::scan_table_with_read_or_view(rtx, schema, name),
-                cancel,
-            );
+            return exec_select_from_view_with_read(rtx, schema, stmt, ctes, &lower_name, &view_qr);
         }
+        let mut view_ctes = ctes.clone();
+        view_ctes.insert(lower_name.clone(), view_qr.shared());
+        return exec_join_sources_with_read(rtx, schema, stmt, &view_ctes, ctes);
     }
 
     let has_view_or_virtual_join = stmt.joins.iter().any(|j| {
@@ -249,12 +199,7 @@ pub(super) fn exec_select_with_read(
                 }
             }
         }
-        return super::exec_select_join_with_ctes(
-            stmt,
-            &view_ctes,
-            &mut |name| super::scan_table_with_read_or_view(rtx, schema, name),
-            cancel,
-        );
+        return exec_join_sources_with_read(rtx, schema, stmt, &view_ctes, ctes);
     }
 
     let table_schema = schema
@@ -263,76 +208,28 @@ pub(super) fn exec_select_with_read(
     // Storage operations below must use the resolved name (post-TEMP-alias).
     let lower_name = table_schema.name.clone();
 
-    // Correlated subquery handling: decorrelate before materialization
-    let corr_ctx = CorrelationCtx {
-        outer_schema: table_schema,
-        outer_alias: stmt.from_alias.as_deref(),
-    };
-    if has_correlated_where(&stmt.where_clause, &corr_ctx, schema) {
-        let (mut rows, remaining_where) =
-            build_and_scan_correlated_with_read(rtx, schema, stmt, table_schema, &corr_ctx)?;
-        let clean_stmt = SelectStmt {
-            where_clause: remaining_where,
-            columns: stmt.columns.clone(),
-            from: stmt.from.clone(),
-            from_alias: stmt.from_alias.clone(),
-            from_subquery: stmt.from_subquery.clone(),
-            from_args: stmt.from_args.clone(),
-            from_json_table: stmt.from_json_table.clone(),
-            joins: stmt.joins.clone(),
-            distinct: stmt.distinct,
-            order_by: stmt.order_by.clone(),
-            limit: stmt.limit.clone(),
-            offset: stmt.offset.clone(),
-            group_by: stmt.group_by.clone(),
-            having: stmt.having.clone(),
-        };
-        let mut ext_cols = table_schema.columns.clone();
-        let clean_stmt = handle_correlated_select_with_read(
-            rtx,
-            schema,
-            &clean_stmt,
-            &corr_ctx,
-            &mut rows,
-            &mut ext_cols,
-        )?;
-
-        let final_stmt;
-        let s = if stmt_has_subquery(&clean_stmt) {
-            final_stmt = materialize_stmt(&clean_stmt, &mut |sub| {
-                exec_subquery_with_read(rtx, schema, sub, ctes)
-            })?;
-            &final_stmt
-        } else {
-            &clean_stmt
-        };
-        return process_select(rows, SelectCtx::new(&ext_cols, s, cancel));
-    }
-
-    if has_correlated_select(&stmt.columns, &corr_ctx, schema) {
-        let (mut rows, _) = collect_rows_with_read(rtx, table_schema, &stmt.where_clause, None)?;
-        let mut ext_cols = table_schema.columns.clone();
-        let clean_stmt = handle_correlated_select_with_read(
-            rtx,
-            schema,
-            stmt,
-            &corr_ctx,
-            &mut rows,
-            &mut ext_cols,
-        )?;
-        let final_stmt;
-        let s = if stmt_has_subquery(&clean_stmt) {
-            final_stmt = materialize_stmt(&clean_stmt, &mut |sub| {
-                exec_subquery_with_read(rtx, schema, sub, ctes)
-            })?;
-            &final_stmt
-        } else {
-            &clean_stmt
-        };
-        return process_select(
-            rows,
-            SelectCtx::new(&ext_cols, s, cancel).predicate_applied(true),
-        );
+    // A subquery that reads the row must see each row, so it cannot be
+    // materialized once with the closed subqueries below.
+    if stmt_has_subquery(stmt) {
+        if stmt.joins.is_empty() {
+            let outer = OuterScope::single(
+                &stmt.from,
+                stmt.from_alias.as_deref(),
+                &table_schema.columns,
+            );
+            if captures_outer_row(schema, ctes, stmt, &outer, cancel)? {
+                return exec_correlated_scan_with_read(
+                    rtx,
+                    schema,
+                    stmt,
+                    ctes,
+                    table_schema,
+                    &outer,
+                );
+            }
+        } else if let Some(result) = exec_correlated_join_with_read(rtx, schema, stmt, ctes)? {
+            return Ok(result);
+        }
     }
 
     let materialized;
@@ -409,6 +306,168 @@ pub(super) fn exec_select_with_read(
         rows,
         SelectCtx::new(&table_schema.columns, stmt, cancel).predicate_applied(predicate_applied),
     )
+}
+
+/// A join over CTEs, views and tables. `sources` resolves the joined names;
+/// subqueries run with the statement's own `ctes`.
+fn exec_join_sources_with_read(
+    rtx: &mut ReadTxn<'_>,
+    schema: &SchemaManager,
+    stmt: &SelectStmt,
+    sources: &CteContext,
+    ctes: &CteContext,
+) -> Result<ExecutionResult> {
+    let cancel = rtx.cancel_token().cloned();
+    let cancel = cancel.as_ref();
+    let scanned = super::scan_join_sources(
+        stmt,
+        sources,
+        &mut |name| super::scan_table_with_read_or_view(rtx, schema, name),
+        cancel,
+    )?;
+    super::exec_select_join_with_ctes(schema, ctes, stmt, scanned, cancel, &mut |sub| {
+        exec_subquery_with_read(rtx, schema, sub, ctes)
+    })
+}
+
+/// A SELECT over one view's rows. Hash decorrelation takes the WHERE shapes
+/// it reproduces exactly; every other subquery that reads the row runs per row.
+fn exec_select_from_view_with_read(
+    rtx: &mut ReadTxn<'_>,
+    schema: &SchemaManager,
+    stmt: &SelectStmt,
+    ctes: &CteContext,
+    name: &str,
+    view_qr: &CteRows,
+) -> Result<ExecutionResult> {
+    let cancel = rtx.cancel_token().cloned();
+    let cancel = cancel.as_ref();
+    let view_schema = build_view_schema(name, view_qr)?;
+    let outer = OuterScope::single(&stmt.from, stmt.from_alias.as_deref(), &view_schema.columns);
+    if !stmt_has_subquery(stmt) || !captures_outer_row(schema, ctes, stmt, &outer, cancel)? {
+        return exec_select_from_cte(
+            schema,
+            ctes,
+            view_qr,
+            stmt,
+            &mut |sub| exec_subquery_with_read(rtx, schema, sub, ctes),
+            cancel,
+        );
+    }
+    let view_ctx = CorrelationCtx {
+        outer_schema: &view_schema,
+        outer_alias: stmt.from_alias.as_deref(),
+    };
+    let mut rows = super::clone_cte_rows_with_cancel(&view_qr.result.rows, cancel)?;
+    let where_clause = handle_correlated_where_with_read(rtx, schema, stmt, &view_ctx, &mut rows)?;
+    let partial = SelectStmt {
+        where_clause,
+        ..stmt.clone()
+    };
+    finish_captured_select(
+        schema,
+        ctes,
+        partial,
+        &outer,
+        rows,
+        view_schema.columns.clone(),
+        cancel,
+        &mut |sub| exec_subquery_with_read(rtx, schema, sub, ctes),
+    )
+}
+
+/// A single-table SELECT whose subqueries read its row. Hash decorrelation
+/// takes the shapes it reproduces exactly; every other subquery that reads
+/// the row runs per row.
+fn exec_correlated_scan_with_read(
+    rtx: &mut ReadTxn<'_>,
+    schema: &SchemaManager,
+    stmt: &SelectStmt,
+    ctes: &CteContext,
+    table_schema: &TableSchema,
+    outer: &OuterScope,
+) -> Result<ExecutionResult> {
+    let cancel = rtx.cancel_token().cloned();
+    let cancel = cancel.as_ref();
+    let corr_ctx = CorrelationCtx {
+        outer_schema: table_schema,
+        outer_alias: stmt.from_alias.as_deref(),
+    };
+    let (mut rows, where_clause) = if has_correlated_where(&stmt.where_clause, &corr_ctx, schema) {
+        build_and_scan_correlated_with_read(rtx, schema, stmt, table_schema, &corr_ctx)?
+    } else {
+        let (rows, _) = collect_rows_with_read(rtx, table_schema, &None, None)?;
+        (rows, stmt.where_clause.clone())
+    };
+    let mut columns = table_schema.columns.clone();
+    let partial = SelectStmt {
+        where_clause,
+        ..stmt.clone()
+    };
+    let partial = handle_correlated_select_with_read(
+        rtx,
+        schema,
+        &partial,
+        &corr_ctx,
+        &mut rows,
+        &mut columns,
+    )?;
+    finish_captured_select(
+        schema,
+        ctes,
+        partial,
+        outer,
+        rows,
+        columns,
+        cancel,
+        &mut |sub| exec_subquery_with_read(rtx, schema, sub, ctes),
+    )
+}
+
+/// A join of base tables whose subqueries read the joined row. Every joined
+/// row keeps every column, since such a subquery may read any of them.
+/// Returns None when no subquery reads the joined row.
+fn exec_correlated_join_with_read(
+    rtx: &mut ReadTxn<'_>,
+    schema: &SchemaManager,
+    stmt: &SelectStmt,
+    ctes: &CteContext,
+) -> Result<Option<ExecutionResult>> {
+    let cancel = rtx.cancel_token().cloned();
+    let cancel = cancel.as_ref();
+    let tables = super::join_tables(schema, stmt)?;
+    let outer = joined_scope(stmt, &tables);
+    if !captures_outer_row(schema, ctes, stmt, &outer, cancel)? {
+        return Ok(None);
+    }
+    let mut stmt = stmt.clone();
+    materialize_join_conditions(schema, ctes, &mut stmt, &outer, cancel, &mut |sub| {
+        exec_subquery_with_read(rtx, schema, sub, ctes)
+    })?;
+    let (rows, columns) = super::join_rows_with_read(rtx, &stmt, &tables, None)?;
+    finish_captured_select(
+        schema,
+        ctes,
+        stmt,
+        &outer,
+        rows,
+        columns,
+        cancel,
+        &mut |sub| exec_subquery_with_read(rtx, schema, sub, ctes),
+    )
+    .map(Some)
+}
+
+/// The scope of a join of base tables, in the order of its row's columns.
+pub(super) fn joined_scope(stmt: &SelectStmt, tables: &[(String, &TableSchema)]) -> OuterScope {
+    let names = std::iter::once(stmt.from.as_str())
+        .chain(stmt.joins.iter().map(|join| join.table.name.as_str()));
+    let sources: Vec<(&str, &str, &[ColumnDef])> = tables
+        .iter()
+        .zip(names)
+        .map(|((visible, table), name)| (visible.as_str(), name, table.columns.as_slice()))
+        .collect();
+    OuterScope::joined(&sources)
 }
 
 /// The streaming-aggregate lane, lifted out of the strategy match so that arm
@@ -3453,12 +3512,14 @@ fn exec_select_lateral_with_io(
                 combined_cols.iter().map(|c| c.collation).collect(),
             );
             new_ctes.insert(mini.from.clone(), outer_qr.shared());
-            let qr = match super::exec_select_join_with_ctes(
+            let sources = super::scan_join_sources(
                 &mini,
                 &new_ctes,
                 &mut |n| io.scan_table(schema, n),
                 cancel,
-            )? {
+            )?;
+            let (rows, columns) = sources.join(&mini, cancel)?;
+            let qr = match process_select(rows, SelectCtx::new(&columns, &mini, cancel))? {
                 ExecutionResult::Query(qr) => qr,
                 _ => unreachable!(),
             };

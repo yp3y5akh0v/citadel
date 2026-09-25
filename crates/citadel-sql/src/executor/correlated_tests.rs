@@ -191,49 +191,6 @@ fn flatten_and_exprs_or_does_not_flatten() {
 }
 
 #[test]
-fn has_correlated_in_expr_with_scalar_subquery() {
-    let outer = schema("o", cols(&[("x", DataType::Integer)]), vec![]);
-    let ctx = CorrelationCtx {
-        outer_schema: &outer,
-        outer_alias: None,
-    };
-    let mgr = crate::schema::SchemaManager::empty();
-    let e = Expr::Literal(i(0));
-    assert!(!has_correlated_in_expr(&e, &ctx, &mgr));
-}
-
-#[test]
-fn has_correlated_in_expr_binary_op_propagates() {
-    let outer = schema("o", cols(&[("x", DataType::Integer)]), vec![]);
-    let ctx = CorrelationCtx {
-        outer_schema: &outer,
-        outer_alias: None,
-    };
-    let mgr = crate::schema::SchemaManager::empty();
-    let e = Expr::BinaryOp {
-        left: Box::new(Expr::Column("a".into())),
-        op: BinOp::Eq,
-        right: Box::new(Expr::Literal(i(1))),
-    };
-    assert!(!has_correlated_in_expr(&e, &ctx, &mgr));
-}
-
-#[test]
-fn has_correlated_select_no_subquery_in_columns() {
-    let outer = schema("o", cols(&[("x", DataType::Integer)]), vec![]);
-    let ctx = CorrelationCtx {
-        outer_schema: &outer,
-        outer_alias: None,
-    };
-    let mgr = crate::schema::SchemaManager::empty();
-    let columns = vec![crate::parser::SelectColumn::Expr {
-        expr: Expr::Column("a".into()),
-        alias: None,
-    }];
-    assert!(!has_correlated_select(&columns, &ctx, &mgr));
-}
-
-#[test]
 fn has_correlated_where_no_where_clause() {
     let outer = schema("o", cols(&[("x", DataType::Integer)]), vec![]);
     let ctx = CorrelationCtx {

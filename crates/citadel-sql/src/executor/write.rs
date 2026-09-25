@@ -1492,21 +1492,17 @@ pub(super) fn exec_select_in_txn(
     if let Some(cte_result) = super::materialized_source(&lower_name, schema, ctes, cancel)? {
         if stmt.joins.is_empty() {
             return super::exec_select_from_cte(
+                schema,
+                ctes,
                 &cte_result,
                 stmt,
                 &mut |sub| exec_subquery_write(wtx, schema, sub, ctes),
                 cancel,
             );
-        } else {
-            let mut sources = ctes.clone();
-            sources.insert(lower_name.clone(), cte_result);
-            return super::exec_select_join_with_ctes(
-                stmt,
-                &sources,
-                &mut |name| super::scan_table_write_or_view(wtx, schema, name),
-                cancel,
-            );
         }
+        let mut sources = ctes.clone();
+        sources.insert(lower_name.clone(), cte_result);
+        return exec_join_sources_in_txn(wtx, schema, stmt, &sources, ctes);
     }
 
     if !ctes.is_empty()
@@ -1515,12 +1511,7 @@ pub(super) fn exec_select_in_txn(
             .iter()
             .any(|j| ctes.contains_key(&j.table.name.to_ascii_lowercase()))
     {
-        return super::exec_select_join_with_ctes(
-            stmt,
-            ctes,
-            &mut |name| super::scan_table_write_or_view(wtx, schema, name),
-            cancel,
-        );
+        return exec_join_sources_in_txn(wtx, schema, stmt, ctes, ctes);
     }
 
     if let Some(view_def) = schema.get_view(&lower_name) {
@@ -1531,21 +1522,17 @@ pub(super) fn exec_select_in_txn(
         let view_qr = exec_view_write(wtx, schema, view_def)?;
         if stmt.joins.is_empty() {
             return super::exec_select_from_cte(
+                schema,
+                ctes,
                 &view_qr,
                 stmt,
                 &mut |sub| exec_subquery_write(wtx, schema, sub, ctes),
                 cancel,
             );
-        } else {
-            let mut view_ctes = ctes.clone();
-            view_ctes.insert(lower_name.clone(), view_qr.shared());
-            return super::exec_select_join_with_ctes(
-                stmt,
-                &view_ctes,
-                &mut |name| super::scan_table_write_or_view(wtx, schema, name),
-                cancel,
-            );
         }
+        let mut view_ctes = ctes.clone();
+        view_ctes.insert(lower_name.clone(), view_qr.shared());
+        return exec_join_sources_in_txn(wtx, schema, stmt, &view_ctes, ctes);
     }
 
     let has_view_or_virtual_join = stmt.joins.iter().any(|j| {
@@ -1563,16 +1550,19 @@ pub(super) fn exec_select_in_txn(
                 }
             }
         }
-        return super::exec_select_join_with_ctes(
-            stmt,
-            &view_ctes,
-            &mut |name| super::scan_table_write_or_view(wtx, schema, name),
-            cancel,
-        );
+        return exec_join_sources_in_txn(wtx, schema, stmt, &view_ctes, ctes);
     }
 
     if !stmt.joins.is_empty() {
-        return super::exec_select_join_in_txn(wtx, schema, stmt);
+        if !stmt_has_subquery(stmt) {
+            return super::exec_select_join_in_txn(wtx, schema, stmt);
+        }
+        if let Some(result) = exec_correlated_join_in_txn(wtx, schema, stmt, ctes)? {
+            return Ok(result);
+        }
+        let materialized =
+            materialize_stmt(stmt, &mut |sub| exec_subquery_write(wtx, schema, sub, ctes))?;
+        return super::exec_select_join_in_txn(wtx, schema, &materialized);
     }
 
     let user_name = stmt.from.to_ascii_lowercase();
@@ -1581,49 +1571,44 @@ pub(super) fn exec_select_in_txn(
         .ok_or_else(|| SqlError::TableNotFound(stmt.from.clone()))?;
     let lower_name = table_schema.name.clone();
 
-    let corr_ctx = CorrelationCtx {
-        outer_schema: table_schema,
-        outer_alias: stmt.from_alias.as_deref().or(Some(&stmt.from)),
-    };
-    if mutation_has_correlated_where(wtx, &stmt.where_clause, &corr_ctx, schema)? {
-        let (mut rows, _) = collect_rows_write(wtx, table_schema, &None, None)?;
-        let remaining_where = filter_mutation_correlated_rows(
-            wtx,
-            schema,
-            &stmt.where_clause,
-            &corr_ctx,
-            &mut rows,
-            Vec::as_slice,
-        )?;
-        let clean_stmt = SelectStmt {
-            where_clause: remaining_where,
-            columns: stmt.columns.clone(),
-            from: stmt.from.clone(),
-            from_alias: stmt.from_alias.clone(),
-            from_subquery: stmt.from_subquery.clone(),
-            from_args: stmt.from_args.clone(),
-            from_json_table: stmt.from_json_table.clone(),
-            joins: stmt.joins.clone(),
-            distinct: stmt.distinct,
-            order_by: stmt.order_by.clone(),
-            limit: stmt.limit.clone(),
-            offset: stmt.offset.clone(),
-            group_by: stmt.group_by.clone(),
-            having: stmt.having.clone(),
-        };
-        let final_stmt;
-        let s = if stmt_has_subquery(&clean_stmt) {
-            final_stmt = materialize_stmt(&clean_stmt, &mut |sub| {
-                exec_subquery_write(wtx, schema, sub, ctes)
-            })?;
-            &final_stmt
-        } else {
-            &clean_stmt
-        };
-        return super::process_select(
-            rows,
-            super::SelectCtx::new(&table_schema.columns, s, cancel),
+    // A subquery that reads the row must see each row, so it cannot be
+    // materialized once with the closed subqueries below.
+    if stmt_has_subquery(stmt) {
+        let outer = OuterScope::single(
+            &stmt.from,
+            stmt.from_alias.as_deref(),
+            &table_schema.columns,
         );
+        if captures_outer_row(schema, ctes, stmt, &outer, cancel)? {
+            let corr_ctx = CorrelationCtx {
+                outer_schema: table_schema,
+                outer_alias: stmt.from_alias.as_deref().or(Some(&stmt.from)),
+            };
+            let (mut rows, _) = collect_rows_write(wtx, table_schema, &None, None)?;
+            let where_clause = filter_mutation_correlated_rows(
+                wtx,
+                schema,
+                ctes,
+                &stmt.where_clause,
+                &corr_ctx,
+                &mut rows,
+                Vec::as_slice,
+            )?;
+            let partial = SelectStmt {
+                where_clause,
+                ..stmt.clone()
+            };
+            return finish_captured_select(
+                schema,
+                ctes,
+                partial,
+                &outer,
+                rows,
+                table_schema.columns.clone(),
+                cancel,
+                &mut |sub| exec_subquery_write(wtx, schema, sub, ctes),
+            );
+        }
     }
 
     let materialized;
@@ -1705,6 +1690,62 @@ pub(super) fn exec_select_in_txn(
         super::SelectCtx::new(&table_schema.columns, stmt, cancel)
             .predicate_applied(predicate_applied),
     )
+}
+
+/// A join over CTEs, views and tables. `sources` resolves the joined names;
+/// subqueries run with the statement's own `ctes`.
+fn exec_join_sources_in_txn(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    schema: &SchemaManager,
+    stmt: &SelectStmt,
+    sources: &CteContext,
+    ctes: &CteContext,
+) -> Result<ExecutionResult> {
+    let cancel = wtx.cancel_token().cloned();
+    let cancel = cancel.as_ref();
+    let scanned = super::scan_join_sources(
+        stmt,
+        sources,
+        &mut |name| super::scan_table_write_or_view(wtx, schema, name),
+        cancel,
+    )?;
+    super::exec_select_join_with_ctes(schema, ctes, stmt, scanned, cancel, &mut |sub| {
+        exec_subquery_write(wtx, schema, sub, ctes)
+    })
+}
+
+/// A join of base tables whose subqueries read the joined row. Every joined
+/// row keeps every column, since such a subquery may read any of them.
+/// Returns None when no subquery reads the joined row.
+fn exec_correlated_join_in_txn(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    schema: &SchemaManager,
+    stmt: &SelectStmt,
+    ctes: &CteContext,
+) -> Result<Option<ExecutionResult>> {
+    let cancel = wtx.cancel_token().cloned();
+    let cancel = cancel.as_ref();
+    let tables = super::join_tables(schema, stmt)?;
+    let outer = joined_scope(stmt, &tables);
+    if !captures_outer_row(schema, ctes, stmt, &outer, cancel)? {
+        return Ok(None);
+    }
+    let mut stmt = stmt.clone();
+    materialize_join_conditions(schema, ctes, &mut stmt, &outer, cancel, &mut |sub| {
+        exec_subquery_write(wtx, schema, sub, ctes)
+    })?;
+    let (rows, columns) = super::join_rows_in_txn(wtx, &stmt, &tables, None)?;
+    finish_captured_select(
+        schema,
+        ctes,
+        stmt,
+        &outer,
+        rows,
+        columns,
+        cancel,
+        &mut |sub| exec_subquery_write(wtx, schema, sub, ctes),
+    )
+    .map(Some)
 }
 
 fn exec_update_in_txn_compiled(
@@ -2422,6 +2463,7 @@ pub(super) fn exec_update_in_txn(
         let remaining = filter_mutation_correlated_rows(
             wtx,
             schema,
+            &CteContext::default(),
             &stmt.where_clause,
             &ctx,
             &mut rows,
@@ -2562,6 +2604,7 @@ pub(super) fn exec_delete_in_txn(
         let remaining = filter_mutation_correlated_rows(
             wtx,
             schema,
+            &CteContext::default(),
             &stmt.where_clause,
             &ctx,
             &mut rows,

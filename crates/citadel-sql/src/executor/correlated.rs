@@ -14,6 +14,12 @@ use super::CteContext;
 #[path = "correlated_bind.rs"]
 mod binding;
 
+#[path = "correlated_apply.rs"]
+mod apply;
+
+pub(super) use apply::apply_captured_subqueries;
+pub(super) use binding::OuterScope;
+
 /// Unlike the conjunct-only decorrelator, mutation predicates may contain a
 /// correlated query under OR, CASE, or another expression.
 pub(super) fn mutation_has_correlated_where(
@@ -39,7 +45,14 @@ pub(super) fn mutation_has_correlated_expr(
     if !super::dml::has_subquery(expr) {
         return Ok(false);
     }
-    binding::bind_predicate(wtx, schema, &mut expr.clone(), ctx, None)
+    binding::bind_predicate(
+        wtx,
+        schema,
+        &CteContext::default(),
+        &mut expr.clone(),
+        ctx,
+        None,
+    )
 }
 
 fn complete_exists_semijoin(
@@ -101,10 +114,13 @@ fn complete_exists_semijoin(
 
 /// Keep physical row locators attached while filtering. Only a complete simple
 /// EXISTS equijoin may use a semijoin; other predicates bind each outer row in
-/// its lexical query scopes and execute against this same writer.
+/// its lexical query scopes and execute against this same writer. `ctes` are
+/// the CTEs visible to the filtered statement.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn filter_mutation_correlated_rows<T>(
     wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
     schema: &SchemaManager,
+    ctes: &CteContext,
     predicate: &Option<Expr>,
     ctx: &CorrelationCtx<'_>,
     rows: &mut Vec<T>,
@@ -115,30 +131,23 @@ pub(super) fn filter_mutation_correlated_rows<T>(
     };
     let predicate = super::dml::materialize_expr_selective(predicate, &mut |query| {
         let mut candidate = Expr::ScalarSubquery(Box::new(query.clone()));
-        if binding::bind_predicate(wtx, schema, &mut candidate, ctx, None)? {
+        if binding::bind_predicate(wtx, schema, ctes, &mut candidate, ctx, None)? {
             Ok(None)
         } else {
-            super::dml::exec_subquery_write(wtx, schema, query, &CteContext::default()).map(Some)
+            super::dml::exec_subquery_write(wtx, schema, query, ctes).map(Some)
         }
     })?;
     if complete_exists_semijoin(&predicate, ctx, schema) {
-        return handle_correlated_where_write(
-            wtx,
-            schema,
-            &Some(predicate.clone()),
-            ctx,
-            rows,
-            values,
-        );
+        return exists_semijoin_write(wtx, schema, &Some(predicate.clone()), ctx, rows, values);
     }
     let cancel = wtx.cancel_token().cloned();
     let columns = ctx.outer_schema.column_map();
     retain_cancellable(rows, cancel.as_ref(), |item| {
         let row = values(item);
         let mut bound = predicate.clone();
-        binding::bind_predicate(wtx, schema, &mut bound, ctx, Some(row))?;
+        binding::bind_predicate(wtx, schema, ctes, &mut bound, ctx, Some(row))?;
         let materialized = super::dml::materialize_expr(&bound, &mut |query| {
-            super::dml::exec_subquery_write(wtx, schema, query, &CteContext::default())
+            super::dml::exec_subquery_write(wtx, schema, query, ctes)
         })?;
         Ok(is_truthy(&eval_expr(
             &materialized,
@@ -287,8 +296,12 @@ pub(super) fn handle_correlated_select_with_read(
     let cancel = cancel.as_ref();
     check_cancel(cancel)?;
     let mut new_columns = Vec::new();
-    let mut scalar_maps: Vec<(FxHashMap<Vec<Value>, Value>, Vec<usize>, Vec<Collation>)> =
-        Vec::new();
+    let mut scalar_maps: Vec<(
+        FxHashMap<Vec<Value>, Option<Value>>,
+        Vec<usize>,
+        Vec<Collation>,
+        HashedScalar,
+    )> = Vec::new();
     let mut corr_col_idx = columns.len();
 
     for col in &stmt.columns {
@@ -308,15 +321,26 @@ pub(super) fn handle_correlated_select_with_read(
                             inner_schema,
                             sub.from_alias.as_deref(),
                         );
-                        if !corr_pairs.is_empty() {
-                            let map =
-                                decorrelate_scalar_with_read(rtx, schema, sub, &corr_pairs, ctx)?;
+                        let shape = hashable_scalar(sub, inner_schema).filter(|_| {
+                            !corr_pairs.is_empty()
+                                && !has_residual_correlation(sub, ctx, inner_schema)
+                        });
+                        if let Some(shape) = shape {
+                            let map = decorrelate_scalar_with_read(
+                                rtx,
+                                schema,
+                                sub,
+                                &corr_pairs,
+                                ctx,
+                                &shape,
+                            )?;
                             let outer_indices: Vec<usize> =
                                 corr_pairs.iter().map(|p| p.outer_col_idx).collect();
                             scalar_maps.push((
                                 map,
                                 outer_indices,
                                 correlation_collations(&corr_pairs),
+                                shape,
                             ));
 
                             let col_name = alias
@@ -359,14 +383,10 @@ pub(super) fn handle_correlated_select_with_read(
 
     for (row_idx, row) in rows.iter_mut().enumerate() {
         check_cancel_at(cancel, row_idx)?;
-        for (map, outer_indices, key_collations) in &scalar_maps {
+        for (map, outer_indices, key_collations, shape) in &scalar_maps {
             let key = correlation_key(row, outer_indices, key_collations);
-            let val = if key.iter().any(|v| v.is_null()) {
-                Value::Null
-            } else {
-                map.get(&key).cloned().unwrap_or(Value::Null)
-            };
-            row.push(val);
+            let value = hashed_scalar_value(map, &key, shape)?;
+            row.push(value);
         }
     }
 
@@ -550,6 +570,239 @@ pub(super) fn collect_column_names(expr: &Expr, out: &mut Vec<String>) {
         }
         _ => {}
     }
+}
+
+/// Whether a subquery in a clause evaluated per source row reads that row.
+/// `ctes` are the CTEs visible to `stmt`.
+pub(super) fn captures_outer_row(
+    schema: &SchemaManager,
+    ctes: &CteContext,
+    stmt: &SelectStmt,
+    outer: &OuterScope,
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<bool> {
+    let columns = stmt.columns.iter().filter_map(|column| match column {
+        SelectColumn::Expr { expr, .. } => Some(expr),
+        _ => None,
+    });
+    let clauses = columns
+        .chain(&stmt.where_clause)
+        .chain(&stmt.group_by)
+        .chain(&stmt.having)
+        .chain(stmt.order_by.iter().map(|item| &item.expr))
+        .chain(stmt.joins.iter().filter_map(|join| join.on_clause.as_ref()));
+    for expr in clauses {
+        if expr_captures_outer(schema, ctes, expr, outer, cancel)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+pub(super) fn expr_captures_outer(
+    schema: &SchemaManager,
+    ctes: &CteContext,
+    expr: &Expr,
+    outer: &OuterScope,
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<bool> {
+    if !super::dml::has_subquery(expr) {
+        return Ok(false);
+    }
+    Ok(binding::bind_outer(schema, ctes, &mut expr.clone(), outer, None, cancel)?.is_some())
+}
+
+/// Finish a SELECT over its source rows: subqueries that read a row run per
+/// row, closed subqueries run once. `ctes` are the CTEs visible to `stmt`.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn finish_captured_select(
+    schema: &SchemaManager,
+    ctes: &CteContext,
+    stmt: SelectStmt,
+    outer: &OuterScope,
+    mut rows: Vec<Vec<Value>>,
+    mut columns: Vec<ColumnDef>,
+    cancel: Option<&citadel::CancelToken>,
+    exec_sub: &mut dyn FnMut(&SelectStmt) -> Result<super::CteRows>,
+) -> Result<ExecutionResult> {
+    let stmt = apply_captured_subqueries(
+        schema,
+        ctes,
+        &stmt,
+        outer,
+        &mut rows,
+        &mut columns,
+        cancel,
+        exec_sub,
+    )?
+    .unwrap_or(stmt);
+    let stmt = if super::dml::stmt_has_subquery(&stmt) {
+        super::dml::materialize_stmt(&stmt, exec_sub)?
+    } else {
+        stmt
+    };
+    super::process_select(rows, super::SelectCtx::new(&columns, &stmt, cancel))
+}
+
+/// Join conditions are evaluated while rows are joined, before any per-row
+/// subquery can run, so their subqueries must be closed. Those run once.
+pub(super) fn materialize_join_conditions(
+    schema: &SchemaManager,
+    ctes: &CteContext,
+    stmt: &mut SelectStmt,
+    outer: &OuterScope,
+    cancel: Option<&citadel::CancelToken>,
+    exec_sub: &mut dyn FnMut(&SelectStmt) -> Result<super::CteRows>,
+) -> Result<()> {
+    for join in &mut stmt.joins {
+        let Some(condition) = &mut join.on_clause else {
+            continue;
+        };
+        if !super::dml::has_subquery(condition) {
+            continue;
+        }
+        if expr_captures_outer(schema, ctes, condition, outer, cancel)? {
+            return Err(SqlError::Unsupported(
+                "a subquery in a JOIN condition that reads a joined row".into(),
+            ));
+        }
+        *condition = super::dml::materialize_expr(condition, exec_sub)?;
+    }
+    Ok(())
+}
+
+/// Hash decorrelation reproduces a subquery only when it reads one source
+/// through conjuncts, with no nested query, grouping, ordering or limit.
+fn hashable_shape(query: &SelectStmt) -> bool {
+    query.joins.is_empty()
+        && query.from_subquery.is_none()
+        && query.from_args.is_none()
+        && query.from_json_table.is_none()
+        && query.group_by.is_empty()
+        && query.having.is_none()
+        && query.order_by.is_empty()
+        && query.limit.is_none()
+        && query.offset.is_none()
+        && !query
+            .where_clause
+            .as_ref()
+            .is_some_and(super::dml::has_subquery)
+        && query.columns.iter().all(|column| match column {
+            SelectColumn::Expr { expr, .. } => !super::dml::has_subquery(expr),
+            _ => true,
+        })
+}
+
+/// An aggregate projection yields a row even for no input, so EXISTS over it
+/// is not a membership test.
+fn hashable_exists(query: &SelectStmt) -> bool {
+    hashable_shape(query)
+        && !query.columns.iter().any(|column| match column {
+            SelectColumn::Expr { expr, .. } => super::aggregate::is_aggregate_expr(expr),
+            _ => false,
+        })
+}
+
+/// The IN path hashes the values of one column of a base table.
+fn hashable_in(schema: &SchemaManager, query: &SelectStmt, inner_schema: &TableSchema) -> bool {
+    schema.get(&query.from.to_ascii_lowercase()).is_some()
+        && hashable_shape(query)
+        && query.columns.len() == 1
+        && matches!(&query.columns[0], SelectColumn::Expr { expr, .. }
+            if in_subquery_value_column_index(expr, inner_schema).is_ok())
+}
+
+/// How hash decorrelation answers a scalar subquery for one outer key.
+pub(super) enum HashedScalar {
+    /// One aggregate call: its value over the key's rows, and this value for a
+    /// key no inner row matches.
+    Aggregate(Value),
+    /// One plain value: the key's row, NULL for no row, and an error for more
+    /// than one.
+    Row,
+}
+
+/// The scalar subqueries hash decorrelation reproduces: one value computed
+/// from the subquery's own source. DISTINCT could merge rows a plain value
+/// must count, so it keeps a plain value on the per-row path.
+fn hashable_scalar(query: &SelectStmt, inner_schema: &TableSchema) -> Option<HashedScalar> {
+    if !hashable_shape(query) || !projects_own_columns(query, inner_schema) {
+        return None;
+    }
+    let [SelectColumn::Expr { expr, .. }] = query.columns.as_slice() else {
+        return None;
+    };
+    match expr {
+        Expr::CountStar => Some(HashedScalar::Aggregate(Value::Integer(0))),
+        Expr::Function { name, args, .. }
+            if super::aggregate::is_aggregate_function(name, args.len())
+                && !args.iter().any(super::aggregate::is_aggregate_expr) =>
+        {
+            Some(HashedScalar::Aggregate(
+                if name.eq_ignore_ascii_case("count") {
+                    Value::Integer(0)
+                } else {
+                    Value::Null
+                },
+            ))
+        }
+        expr if !query.distinct && !super::aggregate::is_aggregate_expr(expr) => {
+            Some(HashedScalar::Row)
+        }
+        _ => None,
+    }
+}
+
+/// Whether every column the subquery projects belongs to its own source.
+fn projects_own_columns(query: &SelectStmt, inner_schema: &TableSchema) -> bool {
+    let own = query.from_alias.as_deref().unwrap_or(&query.from);
+    let mut names = Vec::new();
+    for column in &query.columns {
+        if let SelectColumn::Expr { expr, .. } = column {
+            collect_column_names(expr, &mut names);
+        }
+    }
+    names.iter().all(|name| match name.split_once('.') {
+        Some((table, column)) => {
+            table.eq_ignore_ascii_case(own) && resolves_in(column, inner_schema)
+        }
+        None => resolves_in(name, inner_schema),
+    })
+}
+
+/// A hashed scalar subquery's value for one outer key.
+fn hashed_scalar_value(
+    map: &FxHashMap<Vec<Value>, Option<Value>>,
+    key: &[Value],
+    shape: &HashedScalar,
+) -> Result<Value> {
+    let found = if key.iter().any(Value::is_null) {
+        None
+    } else {
+        map.get(key)
+    };
+    match (found, shape) {
+        (Some(Some(value)), _) => Ok(value.clone()),
+        (Some(None), _) => Err(SqlError::SubqueryMultipleRows),
+        (None, HashedScalar::Aggregate(empty)) => Ok(empty.clone()),
+        (None, HashedScalar::Row) => Ok(Value::Null),
+    }
+}
+
+/// Correlation conjuncts other than equalities, which only the EXISTS path
+/// evaluates per outer row.
+fn has_residual_correlation(
+    query: &SelectStmt,
+    ctx: &CorrelationCtx,
+    inner_schema: &TableSchema,
+) -> bool {
+    let (_, residual) = strip_correlation_predicates(
+        &query.where_clause,
+        ctx,
+        inner_schema,
+        query.from_alias.as_deref(),
+    );
+    !residual.is_empty()
 }
 
 /// Check if a subquery references outer columns not in the inner table.
@@ -1151,13 +1404,16 @@ pub(super) fn decorrelate_in_with_read(
 }
 
 /// Decorrelate scalar subquery. Returns correlation key → scalar result.
+/// The subquery's value per correlation key, or None for a key with more than
+/// one row of a plain value.
 pub(super) fn decorrelate_scalar_with_read(
     rtx: &mut ReadTxn<'_>,
     schema: &SchemaManager,
     subquery: &SelectStmt,
     corr_pairs: &[CorrEqPair],
     ctx: &CorrelationCtx,
-) -> Result<FxHashMap<Vec<Value>, Value>> {
+    shape: &HashedScalar,
+) -> Result<FxHashMap<Vec<Value>, Option<Value>>> {
     let cancel = rtx.cancel_token().cloned();
     let cancel = cancel.as_ref();
     check_cancel(cancel)?;
@@ -1171,10 +1427,15 @@ pub(super) fn decorrelate_scalar_with_read(
         .map(|p| p.inner_col_name.clone())
         .collect();
 
-    let group_by: Vec<Expr> = corr_col_names
-        .iter()
-        .map(|name| Expr::Column(name.clone()))
-        .collect();
+    // An aggregate is computed per key; a plain value keeps every row so a key
+    // with more than one row is caught.
+    let group_by: Vec<Expr> = match shape {
+        HashedScalar::Aggregate(_) => corr_col_names
+            .iter()
+            .map(|name| Expr::Column(name.clone()))
+            .collect(),
+        HashedScalar::Row => Vec::new(),
+    };
 
     let (inner_where, _non_eq) = strip_correlation_predicates(
         &subquery.where_clause,
@@ -1218,19 +1479,21 @@ pub(super) fn decorrelate_scalar_with_read(
     let num_corr = corr_pairs.len();
     let key_collations = correlation_collations(corr_pairs);
     let key_indices: Vec<usize> = (0..num_corr).collect();
-    let mut map = FxHashMap::default();
+    let mut map: FxHashMap<Vec<Value>, Option<Value>> = FxHashMap::default();
     for (row_idx, row) in qr.rows.iter().enumerate() {
         check_cancel_at(cancel, row_idx)?;
         let key = correlation_key(row, &key_indices, &key_collations);
         if key.iter().any(|v| v.is_null()) {
             continue;
         }
-        let val = if row.len() > num_corr {
-            row[num_corr].clone()
-        } else {
-            Value::Null
-        };
-        map.insert(key, val);
+        match map.entry(key) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(Some(row[num_corr].clone()));
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.insert(None);
+            }
+        }
     }
 
     check_cancel(cancel)?;
@@ -1278,137 +1541,10 @@ pub(super) fn decorrelate_exists_write(
     Ok(key_set)
 }
 
-pub(super) fn decorrelate_in_write(
-    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
-    schema: &SchemaManager,
-    subquery: &SelectStmt,
-    corr_pairs: &[CorrEqPair],
-    ctx: &CorrelationCtx,
-    value_collation: Collation,
-) -> Result<InMap> {
-    let cancel = wtx.cancel_token().cloned();
-    let cancel = cancel.as_ref();
-    check_cancel(cancel)?;
-    let inner_name = subquery.from.to_ascii_lowercase();
-    let inner_schema = schema
-        .get(&inner_name)
-        .ok_or_else(|| SqlError::TableNotFound(subquery.from.clone()))?;
-    let in_expr = match &subquery.columns[0] {
-        SelectColumn::Expr { expr, .. } => expr,
-        _ => return Err(SqlError::Unsupported("complex IN subquery column".into())),
-    };
-    let in_col_idx = in_subquery_value_column_index(in_expr, inner_schema)?;
-    let (inner_where, _non_eq) = strip_correlation_predicates(
-        &subquery.where_clause,
-        ctx,
-        inner_schema,
-        subquery.from_alias.as_deref(),
-    );
-    let (inner_rows, _) = super::collect_rows_write(wtx, inner_schema, &inner_where, None)?;
-    let inner_corr_indices: Vec<usize> = corr_pairs
-        .iter()
-        .map(|p| inner_schema.column_index(&p.inner_col_name).unwrap_or(0))
-        .collect();
-    let key_collations = correlation_collations(corr_pairs);
-    let mut map: InMap = FxHashMap::default();
-    for (row_idx, row) in inner_rows.iter().enumerate() {
-        check_cancel_at(cancel, row_idx)?;
-        let key = correlation_key(row, &inner_corr_indices, &key_collations);
-        if key.iter().any(|v| v.is_null()) {
-            continue;
-        }
-        let in_val = row[in_col_idx].clone();
-        let entry = map.entry(key).or_default();
-        if in_val.is_null() {
-            entry.has_null = true;
-        } else {
-            entry.values.insert(value_collation.fold(in_val));
-        }
-    }
-    check_cancel(cancel)?;
-    Ok(map)
-}
-
-pub(super) fn decorrelate_scalar_write(
-    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
-    schema: &SchemaManager,
-    subquery: &SelectStmt,
-    corr_pairs: &[CorrEqPair],
-    ctx: &CorrelationCtx,
-) -> Result<FxHashMap<Vec<Value>, Value>> {
-    let cancel = wtx.cancel_token().cloned();
-    let cancel = cancel.as_ref();
-    check_cancel(cancel)?;
-    let inner_name = subquery.from.to_ascii_lowercase();
-    let inner_schema = schema
-        .get(&inner_name)
-        .ok_or_else(|| SqlError::TableNotFound(subquery.from.clone()))?;
-    let corr_col_names: Vec<String> = corr_pairs
-        .iter()
-        .map(|p| p.inner_col_name.clone())
-        .collect();
-    let group_by: Vec<Expr> = corr_col_names
-        .iter()
-        .map(|n| Expr::Column(n.clone()))
-        .collect();
-    let (inner_where, _non_eq) = strip_correlation_predicates(
-        &subquery.where_clause,
-        ctx,
-        inner_schema,
-        subquery.from_alias.as_deref(),
-    );
-    let mut select_cols: Vec<SelectColumn> = corr_col_names
-        .iter()
-        .map(|name| SelectColumn::Expr {
-            expr: Expr::Column(name.clone()),
-            alias: None,
-        })
-        .collect();
-    select_cols.extend(subquery.columns.clone());
-    let rewritten = SelectStmt {
-        columns: select_cols,
-        from: subquery.from.clone(),
-        from_alias: subquery.from_alias.clone(),
-        from_subquery: subquery.from_subquery.clone(),
-        from_args: subquery.from_args.clone(),
-        from_json_table: subquery.from_json_table.clone(),
-        joins: vec![],
-        distinct: false,
-        where_clause: inner_where,
-        order_by: vec![],
-        limit: None,
-        offset: None,
-        group_by,
-        having: None,
-    };
-    let empty_ctes = CteContext::default();
-    let qr = match super::exec_select_in_txn(wtx, schema, &rewritten, &empty_ctes)? {
-        ExecutionResult::Query(qr) => qr,
-        _ => return Ok(FxHashMap::default()),
-    };
-    let num_corr = corr_pairs.len();
-    let key_collations = correlation_collations(corr_pairs);
-    let key_indices: Vec<usize> = (0..num_corr).collect();
-    let mut map = FxHashMap::default();
-    for (row_idx, row) in qr.rows.iter().enumerate() {
-        check_cancel_at(cancel, row_idx)?;
-        let key = correlation_key(row, &key_indices, &key_collations);
-        if key.iter().any(|v| v.is_null()) {
-            continue;
-        }
-        let val = if row.len() > num_corr {
-            row[num_corr].clone()
-        } else {
-            Value::Null
-        };
-        map.insert(key, val);
-    }
-    check_cancel(cancel)?;
-    Ok(map)
-}
-
-/// Write-transaction variant of handle_correlated_where_read.
-pub(super) fn handle_correlated_where_write<T>(
+/// The semijoin for a predicate `complete_exists_semijoin` accepts: each
+/// EXISTS conjunct filters `rows` by its hashed correlation keys, and the
+/// conjuncts without a subquery are returned for the caller to evaluate.
+fn exists_semijoin_write<T>(
     wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
     schema: &SchemaManager,
     where_clause: &Option<Expr>,
@@ -1467,123 +1603,7 @@ pub(super) fn handle_correlated_where_write<T>(
                     remaining_conjuncts.push(conj.clone());
                 }
             }
-            Expr::InSubquery {
-                expr: in_expr,
-                subquery,
-                negated,
-            } => {
-                if is_correlated_subquery(subquery, ctx, schema) {
-                    let inner_schema = resolve_inner_schema_write(
-                        wtx,
-                        schema,
-                        &subquery.from.to_ascii_lowercase(),
-                    )?;
-                    let (corr_pairs, _) = extract_correlation_predicates(
-                        subquery
-                            .where_clause
-                            .as_ref()
-                            .unwrap_or(&Expr::Literal(Value::Boolean(true))),
-                        ctx,
-                        &inner_schema,
-                        subquery.from_alias.as_deref(),
-                    );
-                    if corr_pairs.is_empty() {
-                        remaining_conjuncts.push(conj.clone());
-                        continue;
-                    }
-                    let col_map = ColumnMap::new(&ctx.outer_schema.columns);
-                    let selected_collation = in_subquery_value_collation(subquery, &inner_schema)?;
-                    let value_collation = crate::eval::operand_collation(in_expr, &col_map)
-                        .unwrap_or(selected_collation);
-                    let in_map = decorrelate_in_write(
-                        wtx,
-                        schema,
-                        subquery,
-                        &corr_pairs,
-                        ctx,
-                        value_collation,
-                    )?;
-                    let outer_col_indices: Vec<usize> =
-                        corr_pairs.iter().map(|p| p.outer_col_idx).collect();
-                    let key_collations = correlation_collations(&corr_pairs);
-                    let is_negated = *negated;
-                    retain_cancellable(rows, cancel, |item| {
-                        let row = row_values(item);
-                        let key = correlation_key(row, &outer_col_indices, &key_collations);
-                        let in_val =
-                            eval_expr(in_expr, &EvalCtx::new(&col_map, row).with_cancel(cancel))?;
-                        let group = if key.iter().any(|v| v.is_null()) {
-                            None
-                        } else {
-                            in_map.get(&key)
-                        };
-                        Ok(correlated_in_passes(
-                            group,
-                            in_val,
-                            value_collation,
-                            is_negated,
-                        ))
-                    })?;
-                } else {
-                    remaining_conjuncts.push(conj.clone());
-                }
-            }
-            _ => {
-                let mut handled = false;
-                if let Expr::BinaryOp { left, op, right } = conj {
-                    if let Expr::ScalarSubquery(sub) = right.as_ref() {
-                        if is_correlated_subquery(sub, ctx, schema) {
-                            let inner_schema = resolve_inner_schema_write(
-                                wtx,
-                                schema,
-                                &sub.from.to_ascii_lowercase(),
-                            )?;
-                            let (corr_pairs, _) = extract_correlation_predicates(
-                                sub.where_clause
-                                    .as_ref()
-                                    .unwrap_or(&Expr::Literal(Value::Boolean(true))),
-                                ctx,
-                                &inner_schema,
-                                sub.from_alias.as_deref(),
-                            );
-                            if !corr_pairs.is_empty() {
-                                let scalar_map =
-                                    decorrelate_scalar_write(wtx, schema, sub, &corr_pairs, ctx)?;
-                                let outer_col_indices: Vec<usize> =
-                                    corr_pairs.iter().map(|p| p.outer_col_idx).collect();
-                                let key_collations = correlation_collations(&corr_pairs);
-                                let cmp_op = *op;
-                                let left_expr = left.clone();
-                                let col_map = ColumnMap::new(&ctx.outer_schema.columns);
-                                retain_cancellable(rows, cancel, |item| {
-                                    let row = row_values(item);
-                                    let key =
-                                        correlation_key(row, &outer_col_indices, &key_collations);
-                                    let scalar_val =
-                                        scalar_map.get(&key).cloned().unwrap_or(Value::Null);
-                                    let left_val = eval_expr(
-                                        &left_expr,
-                                        &EvalCtx::new(&col_map, row).with_cancel(cancel),
-                                    )?;
-                                    let cmp = Expr::BinaryOp {
-                                        left: Box::new(Expr::Literal(left_val)),
-                                        op: cmp_op,
-                                        right: Box::new(Expr::Literal(scalar_val)),
-                                    };
-                                    Ok(is_truthy(&eval_expr(
-                                        &cmp,
-                                        &EvalCtx::new(&col_map, row).with_cancel(cancel),
-                                    )?))
-                                })?;
-                                handled = true;
-                            }
-                        }
-                    }
-                }
-                if !handled {
-                    remaining_conjuncts.push(conj.clone());
-                }
-            }
+            _ => remaining_conjuncts.push(conj.clone()),
         }
     }
 
@@ -1639,42 +1659,6 @@ pub(super) fn has_correlated_where(
     false
 }
 
-/// Check if SELECT columns have any correlated scalar subqueries.
-pub(super) fn has_correlated_select(
-    columns: &[SelectColumn],
-    ctx: &CorrelationCtx,
-    schema: &SchemaManager,
-) -> bool {
-    for col in columns {
-        if let SelectColumn::Expr { expr, .. } = col {
-            if has_correlated_in_expr(expr, ctx, schema) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-pub(super) fn has_correlated_in_expr(
-    expr: &Expr,
-    ctx: &CorrelationCtx,
-    schema: &SchemaManager,
-) -> bool {
-    match expr {
-        Expr::ScalarSubquery(sub) => is_correlated_subquery(sub, ctx, schema),
-        Expr::BinaryOp { left, right, .. } => {
-            has_correlated_in_expr(left, ctx, schema) || has_correlated_in_expr(right, ctx, schema)
-        }
-        Expr::UnaryOp { expr: e, .. } | Expr::Cast { expr: e, .. } => {
-            has_correlated_in_expr(e, ctx, schema)
-        }
-        Expr::Function { args, .. } | Expr::Coalesce(args) => {
-            args.iter().any(|a| has_correlated_in_expr(a, ctx, schema))
-        }
-        _ => false,
-    }
-}
-
 /// Decorrelate + partial-decode scan: only fully decode rows matching correlation.
 pub(super) fn build_and_scan_correlated_with_read(
     rtx: &mut ReadTxn<'_>,
@@ -1702,7 +1686,9 @@ pub(super) fn build_and_scan_correlated_with_read(
 
     for conj in &conjuncts {
         match conj {
-            Expr::Exists { subquery, negated } if is_correlated_subquery(subquery, ctx, schema) => {
+            Expr::Exists { subquery, negated }
+                if hashable_exists(subquery) && is_correlated_subquery(subquery, ctx, schema) =>
+            {
                 let inner_schema = resolve_inner_schema_with_read(
                     rtx,
                     schema,
@@ -1750,7 +1736,10 @@ pub(super) fn build_and_scan_correlated_with_read(
                     &inner_schema,
                     subquery.from_alias.as_deref(),
                 );
-                if corr_pairs.is_empty() {
+                if corr_pairs.is_empty()
+                    || !hashable_in(schema, subquery, &inner_schema)
+                    || has_residual_correlation(subquery, ctx, &inner_schema)
+                {
                     remaining_conjuncts.push((*conj).clone());
                     continue;
                 }
@@ -2093,7 +2082,7 @@ pub(super) fn handle_correlated_where_with_read(
     for conj in conjuncts {
         match conj {
             Expr::Exists { subquery, negated } => {
-                if is_correlated_subquery(subquery, ctx, schema) {
+                if hashable_exists(subquery) && is_correlated_subquery(subquery, ctx, schema) {
                     let inner_schema = resolve_inner_schema_with_read(
                         rtx,
                         schema,
@@ -2197,7 +2186,10 @@ pub(super) fn handle_correlated_where_with_read(
                         &inner_schema,
                         subquery.from_alias.as_deref(),
                     );
-                    if corr_pairs.is_empty() {
+                    if corr_pairs.is_empty()
+                        || !hashable_in(schema, subquery, &inner_schema)
+                        || has_residual_correlation(subquery, ctx, &inner_schema)
+                    {
                         remaining_conjuncts.push(conj.clone());
                         continue;
                     }
@@ -2242,27 +2234,30 @@ pub(super) fn handle_correlated_where_with_read(
                 let mut handled = false;
                 if let Expr::BinaryOp { left, op, right } = conj {
                     if let Expr::ScalarSubquery(sub) = right.as_ref() {
-                        if is_correlated_subquery(sub, ctx, schema) {
-                            let inner_schema = resolve_inner_schema_with_read(
-                                rtx,
-                                schema,
-                                &sub.from.to_ascii_lowercase(),
-                            )?;
+                        let inner_schema = schema
+                            .get(&sub.from.to_ascii_lowercase())
+                            .filter(|_| is_correlated_subquery(sub, ctx, schema));
+                        if let Some(inner_schema) = inner_schema {
                             let (corr_pairs, _) = extract_correlation_predicates(
                                 sub.where_clause
                                     .as_ref()
                                     .unwrap_or(&Expr::Literal(Value::Boolean(true))),
                                 ctx,
-                                &inner_schema,
+                                inner_schema,
                                 sub.from_alias.as_deref(),
                             );
-                            if !corr_pairs.is_empty() {
+                            let shape = hashable_scalar(sub, inner_schema).filter(|_| {
+                                !corr_pairs.is_empty()
+                                    && !has_residual_correlation(sub, ctx, inner_schema)
+                            });
+                            if let Some(shape) = shape {
                                 let scalar_map = decorrelate_scalar_with_read(
                                     rtx,
                                     schema,
                                     sub,
                                     &corr_pairs,
                                     ctx,
+                                    &shape,
                                 )?;
                                 let outer_col_indices: Vec<usize> =
                                     corr_pairs.iter().map(|p| p.outer_col_idx).collect();
@@ -2274,13 +2269,10 @@ pub(super) fn handle_correlated_where_with_read(
                                     let key =
                                         correlation_key(row, &outer_col_indices, &key_collations);
                                     let scalar_val =
-                                        scalar_map.get(&key).cloned().unwrap_or(Value::Null);
-                                    let left_val = eval_expr(
-                                        &left_expr,
-                                        &EvalCtx::new(&col_map, row).with_cancel(cancel),
-                                    )?;
+                                        hashed_scalar_value(&scalar_map, &key, &shape)?;
+                                    // The left operand keeps its column collation.
                                     let cmp_expr = Expr::BinaryOp {
-                                        left: Box::new(Expr::Literal(left_val)),
+                                        left: left_expr.clone(),
                                         op: cmp_op,
                                         right: Box::new(Expr::Literal(scalar_val)),
                                     };

@@ -26,17 +26,122 @@ impl Scope {
     }
 }
 
+/// The sources of the statement whose row a correlated subquery captures, in
+/// the order their columns appear in that row.
+pub(in crate::executor) struct OuterScope {
+    relations: Vec<OuterRelation>,
+}
+
+struct OuterRelation {
+    qualifiers: Vec<String>,
+    columns: Vec<(String, Collation)>,
+    offset: usize,
+}
+
+impl OuterScope {
+    /// One source, qualified by its own name and by its alias.
+    pub(in crate::executor) fn single(
+        name: &str,
+        alias: Option<&str>,
+        columns: &[ColumnDef],
+    ) -> Self {
+        let mut qualifiers = vec![name.to_ascii_lowercase()];
+        qualifiers.extend(alias.map(str::to_ascii_lowercase));
+        Self::from_relations(vec![(qualifiers, columns)])
+    }
+
+    /// Joined sources as `(alias or name, name, columns)`. A source's own name
+    /// also qualifies it when no other source uses that name.
+    pub(in crate::executor) fn joined(sources: &[(&str, &str, &[ColumnDef])]) -> Self {
+        let relations = sources
+            .iter()
+            .enumerate()
+            .map(|(position, &(visible, name, columns))| {
+                let mut qualifiers = vec![visible.to_ascii_lowercase()];
+                let unique = sources
+                    .iter()
+                    .enumerate()
+                    .all(|(other, &(o_visible, o_name, _))| {
+                        other == position
+                            || (!o_visible.eq_ignore_ascii_case(name)
+                                && !o_name.eq_ignore_ascii_case(name))
+                    });
+                if unique && !visible.eq_ignore_ascii_case(name) {
+                    qualifiers.push(name.to_ascii_lowercase());
+                }
+                (qualifiers, columns)
+            })
+            .collect();
+        Self::from_relations(relations)
+    }
+
+    fn from_relations(relations: Vec<(Vec<String>, &[ColumnDef])>) -> Self {
+        let mut offset = 0;
+        let relations = relations
+            .into_iter()
+            .map(|(qualifiers, columns)| {
+                let relation = OuterRelation {
+                    qualifiers,
+                    columns: columns
+                        .iter()
+                        .map(|column| (column.name.to_ascii_lowercase(), column.collation))
+                        .collect(),
+                    offset,
+                };
+                offset += columns.len();
+                relation
+            })
+            .collect();
+        Self { relations }
+    }
+
+    fn column(&self, relation: &OuterRelation, name: &str) -> Option<(usize, Collation)> {
+        relation
+            .columns
+            .iter()
+            .position(|(column, _)| column.eq_ignore_ascii_case(name))
+            .map(|index| (relation.offset + index, relation.columns[index].1))
+    }
+
+    fn bare(&self, name: &str) -> Result<Option<(usize, Collation)>> {
+        let mut found = self
+            .relations
+            .iter()
+            .filter_map(|relation| self.column(relation, name));
+        let first = found.next();
+        if first.is_some() && found.next().is_some() {
+            return Err(SqlError::AmbiguousColumn(name.to_owned()));
+        }
+        Ok(first)
+    }
+
+    fn qualified(&self, table: &str, column: &str) -> Result<Option<(usize, Collation)>> {
+        let Some(relation) = self.relations.iter().find(|relation| {
+            relation
+                .qualifiers
+                .iter()
+                .any(|qualifier| qualifier.eq_ignore_ascii_case(table))
+        }) else {
+            return Ok(None);
+        };
+        self.column(relation, column)
+            .map(Some)
+            .ok_or_else(|| SqlError::ColumnNotFound(format!("{table}.{column}")))
+    }
+}
+
 struct Binder<'a> {
     schema: &'a SchemaManager,
-    outer: &'a TableSchema,
-    alias: Option<&'a str>,
+    outer: &'a OuterScope,
     row: Option<&'a [Value]>,
     cancel: Option<citadel::CancelToken>,
     scopes: Vec<Scope>,
     ctes: Vec<FxHashMap<String, Option<Vec<String>>>>,
+    /// CTEs of the statement that owns the outer row.
+    caller_ctes: Option<&'a CteContext>,
     views: FxHashSet<String>,
     query_depth: usize,
-    bound: bool,
+    captured: Vec<usize>,
 }
 
 /// Detection and substitution use the same lexical resolution. Detection does
@@ -44,24 +149,51 @@ struct Binder<'a> {
 pub(super) fn bind_predicate(
     wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
     schema: &SchemaManager,
+    ctes: &CteContext,
     predicate: &mut Expr,
     ctx: &CorrelationCtx<'_>,
     row: Option<&[Value]>,
 ) -> Result<bool> {
+    let outer = OuterScope::single(
+        &ctx.outer_schema.name,
+        ctx.outer_alias,
+        &ctx.outer_schema.columns,
+    );
+    let captured = bind_outer(schema, ctes, predicate, &outer, row, wtx.cancel_token())?;
+    Ok(captured.is_some())
+}
+
+/// Bind the `outer` row positions that `expr`'s subqueries capture, replacing
+/// them with `row`'s values when a row is given. `ctes` are the CTEs visible
+/// to the outer statement. Returns the captured positions, or None when no
+/// subquery captures the outer row.
+pub(super) fn bind_outer(
+    schema: &SchemaManager,
+    ctes: &CteContext,
+    expr: &mut Expr,
+    outer: &OuterScope,
+    row: Option<&[Value]>,
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<Option<Vec<usize>>> {
     let mut binder = Binder {
         schema,
-        outer: ctx.outer_schema,
-        alias: ctx.outer_alias,
+        outer,
         row,
-        cancel: wtx.cancel_token().cloned(),
+        cancel: cancel.cloned(),
         scopes: Vec::new(),
         ctes: Vec::new(),
+        caller_ctes: Some(ctes),
         views: FxHashSet::default(),
         query_depth: 0,
-        bound: false,
+        captured: Vec::new(),
     };
-    binder.expr(predicate)?;
-    Ok(binder.bound)
+    binder.expr(expr)?;
+    if binder.captured.is_empty() {
+        return Ok(None);
+    }
+    binder.captured.sort_unstable();
+    binder.captured.dedup();
+    Ok(Some(binder.captured))
 }
 
 impl Binder<'_> {
@@ -74,6 +206,9 @@ impl Binder<'_> {
             if let Some(columns) = ctes.get(&lower) {
                 return Ok(columns.clone());
             }
+        }
+        if let Some(cte) = self.caller_ctes.and_then(|ctes| ctes.get(&lower)) {
+            return Ok(Some(cte.result.columns.clone()));
         }
         if let Some(table) = self.schema.get(&lower) {
             return Ok(Some(table.columns.iter().map(|c| c.name.clone()).collect()));
@@ -92,8 +227,10 @@ impl Binder<'_> {
             // A stored view is a closed catalog definition, not a capture of
             // the caller's CTEs or outer-row values.
             let caller_ctes = std::mem::take(&mut self.ctes);
+            let statement_ctes = self.caller_ctes.take();
             let result = self.query(&mut query, false);
             self.ctes = caller_ctes;
+            self.caller_ctes = statement_ctes;
             self.views.remove(&lower);
             let mut columns = result?;
             if let Some(columns) = &mut columns {
@@ -404,7 +541,7 @@ impl Binder<'_> {
                     {
                         None
                     } else {
-                        let outer = self.outer.column_index(name);
+                        let outer = self.outer.bare(name)?;
                         if outer.is_some() && self.scopes.iter().any(|scope| scope.unknown_columns)
                         {
                             return Err(SqlError::Unsupported(format!(
@@ -419,30 +556,22 @@ impl Binder<'_> {
                         .scopes
                         .iter()
                         .rev()
-                        .any(|scope| scope.qualifiers.contains(&table.to_ascii_lowercase()))
-                        && (table.eq_ignore_ascii_case(&self.outer.name)
-                            || self
-                                .alias
-                                .is_some_and(|alias| table.eq_ignore_ascii_case(alias))) =>
+                        .any(|scope| scope.qualifiers.contains(&table.to_ascii_lowercase())) =>
                 {
-                    Some(
-                        self.outer
-                            .column_index(column)
-                            .ok_or_else(|| SqlError::ColumnNotFound(format!("{table}.{column}")))?,
-                    )
+                    self.outer.qualified(table, column)?
                 }
                 _ => None,
             }
         };
-        if let Some(index) = outer_column {
-            self.bound = true;
+        if let Some((index, collation)) = outer_column {
+            self.captured.push(index);
             if let Some(row) = self.row {
                 let value = row.get(index).ok_or_else(|| {
                     SqlError::InvalidValue("outer correlation row does not match its schema".into())
                 })?;
                 *expr = Expr::BoundColumn {
                     value: value.clone(),
-                    collation: self.outer.columns[index].collation,
+                    collation,
                 };
             }
             return Ok(());
@@ -582,6 +711,7 @@ mod tests {
             outer_schema: schema.get("outer_t").unwrap(),
             outer_alias: None,
         };
+        let ctes = CteContext::default();
         let mut txn = db.begin_write().unwrap();
         // Even view/derived discovery must not materialize catalog or data
         // values from this transaction just to classify a predicate.
@@ -628,13 +758,13 @@ mod tests {
             let mut expr = predicate(sql);
             let original = format!("{expr:?}");
             assert_eq!(
-                bind_predicate(&mut txn, &schema, &mut expr, &ctx, None).unwrap(),
+                bind_predicate(&mut txn, &schema, &ctes, &mut expr, &ctx, None).unwrap(),
                 expected,
                 "{sql}"
             );
             assert_eq!(format!("{expr:?}"), original, "detection mutated {sql}");
             assert_eq!(
-                bind_predicate(&mut txn, &schema, &mut expr, &ctx, Some(&row)).unwrap(),
+                bind_predicate(&mut txn, &schema, &ctes, &mut expr, &ctx, Some(&row)).unwrap(),
                 expected,
                 "{sql}"
             );
@@ -660,7 +790,15 @@ mod tests {
         let mut txn = db.begin_write().unwrap();
         let mut expr = predicate("EXISTS (SELECT id)");
         let row = [Value::Text("AbC".into()), Value::Integer(3)];
-        assert!(bind_predicate(&mut txn, &schema, &mut expr, &ctx, Some(&row)).unwrap());
+        assert!(bind_predicate(
+            &mut txn,
+            &schema,
+            &CteContext::default(),
+            &mut expr,
+            &ctx,
+            Some(&row)
+        )
+        .unwrap());
         let Expr::Exists { subquery, .. } = expr else {
             panic!("expected EXISTS")
         };

@@ -29,6 +29,7 @@ pub use ann_persist::AnnSegmentInfo;
 pub use ann_topk::AnnIndexSource;
 pub(crate) use ann_topk::{ann_cache_status, commit_with_ann_publication, persist_ann_index};
 pub(crate) use compile::{compile, CompiledPlan};
+use correlated::{finish_captured_select, materialize_join_conditions, OuterScope};
 use cte::*;
 use ddl::*;
 use dml::*;
@@ -843,63 +844,121 @@ pub(super) fn resolve_table_or_cte(
     }
 }
 
-pub(super) fn exec_select_join_with_ctes(
+/// The sources of a join over CTEs, views and tables, scanned in join order.
+pub(super) struct JoinSources {
+    /// Each source's alias or name, then its own name.
+    names: Vec<(String, String)>,
+    schemas: Vec<TableSchema>,
+    rows: Vec<Vec<Vec<Value>>>,
+}
+
+pub(super) fn scan_join_sources(
     stmt: &SelectStmt,
     ctes: &CteContext,
     scan_table: ScanTableFn<'_>,
     cancel: Option<&citadel::CancelToken>,
+) -> Result<JoinSources> {
+    let mut sources = JoinSources {
+        names: Vec::with_capacity(stmt.joins.len() + 1),
+        schemas: Vec::with_capacity(stmt.joins.len() + 1),
+        rows: Vec::with_capacity(stmt.joins.len() + 1),
+    };
+    let names = std::iter::once((&stmt.from, &stmt.from_alias)).chain(
+        stmt.joins
+            .iter()
+            .map(|join| (&join.table.name, &join.table.alias)),
+    );
+    for (name, alias) in names {
+        let (schema, rows) = resolve_table_or_cte(name, ctes, scan_table, cancel)?;
+        sources
+            .names
+            .push((table_alias_or_name(name, alias), name.clone()));
+        sources.schemas.push(schema);
+        sources.rows.push(rows);
+    }
+    Ok(sources)
+}
+
+impl JoinSources {
+    fn outer_scope(&self) -> OuterScope {
+        let sources: Vec<(&str, &str, &[ColumnDef])> = self
+            .names
+            .iter()
+            .zip(&self.schemas)
+            .map(|((visible, name), schema)| {
+                (visible.as_str(), name.as_str(), schema.columns.as_slice())
+            })
+            .collect();
+        OuterScope::joined(&sources)
+    }
+
+    /// Join the sources in order. Returns the rows and the columns that
+    /// describe them.
+    pub(super) fn join(
+        self,
+        stmt: &SelectStmt,
+        cancel: Option<&citadel::CancelToken>,
+    ) -> Result<(Vec<Vec<Value>>, Vec<ColumnDef>)> {
+        let JoinSources {
+            names,
+            schemas,
+            rows,
+        } = self;
+        let mut rows = rows.into_iter();
+        let mut outer_rows = rows.next().unwrap_or_default();
+        let mut cur_tables: Vec<(String, &TableSchema)> = vec![(names[0].0.clone(), &schemas[0])];
+
+        for (ji, (join, mut inner_rows)) in stmt.joins.iter().zip(rows).enumerate() {
+            let inner_schema = &schemas[ji + 1];
+            let inner_alias = &names[ji + 1].0;
+
+            let mut preview_tables = cur_tables.clone();
+            preview_tables.push((inner_alias.clone(), inner_schema));
+            let combined_cols = build_joined_columns(&preview_tables);
+
+            let outer_col_count = if outer_rows.is_empty() {
+                cur_tables.iter().map(|(_, s)| s.columns.len()).sum()
+            } else {
+                outer_rows[0].len()
+            };
+            let inner_col_count = inner_schema.columns.len();
+
+            let equi = compute_equi_join_meta(join, &combined_cols, outer_col_count);
+            outer_rows = exec_join_step(
+                outer_rows,
+                &mut inner_rows,
+                join,
+                &combined_cols,
+                outer_col_count,
+                inner_col_count,
+                None,
+                None,
+                &equi,
+                cancel,
+            )?;
+            cur_tables.push((inner_alias.clone(), inner_schema));
+        }
+
+        Ok((outer_rows, build_joined_columns(&cur_tables)))
+    }
+}
+
+/// A SELECT over a join of CTEs, views and tables. Closed subqueries run
+/// once; a subquery that reads the joined row runs per row. `ctes` are the
+/// CTEs visible to `stmt`.
+pub(super) fn exec_select_join_with_ctes(
+    schema: &SchemaManager,
+    ctes: &CteContext,
+    stmt: &SelectStmt,
+    sources: JoinSources,
+    cancel: Option<&citadel::CancelToken>,
+    exec_sub: &mut dyn FnMut(&SelectStmt) -> Result<CteRows>,
 ) -> Result<ExecutionResult> {
-    let (from_schema, from_rows) = resolve_table_or_cte(&stmt.from, ctes, scan_table, cancel)?;
-    let from_alias = table_alias_or_name(&stmt.from, &stmt.from_alias);
-
-    let mut tables: Vec<(String, TableSchema)> = vec![(from_alias.clone(), from_schema)];
-    let mut join_rows: Vec<Vec<Vec<Value>>> = Vec::new();
-
-    for join in &stmt.joins {
-        let jname = &join.table.name;
-        let (js, jrows) = resolve_table_or_cte(jname, ctes, scan_table, cancel)?;
-        let jalias = table_alias_or_name(jname, &join.table.alias);
-        tables.push((jalias, js));
-        join_rows.push(jrows);
-    }
-
-    let mut outer_rows = from_rows;
-    let mut cur_tables: Vec<(String, &TableSchema)> = vec![(from_alias.clone(), &tables[0].1)];
-
-    for (ji, join) in stmt.joins.iter().enumerate() {
-        let inner_schema = &tables[ji + 1].1;
-        let inner_alias = &tables[ji + 1].0;
-        let inner_rows = &mut join_rows[ji];
-
-        let mut preview_tables = cur_tables.clone();
-        preview_tables.push((inner_alias.clone(), inner_schema));
-        let combined_cols = build_joined_columns(&preview_tables);
-
-        let outer_col_count = if outer_rows.is_empty() {
-            cur_tables.iter().map(|(_, s)| s.columns.len()).sum()
-        } else {
-            outer_rows[0].len()
-        };
-        let inner_col_count = inner_schema.columns.len();
-
-        let equi = compute_equi_join_meta(join, &combined_cols, outer_col_count);
-        outer_rows = exec_join_step(
-            outer_rows,
-            inner_rows,
-            join,
-            &combined_cols,
-            outer_col_count,
-            inner_col_count,
-            None,
-            None,
-            &equi,
-            cancel,
-        )?;
-        cur_tables.push((inner_alias.clone(), inner_schema));
-    }
-
-    let joined_cols = build_joined_columns(&cur_tables);
-    process_select(outer_rows, SelectCtx::new(&joined_cols, stmt, cancel))
+    let outer = sources.outer_scope();
+    let mut stmt = stmt.clone();
+    materialize_join_conditions(schema, ctes, &mut stmt, &outer, cancel, exec_sub)?;
+    let (rows, columns) = sources.join(&stmt, cancel)?;
+    finish_captured_select(schema, ctes, stmt, &outer, rows, columns, cancel, exec_sub)
 }
 
 #[cfg(test)]
