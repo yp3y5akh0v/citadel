@@ -1287,7 +1287,11 @@ fn eval_temporal_op(left: &Value, op: BinOp, right: &Value) -> Option<Result<Val
                 days,
                 micros,
             },
-        ) => Some(dt::add_interval_to_date(*d, -*months, -*days, -*micros).map(Value::Timestamp)),
+        ) => Some(
+            dt::negate_interval(*months, *days, *micros)
+                .and_then(|(m, days, u)| dt::add_interval_to_date(*d, m, days, u))
+                .map(Value::Timestamp),
+        ),
         (
             Value::Timestamp(t),
             BinOp::Add,
@@ -1315,7 +1319,9 @@ fn eval_temporal_op(left: &Value, op: BinOp, right: &Value) -> Option<Result<Val
                 micros,
             },
         ) => Some(
-            dt::add_interval_to_timestamp(*t, -*months, -*days, -*micros).map(Value::Timestamp),
+            dt::negate_interval(*months, *days, *micros)
+                .and_then(|(m, d, u)| dt::add_interval_to_timestamp(*t, m, d, u))
+                .map(Value::Timestamp),
         ),
         (Value::Timestamp(a), BinOp::Sub, Value::Timestamp(b)) => {
             let (days, micros) = dt::subtract_timestamps(*a, *b);
@@ -1342,7 +1348,11 @@ fn eval_temporal_op(left: &Value, op: BinOp, right: &Value) -> Option<Result<Val
                 days,
                 micros,
             },
-        ) => Some(dt::add_interval_to_time(*t, -*months, -*days, -*micros).map(Value::Time)),
+        ) => Some(
+            dt::negate_interval(*months, *days, *micros)
+                .and_then(|(m, d, u)| dt::add_interval_to_time(*t, m, d, u))
+                .map(Value::Time),
+        ),
         (Value::Time(a), BinOp::Sub, Value::Time(b)) => Some(Ok(Value::Interval {
             months: 0,
             days: 0,
@@ -1360,11 +1370,7 @@ fn eval_temporal_op(left: &Value, op: BinOp, right: &Value) -> Option<Result<Val
                 days: bd,
                 micros: bu,
             },
-        ) => Some(Ok(Value::Interval {
-            months: am.saturating_add(*bm),
-            days: ad.saturating_add(*bd),
-            micros: au.saturating_add(*bu),
-        })),
+        ) => Some(dt::add_intervals((*am, *ad, *au), (*bm, *bd, *bu)).map(interval_value)),
         (
             Value::Interval {
                 months: am,
@@ -1377,11 +1383,7 @@ fn eval_temporal_op(left: &Value, op: BinOp, right: &Value) -> Option<Result<Val
                 days: bd,
                 micros: bu,
             },
-        ) => Some(Ok(Value::Interval {
-            months: am.saturating_sub(*bm),
-            days: ad.saturating_sub(*bd),
-            micros: au.saturating_sub(*bu),
-        })),
+        ) => Some(dt::subtract_intervals((*am, *ad, *au), (*bm, *bd, *bu)).map(interval_value)),
         (
             Value::Interval {
                 months,
@@ -1400,14 +1402,9 @@ fn eval_temporal_op(left: &Value, op: BinOp, right: &Value) -> Option<Result<Val
                 micros,
             },
         ) => {
-            let n32 = (*n).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
-            Some(Ok(Value::Interval {
-                months: months.saturating_mul(n32),
-                days: days.saturating_mul(n32),
-                micros: micros.saturating_mul(*n),
-            }))
+            Some(dt::multiply_interval_by_integer(*months, *days, *micros, *n).map(interval_value))
         }
-        // INTERVAL * REAL — fractional months → days, fractional days → micros (PG).
+        // A fractional product or quotient cascades into days and microseconds (PG).
         (
             Value::Interval {
                 months,
@@ -1425,7 +1422,7 @@ fn eval_temporal_op(left: &Value, op: BinOp, right: &Value) -> Option<Result<Val
                 days,
                 micros,
             },
-        ) => Some(Ok(scale_interval_by_real(*months, *days, *micros, *r))),
+        ) => Some(dt::multiply_interval(*months, *days, *micros, *r).map(interval_value)),
         (
             Value::Interval {
                 months,
@@ -1434,11 +1431,7 @@ fn eval_temporal_op(left: &Value, op: BinOp, right: &Value) -> Option<Result<Val
             },
             BinOp::Div,
             Value::Integer(n),
-        ) if *n != 0 => Some(Ok(Value::Interval {
-            months: (*months as i64 / *n) as i32,
-            days: (*days as i64 / *n) as i32,
-            micros: *micros / *n,
-        })),
+        ) => Some(dt::divide_interval(*months, *days, *micros, *n as f64).map(interval_value)),
         (
             Value::Interval {
                 months,
@@ -1447,7 +1440,7 @@ fn eval_temporal_op(left: &Value, op: BinOp, right: &Value) -> Option<Result<Val
             },
             BinOp::Div,
             Value::Real(r),
-        ) if *r != 0.0 => Some(Ok(scale_interval_by_real(*months, *days, *micros, 1.0 / r))),
+        ) => Some(dt::divide_interval(*months, *days, *micros, *r).map(interval_value)),
         // PG-normalized INTERVAL compare: 30-day month, 24-hour day.
         (
             Value::Interval {
@@ -1545,26 +1538,11 @@ fn coerce_temporal_pair(left: &Value, right: &Value) -> Option<(Value, Value)> {
     }
 }
 
-/// PG fractional-propagation: month frac → days (×30), day frac → micros (×86.4G).
-fn scale_interval_by_real(months: i32, days: i32, micros: i64, factor: f64) -> Value {
-    let raw_months = months as f64 * factor;
-    let whole_months = raw_months.trunc() as i64;
-    let frac_months = raw_months - whole_months as f64;
-    let months_frac_as_days = frac_months * 30.0;
-
-    let raw_days = days as f64 * factor + months_frac_as_days;
-    let whole_days = raw_days.trunc() as i64;
-    let frac_days = raw_days - whole_days as f64;
-    let days_frac_as_micros = (frac_days * crate::datetime::MICROS_PER_DAY as f64).round() as i64;
-
-    let raw_micros = (micros as f64 * factor).round() as i64;
-    let total_micros = raw_micros.saturating_add(days_frac_as_micros);
-
-    let clamp_i32 = |n: i64| n.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+fn interval_value((months, days, micros): (i32, i32, i64)) -> Value {
     Value::Interval {
-        months: clamp_i32(whole_months),
-        days: clamp_i32(whole_days),
-        micros: total_micros,
+        months,
+        days,
+        micros,
     }
 }
 
@@ -1707,16 +1685,7 @@ fn eval_unary_op(op: UnaryOp, val: &Value) -> Result<Value> {
                 months,
                 days,
                 micros,
-            } => {
-                let m = months.checked_neg().ok_or(SqlError::IntegerOverflow)?;
-                let d = days.checked_neg().ok_or(SqlError::IntegerOverflow)?;
-                let u = micros.checked_neg().ok_or(SqlError::IntegerOverflow)?;
-                Ok(Value::Interval {
-                    months: m,
-                    days: d,
-                    micros: u,
-                })
-            }
+            } => crate::datetime::negate_interval(*months, *days, *micros).map(interval_value),
             _ => Err(SqlError::TypeMismatch {
                 expected: "numeric or INTERVAL".into(),
                 got: format!("{}", val.data_type()),
@@ -3115,7 +3084,7 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
                     days,
                     micros,
                 } => {
-                    let (m, d, u) = crate::datetime::justify_days(*months, *days, *micros);
+                    let (m, d, u) = crate::datetime::justify_days(*months, *days, *micros)?;
                     Ok(Value::Interval {
                         months: m,
                         days: d,
@@ -3137,7 +3106,7 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
                     days,
                     micros,
                 } => {
-                    let (m, d, u) = crate::datetime::justify_hours(*months, *days, *micros);
+                    let (m, d, u) = crate::datetime::justify_hours(*months, *days, *micros)?;
                     Ok(Value::Interval {
                         months: m,
                         days: d,
@@ -3159,7 +3128,7 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
                     days,
                     micros,
                 } => {
-                    let (m, d, u) = crate::datetime::justify_interval(*months, *days, *micros);
+                    let (m, d, u) = crate::datetime::justify_interval(*months, *days, *micros)?;
                     Ok(Value::Interval {
                         months: m,
                         days: d,

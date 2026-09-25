@@ -216,6 +216,73 @@ fn interval_fractions_spill_and_hours_stay_whole() {
 }
 
 #[test]
+fn interval_arithmetic_and_averages_cascade_fractions() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    for sql in [
+        "CREATE TABLE spans (id INTEGER PRIMARY KEY, g INTERVAL)",
+        "INSERT INTO spans VALUES (1, '1 day 02:00:00'), (2, '-3 hours'), (3, '1 mon 15 days'), \
+         (4, '00:00:00.000001'), (5, NULL)",
+        "CREATE TABLE wide (id INTEGER PRIMARY KEY, g INTERVAL)",
+        "INSERT INTO wide VALUES (1, '2000000000 days'), (2, '2000000000 days')",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+    for transaction in [false, true] {
+        if transaction {
+            assert_ok(conn.execute("BEGIN").unwrap());
+        }
+        for (sql, expected) in [
+            ("SELECT INTERVAL '10 days' / 4", "2 days 12:00:00"),
+            ("SELECT INTERVAL '1 mon 15 days' / 2", "22 days 12:00:00"),
+            ("SELECT INTERVAL '1 day 02:00:00' / 2.0", "13:00:00"),
+            ("SELECT INTERVAL '1 month' * 1.5", "1 mon 15 days"),
+            (
+                "SELECT justify_interval(INTERVAL '1 mon -1 hour')",
+                "29 days 23:00:00",
+            ),
+            ("SELECT justify_hours(INTERVAL '1 day -1 hour')", "23:00:00"),
+            ("SELECT justify_days(INTERVAL '1 mon -5 days')", "25 days"),
+            ("SELECT AVG(g) FROM spans", "11 days 11:45:00"),
+            (
+                "SELECT AVG(x.g) FROM spans AS x JOIN spans AS y ON y.id = x.id",
+                "11 days 11:45:00",
+            ),
+            ("SELECT SUM(g) FROM spans", "1 mon 16 days -00:59:59.999999"),
+        ] {
+            assert_eq!(
+                scalar(&conn, sql).to_string(),
+                expected,
+                "{sql} (transaction: {transaction})"
+            );
+        }
+        for sql in [
+            "SELECT SUM(g) FROM wide",
+            "SELECT SUM(x.g) FROM wide AS x JOIN wide AS y ON y.id = x.id",
+            "SELECT INTERVAL '2000000000 days' * 2",
+            "SELECT INTERVAL '2000000000 days' + INTERVAL '2000000000 days'",
+            "SELECT DATE '2024-01-01' - INTERVAL '-178956970 years -8 months'",
+            "SELECT -INTERVAL '-178956970 years -8 months'",
+        ] {
+            match conn.query(sql) {
+                Err(SqlError::InvalidValue(message)) => {
+                    assert_eq!(message, "interval out of range", "{sql}")
+                }
+                other => panic!("{sql} (transaction: {transaction}): {other:?}"),
+            }
+        }
+        assert!(matches!(
+            conn.query("SELECT INTERVAL '1 day' / 0"),
+            Err(SqlError::DivisionByZero)
+        ));
+        if transaction {
+            assert_ok(conn.execute("COMMIT").unwrap());
+        }
+    }
+}
+
+#[test]
 fn date_plus_integer() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());

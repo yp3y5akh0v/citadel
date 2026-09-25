@@ -1031,26 +1031,247 @@ fn span_to_triple(span: &Span) -> Result<(i32, i32, i64)> {
     Ok((clamp_i32(months)?, clamp_i32(days)?, micros))
 }
 
-pub fn justify_days(months: i32, days: i32, micros: i64) -> (i32, i32, i64) {
-    // Convert every 30 days into 1 month.
-    let extra_months = days / 30;
-    let rem_days = days % 30;
-    let new_months = months.saturating_add(extra_months);
-    (new_months, rem_days, micros)
+/// An interval result whose fields leave their range.
+pub fn interval_overflow() -> SqlError {
+    SqlError::InvalidValue("interval out of range".into())
 }
 
-pub fn justify_hours(months: i32, days: i32, micros: i64) -> (i32, i32, i64) {
-    // Convert every 24 hours into 1 day.
-    let extra_days = (micros / MICROS_PER_DAY) as i32;
-    let rem_micros = micros % MICROS_PER_DAY;
-    let new_days = days.saturating_add(extra_days);
-    (months, new_days, rem_micros)
+/// PostgreSQL's justify_days: whole 30-day periods become months, and the
+/// days take the months' sign.
+pub fn justify_days(months: i32, days: i32, micros: i64) -> Result<(i32, i32, i64)> {
+    let mut months = months
+        .checked_add(days / 30)
+        .ok_or_else(interval_overflow)?;
+    let mut days = days % 30;
+    if months > 0 && days < 0 {
+        days += 30;
+        months -= 1;
+    } else if months < 0 && days > 0 {
+        days -= 30;
+        months += 1;
+    }
+    Ok((months, days, micros))
 }
 
-pub fn justify_interval(months: i32, days: i32, micros: i64) -> (i32, i32, i64) {
-    let (m1, d1, us1) = justify_hours(months, days, micros);
-    let (m2, d2, us2) = justify_days(m1, d1, us1);
-    (m2, d2, us2)
+/// PostgreSQL's justify_hours: whole 24-hour periods become days, and the
+/// time takes the days' sign.
+pub fn justify_hours(months: i32, days: i32, micros: i64) -> Result<(i32, i32, i64)> {
+    // Whole days of an i64 of microseconds stay far inside i32.
+    let mut days = days
+        .checked_add((micros / MICROS_PER_DAY) as i32)
+        .ok_or_else(interval_overflow)?;
+    let mut micros = micros % MICROS_PER_DAY;
+    if days > 0 && micros < 0 {
+        micros += MICROS_PER_DAY;
+        days -= 1;
+    } else if days < 0 && micros > 0 {
+        micros -= MICROS_PER_DAY;
+        days += 1;
+    }
+    Ok((months, days, micros))
+}
+
+/// PostgreSQL's justify_interval: whole days become months and whole 24-hour
+/// periods days, then every field takes one sign.
+pub fn justify_interval(months: i32, days: i32, micros: i64) -> Result<(i32, i32, i64)> {
+    let (mut months, mut days, mut micros) = (months, days, micros);
+    // Days that share the time's sign are justified first, so adding the
+    // time's whole days below cannot overflow; opposite signs cannot either.
+    if (days > 0 && micros > 0) || (days < 0 && micros < 0) {
+        months = months
+            .checked_add(days / 30)
+            .ok_or_else(interval_overflow)?;
+        days %= 30;
+    }
+    days += (micros / MICROS_PER_DAY) as i32;
+    micros %= MICROS_PER_DAY;
+    months = months
+        .checked_add(days / 30)
+        .ok_or_else(interval_overflow)?;
+    days %= 30;
+    if months > 0 && (days < 0 || (days == 0 && micros < 0)) {
+        days += 30;
+        months -= 1;
+    } else if months < 0 && (days > 0 || (days == 0 && micros > 0)) {
+        days -= 30;
+        months += 1;
+    }
+    if days > 0 && micros < 0 {
+        micros += MICROS_PER_DAY;
+        days -= 1;
+    } else if days < 0 && micros > 0 {
+        micros -= MICROS_PER_DAY;
+        days += 1;
+    }
+    Ok((months, days, micros))
+}
+
+/// `-interval`.
+pub fn negate_interval(months: i32, days: i32, micros: i64) -> Result<(i32, i32, i64)> {
+    match (
+        months.checked_neg(),
+        days.checked_neg(),
+        micros.checked_neg(),
+    ) {
+        (Some(months), Some(days), Some(micros)) => Ok((months, days, micros)),
+        _ => Err(interval_overflow()),
+    }
+}
+
+/// `a + b`, field by field.
+pub fn add_intervals(a: (i32, i32, i64), b: (i32, i32, i64)) -> Result<(i32, i32, i64)> {
+    match (
+        a.0.checked_add(b.0),
+        a.1.checked_add(b.1),
+        a.2.checked_add(b.2),
+    ) {
+        (Some(months), Some(days), Some(micros)) => Ok((months, days, micros)),
+        _ => Err(interval_overflow()),
+    }
+}
+
+/// `a - b`, field by field.
+pub fn subtract_intervals(a: (i32, i32, i64), b: (i32, i32, i64)) -> Result<(i32, i32, i64)> {
+    match (
+        a.0.checked_sub(b.0),
+        a.1.checked_sub(b.1),
+        a.2.checked_sub(b.2),
+    ) {
+        (Some(months), Some(days), Some(micros)) => Ok((months, days, micros)),
+        _ => Err(interval_overflow()),
+    }
+}
+
+/// `interval * factor` for an integer factor, exactly.
+pub fn multiply_interval_by_integer(
+    months: i32,
+    days: i32,
+    micros: i64,
+    factor: i64,
+) -> Result<(i32, i32, i64)> {
+    let field = |value: i32| {
+        i64::from(value)
+            .checked_mul(factor)
+            .and_then(|product| i32::try_from(product).ok())
+    };
+    match (field(months), field(days), micros.checked_mul(factor)) {
+        (Some(months), Some(days), Some(micros)) => Ok((months, days, micros)),
+        _ => Err(interval_overflow()),
+    }
+}
+
+/// `interval * factor` as PostgreSQL's interval_mul computes it.
+pub fn multiply_interval(
+    months: i32,
+    days: i32,
+    micros: i64,
+    factor: f64,
+) -> Result<(i32, i32, i64)> {
+    scale_interval(
+        f64::from(months),
+        f64::from(days),
+        micros as f64,
+        factor,
+        false,
+    )
+}
+
+/// `interval / divisor` as PostgreSQL's interval_div computes it.
+pub fn divide_interval(
+    months: i32,
+    days: i32,
+    micros: i64,
+    divisor: f64,
+) -> Result<(i32, i32, i64)> {
+    scale_interval(
+        f64::from(months),
+        f64::from(days),
+        micros as f64,
+        divisor,
+        true,
+    )
+}
+
+/// The average of `count` intervals whose fields sum to these totals: the
+/// sum divided by the count, as PostgreSQL averages intervals.
+pub fn average_interval(
+    months: i64,
+    days: i64,
+    micros: i128,
+    count: i64,
+) -> Result<(i32, i32, i64)> {
+    scale_interval(
+        months as f64,
+        days as f64,
+        micros as f64,
+        count as f64,
+        true,
+    )
+}
+
+/// Multiplies (or divides) each field by `factor`: months and days keep their
+/// whole parts, and their fractions cascade into days and microseconds at 30
+/// days a month and 86,400 seconds a day, each rounded to a microsecond.
+fn scale_interval(
+    months: f64,
+    days: f64,
+    micros: f64,
+    factor: f64,
+    divide: bool,
+) -> Result<(i32, i32, i64)> {
+    if factor.is_nan() {
+        return Err(interval_overflow());
+    }
+    if factor.is_infinite() {
+        // Without an infinite interval, only a zero one can be scaled up.
+        let zero = months == 0.0 && days == 0.0 && micros == 0.0;
+        return if divide || zero {
+            Ok((0, 0, 0))
+        } else {
+            Err(interval_overflow())
+        };
+    }
+    if divide && factor == 0.0 {
+        return Err(SqlError::DivisionByZero);
+    }
+    let scale = |value: f64| {
+        if divide {
+            value / factor
+        } else {
+            value * factor
+        }
+    };
+    let whole = |value: f64| {
+        if (f64::from(i32::MIN)..-f64::from(i32::MIN)).contains(&value) {
+            Ok(value as i32)
+        } else {
+            Err(interval_overflow())
+        }
+    };
+    let round_to_micros = |value: f64| (value * 1_000_000.0).round_ties_even() / 1_000_000.0;
+    let month_product = scale(months);
+    let whole_months = whole(month_product)?;
+    let day_product = scale(days);
+    let mut whole_days = whole(day_product)?;
+    let month_remainder_days = round_to_micros((month_product - f64::from(whole_months)) * 30.0);
+    let mut second_remainder = round_to_micros(
+        (day_product - f64::from(whole_days) + month_remainder_days.fract()) * 86_400.0,
+    );
+    if second_remainder.abs() >= 86_400.0 {
+        let carried = (second_remainder / 86_400.0) as i32;
+        whole_days = whole_days
+            .checked_add(carried)
+            .ok_or_else(interval_overflow)?;
+        second_remainder -= f64::from(carried) * 86_400.0;
+    }
+    whole_days = whole_days
+        .checked_add(month_remainder_days as i32)
+        .ok_or_else(interval_overflow)?;
+    let time = (scale(micros) + second_remainder * 1_000_000.0).round_ties_even();
+    if !(i64::MIN as f64..-(i64::MIN as f64)).contains(&time) {
+        return Err(interval_overflow());
+    }
+    Ok((whole_months, whole_days, time as i64))
 }
 
 /// PG-normalized total µs for comparison purposes (30-day month, 24-hour day).
