@@ -69,7 +69,10 @@ pub(super) fn exec_select_query_in_txn(
     super::exec_query_body_in_txn(wtx, schema, &sq.body, &ctes)
 }
 
-/// Inline a single simple CTE into a direct query against the real table.
+/// Inline a single simple CTE into a query against its table. The table takes
+/// the name the outer query reads the CTE by, and the outer query may read only
+/// the columns the CTE selects, so every name resolves as it would against the
+/// materialized CTE. Any other shape is materialized.
 pub(super) fn try_fuse_cte(sq: &SelectQuery) -> Option<QueryBody> {
     if sq.ctes.len() != 1 || sq.recursive {
         return None;
@@ -91,27 +94,83 @@ pub(super) fn try_fuse_cte(sq: &SelectQuery) -> Option<QueryBody> {
         || inner.limit.is_some()
         || inner.offset.is_some()
         || !inner.order_by.is_empty()
+        || inner.from_subquery.is_some()
+        || inner.from_args.is_some()
+        || inner.from_json_table.is_some()
         || super::stmt_has_subquery(inner)
+        || inner
+            .where_clause
+            .as_ref()
+            .is_some_and(reads_qualified_column)
     {
         return None;
     }
 
-    let all_simple_refs = inner.columns.iter().all(|c| match c {
-        SelectColumn::AllColumns => true,
-        SelectColumn::AllFromOld | SelectColumn::AllFromNew => false,
-        SelectColumn::Expr { expr, alias } => alias.is_none() && matches!(expr, Expr::Column(_)),
-    });
-    if !all_simple_refs {
-        return None;
-    }
+    // None when the CTE selects every column of its table.
+    let selected = match inner.columns.as_slice() {
+        [SelectColumn::AllColumns] => None,
+        columns => {
+            let mut names: Vec<&str> = Vec::with_capacity(columns.len());
+            for column in columns {
+                match column {
+                    SelectColumn::Expr {
+                        expr: Expr::Column(name),
+                        alias: None,
+                    } if !names.contains(&name.as_str()) => names.push(name),
+                    _ => return None,
+                }
+            }
+            Some(names)
+        }
+    };
 
     let outer = match &sq.body {
         QueryBody::Select(s) => s.as_ref(),
         _ => return None,
     };
-    if !outer.from.eq_ignore_ascii_case(&cte.name) || !outer.joins.is_empty() {
+    // A subquery reads the CTE through scopes the fused table would not keep.
+    if !outer.from.eq_ignore_ascii_case(&cte.name)
+        || !outer.joins.is_empty()
+        || outer.from_args.is_some()
+        || super::stmt_has_subquery(outer)
+    {
         return None;
     }
+    let visible = outer.from_alias.as_deref().unwrap_or(&cte.name);
+    let exposes = |name: &str| selected.as_ref().is_none_or(|names| names.contains(&name));
+    let mut readable = true;
+    let mut check = |expr: &Expr| match expr {
+        Expr::Column(name) => readable &= exposes(name),
+        Expr::QualifiedColumn { table, column } => {
+            readable &= table.eq_ignore_ascii_case(visible) && exposes(column)
+        }
+        _ => {}
+    };
+    let selections = outer.columns.iter().filter_map(|column| match column {
+        SelectColumn::Expr { expr, .. } => Some(expr),
+        _ => None,
+    });
+    for expr in selections
+        .chain(&outer.where_clause)
+        .chain(&outer.group_by)
+        .chain(&outer.having)
+        .chain(outer.order_by.iter().map(|item| &item.expr))
+        .chain(&outer.limit)
+        .chain(&outer.offset)
+    {
+        crate::parser::visit_expr(expr, &mut check);
+    }
+    if !readable {
+        return None;
+    }
+    let columns = outer
+        .columns
+        .iter()
+        .flat_map(|column| match (column, &selected) {
+            (SelectColumn::AllColumns, Some(_)) => inner.columns.clone(),
+            _ => vec![column.clone()],
+        })
+        .collect();
 
     let merged_where = match (&inner.where_clause, &outer.where_clause) {
         (Some(iw), Some(ow)) => Some(Expr::BinaryOp {
@@ -124,12 +183,12 @@ pub(super) fn try_fuse_cte(sq: &SelectQuery) -> Option<QueryBody> {
     };
 
     let fused = SelectStmt {
-        columns: outer.columns.clone(),
+        columns,
         from: inner.from.clone(),
-        from_alias: inner.from_alias.clone(),
-        from_subquery: inner.from_subquery.clone(),
-        from_args: inner.from_args.clone(),
-        from_json_table: inner.from_json_table.clone(),
+        from_alias: Some(visible.to_string()),
+        from_subquery: None,
+        from_args: None,
+        from_json_table: None,
         joins: vec![],
         distinct: outer.distinct,
         where_clause: merged_where,
@@ -141,6 +200,14 @@ pub(super) fn try_fuse_cte(sq: &SelectQuery) -> Option<QueryBody> {
     };
 
     Some(QueryBody::Select(Box::new(fused)))
+}
+
+fn reads_qualified_column(expr: &Expr) -> bool {
+    let mut found = false;
+    crate::parser::visit_expr(expr, &mut |node| {
+        found |= matches!(node, Expr::QualifiedColumn { .. })
+    });
+    found
 }
 
 pub(super) fn materialize_all_ctes(
