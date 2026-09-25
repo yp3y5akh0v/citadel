@@ -427,3 +427,31 @@ fn window_over_cte() {
         .unwrap();
     assert_eq!(qr.rows.len(), 3);
 }
+
+#[test]
+fn window_outputs_are_named_as_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    setup_employees(&conn);
+
+    for filter in ["", " WHERE salary > 1000"] {
+        let qr = conn
+            .query(&format!(
+                "SELECT id, ROW_NUMBER() OVER (ORDER BY id), SUM(salary) OVER (), \
+                 salary + SUM(salary) OVER (), COUNT(*) OVER () AS n FROM employees{filter}"
+            ))
+            .unwrap();
+        assert_eq!(
+            qr.columns,
+            [
+                "id",
+                "ROW_NUMBER()",
+                "SUM(salary)",
+                "salary + SUM(salary)",
+                "n"
+            ],
+            "{filter}"
+        );
+    }
+}
