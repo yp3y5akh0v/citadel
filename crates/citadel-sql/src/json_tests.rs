@@ -272,23 +272,23 @@ fn find_object_key_missing_returns_none() {
 fn parse_dollar_path_basic() {
     let segs = parse_dollar_path("$.foo.bar").unwrap();
     assert_eq!(segs.len(), 2);
-    matches!(segs[0], PathSeg::Key(_));
-    matches!(segs[1], PathSeg::Key(_));
+    assert!(matches!(segs[0], PathSeg::Key(_)));
+    assert!(matches!(segs[1], PathSeg::Key(_)));
 }
 
 #[test]
 fn parse_dollar_path_array_index() {
     let segs = parse_dollar_path("$.items[3]").unwrap();
     assert_eq!(segs.len(), 2);
-    matches!(segs[0], PathSeg::Key(_));
-    matches!(segs[1], PathSeg::Index(3));
+    assert!(matches!(segs[0], PathSeg::Key(_)));
+    assert!(matches!(segs[1], PathSeg::Index(3)));
 }
 
 #[test]
 fn parse_dollar_path_wildcard() {
     let segs = parse_dollar_path("$[*]").unwrap();
     assert_eq!(segs.len(), 1);
-    matches!(segs[0], PathSeg::Wildcard);
+    assert!(matches!(segs[0], PathSeg::Wildcard));
 }
 
 fn assert_interrupted<T>(result: Result<T>) {
