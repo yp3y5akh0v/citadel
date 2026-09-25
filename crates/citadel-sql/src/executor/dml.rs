@@ -419,10 +419,13 @@ pub(super) fn materialize_stmt(
             SelectColumn::AllColumns => Ok(SelectColumn::AllColumns),
             SelectColumn::AllFromOld => Ok(SelectColumn::AllFromOld),
             SelectColumn::AllFromNew => Ok(SelectColumn::AllFromNew),
-            SelectColumn::Expr { expr, alias } => Ok(SelectColumn::Expr {
-                expr: materialize_expr(expr, exec_sub)?,
-                alias: alias.clone(),
-            }),
+            SelectColumn::Expr { expr, alias } => {
+                let materialized = materialize_expr(expr, exec_sub)?;
+                Ok(SelectColumn::Expr {
+                    alias: super::helpers::written_alias(alias, expr, &materialized),
+                    expr: materialized,
+                })
+            }
         })
         .collect::<Result<Vec<_>>>()?;
     let order_by = stmt

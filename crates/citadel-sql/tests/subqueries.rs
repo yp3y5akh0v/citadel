@@ -900,6 +900,73 @@ fn quantified_subqueries_compare_against_every_selected_row() {
     }
 }
 
+/// A subquery's output is named as the query wrote it on every path, never
+/// after its value or a hidden column, and an alias may repeat a column name.
+#[test]
+fn subquery_outputs_are_named_as_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, a INTEGER)",
+        "INSERT INTO t VALUES (1, 5), (2, -5)",
+        "CREATE TABLE u (id INTEGER NOT NULL PRIMARY KEY, k INTEGER)",
+        "INSERT INTO u VALUES (10, 1), (20, 2)",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+    let int = |value: i64| Value::Integer(value);
+    let cases = [
+        (
+            "SELECT (SELECT COUNT(*) FROM u)",
+            vec!["?"],
+            vec![vec![int(2)]],
+        ),
+        (
+            "SELECT EXISTS (SELECT 1 FROM u), 5 IN (SELECT k FROM u)",
+            vec!["?", "?"],
+            vec![vec![Value::Boolean(true), Value::Boolean(false)]],
+        ),
+        (
+            "SELECT t.id, (SELECT u.id FROM u WHERE u.k = t.id) FROM t ORDER BY 1",
+            vec!["t.id", "?"],
+            vec![vec![int(1), int(10)], vec![int(2), int(20)]],
+        ),
+        (
+            "SELECT t.id, (SELECT u.id FROM u WHERE u.k = t.id) AS a FROM t ORDER BY 1",
+            vec!["t.id", "a"],
+            vec![vec![int(1), int(10)], vec![int(2), int(20)]],
+        ),
+        (
+            "SELECT t.id, (SELECT u.id FROM u WHERE u.k = t.id) AS id FROM t ORDER BY 1",
+            vec!["t.id", "id"],
+            vec![vec![int(1), int(10)], vec![int(2), int(20)]],
+        ),
+        (
+            "SELECT (SELECT u.id FROM u WHERE u.k = t.id) AS x, \
+             (SELECT COUNT(*) FROM u WHERE u.k = t.id) AS x FROM t ORDER BY 1",
+            vec!["x", "x"],
+            vec![vec![int(10), int(1)], vec![int(20), int(1)]],
+        ),
+    ];
+    for transaction in [false, true] {
+        if transaction {
+            assert_ok(conn.execute("BEGIN").unwrap());
+        }
+        for (sql, columns, rows) in &cases {
+            let result = conn.query(sql).unwrap();
+            assert_eq!(
+                &result.columns, columns,
+                "{sql} (transaction: {transaction})"
+            );
+            assert_eq!(&result.rows, rows, "{sql} (transaction: {transaction})");
+        }
+        if transaction {
+            assert_ok(conn.execute("ROLLBACK").unwrap());
+        }
+    }
+}
+
 #[test]
 fn subquery_keys_and_members_compare_as_equals_does() {
     let dir = tempfile::tempdir().unwrap();

@@ -1866,6 +1866,21 @@ pub(crate) fn projected_column(
     }
 }
 
+/// The alias that keeps a select item named as the query wrote it once
+/// execution rewrites its expression (a subquery to its value, a window call to
+/// its slot): its own alias, else the written display name when the rewritten
+/// expression displays differently.
+pub(crate) fn written_alias(
+    alias: &Option<String>,
+    written: &Expr,
+    rewritten: &Expr,
+) -> Option<String> {
+    alias.clone().or_else(|| {
+        let name = expr_display_name(written);
+        (name != expr_display_name(rewritten)).then_some(name)
+    })
+}
+
 /// The collation a key expression carries: an explicit COLLATE anywhere in it, else a
 /// column's own preserved through CAST wrappers. Anything else has none. Grouping,
 /// deduplicating and sorting all key expressions by this same rule.
