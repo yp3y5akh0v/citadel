@@ -11,7 +11,7 @@ mod qualifiers;
 pub(crate) use expr_name::expr_display_name;
 #[cfg(test)]
 pub(crate) use expr_name::op_symbol;
-pub use qualifiers::validate_qualifiers;
+use qualifiers::{resolve_qualifiers, Unresolved};
 
 #[derive(Debug, Clone)]
 pub enum Statement {
@@ -716,7 +716,28 @@ pub fn parse_sql_expr(sql: &str) -> Result<Expr> {
     convert_expr(&sp_expr)
 }
 
+/// Parses stored SQL, such as a view or trigger body. A qualified column
+/// whose qualifier names no source in scope is left for execution, so a
+/// definition saved before [`parse_submitted`] rejected one keeps working.
 pub fn parse_sql(sql: &str) -> Result<Statement> {
+    parse_resolved(sql, Unresolved::Keep)
+}
+
+/// Parses SQL a caller submits: every qualified column must name a source in
+/// scope.
+pub fn parse_submitted(sql: &str) -> Result<Statement> {
+    parse_resolved(sql, Unresolved::Reject)
+}
+
+pub fn parse_sql_multi(sql: &str) -> Result<Vec<Statement>> {
+    parse_resolved_multi(sql, Unresolved::Keep)
+}
+
+pub fn parse_submitted_multi(sql: &str) -> Result<Vec<Statement>> {
+    parse_resolved_multi(sql, Unresolved::Reject)
+}
+
+fn parse_resolved(sql: &str, unresolved: Unresolved) -> Result<Statement> {
     if let Some(stmt) = try_parse_refresh_matview(sql) {
         return stmt;
     }
@@ -733,10 +754,11 @@ pub fn parse_sql(sql: &str) -> Result<Statement> {
 
     let mut converted = convert_statement(stmts.into_iter().next().unwrap())?;
     apply_no_data_flags(std::slice::from_mut(&mut converted), &no_data_flags);
+    resolve_qualifiers(&mut converted, unresolved)?;
     Ok(converted)
 }
 
-pub fn parse_sql_multi(sql: &str) -> Result<Vec<Statement>> {
+fn parse_resolved_multi(sql: &str, unresolved: Unresolved) -> Result<Vec<Statement>> {
     let (rewritten, no_data_flags) = strip_matview_with_no_data(sql);
     let mut out: Vec<Statement> = Vec::new();
     for (start, end) in split_statement_spans(&rewritten) {
@@ -755,6 +777,9 @@ pub fn parse_sql_multi(sql: &str) -> Result<Vec<Statement>> {
         return Err(SqlError::Parse("empty SQL".into()));
     }
     apply_no_data_flags(&mut out, &no_data_flags);
+    for stmt in &mut out {
+        resolve_qualifiers(stmt, unresolved)?;
+    }
     Ok(out)
 }
 
@@ -3678,16 +3703,18 @@ fn convert_expr(expr: &sp::Expr) -> Result<Expr> {
         sp::Expr::Value(v) => convert_value(&v.value),
         sp::Expr::Identifier(ident) => Ok(Expr::Column(ident.value.to_ascii_lowercase())),
         sp::Expr::CompoundIdentifier(parts) => {
-            if parts.len() == 2 {
-                Ok(Expr::QualifiedColumn {
-                    table: parts[0].value.to_ascii_lowercase(),
-                    column: parts[1].value.to_ascii_lowercase(),
-                })
-            } else {
-                Ok(Expr::Column(
-                    parts.last().unwrap().value.to_ascii_lowercase(),
-                ))
+            let (column, qualifier) = parts.split_last().unwrap();
+            let column = column.value.to_ascii_lowercase();
+            if qualifier.is_empty() {
+                return Ok(Expr::Column(column));
             }
+            // `schema.table.column` qualifies by the dotted table name.
+            let table = qualifier
+                .iter()
+                .map(|part| part.value.to_ascii_lowercase())
+                .collect::<Vec<_>>()
+                .join(".");
+            Ok(Expr::QualifiedColumn { table, column })
         }
         sp::Expr::BinaryOp { left, op, right } => {
             let bin_op = convert_bin_op(op)?;

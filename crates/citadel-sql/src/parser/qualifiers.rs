@@ -1,95 +1,142 @@
-//! A qualified column reference must name a source of its query or of a query
-//! around it. Execution resolves a column by its name alone once the qualifier
-//! matches nothing, so an unchecked qualifier silently reads whichever source
-//! has a column of that name.
+//! A qualified column reference names a source of its query or of a query
+//! around it. Execution matches a source by the name it gives the source, and
+//! resolves a column by its name alone once the qualifier matches nothing, so
+//! resolution rewrites every other spelling to that name, and SQL a caller
+//! submits must not carry a qualifier that names no source.
 
+use super::expr_name::expr_display_name;
 use super::*;
 
-/// Rejects a qualified column whose qualifier names no source in scope. A
-/// source is visible by its alias, or by its name when it has none.
-pub fn validate_qualifiers(stmt: &Statement) -> Result<()> {
-    Validator::default().statement(stmt)
+/// What resolution does with a qualifier that names no source in scope, or
+/// more than one.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Unresolved {
+    /// SQL a caller submits: the reference is an error.
+    Reject,
+    /// Stored views and trigger bodies are parsed again on every use; keeping
+    /// the reference lets a definition saved before the check keep working.
+    Keep,
 }
 
-#[derive(Default)]
-struct Validator {
-    /// The source names of each enclosing query, innermost last.
-    scopes: Vec<Vec<String>>,
-    /// Rows the statement supplies without a source: OLD and NEW in a trigger
-    /// body or a RETURNING clause.
-    rows: Vec<&'static str>,
+pub(super) fn resolve_qualifiers(stmt: &mut Statement, unresolved: Unresolved) -> Result<()> {
+    Resolver {
+        scopes: Vec::new(),
+        rows: Vec::new(),
+        unresolved,
+    }
+    .statement(stmt)
 }
 
-/// The names a source is visible by. A dotted name is also visible by its
-/// last part, since a qualifier is one identifier.
-fn source_names(name: &str, alias: Option<&str>) -> Vec<String> {
-    let visible = alias.unwrap_or(name).to_ascii_lowercase();
-    let last = visible.rsplit('.').next().unwrap_or_default().to_owned();
-    if last == visible {
-        vec![visible]
-    } else {
-        vec![visible, last]
+#[derive(Clone)]
+struct Source {
+    /// The names a qualifier may use: the alias, or the name when there is
+    /// none. A dotted name is also visible by its last part.
+    names: Vec<String>,
+    /// The name execution gives the source.
+    canonical: String,
+}
+
+impl Source {
+    fn new(name: &str, alias: Option<&str>) -> Self {
+        let canonical = alias.unwrap_or(name).to_ascii_lowercase();
+        let mut names = vec![canonical.clone()];
+        if let Some((_, last)) = canonical.rsplit_once('.') {
+            names.push(last.to_owned());
+        }
+        Self { names, canonical }
     }
 }
 
-impl Validator {
+enum Resolution<'a> {
+    Source(&'a str),
+    Row,
+    Ambiguous,
+    Unknown,
+}
+
+struct Resolver {
+    /// The sources of each enclosing query, innermost last.
+    scopes: Vec<Vec<Source>>,
+    /// Rows the statement supplies without a source: OLD and NEW in a trigger
+    /// body or a RETURNING clause. A source of the same name wins.
+    rows: Vec<&'static str>,
+    unresolved: Unresolved,
+}
+
+impl Resolver {
     fn in_scope<T>(
         &mut self,
-        sources: Vec<String>,
-        check: impl FnOnce(&mut Self) -> Result<T>,
+        sources: Vec<Source>,
+        resolve: impl FnOnce(&mut Self) -> Result<T>,
     ) -> Result<T> {
         self.scopes.push(sources);
-        let result = check(self);
+        let result = resolve(self);
         self.scopes.pop();
         result
     }
 
-    fn visible(&self, qualifier: &str) -> bool {
+    /// The innermost query with a source of this name decides; two sources
+    /// of one query that share it are ambiguous.
+    fn resolve(&self, qualifier: &str) -> Resolution<'_> {
         let qualifier = qualifier.to_ascii_lowercase();
-        self.rows.contains(&qualifier.as_str())
-            || self
-                .scopes
+        for sources in self.scopes.iter().rev() {
+            let mut named = sources
                 .iter()
-                .any(|sources| sources.contains(&qualifier))
+                .filter(|source| source.names.contains(&qualifier));
+            if let Some(source) = named.next() {
+                return match named.next() {
+                    Some(_) => Resolution::Ambiguous,
+                    None => Resolution::Source(&source.canonical),
+                };
+            }
+        }
+        if self.rows.contains(&qualifier.as_str()) {
+            Resolution::Row
+        } else {
+            Resolution::Unknown
+        }
     }
 
-    fn statement(&mut self, stmt: &Statement) -> Result<()> {
+    fn statement(&mut self, stmt: &mut Statement) -> Result<()> {
         match stmt {
             Statement::Select(query) => self.query(query),
             Statement::Insert(insert) => self.insert(insert),
             Statement::Update(update) => self.update(update),
             Statement::Delete(delete) => self.delete(delete),
             Statement::Explain { inner, .. } => self.statement(inner),
-            Statement::CreateView(view) => self.statement(&parse_sql(&view.sql)?),
-            Statement::CreateMaterializedView(view) => self.query(&view.select_parsed),
+            // The body is stored as text and resolved each time it is parsed.
+            Statement::CreateView(view) if self.unresolved == Unresolved::Reject => {
+                parse_submitted(&view.sql).map(drop)
+            }
+            Statement::CreateMaterializedView(view) => self.query(&mut view.select_parsed),
             Statement::CreateTrigger(trigger) => {
                 self.rows = vec!["old", "new"];
-                if let Some(when) = &trigger.when_expr {
+                if let Some(when) = &mut trigger.when_expr {
                     self.expr(when)?;
                 }
                 trigger
                     .body
-                    .iter()
+                    .iter_mut()
                     .try_for_each(|stmt| self.statement(stmt))
             }
             _ => Ok(()),
         }
     }
 
-    fn query(&mut self, query: &SelectQuery) -> Result<()> {
-        for cte in &query.ctes {
-            self.body(&cte.body)?;
+    fn query(&mut self, query: &mut SelectQuery) -> Result<()> {
+        for cte in &mut query.ctes {
+            self.body(&mut cte.body)?;
         }
-        self.body(&query.body)
+        self.body(&mut query.body)
     }
 
-    fn body(&mut self, body: &QueryBody) -> Result<()> {
+    fn body(&mut self, body: &mut QueryBody) -> Result<()> {
         match body {
             QueryBody::Select(select) => self.select(select),
             // A compound's ORDER BY names its output columns.
             QueryBody::Compound(compound) => {
-                self.body(&compound.left)?;
-                self.body(&compound.right)
+                self.body(&mut compound.left)?;
+                self.body(&mut compound.right)
             }
             QueryBody::Insert(insert) => self.insert(insert),
             QueryBody::Update(update) => self.update(update),
@@ -97,72 +144,67 @@ impl Validator {
         }
     }
 
-    fn select(&mut self, select: &SelectStmt) -> Result<()> {
+    fn select(&mut self, select: &mut SelectStmt) -> Result<()> {
         // A derived table sees the queries around this one, and a LATERAL one
         // also the sources before it; a table function's arguments likewise.
         let mut sources = Vec::new();
-        if let Some(derived) = &select.from_subquery {
-            self.query(&derived.query)?;
+        if let Some(derived) = &mut select.from_subquery {
+            self.query(&mut derived.query)?;
         }
-        for arg in select.from_args.iter().flatten() {
+        for arg in select.from_args.iter_mut().flatten() {
             self.expr(arg)?;
         }
-        if let Some(json_table) = &select.from_json_table {
-            self.expr(&json_table.source)?;
+        if let Some(json_table) = &mut select.from_json_table {
+            self.expr(&mut json_table.source)?;
         }
         if !select.from.is_empty() {
-            sources.extend(source_names(&select.from, select.from_alias.as_deref()));
+            sources.push(Source::new(&select.from, select.from_alias.as_deref()));
         }
-        for join in &select.joins {
-            match &join.subquery {
+        for join in &mut select.joins {
+            match &mut join.subquery {
                 Some(derived) if derived.lateral => {
-                    self.in_scope(sources.clone(), |v| v.query(&derived.query))?
+                    self.in_scope(sources.clone(), |r| r.query(&mut derived.query))?
                 }
-                Some(derived) => self.query(&derived.query)?,
+                Some(derived) => self.query(&mut derived.query)?,
                 None => {
-                    for arg in join.table.args.iter().flatten() {
-                        self.in_scope(sources.clone(), |v| v.expr(arg))?;
+                    for arg in join.table.args.iter_mut().flatten() {
+                        self.in_scope(sources.clone(), |r| r.expr(arg))?;
                     }
                 }
             }
-            sources.extend(source_names(&join.table.name, join.table.alias.as_deref()));
+            sources.push(Source::new(&join.table.name, join.table.alias.as_deref()));
         }
-        self.in_scope(sources, |v| {
-            for join in &select.joins {
-                if let Some(on) = &join.on_clause {
-                    v.expr(on)?;
+        self.in_scope(sources, |r| {
+            for join in &mut select.joins {
+                if let Some(on) = &mut join.on_clause {
+                    r.expr(on)?;
                 }
             }
-            for column in &select.columns {
-                if let SelectColumn::Expr { expr, .. } = column {
-                    v.expr(expr)?;
-                }
-            }
+            r.projections(&mut select.columns)?;
             for expr in select
                 .where_clause
-                .iter()
-                .chain(&select.group_by)
-                .chain(&select.having)
-                .chain(select.order_by.iter().map(|item| &item.expr))
-                .chain(&select.limit)
-                .chain(&select.offset)
+                .iter_mut()
+                .chain(&mut select.group_by)
+                .chain(&mut select.having)
+                .chain(select.order_by.iter_mut().map(|item| &mut item.expr))
+                .chain(&mut select.limit)
+                .chain(&mut select.offset)
             {
-                v.expr(expr)?;
+                r.expr(expr)?;
             }
             Ok(())
         })
     }
 
-    fn insert(&mut self, insert: &InsertStmt) -> Result<()> {
-        match &insert.source {
+    fn insert(&mut self, insert: &mut InsertStmt) -> Result<()> {
+        match &mut insert.source {
             InsertSource::Values(rows) => {
-                for expr in rows.iter().flatten() {
+                for expr in rows.iter_mut().flatten() {
                     self.expr(expr)?;
                 }
             }
             InsertSource::Select(query) => self.query(query)?,
         }
-        let target = source_names(&insert.table, None);
         if let Some(OnConflictClause {
             action:
                 OnConflictAction::DoUpdate {
@@ -170,63 +212,88 @@ impl Validator {
                     where_clause,
                 },
             ..
-        }) = &insert.on_conflict
+        }) = &mut insert.on_conflict
         {
-            let mut conflict = target.clone();
-            conflict.push("excluded".into());
-            self.in_scope(conflict, |v| {
-                for (_, expr) in assignments {
-                    v.expr(expr)?;
+            let conflict = vec![
+                Source::new(&insert.table, None),
+                Source::new("excluded", None),
+            ];
+            self.in_scope(conflict, |r| {
+                for (_, expr) in assignments.iter_mut() {
+                    r.expr(expr)?;
                 }
-                where_clause.iter().try_for_each(|expr| v.expr(expr))
+                where_clause.iter_mut().try_for_each(|expr| r.expr(expr))
             })?;
         }
-        self.in_scope(target, |v| v.returning(insert.returning.as_deref()))
+        let target = vec![Source::new(&insert.table, None)];
+        self.in_scope(target, |r| r.returning(insert.returning.as_deref_mut()))
     }
 
-    fn update(&mut self, update: &UpdateStmt) -> Result<()> {
-        self.in_scope(source_names(&update.table, None), |v| {
-            for (_, expr) in &update.assignments {
-                v.expr(expr)?;
+    fn update(&mut self, update: &mut UpdateStmt) -> Result<()> {
+        let target = vec![Source::new(&update.table, None)];
+        self.in_scope(target, |r| {
+            for (_, expr) in &mut update.assignments {
+                r.expr(expr)?;
             }
-            if let Some(expr) = &update.where_clause {
-                v.expr(expr)?;
+            if let Some(expr) = &mut update.where_clause {
+                r.expr(expr)?;
             }
-            v.returning(update.returning.as_deref())
+            r.returning(update.returning.as_deref_mut())
         })
     }
 
-    fn delete(&mut self, delete: &DeleteStmt) -> Result<()> {
-        self.in_scope(source_names(&delete.table, None), |v| {
-            if let Some(expr) = &delete.where_clause {
-                v.expr(expr)?;
+    fn delete(&mut self, delete: &mut DeleteStmt) -> Result<()> {
+        let target = vec![Source::new(&delete.table, None)];
+        self.in_scope(target, |r| {
+            if let Some(expr) = &mut delete.where_clause {
+                r.expr(expr)?;
             }
-            v.returning(delete.returning.as_deref())
+            r.returning(delete.returning.as_deref_mut())
         })
     }
 
     /// RETURNING may also read the row before and after the change as OLD and
     /// NEW.
-    fn returning(&mut self, columns: Option<&[SelectColumn]>) -> Result<()> {
+    fn returning(&mut self, columns: Option<&mut [SelectColumn]>) -> Result<()> {
         let rows = std::mem::replace(&mut self.rows, vec!["old", "new"]);
-        let result = columns
-            .into_iter()
-            .flatten()
-            .try_for_each(|column| match column {
-                SelectColumn::Expr { expr, .. } => self.expr(expr),
-                _ => Ok(()),
-            });
+        let result = columns.map_or(Ok(()), |columns| self.projections(columns));
         self.rows = rows;
         result
     }
 
-    fn expr(&mut self, expr: &Expr) -> Result<()> {
-        match expr {
-            Expr::QualifiedColumn { table, column } => {
-                if !self.visible(table) {
-                    return Err(SqlError::ColumnNotFound(format!("{table}.{column}")));
+    /// A rewritten qualifier keeps the output name the query wrote.
+    fn projections(&mut self, columns: &mut [SelectColumn]) -> Result<()> {
+        for column in columns {
+            if let SelectColumn::Expr { expr, alias } = column {
+                let written = alias.is_none().then(|| expr_display_name(expr));
+                self.expr(expr)?;
+                if let Some(written) = written {
+                    if written != expr_display_name(expr) {
+                        *alias = Some(written);
+                    }
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn expr(&mut self, expr: &mut Expr) -> Result<()> {
+        match expr {
+            Expr::QualifiedColumn { table, column } => match self.resolve(table) {
+                Resolution::Source(canonical) => {
+                    if table != canonical {
+                        *table = canonical.to_owned();
+                    }
+                }
+                Resolution::Row => {}
+                Resolution::Ambiguous if self.unresolved == Unresolved::Reject => {
+                    return Err(SqlError::AmbiguousColumn(format!("{table}.{column}")));
+                }
+                Resolution::Unknown if self.unresolved == Unresolved::Reject => {
+                    return Err(SqlError::ColumnNotFound(format!("{table}.{column}")));
+                }
+                Resolution::Ambiguous | Resolution::Unknown => {}
+            },
             Expr::Exists { subquery, .. } | Expr::ScalarSubquery(subquery) => {
                 self.select(subquery)?
             }
@@ -301,14 +368,14 @@ impl Validator {
                 for arg in args {
                     self.expr(arg)?;
                 }
-                for expr in &spec.partition_by {
+                for expr in &mut spec.partition_by {
                     self.expr(expr)?;
                 }
-                for item in &spec.order_by {
-                    self.expr(&item.expr)?;
+                for item in &mut spec.order_by {
+                    self.expr(&mut item.expr)?;
                 }
-                if let Some(frame) = &spec.frame {
-                    for bound in [&frame.start, &frame.end] {
+                if let Some(frame) = &mut spec.frame {
+                    for bound in [&mut frame.start, &mut frame.end] {
                         if let WindowFrameBound::Preceding(expr)
                         | WindowFrameBound::Following(expr) = bound
                         {

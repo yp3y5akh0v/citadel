@@ -582,16 +582,24 @@ pub(super) fn resolves_in(name: &str, schema: &TableSchema) -> bool {
     schema.columns.iter().any(|c| c.name == lower)
 }
 
-pub(super) fn collect_column_names(expr: &Expr, out: &mut Vec<String>) {
+/// A column an expression reads, lowercased. A qualifier may itself contain a
+/// dot, as `information_schema.tables` does.
+#[derive(Debug, PartialEq)]
+pub(super) struct ColumnName {
+    pub(super) table: Option<String>,
+    pub(super) column: String,
+}
+
+pub(super) fn collect_column_names(expr: &Expr, out: &mut Vec<ColumnName>) {
     match expr {
-        Expr::Column(name) => out.push(name.to_ascii_lowercase()),
-        Expr::QualifiedColumn { table, column } => {
-            out.push(format!(
-                "{}.{}",
-                table.to_ascii_lowercase(),
-                column.to_ascii_lowercase()
-            ));
-        }
+        Expr::Column(name) => out.push(ColumnName {
+            table: None,
+            column: name.to_ascii_lowercase(),
+        }),
+        Expr::QualifiedColumn { table, column } => out.push(ColumnName {
+            table: Some(table.to_ascii_lowercase()),
+            column: column.to_ascii_lowercase(),
+        }),
         Expr::BinaryOp { left, right, .. } => {
             collect_column_names(left, out);
             collect_column_names(right, out);
@@ -880,11 +888,9 @@ fn projects_own_columns(query: &SelectStmt, inner_schema: &TableSchema) -> bool 
             collect_column_names(expr, &mut names);
         }
     }
-    names.iter().all(|name| match name.split_once('.') {
-        Some((table, column)) => {
-            table.eq_ignore_ascii_case(own) && resolves_in(column, inner_schema)
-        }
-        None => resolves_in(name, inner_schema),
+    names.iter().all(|name| match &name.table {
+        Some(table) => table.eq_ignore_ascii_case(own) && resolves_in(&name.column, inner_schema),
+        None => resolves_in(&name.column, inner_schema),
     })
 }
 
@@ -950,17 +956,15 @@ pub(super) fn is_correlated_subquery(
     }
 
     for name in &col_names {
-        if let Some(dot) = name.find('.') {
-            let table_part = &name[..dot];
-            let col_part = &name[dot + 1..];
-            if table_part == inner_alias.as_deref().unwrap_or(&inner_name) {
+        if let Some(table) = &name.table {
+            if *table == inner_alias.as_deref().unwrap_or(&inner_name) {
                 continue;
             }
-            if ctx.matches_outer(table_part) && resolves_in(col_part, ctx.outer_schema) {
+            if ctx.matches_outer(table) && resolves_in(&name.column, ctx.outer_schema) {
                 return true;
             }
         } else if let Some(is) = inner_schema {
-            if !resolves_in(name, is) && resolves_in(name, ctx.outer_schema) {
+            if !resolves_in(&name.column, is) && resolves_in(&name.column, ctx.outer_schema) {
                 return true;
             }
         }
@@ -1136,13 +1140,14 @@ pub(super) fn strip_correlation_predicates(
         }
         let mut refs = Vec::new();
         collect_column_names(c, &mut refs);
-        let refs_outer = refs.iter().any(|name| {
-            if let Some(dot) = name.find('.') {
-                let table_part = &name[..dot];
-                ctx.matches_outer(table_part)
-                    && !table_part.eq_ignore_ascii_case(inner_alias.unwrap_or(&inner_schema.name))
-            } else {
-                !resolves_in(name, inner_schema) && resolves_in(name, ctx.outer_schema)
+        let refs_outer = refs.iter().any(|name| match &name.table {
+            Some(table) => {
+                ctx.matches_outer(table)
+                    && !table.eq_ignore_ascii_case(inner_alias.unwrap_or(&inner_schema.name))
+            }
+            None => {
+                !resolves_in(&name.column, inner_schema)
+                    && resolves_in(&name.column, ctx.outer_schema)
             }
         });
         if refs_outer {
