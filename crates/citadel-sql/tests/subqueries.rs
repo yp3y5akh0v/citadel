@@ -734,3 +734,41 @@ fn persistence_after_subquery_operations() {
         .collect();
     assert_eq!(ids, vec![2, 4]);
 }
+
+#[test]
+fn join_clauses_run_their_subqueries() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    setup_two_tables(&conn);
+    let cases: [(&str, &[i64]); 3] = [
+        (
+            "SELECT t1.id FROM t1 JOIN t2 \
+             ON t1.id = t2.id AND t2.id IN (SELECT id FROM t1 WHERE val > 25)",
+            &[4],
+        ),
+        (
+            "SELECT t1.id FROM t1 JOIN t2 ON t1.id = t2.id \
+             ORDER BY (SELECT COUNT(*) FROM t2) - t1.id",
+            &[4, 2],
+        ),
+        (
+            "SELECT COUNT(*) FROM t1 JOIN t2 ON t1.id = t2.id \
+             HAVING COUNT(*) > (SELECT COUNT(*) FROM t2 WHERE id > 5)",
+            &[2],
+        ),
+    ];
+    let ints = |rows: &[Vec<Value>]| -> Vec<i64> {
+        rows.iter()
+            .map(|row| match &row[0] {
+                Value::Integer(value) => *value,
+                other => panic!("expected an integer, got {other:?}"),
+            })
+            .collect()
+    };
+    for (sql, expected) in cases {
+        assert_eq!(ints(&conn.query(sql).unwrap().rows), expected, "{sql}");
+        let prepared = conn.prepare(sql).unwrap().query_collect(&[]).unwrap();
+        assert_eq!(ints(&prepared.rows), expected, "prepared {sql}");
+    }
+}
