@@ -587,15 +587,10 @@ pub(super) fn exec_select_from_cte(
         stmt
     };
 
-    let has_aggregates = s.columns.iter().any(|c| match c {
-        SelectColumn::Expr { expr, .. } => is_aggregate_expr(expr),
-        _ => false,
-    });
-
     let ctx = super::SelectCtx::new(&cte_schema.columns, s, cancel);
 
     // Window functions run over the groups; `process_select` orders that.
-    if (has_aggregates || !s.group_by.is_empty()) && !super::has_any_window_function(s) {
+    if is_grouped(s) && !super::has_any_window_function(s) {
         if let Some(ref where_expr) = s.where_clause {
             let col_map = ColumnMap::new(&cte_schema.columns);
             let mut filtered = Vec::new();

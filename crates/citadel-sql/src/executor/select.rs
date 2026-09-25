@@ -4347,12 +4347,7 @@ pub(super) fn process_select(
         return eval_window_select(rows, ctx);
     }
 
-    let has_aggregates = stmt.columns.iter().any(|c| match c {
-        SelectColumn::Expr { expr, .. } => is_aggregate_expr(expr),
-        _ => false,
-    });
-
-    if has_aggregates || !stmt.group_by.is_empty() {
+    if is_grouped(stmt) {
         return exec_aggregate(&rows, ctx);
     }
 
