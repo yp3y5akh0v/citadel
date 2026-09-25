@@ -5001,18 +5001,9 @@ impl CompiledSelect {
             QueryBody::Select(s) => s,
             _ => return None,
         };
-        if has_any_window_function(sel)
-            || sel.columns.iter().any(|c| match c {
-                SelectColumn::Expr { expr, .. } => crate::parser::has_subquery(expr),
-                SelectColumn::AllColumns | SelectColumn::AllFromOld | SelectColumn::AllFromNew => {
-                    false
-                }
-            })
-            || sel
-                .where_clause
-                .as_ref()
-                .is_some_and(crate::parser::has_subquery)
-        {
+        // The compiled lanes evaluate clauses directly, so a subquery in any
+        // clause, a join condition included, leaves them to the interpreter.
+        if has_any_window_function(sel) || stmt_has_subquery(sel) {
             return cache_carrier(result_cache);
         }
 
