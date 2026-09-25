@@ -160,6 +160,30 @@ fn grouped_expressions_evaluate_like_row_expressions() {
 }
 
 #[test]
+fn distinct_json_aggregates_keep_one_null() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = database(dir.path());
+    let conn = Connection::open(&database).unwrap();
+    conn.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, n INTEGER, s TEXT COLLATE NOCASE)")
+        .unwrap();
+    conn.execute("INSERT INTO a VALUES (1, 1, 'x'), (2, NULL, 'X'), (3, 1, NULL), (4, NULL, 'y')")
+        .unwrap();
+    assert_eq!(
+        rows(
+            &conn,
+            "SELECT JSON_AGG(DISTINCT n), JSON_AGG(DISTINCT s), COUNT(DISTINCT n), \
+             COUNT(DISTINCT s) FROM a",
+        ),
+        vec![vec![
+            Value::Json("[1,null]".into()),
+            Value::Json("[\"x\",null,\"y\"]".into()),
+            Value::Integer(1),
+            Value::Integer(2),
+        ]]
+    );
+}
+
+#[test]
 fn window_min_max_use_the_argument_collation() {
     let dir = tempfile::tempdir().unwrap();
     let database = database(dir.path());

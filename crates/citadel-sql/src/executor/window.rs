@@ -267,7 +267,7 @@ impl ResolvedFrame {
                                         ..
                                     } => true,
                                     Expr::Function { name, args, .. } => {
-                                        super::aggregate::is_aggregate_function(name, args.len())
+                                        crate::parser::is_aggregate_function(name, args.len())
                                     }
                                     _ => false,
                                 };

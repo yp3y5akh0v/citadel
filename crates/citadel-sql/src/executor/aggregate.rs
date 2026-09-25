@@ -500,13 +500,14 @@ fn aggregate_value(
     }
     if distinct {
         // `COUNT(DISTINCT s)` counts the values `s = s` calls equal, so the argument's
-        // collation folds the key here as it does for GROUP BY.
+        // collation folds the key here as it does for GROUP BY. NULL stays once:
+        // the other aggregates skip it, and JSON_AGG keeps it as a value.
         let coll = expr_collation(arg, col_map);
         let mut seen: rustc_hash::FxHashSet<Value> = rustc_hash::FxHashSet::default();
         let mut distinct_values = Vec::with_capacity(values.len());
         for (value_idx, value) in values.into_iter().enumerate() {
             check_cancel_at(cancel, value_idx)?;
-            if !value.is_null() && seen.insert(coll.fold(value.clone())) {
+            if seen.insert(coll.fold(value.clone())) {
                 distinct_values.push(value);
             }
         }
@@ -721,15 +722,6 @@ fn aggregate_value(
         }
         _ => Err(SqlError::Unsupported(format!("aggregate function: {func}"))),
     }
-}
-
-pub(super) fn is_aggregate_function(name: &str, arg_count: usize) -> bool {
-    let u = name.to_ascii_uppercase();
-    matches!(
-        u.as_str(),
-        "COUNT" | "SUM" | "AVG" | "JSON_AGG" | "JSONB_AGG"
-    ) || (matches!(u.as_str(), "MIN" | "MAX") && arg_count == 1)
-        || (matches!(u.as_str(), "JSON_OBJECT_AGG" | "JSONB_OBJECT_AGG") && arg_count == 2)
 }
 
 /// Whether `expr` calls an aggregate over the query's own rows. A subquery
