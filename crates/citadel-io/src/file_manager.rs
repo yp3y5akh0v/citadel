@@ -634,6 +634,8 @@ pub fn recover_with_v1_requirement(
     let inactive_valid = format_ok(&slot_inactive)
         && slot_inactive.verify_checksum()
         && slot_inactive.verify_mac(mac_key);
+    let newer_inactive =
+        active_valid && inactive_valid && slot_inactive.txn_id > slot_active.txn_id;
 
     let (chosen_slot_idx, chosen_slot) = match (active_valid, inactive_valid) {
         (true, _) => (active, slot_active),
@@ -655,6 +657,12 @@ pub fn recover_with_v1_requirement(
     }
 
     if god_byte & GOD_BIT_RECOVERY != 0 {
+        // A newer authenticated slot is the interrupted commit's candidate, and
+        // its pages may never have reached the disk. Replace it before clearing
+        // the marker so no integrity walk or later fallback can reach it.
+        if newer_inactive {
+            write_commit_slot(io, inactive, &chosen_slot)?;
+        }
         let new_god_byte = (chosen_slot_idx as u8) & GOD_BIT_ACTIVE_SLOT; // clear bit 1
         write_god_byte(io, new_god_byte)?;
         io.fsync()?;
