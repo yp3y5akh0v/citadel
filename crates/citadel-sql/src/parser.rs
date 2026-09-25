@@ -554,6 +554,9 @@ pub enum Expr {
     InSet {
         expr: Box<Expr>,
         values: rustc_hash::FxHashSet<Value>,
+        /// The kinds of value in `values` that `=` converts between, which a
+        /// hash of the raw values cannot match.
+        families: crate::eval::ConversionFamilies,
         has_null: bool,
         negated: bool,
         /// The collation of the column the values were selected from. `x IN (SELECT y)`

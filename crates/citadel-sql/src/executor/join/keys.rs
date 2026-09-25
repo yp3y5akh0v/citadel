@@ -6,50 +6,14 @@ use rustc_hash::{FxHashMap, FxHasher};
 
 use super::{hash_join_value, join_key_hash, EquiJoin, JoinCancel};
 use crate::error::Result;
+use crate::eval::ConversionFamilies;
 use crate::types::{Collation, DataType, Value};
 
 type Buckets = FxHashMap<u64, Vec<usize>>;
 
-#[derive(Clone, Copy, Default)]
-struct Families(u8);
-
-impl Families {
-    const DATE: u8 = 1;
-    const TIME: u8 = 2;
-    const TIMESTAMP: u8 = 4;
-    const INTERVAL: u8 = 8;
-    const TEXT: u8 = 16;
-    const INTEGER: u8 = 32;
-    const TEMPORAL: u8 = Self::DATE | Self::TIME | Self::TIMESTAMP | Self::INTERVAL;
-    const CONVERTIBLE: u8 = Self::TEXT | Self::INTEGER;
-
-    fn add(&mut self, value: &Value) {
-        self.0 |= match value {
-            Value::Date(_) => Self::DATE,
-            Value::Time(_) => Self::TIME,
-            Value::Timestamp(_) => Self::TIMESTAMP,
-            Value::Interval { .. } => Self::INTERVAL,
-            Value::Text(_) => Self::TEXT,
-            Value::Integer(_) => Self::INTEGER,
-            _ => 0,
-        };
-    }
-
-    fn needs_coercion(self, outer: &Value) -> bool {
-        let other = match outer {
-            Value::Date(_) => Self::TIMESTAMP | Self::CONVERTIBLE,
-            Value::Timestamp(_) => Self::DATE | Self::CONVERTIBLE,
-            Value::Time(_) | Value::Interval { .. } => Self::CONVERTIBLE,
-            Value::Text(_) | Value::Integer(_) => Self::TEMPORAL,
-            _ => 0,
-        };
-        self.0 & other != 0
-    }
-}
-
 pub(in crate::executor) struct ProbeTable {
     tuples: Buckets,
-    families: Vec<Families>,
+    families: Vec<ConversionFamilies>,
     coerced_tuples: OnceLock<Option<CoercedTupleIndex>>,
     comparison: OnceLock<ComparisonIndex>,
 }
@@ -62,7 +26,7 @@ impl ProbeTable {
     ) -> Result<Self> {
         let columns = equi.inner_cols();
         let mut tuples = Buckets::with_capacity_and_hasher(inner_rows.len(), Default::default());
-        let mut families = vec![Families::default(); columns.len()];
+        let mut families = vec![ConversionFamilies::default(); columns.len()];
         for (index, inner) in inner_rows.iter().enumerate() {
             cancel.work()?;
             if columns.iter().any(|&column| inner[column].is_null()) {

@@ -20,6 +20,7 @@ use super::correlated::*;
 use super::cte::*;
 use super::dml::*;
 use super::helpers::*;
+use super::join::KeyedRows;
 use super::scan::*;
 pub(super) use super::topk::TopKScanPlan;
 use super::view::*;
@@ -3886,15 +3887,6 @@ impl LateralKey {
     }
 }
 
-/// `=` converts between a date, time or interval and other types, so their
-/// values have no hash key that finds every equal value.
-fn converts_for_equality(value: &Value) -> bool {
-    matches!(
-        value,
-        Value::Date(_) | Value::Time(_) | Value::Timestamp(_) | Value::Interval { .. }
-    )
-}
-
 /// A LIMIT or OFFSET that grouped rows can apply: absent, or a non-negative
 /// integer literal.
 fn literal_row_count(clause: &Option<Expr>) -> Option<Option<usize>> {
@@ -4070,12 +4062,7 @@ fn try_lateral_decorrelated(
             None => return Ok(None),
         }
     }
-    if keys.is_empty()
-        || outer_rows.iter().any(|row| {
-            keys.iter()
-                .any(|key| converts_for_equality(&row[key.outer]))
-        })
-    {
+    if keys.is_empty() {
         return Ok(None);
     }
 
@@ -4094,66 +4081,41 @@ fn try_lateral_decorrelated(
     )?;
     check_cancel(cancel)?;
 
-    let mut groups: FxHashMap<Vec<Value>, Vec<Vec<Value>>> = FxHashMap::default();
-    for (row_idx, row) in inner_qr.rows.into_iter().enumerate() {
-        check_cancel_at(cancel, row_idx)?;
-        if keys
-            .iter()
-            .any(|key| converts_for_equality(&row[key.inner]))
-        {
-            return Ok(None);
-        }
-        // NULL equals nothing.
-        if keys.iter().any(|key| row[key.inner].is_null()) {
-            continue;
-        }
-        let key = keys
-            .iter()
-            .map(|key| key.collation.fold(row[key.inner].clone()))
-            .collect();
-        groups.entry(key).or_default().push(row);
-    }
-    for (group_idx, rows) in groups.values_mut().enumerate() {
-        check_cancel_at(cancel, group_idx)?;
-        rows.drain(..offset.unwrap_or(0).min(rows.len()));
-        if let Some(limit) = limit {
-            rows.truncate(limit);
-        }
-    }
-
+    // Rows keep the order the query sorted them in, so each outer row's matches
+    // arrive in that order for OFFSET and LIMIT to cut.
+    let inner_keys: Vec<(usize, Collation)> =
+        keys.iter().map(|key| (key.inner, key.collation)).collect();
+    let by_key = KeyedRows::build(inner_qr.rows, &inner_keys, cancel)?;
     let mut joined: Vec<Vec<Value>> = Vec::new();
     let mut expansion_work = 0usize;
     for (outer_row_idx, outer_row) in outer_rows.iter().enumerate() {
         check_cancel_at(cancel, outer_row_idx)?;
-        let group = if keys.iter().any(|key| outer_row[key.outer].is_null()) {
-            None
-        } else {
-            let key: Vec<Value> = keys
-                .iter()
-                .map(|key| key.collation.fold(outer_row[key.outer].clone()))
-                .collect();
-            groups.get(&key)
-        };
-        match group {
-            Some(rows) if !rows.is_empty() => {
-                for inner_row in rows {
-                    check_cancel_at(cancel, expansion_work)?;
-                    expansion_work += 1;
-                    let mut combined = outer_row.clone();
-                    combined.extend(
-                        projection
-                            .iter()
-                            .map(|&(_, index)| inner_row[index].clone()),
-                    );
-                    joined.push(combined);
-                }
-            }
-            _ if matches!(join_type, JoinType::Left) => {
-                let mut combined = outer_row.clone();
-                combined.resize(combined.len() + projection.len(), Value::Null);
-                joined.push(combined);
-            }
-            _ => {}
+        let key: Vec<Value> = keys
+            .iter()
+            .map(|key| outer_row[key.outer].clone())
+            .collect();
+        let matched = by_key.matching(&key, cancel)?;
+        let kept = matched
+            .iter()
+            .skip(offset.unwrap_or(0))
+            .take(limit.unwrap_or(usize::MAX));
+        let mut any = false;
+        for inner_row in kept {
+            check_cancel_at(cancel, expansion_work)?;
+            expansion_work += 1;
+            any = true;
+            let mut combined = outer_row.clone();
+            combined.extend(
+                projection
+                    .iter()
+                    .map(|&(_, index)| inner_row[index].clone()),
+            );
+            joined.push(combined);
+        }
+        if !any && matches!(join_type, JoinType::Left) {
+            let mut combined = outer_row.clone();
+            combined.resize(combined.len() + projection.len(), Value::Null);
+            joined.push(combined);
         }
     }
     check_cancel(cancel)?;

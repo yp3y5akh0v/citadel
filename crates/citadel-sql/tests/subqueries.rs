@@ -899,3 +899,111 @@ fn quantified_subqueries_compare_against_every_selected_row() {
         }
     }
 }
+
+#[test]
+fn subquery_keys_and_members_compare_as_equals_does() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    // `=` converts a DATE to the TIMESTAMP at its midnight and TEXT to a date,
+    // and compares intervals by length: none of these pairs is the same value.
+    for sql in [
+        "CREATE TABLE days (id INTEGER PRIMARY KEY, d DATE)",
+        "INSERT INTO days VALUES (1, '2024-01-01'), (2, '2024-01-02')",
+        "CREATE TABLE moments (id INTEGER PRIMARY KEY, t TIMESTAMP, tag INTEGER)",
+        "INSERT INTO moments VALUES (5, '2024-01-01 00:00:00', 1), (6, '2024-01-02 12:00:00', 2)",
+        "CREATE TABLE texts (id INTEGER PRIMARY KEY, s TEXT)",
+        "INSERT INTO texts VALUES (9, '2024-01-01')",
+        "CREATE TABLE ia (id INTEGER PRIMARY KEY, v INTERVAL)",
+        "INSERT INTO ia VALUES (1, INTERVAL '1 month')",
+        "CREATE TABLE ib (id INTEGER PRIMARY KEY, v INTERVAL)",
+        "INSERT INTO ib VALUES (7, INTERVAL '30 days'), (8, INTERVAL '1 month')",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+    let int = |value: i64| Value::Integer(value);
+    let cases: [(&str, Vec<Vec<Value>>); 13] = [
+        (
+            "SELECT id FROM days WHERE EXISTS (SELECT 1 FROM moments WHERE moments.t = days.d)",
+            vec![vec![int(1)]],
+        ),
+        (
+            "SELECT id FROM days WHERE NOT EXISTS (SELECT 1 FROM moments WHERE moments.t = days.d)",
+            vec![vec![int(2)]],
+        ),
+        (
+            "SELECT id FROM days WHERE EXISTS \
+             (SELECT 1 FROM moments WHERE moments.t = days.d AND moments.id > days.id)",
+            vec![vec![int(1)]],
+        ),
+        (
+            "SELECT id FROM days WHERE EXISTS (SELECT 1 FROM texts WHERE texts.s = days.d)",
+            vec![vec![int(1)]],
+        ),
+        (
+            "SELECT days.id, (SELECT moments.id FROM moments WHERE moments.t = days.d) \
+             FROM days ORDER BY 1",
+            vec![vec![int(1), int(5)], vec![int(2), Value::Null]],
+        ),
+        (
+            "SELECT ia.id, (SELECT COUNT(*) FROM ib WHERE ib.v = ia.v) FROM ia",
+            vec![vec![int(1), int(2)]],
+        ),
+        (
+            "SELECT id FROM ia WHERE 2 = (SELECT COUNT(*) FROM ib WHERE ib.v = ia.v)",
+            vec![vec![int(1)]],
+        ),
+        (
+            "SELECT id FROM days WHERE id IN (SELECT tag FROM moments WHERE moments.t = days.d)",
+            vec![vec![int(1)]],
+        ),
+        (
+            "SELECT id FROM days WHERE id NOT IN \
+             (SELECT tag FROM moments WHERE moments.t = days.d) ORDER BY 1",
+            vec![vec![int(2)]],
+        ),
+        (
+            "SELECT id FROM days WHERE d IN (SELECT t FROM moments)",
+            vec![vec![int(1)]],
+        ),
+        (
+            "SELECT id FROM days WHERE d NOT IN (SELECT t FROM moments)",
+            vec![vec![int(2)]],
+        ),
+        (
+            "SELECT id FROM days WHERE d IN (SELECT s FROM texts)",
+            vec![vec![int(1)]],
+        ),
+        (
+            "SELECT id FROM ia WHERE v IN (SELECT v FROM ib WHERE id = 7)",
+            vec![vec![int(1)]],
+        ),
+    ];
+    for transaction in [false, true] {
+        if transaction {
+            assert_ok(conn.execute("BEGIN").unwrap());
+        }
+        for (sql, expected) in &cases {
+            assert_eq!(
+                &conn.query(sql).unwrap().rows,
+                expected,
+                "{sql} (transaction: {transaction})"
+            );
+        }
+        if transaction {
+            assert_rows_affected(
+                conn.execute(
+                    "DELETE FROM days WHERE EXISTS (SELECT 1 FROM moments WHERE moments.t = days.d)",
+                )
+                .unwrap(),
+                1,
+            );
+            assert_rows_affected(
+                conn.execute("UPDATE days SET d = d WHERE d NOT IN (SELECT t FROM moments)")
+                    .unwrap(),
+                1,
+            );
+            assert_ok(conn.execute("ROLLBACK").unwrap());
+        }
+    }
+}
