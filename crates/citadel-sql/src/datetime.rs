@@ -311,12 +311,9 @@ pub fn parse_interval(s: &str) -> Result<(i32, i32, i64)> {
 
 fn parse_iso8601_duration(s: &str, global_negate: bool) -> Result<(i32, i32, i64)> {
     // P[nY][nM][nW][nD][T[nH][nM][nS]]
-    let mut months: i64 = 0;
-    let mut days: i64 = 0;
-    let mut micros: i64 = 0;
+    let mut fields = IntervalFields::default();
     let mut in_time = false;
     let mut num_buf = String::new();
-    let sign = if global_negate { -1i64 } else { 1 };
 
     for ch in s.chars() {
         if ch == 'T' {
@@ -332,35 +329,33 @@ fn parse_iso8601_duration(s: &str, global_negate: bool) -> Result<(i32, i32, i64
                 "expected number before '{ch}'"
             )));
         }
-        let v: f64 = num_buf
-            .parse()
-            .map_err(|_| SqlError::InvalidIntervalLiteral(format!("invalid number: {num_buf}")))?;
+        let (whole, frac) = interval_number(&num_buf)?;
         num_buf.clear();
-        let v_units = sign * v as i64;
-        let v_frac_micros = ((v.fract() * 1_000_000.0) as i64) * sign;
-        match ch {
-            'Y' if !in_time => months = months.saturating_add(v_units * 12),
-            'M' if !in_time => months = months.saturating_add(v_units),
-            'W' if !in_time => days = days.saturating_add(v_units * 7),
-            'D' if !in_time => days = days.saturating_add(v_units),
-            'H' if in_time => micros = micros.saturating_add(v_units * MICROS_PER_HOUR),
-            'M' if in_time => micros = micros.saturating_add(v_units * MICROS_PER_MIN),
-            'S' if in_time => {
-                micros = micros.saturating_add(v_units * MICROS_PER_SEC + v_frac_micros)
-            }
+        let added = match ch {
+            'Y' if !in_time => fields.years(whole, frac),
+            'M' if !in_time => fields.months(whole, frac),
+            'W' if !in_time => fields.days(whole, frac, 7),
+            'D' if !in_time => fields.days(whole, frac, 1),
+            'H' if in_time => fields.micros(whole, frac, MICROS_PER_HOUR),
+            'M' if in_time => fields.micros(whole, frac, MICROS_PER_MIN),
+            'S' if in_time => fields.micros(whole, frac, MICROS_PER_SEC),
             _ => {
                 return Err(SqlError::InvalidIntervalLiteral(format!(
                     "unknown unit '{ch}' (in_time={in_time})"
                 )))
             }
-        }
+        };
+        added.ok_or_else(|| interval_out_of_range(s))?;
     }
     if !num_buf.is_empty() {
         return Err(SqlError::InvalidIntervalLiteral(format!(
             "trailing number without unit: {num_buf}"
         )));
     }
-    Ok((clamp_i32(months)?, clamp_i32(days)?, micros))
+    if global_negate {
+        fields.negate().ok_or_else(|| interval_out_of_range(s))?;
+    }
+    fields.finish().ok_or_else(|| interval_out_of_range(s))
 }
 
 fn parse_pg_interval(s: &str) -> Result<(i32, i32, i64)> {
@@ -373,106 +368,212 @@ fn parse_pg_interval(s: &str) -> Result<(i32, i32, i64)> {
         s.truncate(s.len() - 4);
         s = s.trim().to_string();
     }
-    let sign: i64 = if ago { -1 } else { 1 };
 
-    let mut months: i64 = 0;
-    let mut days: i64 = 0;
-    let mut micros: i64 = 0;
-
+    let mut fields = IntervalFields::default();
     let tokens: Vec<&str> = s.split_whitespace().collect();
     let mut i = 0;
     while i < tokens.len() {
         let tok = tokens[i];
         // "HH:MM:SS[.fff]" form.
         if tok.contains(':') {
-            let (h, m, sc, us) = parse_hms_token(tok)?;
-            let tok_sign = if tok.starts_with('-') { -1 } else { 1 };
-            let tok_micros =
-                (h * MICROS_PER_HOUR + m * MICROS_PER_MIN + sc * MICROS_PER_SEC + us as i64)
-                    * tok_sign
-                    * sign;
-            micros = micros.saturating_add(tok_micros);
+            let clock = interval_clock(tok)?;
+            fields
+                .micros(clock, 0.0, 1)
+                .ok_or_else(|| interval_out_of_range(&s))?;
             i += 1;
             continue;
         }
 
         // "N unit" form.
-        let num: f64 = tok.parse().map_err(|_| {
-            SqlError::InvalidIntervalLiteral(format!("expected number, got '{tok}'"))
-        })?;
-        if i + 1 >= tokens.len() {
+        let (whole, frac) = interval_number(tok)?;
+        let Some(unit) = tokens.get(i + 1) else {
             return Err(SqlError::InvalidIntervalLiteral(format!(
                 "missing unit after '{tok}'"
             )));
-        }
-        let unit = tokens[i + 1].trim_end_matches(',');
-        let v_units = sign * num as i64;
-        let v_frac_micros = ((num.fract() * 1_000_000.0) as i64) * sign;
-        match unit {
-            "year" | "years" | "yr" | "yrs" | "y" => months = months.saturating_add(v_units * 12),
-            "month" | "months" | "mon" | "mons" => months = months.saturating_add(v_units),
-            "week" | "weeks" | "w" => days = days.saturating_add(v_units * 7),
-            "day" | "days" | "d" => days = days.saturating_add(v_units),
-            "hour" | "hours" | "hr" | "hrs" | "h" => {
-                micros = micros.saturating_add(v_units * MICROS_PER_HOUR)
-            }
+        };
+        let added = match unit.trim_end_matches(',') {
+            "year" | "years" | "yr" | "yrs" | "y" => fields.years(whole, frac),
+            "month" | "months" | "mon" | "mons" => fields.months(whole, frac),
+            "week" | "weeks" | "w" => fields.days(whole, frac, 7),
+            "day" | "days" | "d" => fields.days(whole, frac, 1),
+            "hour" | "hours" | "hr" | "hrs" | "h" => fields.micros(whole, frac, MICROS_PER_HOUR),
             "minute" | "minutes" | "min" | "mins" | "m" => {
-                micros = micros.saturating_add(v_units * MICROS_PER_MIN)
+                fields.micros(whole, frac, MICROS_PER_MIN)
             }
             "second" | "seconds" | "sec" | "secs" | "s" => {
-                micros = micros.saturating_add(v_units * MICROS_PER_SEC + v_frac_micros)
+                fields.micros(whole, frac, MICROS_PER_SEC)
             }
-            "millisecond" | "milliseconds" | "ms" => micros = micros.saturating_add(v_units * 1000),
-            "microsecond" | "microseconds" | "us" => micros = micros.saturating_add(v_units),
+            "millisecond" | "milliseconds" | "ms" => fields.micros(whole, frac, 1000),
+            "microsecond" | "microseconds" | "us" => fields.micros(whole, frac, 1),
             other => {
                 return Err(SqlError::InvalidIntervalLiteral(format!(
                     "unknown unit: {other}"
                 )))
             }
-        }
+        };
+        added.ok_or_else(|| interval_out_of_range(&s))?;
         i += 2;
     }
-    Ok((clamp_i32(months)?, clamp_i32(days)?, micros))
+    if ago {
+        fields.negate().ok_or_else(|| interval_out_of_range(&s))?;
+    }
+    fields.finish().ok_or_else(|| interval_out_of_range(&s))
 }
 
-fn parse_hms_token(tok: &str) -> Result<(i64, i64, i64, u32)> {
-    let tok = tok.trim_start_matches('-').trim_start_matches('+');
-    let mut parts = tok.split(':');
-    let h: i64 = parts
-        .next()
-        .ok_or_else(|| SqlError::InvalidIntervalLiteral(format!("bad hms: {tok}")))?
-        .parse()
-        .map_err(|_| SqlError::InvalidIntervalLiteral(format!("bad hour: {tok}")))?;
-    let m: i64 = parts
-        .next()
-        .ok_or_else(|| SqlError::InvalidIntervalLiteral(format!("bad hms: {tok}")))?
-        .parse()
-        .map_err(|_| SqlError::InvalidIntervalLiteral(format!("bad minute: {tok}")))?;
-    let (sc, us) = if let Some(sec_part) = parts.next() {
-        if let Some((s_whole, s_frac)) = sec_part.split_once('.') {
-            let s: i64 = s_whole
-                .parse()
-                .map_err(|_| SqlError::InvalidIntervalLiteral(format!("bad second: {tok}")))?;
-            // Pad / truncate fractional to 6 digits.
-            let mut frac = s_frac.to_string();
-            while frac.len() < 6 {
-                frac.push('0');
-            }
-            frac.truncate(6);
-            let us: u32 = frac
-                .parse()
-                .map_err(|_| SqlError::InvalidIntervalLiteral(format!("bad subsec: {tok}")))?;
-            (s, us)
-        } else {
-            let s: i64 = sec_part
-                .parse()
-                .map_err(|_| SqlError::InvalidIntervalLiteral(format!("bad second: {tok}")))?;
-            (s, 0u32)
+fn interval_out_of_range(input: &str) -> SqlError {
+    SqlError::InvalidIntervalLiteral(format!("field value out of range: {input}"))
+}
+
+/// An interval assembled field by field as PostgreSQL's `DecodeInterval` does:
+/// years, months and days in whole numbers, the rest in microseconds, each step
+/// checked for overflow. A field's fraction spills into the smaller fields.
+#[derive(Default)]
+struct IntervalFields {
+    years: i32,
+    months: i32,
+    days: i32,
+    micros: i64,
+}
+
+impl IntervalFields {
+    /// Years; the fraction rounds to whole months.
+    fn years(&mut self, whole: i64, frac: f64) -> Option<()> {
+        self.years = self.years.checked_add(i32::try_from(whole).ok()?)?;
+        let extra = (frac * 12.0).round_ties_even() as i32;
+        self.months = self.months.checked_add(extra)?;
+        Some(())
+    }
+
+    /// Months; the fraction counts in 30-day months.
+    fn months(&mut self, whole: i64, frac: f64) -> Option<()> {
+        self.months = self.months.checked_add(i32::try_from(whole).ok()?)?;
+        self.fract_days(frac, 30)
+    }
+
+    /// Units of `scale` days (7 for weeks); the fraction counts in 24-hour days.
+    fn days(&mut self, whole: i64, frac: f64, scale: i32) -> Option<()> {
+        let days = i32::try_from(whole).ok()?.checked_mul(scale)?;
+        self.days = self.days.checked_add(days)?;
+        self.fract_days(frac, scale)
+    }
+
+    /// Units of `scale` microseconds; the fraction rounds to a microsecond.
+    fn micros(&mut self, whole: i64, frac: f64, scale: i64) -> Option<()> {
+        self.micros = self.micros.checked_add(whole.checked_mul(scale)?)?;
+        self.fract_micros(frac, scale)
+    }
+
+    fn fract_days(&mut self, frac: f64, scale: i32) -> Option<()> {
+        let days = frac * f64::from(scale);
+        // A fraction is below one, so its whole days fit.
+        let whole = days as i32;
+        self.days = self.days.checked_add(whole)?;
+        self.fract_micros(days - f64::from(whole), MICROS_PER_DAY)
+    }
+
+    /// A half microsecond rounds toward zero, as in PostgreSQL.
+    fn fract_micros(&mut self, frac: f64, scale: i64) -> Option<()> {
+        let micros = frac * scale as f64;
+        let mut whole = micros as i64;
+        let rest = micros - whole as f64;
+        if rest > 0.5 {
+            whole += 1;
+        } else if rest < -0.5 {
+            whole -= 1;
         }
+        self.micros = self.micros.checked_add(whole)?;
+        Some(())
+    }
+
+    fn negate(&mut self) -> Option<()> {
+        self.years = self.years.checked_neg()?;
+        self.months = self.months.checked_neg()?;
+        self.days = self.days.checked_neg()?;
+        self.micros = self.micros.checked_neg()?;
+        Some(())
+    }
+
+    fn finish(self) -> Option<(i32, i32, i64)> {
+        let months = i64::from(self.years) * 12 + i64::from(self.months);
+        Some((i32::try_from(months).ok()?, self.days, self.micros))
+    }
+}
+
+/// A field's number split as PostgreSQL splits it: the whole part exactly and
+/// the fraction apart, both carrying the number's sign.
+fn interval_number(token: &str) -> Result<(i64, f64)> {
+    let invalid = || SqlError::InvalidIntervalLiteral(format!("invalid number: {token}"));
+    let unsigned = token.strip_prefix(['-', '+']).unwrap_or(token);
+    let (whole, fraction) = unsigned.split_once('.').unwrap_or((unsigned, ""));
+    let digits = |part: &str| part.bytes().all(|b| b.is_ascii_digit());
+    if whole.len() + fraction.len() == 0 || !digits(whole) || !digits(fraction) {
+        return Err(invalid());
+    }
+    let whole = if whole.is_empty() {
+        0
     } else {
-        (0, 0u32)
+        // Parsed with its sign, so the most negative value fits.
+        token[..token.len() - unsigned.len() + whole.len()]
+            .parse::<i64>()
+            .map_err(|_| interval_out_of_range(token))?
     };
-    Ok((h, m, sc, us))
+    let fraction = if fraction.is_empty() {
+        0.0
+    } else {
+        let fraction: f64 = format!("0.{fraction}").parse().map_err(|_| invalid())?;
+        if token.starts_with('-') {
+            -fraction
+        } else {
+            fraction
+        }
+    };
+    Ok((whole, fraction))
+}
+
+/// A clock field `[+-]h:m[:s[.f]]` in microseconds, its sign applying to the
+/// whole field. Minutes run to 59 and seconds to 60, as in PostgreSQL.
+fn interval_clock(token: &str) -> Result<i64> {
+    let invalid = || SqlError::InvalidIntervalLiteral(format!("invalid time field: {token}"));
+    let unsigned = token.strip_prefix(['-', '+']).unwrap_or(token);
+    let mut parts = unsigned.split(':');
+    let (Some(hours), Some(minutes), seconds, None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(invalid());
+    };
+    let (seconds, fraction) = seconds.map_or(("0", ""), |s| s.split_once('.').unwrap_or((s, "")));
+    let digits = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+    if !digits(hours)
+        || !digits(minutes)
+        || !digits(seconds)
+        || !fraction.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(invalid());
+    }
+    let out_of_range = || interval_out_of_range(token);
+    let hours: i64 = hours.parse().map_err(|_| out_of_range())?;
+    let minutes: i64 = minutes.parse().map_err(|_| out_of_range())?;
+    let seconds: i64 = seconds.parse().map_err(|_| out_of_range())?;
+    if minutes > 59 || seconds > 60 {
+        return Err(out_of_range());
+    }
+    let fraction = if fraction.is_empty() {
+        0
+    } else {
+        let fraction: f64 = format!("0.{fraction}").parse().map_err(|_| invalid())?;
+        (fraction * MICROS_PER_SEC as f64).round_ties_even() as i64
+    };
+    let micros = hours
+        .checked_mul(MICROS_PER_HOUR)
+        .and_then(|hours| {
+            hours.checked_add(minutes * MICROS_PER_MIN + seconds * MICROS_PER_SEC + fraction)
+        })
+        .ok_or_else(out_of_range)?;
+    Ok(if token.starts_with('-') {
+        -micros
+    } else {
+        micros
+    })
 }
 
 fn clamp_i32(n: i64) -> Result<i32> {
@@ -671,8 +772,10 @@ pub fn format_interval(months: i32, days: i32, micros: i64) -> String {
     }
     if micros != 0 {
         let sign = if micros < 0 { "-" } else { "" };
-        let abs_us = micros.unsigned_abs() as i64;
-        let (h, m, s, us) = micros_to_hmsn(abs_us);
+        let abs_us = micros.unsigned_abs();
+        // An interval's hours are not bounded by a day.
+        let h = abs_us / MICROS_PER_HOUR as u64;
+        let (_, m, s, us) = micros_to_hmsn((abs_us % MICROS_PER_HOUR as u64) as i64);
         if us == 0 {
             parts.push(format!("{sign}{h:02}:{m:02}:{s:02}"));
         } else {
