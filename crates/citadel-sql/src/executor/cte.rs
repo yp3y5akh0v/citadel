@@ -296,6 +296,17 @@ pub(super) fn materialize_cte(
 
 const MAX_RECURSIVE_ITERATIONS: usize = 10_000;
 
+/// The recursive arm of a CTE is a UNION branch: it has the anchor's columns.
+fn check_recursive_width(anchor: usize, recursive: usize) -> Result<()> {
+    if anchor != recursive {
+        return Err(SqlError::CompoundColumnCountMismatch {
+            left: anchor,
+            right: recursive,
+        });
+    }
+    Ok(())
+}
+
 pub(super) fn materialize_recursive_cte(
     cte: &CteDefinition,
     ctx: &CteContext,
@@ -371,6 +382,17 @@ pub(super) fn materialize_recursive_cte(
     };
 
     if let Some(sel) = fast_sel {
+        let width = sel
+            .columns
+            .iter()
+            .map(|column| match column {
+                SelectColumn::Expr { .. } => 1,
+                SelectColumn::AllColumns | SelectColumn::AllFromOld | SelectColumn::AllFromNew => {
+                    columns.len()
+                }
+            })
+            .sum();
+        check_recursive_width(columns.len(), width)?;
         let cte_cols: Vec<ColumnDef> = columns
             .iter()
             .enumerate()
@@ -485,6 +507,7 @@ pub(super) fn materialize_recursive_cte(
             }
 
             let iter_rows = exec_body(recursive_body, &iter_ctx)?;
+            check_recursive_width(columns.len(), iter_rows.result.columns.len())?;
             if iter_rows.result.rows.is_empty() {
                 break;
             }

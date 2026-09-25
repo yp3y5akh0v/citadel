@@ -166,7 +166,7 @@ pub(super) fn materialize_expr_selective(
                 });
             };
             let qr = &selected.result;
-            if !qr.columns.is_empty() && qr.columns.len() != 1 {
+            if qr.columns.len() != 1 {
                 return Err(SqlError::SubqueryMultipleColumns);
             }
             let mut values = rustc_hash::FxHashSet::default();
@@ -194,6 +194,9 @@ pub(super) fn materialize_expr_selective(
                 return Ok(expr.clone());
             };
             let qr = selected.result;
+            if qr.columns.len() != 1 {
+                return Err(SqlError::SubqueryMultipleColumns);
+            }
             if qr.rows.len() > 1 {
                 return Err(SqlError::SubqueryMultipleRows);
             }
@@ -224,7 +227,7 @@ pub(super) fn materialize_expr_selective(
                     None => right.clone(),
                     Some(selected) => {
                         let qr = &selected.result;
-                        if !qr.columns.is_empty() && qr.columns.len() != 1 {
+                        if qr.columns.len() != 1 {
                             return Err(SqlError::SubqueryMultipleColumns);
                         }
                         let values = qr.rows.iter().map(|row| row[0].clone()).collect();
@@ -922,10 +925,7 @@ pub(super) fn apply_set_operation(
     cancel: Option<&citadel::CancelToken>,
 ) -> Result<ExecutionResult> {
     super::check_cancelled(cancel)?;
-    if !left_qr.columns.is_empty()
-        && !right_qr.columns.is_empty()
-        && left_qr.columns.len() != right_qr.columns.len()
-    {
+    if left_qr.columns.len() != right_qr.columns.len() {
         return Err(SqlError::CompoundColumnCountMismatch {
             left: left_qr.columns.len(),
             right: right_qr.columns.len(),

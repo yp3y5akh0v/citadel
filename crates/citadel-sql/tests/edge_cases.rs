@@ -2111,3 +2111,50 @@ fn distinct_all_types() {
         .unwrap();
     assert_eq!(qr.rows.len(), 2);
 }
+
+#[test]
+fn a_select_list_without_columns_keeps_every_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, name TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'b')")
+        .unwrap();
+    let cases: [(&str, usize); 7] = [
+        ("SELECT FROM t", 3),
+        ("SELECT FROM t WHERE id > 1", 2),
+        ("SELECT FROM t ORDER BY id", 3),
+        ("SELECT FROM t LIMIT 2", 2),
+        ("SELECT FROM t LIMIT 2 OFFSET 1", 2),
+        ("SELECT FROM t GROUP BY name", 2),
+        ("SELECT DISTINCT FROM t", 1),
+    ];
+    for transaction in [false, true] {
+        if transaction {
+            conn.execute("BEGIN").unwrap();
+        }
+        for (sql, rows) in cases {
+            assert_eq!(
+                conn.query(sql).unwrap().rows,
+                vec![Vec::<Value>::new(); rows],
+                "{sql} (transaction: {transaction})"
+            );
+        }
+        assert_eq!(
+            conn.query("SELECT COUNT(*) FROM (SELECT FROM t) AS d")
+                .unwrap()
+                .rows,
+            vec![vec![Value::Integer(3)]]
+        );
+        assert_eq!(
+            conn.query("SELECT EXISTS (SELECT FROM t LIMIT 1 OFFSET 2)")
+                .unwrap()
+                .rows,
+            vec![vec![Value::Boolean(true)]]
+        );
+        if transaction {
+            conn.execute("COMMIT").unwrap();
+        }
+    }
+}
