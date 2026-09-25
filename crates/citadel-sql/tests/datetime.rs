@@ -190,6 +190,32 @@ fn interval_iso8601_duration() {
 }
 
 #[test]
+fn interval_fractions_spill_and_hours_stay_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    for (sql, expected) in [
+        ("SELECT INTERVAL '1.5 days'", "1 day 12:00:00"),
+        ("SELECT INTERVAL '1.5' DAY", "1 day 12:00:00"),
+        (
+            "SELECT CAST('1.75 months' AS INTERVAL)",
+            "1 mon 22 days 12:00:00",
+        ),
+        ("SELECT INTERVAL '1.5 years'", "1 year 6 mons"),
+        ("SELECT INTERVAL '3 hours' * 100", "300:00:00"),
+        ("SELECT CAST(INTERVAL '300 hours' AS TEXT)", "300:00:00"),
+    ] {
+        assert_eq!(scalar(&conn, sql).to_string(), expected, "{sql}");
+    }
+    match conn.query("SELECT INTERVAL '153722867281 minutes'") {
+        Err(SqlError::InvalidIntervalLiteral(message)) => {
+            assert!(message.starts_with("field value out of range"), "{message}")
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
 fn date_plus_integer() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());

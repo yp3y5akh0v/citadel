@@ -130,6 +130,84 @@ fn parse_interval_iso8601() {
 }
 
 #[test]
+fn parse_interval_spills_fractions_into_smaller_fields() {
+    let hours = |h: i64| h * MICROS_PER_HOUR;
+    let ninety_minutes = hours(1) + 30 * MICROS_PER_MIN;
+    for (literal, expected) in [
+        ("1.5 years", (18, 0, 0)),
+        ("1.75 months", (1, 22, hours(12))),
+        ("1.5 weeks", (0, 10, hours(12))),
+        ("1.5 days", (0, 1, hours(12))),
+        ("-1.5 days", (0, -1, -hours(12))),
+        ("1.5 days ago", (0, -1, -hours(12))),
+        ("1.5 hours", (0, 0, ninety_minutes)),
+        ("0.5 minutes", (0, 0, 30 * MICROS_PER_SEC)),
+        ("1.000001 seconds", (0, 0, MICROS_PER_SEC + 1)),
+        ("0.3 seconds", (0, 0, 300_000)),
+        (
+            "9007199254740993 microseconds",
+            (0, 0, 9_007_199_254_740_993),
+        ),
+        ("P1.5Y", (18, 0, 0)),
+        ("P1.5D", (0, 1, hours(12))),
+        ("PT1.5H", (0, 0, ninety_minutes)),
+    ] {
+        assert_eq!(parse_interval(literal).unwrap(), expected, "{literal}");
+    }
+}
+
+#[test]
+fn parse_interval_rejects_fields_out_of_range() {
+    for literal in [
+        "153722867281 minutes",
+        "2562047789 hours",
+        "9223372036854775807 microseconds 1 microsecond",
+        "99999999999999999999 seconds",
+        "3000000000 years",
+        "2147483648 days",
+        "99999999999:00:00",
+        "1:60:00",
+        "1:00:61",
+        "PT153722867281M",
+    ] {
+        match parse_interval(literal) {
+            Err(SqlError::InvalidIntervalLiteral(message)) => {
+                assert!(
+                    message.starts_with("field value out of range"),
+                    "{literal}: {message}"
+                )
+            }
+            other => panic!("{literal}: {other:?}"),
+        }
+    }
+    for literal in [
+        "1e3 seconds",
+        "inf hours",
+        "NaN days",
+        "1.2.3 days",
+        "- days",
+    ] {
+        assert!(
+            matches!(
+                parse_interval(literal),
+                Err(SqlError::InvalidIntervalLiteral(_))
+            ),
+            "{literal}"
+        );
+    }
+}
+
+#[test]
+fn format_interval_hours_past_a_day() {
+    assert_eq!(format_interval(0, 0, 300 * MICROS_PER_HOUR), "300:00:00");
+    assert_eq!(
+        format_interval(0, 0, -300 * MICROS_PER_HOUR + 5 * MICROS_PER_MIN),
+        "-299:55:00"
+    );
+    assert_eq!(format_interval(0, 0, i64::MIN), "-2562047788:00:54.775808");
+}
+
+#[test]
 fn format_interval_zero() {
     assert_eq!(format_interval(0, 0, 0), "00:00:00");
 }
