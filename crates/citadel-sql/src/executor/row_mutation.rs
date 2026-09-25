@@ -25,6 +25,22 @@ enum Mutation {
     Update(Vec<(String, Expr)>),
     /// Conflict expressions have already been evaluated against OLD/EXCLUDED.
     EvaluatedUpdate,
+    /// SET expressions were bound to each row before any row changed.
+    BoundUpdate,
+}
+
+/// Gives one row its own SET expressions, with the subqueries that read the
+/// row bound to it and run against the writer.
+pub(super) type BindRow<'b> =
+    dyn FnMut(&mut WriteTxn<'_>, &[Value]) -> Result<Vec<(String, Expr)>> + 'b;
+
+/// What an operation assigns to each selected row.
+enum Change<'s, 'b> {
+    Delete,
+    /// SET expressions evaluated against each row.
+    Assign(&'s [(String, Expr)]),
+    /// SET expressions, and the binder that gives each row its own copy.
+    AssignBound(&'s [(String, Expr)], &'s mut BindRow<'b>),
 }
 
 struct Operation<'a> {
@@ -229,18 +245,25 @@ enum Work<'a> {
     ForeignKeys(ParentChange<'a>, usize),
 }
 
+/// `bind` gives each row its own SET expressions when their subqueries read
+/// the row. Every row's values are computed before any row changes.
 pub(super) fn update_rows(
     wtx: &mut WriteTxn<'_>,
     schema: &SchemaManager,
     table: &TableSchema,
     stmt: &UpdateStmt,
     rows: Vec<KeyedRow>,
+    bind: Option<&mut BindRow<'_>>,
 ) -> Result<ExecutionResult> {
+    let change = match bind {
+        Some(bind) => Change::AssignBound(&stmt.assignments, bind),
+        None => Change::Assign(&stmt.assignments),
+    };
     let operation = prepare_operation(
         wtx,
         schema,
         table,
-        Some(&stmt.assignments),
+        change,
         stmt.returning.is_some(),
         rows,
         true,
@@ -258,7 +281,15 @@ pub(super) fn delete_rows(
     returning: Option<Vec<SelectColumn>>,
     rows: Vec<KeyedRow>,
 ) -> Result<ExecutionResult> {
-    let operation = prepare_operation(wtx, schema, table, None, returning.is_some(), rows, true)?;
+    let operation = prepare_operation(
+        wtx,
+        schema,
+        table,
+        Change::Delete,
+        returning.is_some(),
+        rows,
+        true,
+    )?;
     let mut checks = Vec::new();
     let result = run(wtx, schema, operation, &mut checks)?;
     check_no_action(wtx, schema, checks)?;
@@ -269,7 +300,7 @@ fn prepare_operation<'a>(
     wtx: &mut WriteTxn<'_>,
     schema: &SchemaManager,
     table: &'a TableSchema,
-    assignments: Option<&[(String, Expr)]>,
+    mut change: Change<'_, '_>,
     capture_rows: bool,
     rows: Vec<KeyedRow>,
     root: bool,
@@ -279,10 +310,13 @@ fn prepare_operation<'a>(
     if table.has_ann_index() {
         super::ann_persist::purge_segment(wtx, &table.name)?;
     }
-    let changed_columns = assignments.map_or_else(Vec::new, |a| {
-        a.iter().map(|(name, _)| name.clone()).collect()
-    });
-    let is_update = assignments.is_some();
+    let changed_columns = match &change {
+        Change::Delete => Vec::new(),
+        Change::Assign(a) | Change::AssignBound(a, _) => {
+            a.iter().map(|(name, _)| name.clone()).collect()
+        }
+    };
+    let is_update = !matches!(change, Change::Delete);
     let statement_triggers = if is_update {
         triggers::has_statement_update_triggers(schema, &table.name)
     } else {
@@ -293,9 +327,14 @@ fn prepare_operation<'a>(
     let mut new_rows = Vec::new();
     for (key, old) in rows {
         check_cancel(wtx.cancel_token())?;
-        let new = assignments
-            .map(|a| evaluate_update(table, a, &old, wtx.cancel_token()))
-            .transpose()?;
+        let new = match &mut change {
+            Change::Delete => None,
+            Change::Assign(a) => Some(evaluate_update(table, a, &old, wtx.cancel_token())?),
+            Change::AssignBound(_, bind) => {
+                let bound = bind(wtx, &old)?;
+                Some(evaluate_update(table, &bound, &old, wtx.cancel_token())?)
+            }
+        };
         if statement_triggers {
             old_rows.push(old.clone());
             if let Some(new) = &new {
@@ -310,10 +349,15 @@ fn prepare_operation<'a>(
     } else {
         triggers::has_delete_triggers(schema, &table.name)
     };
+    let mutation = match change {
+        Change::Delete => Mutation::Delete,
+        Change::Assign(a) => Mutation::Update(a.to_vec()),
+        Change::AssignBound(..) => Mutation::BoundUpdate,
+    };
     let operation = Operation {
         table,
         changed_columns,
-        mutation: assignments.map_or(Mutation::Delete, |a| Mutation::Update(a.to_vec())),
+        mutation,
         refresh_rows: has_children || has_triggers || !table.foreign_keys.is_empty(),
         has_children,
         has_triggers,
@@ -701,6 +745,13 @@ fn run<'a>(
                                         "conflict row changed after expression evaluation".into(),
                                     ))
                                 }
+                                Mutation::BoundUpdate => {
+                                    return Err(SqlError::Unsupported(
+                                        "SET subqueries that read the row, for a row a cascade \
+                                         or trigger changed earlier in the same UPDATE"
+                                            .into(),
+                                    ))
+                                }
                             };
                             row.old = current;
                         }
@@ -898,15 +949,11 @@ fn run<'a>(
                             .collect::<Result<Vec<_>>>()?,
                     )
                 };
-                let operation = prepare_operation(
-                    wtx,
-                    schema,
-                    child,
-                    assignments.as_deref(),
-                    false,
-                    rows,
-                    false,
-                )?;
+                let change = match assignments.as_deref() {
+                    Some(assignments) => Change::Assign(assignments),
+                    None => Change::Delete,
+                };
+                let operation = prepare_operation(wtx, schema, child, change, false, rows, false)?;
                 work.push(Work::ForeignKeys(parent, position + 1));
                 work.push(Work::Row(operation));
             }

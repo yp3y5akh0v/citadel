@@ -85,12 +85,11 @@ impl<'a> Lowerer<'a> {
                 }
                 if self.scopes.is_empty() {
                     *expr = Expr::Column(column.clone());
-                } else if self.context == Context::Predicate {
-                    *table = self.table.to_ascii_lowercase();
                 } else {
-                    return Err(SqlError::Unsupported(
-                        "correlated subquery outside a mutation WHERE clause".into(),
-                    ));
+                    // Only WHERE and SET subqueries reach here; RETURNING and ON
+                    // CONFLICT refuse subqueries. They read the target row by the
+                    // table's name, which no inner source is left holding.
+                    *table = self.table.to_ascii_lowercase();
                 }
             } else if self.context == Context::Source && name != self.target {
                 // INSERT's source is an independent SELECT namespace. Its

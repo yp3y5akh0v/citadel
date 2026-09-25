@@ -20,23 +20,14 @@ fn fixture(conn: &Connection<'_>) {
         .unwrap();
 }
 
-fn rejects_capture<T>(result: Result<T, SqlError>) {
-    match result {
-        Err(SqlError::Unsupported(message)) => {
-            assert_eq!(message, "correlated subqueries in UPDATE SET expressions")
-        }
-        Err(error) => panic!("expected unsupported correlated SET, got {error:?}"),
-        Ok(_) => panic!("correlated SET must not be materialized once for all rows"),
-    }
-}
-
 #[test]
-fn correlated_set_is_rejected_before_mutation_on_every_execution_path() {
-    for expr in [
-        "(SELECT COUNT(*) FROM r WHERE r.id = t.id)",
-        "(SELECT COUNT(*) FROM r WHERE r.id = only_outer)",
-        "COALESCE((SELECT t.v), 0)",
-        "CASE WHEN FALSE THEN (SELECT t.v) ELSE 7 END",
+fn correlated_set_reads_each_row_on_every_execution_path() {
+    // Rows (1, 10) and (3, 30); r holds ids 1 and 2.
+    for (expr, expected) in [
+        ("(SELECT COUNT(*) FROM r WHERE r.id = t.id)", [1, 0]),
+        ("(SELECT COUNT(*) FROM r WHERE r.id = only_outer)", [1, 0]),
+        ("COALESCE((SELECT t.v), 0)", [10, 30]),
+        ("CASE WHEN FALSE THEN (SELECT t.v) ELSE 7 END", [7, 7]),
     ] {
         for mode in 0..5 {
             let db = database();
@@ -44,24 +35,31 @@ fn correlated_set_is_rejected_before_mutation_on_every_execution_path() {
             fixture(&conn);
             let sql = format!("UPDATE t SET v = {expr}");
             match mode {
-                0 => rejects_capture(conn.execute(&sql)),
-                1 => rejects_capture(conn.prepare(&sql).unwrap().execute(&[])),
+                0 => {
+                    conn.execute(&sql).unwrap();
+                }
+                1 => {
+                    conn.prepare(&sql).unwrap().execute(&[]).unwrap();
+                }
                 2 => {
                     conn.execute("BEGIN").unwrap();
-                    rejects_capture(conn.execute(&sql));
+                    conn.execute(&sql).unwrap();
                     conn.execute("INSERT INTO r VALUES (4,400)").unwrap();
                     conn.execute("COMMIT").unwrap();
                 }
-                3 => rejects_capture(conn.execute_batch(&sql)),
+                3 => {
+                    conn.execute_batch(&sql).unwrap();
+                }
                 4 => {
                     let mut schema = SchemaManager::load(&db).unwrap();
                     let mut txn = db.begin_write().unwrap();
-                    rejects_capture(executor::execute_in_txn(
+                    executor::execute_in_txn(
                         &mut txn,
                         &mut schema,
                         &parser::parse_sql(&sql).unwrap(),
                         &[],
-                    ));
+                    )
+                    .unwrap();
                     txn.commit().unwrap();
                 }
                 _ => unreachable!(),
@@ -69,13 +67,89 @@ fn correlated_set_is_rejected_before_mutation_on_every_execution_path() {
             assert_eq!(
                 conn.query("SELECT id,v FROM t ORDER BY id").unwrap().rows,
                 vec![
-                    vec![Value::Integer(1), Value::Integer(10)],
-                    vec![Value::Integer(3), Value::Integer(30)],
+                    vec![Value::Integer(1), Value::Integer(expected[0])],
+                    vec![Value::Integer(3), Value::Integer(expected[1])],
                 ],
                 "{mode}: {sql}"
             );
         }
     }
+}
+
+#[test]
+fn every_set_value_is_computed_before_any_row_changes() {
+    let db = database();
+    let conn = Connection::open(&db).unwrap();
+    fixture(&conn);
+    // Each row reads the other row's v, and must see it before either changes.
+    conn.execute("UPDATE t SET v = (SELECT o.v FROM t AS o WHERE o.id <> t.id)")
+        .unwrap();
+    assert_eq!(
+        conn.query("SELECT id,v FROM t ORDER BY id").unwrap().rows,
+        vec![
+            vec![Value::Integer(1), Value::Integer(30)],
+            vec![Value::Integer(3), Value::Integer(10)],
+        ]
+    );
+}
+
+#[test]
+fn a_set_subquery_that_reads_the_row_returns_one_row_or_an_error() {
+    let db = database();
+    let conn = Connection::open(&db).unwrap();
+    fixture(&conn);
+    conn.execute("INSERT INTO r VALUES (3,300),(4,300)")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    let error = conn
+        .execute("UPDATE t SET v = (SELECT r.id FROM r WHERE r.x >= t.v * 10)")
+        .unwrap_err();
+    assert!(matches!(error, SqlError::SubqueryMultipleRows), "{error:?}");
+    conn.execute("ROLLBACK").unwrap();
+    assert_eq!(
+        conn.query("SELECT id,v FROM t ORDER BY id").unwrap().rows,
+        vec![
+            vec![Value::Integer(1), Value::Integer(10)],
+            vec![Value::Integer(3), Value::Integer(30)],
+        ]
+    );
+}
+
+#[test]
+fn a_row_changed_earlier_in_the_statement_is_refused_rather_than_stale() {
+    let db = database();
+    let conn = Connection::open(&db).unwrap();
+    fixture(&conn);
+    // Updating row 1 changes row 3 before row 3's own SET value applies.
+    conn.execute(
+        "CREATE TRIGGER nudge AFTER UPDATE ON t FOR EACH ROW WHEN NEW.id = 1 \
+         BEGIN UPDATE t SET v = v + 1 WHERE id = 3; END",
+    )
+    .unwrap();
+    let error = conn
+        .execute("UPDATE t SET v = (SELECT COUNT(*) FROM r WHERE r.id = t.id)")
+        .unwrap_err();
+    assert!(
+        matches!(&error, SqlError::Unsupported(message) if message.contains("trigger changed")),
+        "{error:?}"
+    );
+    assert_eq!(
+        conn.query("SELECT id,v FROM t ORDER BY id").unwrap().rows,
+        vec![
+            vec![Value::Integer(1), Value::Integer(10)],
+            vec![Value::Integer(3), Value::Integer(30)],
+        ]
+    );
+    // SET expressions without such subqueries are evaluated against the row as
+    // it is when its turn comes.
+    conn.execute("UPDATE t SET v = v * 2").unwrap();
+    assert_eq!(
+        conn.query("SELECT id,v FROM t ORDER BY id").unwrap().rows,
+        vec![
+            vec![Value::Integer(1), Value::Integer(20)],
+            vec![Value::Integer(3), Value::Integer(62)],
+        ]
+    );
 }
 
 #[test]

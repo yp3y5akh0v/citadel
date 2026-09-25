@@ -160,16 +160,6 @@ fn hidden_name(position: usize) -> String {
     format!("__captured_{position}")
 }
 
-fn calls_volatile(expr: &Expr) -> bool {
-    let mut volatile = false;
-    crate::parser::visit_expr(expr, &mut |node| {
-        if let Expr::Function { name, args, .. } = node {
-            volatile |= crate::eval::is_volatile_function_expr(&name.to_ascii_uppercase(), args);
-        }
-    });
-    volatile
-}
-
 fn conjunction(conjuncts: Vec<Expr>) -> Option<Expr> {
     conjuncts.into_iter().reduce(|left, right| Expr::BinaryOp {
         left: Box::new(left),
