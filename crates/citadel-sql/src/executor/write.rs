@@ -308,9 +308,12 @@ fn fast_lane_column_refs(expr: &Expr, out: &mut Vec<String>) -> bool {
             fast_lane_column_refs(expr, out)
         }
         Expr::IsNull(e) | Expr::IsNotNull(e) => fast_lane_column_refs(e, out),
-        Expr::Function { args, distinct, .. } => {
-            !*distinct && args.iter().all(|a| fast_lane_column_refs(a, out))
-        }
+        Expr::Function {
+            args,
+            distinct,
+            filter,
+            ..
+        } => !*distinct && filter.is_none() && args.iter().all(|a| fast_lane_column_refs(a, out)),
         Expr::InList { expr, list, .. } => {
             fast_lane_column_refs(expr, out) && list.iter().all(|e| fast_lane_column_refs(e, out))
         }

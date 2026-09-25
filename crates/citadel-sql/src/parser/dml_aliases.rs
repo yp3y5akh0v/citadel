@@ -116,7 +116,15 @@ impl<'a> Lowerer<'a> {
             | Expr::Cast { expr, .. }
             | Expr::Collate { expr, .. }
             | Expr::InSet { expr, .. } => self.expr(expr)?,
-            Expr::Function { args, .. } | Expr::Coalesce(args) | Expr::ArrayLiteral(args) => {
+            Expr::Function { args, filter, .. } => {
+                for expr in args {
+                    self.expr(expr)?;
+                }
+                if let Some(filter) = filter {
+                    self.expr(filter)?;
+                }
+            }
+            Expr::Coalesce(args) | Expr::ArrayLiteral(args) => {
                 for expr in args {
                     self.expr(expr)?;
                 }

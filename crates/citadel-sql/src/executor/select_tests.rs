@@ -1513,6 +1513,7 @@ fn numeric_aggregate_states_match_generic_families_and_accumulation() {
                 name: name.into(),
                 args: vec![Expr::Column("v".into())],
                 distinct: false,
+                filter: None,
             };
             let expected = eval_aggregate_expr(&expr, &column_map, &row_refs);
             for representation in 0..4 {
@@ -1947,6 +1948,7 @@ fn raw_aggregate_defaults_require_statement_constant_admission() {
         name: "RANDOM".into(),
         args: vec![],
         distinct: false,
+        filter: None,
     });
     // This asserts the evaluation-frequency contract without depending on RNG
     // values or adding a production counter: a missing volatile default must

@@ -374,15 +374,21 @@ pub(super) fn materialize_expr_selective(
             name,
             args,
             distinct,
+            filter,
         } => {
             let materialized = args
                 .iter()
                 .map(|a| materialize_expr_selective(a, exec_sub))
                 .collect::<Result<Vec<_>>>()?;
+            let filter = filter
+                .as_deref()
+                .map(|filter| materialize_expr_selective(filter, exec_sub).map(Box::new))
+                .transpose()?;
             Ok(Expr::Function {
                 name: name.clone(),
                 args: materialized,
                 distinct: *distinct,
+                filter,
             })
         }
         other => Ok(other.clone()),

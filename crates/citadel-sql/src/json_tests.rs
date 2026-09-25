@@ -691,6 +691,7 @@ fn evaluator_threads_cancellation_into_json_has_key_functions() {
             crate::parser::Expr::Literal(Value::Text("missing".into())),
         ],
         distinct: false,
+        filter: None,
     };
     let columns = crate::eval::ColumnMap::new(&[]);
     let token = CancelToken::new();

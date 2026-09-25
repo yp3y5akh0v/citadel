@@ -3958,9 +3958,12 @@ fn collect_column_refs(expr: &Expr, columns: &[ColumnDef], out: &mut Vec<usize>)
         Expr::IsNull(e) | Expr::IsNotNull(e) => {
             collect_column_refs(e, columns, out);
         }
-        Expr::Function { args, .. } => {
+        Expr::Function { args, filter, .. } => {
             for arg in args {
                 collect_column_refs(arg, columns, out);
+            }
+            if let Some(filter) = filter {
+                collect_column_refs(filter, columns, out);
             }
         }
         Expr::InSubquery { expr, .. } => {

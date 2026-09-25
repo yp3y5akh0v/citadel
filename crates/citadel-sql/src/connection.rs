@@ -3774,6 +3774,7 @@ mod tests {
             name: "CURRENT_TIMESTAMP".into(),
             args: Vec::new(),
             distinct: false,
+            filter: None,
         };
         let columns = crate::eval::ColumnMap::new(&[]);
         let direct_eval = || {

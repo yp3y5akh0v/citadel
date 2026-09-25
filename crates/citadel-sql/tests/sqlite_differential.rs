@@ -9,11 +9,13 @@
 //! Generated SQL stays inside the shared semantics: integer and
 //! binary-collated text values, divisors guarded by NULLIF, NOCASE columns
 //! only in predicates, and ORDER BY over every output column so each result
-//! has one correct order. Two SQLite behaviors are kept out of reach. SQLite
-//! 3.51.3 counts OFFSET against every EXISTS match once it plans the EXISTS
-//! as a join, so queries with EXISTS take no OFFSET. SQLite evaluates UPDATE
-//! SET subqueries against rows the statement has already changed, so they
-//! read only the other table.
+//! has one correct order. An aggregate in a subquery always reads a column of
+//! the subquery's own source: SQLite gives one that reads only outer columns
+//! to the outer query, which Citadel does not. Two SQLite behaviors are kept
+//! out of reach. SQLite 3.51.3 counts OFFSET against every EXISTS match once
+//! it plans the EXISTS as a join, so queries with EXISTS take no OFFSET.
+//! SQLite evaluates UPDATE SET subqueries against rows the statement has
+//! already changed, so they read only the other table.
 
 use citadel::{Argon2Profile, DatabaseBuilder};
 use citadel_sql::{Connection, ExecutionResult, Value};
@@ -418,7 +420,33 @@ impl Gen {
             2 => format!("MIN({})", self.int_expr(&inner, 1)),
             _ => format!("MAX({})", self.int_expr(&inner, 1)),
         };
-        format!("(SELECT {aggregate} FROM {from}{filter})")
+        // The FILTER may read the outer row, and always reads the subquery's
+        // own: an aggregate that reads only outer columns belongs to the outer
+        // query.
+        let aggregate_filter = if self.rng.one_in(3) {
+            let own = self
+                .column(&inner, Ty::Int, false)
+                .expect("every source has an integer column");
+            let visible: Vec<Col> = inner.iter().chain(scope).cloned().collect();
+            format!(
+                " FILTER (WHERE {own} {} {} AND {})",
+                self.comparison(),
+                self.int_literal(),
+                self.predicate(&visible, 1)
+            )
+        } else {
+            String::new()
+        };
+        format!("(SELECT {aggregate}{aggregate_filter} FROM {from}{filter})")
+    }
+
+    /// Sometimes a FILTER clause for an aggregate over `scope`.
+    fn aggregate_filter(&mut self, scope: &[Col]) -> String {
+        if self.rng.one_in(3) {
+            format!(" FILTER (WHERE {})", self.predicate(scope, 1))
+        } else {
+            String::new()
+        }
     }
 
     /// FROM clause and the columns it exposes.
@@ -575,14 +603,17 @@ impl Gen {
             })
             .collect();
         let aggregates: Vec<String> = (0..1 + self.rng.below(3))
-            .map(|_| match self.rng.below(7) {
-                0 => "COUNT(*)".to_string(),
-                1 => format!("COUNT({})", self.int_expr(&cols, 1)),
-                2 => format!("SUM({})", self.int_expr(&cols, 1)),
-                3 => format!("MIN({})", self.expr_of_any_type(&cols)),
-                4 => format!("MAX({})", self.expr_of_any_type(&cols)),
-                5 => format!("COUNT(DISTINCT {})", self.expr_of_any_type(&cols)),
-                _ => format!("AVG({})", self.int_expr(&cols, 1)),
+            .map(|_| {
+                let aggregate = match self.rng.below(7) {
+                    0 => "COUNT(*)".to_string(),
+                    1 => format!("COUNT({})", self.int_expr(&cols, 1)),
+                    2 => format!("SUM({})", self.int_expr(&cols, 1)),
+                    3 => format!("MIN({})", self.expr_of_any_type(&cols)),
+                    4 => format!("MAX({})", self.expr_of_any_type(&cols)),
+                    5 => format!("COUNT(DISTINCT {})", self.expr_of_any_type(&cols)),
+                    _ => format!("AVG({})", self.int_expr(&cols, 1)),
+                };
+                aggregate + &self.aggregate_filter(&cols)
             })
             .collect();
         let filter = if self.rng.one_in(3) {
@@ -602,9 +633,22 @@ impl Gen {
             sql.push_str(&format!(" GROUP BY {}", keys.join(", ")));
             if self.rng.one_in(2) {
                 let having = match self.rng.below(3) {
-                    0 => format!("COUNT(*) > {}", self.rng.below(3)),
-                    1 => format!("SUM({}) >= {}", self.int_expr(&cols, 1), self.int_literal()),
-                    _ => format!("MIN({}) IS NOT NULL", self.int_expr(&cols, 1)),
+                    0 => format!(
+                        "COUNT(*){} > {}",
+                        self.aggregate_filter(&cols),
+                        self.rng.below(3)
+                    ),
+                    1 => format!(
+                        "SUM({}){} >= {}",
+                        self.int_expr(&cols, 1),
+                        self.aggregate_filter(&cols),
+                        self.int_literal()
+                    ),
+                    _ => format!(
+                        "MIN({}){} IS NOT NULL",
+                        self.int_expr(&cols, 1),
+                        self.aggregate_filter(&cols)
+                    ),
                 };
                 sql.push_str(&format!(" HAVING {having}"));
             }

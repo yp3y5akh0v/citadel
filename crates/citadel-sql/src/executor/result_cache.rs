@@ -422,10 +422,13 @@ fn cacheable_expr(ctx: &mut WalkCtx<'_>, expr: &Expr) -> bool {
         | Expr::Parameter(_)
         | Expr::CountStar
         | Expr::TypedNullRecord(_) => true,
-        Expr::Function { name, args, .. } => {
+        Expr::Function {
+            name, args, filter, ..
+        } => {
             let upper = name.to_ascii_uppercase();
             crate::eval::is_function_context_independent(&upper, args)
                 && args.iter().all(|a| cacheable_expr(ctx, a))
+                && filter.as_deref().is_none_or(|f| cacheable_expr(ctx, f))
         }
         Expr::BinaryOp { left, op, right } => {
             // ANN index construction uses RNG; distance results can differ

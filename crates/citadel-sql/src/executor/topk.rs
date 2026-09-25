@@ -8,7 +8,6 @@ use crate::eval::ColumnMap;
 use crate::parser::*;
 use crate::types::*;
 
-use super::aggregate::is_aggregate_expr;
 use super::helpers::*;
 use super::scan::FastPredicate;
 use super::select::resolve_simple_col;

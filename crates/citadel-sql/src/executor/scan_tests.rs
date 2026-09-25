@@ -1050,6 +1050,7 @@ fn arithmetic_predicates_decline_unsupported_operands_and_unsafe_columns() {
             name: "ABS".into(),
             args: vec![Expr::Column("v".into())],
             distinct: false,
+            filter: None,
         },
     ] {
         assert!(try_simple_predicate(&make_expr(operand), &table).is_none());
@@ -1068,6 +1069,7 @@ fn arithmetic_predicates_decline_unsupported_operands_and_unsafe_columns() {
         name: "RANDOM".into(),
         args: Vec::new(),
         distinct: false,
+        filter: None,
     });
     variants.push(cols);
     let mut cols = table.columns.clone();
@@ -1283,6 +1285,7 @@ fn scan_predicate_passes_cancellation_into_scalar_evaluation() {
         name: "TO_TSVECTOR".into(),
         args: vec![Expr::Column("body".into())],
         distinct: false,
+        filter: None,
     }));
     let col_map = ColumnMap::new(&table.columns);
     let compiled = CompiledExpr::compile(&predicate, &col_map);
@@ -1333,6 +1336,7 @@ fn point_lookup_does_not_turn_scalar_cancellation_into_no_match() {
         name: "TO_TSVECTOR".into(),
         args: vec![Expr::Column("body".into())],
         distinct: false,
+        filter: None,
     })));
 
     let token = citadel::CancelToken::new();

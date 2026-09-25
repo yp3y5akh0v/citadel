@@ -472,6 +472,7 @@ fn cte_aggregate_filter_passes_cancellation_into_scalar_evaluation() {
         name: "TO_TSVECTOR".into(),
         args: vec![Expr::Column("body".into())],
         distinct: false,
+        filter: None,
     })));
     let token = citadel::CancelToken::new();
     let _cancel = crate::fts::cancel_tokenize_after(token.clone(), 1);

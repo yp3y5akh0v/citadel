@@ -31,7 +31,14 @@ fn rejects(sql: &str) {
 
 #[test]
 fn aggregate_filter_is_not_silently_discarded() {
-    rejects("SELECT COUNT(*) FILTER (WHERE v IS NULL) FROM q");
+    with_connection(|conn| {
+        assert_eq!(
+            conn.query("SELECT COUNT(*) FILTER (WHERE v IS NULL), COUNT(*) FROM q")
+                .unwrap()
+                .rows,
+            vec![vec![Value::Integer(1), Value::Integer(3)]]
+        );
+    });
 }
 
 #[test]
@@ -60,8 +67,9 @@ fn rejected_nested_aggregate_keeps_explicit_transaction_usable() {
     with_connection(|conn| {
         conn.execute("BEGIN").unwrap();
         let before = conn.query("SELECT * FROM q ORDER BY id").unwrap().rows;
-        let result = conn
-            .execute("UPDATE q SET v=(SELECT COUNT(*) FILTER (WHERE v IS NULL) FROM q) WHERE id=1");
+        let result = conn.execute(
+            "UPDATE q SET v=(SELECT STRING_AGG(label, ',' ORDER BY label) FROM q) WHERE id=1",
+        );
         assert!(
             matches!(result, Err(SqlError::Unsupported(_))),
             "{result:?}"

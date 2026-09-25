@@ -16,9 +16,12 @@ pub(super) fn collect_column_refs(expr: &Expr, out: &mut Vec<String>) {
             collect_column_refs(right, out);
         }
         Expr::UnaryOp { expr, .. } | Expr::Cast { expr, .. } => collect_column_refs(expr, out),
-        Expr::Function { args, .. } => {
+        Expr::Function { args, filter, .. } => {
             for a in args {
                 collect_column_refs(a, out);
+            }
+            if let Some(filter) = filter {
+                collect_column_refs(filter, out);
             }
         }
         Expr::Case {

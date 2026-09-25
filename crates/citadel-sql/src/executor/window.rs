@@ -149,10 +149,12 @@ pub(super) fn extract_window_fns(
             expr: Box::new(extract_window_fns(e, slot_counter, extracted)),
             data_type: *data_type,
         },
+        // A FILTER calls no window function.
         Expr::Function {
             name,
             args,
             distinct,
+            filter,
         } => Expr::Function {
             name: name.clone(),
             args: args
@@ -160,6 +162,7 @@ pub(super) fn extract_window_fns(
                 .map(|a| extract_window_fns(a, slot_counter, extracted))
                 .collect(),
             distinct: *distinct,
+            filter: filter.clone(),
         },
         Expr::Coalesce(args) => Expr::Coalesce(
             args.iter()
