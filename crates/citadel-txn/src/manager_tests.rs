@@ -3854,6 +3854,9 @@ fn catalog_lookup_rejects_an_authenticated_cross_page_cycle() {
 #[path = "manager_retry_tests.rs"]
 mod retry_tests;
 
+#[path = "manager_power_loss_tests.rs"]
+mod power_loss_tests;
+
 struct PausedCatalogIO {
     inner: MemIO,
     pause_at: Arc<AtomicU64>,
