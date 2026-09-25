@@ -621,12 +621,14 @@ fn reduce_aggregates(
         Expr::InSet {
             expr,
             values,
+            families,
             has_null,
             negated,
             collation,
         } => Expr::InSet {
             expr: boxed(expr)?,
             values: values.clone(),
+            families: *families,
             has_null: *has_null,
             negated: *negated,
             collation: *collation,

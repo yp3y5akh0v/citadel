@@ -9,6 +9,7 @@ use crate::schema::SchemaManager;
 use crate::types::*;
 
 use super::helpers::{check_cancel, check_cancel_at, decode_full_row_with_cancel};
+use super::join::KeyedRows;
 use super::CteContext;
 
 #[path = "correlated_bind.rs"]
@@ -275,55 +276,91 @@ pub(super) fn filter_mutation_correlated_rows<T>(
     Ok(None)
 }
 
-#[derive(Default)]
-pub(super) struct InValues {
-    values: FxHashSet<Value>,
-    has_null: bool,
+/// A correlated IN subquery's rows, found by an outer row's correlation values
+/// as `=` compares them.
+pub(super) struct InRows {
+    /// The distinct correlation values of every row.
+    groups: KeyedRows,
+    /// The distinct correlation values of the rows selecting NULL.
+    nulls: KeyedRows,
+    /// The distinct correlation values, then selected value, of the rows
+    /// selecting a value.
+    values: KeyedRows,
 }
 
-pub(super) type InMap = FxHashMap<Vec<Value>, InValues>;
-
-fn correlated_in_passes(
-    group: Option<&InValues>,
-    in_value: Value,
-    value_collation: Collation,
-    negated: bool,
-) -> bool {
-    let Some(group) = group else {
-        // The correlated subquery is empty for this key.  In particular,
-        // NULL NOT IN (empty) is true, unlike NULL NOT IN (nonempty).
-        return negated;
-    };
-    if in_value.is_null() {
-        return false;
+impl InRows {
+    /// Whether `in_value IN (subquery)`, or NOT IN when `negated`, holds for the
+    /// outer row whose correlation values are `key`. NULL does not hold.
+    /// `in_value` runs only when the subquery has rows for the key.
+    fn passes(
+        &self,
+        key: &[Value],
+        negated: bool,
+        cancel: Option<&citadel::CancelToken>,
+        in_value: impl FnOnce() -> Result<Value>,
+    ) -> Result<bool> {
+        if !self.groups.contains(key, cancel)? {
+            // The subquery is empty for this row: NULL NOT IN (empty) is true,
+            // unlike NULL NOT IN (nonempty).
+            return Ok(negated);
+        }
+        let in_value = in_value()?;
+        if in_value.is_null() {
+            return Ok(false);
+        }
+        let mut probe = key.to_vec();
+        probe.push(in_value);
+        if self.values.contains(&probe, cancel)? {
+            return Ok(!negated);
+        }
+        Ok(negated && !self.nulls.contains(key, cancel)?)
     }
-
-    let found = group.values.contains(&value_collation.fold(in_value));
-    if found {
-        !negated
-    } else if group.has_null {
-        false
-    } else {
-        negated
-    }
 }
 
-fn correlation_collations(corr_pairs: &[CorrEqPair]) -> Vec<Collation> {
-    corr_pairs.iter().map(|pair| pair.collation).collect()
-}
-
-fn correlation_key(row: &[Value], indices: &[usize], collations: &[Collation]) -> Vec<Value> {
-    indices
+/// The inner column each correlation pair reads, with the collation its `=`
+/// compares under.
+fn inner_keys(
+    corr_pairs: &[CorrEqPair],
+    inner_schema: &TableSchema,
+) -> Result<Vec<(usize, Collation)>> {
+    corr_pairs
         .iter()
-        .enumerate()
-        .map(|(position, &index)| {
-            collations
-                .get(position)
-                .copied()
-                .unwrap_or(Collation::Binary)
-                .fold(row[index].clone())
+        .map(|pair| {
+            let column = inner_schema
+                .column_index(&pair.inner_col_name)
+                .ok_or_else(|| SqlError::ColumnNotFound(pair.inner_col_name.clone()))?;
+            Ok((column, pair.collation))
         })
         .collect()
+}
+
+/// Key positions `0..` of rows that begin with the correlation values.
+fn leading_keys(keys: &[(usize, Collation)]) -> Vec<(usize, Collation)> {
+    keys.iter()
+        .enumerate()
+        .map(|(position, &(_, collation))| (position, collation))
+        .collect()
+}
+
+/// A row's values at `columns`, in that order.
+fn values_at(row: &[Value], columns: &[usize]) -> Vec<Value> {
+    columns.iter().map(|&column| row[column].clone()).collect()
+}
+
+/// The distinct correlation values of `rows`, in no particular order. A
+/// repeated key never changes whether one equals an outer row's.
+fn distinct_keys(
+    rows: &[Vec<Value>],
+    keys: &[(usize, Collation)],
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<Vec<Vec<Value>>> {
+    let columns: Vec<usize> = keys.iter().map(|&(column, _)| column).collect();
+    let mut distinct = FxHashSet::default();
+    for (row_idx, row) in rows.iter().enumerate() {
+        check_cancel_at(cancel, row_idx)?;
+        distinct.insert(values_at(row, &columns));
+    }
+    Ok(distinct.into_iter().collect())
 }
 
 fn in_subquery_value_collation(
@@ -401,7 +438,6 @@ fn any_cancellable<T>(
     Ok(false)
 }
 
-#[allow(clippy::type_complexity)]
 pub(super) fn handle_correlated_select_with_read(
     rtx: &mut ReadTxn<'_>,
     schema: &SchemaManager,
@@ -414,12 +450,8 @@ pub(super) fn handle_correlated_select_with_read(
     let cancel = cancel.as_ref();
     check_cancel(cancel)?;
     let mut new_columns = Vec::new();
-    let mut scalar_maps: Vec<(
-        FxHashMap<Vec<Value>, Option<Value>>,
-        Vec<usize>,
-        Vec<Collation>,
-        HashedScalar,
-    )> = Vec::new();
+    // For each hashed subquery, its value for every row.
+    let mut hashed: Vec<Vec<Value>> = Vec::new();
     let mut corr_col_idx = columns.len();
 
     for col in &stmt.columns {
@@ -443,24 +475,22 @@ pub(super) fn handle_correlated_select_with_read(
                             !corr_pairs.is_empty()
                                 && !has_residual_correlation(sub, ctx, inner_schema)
                         });
-                        if let Some(shape) = shape {
-                            let map = decorrelate_scalar_with_read(
-                                rtx,
-                                schema,
-                                sub,
-                                &corr_pairs,
-                                ctx,
-                                &shape,
-                            )?;
-                            let outer_indices: Vec<usize> =
-                                corr_pairs.iter().map(|p| p.outer_col_idx).collect();
-                            scalar_maps.push((
-                                map,
-                                outer_indices,
-                                correlation_collations(&corr_pairs),
-                                shape,
-                            ));
-
+                        let values = match shape {
+                            Some(shape) => {
+                                let by_key = decorrelate_scalar_with_read(
+                                    rtx,
+                                    schema,
+                                    sub,
+                                    &corr_pairs,
+                                    ctx,
+                                    &shape,
+                                )?;
+                                hashed_scalar_values(&by_key, rows, &corr_pairs, &shape, cancel)?
+                            }
+                            None => None,
+                        };
+                        if let Some(values) = values {
+                            hashed.push(values);
                             let col_name = alias
                                 .clone()
                                 .unwrap_or_else(|| format!("__corr_{corr_col_idx}"));
@@ -495,17 +525,13 @@ pub(super) fn handle_correlated_select_with_read(
         }
     }
 
-    if scalar_maps.is_empty() {
+    if hashed.is_empty() {
         return Ok(stmt.clone());
     }
 
     for (row_idx, row) in rows.iter_mut().enumerate() {
         check_cancel_at(cancel, row_idx)?;
-        for (map, outer_indices, key_collations, shape) in &scalar_maps {
-            let key = correlation_key(row, outer_indices, key_collations);
-            let value = hashed_scalar_value(map, &key, shape)?;
-            row.push(value);
-        }
+        row.extend(hashed.iter().map(|values| values[row_idx].clone()));
     }
 
     check_cancel(cancel)?;
@@ -902,23 +928,31 @@ fn projects_own_columns(query: &SelectStmt, inner_schema: &TableSchema) -> bool 
     })
 }
 
-/// A hashed scalar subquery's value for one outer key.
-fn hashed_scalar_value(
-    map: &FxHashMap<Vec<Value>, Option<Value>>,
-    key: &[Value],
+/// A hashed scalar subquery's value for each of `outer_rows`, or None when an
+/// aggregate's key equals several groups: `=` converts between their values,
+/// so no one group holds the aggregate and the rows need the per-row path.
+/// `by_key` holds the correlation values, then the value, of each group or row.
+fn hashed_scalar_values(
+    by_key: &KeyedRows,
+    outer_rows: &[Vec<Value>],
+    corr_pairs: &[CorrEqPair],
     shape: &HashedScalar,
-) -> Result<Value> {
-    let found = if key.iter().any(Value::is_null) {
-        None
-    } else {
-        map.get(key)
-    };
-    match (found, shape) {
-        (Some(Some(value)), _) => Ok(value.clone()),
-        (Some(None), _) => Err(SqlError::SubqueryMultipleRows),
-        (None, HashedScalar::Aggregate(empty)) => Ok(empty.clone()),
-        (None, HashedScalar::Row) => Ok(Value::Null),
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<Option<Vec<Value>>> {
+    let outer_columns: Vec<usize> = corr_pairs.iter().map(|p| p.outer_col_idx).collect();
+    let mut values = Vec::with_capacity(outer_rows.len());
+    for (row_idx, row) in outer_rows.iter().enumerate() {
+        check_cancel_at(cancel, row_idx)?;
+        let found = by_key.matching(&values_at(row, &outer_columns), cancel)?;
+        values.push(match (found.as_slice(), shape) {
+            ([], HashedScalar::Aggregate(empty)) => empty.clone(),
+            ([], HashedScalar::Row) => Value::Null,
+            ([one], _) => one[corr_pairs.len()].clone(),
+            (_, HashedScalar::Row) => return Err(SqlError::SubqueryMultipleRows),
+            (_, HashedScalar::Aggregate(_)) => return Ok(None),
+        });
     }
+    Ok(Some(values))
 }
 
 /// Correlation conjuncts other than equalities, which only the EXISTS path
@@ -1262,12 +1296,14 @@ pub(super) fn bind_outer_values_in_expr(
         Expr::InSet {
             expr,
             values,
+            families,
             has_null,
             negated,
             collation,
         } => Expr::InSet {
             expr: Box::new(bind(expr)),
             values: values.clone(),
+            families: *families,
             has_null: *has_null,
             negated: *negated,
             collation: *collation,
@@ -1371,15 +1407,57 @@ pub(super) fn bind_outer_values_in_expr(
     }
 }
 
-pub(super) enum ExistsResult {
-    Simple(FxHashSet<Vec<Value>>),
-    WithFilter(Box<ExistsFilterData>),
-}
-
-pub(super) struct ExistsFilterData {
-    rows_by_key: FxHashMap<Vec<Value>, Vec<Vec<Value>>>,
+/// The inner rows of a correlated EXISTS, found by an outer row's correlation
+/// values, and its correlation conjuncts other than those equalities, which a
+/// found row must also satisfy. Without such conjuncts a row holds only its
+/// correlation values.
+pub(super) struct ExistsRows {
+    rows: KeyedRows,
     non_eq_predicates: Vec<Expr>,
     inner_schema: TableSchema,
+}
+
+impl ExistsRows {
+    /// Whether deciding a match reads the outer row beyond its correlation
+    /// values.
+    fn reads_outer_row(&self) -> bool {
+        !self.non_eq_predicates.is_empty()
+    }
+
+    /// Whether one of `candidates`, the rows correlated to `outer_row`,
+    /// satisfies every other correlation conjunct.
+    fn satisfied_by(
+        &self,
+        candidates: &[&[Value]],
+        outer_row: &[Value],
+        outer_col_map: &ColumnMap,
+        ctx: &CorrelationCtx,
+        cancel: Option<&citadel::CancelToken>,
+    ) -> Result<bool> {
+        if candidates.is_empty() {
+            return Ok(false);
+        }
+        let inner_col_map = self.inner_schema.column_map();
+        // The binding varies only with the outer row, so bind once for it.
+        let bound: Vec<_> = self
+            .non_eq_predicates
+            .iter()
+            .map(|pred| {
+                bind_outer_values_in_expr(pred, outer_row, outer_col_map, inner_col_map, ctx)
+            })
+            .collect();
+        any_cancellable(candidates, cancel, |inner_row| {
+            for predicate in &bound {
+                if !is_truthy(&eval_expr(
+                    predicate,
+                    &EvalCtx::new(inner_col_map, inner_row).with_cancel(cancel),
+                )?) {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        })
+    }
 }
 
 pub(super) fn decorrelate_exists_with_read(
@@ -1388,7 +1466,7 @@ pub(super) fn decorrelate_exists_with_read(
     subquery: &SelectStmt,
     corr_pairs: &[CorrEqPair],
     ctx: &CorrelationCtx,
-) -> Result<ExistsResult> {
+) -> Result<ExistsRows> {
     let cancel = rtx.cancel_token().cloned();
     let cancel = cancel.as_ref();
     check_cancel(cancel)?;
@@ -1441,44 +1519,23 @@ pub(super) fn decorrelate_exists_with_read(
         subquery.from_alias.as_deref(),
     );
 
-    let inner_col_indices: Vec<usize> = corr_pairs
-        .iter()
-        .map(|p| inner_schema.column_index(&p.inner_col_name).unwrap_or(0))
-        .collect();
-    let key_collations = correlation_collations(corr_pairs);
-
-    if non_eq.is_empty() {
-        let mut key_set = FxHashSet::default();
-        for (row_idx, row) in inner_rows.iter().enumerate() {
-            check_cancel_at(cancel, row_idx)?;
-            let key = correlation_key(row, &inner_col_indices, &key_collations);
-            if key.iter().any(|v| v.is_null()) {
-                continue;
-            }
-            key_set.insert(key);
-        }
-        check_cancel(cancel)?;
-        Ok(ExistsResult::Simple(key_set))
+    let keys = inner_keys(corr_pairs, inner_schema)?;
+    let rows = if non_eq.is_empty() {
+        let key_rows = distinct_keys(&inner_rows, &keys, cancel)?;
+        KeyedRows::build(key_rows, &leading_keys(&keys), cancel)?
     } else {
-        let mut rows_by_key: FxHashMap<Vec<Value>, Vec<Vec<Value>>> = FxHashMap::default();
-        for (row_idx, row) in inner_rows.into_iter().enumerate() {
-            check_cancel_at(cancel, row_idx)?;
-            let key = correlation_key(&row, &inner_col_indices, &key_collations);
-            if key.iter().any(|v| v.is_null()) {
-                continue;
-            }
-            rows_by_key.entry(key).or_default().push(row);
-        }
-        check_cancel(cancel)?;
-        Ok(ExistsResult::WithFilter(Box::new(ExistsFilterData {
-            rows_by_key,
-            non_eq_predicates: non_eq,
-            inner_schema: inner_schema.clone(),
-        })))
-    }
+        KeyedRows::build(inner_rows, &keys, cancel)?
+    };
+    check_cancel(cancel)?;
+    Ok(ExistsRows {
+        rows,
+        non_eq_predicates: non_eq,
+        inner_schema: inner_schema.clone(),
+    })
 }
 
-/// Decorrelate IN/NOT IN subquery. Returns correlation key → IN-column value set.
+/// Decorrelate IN/NOT IN subquery: its rows, found by correlation values and
+/// by the selected value, which compares under `value_collation`.
 pub(super) fn decorrelate_in_with_read(
     rtx: &mut ReadTxn<'_>,
     schema: &SchemaManager,
@@ -1486,7 +1543,7 @@ pub(super) fn decorrelate_in_with_read(
     corr_pairs: &[CorrEqPair],
     ctx: &CorrelationCtx,
     value_collation: Collation,
-) -> Result<InMap> {
+) -> Result<InRows> {
     let cancel = rtx.cancel_token().cloned();
     let cancel = cancel.as_ref();
     check_cancel(cancel)?;
@@ -1509,36 +1566,40 @@ pub(super) fn decorrelate_in_with_read(
     );
     let (inner_rows, _) = super::collect_rows_with_read(rtx, inner_schema, &inner_where, None)?;
 
-    let inner_corr_indices: Vec<usize> = corr_pairs
-        .iter()
-        .map(|p| inner_schema.column_index(&p.inner_col_name).unwrap_or(0))
-        .collect();
-    let key_collations = correlation_collations(corr_pairs);
-
-    let mut map: InMap = FxHashMap::default();
-
+    let keys = inner_keys(corr_pairs, inner_schema)?;
+    let key_columns: Vec<usize> = keys.iter().map(|&(column, _)| column).collect();
+    // A repeated row never changes whether one matches, so each set keeps one.
+    let mut groups = FxHashSet::default();
+    let mut nulls = FxHashSet::default();
+    let mut selected = FxHashSet::default();
     for (row_idx, row) in inner_rows.iter().enumerate() {
         check_cancel_at(cancel, row_idx)?;
-        let key = correlation_key(row, &inner_corr_indices, &key_collations);
-        if key.iter().any(|v| v.is_null()) {
-            continue;
-        }
-        let in_val = row[in_col_idx].clone();
-        let entry = map.entry(key).or_default();
-        if in_val.is_null() {
-            entry.has_null = true;
+        let key = values_at(row, &key_columns);
+        let value = &row[in_col_idx];
+        if value.is_null() {
+            nulls.insert(key.clone());
         } else {
-            entry.values.insert(value_collation.fold(in_val));
+            let mut with_value = key.clone();
+            with_value.push(value.clone());
+            selected.insert(with_value);
         }
+        groups.insert(key);
     }
-
+    let by_key = leading_keys(&keys);
+    let mut by_value = by_key.clone();
+    by_value.push((keys.len(), value_collation));
+    let rows = InRows {
+        groups: KeyedRows::build(groups.into_iter().collect(), &by_key, cancel)?,
+        nulls: KeyedRows::build(nulls.into_iter().collect(), &by_key, cancel)?,
+        values: KeyedRows::build(selected.into_iter().collect(), &by_value, cancel)?,
+    };
     check_cancel(cancel)?;
-    Ok(map)
+    Ok(rows)
 }
 
-/// Decorrelate scalar subquery. Returns correlation key → scalar result.
-/// The subquery's value per correlation key, or None for a key with more than
-/// one row of a plain value.
+/// Decorrelate scalar subquery: each group of an aggregate, or each row of a
+/// plain value, as its correlation values then the value, found by the
+/// correlation values.
 pub(super) fn decorrelate_scalar_with_read(
     rtx: &mut ReadTxn<'_>,
     schema: &SchemaManager,
@@ -1546,7 +1607,7 @@ pub(super) fn decorrelate_scalar_with_read(
     corr_pairs: &[CorrEqPair],
     ctx: &CorrelationCtx,
     shape: &HashedScalar,
-) -> Result<FxHashMap<Vec<Value>, Option<Value>>> {
+) -> Result<KeyedRows> {
     let cancel = rtx.cancel_token().cloned();
     let cancel = cancel.as_ref();
     check_cancel(cancel)?;
@@ -1606,31 +1667,14 @@ pub(super) fn decorrelate_scalar_with_read(
     let empty_ctes = CteContext::default();
     let qr = match super::exec_select_with_read(rtx, schema, &rewritten, &empty_ctes)? {
         ExecutionResult::Query(qr) => qr,
-        _ => return Ok(FxHashMap::default()),
+        _ => return Err(SqlError::Plan("expected Query result".into())),
     };
-
-    let num_corr = corr_pairs.len();
-    let key_collations = correlation_collations(corr_pairs);
-    let key_indices: Vec<usize> = (0..num_corr).collect();
-    let mut map: FxHashMap<Vec<Value>, Option<Value>> = FxHashMap::default();
-    for (row_idx, row) in qr.rows.iter().enumerate() {
-        check_cancel_at(cancel, row_idx)?;
-        let key = correlation_key(row, &key_indices, &key_collations);
-        if key.iter().any(|v| v.is_null()) {
-            continue;
-        }
-        match map.entry(key) {
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(Some(row[num_corr].clone()));
-            }
-            std::collections::hash_map::Entry::Occupied(mut entry) => {
-                entry.insert(None);
-            }
-        }
-    }
-
-    check_cancel(cancel)?;
-    Ok(map)
+    let keys: Vec<(usize, Collation)> = corr_pairs
+        .iter()
+        .enumerate()
+        .map(|(position, pair)| (position, pair.collation))
+        .collect();
+    KeyedRows::build(qr.rows, &keys, cancel)
 }
 
 // Write-transaction variants below — same logic, use collect_rows_write.
@@ -1641,7 +1685,7 @@ pub(super) fn decorrelate_exists_write(
     subquery: &SelectStmt,
     corr_pairs: &[CorrEqPair],
     ctx: &CorrelationCtx,
-) -> Result<FxHashSet<Vec<Value>>> {
+) -> Result<KeyedRows> {
     let cancel = wtx.cancel_token().cloned();
     let cancel = cancel.as_ref();
     check_cancel(cancel)?;
@@ -1656,22 +1700,11 @@ pub(super) fn decorrelate_exists_write(
         subquery.from_alias.as_deref(),
     );
     let (inner_rows, _) = super::collect_rows_write(wtx, inner_schema, &inner_where, None)?;
-    let inner_col_indices: Vec<usize> = corr_pairs
-        .iter()
-        .map(|p| inner_schema.column_index(&p.inner_col_name).unwrap_or(0))
-        .collect();
-    let key_collations = correlation_collations(corr_pairs);
-    let mut key_set = FxHashSet::default();
-    for (row_idx, row) in inner_rows.iter().enumerate() {
-        check_cancel_at(cancel, row_idx)?;
-        let key = correlation_key(row, &inner_col_indices, &key_collations);
-        if key.iter().any(|v| v.is_null()) {
-            continue;
-        }
-        key_set.insert(key);
-    }
+    let keys = inner_keys(corr_pairs, inner_schema)?;
+    let key_rows = distinct_keys(&inner_rows, &keys, cancel)?;
+    let rows = KeyedRows::build(key_rows, &leading_keys(&keys), cancel)?;
     check_cancel(cancel)?;
-    Ok(key_set)
+    Ok(rows)
 }
 
 /// The semijoin for a predicate `complete_exists_semijoin` accepts: each
@@ -1717,20 +1750,14 @@ fn exists_semijoin_write<T>(
                         remaining_conjuncts.push(conj.clone());
                         continue;
                     }
-                    let key_set =
+                    let inner_rows =
                         decorrelate_exists_write(wtx, schema, subquery, &corr_pairs, ctx)?;
                     let outer_col_indices: Vec<usize> =
                         corr_pairs.iter().map(|p| p.outer_col_idx).collect();
-                    let key_collations = correlation_collations(&corr_pairs);
                     let is_negated = *negated;
                     retain_cancellable(rows, cancel, |item| {
-                        let row = row_values(item);
-                        let key = correlation_key(row, &outer_col_indices, &key_collations);
-                        if key.iter().any(|v| v.is_null()) {
-                            return Ok(is_negated);
-                        }
-                        let found = key_set.contains(&key);
-                        Ok(if is_negated { !found } else { found })
+                        let key = values_at(row_values(item), &outer_col_indices);
+                        Ok(inner_rows.contains(&key, cancel)? != is_negated)
                     })?;
                 } else {
                     remaining_conjuncts.push(conj.clone());
@@ -1846,7 +1873,6 @@ pub(super) fn build_and_scan_correlated_with_read(
                 exists_filters.push(ExistsFilter {
                     result,
                     outer_col_indices,
-                    key_collations: correlation_collations(&corr_pairs),
                     negated: *negated,
                 });
             }
@@ -1879,7 +1905,7 @@ pub(super) fn build_and_scan_correlated_with_read(
                 let selected_collation = in_subquery_value_collation(subquery, &inner_schema)?;
                 let value_collation = crate::eval::operand_collation(expr, &outer_col_map)
                     .unwrap_or(selected_collation);
-                let map = decorrelate_in_with_read(
+                let rows = decorrelate_in_with_read(
                     rtx,
                     schema,
                     subquery,
@@ -1890,10 +1916,8 @@ pub(super) fn build_and_scan_correlated_with_read(
                 let outer_col_indices: Vec<usize> =
                     corr_pairs.iter().map(|p| p.outer_col_idx).collect();
                 in_filters.push(InFilter {
-                    map,
+                    rows,
                     outer_col_indices,
-                    key_collations: correlation_collations(&corr_pairs),
-                    value_collation,
                     in_expr: (**expr).clone(),
                     negated: *negated,
                 });
@@ -1934,14 +1958,6 @@ pub(super) fn build_and_scan_correlated_with_read(
     let mut scan_err: Option<SqlError> = None;
 
     let mut col_vals: Vec<(usize, Value)> = Vec::with_capacity(needed_raw.len());
-    let max_key_cols = exists_filters
-        .iter()
-        .map(|ef| ef.outer_col_indices.len())
-        .chain(in_filters.iter().map(|inf| inf.outer_col_indices.len()))
-        .max()
-        .unwrap_or(0);
-    let mut outer_key: Vec<Value> = Vec::with_capacity(max_key_cols);
-    let mut corr_key: Vec<Value> = Vec::with_capacity(max_key_cols);
 
     rtx.table_scan_raw(lower.as_bytes(), |key, value| {
         // Extract only the correlation columns from raw bytes (fast partial decode)
@@ -1956,160 +1972,64 @@ pub(super) fn build_and_scan_correlated_with_read(
             };
             col_vals.push((col_idx, val));
         }
+        // A filter decodes the whole row only when it has to read more than
+        // the correlation values.
         let mut decoded_row: Option<Vec<Value>> = None;
-
-        for ef in &exists_filters {
-            outer_key.clear();
-            for (position, &oci) in ef.outer_col_indices.iter().enumerate() {
-                let val = col_vals
-                    .iter()
-                    .find(|(idx, _)| *idx == oci)
-                    .unwrap()
-                    .1
-                    .clone();
-                outer_key.push(
-                    ef.key_collations
-                        .get(position)
-                        .copied()
-                        .unwrap_or(Collation::Binary)
-                        .fold(val),
-                );
-            }
-            if outer_key.iter().any(|v| v.is_null()) {
-                if !ef.negated {
-                    return true;
+        let passes = (|| -> Result<bool> {
+            for ef in &exists_filters {
+                let outer_key = partial_values(&col_vals, &ef.outer_col_indices);
+                let found = if ef.result.reads_outer_row() {
+                    let candidates = ef.result.rows.matching(&outer_key, cancel)?;
+                    !candidates.is_empty() && {
+                        let row = decode_once(&mut decoded_row, outer_schema, key, value, cancel)?;
+                        ef.result
+                            .satisfied_by(&candidates, row, &outer_col_map, ctx, cancel)?
+                    }
                 } else {
-                    continue;
-                }
-            }
-            let found = match &ef.result {
-                ExistsResult::Simple(set) => set.contains(&outer_key),
-                ExistsResult::WithFilter(filter_data) => {
-                    // Non-equality correlation — need full decode for predicate eval
-                    if decoded_row.is_none() {
-                        decoded_row =
-                            match decode_full_row_with_cancel(outer_schema, key, value, cancel) {
-                                Ok(row) => Some(row),
-                                Err(e) => {
-                                    scan_err = Some(e);
-                                    return false;
-                                }
-                            };
-                    }
-                    let row = decoded_row.as_ref().unwrap();
-                    let inner_col_map = filter_data.inner_schema.column_map();
-                    let matched = match filter_data.rows_by_key.get(&outer_key) {
-                        Some(inner_rows) if !inner_rows.is_empty() => {
-                            // The binding varies only with the outer row, so rebuilding the
-                            // predicate tree per inner row is pure allocator traffic.
-                            let bound: Vec<_> = filter_data
-                                .non_eq_predicates
-                                .iter()
-                                .map(|pred| {
-                                    bind_outer_values_in_expr(
-                                        pred,
-                                        row,
-                                        &outer_col_map,
-                                        inner_col_map,
-                                        ctx,
-                                    )
-                                })
-                                .collect();
-                            match any_cancellable(inner_rows, cancel, |inner_row| {
-                                for predicate in &bound {
-                                    if !is_truthy(&eval_expr(
-                                        predicate,
-                                        &EvalCtx::new(inner_col_map, inner_row).with_cancel(cancel),
-                                    )?) {
-                                        return Ok(false);
-                                    }
-                                }
-                                Ok(true)
-                            }) {
-                                Ok(matched) => matched,
-                                Err(err) => {
-                                    scan_err = Some(err);
-                                    return false;
-                                }
-                            }
-                        }
-                        _ => false,
-                    };
-                    matched
-                }
-            };
-            if ef.negated == found {
-                return true; // Filtered out
-            }
-        }
-
-        for inf in &in_filters {
-            corr_key.clear();
-            for (position, &oci) in inf.outer_col_indices.iter().enumerate() {
-                let val = col_vals
-                    .iter()
-                    .find(|(idx, _)| *idx == oci)
-                    .unwrap()
-                    .1
-                    .clone();
-                corr_key.push(
-                    inf.key_collations
-                        .get(position)
-                        .copied()
-                        .unwrap_or(Collation::Binary)
-                        .fold(val),
-                );
-            }
-            let group = if corr_key.iter().any(|v| v.is_null()) {
-                None
-            } else {
-                inf.map.get(&corr_key)
-            };
-            if group.is_some() {
-                // Full decode needed for IN eval (subset: matching correlation keys only)
-                if decoded_row.is_none() {
-                    decoded_row =
-                        match decode_full_row_with_cancel(outer_schema, key, value, cancel) {
-                            Ok(row) => Some(row),
-                            Err(e) => {
-                                scan_err = Some(e);
-                                return false;
-                            }
-                        };
-                }
-                let row = decoded_row.as_ref().unwrap();
-                let in_val = match eval_expr(
-                    &inf.in_expr,
-                    &EvalCtx::new(&outer_col_map, row).with_cancel(cancel),
-                ) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        scan_err = Some(e);
-                        return false;
-                    }
+                    ef.result.rows.contains(&outer_key, cancel)?
                 };
-                if !correlated_in_passes(group, in_val, inf.value_collation, inf.negated) {
-                    return true;
+                if ef.negated == found {
+                    return Ok(false);
                 }
-            } else if !correlated_in_passes(None, Value::Null, inf.value_collation, inf.negated) {
-                return true;
+            }
+            for inf in &in_filters {
+                let corr_key = partial_values(&col_vals, &inf.outer_col_indices);
+                let passes = inf.rows.passes(&corr_key, inf.negated, cancel, || {
+                    let row = decode_once(&mut decoded_row, outer_schema, key, value, cancel)?;
+                    eval_expr(
+                        &inf.in_expr,
+                        &EvalCtx::new(&outer_col_map, row).with_cancel(cancel),
+                    )
+                })?;
+                if !passes {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        })();
+        match passes {
+            Ok(false) => true,
+            Ok(true) => {
+                // Reuse a full decode a filter performed, or decode once now for
+                // the output.
+                let row = match decoded_row {
+                    Some(row) => row,
+                    None => match decode_full_row_with_cancel(outer_schema, key, value, cancel) {
+                        Ok(row) => row,
+                        Err(e) => {
+                            scan_err = Some(e);
+                            return false;
+                        }
+                    },
+                };
+                rows.push(row);
+                true
+            }
+            Err(e) => {
+                scan_err = Some(e);
+                false
             }
         }
-
-        // Row passed every filter. Reuse a full decode performed by a filtered
-        // EXISTS/IN clause, or decode once now for the output.
-        let row = match decoded_row {
-            Some(row) => row,
-            None => match decode_full_row_with_cancel(outer_schema, key, value, cancel) {
-                Ok(row) => row,
-                Err(e) => {
-                    scan_err = Some(e);
-                    return false;
-                }
-            },
-        };
-        rows.push(row);
-        scan_err.is_none()
     })
     .map_err(SqlError::Storage)?;
 
@@ -2178,18 +2098,44 @@ fn extract_raw_value(
     }
 }
 
+/// The values at `columns` of a row decoded only at its correlation columns.
+fn partial_values(decoded: &[(usize, Value)], columns: &[usize]) -> Vec<Value> {
+    columns
+        .iter()
+        .map(|&column| {
+            decoded
+                .iter()
+                .find(|(index, _)| *index == column)
+                .unwrap()
+                .1
+                .clone()
+        })
+        .collect()
+}
+
+/// The whole row at `key`/`value`, decoded on first use.
+fn decode_once<'r>(
+    decoded: &'r mut Option<Vec<Value>>,
+    schema: &TableSchema,
+    key: &[u8],
+    value: &[u8],
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<&'r [Value]> {
+    if decoded.is_none() {
+        *decoded = Some(decode_full_row_with_cancel(schema, key, value, cancel)?);
+    }
+    Ok(decoded.as_deref().unwrap())
+}
+
 struct ExistsFilter {
-    result: ExistsResult,
+    result: ExistsRows,
     outer_col_indices: Vec<usize>,
-    key_collations: Vec<Collation>,
     negated: bool,
 }
 
 struct InFilter {
-    map: InMap,
+    rows: InRows,
     outer_col_indices: Vec<usize>,
-    key_collations: Vec<Collation>,
-    value_collation: Collation,
     in_expr: Expr,
     negated: bool,
 }
@@ -2234,67 +2180,28 @@ pub(super) fn handle_correlated_where_with_read(
                         remaining_conjuncts.push(conj.clone());
                         continue;
                     }
-                    let exists_result =
+                    let exists =
                         decorrelate_exists_with_read(rtx, schema, subquery, &corr_pairs, ctx)?;
                     let outer_col_indices: Vec<usize> =
                         corr_pairs.iter().map(|p| p.outer_col_idx).collect();
-                    let key_collations = correlation_collations(&corr_pairs);
+                    let outer_col_map = ColumnMap::new(&ctx.outer_schema.columns);
                     let is_negated = *negated;
-                    match &exists_result {
-                        ExistsResult::Simple(key_set) => {
-                            retain_cancellable(rows, cancel, |row| {
-                                let key = correlation_key(row, &outer_col_indices, &key_collations);
-                                if key.iter().any(|v| v.is_null()) {
-                                    return Ok(is_negated);
-                                }
-                                let found = key_set.contains(&key);
-                                Ok(if is_negated { !found } else { found })
-                            })?;
-                        }
-                        ExistsResult::WithFilter(filter_data) => {
-                            let inner_col_map = ColumnMap::new(&filter_data.inner_schema.columns);
-                            let outer_col_map = ColumnMap::new(&ctx.outer_schema.columns);
-                            retain_cancellable(rows, cancel, |outer_row| {
-                                let key =
-                                    correlation_key(outer_row, &outer_col_indices, &key_collations);
-                                if key.iter().any(|v| v.is_null()) {
-                                    return Ok(is_negated);
-                                }
-                                let found = match filter_data.rows_by_key.get(&key) {
-                                    Some(inner_rows) if !inner_rows.is_empty() => {
-                                        // Bind once per outer row, not once per inner row.
-                                        let bound: Vec<_> = filter_data
-                                            .non_eq_predicates
-                                            .iter()
-                                            .map(|pred| {
-                                                bind_outer_values_in_expr(
-                                                    pred,
-                                                    outer_row,
-                                                    &outer_col_map,
-                                                    &inner_col_map,
-                                                    ctx,
-                                                )
-                                            })
-                                            .collect();
-                                        any_cancellable(inner_rows, cancel, |inner_row| {
-                                            for predicate in &bound {
-                                                if !is_truthy(&eval_expr(
-                                                    predicate,
-                                                    &EvalCtx::new(&inner_col_map, inner_row)
-                                                        .with_cancel(cancel),
-                                                )?) {
-                                                    return Ok(false);
-                                                }
-                                            }
-                                            Ok(true)
-                                        })?
-                                    }
-                                    _ => false,
-                                };
-                                Ok(if is_negated { !found } else { found })
-                            })?;
-                        }
-                    }
+                    retain_cancellable(rows, cancel, |outer_row| {
+                        let key = values_at(outer_row, &outer_col_indices);
+                        let found = if exists.reads_outer_row() {
+                            let candidates = exists.rows.matching(&key, cancel)?;
+                            exists.satisfied_by(
+                                &candidates,
+                                outer_row,
+                                &outer_col_map,
+                                ctx,
+                                cancel,
+                            )?
+                        } else {
+                            exists.rows.contains(&key, cancel)?
+                        };
+                        Ok(found != is_negated)
+                    })?;
                 } else {
                     remaining_conjuncts.push(conj.clone());
                 }
@@ -2330,7 +2237,7 @@ pub(super) fn handle_correlated_where_with_read(
                     let selected_collation = in_subquery_value_collation(subquery, &inner_schema)?;
                     let value_collation = crate::eval::operand_collation(in_expr, &col_map)
                         .unwrap_or(selected_collation);
-                    let in_map = decorrelate_in_with_read(
+                    let in_rows = decorrelate_in_with_read(
                         rtx,
                         schema,
                         subquery,
@@ -2341,22 +2248,11 @@ pub(super) fn handle_correlated_where_with_read(
                     let outer_col_indices: Vec<usize> =
                         corr_pairs.iter().map(|p| p.outer_col_idx).collect();
                     let is_negated = *negated;
-                    let key_collations = correlation_collations(&corr_pairs);
                     retain_cancellable(rows, cancel, |row| {
-                        let key = correlation_key(row, &outer_col_indices, &key_collations);
-                        let in_val =
-                            eval_expr(in_expr, &EvalCtx::new(&col_map, row).with_cancel(cancel))?;
-                        let group = if key.iter().any(|v| v.is_null()) {
-                            None
-                        } else {
-                            in_map.get(&key)
-                        };
-                        Ok(correlated_in_passes(
-                            group,
-                            in_val,
-                            value_collation,
-                            is_negated,
-                        ))
+                        let key = values_at(row, &outer_col_indices);
+                        in_rows.passes(&key, is_negated, cancel, || {
+                            eval_expr(in_expr, &EvalCtx::new(&col_map, row).with_cancel(cancel))
+                        })
                     })?;
                 } else {
                     remaining_conjuncts.push(conj.clone());
@@ -2383,31 +2279,38 @@ pub(super) fn handle_correlated_where_with_read(
                                 !corr_pairs.is_empty()
                                     && !has_residual_correlation(sub, ctx, inner_schema)
                             });
-                            if let Some(shape) = shape {
-                                let scalar_map = decorrelate_scalar_with_read(
-                                    rtx,
-                                    schema,
-                                    sub,
-                                    &corr_pairs,
-                                    ctx,
-                                    &shape,
-                                )?;
-                                let outer_col_indices: Vec<usize> =
-                                    corr_pairs.iter().map(|p| p.outer_col_idx).collect();
-                                let key_collations = correlation_collations(&corr_pairs);
-                                let cmp_op = *op;
-                                let left_expr = left.clone();
+                            let values = match shape {
+                                Some(shape) => {
+                                    let by_key = decorrelate_scalar_with_read(
+                                        rtx,
+                                        schema,
+                                        sub,
+                                        &corr_pairs,
+                                        ctx,
+                                        &shape,
+                                    )?;
+                                    hashed_scalar_values(
+                                        &by_key,
+                                        rows,
+                                        &corr_pairs,
+                                        &shape,
+                                        cancel,
+                                    )?
+                                }
+                                None => None,
+                            };
+                            if let Some(values) = values {
                                 let col_map = ColumnMap::new(&ctx.outer_schema.columns);
+                                // One value for each row, in the order `rows` holds them.
+                                let mut position = 0;
                                 retain_cancellable(rows, cancel, |row| {
-                                    let key =
-                                        correlation_key(row, &outer_col_indices, &key_collations);
-                                    let scalar_val =
-                                        hashed_scalar_value(&scalar_map, &key, &shape)?;
+                                    let value = values[position].clone();
+                                    position += 1;
                                     // The left operand keeps its column collation.
                                     let cmp_expr = Expr::BinaryOp {
-                                        left: left_expr.clone(),
-                                        op: cmp_op,
-                                        right: Box::new(Expr::Literal(scalar_val)),
+                                        left: left.clone(),
+                                        op: *op,
+                                        right: Box::new(Expr::Literal(value)),
                                     };
                                     Ok(is_truthy(&eval_expr(
                                         &cmp_expr,

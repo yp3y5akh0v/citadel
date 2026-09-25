@@ -518,6 +518,7 @@ fn eval_expr_inner(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
         Expr::InSet {
             expr: e,
             values,
+            families,
             has_null,
             negated,
             collation,
@@ -527,7 +528,7 @@ fn eval_expr_inner(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
             // operand, left first.
             let coll = operand_collation(e, ctx.col_map).unwrap_or(*collation);
             let coll = (coll != crate::types::Collation::Binary).then_some(coll);
-            eval_in_set(&lhs, values, *has_null, *negated, coll)
+            eval_in_set(&lhs, values, *families, *has_null, *negated, coll)
         }
 
         Expr::Between {
@@ -856,6 +857,64 @@ fn collated_compare_with_cancel(
         }
     }
     eval_binary_op_with_cancel(left, op, right, cancel)
+}
+
+/// The kinds of value in a set that `=` converts between: a date, time,
+/// timestamp or interval, and a text or integer that may convert to one.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ConversionFamilies(u8);
+
+impl ConversionFamilies {
+    const DATE: u8 = 1;
+    const TIME: u8 = 2;
+    const TIMESTAMP: u8 = 4;
+    const INTERVAL: u8 = 8;
+    const TEXT: u8 = 16;
+    const INTEGER: u8 = 32;
+    const TEMPORAL: u8 = Self::DATE | Self::TIME | Self::TIMESTAMP | Self::INTERVAL;
+    const CONVERTIBLE: u8 = Self::TEXT | Self::INTEGER;
+
+    pub(crate) fn of<'v>(values: impl IntoIterator<Item = &'v Value>) -> Self {
+        let mut families = Self::default();
+        for value in values {
+            families.add(value);
+        }
+        families
+    }
+
+    pub(crate) fn add(&mut self, value: &Value) {
+        self.0 |= match value {
+            Value::Date(_) => Self::DATE,
+            Value::Time(_) => Self::TIME,
+            Value::Timestamp(_) => Self::TIMESTAMP,
+            Value::Interval { .. } => Self::INTERVAL,
+            Value::Text(_) => Self::TEXT,
+            Value::Integer(_) => Self::INTEGER,
+            _ => 0,
+        };
+    }
+
+    /// Whether `=` between `probe` and a value of the set may convert one of
+    /// them to the other's type.
+    pub(crate) fn needs_coercion(self, probe: &Value) -> bool {
+        let other = match probe {
+            Value::Date(_) => Self::TIMESTAMP | Self::CONVERTIBLE,
+            Value::Timestamp(_) => Self::DATE | Self::CONVERTIBLE,
+            Value::Time(_) | Value::Interval { .. } => Self::CONVERTIBLE,
+            Value::Text(_) | Value::Integer(_) => Self::TEMPORAL,
+            _ => 0,
+        };
+        self.0 & other != 0
+    }
+
+    /// Whether `=` between `probe` and a value of the set holds exactly when
+    /// the two are the same value, so a hash of the raw values finds every
+    /// match. Intervals are equal by normalized length ('1 month' = '30 days').
+    pub(crate) fn equal_as_values(self, probe: &Value) -> bool {
+        !self.needs_coercion(probe)
+            && !(matches!(probe, Value::Interval { .. }) && self.0 & Self::INTERVAL != 0)
+    }
 }
 
 /// Equality under `coll`, including the temporal normalization used by the `=` operator.
@@ -1567,6 +1626,7 @@ fn eval_in_values(
 fn eval_in_set(
     lhs: &Value,
     values: &rustc_hash::FxHashSet<Value>,
+    families: ConversionFamilies,
     has_null: bool,
     negated: bool,
     coll: Option<crate::types::Collation>,
@@ -1577,15 +1637,22 @@ fn eval_in_set(
     if lhs.is_null() {
         return Ok(Value::Null);
     }
-    // The set is hashed on the raw value, so a collation that calls distinct bytes equal
-    // cannot be answered by a lookup. Only a non-binary collation reaches the scan.
-    let found = match (coll, lhs) {
-        (Some(c), Value::Text(s)) => values.iter().any(|v| match v {
-            Value::Text(t) => c.eq_text(s, t),
-            _ => false,
-        }),
-        _ => values.contains(lhs),
-    };
+    // The set is hashed on the raw values, so neither a collation that calls distinct text
+    // equal nor `=` converting between types can be answered by a lookup: those compare
+    // `x = y` against each member.
+    let found =
+        if matches!((coll, lhs), (Some(_), Value::Text(_))) || !families.equal_as_values(lhs) {
+            let mut found = false;
+            for value in values {
+                if collated_eq(lhs, value, coll)? {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        } else {
+            values.contains(lhs)
+        };
     if found {
         return Ok(Value::Boolean(!negated));
     }

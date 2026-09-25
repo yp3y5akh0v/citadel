@@ -180,6 +180,7 @@ pub(super) fn materialize_expr_selective(
             }
             Ok(Expr::InSet {
                 expr: Box::new(inner),
+                families: crate::eval::ConversionFamilies::of(&values),
                 values,
                 has_null,
                 negated: *negated,
@@ -280,12 +281,14 @@ pub(super) fn materialize_expr_selective(
         Expr::InSet {
             expr: e,
             values,
+            families,
             has_null,
             negated,
             collation,
         } => Ok(Expr::InSet {
             expr: Box::new(materialize_expr_selective(e, exec_sub)?),
             values: values.clone(),
+            families: *families,
             has_null: *has_null,
             negated: *negated,
             collation: *collation,
