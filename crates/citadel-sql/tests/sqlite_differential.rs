@@ -8,8 +8,8 @@
 //!
 //! Generated SQL stays inside the shared semantics: integer and
 //! binary-collated text values, divisors guarded by NULLIF, NOCASE columns
-//! only in predicates, and ORDER BY over every output column so each result
-//! has one correct order. An aggregate in a subquery always reads a column of
+//! only in predicates, window functions whose ties share a value, and ORDER BY
+//! over every output column so each result has one correct order. An aggregate in a subquery always reads a column of
 //! the subquery's own source: SQLite gives one that reads only outer columns
 //! to the outer query, which Citadel does not. SQLite runs without its
 //! EXISTS-to-join rewrite, which returns wrong rows in 3.51.3. SQLite
@@ -544,11 +544,50 @@ impl Gen {
         clause
     }
 
+    /// A window function every engine computes alike: rows that tie in its
+    /// order share a value, and NULLs are placed explicitly.
+    fn window(&mut self, scope: &[Col]) -> String {
+        let nulls = self.rng.pick(&["NULLS FIRST", "NULLS LAST"]);
+        match self.rng.below(5) {
+            0 => "COUNT(*) OVER ()".to_string(),
+            1 => format!(
+                "SUM({}) OVER (PARTITION BY {})",
+                self.int_expr(scope, 1),
+                self.int_expr(scope, 1)
+            ),
+            2 => format!("RANK() OVER (ORDER BY {} {nulls})", self.int_expr(scope, 1)),
+            3 => format!(
+                "DENSE_RANK() OVER (ORDER BY {} DESC {nulls})",
+                self.int_expr(scope, 1)
+            ),
+            _ => format!(
+                "SUM({}) OVER (ORDER BY {} {nulls})",
+                self.int_expr(scope, 1),
+                self.int_expr(scope, 1)
+            ),
+        }
+    }
+
+    /// A window function over a grouped query's groups.
+    fn aggregate_window(&mut self, scope: &[Col]) -> String {
+        let nulls = self.rng.pick(&["NULLS FIRST", "NULLS LAST"]);
+        match self.rng.below(3) {
+            0 => "SUM(COUNT(*)) OVER ()".to_string(),
+            1 => "RANK() OVER (ORDER BY COUNT(*) DESC)".to_string(),
+            _ => format!(
+                "DENSE_RANK() OVER (ORDER BY SUM({}) {nulls})",
+                self.int_expr(scope, 1)
+            ),
+        }
+    }
+
     /// Output expressions and their types.
     fn outputs(&mut self, scope: &[Col], width: usize) -> (Vec<String>, Vec<Ty>) {
         (0..width)
             .map(|_| {
-                if self.rng.one_in(6) {
+                if self.rng.one_in(7) {
+                    (self.window(scope), Ty::Int)
+                } else if self.rng.one_in(6) {
                     (self.scalar_subquery(scope), Ty::Int)
                 } else if self.rng.one_in(2) {
                     (self.int_expr(scope, 2), Ty::Int)
@@ -614,19 +653,19 @@ impl Gen {
                 aggregate + &self.aggregate_filter(&cols)
             })
             .collect();
+        let window = self.rng.one_in(4).then(|| self.aggregate_window(&cols));
         let filter = if self.rng.one_in(3) {
             String::new()
         } else {
             format!(" WHERE {}", self.predicate(&cols, 2))
         };
-        let mut sql = format!(
-            "SELECT {} FROM {from}{filter}",
-            keys.iter()
-                .chain(&aggregates)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
+        let outputs: Vec<String> = keys
+            .iter()
+            .chain(&aggregates)
+            .chain(&window)
+            .cloned()
+            .collect();
+        let mut sql = format!("SELECT {} FROM {from}{filter}", outputs.join(", "));
         if !keys.is_empty() {
             sql.push_str(&format!(" GROUP BY {}", keys.join(", ")));
             if self.rng.one_in(2) {
@@ -651,7 +690,7 @@ impl Gen {
                 sql.push_str(&format!(" HAVING {having}"));
             }
         }
-        let order = self.order_by(keys.len() + aggregates.len());
+        let order = self.order_by(outputs.len());
         sql + &order
     }
 
