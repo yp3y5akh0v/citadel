@@ -121,6 +121,45 @@ fn aggregate_min_max_use_the_argument_collation_in_every_lane() {
 }
 
 #[test]
+fn grouped_expressions_evaluate_like_row_expressions() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = database(dir.path());
+    let conn = Connection::open(&database).unwrap();
+    conn.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, g INTEGER, s TEXT COLLATE NOCASE)")
+        .unwrap();
+    conn.execute("INSERT INTO a VALUES (1,1,'B'),(2,1,'a'),(3,2,'D'),(4,2,'c')")
+        .unwrap();
+    let text = |value: &str| Value::Text(value.into());
+
+    assert_eq!(
+        rows(&conn, "SELECT s, COUNT(*) FROM a GROUP BY s HAVING s = 'd'"),
+        vec![vec![text("D"), Value::Integer(1)]],
+        "a grouped column compares with its own collation"
+    );
+    assert_eq!(
+        rows(
+            &conn,
+            "SELECT s, CASE WHEN s IN ('A', 'C') THEN 'x' ELSE 'y' END \
+             FROM a GROUP BY s ORDER BY s",
+        ),
+        vec![
+            vec![text("a"), text("x")],
+            vec![text("B"), text("y")],
+            vec![text("c"), text("x")],
+            vec![text("D"), text("y")],
+        ]
+    );
+    assert_eq!(
+        rows(
+            &conn,
+            "SELECT COUNT(*) IN (4), CASE COUNT(*) WHEN 4.0 THEN 'four' END, \
+             MIN(s) COLLATE BINARY FROM a",
+        ),
+        vec![vec![Value::Boolean(true), text("four"), text("a")]]
+    );
+}
+
+#[test]
 fn window_min_max_use_the_argument_collation() {
     let dir = tempfile::tempdir().unwrap();
     let database = database(dir.path());
