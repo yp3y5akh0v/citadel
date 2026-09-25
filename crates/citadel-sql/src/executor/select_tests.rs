@@ -1232,37 +1232,39 @@ fn merge_sum_matches_serial_feed() {
     right.feed_val(&Value::Integer(1)).unwrap();
     left.merge(right);
 
-    assert_eq!(left.finish(), serial.finish());
+    assert_eq!(left.finish().unwrap(), serial.finish().unwrap());
 }
 
-// Merged and serial aggregates must agree in both debug and release profiles.
+/// A total outside i64 overflows and one back inside it does not, whether the
+/// values arrive in one feed or split across merged shards.
 #[test]
-fn merge_sum_overflow_parity_with_serial_feed() {
-    use std::panic::{catch_unwind, AssertUnwindSafe};
+fn merged_and_serial_sums_agree_on_overflow() {
     let op = StreamAgg::Sum(1);
-
-    let serial = catch_unwind(AssertUnwindSafe(|| {
-        let mut s = AggState::new(&op);
-        s.feed_val(&Value::Integer(i64::MAX)).unwrap();
-        s.feed_val(&Value::Integer(1)).unwrap();
-        s.finish()
-    }));
-    let merged = catch_unwind(AssertUnwindSafe(|| {
-        let mut left = AggState::new(&op);
-        left.feed_val(&Value::Integer(i64::MAX)).unwrap();
-        let mut right = AggState::new(&op);
-        right.feed_val(&Value::Integer(1)).unwrap();
-        left.merge(right);
-        left.finish()
-    }));
-    match (serial, merged) {
-        (Ok(a), Ok(b)) => assert_eq!(a, b),
-        (Err(_), Err(_)) => {}
-        (a, b) => panic!(
-            "divergent overflow behavior: serial_ok={} merged_ok={}",
-            a.is_ok(),
-            b.is_ok()
-        ),
+    let sum = |shards: &[Vec<i64>]| {
+        let mut total = AggState::new(&op);
+        for shard in shards {
+            let mut state = AggState::new(&op);
+            for &value in shard {
+                state.feed_val(&Value::Integer(value)).unwrap();
+            }
+            total.merge(state);
+        }
+        total.finish()
+    };
+    for shards in [vec![vec![i64::MAX, 1]], vec![vec![i64::MAX], vec![1]]] {
+        assert!(
+            matches!(sum(&shards), Err(SqlError::IntegerOverflow)),
+            "{shards:?}"
+        );
+    }
+    for shards in [
+        vec![vec![i64::MAX, 1, -1]],
+        vec![vec![i64::MAX, 1], vec![-1]],
+    ] {
+        assert!(
+            matches!(sum(&shards), Ok(Value::Integer(i64::MAX))),
+            "{shards:?}"
+        );
     }
 }
 
@@ -1276,7 +1278,7 @@ fn merge_min_max_keep_left_on_tie() {
         current: Some(Value::Integer(3)),
         collation: Collation::Binary,
     });
-    assert_eq!(left.finish(), Value::Integer(3));
+    assert_eq!(left.finish().unwrap(), Value::Integer(3));
 
     let mut left = AggState::Max {
         current: Some(Value::Text("b".into())),
@@ -1286,7 +1288,7 @@ fn merge_min_max_keep_left_on_tie() {
         current: Some(Value::Text("a".into())),
         collation: Collation::Binary,
     });
-    assert_eq!(left.finish(), Value::Text("b".into()));
+    assert_eq!(left.finish().unwrap(), Value::Text("b".into()));
 
     let mut left = AggState::Min {
         current: None,
@@ -1296,7 +1298,7 @@ fn merge_min_max_keep_left_on_tie() {
         current: Some(Value::Integer(7)),
         collation: Collation::Binary,
     });
-    assert_eq!(left.finish(), Value::Integer(7));
+    assert_eq!(left.finish().unwrap(), Value::Integer(7));
 
     let mut left = AggState::Min {
         current: Some(Value::Text("A".into())),
@@ -1306,17 +1308,17 @@ fn merge_min_max_keep_left_on_tie() {
         current: Some(Value::Text("a".into())),
         collation: Collation::NoCase,
     });
-    assert_eq!(left.finish(), Value::Text("A".into()));
+    assert_eq!(left.finish().unwrap(), Value::Text("A".into()));
 }
 
 #[test]
 fn merge_counts_add() {
     let mut a = AggState::CountStar(41);
     a.merge(AggState::CountStar(1));
-    assert_eq!(a.finish(), Value::Integer(42));
+    assert_eq!(a.finish().unwrap(), Value::Integer(42));
     let mut a = AggState::Count(10);
     a.merge(AggState::Count(5));
-    assert_eq!(a.finish(), Value::Integer(15));
+    assert_eq!(a.finish().unwrap(), Value::Integer(15));
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1534,7 +1536,7 @@ fn numeric_aggregate_states_match_generic_families_and_accumulation() {
                 });
                 match (outcome, &expected) {
                     (Ok(()), Ok(expected)) => {
-                        assert_eq!(state.finish(), *expected, "{name} {values:?}")
+                        assert_eq!(state.finish().unwrap(), *expected, "{name} {values:?}")
                     }
                     (Err(actual), Err(expected)) => {
                         assert_eq!(
@@ -1544,7 +1546,11 @@ fn numeric_aggregate_states_match_generic_families_and_accumulation() {
                         );
                         let prefix =
                             eval_aggregate_expr(&expr, &column_map, &row_refs[..accepted]).unwrap();
-                        assert_eq!(state.finish(), prefix, "failed feed changed {name} state");
+                        assert_eq!(
+                            state.finish().unwrap(),
+                            prefix,
+                            "failed feed changed {name} state"
+                        );
                     }
                     (actual, expected) => {
                         panic!("{name} {values:?}: actual={actual:?}, expected={expected:?}")
