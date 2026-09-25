@@ -11,11 +11,10 @@
 //! only in predicates, and ORDER BY over every output column so each result
 //! has one correct order. An aggregate in a subquery always reads a column of
 //! the subquery's own source: SQLite gives one that reads only outer columns
-//! to the outer query, which Citadel does not. Two SQLite behaviors are kept
-//! out of reach. SQLite 3.51.3 counts OFFSET against every EXISTS match once
-//! it plans the EXISTS as a join, so queries with EXISTS take no OFFSET.
-//! SQLite evaluates UPDATE SET subqueries against rows the statement has
-//! already changed, so they read only the other table.
+//! to the outer query, which Citadel does not. SQLite runs without its
+//! EXISTS-to-join rewrite, which returns wrong rows in 3.51.3. SQLite
+//! evaluates UPDATE SET subqueries against rows the statement has already
+//! changed, so they read only the other table.
 
 use citadel::{Argon2Profile, DatabaseBuilder};
 use citadel_sql::{Connection, ExecutionResult, Value};
@@ -522,9 +521,8 @@ impl Gen {
         }
     }
 
-    /// ORDER BY every output column, then possibly LIMIT, and OFFSET only
-    /// when the query has no EXISTS.
-    fn order_by(&mut self, width: usize, query: &str) -> String {
+    /// ORDER BY every output column, then possibly LIMIT and OFFSET.
+    fn order_by(&mut self, width: usize) -> String {
         let terms: Vec<String> = (1..=width)
             .map(|position| {
                 let direction = if self.rng.one_in(2) { " DESC" } else { "" };
@@ -539,7 +537,7 @@ impl Gen {
         let mut clause = format!(" ORDER BY {}", terms.join(", "));
         if self.rng.one_in(3) {
             clause.push_str(&format!(" LIMIT {}", self.rng.below(8)));
-            if !query.contains("EXISTS") && self.rng.one_in(2) {
+            if self.rng.one_in(2) {
                 clause.push_str(&format!(" OFFSET {}", self.rng.below(5)));
             }
         }
@@ -653,7 +651,7 @@ impl Gen {
                 sql.push_str(&format!(" HAVING {having}"));
             }
         }
-        let order = self.order_by(keys.len() + aggregates.len(), &sql);
+        let order = self.order_by(keys.len() + aggregates.len());
         sql + &order
     }
 
@@ -681,7 +679,7 @@ impl Gen {
                 (format!("{left} {op} {right}"), tys.len())
             }
         };
-        let order = self.order_by(width, &body);
+        let order = self.order_by(width);
         body + &order
     }
 
@@ -897,6 +895,7 @@ impl Engines {
             transactional: create(),
             sqlite: rusqlite::Connection::open_in_memory().unwrap(),
         };
+        without_exists_to_join(&engines.sqlite);
         let mut setup = vec![
             "CREATE TABLE t1 (id INTEGER NOT NULL PRIMARY KEY, a INTEGER, b INTEGER, \
              c TEXT, d TEXT COLLATE NOCASE)"
@@ -939,6 +938,24 @@ impl Engines {
             )
             .unwrap()
     }
+}
+
+/// SQLite 3.51.3 rewrites a WHERE EXISTS into a join that returns wrong rows:
+/// it counts OFFSET against every match, and drops an outer row when the
+/// subquery ORs a comparison on a NOCASE-indexed column with a correlated
+/// one. The oracle runs without that rewrite.
+fn without_exists_to_join(sqlite: &rusqlite::Connection) {
+    const SQLITE_EXISTS_TO_JOIN: std::ffi::c_uint = 0x4000_0000;
+    // SAFETY: the handle belongs to a live connection, and this operation
+    // only sets which of its optimizations are off.
+    let status = unsafe {
+        rusqlite::ffi::sqlite3_test_control(
+            rusqlite::ffi::SQLITE_TESTCTRL_OPTIMIZATIONS,
+            sqlite.handle(),
+            SQLITE_EXISTS_TO_JOIN,
+        )
+    };
+    assert_eq!(status, rusqlite::ffi::SQLITE_OK);
 }
 
 fn value_literal(rng: &mut Rng, ty: Ty, nocase: bool) -> String {
