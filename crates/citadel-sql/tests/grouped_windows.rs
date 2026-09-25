@@ -219,6 +219,35 @@ fn every_execution_path_groups_before_windows() {
 }
 
 #[test]
+fn derived_tables_and_ctes_group_before_windows() {
+    let db = database();
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
+    let expected = vec![
+        vec![text("east"), int(3), int(1)],
+        vec![text("north"), int(1), int(3)],
+        vec![text("west"), int(2), int(2)],
+    ];
+    for sql in [
+        "SELECT d.region, COUNT(*), RANK() OVER (ORDER BY COUNT(*) DESC) \
+         FROM (SELECT region, amount FROM sales WHERE id > 0) AS d \
+         GROUP BY d.region ORDER BY 1",
+        "WITH d AS (SELECT region, amount FROM sales WHERE id > 0) \
+         SELECT d.region, COUNT(*), RANK() OVER (ORDER BY COUNT(*) DESC) FROM d \
+         GROUP BY d.region ORDER BY 1",
+    ] {
+        assert_eq!(rows(&conn, sql), expected, "{sql}");
+    }
+    assert_eq!(
+        rows(
+            &conn,
+            "SELECT MIN(d.amount), SUM(COUNT(*)) OVER () FROM (SELECT amount FROM sales) AS d"
+        ),
+        vec![vec![int(5), int(6)]]
+    );
+}
+
+#[test]
 fn a_grouped_window_query_it_cannot_run_is_an_error() {
     let db = database();
     let conn = Connection::open(&db).unwrap();
