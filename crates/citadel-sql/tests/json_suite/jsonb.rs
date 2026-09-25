@@ -168,6 +168,96 @@ fn jsonb_build_array() {
 }
 
 #[test]
+fn a_text_value_passed_as_jsonb_is_json_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    let doc = "CAST('{\"a\":1,\"b\":[1,2]}' AS JSONB)";
+    let text = |sql: &str| match &conn.query(sql).unwrap().rows[0][0] {
+        Value::Jsonb(bytes) => citadel_sql::json::decode_to_text(bytes).unwrap(),
+        other => panic!("{sql}: {other:?}"),
+    };
+    for (sql, expected) in [
+        (
+            format!("SELECT jsonb_set({doc}, '{{a}}', '5')"),
+            r#"{"a":5,"b":[1,2]}"#,
+        ),
+        (
+            format!("SELECT jsonb_set({doc}, '{{name}}', '\"Bob\"')"),
+            r#"{"a":1,"b":[1,2],"name":"Bob"}"#,
+        ),
+        (
+            format!("SELECT jsonb_set({doc}, '{{b,0}}', '{{\"x\":[true,null]}}')"),
+            r#"{"a":1,"b":[{"x":[true,null]},2]}"#,
+        ),
+        (
+            format!("SELECT jsonb_insert({doc}, '{{b,1}}', '9')"),
+            r#"{"a":1,"b":[1,9,2]}"#,
+        ),
+        (
+            format!("SELECT jsonb_set({doc}, '{{a}}', 7)"),
+            r#"{"a":7,"b":[1,2]}"#,
+        ),
+    ] {
+        assert_eq!(text(&sql), expected, "{sql}");
+    }
+    // Positions as PostgreSQL resolves them: before (or after) the element
+    // named, from the end for a negative index, and past either end.
+    let pair = "CAST('[1,2]' AS JSONB)";
+    for (sql, expected) in [
+        (
+            format!("SELECT jsonb_insert({pair}, '{{1}}', '9', true)"),
+            "[1,2,9]",
+        ),
+        (
+            format!("SELECT jsonb_insert({pair}, '{{-1}}', '9')"),
+            "[1,9,2]",
+        ),
+        (
+            format!("SELECT jsonb_insert({pair}, '{{5}}', '9')"),
+            "[1,2,9]",
+        ),
+        (
+            format!("SELECT jsonb_insert({pair}, '{{-5}}', '9', true)"),
+            "[9,1,2]",
+        ),
+        (
+            "SELECT jsonb_insert(CAST('[]' AS JSONB), '{3}', '9')".into(),
+            "[9]",
+        ),
+        (
+            format!("SELECT jsonb_set({pair}, '{{-5}}', '9')"),
+            "[9,1,2]",
+        ),
+        (
+            format!("SELECT jsonb_insert({pair}, '{{-9223372036854775808}}', '9')"),
+            "[9,1,2]",
+        ),
+        (
+            format!("SELECT jsonb_set({pair}, '{{5}}', '9', false)"),
+            "[1,2]",
+        ),
+    ] {
+        assert_eq!(text(&sql), expected, "{sql}");
+    }
+    // jsonb_insert adds keys; replacing one is jsonb_set's job.
+    assert!(conn
+        .query(&format!("SELECT jsonb_insert({doc}, '{{a}}', '2')"))
+        .is_err());
+    // Text that is not JSON is refused rather than stored as a string.
+    assert!(conn
+        .query(&format!("SELECT jsonb_set({doc}, '{{a}}', 'Bob')"))
+        .is_err());
+    // to_jsonb is strict: NULL in, NULL out, not the JSON null.
+    assert_eq!(
+        conn.query("SELECT to_jsonb(NULL), to_json(NULL)")
+            .unwrap()
+            .rows,
+        vec![vec![Value::Null, Value::Null]]
+    );
+}
+
+#[test]
 fn jsonb_set_object() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
