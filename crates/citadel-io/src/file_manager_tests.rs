@@ -595,6 +595,94 @@ fn flagged_file_rejects_forged_v1_mac() {
     assert_eq!(slot.txn_id, TxnId(0));
 }
 
+/// Slot 0 is published and slot 1 holds a later authenticated slot, the
+/// shape a commit leaves when power fails before its selector flip.
+fn interrupted_commit_image(
+    mac_key: &[u8; MAC_KEY_SIZE],
+) -> (crate::memory_io::MemoryPageIO, CommitSlot) {
+    let io = crate::memory_io::MemoryPageIO::new();
+    let mut header = FileHeader::new(0xC3, [0x21; MAC_SIZE]);
+    for slot in &mut header.slots {
+        slot.seal(mac_key);
+    }
+    write_file_header(&io, &header).unwrap();
+    let mut published = sample_slot();
+    published.seal(mac_key);
+    let mut candidate = sample_slot();
+    candidate.txn_id = TxnId(published.txn_id.as_u64() + 1);
+    candidate.tree_root = PageId(12);
+    candidate.seal(mac_key);
+    write_commit_slot(&io, 0, &published).unwrap();
+    write_commit_slot(&io, 1, &candidate).unwrap();
+    write_god_byte(&io, GOD_BIT_RECOVERY).unwrap();
+    let published = read_commit_slot(&io, 0).unwrap();
+    (io, published)
+}
+
+fn raw_slot(io: &crate::memory_io::MemoryPageIO, slot_index: usize) -> [u8; COMMIT_SLOT_SIZE] {
+    let mut buf = [0u8; COMMIT_SLOT_SIZE];
+    io.read_at(
+        (COMMIT_SLOT_OFFSET + slot_index * COMMIT_SLOT_SIZE) as u64,
+        &mut buf,
+    )
+    .unwrap();
+    buf
+}
+
+/// The candidate's pages may never have reached the disk, so recovery
+/// replaces it with the published slot: neither the integrity walk nor a
+/// later fallback can reach it.
+#[test]
+fn recovery_replaces_an_interrupted_commit_candidate() {
+    let mac_key = test_mac_key();
+    let (io, published) = interrupted_commit_image(&mac_key);
+
+    let (idx, slot) = recover(&io, &mac_key).unwrap();
+    assert_eq!(idx, 0);
+    assert_eq!(slot, published);
+    assert_eq!(read_commit_slot(&io, 1).unwrap(), published);
+    assert_eq!(read_god_byte(&io).unwrap(), 0);
+}
+
+/// Recovery rewrites nothing but the marker when the other slot is the
+/// previous generation, fails authentication, or no commit was interrupted.
+#[test]
+fn recovery_keeps_slots_that_are_not_an_interrupted_candidate() {
+    let mac_key = test_mac_key();
+
+    let (previous, published) = interrupted_commit_image(&mac_key);
+    let mut older = published.clone();
+    older.txn_id = TxnId(published.txn_id.as_u64() - 1);
+    older.seal(&mac_key);
+    write_commit_slot(&previous, 1, &older).unwrap();
+
+    let (unauthenticated, _) = interrupted_commit_image(&mac_key);
+    let mac_offset = COMMIT_SLOT_OFFSET + COMMIT_SLOT_SIZE + SLOT_MAC;
+    let mut byte = [0u8; 1];
+    unauthenticated
+        .read_at(mac_offset as u64, &mut byte)
+        .unwrap();
+    unauthenticated
+        .write_at(mac_offset as u64, &[byte[0] ^ 0xFF])
+        .unwrap();
+
+    let (unmarked, _) = interrupted_commit_image(&mac_key);
+    write_god_byte(&unmarked, 0).unwrap();
+
+    for (case, io) in [
+        ("previous generation", previous),
+        ("unauthenticated slot", unauthenticated),
+        ("no recovery marker", unmarked),
+    ] {
+        let before = raw_slot(&io, 1);
+        let (idx, slot) = recover(&io, &mac_key).unwrap();
+        assert_eq!(idx, 0, "{case}");
+        assert_eq!(slot, published, "{case}");
+        assert_eq!(raw_slot(&io, 1), before, "{case}");
+        assert_eq!(read_god_byte(&io).unwrap(), 0, "{case}");
+    }
+}
+
 /// Exactly the V1 capacity seals V1 and preserves every entry; one more entry
 /// tips it to the legacy fallback. Pins the seal boundary both sides.
 #[test]

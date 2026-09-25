@@ -1252,6 +1252,9 @@ fn shared_pending_free_tail_survives_each_commit_write_failure() {
         drop(oldest);
         drop(mgr);
 
+        // Recovery replaces an interrupted candidate, so the probes below fork
+        // the image as the commit left it.
+        let left_by_commit = io.deep_clone();
         let reopened = TxnManager::open_with_sync(
             Box::new(CappedCommitIO::new(io.share(), MAX_BYTES)),
             dek,
@@ -1282,14 +1285,14 @@ fn shared_pending_free_tail_survives_each_commit_write_failure() {
         // fork. Normal recovery still follows its god byte above; these probes
         // additionally prove neither recovery generation lost its shared tail.
         for slot_index in 0..2 {
-            let slot = read_commit_slot(&io, slot_index).unwrap();
+            let slot = read_commit_slot(&left_by_commit, slot_index).unwrap();
             let expected = if slot.txn_id == target_txn {
                 b"newvalue".as_slice()
             } else {
                 assert_eq!(slot, before_slots[slot_index]);
                 before_values[slot_index]
             };
-            let fork = io.deep_clone();
+            let fork = left_by_commit.deep_clone();
             write_god_byte(&fork, slot_index as u8).unwrap();
             let recovered = TxnManager::open_with_sync(
                 Box::new(CappedCommitIO::new(fork, MAX_BYTES)),
@@ -1509,6 +1512,9 @@ fn consuming_pending_head_survives_each_commit_write_failure() {
         drop(current_reader);
         drop(manager);
 
+        // Recovery replaces an interrupted candidate, so the probes below fork
+        // the image as the commit left it.
+        let left_by_commit = io.deep_clone();
         let reopened = TxnManager::open_with_sync(
             Box::new(CappedCommitIO::new(io.share(), MAX_BYTES)),
             dek,
@@ -1540,7 +1546,7 @@ fn consuming_pending_head_survives_each_commit_write_failure() {
 
         // Both physical slots remain readable even without registered readers.
         for (slot_index, before_slot) in before_slots.iter().enumerate() {
-            let slot = read_commit_slot(&io, slot_index).unwrap();
+            let slot = read_commit_slot(&left_by_commit, slot_index).unwrap();
             let expected = if slot.txn_id == target_txn {
                 b"newvalue".as_slice()
             } else {
@@ -1552,7 +1558,7 @@ fn consuming_pending_head_survives_each_commit_write_failure() {
                     b"durable2".as_slice()
                 }
             };
-            let fork = io.deep_clone();
+            let fork = left_by_commit.deep_clone();
             write_god_byte(&fork, slot_index as u8).unwrap();
             let recovered = TxnManager::open_with_sync(
                 Box::new(CappedCommitIO::new(fork, MAX_BYTES)),
