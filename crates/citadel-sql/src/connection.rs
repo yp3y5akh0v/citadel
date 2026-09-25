@@ -302,21 +302,6 @@ fn is_txn_control(stmt: &Statement) -> bool {
     matches!(stmt, Statement::Begin { .. }) || is_active_txn_control(stmt)
 }
 
-/// Parses SQL a caller submits and checks its qualified column references.
-/// Stored views and trigger bodies are re-parsed without the check, so
-/// definitions saved before it keep working.
-fn parse_submitted(sql: &str) -> Result<Statement> {
-    let stmt = parser::parse_sql(sql)?;
-    parser::validate_qualifiers(&stmt)?;
-    Ok(stmt)
-}
-
-fn parse_submitted_multi(sql: &str) -> Result<Vec<Statement>> {
-    let stmts = parser::parse_sql_multi(sql)?;
-    stmts.iter().try_for_each(parser::validate_qualifiers)?;
-    Ok(stmts)
-}
-
 fn try_normalize_insert(sql: &str) -> Option<(String, Vec<Value>)> {
     let bytes = sql.as_bytes();
     let len = bytes.len();
@@ -731,7 +716,7 @@ impl<'a> Connection<'a> {
     }
 
     fn execute_script_impl(&self, sql: &str, budget: Option<&ReadBudget>) -> ScriptExecution {
-        let stmts = match parse_submitted_multi(sql) {
+        let stmts = match parser::parse_submitted_multi(sql) {
             Ok(s) => s,
             Err(e) => {
                 return ScriptExecution {
@@ -1107,7 +1092,7 @@ impl<'a> ConnectionInner<'a> {
         if let Some(token) = db.cancel_token() {
             token.check().map_err(SqlError::Storage)?;
         }
-        let stmts = parse_submitted_multi(sql)?;
+        let stmts = parser::parse_submitted_multi(sql)?;
         if stmts.iter().any(is_txn_control) {
             return Err(SqlError::Unsupported(
                 "transaction-control statements are not allowed in execute_batch".into(),
@@ -1355,7 +1340,7 @@ impl<'a> ConnectionInner<'a> {
         try_drain_deferred_temp_drops(db);
         let mut parsed = Vec::with_capacity(statements.len());
         for &(sql, params) in statements {
-            let stmt = parse_submitted(sql)?;
+            let stmt = parser::parse_submitted(sql)?;
             let expected = parser::count_params(&stmt);
             if expected != params.len() {
                 return Err(SqlError::ParameterCountMismatch {
@@ -1455,7 +1440,7 @@ impl<'a> ConnectionInner<'a> {
         normalized_key: String,
         gen: u64,
     ) -> Result<Option<Arc<Statement>>> {
-        let stmt = Arc::new(parse_submitted(&normalized_key)?);
+        let stmt = Arc::new(parser::parse_submitted(&normalized_key)?);
         let param_count = parser::count_params(&stmt);
         let literal_bindings_safe = !self.schema.may_read_scoped_parameters();
         self.stmt_cache.put(
@@ -1480,7 +1465,7 @@ impl<'a> ConnectionInner<'a> {
             }
         }
 
-        let stmt = Arc::new(parse_submitted(sql)?);
+        let stmt = Arc::new(parser::parse_submitted(sql)?);
         let param_count = parser::count_params(&stmt);
 
         let cacheable = !matches!(

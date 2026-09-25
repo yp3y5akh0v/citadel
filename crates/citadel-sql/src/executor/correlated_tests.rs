@@ -59,11 +59,21 @@ fn resolves_in_unknown_column_false() {
     assert!(!resolves_in("missing", &ts));
 }
 
+fn unqualified(columns: &[&str]) -> Vec<ColumnName> {
+    columns
+        .iter()
+        .map(|column| ColumnName {
+            table: None,
+            column: (*column).into(),
+        })
+        .collect()
+}
+
 #[test]
 fn collect_column_names_single_column() {
     let mut out = Vec::new();
     collect_column_names(&Expr::Column("X".into()), &mut out);
-    assert_eq!(out, vec!["x"]);
+    assert_eq!(out, unqualified(&["x"]));
 }
 
 #[test]
@@ -76,7 +86,32 @@ fn collect_column_names_qualified_lowercase() {
         },
         &mut out,
     );
-    assert_eq!(out, vec!["t.col"]);
+    assert_eq!(
+        out,
+        vec![ColumnName {
+            table: Some("t".into()),
+            column: "col".into(),
+        }]
+    );
+}
+
+#[test]
+fn collect_column_names_keeps_a_dotted_qualifier_whole() {
+    let mut out = Vec::new();
+    collect_column_names(
+        &Expr::QualifiedColumn {
+            table: "information_schema.tables".into(),
+            column: "table_name".into(),
+        },
+        &mut out,
+    );
+    assert_eq!(
+        out,
+        vec![ColumnName {
+            table: Some("information_schema.tables".into()),
+            column: "table_name".into(),
+        }]
+    );
 }
 
 #[test]
@@ -88,7 +123,7 @@ fn collect_column_names_binary_op_collects_both_sides() {
         right: Box::new(Expr::Column("b".into())),
     };
     collect_column_names(&e, &mut out);
-    assert_eq!(out, vec!["a", "b"]);
+    assert_eq!(out, unqualified(&["a", "b"]));
 }
 
 #[test]
@@ -107,7 +142,7 @@ fn collect_column_names_function_args() {
         distinct: false,
     };
     collect_column_names(&e, &mut out);
-    assert_eq!(out, vec!["x"]);
+    assert_eq!(out, unqualified(&["x"]));
 }
 
 #[test]
@@ -119,7 +154,7 @@ fn collect_column_names_coalesce_collects_all() {
         Expr::Column("c".into()),
     ]);
     collect_column_names(&e, &mut out);
-    assert_eq!(out, vec!["a", "b", "c"]);
+    assert_eq!(out, unqualified(&["a", "b", "c"]));
 }
 
 #[test]
@@ -131,7 +166,7 @@ fn collect_column_names_case_branches() {
         else_result: Some(Box::new(Expr::Column("el".into()))),
     };
     collect_column_names(&e, &mut out);
-    assert_eq!(out, vec!["op", "c", "r", "el"]);
+    assert_eq!(out, unqualified(&["op", "c", "r", "el"]));
 }
 
 #[test]
@@ -144,7 +179,7 @@ fn collect_column_names_between() {
         negated: false,
     };
     collect_column_names(&e, &mut out);
-    assert_eq!(out, vec!["x", "lo", "hi"]);
+    assert_eq!(out, unqualified(&["x", "lo", "hi"]));
 }
 
 #[test]
@@ -153,7 +188,7 @@ fn collect_column_names_unary_and_isnull() {
     let inner = Expr::Column("x".into());
     collect_column_names(&Expr::IsNull(Box::new(inner.clone())), &mut out);
     collect_column_names(&Expr::IsNotNull(Box::new(inner)), &mut out);
-    assert_eq!(out, vec!["x", "x"]);
+    assert_eq!(out, unqualified(&["x", "x"]));
 }
 
 #[test]

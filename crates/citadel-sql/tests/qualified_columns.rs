@@ -128,6 +128,125 @@ fn qualifiers_of_every_visible_source_resolve() {
 }
 
 #[test]
+fn a_multi_part_name_keeps_its_qualifier() {
+    let db = database();
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
+    assert_eq!(
+        conn.query(
+            "SELECT information_schema.tables.table_name FROM information_schema.tables \
+             WHERE information_schema.tables.table_name = 't'"
+        )
+        .unwrap()
+        .rows,
+        vec![vec![Value::Text("t".into())]]
+    );
+    for sql in [
+        "SELECT nope.t.a FROM t",
+        "SELECT x.t.a FROM t AS x",
+        "SELECT id FROM t WHERE nope.t.a = 10",
+    ] {
+        let result = conn.query(sql);
+        assert!(
+            matches!(&result, Err(SqlError::ColumnNotFound(name)) if name.contains('.')),
+            "{sql}: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn a_dotted_source_is_visible_by_its_last_part_from_a_subquery() {
+    let db = database();
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
+    // The subquery's own source has a table_name column too.
+    conn.execute("CREATE TABLE names (id INTEGER NOT NULL PRIMARY KEY, table_name TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO names VALUES (1, 'other')")
+        .unwrap();
+    for sql in [
+        "SELECT (SELECT COUNT(*) FROM names WHERE tables.table_name = 't') \
+         FROM information_schema.tables WHERE table_name = 't'",
+        "SELECT (SELECT COUNT(*) FROM names \
+         WHERE information_schema.tables.table_name = 't') \
+         FROM information_schema.tables WHERE table_name = 't'",
+    ] {
+        assert_eq!(conn.query(sql).unwrap().rows, ints(&[&[1]]), "{sql}");
+    }
+}
+
+#[test]
+fn a_dotted_table_reads_the_same_through_either_name() {
+    let db = database();
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
+    for sql in [
+        "CREATE TABLE s.t (id INTEGER NOT NULL PRIMARY KEY, a INTEGER, k INTEGER)",
+        "INSERT INTO s.t VALUES (1, 10, 1), (2, 20, 1), (3, 30, 2)",
+        // Shares a column name with s.t, so a misread qualifier reads it.
+        "CREATE TABLE names (id INTEGER NOT NULL PRIMARY KEY, a INTEGER)",
+        "INSERT INTO names VALUES (1, 99)",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+    for (sql, expected) in [
+        (
+            "SELECT t.a, names.a FROM s.t JOIN names ON names.id = t.id",
+            ints(&[&[10, 99]]),
+        ),
+        (
+            "SELECT id FROM s.t WHERE EXISTS \
+             (SELECT 1 FROM names WHERE names.id = t.id) ORDER BY id",
+            ints(&[&[1]]),
+        ),
+        (
+            "SELECT (SELECT COUNT(*) FROM names WHERE names.id = 1 AND t.a = 10) \
+             FROM s.t ORDER BY id",
+            ints(&[&[1], &[0], &[0]]),
+        ),
+        (
+            "SELECT (SELECT COUNT(*) FROM names WHERE s.t.a = 10) FROM s.t ORDER BY id",
+            ints(&[&[1], &[0], &[0]]),
+        ),
+        // An equality on an outer-only column plus a filter on the outer row.
+        (
+            "SELECT id FROM s.t WHERE EXISTS \
+             (SELECT 1 FROM names WHERE names.id = k AND t.a > 15) ORDER BY id",
+            ints(&[&[2]]),
+        ),
+    ] {
+        assert_eq!(conn.query(sql).unwrap().rows, expected, "{sql}");
+    }
+    let written = conn.query("SELECT t.a FROM s.t ORDER BY t.a").unwrap();
+    assert_eq!(written.columns, ["t.a"]);
+    assert_eq!(written.rows, ints(&[&[10], &[20], &[30]]));
+
+    conn.execute(
+        "CREATE VIEW matched AS SELECT id FROM s.t \
+         WHERE EXISTS (SELECT 1 FROM names WHERE names.id = t.id)",
+    )
+    .unwrap();
+    assert_eq!(
+        conn.query("SELECT id FROM matched").unwrap().rows,
+        ints(&[&[1]])
+    );
+    conn.execute("UPDATE s.t SET a = (SELECT names.a FROM names WHERE names.id = t.id)")
+        .unwrap();
+    assert_eq!(
+        conn.query("SELECT id, a FROM s.t WHERE a IS NOT NULL")
+            .unwrap()
+            .rows,
+        ints(&[&[1, 99]])
+    );
+
+    let ambiguous = conn.query("SELECT t.a FROM t, s.t");
+    assert!(
+        matches!(&ambiguous, Err(SqlError::AmbiguousColumn(name)) if name == "t.a"),
+        "{ambiguous:?}"
+    );
+}
+
+#[test]
 fn a_view_stored_before_the_check_keeps_reading() {
     let db = database();
     let conn = Connection::open(&db).unwrap();
