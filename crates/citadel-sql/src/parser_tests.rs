@@ -1331,6 +1331,23 @@ fn partial_index_rejects_standard_and_tz_jsonpath_evaluation() {
 }
 
 #[test]
+fn partial_index_rejects_every_aggregate_but_not_scalar_min_max() {
+    for sql in [
+        "CREATE INDEX i ON t (id) WHERE COUNT(a) > 0",
+        "CREATE INDEX i ON t (id) WHERE MIN(a) > 0",
+        "CREATE INDEX i ON t (id) WHERE JSON_AGG(a) IS NULL",
+        "CREATE INDEX i ON t (id) WHERE JSONB_OBJECT_AGG(a, b) IS NULL",
+    ] {
+        let err = parse_sql(sql).unwrap_err();
+        assert!(
+            matches!(&err, SqlError::Unsupported(msg) if msg.contains("cannot contain aggregates")),
+            "{sql}: {err:?}"
+        );
+    }
+    assert!(parse_sql("CREATE INDEX i ON t (id) WHERE MIN(a, b) > 0").is_ok());
+}
+
+#[test]
 fn immutable_expression_and_json_predicate_remain_indexable() {
     assert!(parse_sql("CREATE INDEX i_lower ON t (LOWER(email))").is_ok());
     assert!(parse_sql(r#"CREATE INDEX i_json ON t (id) WHERE j @> '{"active": true}'"#).is_ok());
@@ -2191,6 +2208,9 @@ fn converter_rejects_distinct_when_result_cannot_represent_it() {
         "COALESCE(DISTINCT id, 0)",
         "NULLIF(DISTINCT id, 0)",
         "IIF(DISTINCT id > 0, 1, 0)",
+        "ABS(DISTINCT id)",
+        "LOWER(DISTINCT name)",
+        "MAX(DISTINCT id, 0)",
         "COUNT(*, id)",
         "COUNT(id, *)",
     ] {

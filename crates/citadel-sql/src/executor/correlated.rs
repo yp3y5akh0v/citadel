@@ -853,7 +853,7 @@ fn hashable_scalar(query: &SelectStmt, inner_schema: &TableSchema) -> Option<Has
     match expr {
         Expr::CountStar => Some(HashedScalar::Aggregate(Value::Integer(0))),
         Expr::Function { name, args, .. }
-            if super::aggregate::is_aggregate_function(name, args.len())
+            if crate::parser::is_aggregate_function(name, args.len())
                 && !args.iter().any(super::aggregate::is_aggregate_expr) =>
         {
             Some(HashedScalar::Aggregate(

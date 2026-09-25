@@ -2539,7 +2539,7 @@ fn validate_partial_index_predicate(expr: &Expr) -> Result<()> {
             Expr::Parameter(_) => bad = Some("bound parameters"),
             Expr::QualifiedColumn { .. } => bad = Some("cross-table references"),
             Expr::Function { name, args, .. } => {
-                if is_aggregate_function(name) {
+                if is_aggregate_function(name, args.len()) {
                     bad = Some("aggregates");
                 } else if crate::eval::is_volatile_function_expr(&name.to_ascii_uppercase(), args) {
                     bad = Some("non-deterministic functions");
@@ -2567,11 +2567,15 @@ fn validate_partial_index_predicate(expr: &Expr) -> Result<()> {
     Ok(())
 }
 
-fn is_aggregate_function(name: &str) -> bool {
+/// Whether a call of `name` with `arg_count` arguments is an aggregate. MIN
+/// and MAX with other arities are the scalar functions.
+pub(crate) fn is_aggregate_function(name: &str, arg_count: usize) -> bool {
+    let u = name.to_ascii_uppercase();
     matches!(
-        name.to_ascii_lowercase().as_str(),
-        "count" | "sum" | "avg" | "min" | "max" | "total" | "group_concat" | "string_agg"
-    )
+        u.as_str(),
+        "COUNT" | "SUM" | "AVG" | "JSON_AGG" | "JSONB_AGG"
+    ) || (matches!(u.as_str(), "MIN" | "MAX") && arg_count == 1)
+        || (matches!(u.as_str(), "JSON_OBJECT_AGG" | "JSONB_OBJECT_AGG") && arg_count == 2)
 }
 
 fn convert_create_trigger(ct: sp::CreateTrigger) -> Result<Statement> {
@@ -4309,7 +4313,7 @@ fn convert_function(func: &sp::Function) -> Result<Expr> {
         (distinct && over.is_some(), "DISTINCT window functions"),
         (distinct && is_count_star, "COUNT(DISTINCT *)"),
         (
-            distinct && matches!(name.as_str(), "COALESCE" | "NULLIF" | "IIF"),
+            distinct && !is_aggregate_function(&name, args.len()),
             "DISTINCT on scalar expressions",
         ),
     ])?;
