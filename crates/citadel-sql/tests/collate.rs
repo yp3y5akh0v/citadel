@@ -10,7 +10,10 @@ fn create_db(dir: &std::path::Path) -> citadel::Database {
 }
 
 fn assert_ok(r: ExecutionResult) {
-    matches!(r, ExecutionResult::Ok | ExecutionResult::RowsAffected(_));
+    assert!(
+        matches!(r, ExecutionResult::Ok | ExecutionResult::RowsAffected(_)),
+        "{r:?}"
+    );
 }
 
 fn setup(conn: &Connection) {
