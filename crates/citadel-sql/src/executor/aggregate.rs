@@ -22,42 +22,7 @@ pub(super) fn exec_aggregate(
     check_cancel(cancel)?;
     let col_map = ColumnMap::new(columns);
     let group_exprs = resolve_group_by_exprs(&stmt.group_by, &stmt.columns, &col_map)?;
-    let groups: BTreeMap<Vec<Value>, Vec<&Vec<Value>>> = if group_exprs.is_empty() {
-        let mut m = BTreeMap::new();
-        let group_rows = if cancel.is_none() {
-            rows.iter().collect()
-        } else {
-            let mut group_rows = Vec::with_capacity(rows.len());
-            for (row_idx, row) in rows.iter().enumerate() {
-                check_cancel_at(cancel, row_idx)?;
-                group_rows.push(row);
-            }
-            check_cancel(cancel)?;
-            group_rows
-        };
-        m.insert(vec![], group_rows);
-        m
-    } else {
-        // Folded, so a column whose collation calls two spellings equal groups them.
-        // The key decides equality by comparing, not by an operator, so the
-        // collation has to be baked into it.
-        let group_colls: Vec<crate::types::Collation> = group_exprs
-            .iter()
-            .map(|expr| expr_collation(expr, &col_map))
-            .collect();
-        let mut m: BTreeMap<Vec<Value>, Vec<&Vec<Value>>> = BTreeMap::new();
-        for (row_idx, row) in rows.iter().enumerate() {
-            check_cancel_at(cancel, row_idx)?;
-            let ctx = EvalCtx::new(&col_map, row).with_cancel(cancel);
-            let group_key: Vec<Value> = group_exprs
-                .iter()
-                .zip(&group_colls)
-                .map(|(expr, coll)| eval_expr(expr, &ctx).map(|v| coll.fold(v)))
-                .collect::<Result<_>>()?;
-            m.entry(group_key).or_default().push(row);
-        }
-        m
-    };
+    let groups = group_rows(rows, &group_exprs, &col_map, cancel)?;
 
     let mut result_rows = Vec::new();
     let output_cols = build_output_columns(&stmt.columns, columns);
@@ -80,7 +45,7 @@ pub(super) fn exec_aggregate(
         .collect();
     let mut result_sort_keys = Vec::with_capacity(groups.len());
 
-    for (group_idx, group_rows) in groups.values().enumerate() {
+    for (group_idx, group_rows) in groups.iter().enumerate() {
         check_cancel_at(cancel, group_idx)?;
         let mut result_row = Vec::new();
 
@@ -203,6 +168,282 @@ pub(super) fn exec_aggregate(
         columns: col_names,
         rows: result_rows,
     }))
+}
+
+/// What a grouped query's window functions run over. They run after GROUP BY
+/// and HAVING, so each row is a group HAVING keeps: the group's first row, or
+/// NULLs for the one group of an ungrouped query over no rows, followed by the
+/// value of each aggregate call.
+pub(super) struct GroupedWindowInput {
+    pub(super) columns: Vec<ColumnDef>,
+    pub(super) rows: Vec<Vec<Value>>,
+    /// Reads each aggregate call from its column. WHERE, GROUP BY and HAVING
+    /// are gone: the rows already reflect them.
+    pub(super) stmt: SelectStmt,
+}
+
+/// None when the query does not group.
+pub(super) fn group_for_windows(
+    rows: &[Vec<Value>],
+    ctx: super::SelectCtx<'_>,
+) -> Result<Option<GroupedWindowInput>> {
+    let super::SelectCtx {
+        columns,
+        stmt,
+        cancel,
+        ..
+    } = ctx;
+    let mut select = stmt.clone();
+    let mut calls = Vec::new();
+    for column in &mut select.columns {
+        if let SelectColumn::Expr { expr, alias } = column {
+            let written = alias.is_none().then(|| expr_display_name(expr));
+            lift_aggregates(expr, &mut calls);
+            if let Some(written) = written {
+                if written != expr_display_name(expr) {
+                    *alias = Some(written);
+                }
+            }
+        }
+    }
+    for item in &mut select.order_by {
+        lift_aggregates(&mut item.expr, &mut calls);
+    }
+    if calls.is_empty() && stmt.group_by.is_empty() && stmt.having.is_none() {
+        return Ok(None);
+    }
+    if stmt
+        .columns
+        .iter()
+        .any(|column| !matches!(column, SelectColumn::Expr { .. }))
+    {
+        return Err(SqlError::Unsupported("SELECT * with GROUP BY".into()));
+    }
+    check_cancel(cancel)?;
+    let col_map = ColumnMap::new(columns);
+    let group_exprs = resolve_group_by_exprs(&stmt.group_by, &stmt.columns, &col_map)?;
+    if group_exprs
+        .iter()
+        .any(|expr| super::window::has_window_function(expr))
+    {
+        return Err(SqlError::Unsupported("window functions in GROUP BY".into()));
+    }
+    let mut grouped = Vec::new();
+    let groups = group_rows(rows, &group_exprs, &col_map, cancel)?;
+    for (group_idx, group) in groups.iter().enumerate() {
+        check_cancel_at(cancel, group_idx)?;
+        if let Some(having) = &stmt.having {
+            if !having_keeps(having, stmt, columns, &col_map, group, cancel)? {
+                continue;
+            }
+        }
+        let mut row = match group.first() {
+            Some(first) => (*first).clone(),
+            None => vec![Value::Null; columns.len()],
+        };
+        for call in &calls {
+            row.push(eval_aggregate_expr_with_cancel(
+                call, &col_map, group, cancel,
+            )?);
+        }
+        grouped.push(row);
+    }
+    let mut extended = columns.to_vec();
+    for (index, call) in calls.iter().enumerate() {
+        let collation = expr_collation(call, &col_map);
+        extended.push(projected_column(
+            aggregate_column(index),
+            extended.len(),
+            collation,
+        ));
+    }
+    select.where_clause = None;
+    select.group_by.clear();
+    select.having = None;
+    Ok(Some(GroupedWindowInput {
+        columns: extended,
+        rows: grouped,
+        stmt: select,
+    }))
+}
+
+fn aggregate_column(index: usize) -> String {
+    format!("__aggregate_{index}")
+}
+
+/// Replaces each aggregate call in `expr`, including those a window function
+/// reads, with the column holding its value, and appends the call to `calls`.
+/// A subquery's calls aggregate the subquery's rows and stay.
+fn lift_aggregates(expr: &mut Expr, calls: &mut Vec<Expr>) {
+    let aggregate = match expr {
+        Expr::CountStar => true,
+        Expr::Function { name, args, .. } => is_aggregate_function(name, args.len()),
+        _ => false,
+    };
+    if aggregate {
+        let column = Expr::Column(aggregate_column(calls.len()));
+        calls.push(std::mem::replace(expr, column));
+        return;
+    }
+    let mut lift = |expr: &mut Expr| lift_aggregates(expr, calls);
+    match expr {
+        Expr::Function { args, .. } | Expr::Coalesce(args) | Expr::ArrayLiteral(args) => {
+            args.iter_mut().for_each(&mut lift);
+        }
+        Expr::WindowFunction { args, spec, .. } => {
+            args.iter_mut().for_each(&mut lift);
+            spec.partition_by.iter_mut().for_each(&mut lift);
+            spec.order_by
+                .iter_mut()
+                .for_each(|item| lift(&mut item.expr));
+        }
+        Expr::BinaryOp { left, right, .. } | Expr::IsDistinctFrom { left, right, .. } => {
+            lift(left);
+            lift(right);
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::IsNull(expr)
+        | Expr::IsNotNull(expr)
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. }
+        | Expr::InSet { expr, .. }
+        | Expr::InSubquery { expr, .. } => lift(expr),
+        Expr::InList { expr, list, .. } => {
+            lift(expr);
+            list.iter_mut().for_each(&mut lift);
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            lift(expr);
+            lift(low);
+            lift(high);
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            lift(expr);
+            lift(pattern);
+            if let Some(escape) = escape {
+                lift(escape);
+            }
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+        } => {
+            if let Some(operand) = operand {
+                lift(operand);
+            }
+            for (condition, result) in conditions {
+                lift(condition);
+                lift(result);
+            }
+            if let Some(else_result) = else_result {
+                lift(else_result);
+            }
+        }
+        Expr::Quantified { left, right, .. } => {
+            lift(left);
+            if let QuantifiedRhs::Array(array) = right {
+                lift(array);
+            }
+        }
+        Expr::CountStar
+        | Expr::Exists { .. }
+        | Expr::ScalarSubquery(_)
+        | Expr::Literal(_)
+        | Expr::BoundColumn { .. }
+        | Expr::Column(_)
+        | Expr::QualifiedColumn { .. }
+        | Expr::Parameter(_)
+        | Expr::TypedNullRecord(_) => {}
+    }
+}
+
+/// Whether HAVING keeps a group. HAVING may name an output column, as it
+/// may without window functions; one that holds a window function has no
+/// value yet, since windows run after HAVING.
+fn having_keeps(
+    having: &Expr,
+    stmt: &SelectStmt,
+    columns: &[ColumnDef],
+    col_map: &ColumnMap,
+    group: &[&Vec<Value>],
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<bool> {
+    match eval_aggregate_expr_with_cancel(having, col_map, group, cancel) {
+        Ok(value) => Ok(is_truthy(&value)),
+        Err(SqlError::ColumnNotFound(_)) => {
+            let outputs: Vec<SelectColumn> = stmt
+                .columns
+                .iter()
+                .filter(|column| {
+                    matches!(column, SelectColumn::Expr { expr, .. }
+                        if !super::window::has_window_function(expr))
+                })
+                .cloned()
+                .collect();
+            let mut values = Vec::with_capacity(outputs.len());
+            for column in &outputs {
+                if let SelectColumn::Expr { expr, .. } = column {
+                    values.push(eval_aggregate_expr_with_cancel(
+                        expr, col_map, group, cancel,
+                    )?);
+                }
+            }
+            let output_columns = build_output_columns(&outputs, columns);
+            let output_map = ColumnMap::new(&output_columns);
+            let ctx = EvalCtx::new(&output_map, &values).with_cancel(cancel);
+            Ok(is_truthy(&eval_expr(having, &ctx)?))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Each group's rows, in group key order. Without GROUP BY every row is in
+/// one group, which exists even when there are no rows.
+fn group_rows<'r>(
+    rows: &'r [Vec<Value>],
+    group_exprs: &[&Expr],
+    col_map: &ColumnMap,
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<Vec<Vec<&'r Vec<Value>>>> {
+    if group_exprs.is_empty() {
+        if cancel.is_none() {
+            return Ok(vec![rows.iter().collect()]);
+        }
+        let mut group = Vec::with_capacity(rows.len());
+        for (row_idx, row) in rows.iter().enumerate() {
+            check_cancel_at(cancel, row_idx)?;
+            group.push(row);
+        }
+        check_cancel(cancel)?;
+        return Ok(vec![group]);
+    }
+    // Folded, so a column whose collation calls two spellings equal groups them.
+    // The key decides equality by comparing, not by an operator, so the
+    // collation has to be baked into it.
+    let group_colls: Vec<crate::types::Collation> = group_exprs
+        .iter()
+        .map(|expr| expr_collation(expr, col_map))
+        .collect();
+    let mut groups: BTreeMap<Vec<Value>, Vec<&Vec<Value>>> = BTreeMap::new();
+    for (row_idx, row) in rows.iter().enumerate() {
+        check_cancel_at(cancel, row_idx)?;
+        let ctx = EvalCtx::new(col_map, row).with_cancel(cancel);
+        let group_key: Vec<Value> = group_exprs
+            .iter()
+            .zip(&group_colls)
+            .map(|(expr, coll)| eval_expr(expr, &ctx).map(|v| coll.fold(v)))
+            .collect::<Result<_>>()?;
+        groups.entry(group_key).or_default().push(row);
+    }
+    Ok(groups.into_values().collect())
 }
 
 /// Resolves GROUP BY ordinals (1-based) and output aliases to their expressions.
