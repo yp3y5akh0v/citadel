@@ -1212,8 +1212,8 @@ fn agg_select_stmt(sql: &str) -> SelectStmt {
     }
 }
 
-fn agg_rows(plan: StreamAggPlan, states: Vec<AggState>) -> Vec<Vec<Value>> {
-    match plan.finish(states) {
+fn agg_rows(plan: StreamAggPlan, states: Vec<AggState>, stmt: &SelectStmt) -> Vec<Vec<Value>> {
+    match plan.finish(states, stmt).unwrap() {
         ExecutionResult::Query(q) => q.rows,
         other => panic!("expected query result, got {other:?}"),
     }
@@ -1385,7 +1385,7 @@ mod parallel {
             })
             .unwrap();
             assert!(err.is_none());
-            agg_rows(plan, states)
+            agg_rows(plan, states, &stmt)
         };
 
         for shard_leaves in [1usize, 2, 3, 7] {
@@ -1396,7 +1396,7 @@ mod parallel {
             let leaves = rtx.collect_table_leaves(b"t").unwrap();
             let states = parallel_stream_agg_sharded(&rtx, &plan, &leaves, shard_leaves).unwrap();
             assert_eq!(
-                agg_rows(plan, states),
+                agg_rows(plan, states, &stmt),
                 serial_rows,
                 "shard size {shard_leaves}"
             );

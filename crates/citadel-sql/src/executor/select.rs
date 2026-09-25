@@ -480,11 +480,7 @@ fn exec_stream_agg(
     if let Some(e) = scan_err {
         return Err(e);
     }
-    let mut result = plan.finish(states);
-    if let ExecutionResult::Query(query) = &mut result {
-        apply_offset_limit(&mut query.rows, stmt)?;
-    }
-    Ok(result)
+    plan.finish(states, stmt)
 }
 
 fn fts_phrase_ast_from_predicate(expr: &Expr) -> Option<crate::fts::TsQueryAst> {
@@ -2573,13 +2569,19 @@ impl StreamAggPlan {
         self.raw_feed().feed(key, value, states, scan_err)
     }
 
-    pub(super) fn finish(self, states: Vec<AggState>) -> ExecutionResult {
+    /// The aggregate row, cut by the statement's OFFSET and LIMIT.
+    pub(super) fn finish(
+        self,
+        states: Vec<AggState>,
+        stmt: &SelectStmt,
+    ) -> Result<ExecutionResult> {
         let col_names: Vec<String> = self.ops.iter().map(|(_, name)| name.clone()).collect();
-        let result_row: Vec<Value> = states.into_iter().map(|s| s.finish()).collect();
-        ExecutionResult::Query(QueryResult {
+        let mut rows = vec![states.into_iter().map(|s| s.finish()).collect()];
+        apply_offset_limit(&mut rows, stmt)?;
+        Ok(ExecutionResult::Query(QueryResult {
             columns: col_names,
-            rows: vec![result_row],
-        })
+            rows,
+        }))
     }
 }
 

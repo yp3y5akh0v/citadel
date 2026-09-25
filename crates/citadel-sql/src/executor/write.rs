@@ -1669,7 +1669,7 @@ pub(super) fn exec_select_in_txn(
         if let Some(e) = scan_err {
             return Err(e);
         }
-        return Ok(plan.finish(states));
+        return plan.finish(states, stmt);
     }
 
     if let Some(plan) = StreamGroupByPlan::try_new(stmt, table_schema)? {

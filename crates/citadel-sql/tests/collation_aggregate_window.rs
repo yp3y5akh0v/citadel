@@ -233,18 +233,27 @@ fn aggregate_fast_lanes_apply_limit_offset_and_distinct_semantics() {
     conn.execute("INSERT INTO a VALUES (1,1,'B'),(2,1,'a'),(3,2,'D'),(4,2,'c')")
         .unwrap();
 
-    assert!(rows(&conn, "SELECT MIN(s) FROM a ORDER BY 1 LIMIT 0").is_empty());
-    assert!(rows(&conn, "SELECT COUNT(*) FROM a ORDER BY 1 OFFSET 1").is_empty());
-    assert_eq!(
-        rows(&conn, "SELECT DISTINCT COUNT(*) FROM a GROUP BY g").len(),
-        1,
-        "the streaming GROUP BY lane must not bypass DISTINCT"
-    );
-    assert_eq!(
-        rows(&conn, "SELECT g, MIN(s) FROM a GROUP BY g OFFSET 1").len(),
-        1,
-        "the streaming GROUP BY lane must not bypass OFFSET"
-    );
+    for transaction in [false, true] {
+        if transaction {
+            conn.execute("BEGIN").unwrap();
+        }
+        assert!(rows(&conn, "SELECT MIN(s) FROM a ORDER BY 1 LIMIT 0").is_empty());
+        assert!(rows(&conn, "SELECT COUNT(*) FROM a ORDER BY 1 OFFSET 1").is_empty());
+        assert!(rows(&conn, "SELECT SUM(g) FROM a WHERE g > 0 LIMIT 1 OFFSET 1").is_empty());
+        assert_eq!(
+            rows(&conn, "SELECT DISTINCT COUNT(*) FROM a GROUP BY g").len(),
+            1,
+            "the streaming GROUP BY lane must not bypass DISTINCT"
+        );
+        assert_eq!(
+            rows(&conn, "SELECT g, MIN(s) FROM a GROUP BY g OFFSET 1").len(),
+            1,
+            "the streaming GROUP BY lane must not bypass OFFSET"
+        );
+        if transaction {
+            conn.execute("ROLLBACK").unwrap();
+        }
+    }
 }
 
 #[test]
