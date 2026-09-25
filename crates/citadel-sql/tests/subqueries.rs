@@ -779,3 +779,123 @@ fn join_clauses_run_their_subqueries() {
         conn.execute("ROLLBACK").unwrap();
     }
 }
+
+#[test]
+fn quantified_subqueries_compare_against_every_selected_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    setup_two_tables(&conn);
+    conn.execute("CREATE TABLE n (id INTEGER NOT NULL PRIMARY KEY, name TEXT COLLATE NOCASE)")
+        .unwrap();
+    conn.execute("INSERT INTO n VALUES (1, 'abc')").unwrap();
+    let rows = |sql: &str| -> Vec<Vec<Value>> {
+        let execute = conn
+            .query(sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error}"))
+            .rows;
+        let prepared = conn.prepare(sql).unwrap().query_collect(&[]).unwrap().rows;
+        conn.execute("BEGIN").unwrap();
+        let transaction = conn.query(sql).unwrap().rows;
+        conn.execute("ROLLBACK").unwrap();
+        assert_eq!(prepared, execute, "prepared {sql}");
+        assert_eq!(transaction, execute, "transaction {sql}");
+        execute
+    };
+    let ids = |values: &[i64]| -> Vec<Vec<Value>> {
+        values
+            .iter()
+            .map(|&value| vec![Value::Integer(value)])
+            .collect()
+    };
+    let flags = |values: &[Option<bool>]| -> Vec<Vec<Value>> {
+        vec![values
+            .iter()
+            .map(|value| value.map_or(Value::Null, Value::Boolean))
+            .collect()]
+    };
+
+    assert_eq!(
+        rows("SELECT id FROM t1 WHERE id = ANY (SELECT id FROM t2) ORDER BY id"),
+        ids(&[2, 4])
+    );
+    assert_eq!(
+        rows("SELECT id FROM t1 WHERE id > ALL (SELECT id FROM t2 WHERE id < 5) ORDER BY id"),
+        ids(&[5])
+    );
+    // Over no rows ANY is false and ALL is true.
+    assert_eq!(
+        rows("SELECT id FROM t1 WHERE id = ANY (SELECT id FROM t2 WHERE id > 100)"),
+        ids(&[])
+    );
+    assert_eq!(
+        rows("SELECT COUNT(*) FROM t1 WHERE id > ALL (SELECT id FROM t2 WHERE id > 100)"),
+        ids(&[5])
+    );
+    assert_eq!(
+        rows(
+            "SELECT 2 = ANY (SELECT id FROM t2), 3 = ANY (SELECT id FROM t2), \
+             3 <> ALL (SELECT id FROM t2), 1 = ANY (SELECT NULL)"
+        ),
+        flags(&[Some(true), Some(false), Some(true), None])
+    );
+    // Each outer row compares against its own subquery rows.
+    assert_eq!(
+        rows(
+            "SELECT id FROM t1 WHERE val * 10 > ALL \
+             (SELECT t2.val FROM t2 WHERE t2.id <= t1.id) ORDER BY id"
+        ),
+        ids(&[1, 3, 5])
+    );
+    // The selected column's collation applies unless the left side has its own.
+    assert_eq!(
+        rows(
+            "SELECT 'ABC' = ANY (SELECT name FROM n), \
+             'ABC' COLLATE BINARY = ANY (SELECT name FROM n)"
+        ),
+        flags(&[Some(true), Some(false)])
+    );
+    assert_eq!(
+        rows("SELECT id FROM n WHERE name = ANY (SELECT 'ABC')"),
+        ids(&[1])
+    );
+    assert_eq!(
+        rows("SELECT id FROM n WHERE name = ANY (ARRAY['ABC'])"),
+        ids(&[1])
+    );
+    let error = conn
+        .query("SELECT 1 = ANY (SELECT id, val FROM t2)")
+        .unwrap_err();
+    assert!(
+        matches!(error, SqlError::SubqueryMultipleColumns),
+        "{error}"
+    );
+
+    for transaction in [false, true] {
+        if transaction {
+            conn.execute("BEGIN").unwrap();
+        }
+        assert_rows_affected(
+            conn.execute("UPDATE t1 SET val = -val WHERE id = ANY (SELECT id FROM t2)")
+                .unwrap(),
+            2,
+        );
+        assert_rows_affected(
+            conn.execute("DELETE FROM t1 WHERE val < ALL (SELECT val FROM t1 WHERE val > 0)")
+                .unwrap(),
+            2,
+        );
+        assert_eq!(
+            conn.query("SELECT id FROM t1 ORDER BY id").unwrap().rows,
+            ids(&[1, 3, 5]),
+            "transaction {transaction}"
+        );
+        if transaction {
+            conn.execute("ROLLBACK").unwrap();
+        } else {
+            conn.execute("UPDATE t1 SET val = id * 10").unwrap();
+            conn.execute("INSERT INTO t1 VALUES (2, 20), (4, 40)")
+                .unwrap();
+        }
+    }
+}
