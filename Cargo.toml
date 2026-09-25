@@ -108,7 +108,7 @@ memmap2 = "0.9"
 cipher = "0.4"
 
 sqlparser = "0.61"
-lru = "0.12"
+lru = "0.18.2"
 compact_str = "0.8"
 
 jiff = { version = "0.2", default-features = false, features = ["std", "alloc", "serde", "perf-inline", "tz-system", "tzdb-zoneinfo", "tzdb-bundle-platform"] }
