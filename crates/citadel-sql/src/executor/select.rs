@@ -3149,6 +3149,13 @@ pub(super) trait LateralIo {
         sq: &SelectQuery,
         ctes: &CteContext,
     ) -> Result<QueryResult>;
+    /// Runs a subquery of the statement; `ctes` are those of the statement.
+    fn exec_subquery(
+        &mut self,
+        schema: &SchemaManager,
+        stmt: &SelectStmt,
+        ctes: &CteContext,
+    ) -> Result<CteRows>;
     fn scan_table(
         &mut self,
         schema: &SchemaManager,
@@ -3171,6 +3178,14 @@ impl LateralIo for ReadHeldIo<'_, '_> {
             ExecutionResult::Query(qr) => Ok(qr),
             _ => Err(SqlError::Plan("expected Query result".into())),
         }
+    }
+    fn exec_subquery(
+        &mut self,
+        schema: &SchemaManager,
+        stmt: &SelectStmt,
+        ctes: &CteContext,
+    ) -> Result<CteRows> {
+        exec_subquery_with_read(self.rtx, schema, stmt, ctes)
     }
     fn scan_table(
         &mut self,
@@ -3196,6 +3211,14 @@ impl LateralIo for WriteIo<'_, '_> {
             ExecutionResult::Query(qr) => Ok(qr),
             _ => Err(SqlError::Plan("expected Query result".into())),
         }
+    }
+    fn exec_subquery(
+        &mut self,
+        schema: &SchemaManager,
+        stmt: &SelectStmt,
+        ctes: &CteContext,
+    ) -> Result<CteRows> {
+        exec_subquery_write(self.wtx, schema, stmt, ctes)
     }
     fn scan_table(
         &mut self,
@@ -3465,112 +3488,72 @@ fn exec_select_lateral_with_io(
     cancel: Option<&CancelToken>,
 ) -> Result<ExecutionResult> {
     check_cancel(cancel)?;
-    if !stmt.group_by.is_empty()
-        || stmt.having.is_some()
-        || stmt.distinct
-        || stmt
-            .columns
-            .iter()
-            .any(|c| matches!(c, SelectColumn::Expr { expr, .. } if is_aggregate_expr(expr)))
-    {
+    if stmt.from_subquery.as_ref().is_some_and(|d| d.lateral) {
         return Err(SqlError::Unsupported(
-            "GROUP BY / HAVING / DISTINCT / aggregates with LATERAL".into(),
+            "LATERAL is not allowed as the first FROM item".into(),
         ));
     }
-
-    let mut new_ctes = ctes.clone();
-    let mut from_name = stmt.from.clone();
-    let mut from_alias = stmt.from_alias.clone();
-    if let Some(d) = stmt.from_subquery.as_ref() {
-        if d.lateral {
-            return Err(SqlError::Unsupported(
-                "LATERAL is not allowed as the first FROM item".into(),
-            ));
-        }
-        let qr = materialize_derived(schema, ctes, d, io)?;
-        new_ctes.insert(d.alias.to_ascii_lowercase(), qr.shared());
-        from_name = d.alias.clone();
-        from_alias = None;
-    }
-
-    let (outer_schema, mut outer_rows) = match new_ctes.get(&from_name.to_ascii_lowercase()) {
-        Some(cte) => (
-            super::cte::build_cte_schema(&from_name, cte)?,
-            super::clone_cte_rows_with_cancel(&cte.result.rows, cancel)?,
-        ),
-        None => io.scan_table(schema, &from_name)?,
-    };
-    let outer_alias_str = super::join::table_alias_or_name(&from_name, &from_alias);
-
-    let mut sources = vec![LateralSource::new(
-        &outer_alias_str,
-        &from_name,
-        outer_schema,
-    )];
-    let mut current_alias = outer_alias_str;
+    let (first, mut outer_rows) = lateral_relation(
+        schema,
+        ctes,
+        stmt.from_subquery.as_deref(),
+        &stmt.from,
+        stmt.from_alias.as_deref(),
+        io,
+        cancel,
+    )?;
+    let mut sources = vec![first];
 
     for join in &stmt.joins {
-        let derived = join.subquery.as_ref().ok_or_else(|| {
-            SqlError::Plan("exec_select_lateral encountered non-subquery join".into())
-        })?;
-        if !derived.lateral {
-            let combined_cols = lateral_row_columns(&sources);
-            let qr = materialize_derived(schema, ctes, derived, io)?;
-            let joined = LateralSource::new(
-                &derived.alias,
-                &derived.alias,
-                super::cte::build_cte_schema(&derived.alias, &qr)?,
-            );
-            new_ctes.insert(derived.alias.to_ascii_lowercase(), qr.shared());
-            current_alias = derived.alias.clone();
-            let mini = SelectStmt {
-                columns: vec![SelectColumn::AllColumns],
-                from: format!("__lateral_outer_{}", join.table.name),
-                from_alias: None,
-                from_subquery: None,
-                from_args: None,
-                from_json_table: None,
-                joins: vec![JoinClause {
-                    join_type: join.join_type,
-                    table: TableRef {
-                        name: derived.alias.clone(),
-                        alias: None,
-                        args: None,
-                    },
-                    subquery: None,
-                    on_clause: join.on_clause.clone(),
-                }],
-                distinct: false,
-                where_clause: None,
-                order_by: vec![],
-                limit: None,
-                offset: None,
-                group_by: vec![],
-                having: None,
-            };
-            let outer_qr = CteRows::new(
-                QueryResult {
-                    columns: combined_cols.iter().map(|c| c.name.clone()).collect(),
-                    rows: std::mem::take(&mut outer_rows),
-                },
-                combined_cols.iter().map(|c| c.collation).collect(),
-            );
-            new_ctes.insert(mini.from.clone(), outer_qr.shared());
-            let join_sources = super::scan_join_sources(
-                &mini,
-                &new_ctes,
-                &mut |n| io.scan_table(schema, n),
+        let lateral = join.subquery.as_ref().filter(|derived| derived.lateral);
+        let Some(derived) = lateral else {
+            // A derived table or a relation, joined to the rows so far as a
+            // join of plain tables joins it.
+            let (joined, mut inner_rows) = lateral_relation(
+                schema,
+                ctes,
+                join.subquery.as_deref(),
+                &join.table.name,
+                join.table.alias.as_deref(),
+                io,
                 cancel,
             )?;
-            let (rows, columns) = join_sources.join(&mini, cancel)?;
-            let qr = match process_select(rows, SelectCtx::new(&columns, &mini, cancel))? {
-                ExecutionResult::Query(qr) => qr,
-                _ => unreachable!(),
-            };
-            outer_rows = qr.rows;
+            let outer_col_count = sources.iter().map(|s| s.schema.columns.len()).sum();
+            let inner_col_count = joined.schema.columns.len();
             sources.push(joined);
+            let combined_cols = lateral_row_columns(&sources);
+            let on_clause = match &join.on_clause {
+                Some(condition) => Some(lateral_join_condition(
+                    schema,
+                    ctes,
+                    condition,
+                    &lateral_outer_scope(&sources),
+                    io,
+                    cancel,
+                )?),
+                None => None,
+            };
+            let step = JoinClause {
+                join_type: join.join_type,
+                table: join.table.clone(),
+                subquery: None,
+                on_clause,
+            };
+            let equi = super::join::compute_equi_join_meta(&step, &combined_cols, outer_col_count);
+            outer_rows = super::join::exec_join_step(
+                std::mem::take(&mut outer_rows),
+                &mut inner_rows,
+                &step,
+                &combined_cols,
+                outer_col_count,
+                inner_col_count,
+                None,
+                None,
+                &equi,
+                cancel,
+            )?;
             continue;
-        }
+        };
 
         let outer = lateral_outer_scope(&sources);
         let (rows, columns) = match try_lateral_decorrelated(
@@ -3599,14 +3582,13 @@ fn exec_select_lateral_with_io(
         };
         outer_rows = rows;
         sources.push(lateral_output_source(schema, ctes, derived, columns)?);
-        current_alias = derived.alias.clone();
         check_cancel(cancel)?;
     }
 
     let clean_stmt = SelectStmt {
         where_clause: stmt.where_clause.clone(),
         columns: stmt.columns.clone(),
-        from: current_alias,
+        from: sources[sources.len() - 1].visible.clone(),
         from_alias: None,
         from_subquery: None,
         from_args: None,
@@ -3619,10 +3601,69 @@ fn exec_select_lateral_with_io(
         group_by: stmt.group_by.clone(),
         having: stmt.having.clone(),
     };
-    process_select(
+    let columns = lateral_row_columns(&sources);
+    if !stmt_has_subquery(&clean_stmt) {
+        return process_select(outer_rows, SelectCtx::new(&columns, &clean_stmt, cancel));
+    }
+    finish_captured_select(
+        schema,
+        ctes,
+        clean_stmt,
+        &lateral_outer_scope(&sources),
         outer_rows,
-        SelectCtx::new(&lateral_row_columns(&sources), &clean_stmt, cancel),
+        columns,
+        cancel,
+        &mut |sub| io.exec_subquery(schema, sub, ctes),
     )
+}
+
+/// A join condition beside LATERAL items, with its subqueries run once. As in
+/// a join of plain tables, a subquery that reads a row of the items the
+/// condition sees, `scope`, is refused.
+fn lateral_join_condition(
+    schema: &SchemaManager,
+    ctes: &CteContext,
+    condition: &Expr,
+    scope: &OuterScope,
+    io: &mut dyn LateralIo,
+    cancel: Option<&CancelToken>,
+) -> Result<Expr> {
+    if !crate::parser::has_subquery(condition) {
+        return Ok(condition.clone());
+    }
+    if expr_captures_outer(schema, ctes, condition, scope, cancel)? {
+        return Err(SqlError::Unsupported(
+            "a subquery in a JOIN condition that reads a joined row".into(),
+        ));
+    }
+    materialize_expr(condition, &mut |sub| io.exec_subquery(schema, sub, ctes))
+}
+
+/// A derived table or a relation in the FROM of a query with LATERAL, and its
+/// rows. A relation is a CTE of the statement, a table or a view.
+fn lateral_relation(
+    schema: &SchemaManager,
+    ctes: &CteContext,
+    derived: Option<&DerivedTable>,
+    name: &str,
+    alias: Option<&str>,
+    io: &mut dyn LateralIo,
+    cancel: Option<&CancelToken>,
+) -> Result<(LateralSource, Vec<Vec<Value>>)> {
+    if let Some(derived) = derived {
+        let qr = materialize_derived(schema, ctes, derived, io)?;
+        let table = super::cte::build_cte_schema(&derived.alias, &qr)?;
+        let source = LateralSource::new(&derived.alias, &derived.alias, table);
+        return Ok((source, qr.result.rows));
+    }
+    let (table, rows) = match ctes.get(&name.to_ascii_lowercase()) {
+        Some(cte) => (
+            super::cte::build_cte_schema(name, cte)?,
+            super::clone_cte_rows_with_cancel(&cte.result.rows, cancel)?,
+        ),
+        None => io.scan_table(schema, name)?,
+    };
+    Ok((LateralSource::new(alias.unwrap_or(name), name, table), rows))
 }
 
 /// A FROM item of a query with LATERAL, and the name that qualifies it.
@@ -3643,7 +3684,7 @@ impl LateralSource {
 }
 
 /// The columns of a row joined from `sources`, each named `source.column`.
-fn lateral_row_columns(sources: &[LateralSource]) -> Vec<ColumnDef> {
+fn lateral_row_columns<'a>(sources: impl IntoIterator<Item = &'a LateralSource>) -> Vec<ColumnDef> {
     let mut columns = Vec::new();
     for source in sources {
         super::join::extend_joined_columns(&mut columns, &(source.visible.clone(), &source.schema));
@@ -3652,9 +3693,9 @@ fn lateral_row_columns(sources: &[LateralSource]) -> Vec<ColumnDef> {
 }
 
 /// The sources before a LATERAL item, which it reads as an enclosing scope.
-fn lateral_outer_scope(sources: &[LateralSource]) -> OuterScope {
+fn lateral_outer_scope<'a>(sources: impl IntoIterator<Item = &'a LateralSource>) -> OuterScope {
     let relations: Vec<(&str, &str, &[ColumnDef])> = sources
-        .iter()
+        .into_iter()
         .map(|source| {
             (
                 source.visible.as_str(),
@@ -3776,7 +3817,7 @@ fn lateral_rows_per_outer_row(
     let relation_columns =
         |inner: &QueryResult| lateral_column_names(&derived.query.body, inner.columns.clone());
     let mut columns = closed.as_ref().map(relation_columns);
-    let mut on_columns: Option<ColumnMap> = None;
+    let mut on: Option<(Expr, ColumnMap)> = None;
     let mut rows = Vec::new();
     let mut expansion_work = 0usize;
     for (outer_idx, outer_row) in outer_rows.into_iter().enumerate() {
@@ -3793,14 +3834,18 @@ fn lateral_rows_per_outer_row(
             }
         };
         let names = columns.get_or_insert_with(|| relation_columns(inner));
-        if join.on_clause.is_some() && on_columns.is_none() {
+        if let (Some(condition), None) = (&join.on_clause, &on) {
             let lateral = lateral_output_source(schema, ctes, derived, names.clone())?;
-            let mut row_columns = lateral_row_columns(sources);
-            super::join::extend_joined_columns(
-                &mut row_columns,
-                &(lateral.visible.clone(), &lateral.schema),
-            );
-            on_columns = Some(ColumnMap::new(&row_columns));
+            let visible = || sources.iter().chain([&lateral]);
+            let condition = lateral_join_condition(
+                schema,
+                ctes,
+                condition,
+                &lateral_outer_scope(visible()),
+                io,
+                cancel,
+            )?;
+            on = Some((condition, ColumnMap::new(&lateral_row_columns(visible()))));
         }
         let mut matched = false;
         for inner_row in &inner.rows {
@@ -3808,9 +3853,9 @@ fn lateral_rows_per_outer_row(
             expansion_work += 1;
             let mut combined = outer_row.clone();
             combined.extend(inner_row.iter().cloned());
-            if let (Some(on), Some(on_columns)) = (&join.on_clause, &on_columns) {
+            if let Some((condition, on_columns)) = &on {
                 let ctx = EvalCtx::new(on_columns, &combined).with_cancel(cancel);
-                if !is_truthy(&eval_expr(on, &ctx)?) {
+                if !is_truthy(&eval_expr(condition, &ctx)?) {
                     continue;
                 }
             }

@@ -941,6 +941,15 @@ mod materialized_row_clone_cancellation {
             panic!("the outer CTE clone must finish before a lateral query runs")
         }
 
+        fn exec_subquery(
+            &mut self,
+            _: &crate::schema::SchemaManager,
+            _: &crate::parser::SelectStmt,
+            _: &CteContext,
+        ) -> Result<CteRows> {
+            panic!("the outer CTE clone must finish before a subquery runs")
+        }
+
         fn scan_table(
             &mut self,
             _: &crate::schema::SchemaManager,

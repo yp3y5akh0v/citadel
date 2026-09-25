@@ -488,3 +488,218 @@ fn lateral_items_of_other_shapes() {
         ],
     );
 }
+
+#[test]
+fn relations_join_beside_lateral_items() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    setup_lateral_scopes(&conn);
+    for sql in [
+        "CREATE VIEW pv AS SELECT cat_id, name FROM p WHERE price > 35",
+        "CREATE TABLE n (id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE)",
+        "INSERT INTO n VALUES (1, 'A')",
+        "CREATE TABLE m (id INTEGER PRIMARY KEY, tag TEXT)",
+        "INSERT INTO m VALUES (7, 'a')",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+    let null = Value::Null;
+    assert_rows_each_way(
+        &conn,
+        &[
+            (
+                "SELECT c.id, p.name, d.x FROM c JOIN p ON p.cat_id = c.id, \
+                 LATERAL (SELECT p.price + 1 AS x) AS d ORDER BY 1, 2",
+                vec![
+                    vec![int(1), text("Go"), int(41)],
+                    vec![int(1), text("Rust"), int(51)],
+                    vec![int(1), text("SQL"), int(31)],
+                    vec![int(2), text("Doll"), int(26)],
+                    vec![int(2), text("Lego"), int(101)],
+                ],
+            ),
+            (
+                "SELECT c.id, q.name FROM c, LATERAL (SELECT c.budget AS b) AS d \
+                 JOIN p AS q ON q.cat_id = c.id AND q.price < d.b ORDER BY 1, 2",
+                vec![
+                    vec![int(1), text("Go")],
+                    vec![int(1), text("SQL")],
+                    vec![int(2), text("Doll")],
+                    vec![int(2), text("Lego")],
+                ],
+            ),
+            (
+                "SELECT c.id, d.x, q.name FROM c, LATERAL (SELECT c.id * 10 AS x) AS d \
+                 RIGHT JOIN p AS q ON q.cat_id = c.id AND q.price > 45 ORDER BY 3",
+                vec![
+                    vec![null.clone(), null.clone(), text("Doll")],
+                    vec![null.clone(), null.clone(), text("Go")],
+                    vec![int(2), int(20), text("Lego")],
+                    vec![int(1), int(10), text("Rust")],
+                    vec![null.clone(), null.clone(), text("SQL")],
+                ],
+            ),
+            (
+                "SELECT c.id, q.name FROM c, LATERAL (SELECT 1 AS one) AS d \
+                 FULL JOIN p AS q ON q.cat_id = c.id AND q.price > 45 ORDER BY 2, 1",
+                vec![
+                    vec![int(3), null.clone()],
+                    vec![null.clone(), text("Doll")],
+                    vec![null.clone(), text("Go")],
+                    vec![int(2), text("Lego")],
+                    vec![int(1), text("Rust")],
+                    vec![null.clone(), text("SQL")],
+                ],
+            ),
+            (
+                "WITH k AS (SELECT 2 AS id) SELECT c.name, d.x FROM c, \
+                 LATERAL (SELECT c.budget AS x) AS d JOIN k ON k.id = c.id",
+                vec![vec![text("Toys"), int(200)]],
+            ),
+            (
+                "SELECT c.id, pv.name FROM c, LATERAL (SELECT 1 AS one) AS d \
+                 JOIN pv ON pv.cat_id = c.id ORDER BY 1, 2",
+                vec![
+                    vec![int(1), text("Go")],
+                    vec![int(1), text("Rust")],
+                    vec![int(2), text("Lego")],
+                ],
+            ),
+            // Both joined items have an `id`, which a qualified key must not confuse.
+            (
+                "SELECT c.id, d.top, e.name FROM c, LATERAL (SELECT MAX(price) AS top FROM p \
+                 WHERE p.cat_id = c.id) AS d JOIN (SELECT id, cat_id, name FROM p) AS e \
+                 ON e.cat_id = c.id AND e.id > 11 ORDER BY 1, 3",
+                vec![
+                    vec![int(1), int(50), text("Go")],
+                    vec![int(2), int(100), text("Doll")],
+                    vec![int(2), int(100), text("Lego")],
+                ],
+            ),
+            // `=` takes the collation of its left column.
+            (
+                "SELECT n.id, m.id FROM n, LATERAL (SELECT 1 AS one) AS d JOIN m ON n.name = m.tag",
+                vec![vec![int(1), int(7)]],
+            ),
+            (
+                "SELECT n.id, m.id FROM n, LATERAL (SELECT 1 AS one) AS d JOIN m ON m.tag = n.name",
+                vec![],
+            ),
+        ],
+    );
+}
+
+#[test]
+fn subqueries_and_grouping_around_lateral_items() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    setup_lateral_scopes(&conn);
+    let top = "LATERAL (SELECT MAX(price) AS top FROM p WHERE p.cat_id = c.id) AS d";
+    let prices = "LATERAL (SELECT price FROM p WHERE p.cat_id = c.id) AS d";
+    assert_rows_each_way(
+        &conn,
+        &[
+            (
+                &format!(
+                    "SELECT c.id, (SELECT COUNT(*) FROM p WHERE p.price > d.top) FROM c, {top} \
+                     ORDER BY 1"
+                ),
+                vec![
+                    vec![int(1), int(1)],
+                    vec![int(2), int(0)],
+                    vec![int(3), int(0)],
+                ],
+            ),
+            (
+                &format!(
+                    "SELECT c.id FROM c, {top} WHERE EXISTS (SELECT 1 FROM p WHERE p.price > d.top)"
+                ),
+                vec![vec![int(1)]],
+            ),
+            (
+                "SELECT c.id FROM c, LATERAL (SELECT 1 AS one) AS d \
+                 ORDER BY (SELECT COUNT(*) FROM p WHERE p.cat_id = c.id)",
+                vec![vec![int(3)], vec![int(2)], vec![int(1)]],
+            ),
+            (
+                "SELECT c.id, q.name FROM c, LATERAL (SELECT 1 AS one) AS d \
+                 JOIN p AS q ON q.cat_id = c.id \
+                 WHERE q.price = (SELECT MAX(price) FROM p AS r WHERE r.cat_id = q.cat_id) \
+                 ORDER BY 1",
+                vec![vec![int(1), text("Rust")], vec![int(2), text("Lego")]],
+            ),
+            (
+                &format!(
+                    "SELECT c.id, COUNT(*), SUM(d.price) FROM c, {prices} GROUP BY c.id ORDER BY 1"
+                ),
+                vec![
+                    vec![int(1), int(3), int(120)],
+                    vec![int(2), int(2), int(125)],
+                ],
+            ),
+            (
+                &format!(
+                    "SELECT c.id, SUM(d.price) FROM c, {prices} GROUP BY c.id \
+                     HAVING SUM(d.price) > 120"
+                ),
+                vec![vec![int(2), int(125)]],
+            ),
+            (
+                &format!("SELECT DISTINCT c.id FROM c, {prices} ORDER BY 1"),
+                vec![vec![int(1)], vec![int(2)]],
+            ),
+            (
+                &format!("SELECT COUNT(*), MAX(d.price) FROM c, {prices}"),
+                vec![vec![int(5), int(100)]],
+            ),
+        ],
+    );
+}
+
+#[test]
+fn join_conditions_beside_lateral_items_run_their_subqueries_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    setup_lateral_scopes(&conn);
+    assert_rows_each_way(
+        &conn,
+        &[
+            (
+                "SELECT c.id, q.name FROM c, LATERAL (SELECT 1 AS one) AS d JOIN p AS q \
+                 ON q.cat_id = c.id AND q.price > (SELECT MIN(price) FROM p) ORDER BY 1, 2",
+                vec![
+                    vec![int(1), text("Go")],
+                    vec![int(1), text("Rust")],
+                    vec![int(1), text("SQL")],
+                    vec![int(2), text("Lego")],
+                ],
+            ),
+            (
+                "SELECT c.id, d.name FROM c LEFT JOIN LATERAL (SELECT name, price FROM p \
+                 WHERE p.cat_id = c.id) AS d ON d.price > (SELECT AVG(price) FROM p) \
+                 ORDER BY 1, 2",
+                vec![
+                    vec![int(1), text("Rust")],
+                    vec![int(2), text("Lego")],
+                    vec![int(3), Value::Null],
+                ],
+            ),
+        ],
+    );
+    for sql in [
+        "SELECT c.id FROM c, LATERAL (SELECT 1 AS one) AS d JOIN p \
+         ON p.cat_id = c.id AND EXISTS (SELECT 1 FROM p AS q WHERE q.price > p.price)",
+        "SELECT c.id FROM c LEFT JOIN LATERAL (SELECT price FROM p WHERE p.cat_id = c.id) AS d \
+         ON EXISTS (SELECT 1 FROM p AS q WHERE q.price > d.price)",
+    ] {
+        match conn.execute(sql) {
+            Err(SqlError::Unsupported(message)) => {
+                assert!(message.contains("reads a joined row"), "{message}")
+            }
+            other => panic!("{sql}: {other:?}"),
+        }
+    }
+}
