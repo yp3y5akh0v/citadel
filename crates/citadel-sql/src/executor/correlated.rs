@@ -18,7 +18,7 @@ mod binding;
 mod apply;
 
 pub(super) use apply::apply_captured_subqueries;
-pub(super) use binding::OuterScope;
+pub(super) use binding::{bind_outer_query, OuterScope};
 
 /// Unlike the conjunct-only decorrelator, mutation predicates may contain a
 /// correlated query under OR, CASE, or another expression.
@@ -227,7 +227,7 @@ impl SetRowBinder {
     }
 }
 
-fn calls_volatile(expr: &Expr) -> bool {
+pub(super) fn calls_volatile(expr: &Expr) -> bool {
     let mut volatile = false;
     crate::parser::visit_expr(expr, &mut |node| {
         if let Expr::Function { name, args, .. } = node {

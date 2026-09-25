@@ -2622,9 +2622,9 @@ pub(crate) fn is_aggregate_expr(expr: &Expr) -> bool {
     calls_outside_subqueries(expr, false)
 }
 
-/// A FILTER condition is evaluated for each row, so it may call neither an
-/// aggregate nor a window function.
-fn calls_aggregate_or_window(expr: &Expr) -> bool {
+/// Whether `expr` calls an aggregate or a window function over its query's
+/// rows. A FILTER condition is evaluated for each row, so it may call neither.
+pub(crate) fn calls_aggregate_or_window(expr: &Expr) -> bool {
     calls_outside_subqueries(expr, true)
 }
 

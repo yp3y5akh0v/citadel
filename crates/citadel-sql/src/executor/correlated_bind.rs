@@ -103,7 +103,9 @@ impl OuterScope {
             .map(|index| (relation.offset + index, relation.columns[index].1))
     }
 
-    fn bare(&self, name: &str) -> Result<Option<(usize, Collation)>> {
+    /// The row position and collation of an unqualified column, if one source
+    /// has it.
+    pub(in crate::executor) fn bare(&self, name: &str) -> Result<Option<(usize, Collation)>> {
         let mut found = self
             .relations
             .iter()
@@ -115,7 +117,13 @@ impl OuterScope {
         Ok(first)
     }
 
-    fn qualified(&self, table: &str, column: &str) -> Result<Option<(usize, Collation)>> {
+    /// The row position and collation of `table.column`, if a source is
+    /// qualified by `table`.
+    pub(in crate::executor) fn qualified(
+        &self,
+        table: &str,
+        column: &str,
+    ) -> Result<Option<(usize, Collation)>> {
         let Some(relation) = self.relations.iter().find(|relation| {
             relation
                 .qualifiers
@@ -175,25 +183,57 @@ pub(super) fn bind_outer(
     row: Option<&[Value]>,
     cancel: Option<&citadel::CancelToken>,
 ) -> Result<Option<Vec<usize>>> {
-    let mut binder = Binder {
-        schema,
-        outer,
-        row,
-        cancel: cancel.cloned(),
-        scopes: Vec::new(),
-        ctes: Vec::new(),
-        caller_ctes: Some(ctes),
-        views: FxHashSet::default(),
-        query_depth: 0,
-        captured: Vec::new(),
-    };
+    let mut binder = Binder::new(schema, ctes, outer, row, cancel);
     binder.expr(expr)?;
-    if binder.captured.is_empty() {
-        return Ok(None);
+    Ok(binder.captured())
+}
+
+/// Bind the `outer` row into a LATERAL query, which reads the FROM items
+/// before it as an enclosing scope. Returns the positions it reads, or None
+/// when it reads none.
+pub(in crate::executor) fn bind_outer_query(
+    schema: &SchemaManager,
+    ctes: &CteContext,
+    query: &mut SelectQuery,
+    outer: &OuterScope,
+    row: Option<&[Value]>,
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<Option<Vec<usize>>> {
+    let mut binder = Binder::new(schema, ctes, outer, row, cancel);
+    binder.query(query, true)?;
+    Ok(binder.captured())
+}
+
+impl<'a> Binder<'a> {
+    fn new(
+        schema: &'a SchemaManager,
+        ctes: &'a CteContext,
+        outer: &'a OuterScope,
+        row: Option<&'a [Value]>,
+        cancel: Option<&citadel::CancelToken>,
+    ) -> Self {
+        Binder {
+            schema,
+            outer,
+            row,
+            cancel: cancel.cloned(),
+            scopes: Vec::new(),
+            ctes: Vec::new(),
+            caller_ctes: Some(ctes),
+            views: FxHashSet::default(),
+            query_depth: 0,
+            captured: Vec::new(),
+        }
     }
-    binder.captured.sort_unstable();
-    binder.captured.dedup();
-    Ok(Some(binder.captured))
+
+    fn captured(mut self) -> Option<Vec<usize>> {
+        if self.captured.is_empty() {
+            return None;
+        }
+        self.captured.sort_unstable();
+        self.captured.dedup();
+        Some(self.captured)
+    }
 }
 
 impl Binder<'_> {
