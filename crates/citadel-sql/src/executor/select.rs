@@ -130,18 +130,14 @@ pub(super) fn exec_select_with_read(
         return exec_select_no_from(stmt, cancel);
     }
 
+    if let Some((stmt, ctes)) = materialize_table_function(schema, stmt, ctes, cancel)? {
+        return exec_select_with_read(rtx, schema, &stmt, &ctes);
+    }
     if has_lateral(stmt) {
         return exec_select_lateral_with_read(rtx, schema, stmt, ctes);
     }
     if has_non_lateral_derived(stmt) {
         return exec_select_with_derived_with_read(rtx, schema, stmt, ctes);
-    }
-
-    if stmt.from_args.is_some() && crate::json::is_srf_name(&stmt.from) {
-        return exec_select_with_srf_with_read(rtx, schema, stmt, ctes, cancel);
-    }
-    if stmt.from_json_table.is_some() {
-        return exec_select_with_json_table_with_read(rtx, schema, stmt, ctes, cancel);
     }
 
     let lower_name = stmt.from.to_ascii_lowercase();
@@ -3259,7 +3255,8 @@ fn materialize_derived(
     Ok(CteRows::new(result, collations))
 }
 
-/// `stmt` reading each derived table in its FROM as a CTE of the same name.
+/// `stmt` reading each derived table in its FROM by its alias, and `ctes` with
+/// the relations holding their rows.
 pub(super) fn materialize_derived_tables(
     schema: &SchemaManager,
     stmt: &SelectStmt,
@@ -3270,17 +3267,19 @@ pub(super) fn materialize_derived_tables(
     let mut new_stmt = stmt.clone();
     if let Some(d) = new_stmt.from_subquery.take() {
         let rows = materialize_derived(schema, ctes, &d, io)?;
-        new_ctes.insert(d.alias.to_ascii_lowercase(), rows.shared());
-        new_stmt.from = d.alias;
-        new_stmt.from_alias = None;
+        let relation = from_relation_name(0);
+        new_ctes.insert(relation.clone(), rows.shared());
+        new_stmt.from = relation;
+        new_stmt.from_alias = Some(d.alias);
     }
-    for j in new_stmt.joins.iter_mut() {
+    for (position, j) in (1..).zip(new_stmt.joins.iter_mut()) {
         if let Some(d) = j.subquery.take() {
             let rows = materialize_derived(schema, ctes, &d, io)?;
-            new_ctes.insert(d.alias.to_ascii_lowercase(), rows.shared());
+            let relation = from_relation_name(position);
+            new_ctes.insert(relation.clone(), rows.shared());
             j.table = TableRef {
-                name: d.alias,
-                alias: None,
+                name: relation,
+                alias: Some(d.alias),
                 args: None,
             };
         }
@@ -3288,54 +3287,89 @@ pub(super) fn materialize_derived_tables(
     Ok((new_stmt, new_ctes))
 }
 
-fn exec_select_with_srf_with_read(
-    rtx: &mut ReadTxn<'_>,
+/// The name the FROM item at `position` (0 for the first item, then each join)
+/// is read by once its rows are materialized. The item's alias stays scoped to
+/// its FROM clause: a subquery's `FROM t` still reads the table or CTE `t`.
+fn from_relation_name(position: usize) -> String {
+    format!("__citadel_from_{position}")
+}
+
+/// A table function or JSON_TABLE in the FROM of `stmt`, run: `stmt` reading
+/// its rows by its alias, and `ctes` with the relation holding them. `None`
+/// when the FROM names a relation. A call without arguments names one, as
+/// `timezone_names()` does; arguments to anything but a table function are
+/// refused rather than dropped.
+pub(super) fn materialize_table_function(
     schema: &SchemaManager,
     stmt: &SelectStmt,
     ctes: &CteContext,
     cancel: Option<&CancelToken>,
-) -> Result<ExecutionResult> {
-    let args_exprs = stmt
-        .from_args
-        .as_ref()
-        .expect("from_args present when exec_select_with_srf called");
-
-    let upper_name = stmt.from.to_ascii_uppercase();
-    let (columns, rows) = match upper_name.as_str() {
-        "JSONB_POPULATE_RECORD" | "JSONB_POPULATE_RECORDSET" => {
-            populate_record_dispatch(&upper_name, args_exprs, schema, cancel)?
+) -> Result<Option<(SelectStmt, CteContext)>> {
+    let (alias, columns, rows) = match (&stmt.from_args, &stmt.from_json_table) {
+        (Some(args), _) if crate::json::is_srf_name(&stmt.from) => {
+            let (columns, rows) = table_function_rows(schema, &stmt.from, args, cancel)?;
+            let alias = stmt.from_alias.clone();
+            (
+                alias.unwrap_or_else(|| stmt.from.to_ascii_lowercase()),
+                columns,
+                rows,
+            )
         }
-        _ => {
-            let col_map = ColumnMap::new(&[]);
-            let mut arg_values = Vec::with_capacity(args_exprs.len());
-            for (arg_idx, expr) in args_exprs.iter().enumerate() {
-                check_cancel_at(cancel, arg_idx)?;
-                arg_values.push(eval_expr(
-                    expr,
-                    &EvalCtx::new(&col_map, &[]).with_cancel(cancel),
-                )?);
-            }
-            crate::json::dispatch_srf_with_cancel(&stmt.from, &arg_values, cancel)?
+        (Some(args), _) if !args.is_empty() => {
+            return Err(SqlError::Unsupported(format!(
+                "table function: {}",
+                stmt.from
+            )));
         }
+        (_, Some(spec)) => {
+            let empty = ColumnMap::new(&[]);
+            let source = eval_expr(&spec.source, &EvalCtx::new(&empty, &[]).with_cancel(cancel))?;
+            let (columns, rows) =
+                crate::json::materialize_json_table_with_cancel(&source, spec, cancel)?;
+            let alias = stmt.from_alias.clone();
+            (alias.unwrap_or_else(|| stmt.from.clone()), columns, rows)
+        }
+        _ => return Ok(None),
     };
-
-    let alias = stmt
-        .from_alias
-        .clone()
-        .unwrap_or_else(|| stmt.from.to_ascii_lowercase());
-
-    let mut new_ctes = ctes.clone();
+    let relation = from_relation_name(0);
+    let mut ctes = ctes.clone();
     // The columns are invented by the source rather than read from a relation, so none of
     // them carries a collation.
-    new_ctes.insert(
-        alias.to_ascii_lowercase(),
+    ctes.insert(
+        relation.clone(),
         CteRows::binary(QueryResult { columns, rows }).shared(),
     );
+    let stmt = SelectStmt {
+        from: relation,
+        from_alias: Some(alias),
+        from_args: None,
+        from_json_table: None,
+        ..stmt.clone()
+    };
+    Ok(Some((stmt, ctes)))
+}
 
-    let mut new_stmt = stmt.clone();
-    new_stmt.from = alias;
-    new_stmt.from_args = None;
-    exec_select_with_read(rtx, schema, &new_stmt, &new_ctes)
+/// The columns and rows of the table function `name` called with `args`.
+fn table_function_rows(
+    schema: &SchemaManager,
+    name: &str,
+    args: &[Expr],
+    cancel: Option<&CancelToken>,
+) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
+    let upper_name = name.to_ascii_uppercase();
+    if let "JSONB_POPULATE_RECORD" | "JSONB_POPULATE_RECORDSET" = upper_name.as_str() {
+        return populate_record_dispatch(&upper_name, args, schema, cancel);
+    }
+    let col_map = ColumnMap::new(&[]);
+    let mut arg_values = Vec::with_capacity(args.len());
+    for (arg_idx, expr) in args.iter().enumerate() {
+        check_cancel_at(cancel, arg_idx)?;
+        arg_values.push(eval_expr(
+            expr,
+            &EvalCtx::new(&col_map, &[]).with_cancel(cancel),
+        )?);
+    }
+    crate::json::dispatch_srf_with_cancel(name, &arg_values, cancel)
 }
 
 fn populate_record_dispatch(
@@ -3411,40 +3445,6 @@ fn populate_record_dispatch(
         _ => unreachable!(),
     };
     Ok((columns, rows))
-}
-
-fn exec_select_with_json_table_with_read(
-    rtx: &mut ReadTxn<'_>,
-    schema: &SchemaManager,
-    stmt: &SelectStmt,
-    ctes: &CteContext,
-    cancel: Option<&CancelToken>,
-) -> Result<ExecutionResult> {
-    let spec = stmt
-        .from_json_table
-        .as_ref()
-        .expect("from_json_table present when exec_select_with_json_table called");
-    let col_map = ColumnMap::new(&[]);
-    let source_val = eval_expr(
-        &spec.source,
-        &EvalCtx::new(&col_map, &[]).with_cancel(cancel),
-    )?;
-    let (columns, rows) =
-        crate::json::materialize_json_table_with_cancel(&source_val, spec, cancel)?;
-
-    let alias = stmt.from_alias.clone().unwrap_or_else(|| stmt.from.clone());
-    let mut new_ctes = ctes.clone();
-    // The columns are invented by the source rather than read from a relation, so none of
-    // them carries a collation.
-    new_ctes.insert(
-        alias.to_ascii_lowercase(),
-        CteRows::binary(QueryResult { columns, rows }).shared(),
-    );
-
-    let mut new_stmt = stmt.clone();
-    new_stmt.from = alias;
-    new_stmt.from_json_table = None;
-    exec_select_with_read(rtx, schema, &new_stmt, &new_ctes)
 }
 
 fn exec_select_with_derived_with_read(

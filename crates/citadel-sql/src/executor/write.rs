@@ -1435,6 +1435,11 @@ pub(super) fn exec_select_in_txn(
         return super::exec_select_no_from(stmt, cancel);
     }
 
+    if let Some((stmt, ctes)) =
+        super::select::materialize_table_function(schema, stmt, ctes, cancel)?
+    {
+        return super::exec_select_in_txn(wtx, schema, &stmt, &ctes);
+    }
     if stmt
         .joins
         .iter()
