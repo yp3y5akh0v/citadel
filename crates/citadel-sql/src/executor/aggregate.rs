@@ -1,9 +1,7 @@
 use std::collections::BTreeMap;
 
 use crate::error::{Result, SqlError};
-use crate::eval::{
-    collated_eq, compile_collation, eval_expr, is_truthy, operand_collation, ColumnMap, EvalCtx,
-};
+use crate::eval::{eval_expr, is_truthy, operand_collation, ColumnMap, EvalCtx};
 use crate::parser::*;
 use crate::types::*;
 
@@ -269,6 +267,9 @@ fn first_non_null_is_interval(
     Ok(false)
 }
 
+/// One group's value of `expr`. Each aggregate call reduces the group's rows,
+/// and the expression around the calls reads the group's first row, so columns
+/// keep their collations and every expression form evaluates as it does per row.
 fn eval_aggregate_expr_with_cancel(
     expr: &Expr,
     col_map: &ColumnMap,
@@ -276,459 +277,446 @@ fn eval_aggregate_expr_with_cancel(
     cancel: Option<&citadel::CancelToken>,
 ) -> Result<Value> {
     check_cancel(cancel)?;
-    match expr {
-        Expr::CountStar => Ok(Value::Integer(group_rows.len() as i64)),
+    let reduced;
+    let expr = if is_aggregate_expr(expr) {
+        reduced = reduce_aggregates(expr, col_map, group_rows, cancel)?;
+        &reduced
+    } else {
+        expr
+    };
+    let nulls;
+    let row: &[Value] = match group_rows.first() {
+        Some(row) => row,
+        None => {
+            nulls = vec![Value::Null; col_map.len()];
+            &nulls
+        }
+    };
+    eval_expr(expr, &EvalCtx::new(col_map, row).with_cancel(cancel))
+}
 
+/// A copy of `expr` with each aggregate call replaced by its value over the
+/// group. A subquery aggregates its own rows, so it is kept as it is.
+fn reduce_aggregates(
+    expr: &Expr,
+    col_map: &ColumnMap,
+    group_rows: &[&Vec<Value>],
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<Expr> {
+    let reduce = |expr: &Expr| reduce_aggregates(expr, col_map, group_rows, cancel);
+    let boxed = |expr: &Expr| reduce(expr).map(Box::new);
+    let all = |exprs: &[Expr]| exprs.iter().map(reduce).collect::<Result<Vec<_>>>();
+    Ok(match expr {
+        Expr::CountStar => Expr::Literal(Value::Integer(group_rows.len() as i64)),
         Expr::Function {
             name,
             args,
             distinct,
-        } if is_aggregate_function(name, args.len()) => {
-            let func = name.to_ascii_uppercase();
-            if matches!(func.as_str(), "JSON_OBJECT_AGG" | "JSONB_OBJECT_AGG") {
-                if args.len() != 2 {
-                    return Err(SqlError::Unsupported(format!(
-                        "{func} requires 2 arguments"
-                    )));
-                }
-                if *distinct {
-                    return Err(SqlError::Unsupported(format!(
-                        "DISTINCT not supported with {func}"
-                    )));
-                }
-                let mut pairs: Vec<(Value, Value)> = Vec::with_capacity(group_rows.len());
-                for (row_idx, row) in group_rows.iter().enumerate() {
-                    check_cancel_at(cancel, row_idx)?;
-                    let ctx = EvalCtx::new(col_map, row).with_cancel(cancel);
-                    let k = eval_expr(&args[0], &ctx)?;
-                    let v = eval_expr(&args[1], &ctx)?;
-                    pairs.push((k, v));
-                }
-                let target = if func == "JSONB_OBJECT_AGG" {
-                    crate::types::DataType::Jsonb
-                } else {
-                    crate::types::DataType::Json
-                };
-                let result = crate::json::agg_object_with_cancel(&pairs, target, cancel)?;
-                check_cancel(cancel)?;
-                return Ok(result);
-            }
-            if args.len() != 1 {
-                return Err(SqlError::Unsupported(format!(
-                    "{func} with {} args",
-                    args.len()
-                )));
-            }
-            let arg = &args[0];
-            let mut values: Vec<Value> = Vec::with_capacity(group_rows.len());
-            for (row_idx, row) in group_rows.iter().enumerate() {
-                check_cancel_at(cancel, row_idx)?;
-                values.push(eval_expr(
-                    arg,
-                    &EvalCtx::new(col_map, row).with_cancel(cancel),
-                )?);
-            }
-            if *distinct {
-                // `COUNT(DISTINCT s)` counts the values `s = s` calls equal, so the argument's
-                // collation folds the key here as it does for GROUP BY.
-                let coll = expr_collation(arg, col_map);
-                let mut seen: rustc_hash::FxHashSet<Value> = rustc_hash::FxHashSet::default();
-                let mut distinct_values = Vec::with_capacity(values.len());
-                for (value_idx, value) in values.into_iter().enumerate() {
-                    check_cancel_at(cancel, value_idx)?;
-                    if !value.is_null() && seen.insert(coll.fold(value.clone())) {
-                        distinct_values.push(value);
-                    }
-                }
-                values = distinct_values;
-            }
-
-            match func.as_str() {
-                "COUNT" => {
-                    let mut count = 0;
-                    for (value_idx, value) in values.iter().enumerate() {
-                        check_cancel_at(cancel, value_idx)?;
-                        count += usize::from(!value.is_null());
-                    }
-                    Ok(Value::Integer(count as i64))
-                }
-                "SUM" => {
-                    // INTERVAL sum: field-wise saturating add (PG semantic).
-                    let is_interval = first_non_null_is_interval(&values, cancel)?;
-                    if is_interval {
-                        let mut months: i32 = 0;
-                        let mut days: i32 = 0;
-                        let mut micros: i64 = 0;
-                        let mut all_null = true;
-                        for (value_idx, v) in values.iter().enumerate() {
-                            check_cancel_at(cancel, value_idx)?;
-                            match v {
-                                Value::Null => {}
-                                Value::Interval {
-                                    months: m,
-                                    days: d,
-                                    micros: u,
-                                } => {
-                                    months = months.saturating_add(*m);
-                                    days = days.saturating_add(*d);
-                                    micros = micros.saturating_add(*u);
-                                    all_null = false;
-                                }
-                                _ => {
-                                    return Err(SqlError::TypeMismatch {
-                                        expected: "INTERVAL".into(),
-                                        got: v.data_type().to_string(),
-                                    })
-                                }
-                            }
-                        }
-                        return if all_null {
-                            Ok(Value::Null)
-                        } else {
-                            Ok(Value::Interval {
-                                months,
-                                days,
-                                micros,
-                            })
-                        };
-                    }
-                    let mut int_sum: i64 = 0;
-                    let mut real_sum: f64 = 0.0;
-                    let mut has_real = false;
-                    let mut all_null = true;
-                    for (value_idx, v) in values.iter().enumerate() {
-                        check_cancel_at(cancel, value_idx)?;
-                        match v {
-                            Value::Integer(i) => {
-                                int_sum += i;
-                                all_null = false;
-                            }
-                            Value::Real(r) => {
-                                real_sum += r;
-                                has_real = true;
-                                all_null = false;
-                            }
-                            Value::Null => {}
-                            _ => {
-                                return Err(SqlError::TypeMismatch {
-                                    expected: "numeric".into(),
-                                    got: v.data_type().to_string(),
-                                })
-                            }
-                        }
-                    }
-                    if all_null {
-                        return Ok(Value::Null);
-                    }
-                    if has_real {
-                        Ok(Value::Real(real_sum + int_sum as f64))
-                    } else {
-                        Ok(Value::Integer(int_sum))
-                    }
-                }
-                "AVG" => {
-                    // INTERVAL avg: field-wise sum / count.
-                    let is_interval = first_non_null_is_interval(&values, cancel)?;
-                    if is_interval {
-                        let mut months: i64 = 0;
-                        let mut days: i64 = 0;
-                        let mut micros: i128 = 0;
-                        let mut count: i64 = 0;
-                        for (value_idx, v) in values.iter().enumerate() {
-                            check_cancel_at(cancel, value_idx)?;
-                            match v {
-                                Value::Null => {}
-                                Value::Interval {
-                                    months: m,
-                                    days: d,
-                                    micros: u,
-                                } => {
-                                    months += *m as i64;
-                                    days += *d as i64;
-                                    micros += *u as i128;
-                                    count += 1;
-                                }
-                                _ => {
-                                    return Err(SqlError::TypeMismatch {
-                                        expected: "INTERVAL".into(),
-                                        got: v.data_type().to_string(),
-                                    })
-                                }
-                            }
-                        }
-                        return if count == 0 {
-                            Ok(Value::Null)
-                        } else {
-                            Ok(Value::Interval {
-                                months: (months / count).clamp(i32::MIN as i64, i32::MAX as i64)
-                                    as i32,
-                                days: (days / count).clamp(i32::MIN as i64, i32::MAX as i64) as i32,
-                                micros: (micros / count as i128) as i64,
-                            })
-                        };
-                    }
-                    let mut sum: f64 = 0.0;
-                    let mut count: i64 = 0;
-                    for (value_idx, v) in values.iter().enumerate() {
-                        check_cancel_at(cancel, value_idx)?;
-                        match v {
-                            Value::Integer(i) => {
-                                sum += *i as f64;
-                                count += 1;
-                            }
-                            Value::Real(r) => {
-                                sum += r;
-                                count += 1;
-                            }
-                            Value::Null => {}
-                            _ => {
-                                return Err(SqlError::TypeMismatch {
-                                    expected: "numeric".into(),
-                                    got: v.data_type().to_string(),
-                                })
-                            }
-                        }
-                    }
-                    if count == 0 {
-                        Ok(Value::Null)
-                    } else {
-                        Ok(Value::Real(sum / count as f64))
-                    }
-                }
-                "MIN" => {
-                    let collation = operand_collation(arg, col_map).unwrap_or_default();
-                    let mut min: Option<&Value> = None;
-                    for (value_idx, v) in values.iter().enumerate() {
-                        check_cancel_at(cancel, value_idx)?;
-                        if v.is_null() {
-                            continue;
-                        }
-                        min = Some(match min {
-                            None => v,
-                            Some(m) => {
-                                if collation.cmp_value(v, m).is_lt() {
-                                    v
-                                } else {
-                                    m
-                                }
-                            }
-                        });
-                    }
-                    Ok(min.cloned().unwrap_or(Value::Null))
-                }
-                "MAX" => {
-                    let collation = operand_collation(arg, col_map).unwrap_or_default();
-                    let mut max: Option<&Value> = None;
-                    for (value_idx, v) in values.iter().enumerate() {
-                        check_cancel_at(cancel, value_idx)?;
-                        if v.is_null() {
-                            continue;
-                        }
-                        max = Some(match max {
-                            None => v,
-                            Some(m) => {
-                                if collation.cmp_value(v, m).is_gt() {
-                                    v
-                                } else {
-                                    m
-                                }
-                            }
-                        });
-                    }
-                    Ok(max.cloned().unwrap_or(Value::Null))
-                }
-                "JSON_AGG" | "JSONB_AGG" => {
-                    let target = if func.eq_ignore_ascii_case("JSONB_AGG") {
-                        crate::types::DataType::Jsonb
-                    } else {
-                        crate::types::DataType::Json
-                    };
-                    let result = crate::json::agg_array_with_cancel(&values, target, cancel)?;
-                    check_cancel(cancel)?;
-                    Ok(result)
-                }
-                _ => Err(SqlError::Unsupported(format!("aggregate function: {func}"))),
-            }
-        }
-
-        Expr::Column(_) | Expr::QualifiedColumn { .. } => {
-            if let Some(first) = group_rows.first() {
-                eval_expr(expr, &EvalCtx::new(col_map, first).with_cancel(cancel))
-            } else {
-                Ok(Value::Null)
-            }
-        }
-
-        Expr::Literal(v) | Expr::BoundColumn { value: v, .. } => Ok(v.clone()),
-
-        Expr::BinaryOp { left, op, right } => {
-            let l = eval_aggregate_expr_with_cancel(left, col_map, group_rows, cancel)?;
-            let r = eval_aggregate_expr_with_cancel(right, col_map, group_rows, cancel)?;
-            eval_expr(
-                &Expr::BinaryOp {
-                    left: Box::new(Expr::Literal(l)),
-                    op: *op,
-                    right: Box::new(Expr::Literal(r)),
-                },
-                &EvalCtx::new(col_map, &[]).with_cancel(cancel),
-            )
-        }
-
-        Expr::UnaryOp { op, expr: e } => {
-            let v = eval_aggregate_expr_with_cancel(e, col_map, group_rows, cancel)?;
-            eval_expr(
-                &Expr::UnaryOp {
-                    op: *op,
-                    expr: Box::new(Expr::Literal(v)),
-                },
-                &EvalCtx::new(col_map, &[]).with_cancel(cancel),
-            )
-        }
-
-        Expr::IsNull(e) => {
-            let v = eval_aggregate_expr_with_cancel(e, col_map, group_rows, cancel)?;
-            Ok(Value::Boolean(v.is_null()))
-        }
-
-        Expr::IsNotNull(e) => {
-            let v = eval_aggregate_expr_with_cancel(e, col_map, group_rows, cancel)?;
-            Ok(Value::Boolean(!v.is_null()))
-        }
-
-        Expr::Cast { expr: e, data_type } => {
-            let v = eval_aggregate_expr_with_cancel(e, col_map, group_rows, cancel)?;
-            eval_expr(
-                &Expr::Cast {
-                    expr: Box::new(Expr::Literal(v)),
-                    data_type: *data_type,
-                },
-                &EvalCtx::new(col_map, &[]).with_cancel(cancel),
-            )
-        }
-
-        Expr::Case {
-            operand,
-            conditions,
-            else_result,
-        } => {
-            let op_val = operand
-                .as_ref()
-                .map(|e| eval_aggregate_expr_with_cancel(e, col_map, group_rows, cancel))
-                .transpose()?;
-            if let Some(ov) = &op_val {
-                for (cond, result) in conditions {
-                    let cv = eval_aggregate_expr_with_cancel(cond, col_map, group_rows, cancel)?;
-                    if !ov.is_null() && !cv.is_null() && *ov == cv {
-                        return eval_aggregate_expr_with_cancel(
-                            result, col_map, group_rows, cancel,
-                        );
-                    }
-                }
-            } else {
-                for (cond, result) in conditions {
-                    let cv = eval_aggregate_expr_with_cancel(cond, col_map, group_rows, cancel)?;
-                    if is_truthy(&cv) {
-                        return eval_aggregate_expr_with_cancel(
-                            result, col_map, group_rows, cancel,
-                        );
-                    }
-                }
-            }
-            match else_result {
-                Some(e) => eval_aggregate_expr_with_cancel(e, col_map, group_rows, cancel),
-                None => Ok(Value::Null),
-            }
-        }
-
-        Expr::Coalesce(args) => {
-            for arg in args {
-                let v = eval_aggregate_expr_with_cancel(arg, col_map, group_rows, cancel)?;
-                if !v.is_null() {
-                    return Ok(v);
-                }
-            }
-            Ok(Value::Null)
-        }
-
+        } if is_aggregate_function(name, args.len()) => Expr::Literal(aggregate_value(
+            name, args, *distinct, col_map, group_rows, cancel,
+        )?),
+        Expr::Function {
+            name,
+            args,
+            distinct,
+        } => Expr::Function {
+            name: name.clone(),
+            args: all(args)?,
+            distinct: *distinct,
+        },
+        Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
+            left: boxed(left)?,
+            op: *op,
+            right: boxed(right)?,
+        },
+        Expr::UnaryOp { op, expr } => Expr::UnaryOp {
+            op: *op,
+            expr: boxed(expr)?,
+        },
+        Expr::IsNull(expr) => Expr::IsNull(boxed(expr)?),
+        Expr::IsNotNull(expr) => Expr::IsNotNull(boxed(expr)?),
+        Expr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => Expr::InSubquery {
+            expr: boxed(expr)?,
+            subquery: subquery.clone(),
+            negated: *negated,
+        },
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => Expr::InList {
+            expr: boxed(expr)?,
+            list: all(list)?,
+            negated: *negated,
+        },
+        Expr::InSet {
+            expr,
+            values,
+            has_null,
+            negated,
+            collation,
+        } => Expr::InSet {
+            expr: boxed(expr)?,
+            values: values.clone(),
+            has_null: *has_null,
+            negated: *negated,
+            collation: *collation,
+        },
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => Expr::Between {
+            expr: boxed(expr)?,
+            low: boxed(low)?,
+            high: boxed(high)?,
+            negated: *negated,
+        },
         Expr::IsDistinctFrom {
             left,
             right,
             negated,
-        } => {
-            let l = eval_aggregate_expr_with_cancel(left, col_map, group_rows, cancel)?;
-            let r = eval_aggregate_expr_with_cancel(right, col_map, group_rows, cancel)?;
-            let alike = match (l.is_null(), r.is_null()) {
-                (true, true) => true,
-                (true, false) | (false, true) => false,
-                (false, false) => collated_eq(&l, &r, compile_collation(left, right, col_map))?,
-            };
-            Ok(Value::Boolean(if *negated { alike } else { !alike }))
-        }
-        Expr::Between {
-            expr: e,
-            low,
-            high,
-            negated,
-        } => {
-            let v = eval_aggregate_expr_with_cancel(e, col_map, group_rows, cancel)?;
-            let lo = eval_aggregate_expr_with_cancel(low, col_map, group_rows, cancel)?;
-            let hi = eval_aggregate_expr_with_cancel(high, col_map, group_rows, cancel)?;
-            eval_expr(
-                &Expr::Between {
-                    expr: Box::new(Expr::Literal(v)),
-                    low: Box::new(Expr::Literal(lo)),
-                    high: Box::new(Expr::Literal(hi)),
-                    negated: *negated,
-                },
-                &EvalCtx::new(col_map, &[]).with_cancel(cancel),
-            )
-        }
-
+        } => Expr::IsDistinctFrom {
+            left: boxed(left)?,
+            right: boxed(right)?,
+            negated: *negated,
+        },
         Expr::Like {
-            expr: e,
+            expr,
             pattern,
             escape,
             negated,
-        } => {
-            let v = eval_aggregate_expr_with_cancel(e, col_map, group_rows, cancel)?;
-            let p = eval_aggregate_expr_with_cancel(pattern, col_map, group_rows, cancel)?;
-            let esc = escape
-                .as_ref()
-                .map(|es| eval_aggregate_expr_with_cancel(es, col_map, group_rows, cancel))
-                .transpose()?;
-            let esc_box = esc.map(|v| Box::new(Expr::Literal(v)));
-            eval_expr(
-                &Expr::Like {
-                    expr: Box::new(Expr::Literal(v)),
-                    pattern: Box::new(Expr::Literal(p)),
-                    escape: esc_box,
-                    negated: *negated,
-                },
-                &EvalCtx::new(col_map, &[]).with_cancel(cancel),
-            )
-        }
-
-        Expr::Function { name, args, .. } => {
-            let evaluated: Vec<Value> = args
+        } => Expr::Like {
+            expr: boxed(expr)?,
+            pattern: boxed(pattern)?,
+            escape: escape.as_deref().map(boxed).transpose()?,
+            negated: *negated,
+        },
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+        } => Expr::Case {
+            operand: operand.as_deref().map(boxed).transpose()?,
+            conditions: conditions
                 .iter()
-                .map(|a| eval_aggregate_expr_with_cancel(a, col_map, group_rows, cancel))
-                .collect::<Result<_>>()?;
-            let literal_args: Vec<Expr> = evaluated.into_iter().map(Expr::Literal).collect();
-            eval_expr(
-                &Expr::Function {
-                    name: name.clone(),
-                    args: literal_args,
-                    distinct: false,
-                },
-                &EvalCtx::new(col_map, &[]).with_cancel(cancel),
-            )
+                .map(|(when, then)| Ok((reduce(when)?, reduce(then)?)))
+                .collect::<Result<_>>()?,
+            else_result: else_result.as_deref().map(boxed).transpose()?,
+        },
+        Expr::Coalesce(args) => Expr::Coalesce(all(args)?),
+        Expr::Cast { expr, data_type } => Expr::Cast {
+            expr: boxed(expr)?,
+            data_type: *data_type,
+        },
+        Expr::Collate { expr, collation } => Expr::Collate {
+            expr: boxed(expr)?,
+            collation: *collation,
+        },
+        Expr::ArrayLiteral(items) => Expr::ArrayLiteral(all(items)?),
+        Expr::Quantified {
+            left,
+            op,
+            quantifier,
+            right,
+        } => Expr::Quantified {
+            left: boxed(left)?,
+            op: *op,
+            quantifier: *quantifier,
+            right: match right {
+                QuantifiedRhs::Array(array) => QuantifiedRhs::Array(boxed(array)?),
+                QuantifiedRhs::Subquery(_) => right.clone(),
+            },
+        },
+        Expr::Literal(_)
+        | Expr::BoundColumn { .. }
+        | Expr::Column(_)
+        | Expr::QualifiedColumn { .. }
+        | Expr::Exists { .. }
+        | Expr::ScalarSubquery(_)
+        | Expr::Parameter(_)
+        | Expr::WindowFunction { .. }
+        | Expr::TypedNullRecord(_) => expr.clone(),
+    })
+}
+
+/// The value of aggregate `name` over the group's rows.
+fn aggregate_value(
+    name: &str,
+    args: &[Expr],
+    distinct: bool,
+    col_map: &ColumnMap,
+    group_rows: &[&Vec<Value>],
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<Value> {
+    let func = name.to_ascii_uppercase();
+    if matches!(func.as_str(), "JSON_OBJECT_AGG" | "JSONB_OBJECT_AGG") {
+        if args.len() != 2 {
+            return Err(SqlError::Unsupported(format!(
+                "{func} requires 2 arguments"
+            )));
         }
+        if distinct {
+            return Err(SqlError::Unsupported(format!(
+                "DISTINCT not supported with {func}"
+            )));
+        }
+        let mut pairs: Vec<(Value, Value)> = Vec::with_capacity(group_rows.len());
+        for (row_idx, row) in group_rows.iter().enumerate() {
+            check_cancel_at(cancel, row_idx)?;
+            let ctx = EvalCtx::new(col_map, row).with_cancel(cancel);
+            let k = eval_expr(&args[0], &ctx)?;
+            let v = eval_expr(&args[1], &ctx)?;
+            pairs.push((k, v));
+        }
+        let target = if func == "JSONB_OBJECT_AGG" {
+            crate::types::DataType::Jsonb
+        } else {
+            crate::types::DataType::Json
+        };
+        let result = crate::json::agg_object_with_cancel(&pairs, target, cancel)?;
+        check_cancel(cancel)?;
+        return Ok(result);
+    }
+    if args.len() != 1 {
+        return Err(SqlError::Unsupported(format!(
+            "{func} with {} args",
+            args.len()
+        )));
+    }
+    let arg = &args[0];
+    let mut values: Vec<Value> = Vec::with_capacity(group_rows.len());
+    for (row_idx, row) in group_rows.iter().enumerate() {
+        check_cancel_at(cancel, row_idx)?;
+        values.push(eval_expr(
+            arg,
+            &EvalCtx::new(col_map, row).with_cancel(cancel),
+        )?);
+    }
+    if distinct {
+        // `COUNT(DISTINCT s)` counts the values `s = s` calls equal, so the argument's
+        // collation folds the key here as it does for GROUP BY.
+        let coll = expr_collation(arg, col_map);
+        let mut seen: rustc_hash::FxHashSet<Value> = rustc_hash::FxHashSet::default();
+        let mut distinct_values = Vec::with_capacity(values.len());
+        for (value_idx, value) in values.into_iter().enumerate() {
+            check_cancel_at(cancel, value_idx)?;
+            if !value.is_null() && seen.insert(coll.fold(value.clone())) {
+                distinct_values.push(value);
+            }
+        }
+        values = distinct_values;
+    }
 
-        Expr::Parameter(_) => eval_expr(expr, &EvalCtx::new(col_map, &[]).with_cancel(cancel)),
-
-        _ => Err(SqlError::Unsupported(format!(
-            "expression in aggregate: {expr:?}"
-        ))),
+    match func.as_str() {
+        "COUNT" => {
+            let mut count = 0;
+            for (value_idx, value) in values.iter().enumerate() {
+                check_cancel_at(cancel, value_idx)?;
+                count += usize::from(!value.is_null());
+            }
+            Ok(Value::Integer(count as i64))
+        }
+        "SUM" => {
+            // INTERVAL sum: field-wise saturating add (PG semantic).
+            let is_interval = first_non_null_is_interval(&values, cancel)?;
+            if is_interval {
+                let mut months: i32 = 0;
+                let mut days: i32 = 0;
+                let mut micros: i64 = 0;
+                let mut all_null = true;
+                for (value_idx, v) in values.iter().enumerate() {
+                    check_cancel_at(cancel, value_idx)?;
+                    match v {
+                        Value::Null => {}
+                        Value::Interval {
+                            months: m,
+                            days: d,
+                            micros: u,
+                        } => {
+                            months = months.saturating_add(*m);
+                            days = days.saturating_add(*d);
+                            micros = micros.saturating_add(*u);
+                            all_null = false;
+                        }
+                        _ => {
+                            return Err(SqlError::TypeMismatch {
+                                expected: "INTERVAL".into(),
+                                got: v.data_type().to_string(),
+                            })
+                        }
+                    }
+                }
+                return if all_null {
+                    Ok(Value::Null)
+                } else {
+                    Ok(Value::Interval {
+                        months,
+                        days,
+                        micros,
+                    })
+                };
+            }
+            let mut int_sum: i64 = 0;
+            let mut real_sum: f64 = 0.0;
+            let mut has_real = false;
+            let mut all_null = true;
+            for (value_idx, v) in values.iter().enumerate() {
+                check_cancel_at(cancel, value_idx)?;
+                match v {
+                    Value::Integer(i) => {
+                        int_sum += i;
+                        all_null = false;
+                    }
+                    Value::Real(r) => {
+                        real_sum += r;
+                        has_real = true;
+                        all_null = false;
+                    }
+                    Value::Null => {}
+                    _ => {
+                        return Err(SqlError::TypeMismatch {
+                            expected: "numeric".into(),
+                            got: v.data_type().to_string(),
+                        })
+                    }
+                }
+            }
+            if all_null {
+                return Ok(Value::Null);
+            }
+            if has_real {
+                Ok(Value::Real(real_sum + int_sum as f64))
+            } else {
+                Ok(Value::Integer(int_sum))
+            }
+        }
+        "AVG" => {
+            // INTERVAL avg: field-wise sum / count.
+            let is_interval = first_non_null_is_interval(&values, cancel)?;
+            if is_interval {
+                let mut months: i64 = 0;
+                let mut days: i64 = 0;
+                let mut micros: i128 = 0;
+                let mut count: i64 = 0;
+                for (value_idx, v) in values.iter().enumerate() {
+                    check_cancel_at(cancel, value_idx)?;
+                    match v {
+                        Value::Null => {}
+                        Value::Interval {
+                            months: m,
+                            days: d,
+                            micros: u,
+                        } => {
+                            months += *m as i64;
+                            days += *d as i64;
+                            micros += *u as i128;
+                            count += 1;
+                        }
+                        _ => {
+                            return Err(SqlError::TypeMismatch {
+                                expected: "INTERVAL".into(),
+                                got: v.data_type().to_string(),
+                            })
+                        }
+                    }
+                }
+                return if count == 0 {
+                    Ok(Value::Null)
+                } else {
+                    Ok(Value::Interval {
+                        months: (months / count).clamp(i32::MIN as i64, i32::MAX as i64) as i32,
+                        days: (days / count).clamp(i32::MIN as i64, i32::MAX as i64) as i32,
+                        micros: (micros / count as i128) as i64,
+                    })
+                };
+            }
+            let mut sum: f64 = 0.0;
+            let mut count: i64 = 0;
+            for (value_idx, v) in values.iter().enumerate() {
+                check_cancel_at(cancel, value_idx)?;
+                match v {
+                    Value::Integer(i) => {
+                        sum += *i as f64;
+                        count += 1;
+                    }
+                    Value::Real(r) => {
+                        sum += r;
+                        count += 1;
+                    }
+                    Value::Null => {}
+                    _ => {
+                        return Err(SqlError::TypeMismatch {
+                            expected: "numeric".into(),
+                            got: v.data_type().to_string(),
+                        })
+                    }
+                }
+            }
+            if count == 0 {
+                Ok(Value::Null)
+            } else {
+                Ok(Value::Real(sum / count as f64))
+            }
+        }
+        "MIN" => {
+            let collation = operand_collation(arg, col_map).unwrap_or_default();
+            let mut min: Option<&Value> = None;
+            for (value_idx, v) in values.iter().enumerate() {
+                check_cancel_at(cancel, value_idx)?;
+                if v.is_null() {
+                    continue;
+                }
+                min = Some(match min {
+                    None => v,
+                    Some(m) => {
+                        if collation.cmp_value(v, m).is_lt() {
+                            v
+                        } else {
+                            m
+                        }
+                    }
+                });
+            }
+            Ok(min.cloned().unwrap_or(Value::Null))
+        }
+        "MAX" => {
+            let collation = operand_collation(arg, col_map).unwrap_or_default();
+            let mut max: Option<&Value> = None;
+            for (value_idx, v) in values.iter().enumerate() {
+                check_cancel_at(cancel, value_idx)?;
+                if v.is_null() {
+                    continue;
+                }
+                max = Some(match max {
+                    None => v,
+                    Some(m) => {
+                        if collation.cmp_value(v, m).is_gt() {
+                            v
+                        } else {
+                            m
+                        }
+                    }
+                });
+            }
+            Ok(max.cloned().unwrap_or(Value::Null))
+        }
+        "JSON_AGG" | "JSONB_AGG" => {
+            let target = if func.eq_ignore_ascii_case("JSONB_AGG") {
+                crate::types::DataType::Jsonb
+            } else {
+                crate::types::DataType::Json
+            };
+            let result = crate::json::agg_array_with_cancel(&values, target, cancel)?;
+            check_cancel(cancel)?;
+            Ok(result)
+        }
+        _ => Err(SqlError::Unsupported(format!("aggregate function: {func}"))),
     }
 }
 
@@ -741,17 +729,27 @@ pub(super) fn is_aggregate_function(name: &str, arg_count: usize) -> bool {
         || (matches!(u.as_str(), "JSON_OBJECT_AGG" | "JSONB_OBJECT_AGG") && arg_count == 2)
 }
 
+/// Whether `expr` calls an aggregate over the query's own rows. A subquery
+/// aggregates its own rows and a window function its window.
 pub(super) fn is_aggregate_expr(expr: &Expr) -> bool {
     match expr {
         Expr::CountStar => true,
         Expr::Function { name, args, .. } => {
             is_aggregate_function(name, args.len()) || args.iter().any(is_aggregate_expr)
         }
-        Expr::BinaryOp { left, right, .. } => is_aggregate_expr(left) || is_aggregate_expr(right),
+        Expr::BinaryOp { left, right, .. } | Expr::IsDistinctFrom { left, right, .. } => {
+            is_aggregate_expr(left) || is_aggregate_expr(right)
+        }
         Expr::UnaryOp { expr, .. }
         | Expr::IsNull(expr)
         | Expr::IsNotNull(expr)
-        | Expr::Cast { expr, .. } => is_aggregate_expr(expr),
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. }
+        | Expr::InSet { expr, .. }
+        | Expr::InSubquery { expr, .. } => is_aggregate_expr(expr),
+        Expr::InList { expr, list, .. } => {
+            is_aggregate_expr(expr) || list.iter().any(is_aggregate_expr)
+        }
         Expr::Case {
             operand,
             conditions,
@@ -763,13 +761,10 @@ pub(super) fn is_aggregate_expr(expr: &Expr) -> bool {
                     .any(|(c, r)| is_aggregate_expr(c) || is_aggregate_expr(r))
                 || else_result.as_ref().is_some_and(|e| is_aggregate_expr(e))
         }
-        Expr::Coalesce(args) => args.iter().any(is_aggregate_expr),
+        Expr::Coalesce(args) | Expr::ArrayLiteral(args) => args.iter().any(is_aggregate_expr),
         Expr::Between {
             expr, low, high, ..
         } => is_aggregate_expr(expr) || is_aggregate_expr(low) || is_aggregate_expr(high),
-        Expr::IsDistinctFrom { left, right, .. } => {
-            is_aggregate_expr(left) || is_aggregate_expr(right)
-        }
         Expr::Like {
             expr,
             pattern,
@@ -780,8 +775,19 @@ pub(super) fn is_aggregate_expr(expr: &Expr) -> bool {
                 || is_aggregate_expr(pattern)
                 || escape.as_ref().is_some_and(|e| is_aggregate_expr(e))
         }
-        Expr::WindowFunction { .. } => false,
-        _ => false,
+        Expr::Quantified { left, right, .. } => {
+            is_aggregate_expr(left)
+                || matches!(right, QuantifiedRhs::Array(array) if is_aggregate_expr(array))
+        }
+        Expr::WindowFunction { .. }
+        | Expr::Exists { .. }
+        | Expr::ScalarSubquery(_)
+        | Expr::Literal(_)
+        | Expr::BoundColumn { .. }
+        | Expr::Column(_)
+        | Expr::QualifiedColumn { .. }
+        | Expr::Parameter(_)
+        | Expr::TypedNullRecord(_) => false,
     }
 }
 
