@@ -192,6 +192,51 @@ fn try_fuse_cte_simple_passthrough_fuses() {
     }
 }
 
+fn parsed_query(sql: &str) -> SelectQuery {
+    let Statement::Select(sq) = crate::parser::parse_sql(sql).unwrap() else {
+        panic!("expected a SELECT: {sql}");
+    };
+    *sq
+}
+
+#[test]
+fn try_fuse_cte_reads_the_table_by_the_cte_name_and_its_columns() {
+    let sq =
+        parsed_query("WITH c AS (SELECT id, a FROM t WHERE a > 0) SELECT * FROM c WHERE id = 1");
+    let Some(QueryBody::Select(fused)) = try_fuse_cte(&sq) else {
+        panic!("expected a fused select");
+    };
+    assert_eq!(fused.from, "t");
+    assert_eq!(fused.from_alias.as_deref(), Some("c"));
+    let names: Vec<String> = fused
+        .columns
+        .iter()
+        .map(|column| match column {
+            SelectColumn::Expr {
+                expr: Expr::Column(name),
+                alias: None,
+            } => name.clone(),
+            other => panic!("expected a column of the CTE, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(names, ["id", "a"]);
+}
+
+#[test]
+fn try_fuse_cte_materializes_what_the_table_would_resolve_differently() {
+    for sql in [
+        "WITH c AS (SELECT id FROM t) SELECT a FROM c",
+        "WITH c AS (SELECT id FROM t) SELECT x.id FROM c",
+        "WITH c AS (SELECT id FROM t) SELECT c.id FROM c AS x",
+        "WITH c AS (SELECT id, a FROM t) SELECT c.id FROM c \
+         WHERE EXISTS (SELECT 1 FROM t AS i WHERE i.a < c.a)",
+        "WITH c AS (SELECT id FROM t AS x WHERE x.a > 0) SELECT id FROM c",
+        "WITH c AS (SELECT id, id FROM t) SELECT id FROM c",
+    ] {
+        assert!(try_fuse_cte(&parsed_query(sql)).is_none(), "{sql}");
+    }
+}
+
 #[test]
 fn recursive_cte_stops_while_materializing_anchor_rows() {
     let token = citadel::CancelToken::new();

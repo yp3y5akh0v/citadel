@@ -721,3 +721,48 @@ fn with_dml_savepoint_rollback_restores() {
     assert_ok(conn.execute("COMMIT").unwrap());
     assert_eq!(count(&conn, "SELECT COUNT(*) FROM t"), 2);
 }
+
+#[test]
+fn a_simple_cte_exposes_only_its_own_columns() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, a INTEGER, b INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10, NULL), (2, 20, 1), (3, 10, 2)")
+        .unwrap();
+    let cases: [(&str, &[&[i64]]); 3] = [
+        (
+            "WITH c AS (SELECT id, a FROM t) SELECT * FROM c WHERE id < 3 ORDER BY 1",
+            &[&[1, 10], &[2, 20]],
+        ),
+        (
+            "WITH c AS (SELECT id, a FROM t) SELECT x.id FROM c AS x WHERE x.a = 20",
+            &[&[2]],
+        ),
+        (
+            "WITH c AS (SELECT id, a FROM t WHERE t.b IS NOT NULL) SELECT id FROM c ORDER BY 1",
+            &[&[2], &[3]],
+        ),
+    ];
+    for transaction in [false, true] {
+        if transaction {
+            assert_ok(conn.execute("BEGIN").unwrap());
+        }
+        for (sql, expected) in cases {
+            let expected: Vec<Vec<Value>> = expected
+                .iter()
+                .map(|row| row.iter().map(|&value| Value::Integer(value)).collect())
+                .collect();
+            assert_eq!(conn.query(sql).unwrap().rows, expected, "{sql}");
+        }
+        let unknown = conn.query("WITH c AS (SELECT id FROM t) SELECT b FROM c");
+        assert!(
+            matches!(unknown, Err(SqlError::ColumnNotFound(_))),
+            "{unknown:?}"
+        );
+        if transaction {
+            assert_ok(conn.execute("ROLLBACK").unwrap());
+        }
+    }
+}
