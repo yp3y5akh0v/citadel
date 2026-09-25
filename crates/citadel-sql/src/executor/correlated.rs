@@ -458,7 +458,7 @@ pub(super) fn handle_correlated_select_with_read(
     for col in &stmt.columns {
         match col {
             SelectColumn::Expr {
-                expr: Expr::ScalarSubquery(sub),
+                expr: written @ Expr::ScalarSubquery(sub),
                 alias,
             } => {
                 if is_correlated_subquery(sub, ctx, schema) {
@@ -492,9 +492,10 @@ pub(super) fn handle_correlated_select_with_read(
                         };
                         if let Some(values) = values {
                             hashed.push(values);
-                            let col_name = alias
-                                .clone()
-                                .unwrap_or_else(|| format!("__corr_{corr_col_idx}"));
+                            // The value sits in a hidden column named apart from
+                            // the query's names; the output keeps the name the
+                            // query gave it.
+                            let col_name = format!("__corr_{corr_col_idx}");
                             columns.push(ColumnDef {
                                 name: col_name.clone(),
                                 data_type: DataType::Null,
@@ -511,9 +512,10 @@ pub(super) fn handle_correlated_select_with_read(
                                 generated_kind: None,
                                 collation: crate::types::Collation::Binary,
                             });
+                            let slot = Expr::Column(col_name);
                             new_columns.push(SelectColumn::Expr {
-                                expr: Expr::Column(col_name),
-                                alias: alias.clone(),
+                                alias: super::helpers::written_alias(alias, written, &slot),
+                                expr: slot,
                             });
                             corr_col_idx += 1;
                             continue;

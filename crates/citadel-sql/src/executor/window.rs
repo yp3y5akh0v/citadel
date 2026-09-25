@@ -1038,14 +1038,9 @@ pub(super) fn eval_window_select(
             SelectColumn::AllFromNew => rewritten_columns.push(SelectColumn::AllFromNew),
             SelectColumn::Expr { expr, alias } => {
                 let new_expr = extract_window_fns(expr, &mut slot_counter, &mut all_extracted);
-                // Named as written, not after the slot columns it now reads.
-                let alias = alias.clone().or_else(|| {
-                    let written = expr_display_name(expr);
-                    (written != expr_display_name(&new_expr)).then_some(written)
-                });
                 rewritten_columns.push(SelectColumn::Expr {
+                    alias: written_alias(alias, expr, &new_expr),
                     expr: new_expr,
-                    alias,
                 });
             }
         }
