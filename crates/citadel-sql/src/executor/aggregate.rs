@@ -506,6 +506,10 @@ fn aggregate_value(
                 "DISTINCT not supported with {func}"
             )));
         }
+        // Like every aggregate but COUNT, NULL over no rows.
+        if group_rows.is_empty() {
+            return Ok(Value::Null);
+        }
         let mut pairs: Vec<(Value, Value)> = Vec::with_capacity(group_rows.len());
         for (row_idx, row) in group_rows.iter().enumerate() {
             check_cancel_at(cancel, row_idx)?;
@@ -751,6 +755,9 @@ fn aggregate_value(
             Ok(max.cloned().unwrap_or(Value::Null))
         }
         "JSON_AGG" | "JSONB_AGG" => {
+            if values.is_empty() {
+                return Ok(Value::Null);
+            }
             let target = if func.eq_ignore_ascii_case("JSONB_AGG") {
                 crate::types::DataType::Jsonb
             } else {

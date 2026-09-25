@@ -361,6 +361,55 @@ fn jsonb_object_agg_duplicate_last_wins() {
 }
 
 #[test]
+fn json_aggregates_over_no_rows_are_null() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, dept TEXT, k TEXT, v INTEGER)")
+        .unwrap();
+    let aggregates = "JSON_AGG(v), JSONB_AGG(v), JSON_OBJECT_AGG(k, v), JSONB_OBJECT_AGG(k, v)";
+    let nulls = vec![vec![Value::Null; 4]];
+    assert_eq!(
+        conn.query(&format!("SELECT {aggregates} FROM t"))
+            .unwrap()
+            .rows,
+        nulls
+    );
+    conn.execute("INSERT INTO t VALUES (1, 'eng', 'a', NULL), (2, 'eng', 'b', NULL)")
+        .unwrap();
+    assert_eq!(
+        conn.query(&format!("SELECT {aggregates} FROM t WHERE id > 5"))
+            .unwrap()
+            .rows,
+        nulls
+    );
+    assert_eq!(
+        conn.query(
+            "SELECT dept, JSON_AGG(v) FILTER (WHERE v IS NOT NULL), \
+             COALESCE(JSON_AGG(v) FILTER (WHERE v IS NOT NULL), CAST('[]' AS JSON)) \
+             FROM t GROUP BY dept"
+        )
+        .unwrap()
+        .rows,
+        vec![vec![
+            Value::Text("eng".into()),
+            Value::Null,
+            Value::Json("[]".into())
+        ]]
+    );
+    // Rows whose values are NULL are still rows.
+    assert_eq!(
+        conn.query("SELECT JSON_AGG(v), JSON_OBJECT_AGG(k, v) FROM t")
+            .unwrap()
+            .rows,
+        vec![vec![
+            Value::Json("[null,null]".into()),
+            Value::Json("{\"a\":null,\"b\":null}".into())
+        ]]
+    );
+}
+
+#[test]
 fn json_object_agg_returns_json_text() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
