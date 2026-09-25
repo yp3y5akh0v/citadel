@@ -944,19 +944,33 @@ pub fn add_interval_to_timestamp(ts: i64, months: i32, days: i32, micros: i64) -
     }
     let jts =
         JTimestamp::from_microsecond(ts).map_err(|e| SqlError::InvalidValue(format!("ts: {e}")))?;
-    // PG order: months, then days, then micros.
-    let span = Span::new()
-        .try_months(months as i64)
-        .map_err(|e| SqlError::InvalidValue(format!("months overflow: {e}")))?
-        .try_days(days as i64)
-        .map_err(|e| SqlError::InvalidValue(format!("days overflow: {e}")))?
-        .try_microseconds(micros)
-        .map_err(|e| SqlError::InvalidValue(format!("micros overflow: {e}")))?;
-    let result = jts
-        .to_zoned(TimeZone::UTC)
-        .checked_add(span)
-        .map_err(|_| SqlError::IntegerOverflow)?;
-    Ok(result.timestamp().as_microsecond())
+    // PG order: the months (keeping the day inside the month), then the days,
+    // then the time, each with its own sign. One jiff span has a single sign,
+    // so '1 month -1 day' cannot be one span.
+    let mut zoned = jts.to_zoned(TimeZone::UTC);
+    if months != 0 {
+        let span = Span::new()
+            .try_months(months as i64)
+            .map_err(|e| SqlError::InvalidValue(format!("months overflow: {e}")))?;
+        zoned = zoned
+            .checked_add(span)
+            .map_err(|_| SqlError::IntegerOverflow)?;
+    }
+    if days != 0 {
+        let span = Span::new()
+            .try_days(days as i64)
+            .map_err(|e| SqlError::InvalidValue(format!("days overflow: {e}")))?;
+        zoned = zoned
+            .checked_add(span)
+            .map_err(|_| SqlError::IntegerOverflow)?;
+    }
+    let result = zoned
+        .timestamp()
+        .as_microsecond()
+        .checked_add(micros)
+        .ok_or(SqlError::IntegerOverflow)?;
+    JTimestamp::from_microsecond(result).map_err(|_| SqlError::IntegerOverflow)?;
+    Ok(result)
 }
 
 /// PG rule: DATE + INTERVAL always yields TIMESTAMP.
@@ -993,8 +1007,8 @@ pub fn add_interval_to_time(t: i64, months: i32, days: i32, micros: i64) -> Resu
         ));
     }
     // PG: TIME + interval wraps mod 24h.
-    let combined = t.checked_add(micros).unwrap_or(t);
-    Ok(combined.rem_euclid(MICROS_PER_DAY))
+    let combined = i128::from(t) + i128::from(micros);
+    Ok(combined.rem_euclid(i128::from(MICROS_PER_DAY)) as i64)
 }
 
 /// PG `timestamp - timestamp`: returns `(days, remainder_micros)` with months = 0.
