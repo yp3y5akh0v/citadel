@@ -681,7 +681,9 @@ fn reject_non_deterministic(sq: &SelectQuery) -> Result<()> {
     }
     fn walk_expr(expr: &Expr) -> Result<()> {
         match expr {
-            Expr::Function { name, args, .. } => {
+            Expr::Function {
+                name, args, filter, ..
+            } => {
                 if crate::eval::is_volatile_function_expr(&name.to_ascii_uppercase(), args) {
                     return Err(SqlError::Unsupported(format!(
                         "non-deterministic function '{}' in matview definition",
@@ -690,6 +692,9 @@ fn reject_non_deterministic(sq: &SelectQuery) -> Result<()> {
                 }
                 for a in args {
                     walk_expr(a)?;
+                }
+                if let Some(filter) = filter {
+                    walk_expr(filter)?;
                 }
                 Ok(())
             }

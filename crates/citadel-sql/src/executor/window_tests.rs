@@ -100,6 +100,7 @@ fn has_window_function_inside_function_args() {
         name: "ABS".into(),
         args: vec![empty_window_fn("LAG")],
         distinct: false,
+        filter: None,
     };
     assert!(has_window_function(&e));
 }
@@ -419,6 +420,7 @@ fn extract_window_fns_inside_function_args() {
         name: "ABS".into(),
         args: vec![empty_window_fn("ROW_NUMBER")],
         distinct: false,
+        filter: None,
     };
     let mut counter = 0;
     let mut out = Vec::new();
@@ -512,6 +514,7 @@ fn window_argument_passes_cancellation_into_scalar_evaluation() {
                     name: "TO_TSVECTOR".into(),
                     args: vec![Expr::Column("body".into())],
                     distinct: false,
+                    filter: None,
                 },
                 Expr::Literal(i(1)),
             ],

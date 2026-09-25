@@ -589,6 +589,7 @@ fn collect_column_refs_function_args() {
         name: "ABS".into(),
         args: vec![Expr::Column("v".into())],
         distinct: false,
+        filter: None,
     };
     collect_column_refs(&e, &mut out);
     assert_eq!(out, vec!["v"]);

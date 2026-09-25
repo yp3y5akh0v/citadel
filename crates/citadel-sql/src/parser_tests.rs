@@ -2144,8 +2144,6 @@ fn upstream_function(sql: &str) -> sp::Function {
 #[test]
 fn converter_rejects_unsupported_function_modifiers() {
     for sql in [
-        "COUNT(*) FILTER (WHERE false)",
-        "SUM(id) FILTER (WHERE id > 0)",
         "FIRST_VALUE(id) IGNORE NULLS OVER (ORDER BY id)",
         "SUM(id) RESPECT NULLS OVER (ORDER BY id)",
         "NTH_VALUE(id, 1) RESPECT NULLS OVER (ORDER BY id)",
@@ -2176,6 +2174,7 @@ fn converter_checks_function_only_ast_options() {
         name,
         args,
         distinct,
+        filter: None,
     } = convert_function(&function).unwrap()
     else {
         panic!("expected function");
@@ -2197,6 +2196,60 @@ fn converter_checks_function_only_ast_options() {
         convert_function(&function),
         Err(SqlError::Unsupported(_))
     ));
+}
+
+#[test]
+fn converter_keeps_an_aggregate_filter() {
+    let Expr::Function {
+        name,
+        args,
+        distinct,
+        filter: Some(filter),
+    } = convert_function(&upstream_function("COUNT(*) FILTER (WHERE id > 0)")).unwrap()
+    else {
+        panic!("COUNT(*) FILTER is a COUNT call with its condition");
+    };
+    assert_eq!(name, "COUNT");
+    assert!(args.is_empty() && !distinct);
+    assert!(matches!(*filter, Expr::BinaryOp { op: BinOp::Gt, .. }));
+    assert!(matches!(
+        convert_function(&upstream_function("SUM(DISTINCT id) FILTER (WHERE id > 0)")).unwrap(),
+        Expr::Function {
+            distinct: true,
+            filter: Some(_),
+            ..
+        }
+    ));
+    // A subquery's aggregate aggregates the subquery's rows.
+    assert!(convert_function(&upstream_function(
+        "SUM(id) FILTER (WHERE id IN (SELECT MAX(id) FROM t))"
+    ))
+    .is_ok());
+    assert!(matches!(
+        convert_function(&upstream_function("COUNT(*)")).unwrap(),
+        Expr::CountStar
+    ));
+}
+
+#[test]
+fn converter_rejects_a_filter_it_cannot_apply() {
+    for sql in [
+        "ABS(id) FILTER (WHERE id > 0)",
+        "COALESCE(id, 0) FILTER (WHERE id > 0)",
+        "MAX(id, 0) FILTER (WHERE id > 0)",
+        "SUM(id) FILTER (WHERE id > 0) OVER ()",
+        "COUNT(*) FILTER (WHERE id > 0) OVER (ORDER BY id)",
+        "SUM(id) FILTER (WHERE COUNT(*) > 1)",
+        "SUM(id) FILTER (WHERE id > MAX(id))",
+        "COUNT(*) FILTER (WHERE COALESCE(SUM(id), 0) > 0)",
+        "SUM(id) FILTER (WHERE ROW_NUMBER() OVER () > 1)",
+    ] {
+        let result = convert_function(&upstream_function(sql));
+        assert!(
+            matches!(result, Err(SqlError::Unsupported(_))),
+            "{sql}: {result:?}"
+        );
+    }
 }
 
 #[test]

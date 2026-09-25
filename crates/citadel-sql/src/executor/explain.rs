@@ -476,7 +476,10 @@ pub(super) fn count_subqueries(expr: &Expr) -> usize {
         Expr::BinaryOp { left, right, .. } => count_subqueries(left) + count_subqueries(right),
         Expr::UnaryOp { expr: e, .. } => count_subqueries(e),
         Expr::IsNull(e) | Expr::IsNotNull(e) => count_subqueries(e),
-        Expr::Function { args, .. } => args.iter().map(count_subqueries).sum(),
+        Expr::Function { args, filter, .. } => {
+            args.iter().map(count_subqueries).sum::<usize>()
+                + filter.as_deref().map_or(0, count_subqueries)
+        }
         Expr::Between {
             expr: e, low, high, ..
         } => count_subqueries(e) + count_subqueries(low) + count_subqueries(high),

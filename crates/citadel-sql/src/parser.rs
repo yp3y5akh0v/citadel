@@ -531,6 +531,9 @@ pub enum Expr {
         args: Vec<Expr>,
         /// True for aggregate forms like `COUNT(DISTINCT x)`.
         distinct: bool,
+        /// An aggregate's `FILTER (WHERE ...)`: only rows it holds for are
+        /// aggregated. `COUNT(*) FILTER (...)` is COUNT with no arguments.
+        filter: Option<Box<Expr>>,
     },
     CountStar,
     InSubquery {
@@ -1332,7 +1335,15 @@ pub(crate) fn visit_expr(expr: &Expr, visitor: &mut impl FnMut(&Expr)) {
         Expr::UnaryOp { expr: e, .. } | Expr::IsNull(e) | Expr::IsNotNull(e) => {
             visit_expr(e, visitor);
         }
-        Expr::Function { args, .. } | Expr::Coalesce(args) => {
+        Expr::Function { args, filter, .. } => {
+            for a in args {
+                visit_expr(a, visitor);
+            }
+            if let Some(filter) = filter {
+                visit_expr(filter, visitor);
+            }
+        }
+        Expr::Coalesce(args) => {
             for a in args {
                 visit_expr(a, visitor);
             }
@@ -2603,6 +2614,70 @@ pub(crate) fn is_aggregate_function(name: &str, arg_count: usize) -> bool {
         "COUNT" | "SUM" | "AVG" | "JSON_AGG" | "JSONB_AGG"
     ) || (matches!(u.as_str(), "MIN" | "MAX") && arg_count == 1)
         || (matches!(u.as_str(), "JSON_OBJECT_AGG" | "JSONB_OBJECT_AGG") && arg_count == 2)
+}
+
+/// Whether `expr` calls an aggregate over its query's rows. A subquery
+/// aggregates its own rows and a window function its window.
+pub(crate) fn is_aggregate_expr(expr: &Expr) -> bool {
+    calls_outside_subqueries(expr, false)
+}
+
+/// A FILTER condition is evaluated for each row, so it may call neither an
+/// aggregate nor a window function.
+fn calls_aggregate_or_window(expr: &Expr) -> bool {
+    calls_outside_subqueries(expr, true)
+}
+
+fn calls_outside_subqueries(expr: &Expr, windows: bool) -> bool {
+    let calls = |expr: &Expr| calls_outside_subqueries(expr, windows);
+    match expr {
+        Expr::CountStar => true,
+        Expr::WindowFunction { .. } => windows,
+        Expr::Function { name, args, .. } => {
+            is_aggregate_function(name, args.len()) || args.iter().any(calls)
+        }
+        Expr::BinaryOp { left, right, .. } | Expr::IsDistinctFrom { left, right, .. } => {
+            calls(left) || calls(right)
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::IsNull(expr)
+        | Expr::IsNotNull(expr)
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. }
+        | Expr::InSet { expr, .. }
+        | Expr::InSubquery { expr, .. } => calls(expr),
+        Expr::InList { expr, list, .. } => calls(expr) || list.iter().any(calls),
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+        } => {
+            operand.as_deref().is_some_and(calls)
+                || conditions.iter().any(|(c, r)| calls(c) || calls(r))
+                || else_result.as_deref().is_some_and(calls)
+        }
+        Expr::Coalesce(args) | Expr::ArrayLiteral(args) => args.iter().any(calls),
+        Expr::Between {
+            expr, low, high, ..
+        } => calls(expr) || calls(low) || calls(high),
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => calls(expr) || calls(pattern) || escape.as_deref().is_some_and(calls),
+        Expr::Quantified { left, right, .. } => {
+            calls(left) || matches!(right, QuantifiedRhs::Array(array) if calls(array))
+        }
+        Expr::Exists { .. }
+        | Expr::ScalarSubquery(_)
+        | Expr::Literal(_)
+        | Expr::BoundColumn { .. }
+        | Expr::Column(_)
+        | Expr::QualifiedColumn { .. }
+        | Expr::Parameter(_)
+        | Expr::TypedNullRecord(_) => false,
+    }
 }
 
 fn convert_create_trigger(ct: sp::CreateTrigger) -> Result<Statement> {
@@ -3947,6 +4022,7 @@ fn convert_expr(expr: &sp::Expr) -> Result<Expr> {
                 name: "SUBSTR".into(),
                 args,
                 distinct: false,
+                filter: None,
             })
         }
         sp::Expr::Trim {
@@ -3972,22 +4048,26 @@ fn convert_expr(expr: &sp::Expr) -> Result<Expr> {
                 name: fn_name.into(),
                 args,
                 distinct: false,
+                filter: None,
             })
         }
         sp::Expr::Ceil { expr: e, .. } => Ok(Expr::Function {
             name: "CEIL".into(),
             args: vec![convert_expr(e)?],
             distinct: false,
+            filter: None,
         }),
         sp::Expr::Floor { expr: e, .. } => Ok(Expr::Function {
             name: "FLOOR".into(),
             args: vec![convert_expr(e)?],
             distinct: false,
+            filter: None,
         }),
         sp::Expr::Position { expr: e, r#in } => Ok(Expr::Function {
             name: "INSTR".into(),
             args: vec![convert_expr(r#in)?, convert_expr(e)?],
             distinct: false,
+            filter: None,
         }),
         sp::Expr::TypedString(ts) => {
             let raw = match &ts.value.value {
@@ -4033,6 +4113,7 @@ fn convert_expr(expr: &sp::Expr) -> Result<Expr> {
                     convert_expr(e)?,
                 ],
                 distinct: false,
+                filter: None,
             })
         }
         sp::Expr::AtTimeZone {
@@ -4042,6 +4123,7 @@ fn convert_expr(expr: &sp::Expr) -> Result<Expr> {
             name: "AT_TIMEZONE".into(),
             args: vec![convert_expr(timestamp)?, convert_expr(time_zone)?],
             distinct: false,
+            filter: None,
         }),
         _ => Err(SqlError::Unsupported(format!("expression: {expr}"))),
     }
@@ -4255,7 +4337,6 @@ fn convert_function(func: &sp::Function) -> Result<Expr> {
             !matches!(parameters, sp::FunctionArguments::None),
             "parametric functions",
         ),
-        (filter.is_some(), "aggregate FILTER"),
         (
             null_treatment.as_ref().is_some_and(|treatment| {
                 !respects_nulls || !matches!(treatment, sp::NullTreatment::RespectNulls)
@@ -4338,12 +4419,23 @@ fn convert_function(func: &sp::Function) -> Result<Expr> {
         }
     };
 
+    let filter = filter
+        .as_deref()
+        .map(|filter| convert_expr(filter).map(Box::new))
+        .transpose()?;
+    let aggregate = is_aggregate_function(&name, args.len());
     reject_unsupported_clauses(&[
         (distinct && over.is_some(), "DISTINCT window functions"),
         (distinct && is_count_star, "COUNT(DISTINCT *)"),
+        (distinct && !aggregate, "DISTINCT on scalar expressions"),
         (
-            distinct && !is_aggregate_function(&name, args.len()),
-            "DISTINCT on scalar expressions",
+            filter.is_some() && over.is_some(),
+            "aggregate FILTER in window functions",
+        ),
+        (filter.is_some() && !aggregate, "FILTER on scalar functions"),
+        (
+            filter.as_deref().is_some_and(calls_aggregate_or_window),
+            "aggregate or window functions in FILTER",
         ),
     ])?;
 
@@ -4358,7 +4450,15 @@ fn convert_function(func: &sp::Function) -> Result<Expr> {
     }
 
     if is_count_star {
-        return Ok(Expr::CountStar);
+        return Ok(match filter {
+            None => Expr::CountStar,
+            Some(filter) => Expr::Function {
+                name,
+                args,
+                distinct,
+                filter: Some(filter),
+            },
+        });
     }
 
     if name == "COALESCE" {
@@ -4407,6 +4507,7 @@ fn convert_function(func: &sp::Function) -> Result<Expr> {
         name,
         args,
         distinct,
+        filter,
     })
 }
 

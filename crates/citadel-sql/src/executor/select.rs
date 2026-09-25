@@ -2358,6 +2358,7 @@ impl StreamAggPlan {
                     name: func_name,
                     args,
                     distinct,
+                    filter: None,
                 } if args.len() == 1 => {
                     if *distinct {
                         return Ok(None);
@@ -2775,6 +2776,7 @@ impl StreamGroupByPlan {
                     name: func_name,
                     args,
                     distinct,
+                    filter: None,
                 } if args.len() == 1 => {
                     if *distinct {
                         return Ok(None);
@@ -3919,7 +3921,10 @@ fn expr_uses_outer(
             Expr::BinaryOp { left, right, .. } => walk(left, f) || walk(right, f),
             Expr::UnaryOp { expr, .. } => walk(expr, f),
             Expr::IsNull(x) | Expr::IsNotNull(x) => walk(x, f),
-            Expr::Function { args, .. } | Expr::Coalesce(args) => args.iter().any(|a| walk(a, f)),
+            Expr::Function { args, filter, .. } => {
+                args.iter().any(|a| walk(a, f)) || filter.as_deref().is_some_and(|x| walk(x, f))
+            }
+            Expr::Coalesce(args) => args.iter().any(|a| walk(a, f)),
             Expr::Cast { expr, .. } => walk(expr, f),
             Expr::Between {
                 expr, low, high, ..
@@ -4131,6 +4136,7 @@ fn bind_expr_with_outer(
             name,
             args,
             distinct,
+            filter,
         } => Ok(Function {
             name: name.clone(),
             args: args
@@ -4138,6 +4144,10 @@ fn bind_expr_with_outer(
                 .map(|a| bind_expr_with_outer(a, outer_row, outer_col_map))
                 .collect::<Result<Vec<_>>>()?,
             distinct: *distinct,
+            filter: filter
+                .as_deref()
+                .map(|filter| bind_expr_with_outer(filter, outer_row, outer_col_map).map(Box::new))
+                .transpose()?,
         }),
         Cast {
             expr: inner,

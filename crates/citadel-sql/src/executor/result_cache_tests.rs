@@ -52,6 +52,7 @@ fn cacheable_accepts_pure_reads() {
     let s = schema_with_t();
     assert!(cacheable(&s, "SELECT 1"));
     assert!(cacheable(&s, "SELECT SUM(v) FROM t"));
+    assert!(cacheable(&s, "SELECT SUM(v) FILTER (WHERE v > 1) FROM t"));
     assert!(cacheable(
         &s,
         "SELECT v FROM t WHERE v > $1 ORDER BY v LIMIT 3"
@@ -74,6 +75,10 @@ fn cacheable_refuses_volatile_and_unknown() {
     assert!(!cacheable(&s, "SELECT DATE(v) FROM t"));
     assert!(!cacheable(&s, "SELECT v FROM missing_table"));
     assert!(!cacheable(&s, "SELECT v FROM t WHERE v > RANDOM()"));
+    assert!(!cacheable(
+        &s,
+        "SELECT COUNT(*) FILTER (WHERE v > RANDOM()) FROM t"
+    ));
     assert!(!cacheable(
         &s,
         "SELECT ROW_NUMBER() OVER (ORDER BY RANDOM()) FROM t"

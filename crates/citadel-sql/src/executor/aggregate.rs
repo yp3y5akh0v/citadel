@@ -312,17 +312,26 @@ fn reduce_aggregates(
             name,
             args,
             distinct,
+            filter,
         } if is_aggregate_function(name, args.len()) => Expr::Literal(aggregate_value(
-            name, args, *distinct, col_map, group_rows, cancel,
+            name,
+            args,
+            *distinct,
+            filter.as_deref(),
+            col_map,
+            group_rows,
+            cancel,
         )?),
         Expr::Function {
             name,
             args,
             distinct,
+            filter,
         } => Expr::Function {
             name: name.clone(),
             args: all(args)?,
             distinct: *distinct,
+            filter: filter.clone(),
         },
         Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
             left: boxed(left)?,
@@ -445,16 +454,47 @@ fn reduce_aggregates(
     })
 }
 
-/// The value of aggregate `name` over the group's rows.
+/// The group's rows a FILTER condition holds for; NULL counts as false.
+fn filter_rows<'r>(
+    filter: &Expr,
+    col_map: &ColumnMap,
+    group_rows: &[&'r Vec<Value>],
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<Vec<&'r Vec<Value>>> {
+    let mut passing = Vec::with_capacity(group_rows.len());
+    for (row_idx, row) in group_rows.iter().enumerate() {
+        check_cancel_at(cancel, row_idx)?;
+        let ctx = EvalCtx::new(col_map, row).with_cancel(cancel);
+        if is_truthy(&eval_expr(filter, &ctx)?) {
+            passing.push(*row);
+        }
+    }
+    Ok(passing)
+}
+
+/// The value of aggregate `name` over the group's rows, or over those its
+/// FILTER holds for.
 fn aggregate_value(
     name: &str,
     args: &[Expr],
     distinct: bool,
+    filter: Option<&Expr>,
     col_map: &ColumnMap,
     group_rows: &[&Vec<Value>],
     cancel: Option<&citadel::CancelToken>,
 ) -> Result<Value> {
+    let passing;
+    let group_rows = match filter {
+        Some(filter) => {
+            passing = filter_rows(filter, col_map, group_rows, cancel)?;
+            passing.as_slice()
+        }
+        None => group_rows,
+    };
     let func = name.to_ascii_uppercase();
+    if func == "COUNT" && args.is_empty() {
+        return Ok(Value::Integer(group_rows.len() as i64));
+    }
     if matches!(func.as_str(), "JSON_OBJECT_AGG" | "JSONB_OBJECT_AGG") {
         if args.len() != 2 {
             return Err(SqlError::Unsupported(format!(
@@ -721,68 +761,6 @@ fn aggregate_value(
             Ok(result)
         }
         _ => Err(SqlError::Unsupported(format!("aggregate function: {func}"))),
-    }
-}
-
-/// Whether `expr` calls an aggregate over the query's own rows. A subquery
-/// aggregates its own rows and a window function its window.
-pub(super) fn is_aggregate_expr(expr: &Expr) -> bool {
-    match expr {
-        Expr::CountStar => true,
-        Expr::Function { name, args, .. } => {
-            is_aggregate_function(name, args.len()) || args.iter().any(is_aggregate_expr)
-        }
-        Expr::BinaryOp { left, right, .. } | Expr::IsDistinctFrom { left, right, .. } => {
-            is_aggregate_expr(left) || is_aggregate_expr(right)
-        }
-        Expr::UnaryOp { expr, .. }
-        | Expr::IsNull(expr)
-        | Expr::IsNotNull(expr)
-        | Expr::Cast { expr, .. }
-        | Expr::Collate { expr, .. }
-        | Expr::InSet { expr, .. }
-        | Expr::InSubquery { expr, .. } => is_aggregate_expr(expr),
-        Expr::InList { expr, list, .. } => {
-            is_aggregate_expr(expr) || list.iter().any(is_aggregate_expr)
-        }
-        Expr::Case {
-            operand,
-            conditions,
-            else_result,
-        } => {
-            operand.as_ref().is_some_and(|e| is_aggregate_expr(e))
-                || conditions
-                    .iter()
-                    .any(|(c, r)| is_aggregate_expr(c) || is_aggregate_expr(r))
-                || else_result.as_ref().is_some_and(|e| is_aggregate_expr(e))
-        }
-        Expr::Coalesce(args) | Expr::ArrayLiteral(args) => args.iter().any(is_aggregate_expr),
-        Expr::Between {
-            expr, low, high, ..
-        } => is_aggregate_expr(expr) || is_aggregate_expr(low) || is_aggregate_expr(high),
-        Expr::Like {
-            expr,
-            pattern,
-            escape,
-            ..
-        } => {
-            is_aggregate_expr(expr)
-                || is_aggregate_expr(pattern)
-                || escape.as_ref().is_some_and(|e| is_aggregate_expr(e))
-        }
-        Expr::Quantified { left, right, .. } => {
-            is_aggregate_expr(left)
-                || matches!(right, QuantifiedRhs::Array(array) if is_aggregate_expr(array))
-        }
-        Expr::WindowFunction { .. }
-        | Expr::Exists { .. }
-        | Expr::ScalarSubquery(_)
-        | Expr::Literal(_)
-        | Expr::BoundColumn { .. }
-        | Expr::Column(_)
-        | Expr::QualifiedColumn { .. }
-        | Expr::Parameter(_)
-        | Expr::TypedNullRecord(_) => false,
     }
 }
 

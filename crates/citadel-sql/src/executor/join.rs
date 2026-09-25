@@ -1053,9 +1053,13 @@ pub(super) fn has_ambiguous_bare_ref(expr: &Expr, columns: &[ColumnDef]) -> bool
         Expr::UnaryOp { expr: inner, .. } | Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
             has_ambiguous_bare_ref(inner, columns)
         }
-        Expr::Function { args, .. } | Expr::Coalesce(args) => {
+        Expr::Function { args, filter, .. } => {
             args.iter().any(|a| has_ambiguous_bare_ref(a, columns))
+                || filter
+                    .as_deref()
+                    .is_some_and(|filter| has_ambiguous_bare_ref(filter, columns))
         }
+        Expr::Coalesce(args) => args.iter().any(|a| has_ambiguous_bare_ref(a, columns)),
         Expr::Between {
             expr: e, low, high, ..
         } => {

@@ -84,6 +84,7 @@ fn is_aggregate_expr_aggregate_function() {
         name: "SUM".into(),
         args: vec![Expr::Column("x".into())],
         distinct: false,
+        filter: None,
     };
     assert!(is_aggregate_expr(&e));
 }
@@ -94,11 +95,13 @@ fn is_aggregate_expr_nested_aggregate_in_args() {
         name: "MAX".into(),
         args: vec![Expr::Column("x".into())],
         distinct: false,
+        filter: None,
     };
     let outer = Expr::Function {
         name: "ABS".into(),
         args: vec![inner],
         distinct: false,
+        filter: None,
     };
     assert!(is_aggregate_expr(&outer));
 }
@@ -147,6 +150,7 @@ fn is_aggregate_expr_case_with_aggregate_branch() {
                 name: "COUNT".into(),
                 args: vec![Expr::Column("x".into())],
                 distinct: false,
+                filter: None,
             },
         )],
         else_result: None,
@@ -184,6 +188,7 @@ fn eval_aggregate_expr_sum_integer() {
         name: "SUM".into(),
         args: vec![Expr::Column("v".into())],
         distinct: false,
+        filter: None,
     };
     let result = eval_aggregate_expr(&e, &cm, &rows).unwrap();
     assert_eq!(result, i(60));
@@ -199,6 +204,7 @@ fn aggregate_materialization_honors_cancellation() {
         name: "SUM".into(),
         args: vec![Expr::Column("v".into())],
         distinct: false,
+        filter: None,
     };
     let token = citadel::CancelToken::new();
     token.cancel();
@@ -252,8 +258,10 @@ fn aggregate_argument_passes_cancellation_into_scalar_evaluation() {
             name: "TO_TSVECTOR".into(),
             args: vec![Expr::Column("body".into())],
             distinct: false,
+            filter: None,
         }],
         distinct: false,
+        filter: None,
     };
     let token = citadel::CancelToken::new();
     let _cancel = crate::fts::cancel_tokenize_after(token.clone(), 1);

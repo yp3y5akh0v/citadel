@@ -25,7 +25,6 @@ use crate::parser::*;
 use crate::schema::SchemaManager;
 use crate::types::*;
 
-use super::aggregate::is_aggregate_expr;
 use super::ann_persist;
 use super::helpers::{
     check_cancel, check_cancel_at, eval_const_expr, eval_row_count, project_rows,

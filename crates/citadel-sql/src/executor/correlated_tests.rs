@@ -140,6 +140,7 @@ fn collect_column_names_function_args() {
         name: "ABS".into(),
         args: vec![Expr::Column("x".into())],
         distinct: false,
+        filter: None,
     };
     collect_column_names(&e, &mut out);
     assert_eq!(out, unqualified(&["x"]));

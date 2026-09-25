@@ -450,6 +450,7 @@ fn expr_display_name_function() {
         name: "UPPER".into(),
         args: vec![Expr::Column("name".into())],
         distinct: false,
+        filter: None,
     };
     assert_eq!(expr_display_name(&e), "UPPER(name)");
 }
@@ -460,6 +461,7 @@ fn expr_display_name_function_distinct() {
         name: "COUNT".into(),
         args: vec![Expr::Column("id".into())],
         distinct: true,
+        filter: None,
     };
     assert_eq!(expr_display_name(&e), "COUNT(DISTINCT id)");
 }
@@ -550,6 +552,7 @@ fn infer_expr_type_count_function() {
         name: "COUNT".into(),
         args: vec![Expr::Column("x".into())],
         distinct: false,
+        filter: None,
     };
     assert_eq!(infer_expr_type(&e, &[]), DataType::Integer);
 }
@@ -560,6 +563,7 @@ fn infer_expr_type_avg_function() {
         name: "AVG".into(),
         args: vec![Expr::Column("x".into())],
         distinct: false,
+        filter: None,
     };
     assert_eq!(infer_expr_type(&e, &[]), DataType::Real);
 }
@@ -947,6 +951,7 @@ fn decoding_an_old_row_passes_cancellation_to_its_default_expression() {
             "several words to tokenize".into(),
         ))],
         distinct: false,
+        filter: None,
     });
     let ts = schema(
         "docs",

@@ -98,6 +98,7 @@ fn reject_non_deterministic_now_rejected() {
             name: "NOW".into(),
             args: vec![],
             distinct: false,
+            filter: None,
         },
         alias: None,
     }];
@@ -116,6 +117,7 @@ fn reject_non_deterministic_random_rejected() {
         name: "random".into(),
         args: vec![],
         distinct: false,
+        filter: None,
     });
     let sq = SelectQuery {
         ctes: vec![],
@@ -133,6 +135,7 @@ fn reject_non_deterministic_deterministic_ok() {
             name: "UPPER".into(),
             args: vec![Expr::Column("name".into())],
             distinct: false,
+            filter: None,
         },
         alias: None,
     }];
@@ -167,6 +170,7 @@ fn reject_non_deterministic_compound_walks_both_sides() {
         name: "NOW".into(),
         args: vec![],
         distinct: false,
+        filter: None,
     });
     let comp = CompoundSelect {
         op: SetOp::Union,

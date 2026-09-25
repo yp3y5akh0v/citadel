@@ -611,7 +611,15 @@ pub(super) fn collect_column_names(expr: &Expr, out: &mut Vec<ColumnName>) {
         | Expr::Collate { expr: e, .. } => {
             collect_column_names(e, out);
         }
-        Expr::Function { args, .. } | Expr::Coalesce(args) | Expr::ArrayLiteral(args) => {
+        Expr::Function { args, filter, .. } => {
+            for a in args {
+                collect_column_names(a, out);
+            }
+            if let Some(filter) = filter {
+                collect_column_names(filter, out);
+            }
+        }
+        Expr::Coalesce(args) | Expr::ArrayLiteral(args) => {
             for a in args {
                 collect_column_names(a, out);
             }
@@ -824,7 +832,7 @@ fn hashable_shape(query: &SelectStmt) -> bool {
 fn hashable_exists(query: &SelectStmt) -> bool {
     hashable_shape(query)
         && !query.columns.iter().any(|column| match column {
-            SelectColumn::Expr { expr, .. } => super::aggregate::is_aggregate_expr(expr),
+            SelectColumn::Expr { expr, .. } => crate::parser::is_aggregate_expr(expr),
             _ => false,
         })
 }
@@ -862,7 +870,7 @@ fn hashable_scalar(query: &SelectStmt, inner_schema: &TableSchema) -> Option<Has
         Expr::CountStar => Some(HashedScalar::Aggregate(Value::Integer(0))),
         Expr::Function { name, args, .. }
             if crate::parser::is_aggregate_function(name, args.len())
-                && !args.iter().any(super::aggregate::is_aggregate_expr) =>
+                && !args.iter().any(crate::parser::is_aggregate_expr) =>
         {
             Some(HashedScalar::Aggregate(
                 if name.eq_ignore_ascii_case("count") {
@@ -872,7 +880,7 @@ fn hashable_scalar(query: &SelectStmt, inner_schema: &TableSchema) -> Option<Has
                 },
             ))
         }
-        expr if !query.distinct && !super::aggregate::is_aggregate_expr(expr) => {
+        expr if !query.distinct && !crate::parser::is_aggregate_expr(expr) => {
             Some(HashedScalar::Row)
         }
         _ => None,
@@ -1226,10 +1234,12 @@ pub(super) fn bind_outer_values_in_expr(
             name,
             args,
             distinct,
+            filter,
         } => Expr::Function {
             name: name.clone(),
             args: args.iter().map(bind).collect(),
             distinct: *distinct,
+            filter: filter.as_deref().map(|filter| Box::new(bind(filter))),
         },
         Expr::InSubquery {
             expr,

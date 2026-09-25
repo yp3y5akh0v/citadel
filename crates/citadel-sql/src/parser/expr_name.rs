@@ -12,12 +12,19 @@ pub(crate) fn expr_display_name(expr: &Expr) -> String {
             name,
             args,
             distinct,
+            filter,
         } => {
             let arg_strs: Vec<String> = args.iter().map(expr_display_name).collect();
-            if *distinct {
+            let call = if *distinct {
                 format!("{name}(DISTINCT {})", arg_strs.join(", "))
+            } else if args.is_empty() && name == "COUNT" {
+                "COUNT(*)".into()
             } else {
                 format!("{name}({})", arg_strs.join(", "))
+            };
+            match filter {
+                Some(filter) => format!("{call} FILTER (WHERE {})", expr_display_name(filter)),
+                None => call,
             }
         }
         Expr::BinaryOp { left, op, right } => {

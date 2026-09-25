@@ -457,6 +457,7 @@ fn residual_join_predicate_propagates_scalar_cancellation() {
             column: "body".into(),
         }],
         distinct: false,
+        filter: None,
     };
     let join = JoinClause {
         join_type: JoinType::Inner,

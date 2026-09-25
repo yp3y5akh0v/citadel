@@ -70,6 +70,7 @@ fn count_subqueries_in_function_args() {
         name: "COALESCE".into(),
         args: vec![scalar_subq("a"), scalar_subq("b"), scalar_subq("c")],
         distinct: false,
+        filter: None,
     };
     assert_eq!(count_subqueries(&e), 3);
 }
