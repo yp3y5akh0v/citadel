@@ -1,0 +1,15 @@
+# CI runs `cargo deny check advisories sources`. Licences are enforced by
+# cargo-about against packaging/licenses/about.toml in the Scripts workflow.
+
+[graph]
+all-features = true
+
+[advisories]
+ignore = [
+    { id = "RUSTSEC-2024-0436", reason = "paste has no maintained release; it is a build-time proc-macro reached only through candle's gemm" },
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser has no maintained release; winit's Wayland decorations depend on it, so dropping Studio's direct use would not remove it" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

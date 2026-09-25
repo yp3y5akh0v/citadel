@@ -70,6 +70,23 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - run: cargo +1.95 check --workspace --locked
 
+  # Runs on every change so advisories published against an unchanged
+  # lockfile still surface.
+  advisories:
+    runs-on: ubuntu-latest
+    name: dependency advisories
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@7b8d4719ee4aaa279bdf55df38dacb9ebfe12a6c # v2.87.6
+        with:
+          tool: cargo-deny@0.20.2
+          checksum: true
+          fallback: none
+      - run: cargo deny --locked check advisories sources
+
   test:
     env:
       CARGO_PROFILE_TEST_DEBUG: line-tables-only
