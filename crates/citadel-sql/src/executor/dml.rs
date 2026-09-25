@@ -212,6 +212,40 @@ pub(super) fn materialize_expr_selective(
             let result = if *negated { !exists } else { exists };
             Ok(Expr::Literal(Value::Boolean(result)))
         }
+        Expr::Quantified {
+            left,
+            op,
+            quantifier,
+            right,
+        } => {
+            let right = match right {
+                QuantifiedRhs::Subquery(subquery) => match exec_sub(subquery)? {
+                    None => right.clone(),
+                    Some(selected) => {
+                        let qr = &selected.result;
+                        if !qr.columns.is_empty() && qr.columns.len() != 1 {
+                            return Err(SqlError::SubqueryMultipleColumns);
+                        }
+                        let values = qr.rows.iter().map(|row| row[0].clone()).collect();
+                        // The values compare like the column they were selected from,
+                        // as `x IN (SELECT y)` does.
+                        QuantifiedRhs::Array(Box::new(Expr::BoundColumn {
+                            value: Value::Array(Arc::new(values)),
+                            collation: selected.collation_at(0),
+                        }))
+                    }
+                },
+                QuantifiedRhs::Array(array) => {
+                    QuantifiedRhs::Array(Box::new(materialize_expr_selective(array, exec_sub)?))
+                }
+            };
+            Ok(Expr::Quantified {
+                left: Box::new(materialize_expr_selective(left, exec_sub)?),
+                op: *op,
+                quantifier: *quantifier,
+                right,
+            })
+        }
         Expr::InList {
             expr: e,
             list,

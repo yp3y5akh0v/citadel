@@ -639,25 +639,36 @@ fn eval_quantified(
     right: &crate::parser::QuantifiedRhs,
     ctx: &EvalCtx,
 ) -> Result<Value> {
-    use crate::parser::{QuantifiedRhs, Quantifier};
+    use crate::parser::{BinOp, QuantifiedRhs, Quantifier};
+    if !matches!(
+        op,
+        BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq
+    ) {
+        return Err(SqlError::Unsupported(format!(
+            "ANY/ALL comparison op {op:?}"
+        )));
+    }
     let lhs = eval_expr(left, ctx)?;
-    let elems: Vec<Value> = match right {
-        QuantifiedRhs::Array(e) => match eval_expr(e, ctx)? {
-            Value::Array(a) => (*a).clone(),
-            Value::Null => return Ok(Value::Null),
-            other => {
-                return Err(SqlError::TypeMismatch {
-                    expected: "ARRAY".into(),
-                    got: other.data_type().to_string(),
-                });
-            }
-        },
+    let array = match right {
+        QuantifiedRhs::Array(array) => array,
         QuantifiedRhs::Subquery(_) => {
             return Err(SqlError::Unsupported(
                 "ANY/ALL subquery not materialized (internal error)".into(),
             ));
         }
     };
+    let elems = match eval_expr(array, ctx)? {
+        Value::Array(elems) => elems,
+        Value::Null => return Ok(Value::Null),
+        other => {
+            return Err(SqlError::TypeMismatch {
+                expected: "ARRAY".into(),
+                got: other.data_type().to_string(),
+            });
+        }
+    };
+    // Each element compares as `left op element` does, collation included.
+    let collation = compile_collation(left, array, ctx.col_map);
 
     if lhs.is_null() {
         return if elems.is_empty() {
@@ -673,12 +684,12 @@ fn eval_quantified(
     let mut any_unknown = false;
     let mut any_match = false;
     let mut any_mismatch = false;
-    for elem in &elems {
+    for elem in elems.iter() {
         if elem.is_null() {
             any_unknown = true;
             continue;
         }
-        let result = eval_binary_compare(&lhs, op, elem)?;
+        let result = collated_compare_with_cancel(&lhs, op, elem, collation, ctx.cancel)?;
         match result {
             Value::Boolean(true) => any_match = true,
             Value::Boolean(false) => any_mismatch = true,
@@ -712,35 +723,6 @@ fn eval_quantified(
             }
         }
     }
-}
-
-fn eval_binary_compare(left: &Value, op: crate::parser::BinOp, right: &Value) -> Result<Value> {
-    use crate::parser::BinOp;
-    if left.is_null() || right.is_null() {
-        return Ok(Value::Null);
-    }
-    let cmp = match (left, right) {
-        (Value::Text(a), Value::Text(b)) => Some(a.cmp(b)),
-        _ => left.partial_cmp(right),
-    };
-    let Some(cmp) = cmp else {
-        return Ok(Value::Null);
-    };
-    use std::cmp::Ordering;
-    let result = match op {
-        BinOp::Eq => cmp == Ordering::Equal,
-        BinOp::NotEq => cmp != Ordering::Equal,
-        BinOp::Lt => cmp == Ordering::Less,
-        BinOp::Gt => cmp == Ordering::Greater,
-        BinOp::LtEq => cmp != Ordering::Greater,
-        BinOp::GtEq => cmp != Ordering::Less,
-        _ => {
-            return Err(SqlError::Unsupported(format!(
-                "ANY/ALL comparison op {op:?}"
-            )));
-        }
-    };
-    Ok(Value::Boolean(result))
 }
 
 pub(crate) fn collation_of(expr: &Expr) -> Option<crate::types::Collation> {
