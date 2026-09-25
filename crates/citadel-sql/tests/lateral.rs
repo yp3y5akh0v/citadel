@@ -415,6 +415,34 @@ fn lateral_correlation_compares_as_equals_does() {
     );
 }
 
+/// 64 outer rows share one correlation key: a LATERAL query run once for the
+/// key would give every row the same volatile answer.
+#[test]
+fn a_volatile_lateral_query_runs_for_each_outer_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE outer_rows (id INTEGER PRIMARY KEY, k INTEGER)")
+        .unwrap();
+    conn.execute("CREATE TABLE coin (id INTEGER PRIMARY KEY, k INTEGER)")
+        .unwrap();
+    let outer = (0..64)
+        .map(|id| format!("({id}, 1)"))
+        .collect::<Vec<_>>()
+        .join(",");
+    conn.execute(&format!("INSERT INTO outer_rows VALUES {outer}"))
+        .unwrap();
+    conn.execute("INSERT INTO coin VALUES (1, 1)").unwrap();
+    let hits = query(
+        &conn,
+        "SELECT outer_rows.id FROM outer_rows, LATERAL (SELECT coin.id FROM coin \
+         WHERE coin.k = outer_rows.k AND RANDOM() % 2 = 0) AS d",
+    )
+    .rows
+    .len();
+    assert!(0 < hits && hits < 64, "{hits} of 64");
+}
+
 #[test]
 fn lateral_items_of_other_shapes() {
     let dir = tempfile::tempdir().unwrap();

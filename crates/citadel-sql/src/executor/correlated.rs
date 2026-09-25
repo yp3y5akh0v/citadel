@@ -80,6 +80,7 @@ fn complete_exists_semijoin(
             || !query.order_by.is_empty()
             || query.limit.is_some()
             || query.offset.is_some()
+            || query.where_clause.as_ref().is_some_and(calls_volatile)
             || !query.columns.iter().all(|column| {
                 matches!(
                     column,
@@ -832,7 +833,8 @@ pub(super) fn materialize_join_conditions(
 }
 
 /// Hash decorrelation reproduces a subquery only when it reads one source
-/// through conjuncts, with no nested query, grouping, ordering or limit.
+/// through conjuncts, with no nested query, grouping, ordering or limit, and
+/// no volatile call, which each outer row's run evaluates anew.
 fn hashable_shape(query: &SelectStmt) -> bool {
     query.joins.is_empty()
         && query.from_subquery.is_none()
@@ -846,9 +848,11 @@ fn hashable_shape(query: &SelectStmt) -> bool {
         && !query
             .where_clause
             .as_ref()
-            .is_some_and(super::dml::has_subquery)
+            .is_some_and(|expr| super::dml::has_subquery(expr) || calls_volatile(expr))
         && query.columns.iter().all(|column| match column {
-            SelectColumn::Expr { expr, .. } => !super::dml::has_subquery(expr),
+            SelectColumn::Expr { expr, .. } => {
+                !super::dml::has_subquery(expr) && !calls_volatile(expr)
+            }
             _ => true,
         })
 }
