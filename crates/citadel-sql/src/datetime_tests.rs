@@ -198,6 +198,65 @@ fn parse_interval_rejects_fields_out_of_range() {
 }
 
 #[test]
+fn scaling_an_interval_cascades_fractions_like_postgres() {
+    let hours = |h: i64| h * MICROS_PER_HOUR;
+    assert_eq!(divide_interval(0, 10, 0, 4.0).unwrap(), (0, 2, hours(12)));
+    assert_eq!(divide_interval(1, 15, 0, 2.0).unwrap(), (0, 22, hours(12)));
+    assert_eq!(
+        divide_interval(0, 1, hours(2), 2.0).unwrap(),
+        (0, 0, hours(13))
+    );
+    assert_eq!(multiply_interval(1, 0, 0, 1.5).unwrap(), (1, 15, 0));
+    assert_eq!(multiply_interval(0, 1, 0, 0.5).unwrap(), (0, 0, hours(12)));
+    // '1 day 02:00:00', '-3 hours', '1 mon 15 days' and one microsecond.
+    assert_eq!(
+        average_interval(1, 16, i128::from(hours(2) - hours(3) + 1), 4).unwrap(),
+        (0, 11, hours(11) + 45 * MICROS_PER_MIN)
+    );
+    assert!(matches!(
+        divide_interval(0, 1, 0, 0.0),
+        Err(SqlError::DivisionByZero)
+    ));
+    for overflow in [
+        multiply_interval(i32::MAX, 0, 0, 2.0),
+        multiply_interval(0, 0, i64::MAX, 2.0),
+        multiply_interval(1, 0, 0, f64::NAN),
+        multiply_interval_by_integer(i32::MAX, 0, 0, 2),
+        multiply_interval_by_integer(0, 0, i64::MIN, -1),
+        add_intervals((0, i32::MAX, 0), (0, 1, 0)),
+        subtract_intervals((0, 0, i64::MIN), (0, 0, 1)),
+        negate_interval(i32::MIN, 0, 0),
+    ] {
+        assert!(
+            matches!(&overflow, Err(SqlError::InvalidValue(message)) if message == "interval out of range"),
+            "{overflow:?}"
+        );
+    }
+}
+
+#[test]
+fn justify_moves_signs_like_postgres() {
+    let hours = |h: i64| h * MICROS_PER_HOUR;
+    assert_eq!(justify_days(1, -5, 0).unwrap(), (0, 25, 0));
+    assert_eq!(justify_days(-1, 5, 0).unwrap(), (0, -25, 0));
+    assert_eq!(justify_hours(0, 1, -hours(1)).unwrap(), (0, 0, hours(23)));
+    assert_eq!(justify_hours(0, -1, hours(1)).unwrap(), (0, 0, -hours(23)));
+    assert_eq!(
+        justify_interval(1, 0, -hours(1)).unwrap(),
+        (0, 29, hours(23))
+    );
+    assert_eq!(
+        justify_interval(-1, 0, hours(1)).unwrap(),
+        (0, -29, -hours(23))
+    );
+    assert_eq!(
+        justify_interval(0, 35, hours(25)).unwrap(),
+        (1, 6, hours(1))
+    );
+    assert!(justify_days(i32::MAX, 30, 0).is_err());
+}
+
+#[test]
 fn format_interval_hours_past_a_day() {
     assert_eq!(format_interval(0, 0, 300 * MICROS_PER_HOUR), "300:00:00");
     assert_eq!(
@@ -251,13 +310,13 @@ fn interval_normalized_compare() {
 
 #[test]
 fn justify_days_basic() {
-    let (m, d, us) = justify_days(0, 65, 0);
+    let (m, d, us) = justify_days(0, 65, 0).unwrap();
     assert_eq!((m, d, us), (2, 5, 0));
 }
 
 #[test]
 fn justify_hours_basic() {
-    let (m, d, us) = justify_hours(0, 0, 50 * MICROS_PER_HOUR + 10 * MICROS_PER_MIN);
+    let (m, d, us) = justify_hours(0, 0, 50 * MICROS_PER_HOUR + 10 * MICROS_PER_MIN).unwrap();
     assert_eq!(
         (m, d, us),
         (0, 2, 2 * MICROS_PER_HOUR + 10 * MICROS_PER_MIN)

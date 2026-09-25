@@ -826,7 +826,7 @@ fn aggregate_value(
             Ok(Value::Integer(count as i64))
         }
         "SUM" => {
-            // INTERVAL sum: field-wise saturating add (PG semantic).
+            // INTERVAL sum: field by field, an overflow an error (PG semantic).
             let is_interval = first_non_null_is_interval(&values, cancel)?;
             if is_interval {
                 let mut months: i32 = 0;
@@ -842,9 +842,10 @@ fn aggregate_value(
                             days: d,
                             micros: u,
                         } => {
-                            months = months.saturating_add(*m);
-                            days = days.saturating_add(*d);
-                            micros = micros.saturating_add(*u);
+                            (months, days, micros) = crate::datetime::add_intervals(
+                                (months, days, micros),
+                                (*m, *d, *u),
+                            )?;
                             all_null = false;
                         }
                         _ => {
@@ -903,7 +904,7 @@ fn aggregate_value(
             }
         }
         "AVG" => {
-            // INTERVAL avg: field-wise sum / count.
+            // INTERVAL avg: the sum divided by the count, as interval division.
             let is_interval = first_non_null_is_interval(&values, cancel)?;
             if is_interval {
                 let mut months: i64 = 0;
@@ -932,15 +933,16 @@ fn aggregate_value(
                         }
                     }
                 }
-                return if count == 0 {
-                    Ok(Value::Null)
-                } else {
-                    Ok(Value::Interval {
-                        months: (months / count).clamp(i32::MIN as i64, i32::MAX as i64) as i32,
-                        days: (days / count).clamp(i32::MIN as i64, i32::MAX as i64) as i32,
-                        micros: (micros / count as i128) as i64,
-                    })
-                };
+                if count == 0 {
+                    return Ok(Value::Null);
+                }
+                let (months, days, micros) =
+                    crate::datetime::average_interval(months, days, micros, count)?;
+                return Ok(Value::Interval {
+                    months,
+                    days,
+                    micros,
+                });
             }
             let mut sum: f64 = 0.0;
             let mut count: i64 = 0;

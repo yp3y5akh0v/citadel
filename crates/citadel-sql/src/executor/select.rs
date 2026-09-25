@@ -2000,9 +2000,11 @@ impl AggState {
                         days,
                         micros,
                     } => {
-                        *interval_months = interval_months.saturating_add(*months);
-                        *interval_days = interval_days.saturating_add(*days);
-                        *interval_micros = interval_micros.saturating_add(*micros);
+                        (*interval_months, *interval_days, *interval_micros) =
+                            crate::datetime::add_intervals(
+                                (*interval_months, *interval_days, *interval_micros),
+                                (*months, *days, *micros),
+                            )?;
                         *all_null = false;
                         *is_interval = true;
                     }
@@ -2131,12 +2133,16 @@ impl AggState {
                 if count == 0 {
                     Value::Null
                 } else if is_interval {
+                    let (months, days, micros) = crate::datetime::average_interval(
+                        interval_months,
+                        interval_days,
+                        interval_micros,
+                        count,
+                    )?;
                     Value::Interval {
-                        months: (interval_months / count).clamp(i32::MIN as i64, i32::MAX as i64)
-                            as i32,
-                        days: (interval_days / count).clamp(i32::MIN as i64, i32::MAX as i64)
-                            as i32,
-                        micros: (interval_micros / count as i128) as i64,
+                        months,
+                        days,
+                        micros,
                     }
                 } else {
                     Value::Real(sum / count as f64)
