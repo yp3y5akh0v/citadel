@@ -1684,6 +1684,41 @@ fn random_returns_integer() {
 }
 
 #[test]
+fn random_draws_a_new_value_for_every_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE many (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    let values = (0..512)
+        .map(|id| format!("({id})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    conn.execute(&format!("INSERT INTO many VALUES {values}"))
+        .unwrap();
+    // Two calls in one row run nanoseconds apart, so a value drawn from the
+    // clock repeats; rows close together repeat it too.
+    assert_eq!(
+        scalar(&conn, "SELECT COUNT(*) FROM many WHERE RANDOM() = RANDOM()"),
+        Value::Integer(0)
+    );
+    assert_eq!(
+        scalar(
+            &conn,
+            "SELECT COUNT(DISTINCT r) FROM (SELECT RANDOM() AS r FROM many) AS d"
+        ),
+        Value::Integer(512)
+    );
+    let shuffled = conn
+        .query("SELECT id FROM many ORDER BY RANDOM()")
+        .unwrap()
+        .rows;
+    let in_order: Vec<Vec<Value>> = (0..512).map(|id| vec![Value::Integer(id)]).collect();
+    assert_eq!(shuffled.len(), 512);
+    assert_ne!(shuffled, in_order, "ORDER BY RANDOM() kept the scan order");
+}
+
+#[test]
 fn concat_op_all_types() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
