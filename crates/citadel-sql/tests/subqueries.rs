@@ -770,5 +770,12 @@ fn join_clauses_run_their_subqueries() {
         assert_eq!(ints(&conn.query(sql).unwrap().rows), expected, "{sql}");
         let prepared = conn.prepare(sql).unwrap().query_collect(&[]).unwrap();
         assert_eq!(ints(&prepared.rows), expected, "prepared {sql}");
+        conn.execute("BEGIN").unwrap();
+        assert_eq!(
+            ints(&conn.query(sql).unwrap().rows),
+            expected,
+            "transaction {sql}"
+        );
+        conn.execute("ROLLBACK").unwrap();
     }
 }

@@ -552,13 +552,33 @@ pub(super) fn build_cte_schema(name: &str, cte: &CteRows) -> Result<TableSchema>
     ))
 }
 
+/// `ctes` are the CTEs visible to `stmt`; `cte` is the source it reads.
 pub(super) fn exec_select_from_cte(
+    schema: &SchemaManager,
+    ctes: &CteContext,
     cte: &CteRows,
     stmt: &SelectStmt,
     exec_sub: &mut dyn FnMut(&SelectStmt) -> Result<CteRows>,
     cancel: Option<&citadel::CancelToken>,
 ) -> Result<ExecutionResult> {
     let cte_schema = build_cte_schema(&stmt.from, cte)?;
+    if super::stmt_has_subquery(stmt) {
+        let outer =
+            super::OuterScope::single(&stmt.from, stmt.from_alias.as_deref(), &cte_schema.columns);
+        if super::correlated::captures_outer_row(schema, ctes, stmt, &outer, cancel)? {
+            let rows = super::clone_cte_rows_with_cancel(&cte.result.rows, cancel)?;
+            return super::finish_captured_select(
+                schema,
+                ctes,
+                stmt.clone(),
+                &outer,
+                rows,
+                cte_schema.columns,
+                cancel,
+                exec_sub,
+            );
+        }
+    }
     let actual_stmt;
     let s = if super::stmt_has_subquery(stmt) {
         actual_stmt = super::materialize_stmt(stmt, exec_sub)?;

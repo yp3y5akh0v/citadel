@@ -407,6 +407,8 @@ fn aggregate_cte_filter_stops_when_cancelled_during_materialization() {
     stmt.where_clause = Some(Expr::Literal(Value::Boolean(true)));
 
     let outcome = exec_select_from_cte(
+        &SchemaManager::empty(),
+        &CteContext::default(),
         &cte,
         &stmt,
         &mut |_| panic!("the statement has no subquery"),
@@ -424,6 +426,8 @@ fn ordinary_cte_clone_stops_when_cancelled_during_materialization() {
     let cte = many_cte_rows();
 
     let outcome = exec_select_from_cte(
+        &SchemaManager::empty(),
+        &CteContext::default(),
         &cte,
         &empty_select("c"),
         &mut |_| panic!("the statement has no subquery"),
@@ -473,6 +477,8 @@ fn cte_aggregate_filter_passes_cancellation_into_scalar_evaluation() {
     let _cancel = crate::fts::cancel_tokenize_after(token.clone(), 1);
 
     let outcome = exec_select_from_cte(
+        &SchemaManager::empty(),
+        &CteContext::default(),
         &cte,
         &stmt,
         &mut |_| panic!("the statement has no subquery"),

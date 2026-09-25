@@ -798,8 +798,7 @@ fn scalar_in_select_count() {
     ).unwrap();
     assert_eq!(qr.rows.len(), 5);
     assert_eq!(qr.rows[0][1], Value::Integer(2)); // Alice has 2 orders
-                                                  // Bob has 0 orders — decorrelation returns NULL (no matching group in GROUP BY)
-    assert!(qr.rows[1][1].is_null());
+    assert_eq!(qr.rows[1][1], Value::Integer(0)); // Bob has none
     assert_eq!(qr.rows[2][1], Value::Integer(1)); // Charlie has 1
 }
 
