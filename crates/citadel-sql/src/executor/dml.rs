@@ -514,28 +514,6 @@ pub(super) fn update_has_subquery(stmt: &UpdateStmt) -> bool {
         || stmt.assignments.iter().any(|(_, e)| has_subquery(e))
 }
 
-pub(super) fn materialize_update(
-    stmt: &UpdateStmt,
-    exec_sub: &mut dyn FnMut(&SelectStmt) -> Result<CteRows>,
-) -> Result<UpdateStmt> {
-    let where_clause = stmt
-        .where_clause
-        .as_ref()
-        .map(|e| materialize_expr(e, exec_sub))
-        .transpose()?;
-    let assignments = stmt
-        .assignments
-        .iter()
-        .map(|(name, expr)| Ok((name.clone(), materialize_expr(expr, exec_sub)?)))
-        .collect::<Result<Vec<_>>>()?;
-    Ok(UpdateStmt {
-        table: stmt.table.clone(),
-        assignments,
-        where_clause,
-        returning: stmt.returning.clone(),
-    })
-}
-
 pub(super) fn delete_has_subquery(stmt: &DeleteStmt) -> bool {
     stmt.where_clause.as_ref().is_some_and(has_subquery)
 }

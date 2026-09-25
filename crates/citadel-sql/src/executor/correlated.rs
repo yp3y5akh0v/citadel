@@ -112,6 +112,131 @@ fn complete_exists_semijoin(
     })
 }
 
+/// Run the subqueries in `expr` that do not read the target row; keep the
+/// ones that do, for each row to bind.
+pub(super) fn materialize_closed_subqueries(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    schema: &SchemaManager,
+    ctes: &CteContext,
+    expr: &Expr,
+    ctx: &CorrelationCtx<'_>,
+) -> Result<Expr> {
+    super::dml::materialize_expr_selective(expr, &mut |query| {
+        let mut candidate = Expr::ScalarSubquery(Box::new(query.clone()));
+        if binding::bind_predicate(wtx, schema, ctes, &mut candidate, ctx, None)? {
+            Ok(None)
+        } else {
+            super::dml::exec_subquery_write(wtx, schema, query, ctes).map(Some)
+        }
+    })
+}
+
+/// UPDATE SET expressions whose subqueries read the target row, bound to one
+/// row at a time. A subquery runs once per distinct captured value unless it
+/// calls a volatile function.
+pub(super) struct SetRowBinder {
+    outer: OuterScope,
+    assignments: Vec<SetAssignment>,
+}
+
+struct SetAssignment {
+    name: String,
+    expr: Expr,
+    /// The row positions its subqueries read; None when they read none.
+    captured: Option<Vec<usize>>,
+    memo: Option<FxHashMap<Vec<Value>, Expr>>,
+}
+
+impl SetRowBinder {
+    /// None when no SET expression reads the row through a subquery.
+    pub(super) fn new(
+        schema: &SchemaManager,
+        ctes: &CteContext,
+        assignments: &[(String, Expr)],
+        ctx: &CorrelationCtx<'_>,
+        cancel: Option<&citadel::CancelToken>,
+    ) -> Result<Option<Self>> {
+        let outer = OuterScope::single(
+            &ctx.outer_schema.name,
+            ctx.outer_alias,
+            &ctx.outer_schema.columns,
+        );
+        let mut bound = Vec::with_capacity(assignments.len());
+        for (name, expr) in assignments {
+            let captured = if super::dml::has_subquery(expr) {
+                binding::bind_outer(schema, ctes, &mut expr.clone(), &outer, None, cancel)?
+            } else {
+                None
+            };
+            let memo = (captured.is_some() && !calls_volatile(expr)).then(FxHashMap::default);
+            bound.push(SetAssignment {
+                name: name.clone(),
+                expr: expr.clone(),
+                captured,
+                memo,
+            });
+        }
+        Ok(bound
+            .iter()
+            .any(|assignment| assignment.captured.is_some())
+            .then_some(Self {
+                outer,
+                assignments: bound,
+            }))
+    }
+
+    /// `row`'s SET expressions, with its captured values bound in and the
+    /// subqueries that read them run against the writer.
+    pub(super) fn bind(
+        &mut self,
+        wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+        schema: &SchemaManager,
+        ctes: &CteContext,
+        row: &[Value],
+    ) -> Result<Vec<(String, Expr)>> {
+        let cancel = wtx.cancel_token().cloned();
+        let mut bound = Vec::with_capacity(self.assignments.len());
+        for assignment in &mut self.assignments {
+            let Some(positions) = &assignment.captured else {
+                bound.push((assignment.name.clone(), assignment.expr.clone()));
+                continue;
+            };
+            let key: Vec<Value> = positions.iter().map(|&p| row[p].clone()).collect();
+            if let Some(expr) = assignment.memo.as_ref().and_then(|memo| memo.get(&key)) {
+                bound.push((assignment.name.clone(), expr.clone()));
+                continue;
+            }
+            let mut expr = assignment.expr.clone();
+            binding::bind_outer(
+                schema,
+                ctes,
+                &mut expr,
+                &self.outer,
+                Some(row),
+                cancel.as_ref(),
+            )?;
+            let expr = super::dml::materialize_expr(&expr, &mut |query| {
+                super::dml::exec_subquery_write(wtx, schema, query, ctes)
+            })?;
+            if let Some(memo) = &mut assignment.memo {
+                memo.insert(key, expr.clone());
+            }
+            bound.push((assignment.name.clone(), expr));
+        }
+        Ok(bound)
+    }
+}
+
+fn calls_volatile(expr: &Expr) -> bool {
+    let mut volatile = false;
+    crate::parser::visit_expr(expr, &mut |node| {
+        if let Expr::Function { name, args, .. } = node {
+            volatile |= crate::eval::is_volatile_function_expr(&name.to_ascii_uppercase(), args);
+        }
+    });
+    volatile
+}
+
 /// Keep physical row locators attached while filtering. Only a complete simple
 /// EXISTS equijoin may use a semijoin; other predicates bind each outer row in
 /// its lexical query scopes and execute against this same writer. `ctes` are
@@ -129,14 +254,7 @@ pub(super) fn filter_mutation_correlated_rows<T>(
     let Some(predicate) = predicate else {
         return Ok(None);
     };
-    let predicate = super::dml::materialize_expr_selective(predicate, &mut |query| {
-        let mut candidate = Expr::ScalarSubquery(Box::new(query.clone()));
-        if binding::bind_predicate(wtx, schema, ctes, &mut candidate, ctx, None)? {
-            Ok(None)
-        } else {
-            super::dml::exec_subquery_write(wtx, schema, query, ctes).map(Some)
-        }
-    })?;
+    let predicate = materialize_closed_subqueries(wtx, schema, ctes, predicate, ctx)?;
     if complete_exists_semijoin(&predicate, ctx, schema) {
         return exists_semijoin_write(wtx, schema, &Some(predicate.clone()), ctx, rows, values);
     }

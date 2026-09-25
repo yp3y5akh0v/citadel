@@ -2446,16 +2446,7 @@ pub(super) fn exec_update_in_txn(
         outer_schema: table_schema,
         outer_alias: Some(&stmt.table),
     };
-    // SET subqueries are materialized once below, not evaluated per target row.
-    // Reject captures before materialization can mistake an outer column for a
-    // similarly named local column and silently apply the wrong value.
-    for (_, expr) in &stmt.assignments {
-        if mutation_has_correlated_expr(wtx, expr, &ctx, schema)? {
-            return Err(SqlError::Unsupported(
-                "correlated subqueries in UPDATE SET expressions".into(),
-            ));
-        }
-    }
+    let ctes = CteContext::default();
     let mut correlated_rows = None;
     let rewritten;
     let stmt = if mutation_has_correlated_where(wtx, &stmt.where_clause, &ctx, schema)? {
@@ -2463,7 +2454,7 @@ pub(super) fn exec_update_in_txn(
         let remaining = filter_mutation_correlated_rows(
             wtx,
             schema,
-            &CteContext::default(),
+            &ctes,
             &stmt.where_clause,
             &ctx,
             &mut rows,
@@ -2482,20 +2473,42 @@ pub(super) fn exec_update_in_txn(
     };
     let materialized;
     let stmt = if update_has_subquery(stmt) {
-        materialized = materialize_update(stmt, &mut |sub| {
-            exec_subquery_write(wtx, schema, sub, &CteContext::default())
-        })?;
+        // A SET subquery that reads the target row stays for each row to bind.
+        let assignments = stmt
+            .assignments
+            .iter()
+            .map(|(name, expr)| {
+                let expr = materialize_closed_subqueries(wtx, schema, &ctes, expr, &ctx)?;
+                Ok((name.clone(), expr))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let where_clause = stmt
+            .where_clause
+            .as_ref()
+            .map(|expr| {
+                materialize_expr(expr, &mut |sub| {
+                    exec_subquery_write(wtx, schema, sub, &ctes)
+                })
+            })
+            .transpose()?;
+        materialized = UpdateStmt {
+            table: stmt.table.clone(),
+            assignments,
+            where_clause,
+            returning: stmt.returning.clone(),
+        };
         &materialized
     } else {
         stmt
     };
+    let mut set_binder = SetRowBinder::new(schema, &ctes, &stmt.assignments, &ctx, cancel)?;
     schema.mark_dml(&table_schema.name);
     if table_schema.has_ann_index() {
         super::ann_persist::purge_segment(wtx, &table_schema.name)?;
     }
     let col_map = table_schema.column_map();
 
-    if correlated_rows.is_none() {
+    if correlated_rows.is_none() && set_binder.is_none() {
         if let Some(result) = try_fast_update_in_txn(wtx, schema, stmt, table_schema, col_map)? {
             return Ok(result);
         }
@@ -2507,7 +2520,23 @@ pub(super) fn exec_update_in_txn(
     };
     let matching_rows = filter_keyed_rows(all_candidates, &stmt.where_clause, col_map, cancel)?;
 
-    super::row_mutation::update_rows(wtx, schema, table_schema, stmt, matching_rows)
+    match &mut set_binder {
+        Some(binder) => super::row_mutation::update_rows(
+            wtx,
+            schema,
+            table_schema,
+            stmt,
+            matching_rows,
+            Some(
+                &mut |wtx: &mut citadel_txn::write_txn::WriteTxn<'_>, row: &[Value]| {
+                    binder.bind(wtx, schema, &ctes, row)
+                },
+            ),
+        ),
+        None => {
+            super::row_mutation::update_rows(wtx, schema, table_schema, stmt, matching_rows, None)
+        }
+    }
 }
 
 /// Without a predicate, referencing children or DELETE triggers, every live

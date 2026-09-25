@@ -127,6 +127,28 @@ fn set_subquery_local_alias_shadows_target_without_becoming_correlated() {
 }
 
 #[test]
+fn set_subquery_reads_the_target_row_through_its_alias() {
+    for prepared in [false, true] {
+        with_connection(|conn| {
+            let result = query(
+                conn,
+                "UPDATE t AS dst SET v = (SELECT src.v FROM u AS src WHERE src.id = dst.id) \
+                 RETURNING dst.id, dst.v",
+                prepared,
+            );
+            assert_eq!(
+                result.rows,
+                vec![
+                    vec![Value::Integer(1), Value::Null],
+                    vec![Value::Integer(2), Value::Integer(200)],
+                    vec![Value::Integer(3), Value::Null],
+                ]
+            );
+        });
+    }
+}
+
+#[test]
 fn renamed_inner_alias_preserves_derived_column_names() {
     with_connection(|conn| {
         let result = conn.query("UPDATE t AS dst SET v = 7 WHERE EXISTS (SELECT 1 FROM (SELECT t.id FROM u AS t) AS d WHERE d.\"t.id\" = dst.id) RETURNING dst.id").unwrap();
@@ -198,7 +220,6 @@ fn invalid_qualifiers_and_unsupported_correlations_cannot_mutate_rows() {
         "UPDATE t AS dst SET v = wrong.v WHERE dst.id = 1",
         "UPDATE t AS dst SET v = 7 WHERE t.id = 1",
         "DELETE FROM t AS dst WHERE EXISTS (SELECT 1 FROM u AS src WHERE wrong.id = dst.id)",
-        "UPDATE t AS dst SET v = (SELECT src.v FROM u AS src WHERE src.id = dst.id)",
         "UPDATE t AS dst SET v = 7 RETURNING (SELECT 1)",
         "INSERT INTO t AS dst VALUES (1, 7) ON CONFLICT (id) DO UPDATE SET v = (SELECT 1)",
         "INSERT INTO t AS excluded VALUES (1, 7) ON CONFLICT (id) DO UPDATE SET v = excluded.v",

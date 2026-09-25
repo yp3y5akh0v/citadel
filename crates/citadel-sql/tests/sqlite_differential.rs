@@ -120,8 +120,6 @@ struct Gen {
     aliases: usize,
     /// Tables a subquery may read.
     sources: &'static [&'static Table],
-    /// Whether a subquery may read the enclosing row.
-    correlate: bool,
 }
 
 impl Gen {
@@ -130,7 +128,6 @@ impl Gen {
             rng,
             aliases: 0,
             sources: &TABLES,
-            correlate: true,
         }
     }
 
@@ -375,13 +372,13 @@ impl Gen {
     }
 
     /// A subquery over a base table, correlated with the outer scope about
-    /// half of the time when correlation is allowed.
+    /// half of the time.
     fn subquery_source(&mut self, outer: &[Col]) -> (String, Vec<Col>, String) {
         let table = self.rng.pick(self.sources);
         let alias = self.alias("s");
         let inner = scope(table, &alias);
         let mut filters = Vec::new();
-        if self.correlate && self.rng.one_in(2) {
+        if self.rng.one_in(2) {
             if let Some(outer_col) = self.column(outer, Ty::Int, false) {
                 let inner_col = self.column(&inner, Ty::Int, false).unwrap();
                 filters.push(format!("{inner_col} {} {outer_col}", self.comparison()));
@@ -703,15 +700,19 @@ impl Gen {
         } else {
             &[&T1]
         };
-        let saved = (self.sources, self.correlate);
-        (self.sources, self.correlate) = (other, false);
+        let saved = std::mem::replace(&mut self.sources, other);
         let assignments: Vec<String> = (0..1 + self.rng.below(2))
             .map(|_| {
                 let (name, ty) = columns.remove(self.rng.below(columns.len()));
-                format!("{name} = {}", self.expr(ty, target, 2))
+                let value = if ty == Ty::Int && self.rng.one_in(3) {
+                    self.scalar_subquery(target)
+                } else {
+                    self.expr(ty, target, 2)
+                };
+                format!("{name} = {value}")
             })
             .collect();
-        (self.sources, self.correlate) = saved;
+        self.sources = saved;
         let filter = if self.rng.one_in(6) {
             String::new()
         } else {
