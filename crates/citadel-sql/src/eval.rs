@@ -394,6 +394,35 @@ pub(crate) fn operand_collation(
 thread_local! {
     static JSONPATH_OVERRIDE_CTX: std::cell::Cell<*const ()> =
         const { std::cell::Cell::new(std::ptr::null()) };
+
+    /// SplitMix64 state behind RANDOM(): seeded once per thread from the
+    /// clock and the thread, then advanced by every call.
+    static RANDOM_STATE: std::cell::Cell<u64> = std::cell::Cell::new(random_seed());
+}
+
+fn random_seed() -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    crate::datetime::now_micros().hash(&mut hasher);
+    std::thread::current().id().hash(&mut hasher);
+    hasher.finish()
+}
+
+/// The next value of this thread's RANDOM() sequence.
+fn next_random() -> i64 {
+    let bits = RANDOM_STATE.with(|state| {
+        let next = state.get().wrapping_add(0x9E37_79B9_7F4A_7C15);
+        state.set(next);
+        let mut z = next;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    });
+    // i64::MIN has no absolute value, so ABS(RANDOM()) cannot overflow.
+    match bits as i64 {
+        i64::MIN => i64::MAX,
+        value => value,
+    }
 }
 
 pub fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
@@ -2713,16 +2742,7 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
         }
         "RANDOM" => {
             check_args(name, &evaluated, 0)?;
-            use std::collections::hash_map::DefaultHasher;
-            use std::hash::{Hash, Hasher};
-            let mut hasher = DefaultHasher::new();
-            crate::datetime::now_micros().hash(&mut hasher);
-            std::thread::current().id().hash(&mut hasher);
-            let mut val = hasher.finish() as i64;
-            if val == i64::MIN {
-                val = i64::MAX;
-            }
-            Ok(Value::Integer(val))
+            Ok(Value::Integer(next_random()))
         }
         "TYPEOF" => {
             check_args(name, &evaluated, 1)?;
