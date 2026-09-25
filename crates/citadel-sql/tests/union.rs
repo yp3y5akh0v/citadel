@@ -543,3 +543,55 @@ fn union_in_subquery_rejected() {
         "expected UNION-in-subquery error, got: {err}"
     );
 }
+
+#[test]
+fn union_branches_select_as_many_columns_as_each_other() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    setup_two_tables(&conn);
+    let mismatches = [
+        ("SELECT 1 UNION ALL SELECT FROM t1", 1, 0),
+        ("SELECT FROM t1 UNION SELECT id FROM t2", 0, 1),
+        // A recursive arm the CTE evaluates row by row.
+        (
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1, n FROM r WHERE n < 3) \
+             SELECT * FROM r",
+            1,
+            2,
+        ),
+        (
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT FROM r WHERE n < 3) SELECT n FROM r",
+            1,
+            0,
+        ),
+        // A recursive arm the CTE runs as a query.
+        (
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT r.n + 1, t1.name FROM r \
+             JOIN t1 ON t1.id = r.n WHERE r.n < 3) SELECT * FROM r",
+            1,
+            2,
+        ),
+    ];
+    for transaction in [false, true] {
+        if transaction {
+            assert_ok(conn.execute("BEGIN").unwrap());
+        }
+        for (sql, left, right) in mismatches {
+            match conn.query(sql) {
+                Err(SqlError::CompoundColumnCountMismatch { left: l, right: r }) => {
+                    assert_eq!((l, r), (left, right), "{sql}")
+                }
+                other => panic!("{sql} (transaction: {transaction}): {other:?}"),
+            }
+        }
+        let empty_rows = conn
+            .query("SELECT FROM t1 UNION ALL SELECT FROM t2")
+            .unwrap()
+            .rows;
+        assert_eq!(empty_rows, vec![Vec::<Value>::new(); 6]);
+        if transaction {
+            assert_ok(conn.execute("COMMIT").unwrap());
+        }
+    }
+}

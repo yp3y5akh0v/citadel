@@ -1076,6 +1076,47 @@ fn subquery_keys_and_members_compare_as_equals_does() {
 }
 
 #[test]
+fn subqueries_read_as_values_select_one_column() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    setup_two_tables(&conn);
+    let statements = [
+        "SELECT (SELECT id, val FROM t2 LIMIT 1)",
+        "SELECT (SELECT id, val FROM t2 WHERE false)",
+        "SELECT (SELECT FROM t2 LIMIT 1)",
+        "SELECT (SELECT t2.id, t2.val FROM t2 WHERE t2.id = t1.id) FROM t1",
+        "SELECT (SELECT FROM t2 WHERE t2.id = t1.id) FROM t1",
+        "SELECT 1 IN (SELECT FROM t2)",
+        "SELECT id FROM t1 WHERE id IN (SELECT FROM t2 WHERE t2.id = t1.id)",
+        "SELECT 1 = ANY (SELECT FROM t2)",
+        "SELECT id FROM t1 WHERE id = ANY (SELECT FROM t2 WHERE t2.id = t1.id)",
+        "UPDATE t1 SET val = (SELECT id, val FROM t2 LIMIT 1)",
+        "UPDATE t1 SET val = (SELECT t2.id, t2.val FROM t2 WHERE t2.id = t1.id)",
+        "INSERT INTO t1 VALUES (9, (SELECT id, val FROM t2 LIMIT 1))",
+    ];
+    for transaction in [false, true] {
+        if transaction {
+            assert_ok(conn.execute("BEGIN").unwrap());
+        }
+        for sql in statements {
+            assert!(
+                matches!(conn.execute(sql), Err(SqlError::SubqueryMultipleColumns)),
+                "{sql} (transaction: {transaction})"
+            );
+        }
+        // EXISTS reads no column, so any number will do.
+        assert_eq!(
+            query(&conn, "SELECT EXISTS (SELECT FROM t2)").rows,
+            vec![vec![Value::Boolean(true)]]
+        );
+        if transaction {
+            assert_ok(conn.execute("ROLLBACK").unwrap());
+        }
+    }
+}
+
+#[test]
 fn a_derived_table_alias_names_only_its_rows() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());

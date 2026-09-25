@@ -2391,6 +2391,11 @@ impl StreamAggPlan {
                 _ => return Ok(None),
             }
         }
+        // Without an aggregate call the query keeps its rows: `SELECT FROM t`
+        // has one for each row of `t`.
+        if ops.is_empty() {
+            return Ok(None);
+        }
 
         let mut needed: Vec<usize> = ops
             .iter()
