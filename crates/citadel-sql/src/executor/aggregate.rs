@@ -170,6 +170,21 @@ pub(super) fn exec_aggregate(
     }))
 }
 
+/// Whether a query aggregates its rows into groups: it has GROUP BY or
+/// HAVING, or its select list or ORDER BY calls an aggregate. Without GROUP
+/// BY, all its rows are one group.
+pub(super) fn is_grouped(stmt: &SelectStmt) -> bool {
+    !stmt.group_by.is_empty()
+        || stmt.having.is_some()
+        || stmt.columns.iter().any(
+            |column| matches!(column, SelectColumn::Expr { expr, .. } if is_aggregate_expr(expr)),
+        )
+        || stmt
+            .order_by
+            .iter()
+            .any(|item| is_aggregate_expr(&item.expr))
+}
+
 /// What a grouped query's window functions run over. They run after GROUP BY
 /// and HAVING, so each row is a group HAVING keeps: the group's first row, or
 /// NULLs for the one group of an ungrouped query over no rows, followed by the
