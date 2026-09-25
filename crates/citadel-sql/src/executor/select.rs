@@ -4333,6 +4333,17 @@ pub(super) fn process_select(
     ctx.check()?;
 
     if has_any_window_function(stmt) {
+        if let Some(GroupedWindowInput {
+            columns: grouped_columns,
+            rows: grouped_rows,
+            stmt: grouped_stmt,
+        }) = group_for_windows(&rows, ctx)?
+        {
+            return eval_window_select(
+                grouped_rows,
+                SelectCtx::new(&grouped_columns, &grouped_stmt, ctx.cancel).predicate_applied(true),
+            );
+        }
         return eval_window_select(rows, ctx);
     }
 
