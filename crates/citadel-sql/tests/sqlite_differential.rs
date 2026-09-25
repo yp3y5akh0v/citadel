@@ -373,8 +373,8 @@ impl Gen {
     }
 
     /// A subquery over a base table, correlated with the outer scope about
-    /// half of the time.
-    fn subquery_source(&mut self, outer: &[Col]) -> (String, Vec<Col>, String) {
+    /// half of the time. Its own filter nests at most `depth` levels.
+    fn subquery_source(&mut self, outer: &[Col], depth: u32) -> (String, Vec<Col>, String) {
         let table = self.rng.pick(self.sources);
         let alias = self.alias("s");
         let inner = scope(table, &alias);
@@ -386,7 +386,7 @@ impl Gen {
             }
         }
         if self.rng.one_in(2) {
-            filters.push(self.predicate(&inner, 1));
+            filters.push(self.predicate(&inner, depth));
         }
         let from = format!("{} AS {alias}", table.name);
         let filter = if filters.is_empty() {
@@ -397,14 +397,14 @@ impl Gen {
         (from, inner, filter)
     }
 
-    fn exists_predicate(&mut self, scope: &[Col], _depth: u32) -> String {
-        let (from, _, filter) = self.subquery_source(scope);
+    fn exists_predicate(&mut self, scope: &[Col], depth: u32) -> String {
+        let (from, _, filter) = self.subquery_source(scope, depth);
         let not = if self.rng.one_in(3) { "NOT " } else { "" };
         format!("{not}EXISTS (SELECT 1 FROM {from}{filter})")
     }
 
-    fn in_subquery_predicate(&mut self, scope: &[Col], _depth: u32) -> String {
-        let (from, inner, filter) = self.subquery_source(scope);
+    fn in_subquery_predicate(&mut self, scope: &[Col], depth: u32) -> String {
+        let (from, inner, filter) = self.subquery_source(scope, depth);
         let value = self.int_expr(scope, 1);
         let selected = self.int_expr(&inner, 1);
         let not = if self.rng.one_in(3) { " NOT" } else { "" };
@@ -412,7 +412,7 @@ impl Gen {
     }
 
     fn scalar_subquery(&mut self, scope: &[Col]) -> String {
-        let (from, inner, filter) = self.subquery_source(scope);
+        let (from, inner, filter) = self.subquery_source(scope, 1);
         let aggregate = match self.rng.below(4) {
             0 => "COUNT(*)".to_string(),
             1 => format!("SUM({})", self.int_expr(&inner, 1)),
