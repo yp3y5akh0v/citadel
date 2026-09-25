@@ -1718,7 +1718,8 @@ pub(super) enum AggState {
     CountStar(i64),
     Count(i64),
     Sum {
-        int_sum: i64,
+        /// Exact, so only a total outside i64 overflows, whatever the order.
+        int_sum: i128,
         real_sum: f64,
         has_real: bool,
         all_null: bool,
@@ -1801,8 +1802,8 @@ impl AggState {
     }
 
     /// Fold `other` (a later shard in leaf order) into `self`. Only gate-admitted
-    /// states reach here: counts, integer Sum (wrapping add is associative), and
-    /// Min/Max over non-REAL (strict compare keeps the earlier value on ties).
+    /// states reach here: counts, integer Sum (exact i128 add is associative),
+    /// and Min/Max over non-REAL (strict compare keeps the earlier value on ties).
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn merge(&mut self, other: AggState) {
         match (self, other) {
@@ -1989,7 +1990,7 @@ impl AggState {
                 check_numeric_aggregate_family(raw, !*all_null, *is_interval)?;
                 match raw {
                     RawColumn::Integer(i) => {
-                        *int_sum += i;
+                        *int_sum += i128::from(*i);
                         *all_null = false;
                     }
                     RawColumn::Real(r) => {
@@ -2095,8 +2096,8 @@ impl AggState {
         Ok(())
     }
 
-    pub(super) fn finish(self) -> Value {
-        match self {
+    pub(super) fn finish(self) -> Result<Value> {
+        Ok(match self {
             AggState::CountStar(c) | AggState::Count(c) => Value::Integer(c),
             AggState::Sum {
                 int_sum,
@@ -2119,7 +2120,7 @@ impl AggState {
                 } else if has_real {
                     Value::Real(real_sum + int_sum as f64)
                 } else {
-                    Value::Integer(int_sum)
+                    Value::Integer(i64::try_from(int_sum).map_err(|_| SqlError::IntegerOverflow)?)
                 }
             }
             AggState::Avg {
@@ -2147,7 +2148,7 @@ impl AggState {
             AggState::Min { current, .. } | AggState::Max { current, .. } => {
                 current.unwrap_or(Value::Null)
             }
-        }
+        })
     }
 }
 
@@ -2635,7 +2636,10 @@ impl StreamAggPlan {
         stmt: &SelectStmt,
     ) -> Result<ExecutionResult> {
         let col_names: Vec<String> = self.ops.iter().map(|(_, name)| name.clone()).collect();
-        let mut rows = vec![states.into_iter().map(|s| s.finish()).collect()];
+        let mut rows = vec![states
+            .into_iter()
+            .map(AggState::finish)
+            .collect::<Result<Vec<_>>>()?];
         apply_offset_limit(&mut rows, stmt)?;
         Ok(ExecutionResult::Query(QueryResult {
             columns: col_names,
@@ -2937,7 +2941,10 @@ impl StreamGroupByPlan {
         let mut result_rows: Vec<Vec<Value>> = Vec::with_capacity(groups.len() + null_extra);
         if let Some(states) = null_group {
             let mut row = Vec::with_capacity(self.output.len());
-            let finished: Vec<Value> = states.into_iter().map(|s| s.finish()).collect();
+            let finished = states
+                .into_iter()
+                .map(AggState::finish)
+                .collect::<Result<Vec<_>>>()?;
             for (col, _) in &self.output {
                 match col {
                     GroupByOutputCol::GroupKey => row.push(Value::Null),
@@ -2949,7 +2956,10 @@ impl StreamGroupByPlan {
         for (group_idx, (group_key, states)) in groups.into_iter().enumerate() {
             check_cancel_at(cancel, group_idx)?;
             let mut row = Vec::with_capacity(self.output.len());
-            let finished: Vec<Value> = states.into_iter().map(|s| s.finish()).collect();
+            let finished = states
+                .into_iter()
+                .map(AggState::finish)
+                .collect::<Result<Vec<_>>>()?;
             for (col, _) in &self.output {
                 match col {
                     GroupByOutputCol::GroupKey => row.push(Value::Integer(group_key)),

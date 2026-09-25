@@ -562,7 +562,8 @@ fn aggregate_value(
                     })
                 };
             }
-            let mut int_sum: i64 = 0;
+            // Exact, so only a total outside i64 overflows, whatever the order.
+            let mut int_sum: i128 = 0;
             let mut real_sum: f64 = 0.0;
             let mut has_real = false;
             let mut all_null = true;
@@ -570,7 +571,7 @@ fn aggregate_value(
                 check_cancel_at(cancel, value_idx)?;
                 match v {
                     Value::Integer(i) => {
-                        int_sum += i;
+                        int_sum += i128::from(*i);
                         all_null = false;
                     }
                     Value::Real(r) => {
@@ -593,7 +594,9 @@ fn aggregate_value(
             if has_real {
                 Ok(Value::Real(real_sum + int_sum as f64))
             } else {
-                Ok(Value::Integer(int_sum))
+                i64::try_from(int_sum)
+                    .map(Value::Integer)
+                    .map_err(|_| SqlError::IntegerOverflow)
             }
         }
         "AVG" => {

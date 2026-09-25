@@ -1394,6 +1394,49 @@ fn sum_large_integers() {
 }
 
 #[test]
+fn integer_sum_overflow_is_an_error_in_every_aggregate_lane() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, g INTEGER, val INTEGER)")
+        .unwrap();
+    // Group 1 ends past i64::MAX; group 2 passes it on the way and ends at it.
+    conn.execute(
+        "INSERT INTO t VALUES (1, 1, 9223372036854775807), (2, 1, 1), \
+         (3, 2, 9223372036854775807), (4, 2, 1), (5, 2, -1)",
+    )
+    .unwrap();
+
+    for transaction in [false, true] {
+        if transaction {
+            conn.execute("BEGIN").unwrap();
+        }
+        for sql in [
+            "SELECT SUM(val) FROM t WHERE g = 1",
+            "SELECT g, SUM(val) FROM t GROUP BY g",
+            "SELECT SUM(val) + 0 FROM t WHERE g = 1",
+        ] {
+            let error = conn.query(sql).unwrap_err();
+            assert!(matches!(error, SqlError::IntegerOverflow), "{sql}: {error}");
+        }
+        for sql in [
+            "SELECT SUM(val) FROM t WHERE g = 2",
+            "SELECT SUM(val) + 0 FROM t WHERE g = 2",
+        ] {
+            assert_eq!(
+                conn.query(sql).unwrap().rows,
+                vec![vec![Value::Integer(i64::MAX)]],
+                "{sql}"
+            );
+        }
+        if transaction {
+            conn.execute("ROLLBACK").unwrap();
+        }
+    }
+}
+
+#[test]
 fn avg_returns_real() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
