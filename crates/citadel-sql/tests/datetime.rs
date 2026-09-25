@@ -216,6 +216,52 @@ fn interval_fractions_spill_and_hours_stay_whole() {
 }
 
 #[test]
+fn each_interval_field_moves_a_timestamp_with_its_own_sign() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    // PostgreSQL 17's answers: the months first (the day kept inside the
+    // month), then the days, then the time.
+    for (sql, expected) in [
+        (
+            "SELECT TIMESTAMP '2024-01-31 12:00:00' + INTERVAL '1 month -1 day'",
+            "2024-02-28 12:00:00",
+        ),
+        (
+            "SELECT TIMESTAMP '2024-01-31 12:00:00' + INTERVAL '-1 month 1 day'",
+            "2024-01-01 12:00:00",
+        ),
+        (
+            "SELECT TIMESTAMP '2024-01-31 12:00:00' + INTERVAL '1 month -1 hour'",
+            "2024-02-29 11:00:00",
+        ),
+        (
+            "SELECT TIMESTAMP '2024-01-15 12:00:00' + INTERVAL '2 months -3 days'",
+            "2024-03-12 12:00:00",
+        ),
+        (
+            "SELECT TIMESTAMP '2024-01-15 12:00:00' - INTERVAL '2 months -3 days'",
+            "2023-11-18 12:00:00",
+        ),
+        (
+            "SELECT DATE '2024-01-31' + INTERVAL '1 month -1 day'",
+            "2024-02-28 00:00:00",
+        ),
+    ] {
+        assert_eq!(scalar(&conn, sql).to_string(), expected, "{sql}");
+    }
+    // TIME wraps around the day even when the sum leaves i64.
+    let wrapped = (36_000_000_000i128 + i128::from(i64::MAX)) % 86_400_000_000;
+    assert_eq!(
+        scalar(
+            &conn,
+            "SELECT TIME '10:00:00' + INTERVAL '9223372036854775807 microseconds'"
+        ),
+        Value::Time(wrapped as i64)
+    );
+}
+
+#[test]
 fn interval_arithmetic_and_averages_cascade_fractions() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
