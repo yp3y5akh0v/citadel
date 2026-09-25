@@ -4247,12 +4247,28 @@ pub(crate) fn fn_set_with_cancel(
     run_json_work(cancel, |work| {
         let mut root = value_to_serde_with_work(j, work)?;
         let segments = path_to_segments_with_work(path, work)?;
-        let new_serde = value_to_serde_lossy_with_work(new_value, work)?;
+        let new_serde = jsonb_argument_with_work(new_value, work)?;
         work.checkpoint()?;
-        set_at_path(&mut root, &segments, new_serde, create_missing, false);
+        set_at_path(
+            &mut root,
+            &segments,
+            new_serde,
+            PathWrite::Set {
+                create: create_missing,
+            },
+        )?;
         work.checkpoint()?;
         serde_to_value_with_work(root, target, work)
     })
+}
+
+/// A value passed where jsonb is expected: text is JSON input, as PostgreSQL
+/// reads `'5'` or `'"x"'` there, and other values convert as `to_jsonb` does.
+fn jsonb_argument_with_work(v: &Value, work: &mut JsonWork<'_>) -> Result<serde_json::Value> {
+    match v {
+        Value::Text(s) => parse_json_text_with_work(s, work),
+        other => value_to_serde_lossy_with_work(other, work),
+    }
 }
 
 pub fn fn_insert(
@@ -4276,67 +4292,84 @@ pub(crate) fn fn_insert_with_cancel(
     run_json_work(cancel, |work| {
         let mut root = value_to_serde_with_work(j, work)?;
         let segments = path_to_segments_with_work(path, work)?;
-        let new_serde = value_to_serde_lossy_with_work(new_value, work)?;
+        let new_serde = jsonb_argument_with_work(new_value, work)?;
         work.checkpoint()?;
-        set_at_path(&mut root, &segments, new_serde, true, insert_after);
+        set_at_path(
+            &mut root,
+            &segments,
+            new_serde,
+            PathWrite::Insert {
+                after: insert_after,
+            },
+        )?;
         work.checkpoint()?;
         serde_to_value_with_work(root, target, work)
     })
 }
 
+/// What a write at the end of a path does with what is there.
+#[derive(Clone, Copy)]
+enum PathWrite {
+    /// jsonb_set: replaces the key or element, and adds a missing one when
+    /// `create`.
+    Set { create: bool },
+    /// jsonb_insert: adds a key that is not there, or an element before (or
+    /// after) the one the path names.
+    Insert { after: bool },
+}
+
+/// Writes `new_value` at the end of `segments` as PostgreSQL's jsonb_set and
+/// jsonb_insert do. A path through a missing key or element changes nothing.
 fn set_at_path(
     root: &mut serde_json::Value,
     segments: &[PathSeg],
     new_value: serde_json::Value,
-    create_missing: bool,
-    insert_array: bool,
-) -> bool {
-    if segments.is_empty() {
-        return false;
-    }
-    let (last, prefix) = segments.split_last().unwrap();
+    write: PathWrite,
+) -> Result<()> {
+    let Some((last, prefix)) = segments.split_last() else {
+        return Ok(());
+    };
     let Some(target) = navigate_mut(root, prefix) else {
-        return false;
+        return Ok(());
     };
     match (target, last) {
         (serde_json::Value::Object(m), PathSeg::Key(k)) => {
             let exists = m.contains_key(k.as_str());
-            if exists || create_missing {
-                m.insert(k.clone(), new_value);
-                true
-            } else {
-                false
+            match write {
+                PathWrite::Insert { .. } if exists => {
+                    return Err(SqlError::InvalidValue(
+                        "cannot replace existing key; jsonb_set replaces a key's value".into(),
+                    ));
+                }
+                PathWrite::Set { create: false } if !exists => {}
+                _ => {
+                    m.insert(k.clone(), new_value);
+                }
             }
         }
         (serde_json::Value::Array(arr), PathSeg::Index(i)) => {
             let len = arr.len() as i64;
-            let idx = if *i < 0 { len + i } else { *i };
-            if insert_array {
-                let target_pos = if idx <= 0 {
-                    0
-                } else if idx >= len {
-                    arr.len()
-                } else {
-                    idx as usize
-                };
-                arr.insert(target_pos, new_value);
-                true
-            } else if (0..len).contains(&idx) {
-                arr[idx as usize] = new_value;
-                true
-            } else if create_missing {
-                if idx < 0 {
-                    arr.insert(0, new_value);
-                } else {
-                    arr.push(new_value);
-                }
-                true
+            // A negative index counts from the end; one before the start
+            // prepends, and one past the end appends.
+            let position = if *i < 0 {
+                (i.unsigned_abs() <= len as u64).then(|| len + i)
             } else {
-                false
+                Some((*i).min(len))
+            };
+            match (write, position) {
+                (PathWrite::Set { .. }, Some(at)) if at < len => arr[at as usize] = new_value,
+                (PathWrite::Set { create: false }, _) => {}
+                (PathWrite::Set { create: true }, Some(_)) => arr.push(new_value),
+                (_, None) => arr.insert(0, new_value),
+                (PathWrite::Insert { after }, Some(at)) => {
+                    let at = if after && at < len { at + 1 } else { at };
+                    arr.insert(at as usize, new_value);
+                }
             }
         }
-        _ => false,
+        _ => {}
     }
+    Ok(())
 }
 
 pub fn fn_to_json(v: &Value, target: crate::types::DataType) -> Result<Value> {

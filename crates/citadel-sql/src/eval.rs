@@ -3498,6 +3498,10 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
         }
         "TO_JSONB" | "TO_JSON" => {
             check_args(name, &evaluated, 1)?;
+            // Strict, as in PostgreSQL: NULL is not the JSON null.
+            if evaluated[0].is_null() {
+                return Ok(Value::Null);
+            }
             let target = if name.eq_ignore_ascii_case("TO_JSONB") {
                 crate::types::DataType::Jsonb
             } else {
