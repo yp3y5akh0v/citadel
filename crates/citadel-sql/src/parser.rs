@@ -3248,6 +3248,14 @@ fn convert_from_relation(relation: &sp::TableFactor) -> Result<FromRelation> {
                 None => return Err(SqlError::Unsupported("derived table requires alias".into())),
             };
             let inner = convert_select_query(subquery)?;
+            if matches!(
+                &inner.body,
+                QueryBody::Insert(_) | QueryBody::Update(_) | QueryBody::Delete(_)
+            ) {
+                return Err(SqlError::Unsupported(
+                    "INSERT, UPDATE or DELETE as a derived table".into(),
+                ));
+            }
             for cte in &inner.ctes {
                 if matches!(
                     &cte.body,

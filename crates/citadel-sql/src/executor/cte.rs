@@ -19,21 +19,36 @@ pub(super) fn exec_select_query_with_read(
             "DML CTE bodies require an active write transaction".into(),
         ));
     }
+    exec_nested_query_with_read(rtx, schema, sq, &CteContext::default())
+}
+
+/// A query whose own CTEs are defined over `outer`, the CTEs of the statement
+/// a derived table is part of.
+pub(super) fn exec_nested_query_with_read(
+    rtx: &mut ReadTxn<'_>,
+    schema: &SchemaManager,
+    sq: &SelectQuery,
+    outer: &CteContext,
+) -> Result<ExecutionResult> {
     if sq.ctes.is_empty() {
-        let empty = CteContext::default();
-        return super::exec_query_body_with_read(rtx, schema, &sq.body, &empty);
+        return super::exec_query_body_with_read(rtx, schema, &sq.body, outer);
     }
     if let Some(fused) = try_fuse_cte(sq) {
-        let empty = CteContext::default();
-        return super::exec_query_body_with_read(rtx, schema, &fused, &empty);
+        return super::exec_query_body_with_read(rtx, schema, &fused, outer);
     }
     let cancel = rtx.cancel_token().cloned();
-    let ctes = materialize_all_ctes(&sq.ctes, sq.recursive, cancel.as_ref(), &mut |body, ctx| {
-        let result = super::exec_query_body_with_read_qr(rtx, schema, body, ctx)?;
-        let collations =
-            super::dml::body_output_collations(schema, ctx, body, result.columns.len());
-        Ok(CteRows::new(result, collations))
-    })?;
+    let ctes = materialize_all_ctes_with_outer(
+        &sq.ctes,
+        sq.recursive,
+        outer,
+        cancel.as_ref(),
+        &mut |body, ctx| {
+            let result = super::exec_query_body_with_read_qr(rtx, schema, body, ctx)?;
+            let collations =
+                super::dml::body_output_collations(schema, ctx, body, result.columns.len());
+            Ok(CteRows::new(result, collations))
+        },
+    )?;
     super::exec_query_body_with_read(rtx, schema, &sq.body, &ctes)
 }
 
@@ -51,21 +66,36 @@ pub(super) fn exec_select_query_in_txn(
     schema: &SchemaManager,
     sq: &SelectQuery,
 ) -> Result<ExecutionResult> {
+    exec_nested_query_in_txn(wtx, schema, sq, &CteContext::default())
+}
+
+/// A query whose own CTEs are defined over `outer`, the CTEs of the statement
+/// a derived table is part of.
+pub(super) fn exec_nested_query_in_txn(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    schema: &SchemaManager,
+    sq: &SelectQuery,
+    outer: &CteContext,
+) -> Result<ExecutionResult> {
     if sq.ctes.is_empty() {
-        let empty = CteContext::default();
-        return super::exec_query_body_in_txn(wtx, schema, &sq.body, &empty);
+        return super::exec_query_body_in_txn(wtx, schema, &sq.body, outer);
     }
     if let Some(fused) = try_fuse_cte(sq) {
-        let empty = CteContext::default();
-        return super::exec_query_body_in_txn(wtx, schema, &fused, &empty);
+        return super::exec_query_body_in_txn(wtx, schema, &fused, outer);
     }
     let cancel = wtx.cancel_token().cloned();
-    let ctes = materialize_all_ctes(&sq.ctes, sq.recursive, cancel.as_ref(), &mut |body, ctx| {
-        let result = super::exec_query_body_write(wtx, schema, body, ctx)?;
-        let collations =
-            super::dml::body_output_collations(schema, ctx, body, result.columns.len());
-        Ok(CteRows::new(result, collations))
-    })?;
+    let ctes = materialize_all_ctes_with_outer(
+        &sq.ctes,
+        sq.recursive,
+        outer,
+        cancel.as_ref(),
+        &mut |body, ctx| {
+            let result = super::exec_query_body_write(wtx, schema, body, ctx)?;
+            let collations =
+                super::dml::body_output_collations(schema, ctx, body, result.columns.len());
+            Ok(CteRows::new(result, collations))
+        },
+    )?;
     super::exec_query_body_in_txn(wtx, schema, &sq.body, &ctes)
 }
 
@@ -208,15 +238,6 @@ fn reads_qualified_column(expr: &Expr) -> bool {
         found |= matches!(node, Expr::QualifiedColumn { .. })
     });
     found
-}
-
-pub(super) fn materialize_all_ctes(
-    defs: &[CteDefinition],
-    recursive: bool,
-    cancel: Option<&citadel::CancelToken>,
-    exec_body: &mut dyn FnMut(&QueryBody, &CteContext) -> Result<CteRows>,
-) -> Result<CteContext> {
-    materialize_all_ctes_with_outer(defs, recursive, &CteContext::default(), cancel, exec_body)
 }
 
 pub(super) fn materialize_all_ctes_with_outer(

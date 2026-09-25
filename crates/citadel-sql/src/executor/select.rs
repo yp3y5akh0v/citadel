@@ -3141,7 +3141,13 @@ fn try_streaming_distinct_with_read(
 }
 
 pub(super) trait LateralIo {
-    fn exec_select(&mut self, schema: &SchemaManager, sq: &SelectQuery) -> Result<QueryResult>;
+    /// Runs a derived table's query; `ctes` are those of its statement.
+    fn exec_select(
+        &mut self,
+        schema: &SchemaManager,
+        sq: &SelectQuery,
+        ctes: &CteContext,
+    ) -> Result<QueryResult>;
     fn scan_table(
         &mut self,
         schema: &SchemaManager,
@@ -3154,8 +3160,13 @@ pub(super) struct ReadHeldIo<'a, 'db: 'a> {
 }
 
 impl LateralIo for ReadHeldIo<'_, '_> {
-    fn exec_select(&mut self, schema: &SchemaManager, sq: &SelectQuery) -> Result<QueryResult> {
-        match super::cte::exec_select_query_with_read(self.rtx, schema, sq)? {
+    fn exec_select(
+        &mut self,
+        schema: &SchemaManager,
+        sq: &SelectQuery,
+        ctes: &CteContext,
+    ) -> Result<QueryResult> {
+        match super::cte::exec_nested_query_with_read(self.rtx, schema, sq, ctes)? {
             ExecutionResult::Query(qr) => Ok(qr),
             _ => Err(SqlError::Plan("expected Query result".into())),
         }
@@ -3174,8 +3185,13 @@ pub(super) struct WriteIo<'a, 'b> {
 }
 
 impl LateralIo for WriteIo<'_, '_> {
-    fn exec_select(&mut self, schema: &SchemaManager, sq: &SelectQuery) -> Result<QueryResult> {
-        match super::cte::exec_select_query_in_txn(self.wtx, schema, sq)? {
+    fn exec_select(
+        &mut self,
+        schema: &SchemaManager,
+        sq: &SelectQuery,
+        ctes: &CteContext,
+    ) -> Result<QueryResult> {
+        match super::cte::exec_nested_query_in_txn(self.wtx, schema, sq, ctes)? {
             ExecutionResult::Query(qr) => Ok(qr),
             _ => Err(SqlError::Plan("expected Query result".into())),
         }
@@ -3206,16 +3222,46 @@ fn has_non_lateral_derived(stmt: &SelectStmt) -> bool {
 
 /// A derived table's rows keep the collations of the columns its query selected, so reading
 /// a NOCASE column through `(SELECT ...) AS x` compares the way reading it directly does.
+/// `ctes` are those of the statement, not its sibling derived tables.
 fn materialize_derived(
     schema: &SchemaManager,
     ctes: &CteContext,
     derived: &DerivedTable,
     io: &mut dyn LateralIo,
 ) -> Result<CteRows> {
-    let result = io.exec_select(schema, &derived.query)?;
+    let result = io.exec_select(schema, &derived.query, ctes)?;
     let collations =
         super::dml::query_output_collations(schema, ctes, &derived.query, result.columns.len());
     Ok(CteRows::new(result, collations))
+}
+
+/// `stmt` reading each derived table in its FROM as a CTE of the same name.
+pub(super) fn materialize_derived_tables(
+    schema: &SchemaManager,
+    stmt: &SelectStmt,
+    ctes: &CteContext,
+    io: &mut dyn LateralIo,
+) -> Result<(SelectStmt, CteContext)> {
+    let mut new_ctes = ctes.clone();
+    let mut new_stmt = stmt.clone();
+    if let Some(d) = new_stmt.from_subquery.take() {
+        let rows = materialize_derived(schema, ctes, &d, io)?;
+        new_ctes.insert(d.alias.to_ascii_lowercase(), rows.shared());
+        new_stmt.from = d.alias;
+        new_stmt.from_alias = None;
+    }
+    for j in new_stmt.joins.iter_mut() {
+        if let Some(d) = j.subquery.take() {
+            let rows = materialize_derived(schema, ctes, &d, io)?;
+            new_ctes.insert(d.alias.to_ascii_lowercase(), rows.shared());
+            j.table = TableRef {
+                name: d.alias,
+                alias: None,
+                args: None,
+            };
+        }
+    }
+    Ok((new_stmt, new_ctes))
 }
 
 fn exec_select_with_srf_with_read(
@@ -3383,33 +3429,9 @@ fn exec_select_with_derived_with_read(
     stmt: &SelectStmt,
     ctes: &CteContext,
 ) -> Result<ExecutionResult> {
-    let mut new_ctes = ctes.clone();
-    let mut new_stmt = stmt.clone();
-
-    {
-        let mut io = ReadHeldIo { rtx: &mut *rtx };
-
-        if let Some(d) = stmt.from_subquery.as_ref() {
-            let qr = materialize_derived(schema, &new_ctes, d, &mut io)?;
-            new_ctes.insert(d.alias.to_ascii_lowercase(), qr.shared());
-            new_stmt.from = d.alias.clone();
-            new_stmt.from_alias = None;
-            new_stmt.from_subquery = None;
-        }
-        for j in new_stmt.joins.iter_mut() {
-            if let Some(d) = j.subquery.take() {
-                let qr = materialize_derived(schema, &new_ctes, &d, &mut io)?;
-                new_ctes.insert(d.alias.to_ascii_lowercase(), qr.shared());
-                j.table = TableRef {
-                    name: d.alias.clone(),
-                    alias: None,
-                    args: None,
-                };
-            }
-        }
-    }
-
-    exec_select_with_read(rtx, schema, &new_stmt, &new_ctes)
+    let (stmt, ctes) =
+        materialize_derived_tables(schema, stmt, ctes, &mut ReadHeldIo { rtx: &mut *rtx })?;
+    exec_select_with_read(rtx, schema, &stmt, &ctes)
 }
 
 fn exec_select_lateral_with_read(
@@ -3464,7 +3486,7 @@ fn exec_select_lateral_with_io(
                 "LATERAL is not allowed as the first FROM item".into(),
             ));
         }
-        let qr = materialize_derived(schema, &new_ctes, d, io)?;
+        let qr = materialize_derived(schema, ctes, d, io)?;
         new_ctes.insert(d.alias.to_ascii_lowercase(), qr.shared());
         from_name = d.alias.clone();
         from_alias = None;
@@ -3488,7 +3510,7 @@ fn exec_select_lateral_with_io(
             SqlError::Plan("exec_select_lateral encountered non-subquery join".into())
         })?;
         if !derived.lateral {
-            let qr = materialize_derived(schema, &new_ctes, derived, io)?;
+            let qr = materialize_derived(schema, ctes, derived, io)?;
             new_ctes.insert(derived.alias.to_ascii_lowercase(), qr.shared());
             current_alias = derived.alias.clone();
             let mini = SelectStmt {
@@ -3564,6 +3586,7 @@ fn exec_select_lateral_with_io(
 
         if let Some(fast) = try_lateral_decorrelated(
             schema,
+            ctes,
             derived,
             &combined_cols,
             &outer_col_map,
@@ -3596,7 +3619,7 @@ fn exec_select_lateral_with_io(
         for (outer_idx, outer_row) in outer_rows.drain(..).enumerate() {
             check_cancel_at(cancel, outer_idx)?;
             let bound_query = bind_query_with_outer(&derived.query, &outer_row, &outer_col_map)?;
-            let inner_qr = io.exec_select(schema, &bound_query)?;
+            let inner_qr = io.exec_select(schema, &bound_query, ctes)?;
             check_cancel(cancel)?;
             if probe_columns.is_empty() {
                 probe_columns = inner_qr.columns.clone();
@@ -3680,6 +3703,7 @@ type LateralRows = (Vec<Vec<Value>>, Vec<String>);
 #[allow(clippy::too_many_arguments)]
 fn try_lateral_decorrelated(
     schema: &SchemaManager,
+    ctes: &CteContext,
     derived: &DerivedTable,
     outer_cols: &[ColumnDef],
     outer_col_map: &ColumnMap,
@@ -3709,6 +3733,9 @@ fn try_lateral_decorrelated(
         return Ok(None);
     }
     let inner_table = sel.from.to_ascii_lowercase();
+    if ctes.contains_key(&inner_table) {
+        return Ok(None);
+    }
     let inner_schema = match schema.get(&inner_table) {
         Some(s) => s,
         None => return Ok(None),
@@ -3797,6 +3824,7 @@ fn try_lateral_decorrelated(
             recursive: false,
             body: QueryBody::Select(Box::new(inner_stmt)),
         },
+        ctes,
     )?;
     check_cancel(cancel)?;
 
