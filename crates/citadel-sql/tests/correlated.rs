@@ -1200,3 +1200,82 @@ fn view_as_inner_correlated() {
     assert_eq!(qr.rows[0][0], Value::Text("Alice".into()));
     assert_eq!(qr.rows[1][0], Value::Text("Eve".into()));
 }
+
+/// A volatile call in a correlated subquery runs anew for each outer row: 64
+/// outer rows share one correlation key, so a subquery run once for the key
+/// would give every row the same answer.
+#[test]
+fn volatile_correlated_subqueries_run_for_each_outer_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE outer_rows (id INTEGER NOT NULL PRIMARY KEY, k INTEGER)")
+        .unwrap();
+    conn.execute("CREATE TABLE coin (id INTEGER NOT NULL PRIMARY KEY, k INTEGER)")
+        .unwrap();
+    conn.execute("CREATE TABLE coins (id INTEGER NOT NULL PRIMARY KEY, k INTEGER)")
+        .unwrap();
+    let outer = (0..64)
+        .map(|id| format!("({id}, 1)"))
+        .collect::<Vec<_>>()
+        .join(",");
+    conn.execute(&format!("INSERT INTO outer_rows VALUES {outer}"))
+        .unwrap();
+    conn.execute("INSERT INTO coin VALUES (1, 1)").unwrap();
+    let coins = (0..24)
+        .map(|id| format!("({id}, 1)"))
+        .collect::<Vec<_>>()
+        .join(",");
+    conn.execute(&format!("INSERT INTO coins VALUES {coins}"))
+        .unwrap();
+    let count = |sql: &str| match conn.query(sql).unwrap().rows[0][0] {
+        Value::Integer(count) => count,
+        ref other => panic!("{sql}: {other:?}"),
+    };
+    let flip = "RANDOM() % 2 = 0";
+    for transaction in [false, true] {
+        if transaction {
+            assert_ok(conn.execute("BEGIN").unwrap());
+        }
+        for sql in [
+            format!(
+                "SELECT COUNT(*) FROM outer_rows WHERE EXISTS \
+                 (SELECT 1 FROM coin WHERE coin.k = outer_rows.k AND {flip})"
+            ),
+            format!(
+                "SELECT COUNT(*) FROM outer_rows WHERE k IN \
+                 (SELECT k FROM coin WHERE coin.k = outer_rows.k AND {flip})"
+            ),
+        ] {
+            let hits = count(&sql);
+            assert!(
+                0 < hits && hits < 64,
+                "{sql} (transaction: {transaction}): {hits} of 64"
+            );
+        }
+        let per_row = conn
+            .query(&format!(
+                "SELECT (SELECT COUNT(*) FROM coins WHERE coins.k = outer_rows.k AND {flip}) \
+                 FROM outer_rows"
+            ))
+            .unwrap()
+            .rows;
+        assert!(
+            per_row.windows(2).any(|pair| pair[0] != pair[1]),
+            "every row got one count (transaction: {transaction}): {per_row:?}"
+        );
+        if transaction {
+            let ExecutionResult::RowsAffected(deleted) = conn
+                .execute(&format!(
+                    "DELETE FROM outer_rows WHERE EXISTS \
+                     (SELECT 1 FROM coin WHERE coin.k = outer_rows.k AND {flip})"
+                ))
+                .unwrap()
+            else {
+                panic!("expected RowsAffected");
+            };
+            assert!(0 < deleted && deleted < 64, "deleted {deleted} of 64");
+            assert_ok(conn.execute("ROLLBACK").unwrap());
+        }
+    }
+}
