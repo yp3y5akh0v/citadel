@@ -642,10 +642,128 @@ fn with_dml_in_subquery_rejected() {
 
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
         .unwrap();
-    let err = conn
-        .execute("SELECT * FROM (WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d) sub")
-        .unwrap_err();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+    let sql = "SELECT * FROM (WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d) sub";
+    let err = conn.execute(sql).unwrap_err();
     assert!(matches!(err, SqlError::Unsupported(_)));
+    // A transaction runs a derived table's own CTEs, so this must stay refused.
+    assert_ok(conn.execute("BEGIN").unwrap());
+    let err = conn.execute(sql).unwrap_err();
+    assert!(matches!(err, SqlError::Unsupported(_)));
+    assert_ok(conn.execute("COMMIT").unwrap());
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM t"), 1);
+}
+
+#[test]
+fn a_data_changing_statement_is_not_a_derived_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1), (2)").unwrap();
+    for sql in [
+        "SELECT * FROM (DELETE FROM t WHERE id = 1 RETURNING *) AS d",
+        "SELECT * FROM (INSERT INTO t VALUES (5) RETURNING *) AS d",
+        "SELECT * FROM (UPDATE t SET id = id + 10 RETURNING *) AS d",
+        "SELECT x.id FROM t AS x, LATERAL (DELETE FROM t WHERE id = x.id RETURNING *) AS d",
+        "SELECT (SELECT COUNT(*) FROM (DELETE FROM t RETURNING *) AS d)",
+    ] {
+        for transaction in [false, true] {
+            if transaction {
+                assert_ok(conn.execute("BEGIN").unwrap());
+            }
+            let err = conn.execute(sql).unwrap_err();
+            assert!(matches!(err, SqlError::Unsupported(_)), "{sql}: {err:?}");
+            if transaction {
+                assert_ok(conn.execute("COMMIT").unwrap());
+            }
+            assert_eq!(count(&conn, "SELECT COUNT(*) FROM t"), 2, "{sql}");
+        }
+    }
+}
+
+#[test]
+fn a_derived_table_reads_the_ctes_of_its_statement_and_its_own() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
+    // A CTE named t hides the table t, inside a derived table as well. Its
+    // columns sit where the table's do not.
+    let hiding = "WITH t AS (SELECT 0 AS pad, id + 10 AS id FROM t)";
+    let cases: [(String, &[&[i64]]); 8] = [
+        (
+            format!("{hiding} SELECT * FROM (SELECT id FROM t) AS d ORDER BY 1"),
+            &[&[11], &[12], &[13]],
+        ),
+        (
+            format!(
+                "{hiding} SELECT x.id FROM t AS x JOIN (SELECT id FROM t WHERE id > 11) AS d \
+                 ON d.id = x.id ORDER BY 1"
+            ),
+            &[&[12], &[13]],
+        ),
+        (
+            format!(
+                "{hiding} SELECT x.id, d.id FROM (SELECT 12 AS id) AS x, \
+                 LATERAL (SELECT id FROM t WHERE t.id = x.id) AS d"
+            ),
+            &[&[12, 12]],
+        ),
+        (
+            format!(
+                "{hiding} SELECT x.id, d.id FROM (SELECT 12 AS id) AS x, \
+                 LATERAL (SELECT id FROM t WHERE t.id > x.id) AS d"
+            ),
+            &[&[12, 13]],
+        ),
+        (
+            "SELECT * FROM (WITH c AS (SELECT id FROM t WHERE id > 1) SELECT id FROM c) AS d \
+             ORDER BY 1"
+                .into(),
+            &[&[2], &[3]],
+        ),
+        (
+            "WITH c AS (SELECT 7 AS id) \
+             SELECT * FROM (WITH c AS (SELECT 8 AS id) SELECT id FROM c) AS d"
+                .into(),
+            &[&[8]],
+        ),
+        (
+            "WITH c AS (SELECT 7 AS id) \
+             SELECT * FROM (WITH e AS (SELECT id FROM c) SELECT id FROM e) AS d"
+                .into(),
+            &[&[7]],
+        ),
+        (
+            "SELECT * FROM (SELECT id FROM t WHERE id = 1 UNION ALL SELECT id FROM t WHERE id = 3) \
+             AS d ORDER BY 1"
+                .into(),
+            &[&[1], &[3]],
+        ),
+    ];
+    for transaction in [false, true] {
+        if transaction {
+            assert_ok(conn.execute("BEGIN").unwrap());
+        }
+        for (sql, expected) in &cases {
+            let expected: Vec<Vec<Value>> = expected
+                .iter()
+                .map(|row| row.iter().map(|&value| Value::Integer(value)).collect())
+                .collect();
+            assert_eq!(
+                conn.query(sql).unwrap().rows,
+                expected,
+                "{sql} (transaction: {transaction})"
+            );
+        }
+        if transaction {
+            assert_ok(conn.execute("COMMIT").unwrap());
+        }
+    }
 }
 
 #[test]

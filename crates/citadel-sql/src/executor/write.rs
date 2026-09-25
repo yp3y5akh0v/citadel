@@ -17,7 +17,7 @@ use super::helpers::*;
 use super::scan::*;
 use super::select::*;
 use super::view::*;
-use super::{CteContext, CteRows};
+use super::CteContext;
 
 struct UpdateBufs {
     key_buf: Vec<u8>,
@@ -1443,51 +1443,13 @@ pub(super) fn exec_select_in_txn(
         return super::select::exec_select_lateral_in_txn(wtx, schema, stmt, ctes);
     }
     if has_derived_in_stmt(stmt) {
-        let mut new_ctes = ctes.clone();
-        let mut new_stmt = stmt.clone();
-        if let Some(d) = stmt.from_subquery.as_ref() {
-            let inner_body = match &d.query.body {
-                QueryBody::Select(s) => s.as_ref(),
-                _ => return Err(SqlError::Unsupported("derived must be SELECT".into())),
-            };
-            let qr = match super::exec_select_in_txn(wtx, schema, inner_body, ctes)? {
-                ExecutionResult::Query(qr) => qr,
-                _ => return Err(SqlError::Unsupported("derived returned non-Query".into())),
-            };
-            let collations =
-                super::dml::query_output_collations(schema, ctes, &d.query, qr.columns.len());
-            new_ctes.insert(
-                d.alias.to_ascii_lowercase(),
-                CteRows::new(qr, collations).shared(),
-            );
-            new_stmt.from = d.alias.clone();
-            new_stmt.from_alias = None;
-            new_stmt.from_subquery = None;
-        }
-        for j in new_stmt.joins.iter_mut() {
-            if let Some(d) = j.subquery.take() {
-                let inner_body = match &d.query.body {
-                    QueryBody::Select(s) => s.as_ref(),
-                    _ => return Err(SqlError::Unsupported("derived must be SELECT".into())),
-                };
-                let qr = match super::exec_select_in_txn(wtx, schema, inner_body, ctes)? {
-                    ExecutionResult::Query(qr) => qr,
-                    _ => return Err(SqlError::Unsupported("derived returned non-Query".into())),
-                };
-                let collations =
-                    super::dml::query_output_collations(schema, ctes, &d.query, qr.columns.len());
-                new_ctes.insert(
-                    d.alias.to_ascii_lowercase(),
-                    CteRows::new(qr, collations).shared(),
-                );
-                j.table = crate::parser::TableRef {
-                    name: d.alias.clone(),
-                    alias: None,
-                    args: None,
-                };
-            }
-        }
-        return super::exec_select_in_txn(wtx, schema, &new_stmt, &new_ctes);
+        let (stmt, ctes) = super::select::materialize_derived_tables(
+            schema,
+            stmt,
+            ctes,
+            &mut super::select::WriteIo { wtx: &mut *wtx },
+        )?;
+        return super::exec_select_in_txn(wtx, schema, &stmt, &ctes);
     }
 
     let lower_name = stmt.from.to_ascii_lowercase();
