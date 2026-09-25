@@ -1074,3 +1074,61 @@ fn subquery_keys_and_members_compare_as_equals_does() {
         }
     }
 }
+
+#[test]
+fn a_derived_table_alias_names_only_its_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    // One row in the table `t`, so a subquery that read a derived table aliased
+    // `t` in its place counts the derived rows.
+    for sql in [
+        "CREATE TABLE t (a INTEGER NOT NULL PRIMARY KEY)",
+        "INSERT INTO t VALUES (7)",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+    let int = |value: i64| Value::Integer(value);
+    let cases: [(&str, Vec<Vec<Value>>); 5] = [
+        (
+            "SELECT t.a FROM (SELECT 5 AS a) AS t WHERE EXISTS (SELECT 1 FROM t AS r WHERE r.a = 7)",
+            vec![vec![int(5)]],
+        ),
+        (
+            "SELECT t.a, (SELECT COUNT(*) FROM t) FROM (SELECT 99 AS a UNION ALL SELECT 98) AS t \
+             ORDER BY 1",
+            vec![vec![int(98), int(1)], vec![int(99), int(1)]],
+        ),
+        (
+            "SELECT d.a, (SELECT COUNT(*) FROM t) FROM (SELECT 1 AS a) AS d \
+             JOIN (SELECT 1 AS a UNION ALL SELECT 1) AS t ON t.a = d.a",
+            vec![vec![int(1), int(1)], vec![int(1), int(1)]],
+        ),
+        (
+            "WITH t AS (SELECT 1 AS a UNION ALL SELECT 2 UNION ALL SELECT 3) \
+             SELECT (SELECT COUNT(*) FROM t) FROM (SELECT 1 AS a) AS t",
+            vec![vec![int(3)]],
+        ),
+        // The derived table's columns stay readable through its alias.
+        (
+            "SELECT t.a FROM (SELECT 7 AS a UNION ALL SELECT 8) AS t \
+             WHERE EXISTS (SELECT 1 FROM t AS r WHERE r.a = t.a) ORDER BY 1",
+            vec![vec![int(7)]],
+        ),
+    ];
+    for transaction in [false, true] {
+        if transaction {
+            assert_ok(conn.execute("BEGIN").unwrap());
+        }
+        for (sql, expected) in &cases {
+            assert_eq!(
+                &conn.query(sql).unwrap().rows,
+                expected,
+                "{sql} (transaction: {transaction})"
+            );
+        }
+        if transaction {
+            assert_ok(conn.execute("ROLLBACK").unwrap());
+        }
+    }
+}
