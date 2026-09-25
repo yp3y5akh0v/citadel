@@ -7,9 +7,11 @@ use crate::types::{DataType, Value};
 
 mod dml_aliases;
 mod expr_name;
+mod qualifiers;
 pub(crate) use expr_name::expr_display_name;
 #[cfg(test)]
 pub(crate) use expr_name::op_symbol;
+pub use qualifiers::validate_qualifiers;
 
 #[derive(Debug, Clone)]
 pub enum Statement {
