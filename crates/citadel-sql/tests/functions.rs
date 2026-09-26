@@ -560,6 +560,37 @@ fn fn_substr_negative_start() {
 }
 
 #[test]
+fn fn_substr_matches_sqlite_for_every_start_and_length() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+    let mut calls = Vec::new();
+    for text in ["''", "'a'", "'héllo'", "'hello world'"] {
+        for start in -13..=13 {
+            calls.push(format!("SUBSTR({text}, {start})"));
+            for length in -13..=13 {
+                calls.push(format!("SUBSTR({text}, {start}, {length})"));
+            }
+        }
+    }
+    for (start, length) in [(i64::MIN, i64::MAX), (0, i64::MIN), (i64::MAX, i64::MIN)] {
+        calls.push(format!("SUBSTR('abc', {start}, {length})"));
+    }
+    for call in calls {
+        let sql = format!("SELECT {call}");
+        let expected: String = sqlite.query_row(&sql, [], |row| row.get(0)).unwrap();
+        assert_eq!(scalar(&conn, &sql), Value::Text(expected.into()), "{sql}");
+    }
+    // A BLOB is cut in bytes ('é' is two).
+    for (start, length) in [(2, 2), (2, 1), (-2, 5), (4, -3), (0, 1), (9, 1)] {
+        let sql = format!("SELECT SUBSTR(CAST('héllo' AS BLOB), {start}, {length})");
+        let expected: Vec<u8> = sqlite.query_row(&sql, [], |row| row.get(0)).unwrap();
+        assert_eq!(scalar(&conn, &sql), Value::Blob(expected), "{sql}");
+    }
+}
+
+#[test]
 fn fn_trim() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
