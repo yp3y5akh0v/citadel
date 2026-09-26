@@ -398,6 +398,26 @@ impl Value {
             _ => None,
         }
     }
+
+    /// The SQL order of two values without a collation: intervals by length with 30-day
+    /// months (so '1 month' and '30 days' tie), everything else in the total order.
+    pub(crate) fn sql_cmp(&self, other: &Value) -> Ordering {
+        match (self, other) {
+            (
+                Value::Interval {
+                    months: am,
+                    days: ad,
+                    micros: au,
+                },
+                Value::Interval {
+                    months: bm,
+                    days: bd,
+                    micros: bu,
+                },
+            ) => crate::datetime::pg_normalized_interval_cmp((*am, *ad, *au), (*bm, *bd, *bu)),
+            _ => self.cmp(other),
+        }
+    }
 }
 
 impl PartialEq for Value {
@@ -535,7 +555,8 @@ impl PartialOrd for Value {
 
 impl Ord for Value {
     // Order: NULL < BOOLEAN < numeric < TIME < DATE < TIMESTAMP < INTERVAL < TEXT < BLOB.
-    // INTERVAL compares field-wise for trait-invariant safety; SQL-level ops normalize.
+    // INTERVAL compares field-wise for trait-invariant safety; SQL ordering normalizes
+    // (`Value::sql_cmp`).
     fn cmp(&self, other: &Self) -> Ordering {
         match (self, other) {
             (Value::Null, Value::Null) => Ordering::Equal,
@@ -745,12 +766,12 @@ impl Collation {
         }
     }
 
-    /// Compare two SQL values, applying this collation when both are text.
-    /// Non-text values keep the engine's ordinary total ordering.
+    /// The SQL order of two values: text under this collation, anything else as
+    /// [`Value::sql_cmp`] orders it.
     pub(crate) fn cmp_value(self, a: &Value, b: &Value) -> std::cmp::Ordering {
         match (a, b) {
             (Value::Text(a), Value::Text(b)) => self.cmp_text(a, b),
-            _ => a.cmp(b),
+            _ => a.sql_cmp(b),
         }
     }
 

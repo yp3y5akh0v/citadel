@@ -456,6 +456,109 @@ fn pg_normalized_interval_equality() {
 }
 
 #[test]
+fn intervals_sort_by_normalized_length() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    assert_ok(
+        conn.execute("CREATE TABLE spans (id INTEGER PRIMARY KEY, v INTERVAL)")
+            .unwrap(),
+    );
+    assert_rows(
+        conn.execute(
+            "INSERT INTO spans VALUES (1, INTERVAL '1 month'), (2, INTERVAL '31 days'), \
+             (3, INTERVAL '29 days'), (4, INTERVAL '-1 month 45 days'), \
+             (5, INTERVAL '2 days -50 hours'), (6, NULL), (7, INTERVAL '30 days')",
+        )
+        .unwrap(),
+        7,
+    );
+    const HOUR: i64 = 3_600_000_000;
+    let interval = |months, days, micros| Value::Interval {
+        months,
+        days,
+        micros,
+    };
+    let rows = |sql: &str| conn.query(sql).unwrap().rows;
+    let integers = |values: &[i64]| -> Vec<Vec<Value>> {
+        values.iter().map(|&v| vec![Value::Integer(v)]).collect()
+    };
+    // A month counts 30 days: '1 month' and '30 days' tie, so id orders them.
+    assert_eq!(
+        rows("SELECT id FROM spans ORDER BY v, id"),
+        integers(&[6, 5, 4, 3, 1, 7, 2])
+    );
+    assert_eq!(
+        rows("SELECT id FROM spans ORDER BY v DESC, id"),
+        integers(&[2, 1, 7, 3, 4, 5, 6])
+    );
+    assert_eq!(
+        rows("SELECT id FROM spans ORDER BY v DESC, id LIMIT 3"),
+        integers(&[2, 1, 7])
+    );
+    // A single sort key, over rows without a tie.
+    assert_eq!(
+        rows("SELECT id FROM spans WHERE id <> 7 ORDER BY v"),
+        integers(&[6, 5, 4, 3, 1, 2])
+    );
+    assert_eq!(
+        rows("SELECT id FROM spans WHERE id <> 7 ORDER BY v DESC"),
+        integers(&[2, 1, 3, 4, 5, 6])
+    );
+    assert_eq!(
+        rows("SELECT id FROM spans WHERE id <> 7 ORDER BY v DESC LIMIT 2"),
+        integers(&[2, 1])
+    );
+    assert_eq!(
+        rows("SELECT id FROM spans WHERE id <> 7 ORDER BY v COLLATE NOCASE"),
+        integers(&[6, 5, 4, 3, 1, 2])
+    );
+    assert_eq!(
+        rows("SELECT MIN(v), MAX(v) FROM spans"),
+        vec![vec![interval(0, 2, -50 * HOUR), interval(0, 31, 0)]]
+    );
+    assert_eq!(
+        rows("SELECT id <= 3 AS g, MIN(v), MAX(v) FROM spans GROUP BY id <= 3 ORDER BY g"),
+        vec![
+            vec![
+                Value::Boolean(false),
+                interval(0, 2, -50 * HOUR),
+                interval(0, 30, 0)
+            ],
+            vec![Value::Boolean(true), interval(0, 29, 0), interval(0, 31, 0)],
+        ]
+    );
+    assert_eq!(
+        rows("SELECT RANK() OVER (ORDER BY v) FROM spans ORDER BY id"),
+        integers(&[5, 7, 4, 3, 2, 1, 5])
+    );
+    assert_eq!(
+        rows("SELECT COUNT(*) OVER (PARTITION BY v) FROM spans ORDER BY id"),
+        integers(&[2, 1, 1, 1, 1, 1, 2])
+    );
+    assert_eq!(
+        rows("SELECT MAX(v) OVER () FROM spans ORDER BY id LIMIT 1"),
+        vec![vec![interval(0, 31, 0)]]
+    );
+    assert_eq!(
+        rows(
+            "SELECT MAX(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW), \
+             MIN(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) \
+             FROM spans ORDER BY id"
+        ),
+        vec![
+            vec![interval(1, 0, 0), interval(1, 0, 0)],
+            vec![interval(0, 31, 0), interval(1, 0, 0)],
+            vec![interval(0, 31, 0), interval(0, 29, 0)],
+            vec![interval(0, 29, 0), interval(-1, 45, 0)],
+            vec![interval(-1, 45, 0), interval(0, 2, -50 * HOUR)],
+            vec![interval(0, 2, -50 * HOUR), interval(0, 2, -50 * HOUR)],
+            vec![interval(0, 30, 0), interval(0, 30, 0)],
+        ]
+    );
+}
+
+#[test]
 fn now_returns_timestamp() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
