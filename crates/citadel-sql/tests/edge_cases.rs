@@ -2113,6 +2113,69 @@ fn distinct_all_types() {
 }
 
 #[test]
+fn distinct_scan_matches_the_general_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, a INTEGER, r REAL, f BOOLEAN, d DATE, \
+         ts TIMESTAMP, name TEXT COLLATE NOCASE, tail TEXT)",
+        "INSERT INTO t VALUES \
+         (1, 100, 1.5, true, '2024-01-01', '2024-01-01 10:00:00', 'A', 'x'), \
+         (2, 100, 1.5, true, '2024-01-01', '2024-01-01 10:00:00', 'a', 'y'), \
+         (3, -7, -2.5, false, '1969-12-31', '1969-12-31 23:59:59', 'B', 'x'), \
+         (4, -7, -2.5, false, '1969-12-31', '1969-12-31 23:59:59', 'b', 'z')",
+        "ALTER TABLE t ADD COLUMN z INTEGER DEFAULT 7",
+        "INSERT INTO t (id, a, z) VALUES (5, 100, 8)",
+        "CREATE TABLE g (id INTEGER NOT NULL PRIMARY KEY, a INTEGER, \
+         v INTEGER GENERATED ALWAYS AS (a * 2) VIRTUAL, \
+         s INTEGER GENERATED ALWAYS AS (a * 3) STORED, tail TEXT)",
+        "INSERT INTO g (id, a, tail) VALUES (1, 5, 'p'), (2, 5, 'q'), (3, -6, 'r')",
+        "CREATE TABLE k (name TEXT NOT NULL PRIMARY KEY, n INTEGER)",
+        "INSERT INTO k VALUES ('a', 1), ('b', 1)",
+        "CREATE TABLE c (x INTEGER NOT NULL, y INTEGER NOT NULL, PRIMARY KEY (x, y))",
+        "INSERT INTO c VALUES (1, 1), (1, 2), (-2, 1)",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+    // Without WHERE, DISTINCT over one table's columns takes the one-scan path;
+    // a WHERE that keeps every row takes the general one, in the same row order.
+    for (columns, table, key, distinct_rows) in [
+        ("a", "t", "id", 2),
+        ("r", "t", "id", 3),
+        ("f", "t", "id", 3),
+        ("d", "t", "id", 3),
+        ("ts", "t", "id", 3),
+        ("name", "t", "id", 3),
+        ("z", "t", "id", 2),
+        ("a, z", "t", "id", 3),
+        ("v", "g", "id", 2),
+        ("s", "g", "id", 2),
+        ("name", "k", "name", 2),
+        ("n", "k", "name", 1),
+        ("x", "c", "x", 2),
+        ("y", "c", "x", 2),
+    ] {
+        let scan = format!("SELECT DISTINCT {columns} FROM {table}");
+        let general = format!("{scan} WHERE {key} IS NOT NULL");
+        let rows = conn.query(&scan).unwrap().rows;
+        assert_eq!(rows, conn.query(&general).unwrap().rows, "{scan}");
+        assert_eq!(rows.len(), distinct_rows, "{scan}: {rows:?}");
+    }
+    // A row stored before its column was added reads the column's default.
+    assert_eq!(
+        conn.query("SELECT DISTINCT z FROM t").unwrap().rows,
+        vec![vec![Value::Integer(7)], vec![Value::Integer(8)]]
+    );
+    assert_eq!(
+        conn.query("SELECT DISTINCT a FROM t LIMIT 1 OFFSET 1")
+            .unwrap()
+            .rows,
+        vec![vec![Value::Integer(-7)]]
+    );
+}
+
+#[test]
 fn a_select_list_without_columns_keeps_every_row() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
