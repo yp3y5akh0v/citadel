@@ -1875,6 +1875,28 @@ fn split_spans_refresh_in_middle_of_script() {
 }
 
 #[test]
+fn reindex_targets() {
+    for (sql, target) in [
+        ("REINDEX", ReindexTarget::All),
+        ("reindex database;", ReindexTarget::All),
+        ("REINDEX TABLE s.t", ReindexTarget::Table("s.t".into())),
+        ("REINDEX INDEX t_v", ReindexTarget::Index("t_v".into())),
+        ("REINDEX t", ReindexTarget::TableOrIndex("t".into())),
+        (
+            "REINDEX \"odd name\"",
+            ReindexTarget::TableOrIndex("odd name".into()),
+        ),
+    ] {
+        match parse_sql(sql).unwrap() {
+            Statement::Reindex(parsed) => assert_eq!(parsed, target, "{sql}"),
+            other => panic!("{sql}: {other:?}"),
+        }
+    }
+    assert!(parse_sql("REINDEXES t").is_err());
+    assert_eq!(parse_sql_multi("SELECT 1; REINDEX t").unwrap().len(), 2);
+}
+
+#[test]
 fn has_subquery_follows_collation_and_window_expression_wrappers() {
     for sql in [
         "(SELECT 1) COLLATE BINARY",

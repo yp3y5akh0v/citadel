@@ -464,11 +464,11 @@ executable hashes, and per-run results are in
 
 ## SQL
 
-**Statements** - CREATE/DROP TABLE (incl. `TEMP`), ALTER TABLE (ADD/DROP/RENAME COLUMN, RENAME TABLE, DISABLE/ENABLE TRIGGER), CREATE/DROP INDEX (incl. partial `WHERE`, expression keys, `CONCURRENTLY`), CREATE/DROP VIEW, CREATE/DROP MATERIALIZED VIEW (with `REFRESH [CONCURRENTLY]`), CREATE/DROP TRIGGER (BEFORE/AFTER/INSTEAD OF, FOR EACH ROW/STATEMENT, `REFERENCING NEW/OLD TABLE`, `WHEN`, `UPDATE OF cols`), INSERT (VALUES, SELECT, ON CONFLICT DO NOTHING/DO UPDATE, ON CONSTRAINT), SELECT, UPDATE, DELETE, TRUNCATE TABLE, RETURNING (with `OLD`/`NEW`), BEGIN [READ ONLY | READ WRITE]/COMMIT/ROLLBACK, SAVEPOINT/RELEASE/ROLLBACK TO, SET [LOCAL] TIME ZONE, EXPLAIN, REFRESH MATERIALIZED VIEW
+**Statements** - CREATE/DROP TABLE (incl. `TEMP`), ALTER TABLE (ADD/DROP/RENAME COLUMN, RENAME TABLE, DISABLE/ENABLE TRIGGER), CREATE/DROP INDEX (incl. partial `WHERE`, expression keys, `CONCURRENTLY`), REINDEX [DATABASE | TABLE | INDEX], CREATE/DROP VIEW, CREATE/DROP MATERIALIZED VIEW (with `REFRESH [CONCURRENTLY]`), CREATE/DROP TRIGGER (BEFORE/AFTER/INSTEAD OF, FOR EACH ROW/STATEMENT, `REFERENCING NEW/OLD TABLE`, `WHEN`, `UPDATE OF cols`), INSERT (VALUES, SELECT, ON CONFLICT DO NOTHING/DO UPDATE, ON CONSTRAINT), SELECT, UPDATE, DELETE, TRUNCATE TABLE, RETURNING (with `OLD`/`NEW`), BEGIN [READ ONLY | READ WRITE]/COMMIT/ROLLBACK, SAVEPOINT/RELEASE/ROLLBACK TO, SET [LOCAL] TIME ZONE, EXPLAIN, REFRESH MATERIALIZED VIEW
 
 **Constraints** - PRIMARY KEY, NOT NULL, UNIQUE, DEFAULT, CHECK (column + table level), FOREIGN KEY with full referential actions (`ON DELETE` / `ON UPDATE` `CASCADE` / `SET NULL` / `SET DEFAULT` / `RESTRICT` / `NO ACTION`), GENERATED ALWAYS AS (...) STORED|VIRTUAL
 
-**Collations** - `BINARY`, `NOCASE` (ASCII case-insensitive), and `RTRIM` (ignores trailing spaces). Text primary keys use their declared collation; foreign keys use the referenced columns' collation. Column index keys inherit their column's collation unless overridden with `COLLATE`.
+**Collations** - `BINARY`, `NOCASE` (ASCII case-insensitive), and `RTRIM` (ignores trailing spaces). Text primary keys use their declared collation; foreign keys use the referenced columns' collation. Column index keys inherit their column's collation unless overridden with `COLLATE`. INTERVAL keys (primary, unique, foreign and index) compare by length as `=` does, so '1 month' and '30 days' are one key; `REINDEX` converts interval columns stored by earlier versions.
 
 **Types** - INTEGER, REAL, TEXT, BLOB, BOOLEAN, DATE, TIME, TIMESTAMP (WITH TIME ZONE), INTERVAL, JSON, JSONB, TSVECTOR, TSQUERY, ARRAY
 

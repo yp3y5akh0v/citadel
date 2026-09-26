@@ -152,6 +152,27 @@ fn every_dml_path_purges_the_segment_in_its_own_commit() {
 }
 
 #[test]
+fn reindex_rebuilds_instead_of_loading_the_segment() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    seed(&conn);
+    let truth = ids(&conn, QUERY);
+    conn.persist_ann_index("t", "v").unwrap();
+    conn.execute("REINDEX INDEX ix_v").unwrap();
+    drop(conn);
+    drop(db);
+
+    let db = open_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    assert_eq!(ids(&conn, QUERY), truth);
+    match status(&conn, "t") {
+        Some(AnnIndexSource::Built { refusal }) => assert!(refusal.is_none(), "{refusal:?}"),
+        other => panic!("expected Built after REINDEX, got {other:?}"),
+    }
+}
+
+#[test]
 fn rollback_preserves_the_segment() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());

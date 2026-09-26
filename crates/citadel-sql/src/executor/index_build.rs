@@ -86,6 +86,12 @@ impl<'a> IndexBuildPlan<'a> {
         })
     }
 
+    pub(super) fn build(&self, wtx: &mut WriteTxn<'_>, storage: &[u8]) -> Result<()> {
+        let entries =
+            self.collect(|visit| wtx.table_scan_from(self.schema.name.as_bytes(), b"", visit))?;
+        self.insert(wtx, storage, entries)
+    }
+
     pub(super) fn collect(
         &self,
         scan: impl FnOnce(&mut ScanRow<'_>) -> citadel_core::Result<()>,

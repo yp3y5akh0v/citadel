@@ -745,7 +745,7 @@ pub enum Collation {
     NoCase = 1,
     Rtrim = 2,
     /// Interval keys equal by length, as `=` compares intervals. An interval column under
-    /// BINARY keys by exact fields.
+    /// BINARY keys by exact fields until REINDEX converts it.
     IntervalLength = 3,
 }
 

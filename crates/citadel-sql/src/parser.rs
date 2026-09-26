@@ -1,6 +1,9 @@
 //! SQL parser: converts SQL strings into the internal AST.
 
 use sqlparser::ast as sp;
+use sqlparser::keywords::Keyword;
+use sqlparser::parser::{Parser, ParserError};
+use sqlparser::tokenizer::Token;
 
 use crate::error::{Result, SqlError};
 use crate::types::{Collation, DataType, Value};
@@ -24,6 +27,7 @@ pub enum Statement {
     CreateMaterializedView(Box<CreateMatviewStmt>),
     RefreshMaterializedView(RefreshMatviewStmt),
     DropMaterializedView(DropMatviewStmt),
+    Reindex(ReindexTarget),
     CreateTrigger(Box<CreateTriggerStmt>),
     DropTrigger(DropTriggerStmt),
     AlterTable(Box<AlterTableStmt>),
@@ -233,6 +237,14 @@ pub struct CreateMatviewStmt {
 pub struct RefreshMatviewStmt {
     pub name: String,
     pub concurrently: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReindexTarget {
+    All,
+    Table(String),
+    Index(String),
+    TableOrIndex(String),
 }
 
 #[derive(Debug, Clone)]
@@ -744,7 +756,7 @@ pub fn parse_submitted_multi(sql: &str) -> Result<Vec<Statement>> {
 }
 
 fn parse_resolved(sql: &str, unresolved: Unresolved) -> Result<Statement> {
-    if let Some(stmt) = try_parse_refresh_matview(sql) {
+    if let Some(stmt) = try_parse_unsupported_by_sqlparser(sql) {
         return stmt;
     }
     let (rewritten, no_data_flags) = strip_matview_with_no_data(sql);
@@ -769,7 +781,7 @@ fn parse_resolved_multi(sql: &str, unresolved: Unresolved) -> Result<Vec<Stateme
     let mut out: Vec<Statement> = Vec::new();
     for (start, end) in split_statement_spans(&rewritten) {
         let stmt_sql = &rewritten[start..end];
-        if let Some(parsed) = try_parse_refresh_matview(stmt_sql) {
+        if let Some(parsed) = try_parse_unsupported_by_sqlparser(stmt_sql) {
             out.push(parsed?);
         } else {
             let raw = crate::dialect::parse_statements(stmt_sql)
@@ -891,7 +903,56 @@ fn apply_no_data_flags(stmts: &mut [Statement], flags: &[bool]) {
     }
 }
 
-/// sqlparser 0.61 doesn't natively parse REFRESH MATERIALIZED VIEW [CONCURRENTLY] <name>.
+/// Statements sqlparser 0.61 does not parse.
+fn try_parse_unsupported_by_sqlparser(sql: &str) -> Option<Result<Statement>> {
+    try_parse_refresh_matview(sql).or_else(|| try_parse_reindex(sql))
+}
+
+fn try_parse_reindex(sql: &str) -> Option<Result<Statement>> {
+    let sql = sql.trim().trim_end_matches(';');
+    let rest = sql.get(7..)?;
+    let is_reindex = sql[..7].eq_ignore_ascii_case("reindex")
+        && !rest.starts_with(|c: char| c.is_alphanumeric() || c == '_');
+    is_reindex.then(|| parse_reindex(sql))
+}
+
+fn parse_reindex(sql: &str) -> Result<Statement> {
+    let dialect = crate::dialect::CitadelDialect::new();
+    let syntax = |error: ParserError| SqlError::Parse(error.to_string());
+    let unsupported =
+        || SqlError::Unsupported("REINDEX [DATABASE] or REINDEX [TABLE | INDEX] name".into());
+    let mut parser = Parser::new(&dialect).try_with_sql(sql).map_err(syntax)?;
+    parser.expect_keyword_is(Keyword::REINDEX).map_err(syntax)?;
+    if parser.peek_token().token == Token::LParen {
+        return Err(unsupported());
+    }
+    let kind = parser.parse_one_of_keywords(&[
+        Keyword::TABLE,
+        Keyword::INDEX,
+        Keyword::DATABASE,
+        Keyword::SCHEMA,
+        Keyword::SYSTEM,
+    ]);
+    if parser.parse_keyword(Keyword::CONCURRENTLY) {
+        return Err(unsupported());
+    }
+    let name = match parser.peek_token().token {
+        Token::EOF => None,
+        _ => Some(object_name_to_string(
+            &parser.parse_object_name(false).map_err(syntax)?,
+        )),
+    };
+    parser.expect_token(&Token::EOF).map_err(syntax)?;
+    match (kind, name) {
+        (None | Some(Keyword::DATABASE), None) => Ok(ReindexTarget::All),
+        (Some(Keyword::TABLE), Some(name)) => Ok(ReindexTarget::Table(name)),
+        (Some(Keyword::INDEX), Some(name)) => Ok(ReindexTarget::Index(name)),
+        (None, Some(name)) => Ok(ReindexTarget::TableOrIndex(name)),
+        _ => Err(unsupported()),
+    }
+    .map(Statement::Reindex)
+}
+
 fn try_parse_refresh_matview(sql: &str) -> Option<Result<Statement>> {
     let trimmed = sql.trim().trim_end_matches(';').trim();
     let lower = trimmed.to_ascii_lowercase();
