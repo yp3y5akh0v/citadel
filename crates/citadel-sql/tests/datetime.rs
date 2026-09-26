@@ -970,6 +970,108 @@ fn dates_past_year_9999_compute_exactly() {
 }
 
 #[test]
+fn timestamps_parse_through_9999_and_round_fractions_as_postgresql() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE ends (id INTEGER PRIMARY KEY, valid_to TIMESTAMP)")
+        .unwrap();
+    conn.execute("INSERT INTO ends VALUES (1, '9999-12-31 23:59:59')")
+        .unwrap();
+    // PostgreSQL 17's answers: fractions past the sixth digit round half to
+    // even, and a carry reaches the next second, day or 24:00:00.
+    for (sql, expected) in [
+        ("SELECT valid_to FROM ends", "9999-12-31 23:59:59"),
+        (
+            "SELECT TIMESTAMP '9999-12-31 23:59:59.999999'",
+            "9999-12-31 23:59:59.999999",
+        ),
+        (
+            "SELECT CAST('9999-12-30 22:00:01' AS TIMESTAMP)",
+            "9999-12-30 22:00:01",
+        ),
+        (
+            "SELECT TIMESTAMP '2024-01-01 12:00:00.1234567'",
+            "2024-01-01 12:00:00.123457",
+        ),
+        (
+            "SELECT TIMESTAMP '2024-01-01 12:00:00.1234565'",
+            "2024-01-01 12:00:00.123456",
+        ),
+        (
+            "SELECT TIMESTAMP '1969-12-31 23:59:59.9999995'",
+            "1970-01-01 00:00:00",
+        ),
+        (
+            "SELECT TIMESTAMP '2024-01-01 12:00:00.1234567+02:00'",
+            "2024-01-01 10:00:00.123457",
+        ),
+        ("SELECT TIME '23:59:59.9999995'", "24:00:00"),
+        ("SELECT TIME '10:00:00.1234565'", "10:00:00.123456"),
+        ("SELECT TIME '10:00:00.1234575'", "10:00:00.123458"),
+    ] {
+        assert_eq!(scalar(&conn, sql).to_string(), expected, "{sql}");
+    }
+}
+
+#[test]
+fn timestamp_arithmetic_spans_the_whole_calendar() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    // PostgreSQL 17's answers: months first (the day kept inside the month),
+    // then days, then time, on either side of year 9999.
+    for (sql, expected) in [
+        (
+            "SELECT TIMESTAMP '9999-12-31 00:00:00' + INTERVAL '1 day'",
+            "10000-01-01 00:00:00",
+        ),
+        (
+            "SELECT TIMESTAMP '9999-12-31 00:00:00' + INTERVAL '1 month'",
+            "10000-01-31 00:00:00",
+        ),
+        (
+            "SELECT DATE '9999-12-31' + INTERVAL '1 hour'",
+            "9999-12-31 01:00:00",
+        ),
+        (
+            "SELECT TIMESTAMP '9999-12-31 23:59:59.999999' - TIMESTAMP '2000-01-01 00:00:00'",
+            "2921939 days 23:59:59.999999",
+        ),
+        (
+            "SELECT TIMESTAMP '0044-03-15 12:00:00 BC' - INTERVAL '1 month'",
+            "0044-02-15 12:00:00 BC",
+        ),
+        (
+            "SELECT TIMESTAMP '0001-03-01 00:00:00' - INTERVAL '1 day 1 month'",
+            "0001-01-31 00:00:00",
+        ),
+        (
+            "SELECT TIMESTAMP '2024-03-31 10:00:00' - INTERVAL '1 month 1 day'",
+            "2024-02-28 10:00:00",
+        ),
+    ] {
+        assert_eq!(scalar(&conn, sql).to_string(), expected, "{sql}");
+    }
+    assert_eq!(
+        scalar(
+            &conn,
+            "SELECT extract(year FROM TIMESTAMP '9999-12-31 23:59:59.999999' \
+             + INTERVAL '1 microsecond')"
+        ),
+        Value::Integer(10_000)
+    );
+    for sql in [
+        "SELECT TIMESTAMP '2024-01-01 00:00:00' + INTERVAL '178956970 years'",
+        "SELECT TIMESTAMP '2024-01-01 00:00:00' + INTERVAL '2147483647 days' \
+         + INTERVAL '2147483647 days'",
+        "SELECT TIMESTAMP '2024-01-01 00:00:00' + INTERVAL '9223372036854775807 microseconds'",
+    ] {
+        assert_invalid(&conn, sql, "timestamp out of range");
+    }
+}
+
+#[test]
 fn bc_dates_follow_postgresql_calendar_fields() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
