@@ -3,7 +3,7 @@ use citadel_sql::executor::{exec_insert_in_txn, execute, execute_in_txn};
 use citadel_sql::parser::{parse_sql, Statement};
 use citadel_sql::schema::SchemaManager;
 use citadel_sql::types::{Collation, IndexKey};
-use citadel_sql::{Connection, ExecutionResult, SqlError, Value};
+use citadel_sql::{Connection, DataType, ExecutionResult, SqlError, Value};
 
 fn database() -> Database {
     DatabaseBuilder::new("")
@@ -761,33 +761,56 @@ fn interval_keys_reject_values_of_equal_length() {
     }
 }
 
+fn use_exact_interval_keys(db: &Database, tables: &[&str]) {
+    let conn = Connection::open(db).unwrap();
+    let schemas: Vec<_> = tables
+        .iter()
+        .map(|table| conn.table_schema(table).unwrap())
+        .collect();
+    drop(conn);
+    let mut write = db.begin_write().unwrap();
+    for mut schema in schemas {
+        for column in schema
+            .columns
+            .iter_mut()
+            .filter(|column| column.data_type == DataType::Interval)
+        {
+            column.collation = Collation::Binary;
+        }
+        for key in schema.indices.iter_mut().flat_map(|index| &mut index.keys) {
+            if let IndexKey::Column { idx, collate } = key {
+                if schema.columns[*idx as usize].data_type == DataType::Interval {
+                    *collate = Collation::Binary;
+                }
+            }
+        }
+        // A key left without a folding collation had no equality index.
+        if schema
+            .primary_key_columns
+            .iter()
+            .all(|&column| schema.columns[column as usize].collation == Collation::Binary)
+        {
+            for index in schema
+                .indices
+                .extract_if(.., |index| index.name.starts_with("__pk_"))
+            {
+                let storage = citadel_sql::TableSchema::index_table_name(&schema.name, &index.name);
+                write.drop_table(&storage).unwrap();
+            }
+        }
+        SchemaManager::save_schema(&mut write, &schema).unwrap();
+    }
+    write.commit().unwrap();
+}
+
 #[test]
 fn interval_keys_stored_under_binary_keep_exact_fields() {
     let db = database();
-    let conn = Connection::open(&db).unwrap();
-    conn.execute("CREATE TABLE spans (v INTERVAL PRIMARY KEY, w INTERVAL UNIQUE)")
+    Connection::open(&db)
+        .unwrap()
+        .execute("CREATE TABLE spans (v INTERVAL PRIMARY KEY, w INTERVAL UNIQUE)")
         .unwrap();
-    let mut schema = conn.table_schema("spans").unwrap();
-    drop(conn);
-    // The catalog of a table whose interval keys hold exact fields.
-    let mut write = db.begin_write().unwrap();
-    write
-        .drop_table(&citadel_sql::TableSchema::index_table_name(
-            "spans",
-            "__pk_spans",
-        ))
-        .unwrap();
-    schema.indices.retain(|index| index.name != "__pk_spans");
-    for column in &mut schema.columns {
-        column.collation = Collation::Binary;
-    }
-    for key in schema.indices.iter_mut().flat_map(|index| &mut index.keys) {
-        if let IndexKey::Column { collate, .. } = key {
-            *collate = Collation::Binary;
-        }
-    }
-    SchemaManager::save_schema(&mut write, &schema).unwrap();
-    write.commit().unwrap();
+    use_exact_interval_keys(&db, &["spans"]);
 
     let conn = Connection::open(&db).unwrap();
     conn.execute(
@@ -820,6 +843,137 @@ fn interval_keys_stored_under_binary_keep_exact_fields() {
         .iter()
         .all(|column| column.collation == Collation::Binary));
     assert_eq!(schema.indices.len(), 1);
+}
+
+#[test]
+fn reindex_keys_older_interval_columns_by_length() {
+    let db = database();
+    let conn = Connection::open(&db).unwrap();
+    for sql in [
+        "CREATE TABLE spans (v INTERVAL PRIMARY KEY, w INTERVAL UNIQUE, n INTEGER)",
+        "CREATE INDEX spans_w_n ON spans (w, n)",
+        "CREATE TABLE child (id INTEGER PRIMARY KEY, v INTERVAL REFERENCES spans(v))",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+    drop(conn);
+    use_exact_interval_keys(&db, &["spans", "child"]);
+    let conn = Connection::open(&db).unwrap();
+    conn.execute(
+        "INSERT INTO spans VALUES (INTERVAL '1 day', INTERVAL '1 month', 1), \
+         (INTERVAL '2 days', INTERVAL '31 days', 2)",
+    )
+    .unwrap();
+    let child = "INSERT INTO child VALUES (1, INTERVAL '24 hours')";
+    assert!(matches!(
+        conn.execute(child),
+        Err(SqlError::ForeignKeyViolation(_))
+    ));
+    let collations = |conn: &Connection<'_>| {
+        let schema = conn.table_schema("spans").unwrap();
+        let index = schema.index_by_name("spans_w_n").unwrap();
+        [
+            schema.columns[0].collation,
+            schema.columns[1].collation,
+            index.collation_at(0),
+        ]
+    };
+    conn.execute("REINDEX INDEX spans_w_n").unwrap();
+    assert_eq!(collations(&conn), [Collation::Binary; 3]);
+
+    conn.execute("REINDEX TABLE spans").unwrap();
+    assert_eq!(collations(&conn), [Collation::IntervalLength; 3]);
+    assert!(matches!(
+        conn.execute("INSERT INTO spans VALUES (INTERVAL '24 hours', NULL, 3)"),
+        Err(SqlError::DuplicateKey)
+    ));
+    assert!(matches!(
+        conn.execute("INSERT INTO spans VALUES (INTERVAL '3 days', INTERVAL '30 days', 3)"),
+        Err(SqlError::UniqueViolation(_))
+    ));
+    conn.execute(child).unwrap();
+    drop(conn);
+    let conn = Connection::open(&db).unwrap();
+    assert!(matches!(
+        conn.execute("INSERT INTO spans VALUES (INTERVAL '86400 seconds', NULL, 4)"),
+        Err(SqlError::DuplicateKey)
+    ));
+}
+
+#[test]
+fn reindex_refuses_interval_keys_of_equal_length_and_changes_nothing() {
+    let db = database();
+    Connection::open(&db)
+        .unwrap()
+        .execute("CREATE TABLE spans (v INTERVAL PRIMARY KEY, w INTERVAL UNIQUE)")
+        .unwrap();
+    use_exact_interval_keys(&db, &["spans"]);
+    let conn = Connection::open(&db).unwrap();
+    conn.execute(
+        "INSERT INTO spans VALUES (INTERVAL '1 day', INTERVAL '1 month'), \
+         (INTERVAL '24 hours', INTERVAL '2 months')",
+    )
+    .unwrap();
+    for begin in [None, Some("BEGIN")] {
+        if let Some(begin) = begin {
+            conn.execute(begin).unwrap();
+        }
+        match conn.execute("REINDEX TABLE spans") {
+            Err(SqlError::UniqueViolation(message)) => assert_eq!(
+                message,
+                "primary key of 'spans' under its declared collation"
+            ),
+            other => panic!("{begin:?}: {other:?}"),
+        }
+        if begin.is_some() {
+            conn.execute("INSERT INTO spans VALUES (INTERVAL '3 days', NULL)")
+                .unwrap();
+            conn.execute("COMMIT").unwrap();
+        }
+    }
+    conn.execute("DELETE FROM spans WHERE v = INTERVAL '3 days'")
+        .unwrap();
+    conn.execute(
+        "UPDATE spans SET v = INTERVAL '2 days', w = INTERVAL '30 days' \
+         WHERE w = INTERVAL '2 months'",
+    )
+    .unwrap();
+    let unique = conn.table_schema("spans").unwrap().indices[0].name.clone();
+    match conn.execute("REINDEX") {
+        Err(SqlError::UniqueViolation(index)) => assert_eq!(index, unique),
+        other => panic!("{other:?}"),
+    }
+    let schema = conn.table_schema("spans").unwrap();
+    assert!(schema
+        .columns
+        .iter()
+        .all(|column| column.collation == Collation::Binary));
+    assert_eq!(schema.indices.len(), 1);
+    assert_eq!(
+        conn.query("SELECT COUNT(*) FROM spans").unwrap().rows,
+        vec![vec![Value::Integer(2)]]
+    );
+}
+
+#[test]
+fn reindex_names_the_primary_key_its_rebuilt_equality_index_rejects() {
+    let db = database();
+    Connection::open(&db)
+        .unwrap()
+        .execute("CREATE TABLE tags (name TEXT COLLATE NOCASE, v INTERVAL, PRIMARY KEY (name, v))")
+        .unwrap();
+    use_exact_interval_keys(&db, &["tags"]);
+    let conn = Connection::open(&db).unwrap();
+    assert_eq!(conn.table_schema("tags").unwrap().indices.len(), 1);
+    conn.execute("INSERT INTO tags VALUES ('a', INTERVAL '1 day'), ('A', INTERVAL '24 hours')")
+        .unwrap();
+    match conn.execute("REINDEX TABLE tags") {
+        Err(SqlError::UniqueViolation(message)) => assert_eq!(
+            message,
+            "primary key of 'tags' under its declared collation"
+        ),
+        other => panic!("{other:?}"),
+    }
 }
 
 #[test]

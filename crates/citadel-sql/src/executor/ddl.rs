@@ -728,10 +728,7 @@ pub(super) fn exec_create_index_in_txn(
 
     SchemaManager::ensure_schema_table(wtx)?;
     wtx.create_table(&idx_table).map_err(SqlError::Storage)?;
-
-    let entries =
-        plan.collect(|visit| wtx.table_scan_from(table_schema.name.as_bytes(), b"", visit))?;
-    plan.insert(wtx, &idx_table, entries)?;
+    plan.build(wtx, &idx_table)?;
 
     table_schema.indices.push(idx_def);
     SchemaManager::save_schema(wtx, &table_schema)?;

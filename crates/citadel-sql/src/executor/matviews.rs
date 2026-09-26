@@ -81,7 +81,7 @@ pub(super) fn exec_create_matview_in_txn(
         backing_schema.indices.push(index);
     }
 
-    with_matview_savepoint(wtx, schema, |wtx, schema| {
+    super::with_statement_savepoint(wtx, schema, |wtx, schema| {
         wtx.create_table(backing_table.as_bytes())
             .map_err(SqlError::Storage)?;
         super::ddl::create_index_tables(wtx, &backing_schema)?;
@@ -194,7 +194,7 @@ pub(super) fn exec_refresh_matview(
         }
 
         let backing = backing.clone();
-        with_matview_savepoint(&mut wtx, schema, |wtx, schema| {
+        super::with_statement_savepoint(&mut wtx, schema, |wtx, schema| {
             diff_merge_concurrent(wtx, schema, &backing, &rows)
         })?;
         super::helpers::drain_deferred_fk_checks(&mut wtx, schema)?;
@@ -269,7 +269,7 @@ pub(super) fn exec_refresh_matview_in_txn(
         .get(&mv.backing_table)
         .ok_or_else(|| SqlError::TableNotFound(mv.backing_table.clone()))?
         .clone();
-    with_matview_savepoint(wtx, schema, |wtx, schema| {
+    super::with_statement_savepoint(wtx, schema, |wtx, schema| {
         if stmt.concurrently {
             diff_merge_concurrent(wtx, schema, &backing, &rows)?;
         } else {
@@ -383,34 +383,6 @@ pub(super) fn exec_drop_matview_in_txn(
     SchemaManager::delete_matview(wtx, &name_lower)?;
     schema.remove_matview(&name_lower);
     Ok(ExecutionResult::Ok)
-}
-
-/// Keep the backing rows, all index trees, and catalog publication atomic even
-/// when called with a public caller-owned writer.
-fn with_matview_savepoint<T>(
-    wtx: &mut WriteTxn<'_>,
-    schema: &mut SchemaManager,
-    mutate: impl FnOnce(&mut WriteTxn<'_>, &mut SchemaManager) -> Result<T>,
-) -> Result<T> {
-    let catalog = schema.save_snapshot();
-    let savepoint = wtx.begin_savepoint();
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let result = mutate(wtx, schema)?;
-        super::helpers::check_cancel(wtx.cancel_token())?;
-        Ok(result)
-    }));
-    match outcome {
-        Ok(Ok(result)) => Ok(result),
-        failure => {
-            wtx.restore_snapshot(savepoint);
-            schema.restore_snapshot(catalog);
-            match failure {
-                Ok(Err(error)) => Err(error),
-                Err(payload) => std::panic::resume_unwind(payload),
-                Ok(Ok(_)) => unreachable!(),
-            }
-        }
-    }
 }
 
 fn row_primary_key<'a>(table: &TableSchema, row: &'a [Value]) -> Result<&'a Value> {

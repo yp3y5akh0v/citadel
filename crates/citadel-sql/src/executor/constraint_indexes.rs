@@ -101,24 +101,11 @@ pub(crate) fn reconcile_constraint_indexes_in_txn(
             for index in &additions {
                 let storage = TableSchema::index_table_name(&table.name, &index.name);
                 let plan = IndexBuildPlan::new(&table, index, cancel.as_ref())?;
-                let entries =
-                    plan.collect(|visit| wtx.table_scan_from(table.name.as_bytes(), b"", visit))?;
                 // A physical collision is corruption, never permission to adopt
                 // or overwrite an undeclared tree.
                 wtx.create_table(&storage).map_err(SqlError::Storage)?;
-                if let Err(error) = plan.insert(wtx, &storage, entries) {
-                    return Err(match error {
-                        SqlError::UniqueViolation(_)
-                            if table.is_primary_key_equality_index(index) =>
-                        {
-                            SqlError::UniqueViolation(format!(
-                                "primary key of '{}' under its declared collation",
-                                table.name
-                            ))
-                        }
-                        other => other,
-                    });
-                }
+                plan.build(wtx, &storage)
+                    .map_err(|error| name_primary_key_duplicate(&table, index, error))?;
             }
             SchemaManager::save_schema(wtx, &table)?;
             updated.push(table);
@@ -157,6 +144,22 @@ pub(crate) fn reconcile_constraint_indexes_in_txn(
                 Ok(Ok(())) => unreachable!(),
             }
         }
+    }
+}
+
+pub(super) fn name_primary_key_duplicate(
+    table: &TableSchema,
+    index: &IndexDef,
+    error: SqlError,
+) -> SqlError {
+    match error {
+        SqlError::UniqueViolation(_) if table.is_primary_key_equality_index(index) => {
+            SqlError::UniqueViolation(format!(
+                "primary key of '{}' under its declared collation",
+                table.name
+            ))
+        }
+        other => other,
     }
 }
 

@@ -16,6 +16,7 @@ mod index_build;
 mod insert_copy;
 mod join;
 pub(crate) mod matviews;
+mod reindex;
 mod result_cache;
 mod row_mutation;
 mod scan;
@@ -69,7 +70,8 @@ pub(crate) fn stmt_mutates(stmt: &Statement) -> bool {
         | Statement::DropTrigger(_)
         | Statement::CreateMaterializedView(_)
         | Statement::RefreshMaterializedView(_)
-        | Statement::DropMaterializedView(_) => true,
+        | Statement::DropMaterializedView(_)
+        | Statement::Reindex(_) => true,
         Statement::Select(query) => {
             query.ctes.iter().any(|cte| query_body_mutates(&cte.body))
                 || query_body_mutates(&query.body)
@@ -95,7 +97,8 @@ pub(crate) fn stmt_mutates_schema(stmt: &Statement) -> bool {
         | Statement::DropTrigger(_)
         | Statement::CreateMaterializedView(_)
         | Statement::RefreshMaterializedView(_)
-        | Statement::DropMaterializedView(_) => true,
+        | Statement::DropMaterializedView(_)
+        | Statement::Reindex(_) => true,
         Statement::Explain {
             inner,
             analyze: true,
@@ -580,7 +583,8 @@ pub(crate) fn execute_with_admitted_read(
         | Statement::DropTrigger(_)
         | Statement::CreateMaterializedView(_)
         | Statement::RefreshMaterializedView(_)
-        | Statement::DropMaterializedView(_) => Err(SqlError::Unsupported(
+        | Statement::DropMaterializedView(_)
+        | Statement::Reindex(_) => Err(SqlError::Unsupported(
             "cannot execute mutating statement inside a read-only transaction".into(),
         )),
         Statement::Begin { .. }
@@ -670,6 +674,30 @@ pub(crate) fn execute_in_admitted_txn(
     outcome
 }
 
+/// Keep a statement's rows, index trees and catalog atomic even for a public caller-owned
+/// writer.
+fn with_statement_savepoint<T>(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    schema: &mut SchemaManager,
+    mutate: impl FnOnce(&mut citadel_txn::write_txn::WriteTxn<'_>, &mut SchemaManager) -> Result<T>,
+) -> Result<T> {
+    let catalog = schema.save_snapshot();
+    let savepoint = wtx.begin_savepoint();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let result = mutate(wtx, schema)?;
+        helpers::check_cancel(wtx.cancel_token())?;
+        Ok(result)
+    }));
+    if !matches!(outcome, Ok(Ok(_))) {
+        wtx.restore_snapshot(savepoint);
+        schema.restore_snapshot(catalog);
+    }
+    match outcome {
+        Ok(result) => result,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
 pub(crate) fn mark_write_statement_failed(
     wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
     error: &SqlError,
@@ -729,6 +757,7 @@ fn execute_in_txn_inner(
         Statement::DropMaterializedView(dmv) => {
             matviews::exec_drop_matview_in_txn(wtx, schema, dmv)
         }
+        Statement::Reindex(target) => reindex::exec_reindex_in_txn(wtx, schema, target),
         Statement::Begin { .. }
         | Statement::Commit
         | Statement::Rollback
