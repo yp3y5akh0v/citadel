@@ -25,7 +25,10 @@ const SCHEMA: &[&str] = &[
      f TIMESTAMP, g INTERVAL, h BOOLEAN)",
     "CREATE TABLE u (id INTEGER PRIMARY KEY, k INTEGER, name TEXT COLLATE NOCASE)",
     "CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT, v VECTOR(3))",
+    "CREATE TABLE iv (v INTERVAL PRIMARY KEY, w INTERVAL UNIQUE, \
+     p INTERVAL REFERENCES iv(v) ON DELETE CASCADE ON UPDATE CASCADE)",
     "CREATE INDEX t_a ON t (a)",
+    "CREATE INDEX t_g ON t (g)",
     "CREATE INDEX docs_body ON docs USING fts (body)",
     "INSERT INTO t VALUES \
      (1, 10, 'x', 1.5, '{\"k\":[1,2]}', '2024-01-01', '2024-01-01 10:00:00', INTERVAL '1 day', true), \
@@ -41,6 +44,8 @@ const SCHEMA: &[&str] = &[
     "INSERT INTO u VALUES (10, 1, 'A'), (20, 3, 'b')",
     "INSERT INTO docs VALUES (1, 'the quick brown fox', '[1, 0, 0]'::VECTOR(3)), \
      (2, 'lazy dogs sleep', '[0, 1, 0]'::VECTOR(3))",
+    "INSERT INTO iv VALUES (INTERVAL '1 day', INTERVAL '1 mon', NULL), \
+     (INTERVAL '36 hours', INTERVAL '5 days', INTERVAL '24 hours')",
     "CREATE VIEW v AS SELECT id, a FROM t WHERE a > 0",
 ];
 
@@ -109,11 +114,27 @@ const CORPUS: &[&str] = &[
     "CREATE INDEX u_name ON u (name)",
     "CREATE UNIQUE INDEX u_k ON u (k) WHERE k > 0",
     "CREATE TRIGGER trg AFTER INSERT ON u FOR EACH ROW BEGIN UPDATE t SET a = a WHERE id = 1; END",
-    "CREATE MATERIALIZED VIEW mv AS SELECT a, COUNT(*) AS n FROM t GROUP BY a",
+    "CREATE MATERIALIZED VIEW mv AS SELECT a, COUNT(*) AS n FROM t WHERE a IS NOT NULL GROUP BY a",
     "REFRESH MATERIALIZED VIEW mv",
     "REINDEX TABLE u",
     "REINDEX INDEX u_name",
     "REINDEX",
+    "CREATE UNIQUE INDEX t_gu ON t (g) WHERE a > 0",
+    "SELECT id, g FROM t WHERE g >= INTERVAL '24 hours' AND g < INTERVAL '1 mon' ORDER BY g LIMIT 2",
+    "SELECT id FROM t WHERE g IN (INTERVAL '86400 seconds', INTERVAL '120 minutes') \
+     OR ARRAY[g] = ARRAY[INTERVAL '1 day'] ORDER BY g DESC",
+    "SELECT v, p FROM iv WHERE v = INTERVAL '24 hours'",
+    "INSERT INTO iv (v, w) SELECT g, g FROM t WHERE g IS NOT NULL \
+     ON CONFLICT (v) DO UPDATE SET w = excluded.w",
+    "INSERT INTO iv VALUES (INTERVAL '24 hours', INTERVAL '2 mons', NULL) ON CONFLICT DO NOTHING",
+    "UPDATE iv SET v = v + INTERVAL '1 day' WHERE p IS NULL RETURNING v, p",
+    "UPDATE iv SET v = INTERVAL '86400 seconds' WHERE v = INTERVAL '1 day'",
+    "DELETE FROM iv WHERE v = INTERVAL '86400 seconds'",
+    "SELECT a.v, b.w FROM iv AS a JOIN iv AS b ON a.v = b.p ORDER BY a.v LIMIT 3",
+    "CREATE MATERIALIZED VIEW mvg AS SELECT g, COUNT(*) AS n FROM t WHERE g IS NOT NULL GROUP BY g",
+    "REFRESH MATERIALIZED VIEW CONCURRENTLY mvg",
+    "REINDEX TABLE t",
+    "REINDEX TABLE iv",
     "CREATE TABLE w (id INTEGER PRIMARY KEY, p INTEGER REFERENCES u(id) ON DELETE CASCADE, \
      q TEXT CHECK (length(q) < 5), r INTEGER GENERATED ALWAYS AS (p * 2) STORED)",
     "DROP TABLE IF EXISTS w",
