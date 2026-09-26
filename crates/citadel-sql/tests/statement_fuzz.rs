@@ -31,6 +31,13 @@ const SCHEMA: &[&str] = &[
      (1, 10, 'x', 1.5, '{\"k\":[1,2]}', '2024-01-01', '2024-01-01 10:00:00', INTERVAL '1 day', true), \
      (2, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL), \
      (3, -5, 'yy', 2.5, '[1,2,3]', '2023-12-31', '2023-12-31 23:59:59', INTERVAL '2 hours', false)",
+    // Values at the edges of each type: extreme integers, infinite and BC dates,
+    // the widest intervals, text past ASCII.
+    "INSERT INTO t VALUES \
+     (4, 9223372036854775807, 'é😀', 1e308, '{\"k\":{}}', 'infinity', '-infinity', \
+      INTERVAL '-178956970 years -8 months', true), \
+     (5, -9223372036854775808, '', -1e-300, '[]', '0044-03-15 BC', '9999-12-31 23:59:59.999999', \
+      INTERVAL '2147483647 days 2562047788:00:54.775807', false)",
     "INSERT INTO u VALUES (10, 1, 'A'), (20, 3, 'b')",
     "INSERT INTO docs VALUES (1, 'the quick brown fox', '[1, 0, 0]'::VECTOR(3)), \
      (2, 'lazy dogs sleep', '[0, 1, 0]'::VECTOR(3))",
@@ -65,6 +72,13 @@ const CORPUS: &[&str] = &[
     "SELECT e + INTERVAL '1 month', f - g, EXTRACT(YEAR FROM e), DATE_TRUNC('day', f), \
      f AT TIME ZONE 'UTC', AGE(f, TIMESTAMP '2000-01-01') FROM t",
     "SELECT date_bin(INTERVAL '15 minutes', f, TIMESTAMP '2001-01-01'), justify_hours(g) FROM t",
+    "SELECT EXTRACT(EPOCH FROM e), date_part('isoyear', f), EXTRACT(JULIAN FROM f), \
+     date_trunc('decade', e), age(f, e), e - DATE '2000-01-01', f - TIMESTAMP 'infinity', e + a, \
+     CAST(e AS TIMESTAMP), CAST(f AS DATE), CAST(a AS DATE), CAST(a AS TIMESTAMP) FROM t",
+    "SELECT make_date(a, 2, 29), make_time(a, a, c), make_interval(a, a, a, a, a, a, c), \
+     g * c, g / a, SUM(g), AVG(g), justify_interval(g), -g, f + g, e - g FROM t GROUP BY a, c, e, f, g",
+    "SELECT SUBSTR(b, a, a), REPLACE(b, b, b), LENGTH(b), UPPER(b), a % -1, a / -1, ABS(a), \
+     ROUND(c, a), d -> a, d ->> a, jsonb_set(d::JSONB, '{k,0}', '1') FROM t",
     "SELECT a FROM t UNION SELECT k FROM u INTERSECT SELECT a FROM t EXCEPT SELECT 99",
     "SELECT DISTINCT b FROM t ORDER BY b NULLS LAST",
     "SELECT a BETWEEN 1 AND 20, b LIKE 'x%', b ILIKE 'Y%', a IS DISTINCT FROM NULL FROM t",
@@ -203,6 +217,14 @@ const FRAGMENTS: &[&str] = &[
     "LIKE",
     "ESCAPE",
     "RECURSIVE",
+    "'infinity'",
+    "'-infinity'",
+    " BC'",
+    "DATE '",
+    "TIMESTAMP '",
+    "e",
+    "f",
+    "g",
 ];
 
 const NUMBERS: &[&str] = &[
