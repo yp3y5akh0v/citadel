@@ -2710,32 +2710,48 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
             };
             Ok(Value::Text(type_name.into()))
         }
-        // The least or greatest of two or more arguments, compared as `<`
-        // compares them under the first argument collation found; NULL when
-        // any argument is NULL. Of equal arguments MIN keeps the later one,
-        // MAX the earlier.
+        // The least or greatest of two or more arguments; NULL when any
+        // argument is NULL. Of equal arguments MIN keeps the later one, MAX
+        // the earlier.
         "MIN" | "MAX" => {
             check_min_args(name, &evaluated, 2)?;
             if evaluated.iter().any(Value::is_null) {
                 return Ok(Value::Null);
             }
-            let greatest = name == "MAX";
-            let collation = args
-                .iter()
-                .find_map(|arg| operand_collation(arg, ctx.col_map));
-            let mut best = &evaluated[0];
-            for candidate in &evaluated[1..] {
-                let below = collated_compare_with_cancel(
-                    best,
-                    BinOp::Lt,
-                    candidate,
-                    collation,
-                    ctx.cancel,
-                )?;
-                if matches!(below, Value::Boolean(true)) == greatest {
-                    best = candidate;
-                }
-            }
+            let (greatest, tie) = if name == "MAX" {
+                (true, Tie::Earlier)
+            } else {
+                (false, Tie::Later)
+            };
+            let collation = args_collation(args, ctx.col_map);
+            let best = extreme(
+                &evaluated[0],
+                &evaluated[1..],
+                greatest,
+                tie,
+                collation,
+                ctx.cancel,
+            )?;
+            Ok(best.clone())
+        }
+        // The greatest or least of one or more arguments, skipping NULLs; NULL
+        // only when every argument is NULL. Of equal arguments the earlier is
+        // kept.
+        "GREATEST" | "LEAST" => {
+            check_min_args(name, &evaluated, 1)?;
+            let mut present = evaluated.iter().filter(|value| !value.is_null());
+            let Some(first) = present.next() else {
+                return Ok(Value::Null);
+            };
+            let collation = args_collation(args, ctx.col_map);
+            let best = extreme(
+                first,
+                present,
+                name == "GREATEST",
+                Tie::Earlier,
+                collation,
+                ctx.cancel,
+            )?;
             Ok(best.clone())
         }
         "HEX" => {
@@ -3967,6 +3983,47 @@ fn substr_span(len: usize, start: i64, count: Option<i64>) -> (usize, usize) {
     }
     let skip = skip.min(len);
     (skip as usize, take.min(len - skip) as usize)
+}
+
+/// Which of the values that compare equal [`extreme`] keeps.
+#[derive(Clone, Copy)]
+enum Tie {
+    Earlier,
+    Later,
+}
+
+/// The collation that orders a function's text arguments: the first one an argument carries.
+fn args_collation(args: &[Expr], col_map: &ColumnMap) -> Option<crate::types::Collation> {
+    args.iter().find_map(|arg| operand_collation(arg, col_map))
+}
+
+/// The greatest, or else the least, of `first` and `rest` as `<` orders them under
+/// `collation`.
+fn extreme<'v>(
+    first: &'v Value,
+    rest: impl IntoIterator<Item = &'v Value>,
+    greatest: bool,
+    tie: Tie,
+    collation: Option<crate::types::Collation>,
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<&'v Value> {
+    // Whether `a` lies strictly past `b` in the direction sought.
+    let past = |a: &Value, b: &Value| -> Result<bool> {
+        let (low, high) = if greatest { (b, a) } else { (a, b) };
+        let below = collated_compare_with_cancel(low, BinOp::Lt, high, collation, cancel)?;
+        Ok(matches!(below, Value::Boolean(true)))
+    };
+    let mut best = first;
+    for candidate in rest {
+        let replace = match tie {
+            Tie::Earlier => past(candidate, best)?,
+            Tie::Later => !past(best, candidate)?,
+        };
+        if replace {
+            best = candidate;
+        }
+    }
+    Ok(best)
 }
 
 /// For functions with optional trailing arguments, whose callee validates the upper bound.

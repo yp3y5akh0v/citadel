@@ -608,6 +608,90 @@ fn fn_min_max_and_replace_match_sqlite() {
 }
 
 #[test]
+fn fn_greatest_and_least() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
+    conn.execute("CREATE TABLE names (id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE)")
+        .unwrap();
+    conn.execute("INSERT INTO names VALUES (1, 'B')").unwrap();
+    let text = |s: &str| Value::Text(s.into());
+    let interval = |months, days| Value::Interval {
+        months,
+        days,
+        micros: 0,
+    };
+    for (sql, expected) in [
+        // NULLs are skipped; the result is NULL only when every argument is.
+        ("SELECT GREATEST(1, NULL, 3)", Value::Integer(3)),
+        ("SELECT LEAST(1, NULL, 3)", Value::Integer(1)),
+        ("SELECT GREATEST(NULL, NULL)", Value::Null),
+        ("SELECT LEAST(NULL)", Value::Null),
+        ("SELECT GREATEST(5)", Value::Integer(5)),
+        ("SELECT LEAST('x')", text("x")),
+        ("SELECT GREATEST('b', 'a', 'c')", text("c")),
+        ("SELECT LEAST('b', 'a', 'c')", text("a")),
+        ("SELECT GREATEST(1, 2.5)", Value::Real(2.5)),
+        ("SELECT LEAST(3, 2.5)", Value::Real(2.5)),
+        ("SELECT GREATEST(true, false)", Value::Boolean(true)),
+        ("SELECT LEAST(true, NULL)", Value::Boolean(true)),
+        (
+            "SELECT GREATEST(DATE '2024-01-01', NULL, DATE '2023-01-01')",
+            Value::Date(19723),
+        ),
+        // Of equal arguments the earlier is kept.
+        ("SELECT GREATEST(1, 1.0)", Value::Integer(1)),
+        ("SELECT GREATEST(1.0, 1)", Value::Real(1.0)),
+        ("SELECT LEAST(1.0, 1)", Value::Real(1.0)),
+        ("SELECT LEAST(1, 1.0)", Value::Integer(1)),
+        (
+            "SELECT GREATEST(INTERVAL '1 month', INTERVAL '30 days')",
+            interval(1, 0),
+        ),
+        (
+            "SELECT LEAST(INTERVAL '30 days', INTERVAL '1 month')",
+            interval(0, 30),
+        ),
+        // Intervals compare as `<` compares them: 31 days exceed a 30-day month.
+        (
+            "SELECT GREATEST(INTERVAL '1 month', INTERVAL '31 days')",
+            interval(0, 31),
+        ),
+        // The first argument collation found orders the text.
+        ("SELECT GREATEST('a', 'B')", text("a")),
+        ("SELECT GREATEST('a', 'B' COLLATE NOCASE)", text("B")),
+        ("SELECT GREATEST(name, 'b') FROM names", text("B")),
+        ("SELECT LEAST('b', name) FROM names", text("b")),
+    ] {
+        // Debug text keeps INTEGER and REAL apart, which equality does not.
+        assert_eq!(
+            format!("{:?}", scalar(&conn, sql)),
+            format!("{expected:?}"),
+            "{sql}"
+        );
+    }
+    assert_eq!(
+        query(
+            &conn,
+            "SELECT GREATEST(val, 25), LEAST(val, score) FROM t ORDER BY id"
+        )
+        .rows,
+        vec![
+            vec![Value::Integer(25), Value::Real(1.5)],
+            vec![Value::Integer(25), Value::Real(2.5)],
+            vec![Value::Integer(30), Value::Real(3.5)],
+            vec![Value::Integer(25), Value::Null],
+            vec![Value::Integer(50), Value::Real(5.5)],
+        ]
+    );
+    assert!(matches!(
+        conn.execute("SELECT GREATEST()"),
+        Err(SqlError::InvalidValue(_))
+    ));
+}
+
+#[test]
 fn fn_substr_matches_sqlite_for_every_start_and_length() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
