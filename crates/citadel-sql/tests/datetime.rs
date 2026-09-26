@@ -1337,6 +1337,29 @@ fn dates_past_year_9999_compute_exactly() {
 }
 
 #[test]
+fn a_date_minus_the_smallest_integer_is_out_of_range_unless_infinite() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE shifts (id INTEGER PRIMARY KEY, n INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO shifts VALUES (1, -9223372036854775808)")
+        .unwrap();
+    // PostgreSQL 17's answers for its smallest integer.
+    assert_invalid(
+        &conn,
+        "SELECT DATE '2024-01-01' - n FROM shifts",
+        "date out of range",
+    );
+    for (sql, expected) in [
+        ("SELECT DATE 'infinity' - n FROM shifts", i32::MAX),
+        ("SELECT DATE '-infinity' - n FROM shifts", i32::MIN),
+    ] {
+        assert_eq!(scalar(&conn, sql), Value::Date(expected), "{sql}");
+    }
+}
+
+#[test]
 fn timestamps_parse_through_9999_and_round_fractions_as_postgresql() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());

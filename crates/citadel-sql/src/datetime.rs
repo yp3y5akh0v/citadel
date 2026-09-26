@@ -1019,16 +1019,23 @@ pub fn add_interval_to_date(days: i32, months: i32, i_days: i32, micros: i64) ->
     add_interval_to_timestamp(date_to_ts(days)?, months, i_days, micros)
 }
 
+pub fn add_days_to_date(days: i32, n: i64) -> Result<i32> {
+    shift_date(days, n, i64::checked_add)
+}
+
+pub fn subtract_days_from_date(days: i32, n: i64) -> Result<i32> {
+    shift_date(days, n, i64::checked_sub)
+}
+
 /// DATE ± INTEGER: an infinite date stays infinite, and a finite result must
 /// be a finite date.
-pub fn add_days_to_date(days: i32, n: i64) -> Result<i32> {
+fn shift_date(days: i32, n: i64, shift: fn(i64, i64) -> Option<i64>) -> Result<i32> {
     if is_infinity_date(days) {
         return Ok(days);
     }
-    i64::from(days)
-        .checked_add(n)
-        .and_then(|sum| i32::try_from(sum).ok())
-        .filter(|sum| !is_infinity_date(*sum))
+    shift(i64::from(days), n)
+        .and_then(|day| i32::try_from(day).ok())
+        .filter(|day| !is_infinity_date(*day))
         .ok_or_else(|| SqlError::InvalidValue("date out of range".into()))
 }
 

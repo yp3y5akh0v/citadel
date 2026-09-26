@@ -1254,7 +1254,7 @@ fn eval_temporal_op(left: &Value, op: BinOp, right: &Value) -> Option<Result<Val
             Some(dt::add_days_to_date(*d, *n).map(Value::Date))
         }
         (Value::Date(d), BinOp::Sub, Value::Integer(n)) => {
-            Some(dt::add_days_to_date(*d, -*n).map(Value::Date))
+            Some(dt::subtract_days_from_date(*d, *n).map(Value::Date))
         }
         (Value::Date(a), BinOp::Sub, Value::Date(b)) => {
             Some(dt::subtract_dates(*a, *b).map(Value::Integer))
