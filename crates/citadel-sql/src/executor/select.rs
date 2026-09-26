@@ -5,7 +5,8 @@ use citadel_txn::read_txn::ReadTxn;
 use rustc_hash::FxHashMap;
 
 use crate::encoding::{
-    decode_composite_key, decode_pk_integer, decode_stored_column_raw, RawColumn,
+    decode_composite_key, decode_pk_integer, decode_stored_column_raw, keys_sort_in_sql_order,
+    RawColumn,
 };
 use crate::error::{Result, SqlError};
 use crate::eval::{eval_expr, is_truthy, referenced_columns, ColumnMap, EvalCtx};
@@ -1644,7 +1645,8 @@ fn order_by_is_pk_prefix_asc(stmt: &SelectStmt, table_schema: &TableSchema) -> b
     let Some(idx) = table_schema.column_index(name) else {
         return false;
     };
-    idx as u16 == pk0 && table_schema.columns[idx].collation == Collation::Binary
+    let column = &table_schema.columns[idx];
+    idx as u16 == pk0 && keys_sort_in_sql_order(column.data_type, column.collation)
 }
 
 /// The `SELECT COUNT(*)` shortcut's eligibility, with no counting done.

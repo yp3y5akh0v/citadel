@@ -731,6 +731,53 @@ fn intervals_group_by_normalized_length() {
 }
 
 #[test]
+fn interval_keys_sort_by_length_under_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    for sql in [
+        "CREATE TABLE spans (v INTERVAL PRIMARY KEY, k INTEGER)",
+        "CREATE INDEX spans_k_v ON spans (k, v)",
+        "INSERT INTO spans VALUES (INTERVAL '31 days', 1), (INTERVAL '1 month', 1), \
+         (INTERVAL '29 days', 1), (INTERVAL '2 months', 1)",
+        "CREATE MATERIALIZED VIEW span_lists AS SELECT ARRAY[v] AS vs, k FROM spans",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+    let days = |days| Value::Interval {
+        months: 0,
+        days,
+        micros: 0,
+    };
+    let month = Value::Interval {
+        months: 1,
+        days: 0,
+        micros: 0,
+    };
+    let array = |element: Value| vec![Value::Array(std::sync::Arc::new(vec![element]))];
+    let rows = |sql: &str| conn.query(sql).unwrap().rows;
+    // Keys hold months before days, so key order puts '31 days' ahead of '1 month'.
+    let first_two = vec![vec![days(29)], vec![month.clone()]];
+    assert_eq!(rows("SELECT v FROM spans ORDER BY v LIMIT 2"), first_two);
+    assert_eq!(
+        rows("SELECT v FROM spans WHERE k = 1 ORDER BY v LIMIT 2"),
+        first_two
+    );
+    assert_eq!(
+        rows("SELECT v FROM spans ORDER BY v LIMIT 2 OFFSET 1"),
+        vec![vec![month.clone()], vec![days(31)]]
+    );
+    assert_eq!(
+        rows("SELECT vs FROM span_lists ORDER BY vs LIMIT 2"),
+        vec![array(days(29)), array(month.clone())]
+    );
+    assert_eq!(
+        rows("SELECT vs FROM span_lists ORDER BY vs LIMIT 2 OFFSET 1"),
+        vec![array(month), array(days(31))]
+    );
+}
+
+#[test]
 fn now_returns_timestamp() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());

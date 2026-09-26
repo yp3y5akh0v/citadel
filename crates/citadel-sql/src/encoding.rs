@@ -1,7 +1,7 @@
 //! Order-preserving key encoding and row encoding for non-PK column storage.
 
 use crate::error::{Result, SqlError};
-use crate::types::{CompactString, DataType, Value};
+use crate::types::{Collation, CompactString, DataType, Value};
 
 /// Type tags for order-preserving key encoding.
 pub(crate) const TAG_NULL: u8 = 0x00;
@@ -109,6 +109,16 @@ pub(crate) fn encode_key_value_into(value: &Value, buf: &mut Vec<u8>) {
         Value::Array(a) => encode_array_into(a, buf),
         Value::Vector(v) => encode_vector_into(v, buf),
     }
+}
+
+/// A collation other than BINARY reorders text; interval keys hold fields rather than
+/// length, array keys may hold intervals, and vector keys hold little-endian floats.
+pub(crate) fn keys_sort_in_sql_order(data_type: DataType, collation: Collation) -> bool {
+    collation == Collation::Binary
+        && !matches!(
+            data_type,
+            DataType::Interval | DataType::Array | DataType::Vector { .. }
+        )
 }
 
 fn encode_vector_into(v: &[f32], buf: &mut Vec<u8>) {
