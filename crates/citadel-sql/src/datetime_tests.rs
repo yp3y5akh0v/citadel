@@ -80,6 +80,16 @@ fn date_arithmetic_keeps_infinity_and_the_finite_range() {
     assert!(add_days_to_date(i32::MAX - 1, 1).is_err());
     assert!(add_days_to_date(i32::MIN + 1, -1).is_err());
     assert!(add_days_to_date(0, i64::MAX).is_err());
+    assert_eq!(
+        subtract_days_from_date(DATE_NEG_INFINITY_DAYS, i64::MIN).unwrap(),
+        DATE_NEG_INFINITY_DAYS
+    );
+    assert_eq!(
+        subtract_days_from_date(i32::MIN + 2, 1).unwrap(),
+        i32::MIN + 1
+    );
+    assert!(subtract_days_from_date(i32::MIN + 1, 1).is_err());
+    assert!(subtract_days_from_date(0, i64::MIN).is_err());
     assert!(subtract_dates(DATE_INFINITY_DAYS, 0).is_err());
     assert!(subtract_dates(0, DATE_NEG_INFINITY_DAYS).is_err());
     assert_eq!(
