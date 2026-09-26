@@ -1258,7 +1258,7 @@ fn eval_temporal_op(left: &Value, op: BinOp, right: &Value) -> Option<Result<Val
             Some(dt::add_days_to_date(*d, -*n).map(Value::Date))
         }
         (Value::Date(a), BinOp::Sub, Value::Date(b)) => {
-            Some(Ok(Value::Integer(*a as i64 - *b as i64)))
+            Some(dt::subtract_dates(*a, *b).map(Value::Integer))
         }
         // DATE ± INTERVAL → TIMESTAMP (PG rule).
         (
@@ -1323,14 +1323,13 @@ fn eval_temporal_op(left: &Value, op: BinOp, right: &Value) -> Option<Result<Val
                 .and_then(|(m, d, u)| dt::add_interval_to_timestamp(*t, m, d, u))
                 .map(Value::Timestamp),
         ),
-        (Value::Timestamp(a), BinOp::Sub, Value::Timestamp(b)) => {
-            let (days, micros) = dt::subtract_timestamps(*a, *b);
-            Some(Ok(Value::Interval {
+        (Value::Timestamp(a), BinOp::Sub, Value::Timestamp(b)) => Some(
+            dt::subtract_timestamps(*a, *b).map(|(days, micros)| Value::Interval {
                 months: 0,
                 days,
                 micros,
-            }))
-        }
+            }),
+        ),
         (
             Value::Time(t),
             BinOp::Add,
@@ -2944,18 +2943,9 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
                 if evaluated[0].is_null() {
                     return Ok(Value::Null);
                 }
-                let ts = match &evaluated[0] {
-                    Value::Timestamp(t) => *t,
-                    Value::Date(d) => crate::datetime::date_to_ts(*d),
-                    _ => {
-                        return Err(SqlError::TypeMismatch {
-                            expected: "TIMESTAMP or DATE".into(),
-                            got: evaluated[0].data_type().to_string(),
-                        })
-                    }
-                };
+                let ts = ts_of(&evaluated[0])?;
                 let today = crate::datetime::today_days()?;
-                let midnight = crate::datetime::date_to_ts(today);
+                let midnight = crate::datetime::date_to_ts(today)?;
                 let (m, d, u) = crate::datetime::age(midnight, ts)?;
                 return Ok(Value::Interval {
                     months: m,
@@ -2981,41 +2971,44 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
             if evaluated.iter().any(|v| v.is_null()) {
                 return Ok(Value::Null);
             }
-            let y = int_arg(&evaluated[0], "MAKE_DATE year")? as i32;
-            let m = int_arg(&evaluated[1], "MAKE_DATE month")? as u8;
-            let d = int_arg(&evaluated[2], "MAKE_DATE day")? as u8;
-            crate::datetime::ymd_to_days(y, m, d)
-                .map(Value::Date)
-                .ok_or_else(|| SqlError::InvalidDateLiteral(format!("make_date({y}, {m}, {d})")))
+            make_date_days(
+                "make_date",
+                int_arg(&evaluated[0], "MAKE_DATE year")?,
+                int_arg(&evaluated[1], "MAKE_DATE month")?,
+                int_arg(&evaluated[2], "MAKE_DATE day")?,
+            )
+            .map(Value::Date)
         }
         "MAKE_TIME" => {
             check_args(name, &evaluated, 3)?;
             if evaluated.iter().any(|v| v.is_null()) {
                 return Ok(Value::Null);
             }
-            let h = int_arg(&evaluated[0], "MAKE_TIME hour")? as u8;
-            let mi = int_arg(&evaluated[1], "MAKE_TIME minute")? as u8;
-            let (s, us) = real_sec_arg(&evaluated[2])?;
-            crate::datetime::hmsn_to_micros(h, mi, s, us)
-                .map(Value::Time)
-                .ok_or_else(|| SqlError::InvalidTimeLiteral(format!("make_time({h}, {mi}, ...)")))
+            make_time_micros(
+                "make_time",
+                int_arg(&evaluated[0], "MAKE_TIME hour")?,
+                int_arg(&evaluated[1], "MAKE_TIME minute")?,
+                &evaluated[2],
+            )
+            .map(Value::Time)
         }
         "MAKE_TIMESTAMP" => {
             check_args(name, &evaluated, 6)?;
             if evaluated.iter().any(|v| v.is_null()) {
                 return Ok(Value::Null);
             }
-            let y = int_arg(&evaluated[0], "MAKE_TIMESTAMP year")? as i32;
-            let mo = int_arg(&evaluated[1], "MAKE_TIMESTAMP month")? as u8;
-            let d = int_arg(&evaluated[2], "MAKE_TIMESTAMP day")? as u8;
-            let h = int_arg(&evaluated[3], "MAKE_TIMESTAMP hour")? as u8;
-            let mi = int_arg(&evaluated[4], "MAKE_TIMESTAMP min")? as u8;
-            let (s, us) = real_sec_arg(&evaluated[5])?;
-            let days = crate::datetime::ymd_to_days(y, mo, d).ok_or_else(|| {
-                SqlError::InvalidTimestampLiteral(format!("make_timestamp year={y}"))
-            })?;
-            let tmicros = crate::datetime::hmsn_to_micros(h, mi, s, us)
-                .ok_or_else(|| SqlError::InvalidTimestampLiteral("time out of range".into()))?;
+            let days = make_date_days(
+                "make_timestamp",
+                int_arg(&evaluated[0], "MAKE_TIMESTAMP year")?,
+                int_arg(&evaluated[1], "MAKE_TIMESTAMP month")?,
+                int_arg(&evaluated[2], "MAKE_TIMESTAMP day")?,
+            )?;
+            let tmicros = make_time_micros(
+                "make_timestamp",
+                int_arg(&evaluated[3], "MAKE_TIMESTAMP hour")?,
+                int_arg(&evaluated[4], "MAKE_TIMESTAMP min")?,
+                &evaluated[5],
+            )?;
             Ok(Value::Timestamp(crate::datetime::ts_combine(days, tmicros)))
         }
         "MAKE_INTERVAL" => {
@@ -3025,16 +3018,35 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
                     "MAKE_INTERVAL accepts at most 7 arguments".into(),
                 ));
             }
-            let mut months: i64 = 0;
-            let mut days: i64 = 0;
-            let mut micros: i64 = 0;
-            for (i, v) in evaluated.iter().enumerate() {
-                if v.is_null() {
-                    continue;
-                }
-                let n = match v {
-                    Value::Integer(n) => *n,
-                    Value::Real(r) => *r as i64,
+            use crate::datetime::{
+                interval_overflow, MICROS_PER_HOUR, MICROS_PER_MIN, MICROS_PER_SEC,
+            };
+            // Each argument's field (months, days, microseconds) and scale.
+            const FIELDS: [(usize, i64); 7] = [
+                (0, 12),
+                (0, 1),
+                (1, 7),
+                (1, 1),
+                (2, MICROS_PER_HOUR),
+                (2, MICROS_PER_MIN),
+                (2, MICROS_PER_SEC),
+            ];
+            let whole = |r: f64| {
+                (i64::MIN as f64..-(i64::MIN as f64))
+                    .contains(&r)
+                    .then_some(r as i64)
+            };
+            let mut totals = [0i64; 3];
+            for ((field, scale), v) in FIELDS.into_iter().zip(&evaluated) {
+                let amount = match v {
+                    Value::Null => continue,
+                    Value::Integer(n) => n.checked_mul(scale),
+                    // Seconds round to the microsecond, as PostgreSQL's rint.
+                    Value::Real(r) if scale == MICROS_PER_SEC => {
+                        whole((r * MICROS_PER_SEC as f64).round_ties_even())
+                    }
+                    // The other fields count whole units, dropping a fraction as CAST does.
+                    Value::Real(r) => whole(r.trunc()).and_then(|n| n.checked_mul(scale)),
                     _ => {
                         return Err(SqlError::TypeMismatch {
                             expected: "numeric".into(),
@@ -3042,38 +3054,18 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
                         })
                     }
                 };
-                match i {
-                    0 => months = months.saturating_add(n.saturating_mul(12)),
-                    1 => months = months.saturating_add(n),
-                    2 => days = days.saturating_add(n.saturating_mul(7)),
-                    3 => days = days.saturating_add(n),
-                    4 => {
-                        micros = micros
-                            .saturating_add(n.saturating_mul(crate::datetime::MICROS_PER_HOUR))
-                    }
-                    5 => {
-                        micros =
-                            micros.saturating_add(n.saturating_mul(crate::datetime::MICROS_PER_MIN))
-                    }
-                    6 => {
-                        // Seconds may be fractional — also check Real.
-                        if let Value::Real(r) = v {
-                            micros = micros.saturating_add(
-                                (*r * crate::datetime::MICROS_PER_SEC as f64) as i64,
-                            );
-                        } else {
-                            micros = micros
-                                .saturating_add(n.saturating_mul(crate::datetime::MICROS_PER_SEC));
-                        }
-                    }
-                    _ => unreachable!(),
-                }
+                totals[field] = amount
+                    .and_then(|amount| totals[field].checked_add(amount))
+                    .ok_or_else(interval_overflow)?;
             }
-            Ok(Value::Interval {
-                months: months.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
-                days: days.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
-                micros,
-            })
+            match (i32::try_from(totals[0]), i32::try_from(totals[1])) {
+                (Ok(months), Ok(days)) => Ok(Value::Interval {
+                    months,
+                    days,
+                    micros: totals[2],
+                }),
+                _ => Err(interval_overflow()),
+            }
         }
         "JUSTIFY_DAYS" => {
             check_args(name, &evaluated, 1)?;
@@ -3160,9 +3152,7 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
                 Value::Timestamp(t) => crate::datetime::ts_to_date_floor(*t),
                 Value::Text(s) if s.eq_ignore_ascii_case("now") => crate::datetime::today_days()?,
                 Value::Text(s) => crate::datetime::parse_date(s)?,
-                Value::Integer(n) => {
-                    crate::datetime::ts_to_date_floor(*n * crate::datetime::MICROS_PER_SEC)
-                }
+                Value::Integer(n) => crate::datetime::ts_to_date_floor(unix_seconds_to_ts(*n)?),
                 other => {
                     return Err(SqlError::TypeMismatch {
                         expected: "TIMESTAMP, DATE, TEXT, or INTEGER".into(),
@@ -3181,6 +3171,10 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
             }
             let t = match &evaluated[0] {
                 Value::Time(t) => *t,
+                // As PostgreSQL's cast, an infinite timestamp has no time of day.
+                Value::Timestamp(t) if crate::datetime::is_infinity_ts(*t) => {
+                    return Ok(Value::Null)
+                }
                 Value::Timestamp(t) => crate::datetime::ts_split(*t).1,
                 Value::Text(s) if s.eq_ignore_ascii_case("now") => {
                     crate::datetime::current_time_micros()?
@@ -3204,12 +3198,12 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
             }
             let t = match &evaluated[0] {
                 Value::Timestamp(t) => *t,
-                Value::Date(d) => crate::datetime::date_to_ts(*d),
+                Value::Date(d) => crate::datetime::date_to_ts(*d)?,
                 Value::Text(s) if s.eq_ignore_ascii_case("now") => {
                     crate::datetime::current_local_timestamp_micros()?
                 }
                 Value::Text(s) => crate::datetime::parse_timestamp(s)?,
-                Value::Integer(n) => n * crate::datetime::MICROS_PER_SEC,
+                Value::Integer(n) => unix_seconds_to_ts(*n)?,
                 other => {
                     return Err(SqlError::TypeMismatch {
                         expected: "TIMESTAMP, DATE, TEXT, or INTEGER".into(),
@@ -3249,7 +3243,7 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
             if evaluated[0].is_null() {
                 return Ok(Value::Null);
             }
-            let micros = ts_of(&evaluated[0])?;
+            let micros = finite_ts_of(&evaluated[0], "JULIANDAY")?;
             let (days, tmicros) = crate::datetime::ts_split(micros);
             // Julian Day 2440587.5 = 1970-01-01 00:00:00 UTC (Julian days start at noon).
             let julian =
@@ -3265,7 +3259,7 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
             if evaluated[0].is_null() {
                 return Ok(Value::Null);
             }
-            let micros = ts_of(&evaluated[0])?;
+            let micros = finite_ts_of(&evaluated[0], "UNIXEPOCH")?;
             let subsec = evaluated
                 .get(1)
                 .and_then(|v| {
@@ -3292,7 +3286,7 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
             }
             let a = ts_of(&evaluated[0])?;
             let b = ts_of(&evaluated[1])?;
-            let (days, micros) = crate::datetime::subtract_timestamps(a, b);
+            let (days, micros) = crate::datetime::subtract_timestamps(a, b)?;
             let sign = if days < 0 || (days == 0 && micros < 0) {
                 "-"
             } else {
@@ -3313,7 +3307,7 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
             }
             let ts = match &evaluated[0] {
                 Value::Timestamp(t) => *t,
-                Value::Date(d) => crate::datetime::date_to_ts(*d),
+                Value::Date(d) => crate::datetime::date_to_ts(*d)?,
                 other => {
                     return Err(SqlError::TypeMismatch {
                         expected: "TIMESTAMP or DATE".into(),
@@ -3879,12 +3873,30 @@ fn fts_strip(args: &[Value], cancel: Option<&citadel::CancelToken>) -> Result<Va
 fn ts_of(v: &Value) -> Result<i64> {
     match v {
         Value::Timestamp(t) => Ok(*t),
-        Value::Date(d) => Ok(crate::datetime::date_to_ts(*d)),
+        Value::Date(d) => crate::datetime::date_to_ts(*d),
         _ => Err(SqlError::TypeMismatch {
             expected: "TIMESTAMP or DATE".into(),
             got: v.data_type().to_string(),
         }),
     }
+}
+
+/// [`ts_of`] for a function with no result at infinity.
+fn finite_ts_of(v: &Value, function: &str) -> Result<i64> {
+    let ts = ts_of(v)?;
+    if crate::datetime::is_infinity_ts(ts) {
+        return Err(SqlError::InvalidValue(format!(
+            "{function} is not defined for infinite timestamps"
+        )));
+    }
+    Ok(ts)
+}
+
+/// Unix epoch seconds as a timestamp (µs UTC).
+fn unix_seconds_to_ts(seconds: i64) -> Result<i64> {
+    seconds
+        .checked_mul(crate::datetime::MICROS_PER_SEC)
+        .ok_or_else(|| SqlError::InvalidValue("timestamp out of range".into()))
 }
 
 fn int_arg(v: &Value, label: &str) -> Result<i64> {
@@ -3897,28 +3909,61 @@ fn int_arg(v: &Value, label: &str) -> Result<i64> {
     }
 }
 
-/// Extract (whole_seconds: u8, frac_micros: u32) from a numeric argument for MAKE_TIME-style calls.
-fn real_sec_arg(v: &Value) -> Result<(u8, u32)> {
-    match v {
-        Value::Integer(n) => {
-            if !(0..=60).contains(n) {
-                return Err(SqlError::InvalidValue(format!("second out of range: {n}")));
-            }
-            Ok((*n as u8, 0))
-        }
-        Value::Real(r) => {
-            let whole = r.trunc() as i64;
-            if !(0..=60).contains(&whole) {
-                return Err(SqlError::InvalidValue(format!("second out of range: {r}")));
-            }
-            let frac = ((r - whole as f64) * 1_000_000.0).round() as i64;
-            Ok((whole as u8, frac.max(0) as u32))
-        }
-        _ => Err(SqlError::TypeMismatch {
-            expected: "numeric seconds".into(),
-            got: v.data_type().to_string(),
-        }),
+/// The day of make_date and make_timestamp. As in PostgreSQL, a negative year
+/// is BC and a field outside its range is an error, not wrapped into range.
+fn make_date_days(function: &str, year: i64, month: i64, day: i64) -> Result<i32> {
+    let astronomical = if year < 0 { year + 1 } else { year };
+    let fields = (
+        i32::try_from(astronomical),
+        u8::try_from(month),
+        u8::try_from(day),
+    );
+    match fields {
+        (Ok(y), Ok(m), Ok(d)) if year != 0 => crate::datetime::ymd_to_days(y, m, d),
+        _ => None,
     }
+    .ok_or_else(|| {
+        SqlError::InvalidDateLiteral(format!(
+            "{function}: date field value out of range: {year}-{month}-{day}"
+        ))
+    })
+}
+
+/// The time of day of make_time and make_timestamp, checked as PostgreSQL
+/// does: each field in range, the seconds rounded to the microsecond first,
+/// and the whole time no later than 24:00:00.
+fn make_time_micros(function: &str, hour: i64, minute: i64, seconds: &Value) -> Result<i64> {
+    use crate::datetime::{MICROS_PER_DAY, MICROS_PER_HOUR, MICROS_PER_MIN, MICROS_PER_SEC};
+    let second_micros = match seconds {
+        Value::Integer(n) => n.checked_mul(MICROS_PER_SEC),
+        // A cast that saturates still fails the range check below; NaN has no value.
+        Value::Real(r) => {
+            let micros = (r * MICROS_PER_SEC as f64).round_ties_even();
+            (!micros.is_nan()).then_some(micros as i64)
+        }
+        _ => {
+            return Err(SqlError::TypeMismatch {
+                expected: "numeric seconds".into(),
+                got: seconds.data_type().to_string(),
+            })
+        }
+    };
+    match second_micros {
+        Some(second_micros)
+            if (0..=24).contains(&hour)
+                && (0..60).contains(&minute)
+                && (0..=60 * MICROS_PER_SEC).contains(&second_micros) =>
+        {
+            let time = hour * MICROS_PER_HOUR + minute * MICROS_PER_MIN + second_micros;
+            (time <= MICROS_PER_DAY).then_some(time)
+        }
+        _ => None,
+    }
+    .ok_or_else(|| {
+        SqlError::InvalidTimeLiteral(format!(
+            "{function}: time field value out of range: {hour}:{minute}:{seconds}"
+        ))
+    })
 }
 
 /// For functions with optional trailing arguments, whose callee validates the upper bound.

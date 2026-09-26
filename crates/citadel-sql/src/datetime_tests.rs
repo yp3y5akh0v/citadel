@@ -20,6 +20,83 @@ fn ymd_pre_epoch() {
 }
 
 #[test]
+fn calendar_arithmetic_agrees_with_jiff_over_its_whole_range() {
+    let mut date = JDate::MIN;
+    let mut days = date.since((Unit::Day, epoch_date())).unwrap().get_days();
+    loop {
+        let ymd = (i32::from(date.year()), date.month() as u8, date.day() as u8);
+        assert_eq!(days_to_ymd(days), ymd, "day {days}");
+        assert_eq!(ymd_to_days(ymd.0, ymd.1, ymd.2), Some(days), "{ymd:?}");
+        let day = i64::from(days);
+        let iso = date.iso_week_date();
+        assert_eq!(
+            iso_weekday(day),
+            i64::from(date.weekday().to_monday_one_offset())
+        );
+        assert_eq!(
+            iso_week(day),
+            (i64::from(iso.year()), i64::from(iso.week())),
+            "{ymd:?}"
+        );
+        assert_eq!(date_field("doy", days), Some(i64::from(date.day_of_year())));
+        assert_eq!(
+            date_field("dow", days),
+            Some(i64::from(date.weekday().to_sunday_zero_offset()))
+        );
+        if date == JDate::MAX {
+            break;
+        }
+        date = date.tomorrow().unwrap();
+        days += 1;
+    }
+}
+
+#[test]
+fn every_finite_day_count_is_a_calendar_date() {
+    // i32::MAX is 14,699 eras of 146,097 days and 3,844 days past 1970-01-01;
+    // i32::MIN is 14,700 eras before it and 142,252 days on.
+    assert_eq!(days_to_ymd(i32::MAX), (5_881_580, 7, 11));
+    assert_eq!(days_to_ymd(i32::MIN), (-5_877_641, 6, 23));
+    for days in [i32::MIN + 1, i32::MAX - 1] {
+        let (y, m, d) = days_to_ymd(days);
+        assert_eq!(ymd_to_days(y, m, d), Some(days));
+    }
+    // The extreme counts stand for ±infinity, and nothing lies past them.
+    assert_eq!(ymd_to_days(5_881_580, 7, 11), None);
+    assert_eq!(ymd_to_days(-5_877_641, 6, 23), None);
+    assert_eq!(ymd_to_days(5_881_580, 7, 12), None);
+    for (y, m, d) in [(2023, 2, 29), (2024, 13, 1), (2024, 4, 31), (2024, 1, 0)] {
+        assert_eq!(ymd_to_days(y, m, d), None, "{y}-{m}-{d}");
+    }
+}
+
+#[test]
+fn date_arithmetic_keeps_infinity_and_the_finite_range() {
+    assert_eq!(
+        add_days_to_date(DATE_INFINITY_DAYS, -5).unwrap(),
+        DATE_INFINITY_DAYS
+    );
+    assert_eq!(add_days_to_date(i32::MAX - 2, 1).unwrap(), i32::MAX - 1);
+    assert!(add_days_to_date(i32::MAX - 1, 1).is_err());
+    assert!(add_days_to_date(i32::MIN + 1, -1).is_err());
+    assert!(add_days_to_date(0, i64::MAX).is_err());
+    assert!(subtract_dates(DATE_INFINITY_DAYS, 0).is_err());
+    assert!(subtract_dates(0, DATE_NEG_INFINITY_DAYS).is_err());
+    assert_eq!(
+        subtract_dates(i32::MAX - 1, i32::MIN + 1).unwrap(),
+        i64::from(u32::MAX) - 2
+    );
+    assert_eq!(date_to_ts(DATE_INFINITY_DAYS).unwrap(), TS_INFINITY_MICROS);
+    assert_eq!(
+        date_to_ts(DATE_NEG_INFINITY_DAYS).unwrap(),
+        TS_NEG_INFINITY_MICROS
+    );
+    assert!(date_to_ts(i32::MAX - 1).is_err());
+    assert!(subtract_timestamps(TS_INFINITY_MICROS, 0).is_err());
+    assert!(subtract_timestamps(i64::MAX - 1, i64::MIN + 1).is_err());
+}
+
+#[test]
 fn hmsn_roundtrip() {
     let us = hmsn_to_micros(12, 30, 45, 123456).unwrap();
     assert_eq!(micros_to_hmsn(us), (12, 30, 45, 123456));
@@ -340,7 +417,7 @@ fn time_add_rejects_days() {
 fn subtract_timestamps_basic() {
     let a = parse_timestamp("2024-01-02 12:00:00").unwrap();
     let b = parse_timestamp("2024-01-01 00:00:00").unwrap();
-    let (days, micros) = subtract_timestamps(a, b);
+    let (days, micros) = subtract_timestamps(a, b).unwrap();
     assert_eq!(days, 1);
     assert_eq!(micros, 12 * MICROS_PER_HOUR);
 }
