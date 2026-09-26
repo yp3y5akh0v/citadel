@@ -1092,10 +1092,12 @@ dependencies = [
  "ctr",
  "hkdf",
  "hmac",
+ "libc",
  "pbkdf2",
  "rand 0.8.6",
  "sha2",
  "subtle",
+ "windows-sys 0.59.0",
  "zeroize",
 ]
 

@@ -35,6 +35,9 @@ pub const DEK_SIZE: usize = 32; // Data Encryption Key
 pub const MAC_KEY_SIZE: usize = 32; // HMAC key
 pub const WRAPPED_KEY_SIZE: usize = 40; // AES-KW(32B key) = 40B (32 + 8 integrity)
 pub const ARGON2_SALT_SIZE: usize = 16;
+// Key files and backups name their KDF costs before anything in them can be
+// authenticated, so the format bounds the work opening one can be made to do.
+pub const ARGON2_MAX_T_COST: u32 = 16;
 
 pub const KEY_FILE_SIZE: usize = 172;
 
@@ -66,6 +69,7 @@ pub const ATOM_STORE_VERSION: u32 = 1;
 pub const ATOM_STORE_PREALLOC_SLOTS: u32 = 256; // initial capacity (grows append-only)
 
 pub const PBKDF2_MIN_ITERATIONS: u32 = 600_000;
+pub const PBKDF2_MAX_ITERATIONS: u32 = 10_000_000; // see ARGON2_MAX_T_COST
 
 pub const KEY_BACKUP_MAGIC: u32 = 0x4B45_5942; // "KEYB"
 pub const KEY_BACKUP_VERSION: u32 = 1;

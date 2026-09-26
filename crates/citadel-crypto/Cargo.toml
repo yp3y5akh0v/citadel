@@ -32,6 +32,12 @@ cipher = { workspace = true }
 [dependencies.pbkdf2]
 workspace = true
 
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_System_SystemInformation"] }
+
 [dev-dependencies]
 criterion = { workspace = true }
 

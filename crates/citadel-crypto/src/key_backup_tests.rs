@@ -4,6 +4,27 @@ use crate::key_manager::{
 };
 
 #[test]
+fn restore_refuses_kdf_costs_it_cannot_honour() {
+    let backup = create_key_backup(
+        &[0x11u8; KEY_SIZE],
+        b"pass",
+        42,
+        KdfAlgorithm::Argon2id,
+        64,
+        1,
+        1,
+        1,
+        0,
+    )
+    .unwrap();
+    for cost in [20..24, 24..28] {
+        let mut image = backup;
+        image[cost].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(restore_rek_from_backup(&image, b"pass").is_err());
+    }
+}
+
+#[test]
 fn backup_mac_key_derivation_is_frozen() {
     let key = derive_backup_mac_key(&[0x42u8; KEY_SIZE]);
     let hex: String = key.iter().map(|byte| format!("{byte:02x}")).collect();

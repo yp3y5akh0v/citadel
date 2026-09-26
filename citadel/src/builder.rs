@@ -123,7 +123,7 @@ impl DatabaseBuilder {
 
     /// Set the number of PBKDF2 iterations (only used when KDF is PBKDF2).
     ///
-    /// Default: 600,000 (OWASP 2024 minimum for PBKDF2-HMAC-SHA256).
+    /// Default: 600,000 (OWASP 2024 minimum for PBKDF2-HMAC-SHA256); at most 10,000,000.
     pub fn pbkdf2_iterations(mut self, iterations: u32) -> Self {
         self.pbkdf2_iterations = iterations;
         self

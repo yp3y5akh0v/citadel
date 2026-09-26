@@ -1,4 +1,46 @@
 use super::*;
+use citadel_core::{ARGON2_MAX_T_COST, PBKDF2_MAX_ITERATIONS, PBKDF2_MIN_ITERATIONS};
+
+#[test]
+fn open_refuses_kdf_costs_it_cannot_honour() {
+    let (argon2, _) = create_key_file(b"password", 42, KdfAlgorithm::Argon2id, 64, 1, 1).unwrap();
+    let (pbkdf2, _) = create_key_file(
+        b"password",
+        42,
+        KdfAlgorithm::Pbkdf2HmacSha256,
+        PBKDF2_MIN_ITERATIONS,
+        0,
+        0,
+    )
+    .unwrap();
+    for (key_file, cost) in [(&argon2, 32..36), (&argon2, 36..40), (&pbkdf2, 32..36)] {
+        let mut image = key_file.serialize();
+        image[cost].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(open_key_file(&image, b"password", 42).is_err());
+    }
+}
+
+#[test]
+fn create_refuses_kdf_costs_the_format_cannot_open() {
+    let argon2 = KdfAlgorithm::Argon2id;
+    let pbkdf2 = KdfAlgorithm::Pbkdf2HmacSha256;
+    assert!(create_key_file(b"password", 42, argon2, 64, ARGON2_MAX_T_COST + 1, 1).is_err());
+    assert!(create_key_file(b"password", 42, pbkdf2, PBKDF2_MAX_ITERATIONS + 1, 0, 0).is_err());
+}
+
+#[test]
+fn a_key_file_at_the_largest_argon2_time_cost_opens() {
+    let (key_file, _) = create_key_file(
+        b"password",
+        42,
+        KdfAlgorithm::Argon2id,
+        64,
+        ARGON2_MAX_T_COST,
+        1,
+    )
+    .unwrap();
+    assert!(open_key_file(&key_file.serialize(), b"password", 42).is_ok());
+}
 
 fn mark_as_id_one_with_current_auth(key_file: &mut KeyFile, keys: &DerivedKeys) {
     key_file.encoded_cipher_id = LEGACY_AES_CIPHER_ID;

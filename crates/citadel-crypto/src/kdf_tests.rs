@@ -28,6 +28,36 @@ fn argon2id_different_salt() {
 }
 
 #[test]
+fn argon2id_derives_what_the_crates_allocating_path_derives() {
+    let salt = [0x42u8; ARGON2_SALT_SIZE];
+    let params = argon2::Params::new(256, 2, 2, Some(KEY_SIZE)).unwrap();
+    let mut expected = [0u8; KEY_SIZE];
+    argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
+        .hash_password_into(b"test", &salt, &mut expected)
+        .unwrap();
+    let derived = derive_mk_argon2id(b"test", &salt, 256, 2, 2).unwrap();
+    assert_eq!(*derived, expected);
+}
+
+#[test]
+fn argon2id_time_cost_is_bounded_by_the_format() {
+    let salt = [0x42u8; ARGON2_SALT_SIZE];
+    assert!(derive_mk_argon2id(b"test", &salt, 64, ARGON2_MAX_T_COST, 1).is_ok());
+    assert!(derive_mk_argon2id(b"test", &salt, 64, ARGON2_MAX_T_COST + 1, 1).is_err());
+}
+
+#[test]
+fn argon2id_memory_beyond_the_machine_is_an_error_not_an_abort() {
+    fn out_of_memory<T>(result: citadel_core::Result<T>) -> bool {
+        matches!(result, Err(citadel_core::Error::Io(e)) if e.kind() == io::ErrorKind::OutOfMemory)
+    }
+    let salt = [0x42u8; ARGON2_SALT_SIZE];
+    let four_tebibytes = derive_mk_argon2id(b"test", &salt, u32::MAX, 1, 1);
+    assert!(out_of_memory(four_tebibytes));
+    assert!(out_of_memory(argon2_memory(usize::MAX)));
+}
+
+#[test]
 fn argon2id_profile_desktop() {
     let salt = [0x42u8; ARGON2_SALT_SIZE];
     let mk = derive_mk_argon2id(b"test", &salt, 256, 1, 1).unwrap();
@@ -66,6 +96,16 @@ fn pbkdf2_too_few_iterations() {
     let salt = [0x42u8; ARGON2_SALT_SIZE];
     let result = derive_mk_pbkdf2(b"test", &salt, 1000);
     assert!(result.is_err());
+}
+
+#[test]
+fn pbkdf2_iterations_are_bounded_by_the_format() {
+    assert!(check_pbkdf2_iterations(PBKDF2_MIN_ITERATIONS - 1).is_err());
+    assert!(check_pbkdf2_iterations(PBKDF2_MIN_ITERATIONS).is_ok());
+    assert!(check_pbkdf2_iterations(PBKDF2_MAX_ITERATIONS).is_ok());
+    assert!(check_pbkdf2_iterations(PBKDF2_MAX_ITERATIONS + 1).is_err());
+    let salt = [0x42u8; ARGON2_SALT_SIZE];
+    assert!(derive_mk_pbkdf2(b"test", &salt, PBKDF2_MAX_ITERATIONS + 1).is_err());
 }
 
 #[test]

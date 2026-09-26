@@ -5,3 +5,4 @@ pub mod key_backup;
 pub mod key_manager;
 pub mod mac;
 pub mod page_cipher;
+mod physical_memory;
