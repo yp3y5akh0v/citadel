@@ -862,11 +862,11 @@ fn split_statement_spans(sql: &str) -> Vec<(usize, usize)> {
                 j += 1;
             }
             if j < bytes.len() && bytes[j] == b'$' {
-                let tag_len = j - i + 1;
+                let tag = &bytes[i..=j];
                 i = j + 1;
-                while i + tag_len <= bytes.len() {
-                    if bytes[i..i + tag_len] == bytes[(j - tag_len + 1)..=j] {
-                        i += tag_len;
+                while i + tag.len() <= bytes.len() {
+                    if bytes[i..].starts_with(tag) {
+                        i += tag.len();
                         break;
                     }
                     i += 1;
@@ -1080,13 +1080,13 @@ fn strip_matview_with_no_data(sql: &str) -> (String, Vec<bool>) {
                 j += 1;
             }
             if j < bytes.len() && bytes[j] == b'$' {
-                let tag_len = j - i + 1;
+                let tag = &bytes[i..=j];
                 out.push_str(&sql[i..=j]);
                 i = j + 1;
-                while i + tag_len <= bytes.len() {
-                    if bytes[i..i + tag_len] == bytes[(j - tag_len + 1)..=j] {
-                        out.push_str(&sql[i..i + tag_len]);
-                        i += tag_len;
+                while i + tag.len() <= bytes.len() {
+                    if bytes[i..].starts_with(tag) {
+                        out.push_str(&sql[i..i + tag.len()]);
+                        i += tag.len();
                         break;
                     }
                     push_one(&mut out, &mut i, bytes, sql);

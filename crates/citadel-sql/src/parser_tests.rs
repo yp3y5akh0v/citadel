@@ -1822,6 +1822,16 @@ fn split_spans_anonymous_dollar_quote() {
 }
 
 #[test]
+fn dollar_quotes_opening_the_text_are_scanned() {
+    for s in ["$tag$a;b$tag$; SELECT 2", "$$a;b$$; SELECT 2"] {
+        let spans = split_statement_spans(s);
+        assert_eq!(spans.len(), 2, "{s}");
+        assert_eq!(&s[spans[0].0..spans[0].1], &s[..s.find("$;").unwrap() + 1]);
+        assert_eq!(strip_matview_with_no_data(s), (s.to_string(), vec![]));
+    }
+}
+
+#[test]
 fn split_spans_dollar_sign_not_a_quote_passes_through() {
     let s = "SELECT $1 + 2; SELECT $1";
     let spans = split_statement_spans(s);
