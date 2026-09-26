@@ -850,14 +850,19 @@ fn eval_text_compare(
         (Value::Text(a), Value::Text(b)) => (a.as_str(), b.as_str()),
         _ => return None,
     };
-    let ord = coll.cmp_text(a, b);
+    ordering_satisfies(op, coll.cmp_text(a, b))
+}
+
+/// Whether a left operand ordered `ord` against the right one satisfies the comparison
+/// `op`; None when `op` is not a comparison.
+fn ordering_satisfies(op: BinOp, ord: std::cmp::Ordering) -> Option<bool> {
     Some(match op {
-        BinOp::Eq => ord == std::cmp::Ordering::Equal,
-        BinOp::NotEq => ord != std::cmp::Ordering::Equal,
-        BinOp::Lt => ord == std::cmp::Ordering::Less,
-        BinOp::Gt => ord == std::cmp::Ordering::Greater,
-        BinOp::LtEq => ord != std::cmp::Ordering::Greater,
-        BinOp::GtEq => ord != std::cmp::Ordering::Less,
+        BinOp::Eq => ord.is_eq(),
+        BinOp::NotEq => ord.is_ne(),
+        BinOp::Lt => ord.is_lt(),
+        BinOp::Gt => ord.is_gt(),
+        BinOp::LtEq => ord.is_le(),
+        BinOp::GtEq => ord.is_ge(),
         _ => return None,
     })
 }
@@ -939,10 +944,15 @@ impl ConversionFamilies {
 
     /// Whether `=` between `probe` and a value of the set holds exactly when
     /// the two are the same value, so a hash of the raw values finds every
-    /// match. Intervals are equal by normalized length ('1 month' = '30 days').
+    /// match. Intervals, alone or in arrays, are equal by normalized length
+    /// ('1 month' = '30 days'); the families do not follow arrays.
     pub(crate) fn equal_as_values(self, probe: &Value) -> bool {
-        !self.needs_coercion(probe)
-            && !(matches!(probe, Value::Interval { .. }) && self.0 & Self::INTERVAL != 0)
+        let by_length = match probe {
+            Value::Interval { .. } => self.0 & Self::INTERVAL != 0,
+            Value::Array(_) => probe.holds_interval(),
+            _ => false,
+        };
+        !self.needs_coercion(probe) && !by_length
     }
 }
 
@@ -984,6 +994,12 @@ pub(crate) fn eval_binary_op_with_cancel(
 
     if let Some(res) = eval_temporal_op(left, op, right) {
         return res;
+    }
+    // Arrays compare element by element, each as its elements compare.
+    if let (Value::Array(_), Value::Array(_)) = (left, right) {
+        if let Some(result) = ordering_satisfies(op, left.sql_cmp(right)) {
+            return Ok(Value::Boolean(result));
+        }
     }
 
     match op {
@@ -1228,7 +1244,6 @@ fn eval_at_at_with_cancel(
 /// Returns `Some` when `(left, op, right)` is a temporal operation; `None` to fall through.
 fn eval_temporal_op(left: &Value, op: BinOp, right: &Value) -> Option<Result<Value>> {
     use crate::datetime as dt;
-    use std::cmp::Ordering;
 
     let is_temporal = |v: &Value| {
         matches!(
@@ -1459,16 +1474,7 @@ fn eval_temporal_op(left: &Value, op: BinOp, right: &Value) -> Option<Result<Val
         ) =>
         {
             let ord = dt::pg_normalized_interval_cmp((*am, *ad, *au), (*bm, *bd, *bu));
-            let b = match op {
-                BinOp::Eq => ord == Ordering::Equal,
-                BinOp::NotEq => ord != Ordering::Equal,
-                BinOp::Lt => ord == Ordering::Less,
-                BinOp::Gt => ord == Ordering::Greater,
-                BinOp::LtEq => ord != Ordering::Greater,
-                BinOp::GtEq => ord != Ordering::Less,
-                _ => unreachable!(),
-            };
-            Some(Ok(Value::Boolean(b)))
+            ordering_satisfies(op, ord).map(|b| Ok(Value::Boolean(b)))
         }
         // PG rejects TIMESTAMP ± INTEGER; require CAST to INTERVAL.
         (Value::Timestamp(_), BinOp::Add | BinOp::Sub, Value::Integer(_))
@@ -1494,18 +1500,7 @@ fn eval_temporal_op(left: &Value, op: BinOp, right: &Value) -> Option<Result<Val
 /// Compares values where one side is temporal, coercing the other to match.
 fn temporal_compare(left: &Value, op: BinOp, right: &Value) -> Option<Result<Value>> {
     let (a, b) = coerce_temporal_pair(left, right)?;
-    let ord = a.sql_cmp(&b);
-    use std::cmp::Ordering;
-    let result = match op {
-        BinOp::Eq => ord == Ordering::Equal,
-        BinOp::NotEq => ord != Ordering::Equal,
-        BinOp::Lt => ord == Ordering::Less,
-        BinOp::Gt => ord == Ordering::Greater,
-        BinOp::LtEq => ord != Ordering::Greater,
-        BinOp::GtEq => ord != Ordering::Less,
-        _ => return None,
-    };
-    Some(Ok(Value::Boolean(result)))
+    ordering_satisfies(op, a.sql_cmp(&b)).map(|result| Ok(Value::Boolean(result)))
 }
 
 /// Coerces a TEXT/INTEGER (or DATE/TIMESTAMP) operand to match the temporal side.

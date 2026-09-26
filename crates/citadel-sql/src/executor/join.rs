@@ -227,6 +227,8 @@ fn hash_join_value(value: &Value, collation: Collation, state: &mut FxHasher) {
     {
         8u8.hash(state);
         crate::datetime::interval_to_total_micros(*months, *days, *micros).hash(state);
+    } else if value.holds_interval() {
+        Collation::Binary.group_key(value.clone()).hash(state);
     } else {
         match collation {
             Collation::NoCase | Collation::Rtrim => collation.fold(value.clone()).hash(state),

@@ -694,6 +694,29 @@ fn raw_interval_comparisons_use_normalized_length() {
 }
 
 #[test]
+fn raw_interval_array_comparisons_use_normalized_length() {
+    use std::cmp::Ordering;
+    let interval = |months, days| Value::Interval {
+        months,
+        days,
+        micros: 0,
+    };
+    let encoded = encode_row(&[Value::Array(vec![interval(1, 0)].into())]);
+    let raw = decode_column_raw(&encoded, 0).unwrap();
+    // Elements compare as intervals do, then the shorter array first.
+    for (other, order) in [
+        (vec![interval(0, 30)], Ordering::Equal),
+        (vec![interval(0, 31)], Ordering::Less),
+        (vec![interval(0, 29)], Ordering::Greater),
+        (vec![interval(0, 30), interval(0, 1)], Ordering::Less),
+    ] {
+        let other = Value::Array(other.into());
+        assert_eq!(raw.cmp_value(&other).unwrap(), Some(order), "{other:?}");
+        assert_eq!(raw.eq_value(&other).unwrap(), order.is_eq(), "{other:?}");
+    }
+}
+
+#[test]
 fn raw_column_as_numeric() {
     assert_eq!(RawColumn::Integer(42).as_i64(), Some(42));
     assert_eq!(RawColumn::Integer(42).as_f64(), Some(42.0));

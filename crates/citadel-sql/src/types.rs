@@ -400,7 +400,8 @@ impl Value {
     }
 
     /// The SQL order of two values without a collation: intervals by length with 30-day
-    /// months (so '1 month' and '30 days' tie), everything else in the total order.
+    /// months (so '1 month' and '30 days' tie), arrays element by element in this order and
+    /// then by length, everything else in the total order.
     pub(crate) fn sql_cmp(&self, other: &Value) -> Ordering {
         match (self, other) {
             (
@@ -415,7 +416,23 @@ impl Value {
                     micros: bu,
                 },
             ) => crate::datetime::pg_normalized_interval_cmp((*am, *ad, *au), (*bm, *bd, *bu)),
+            (Value::Array(a), Value::Array(b)) => a
+                .iter()
+                .zip(b.iter())
+                .map(|(x, y)| x.sql_cmp(y))
+                .find(|order| order.is_ne())
+                .unwrap_or_else(|| a.len().cmp(&b.len())),
             _ => self.cmp(other),
+        }
+    }
+
+    /// Whether this value is an interval or holds one, so that its SQL equality can differ
+    /// from its fields'.
+    pub(crate) fn holds_interval(&self) -> bool {
+        match self {
+            Value::Interval { .. } => true,
+            Value::Array(elements) => elements.iter().any(Value::holds_interval),
+            _ => false,
         }
     }
 }
@@ -791,9 +808,9 @@ impl Collation {
     }
 
     /// The value grouping and deduplication compare in place of `value`: text folded as
-    /// [`fold`](Self::fold) folds it, and an interval as the fields every interval of its
-    /// length shares, so plain `Eq` and `Hash` group what this collation and interval
-    /// length call equal.
+    /// [`fold`](Self::fold) folds it, and an interval, alone or in an array, as the fields
+    /// every interval of its length shares, so plain `Eq` and `Hash` group what this
+    /// collation and interval length call equal.
     pub(crate) fn group_key(self, value: Value) -> Value {
         match value {
             Value::Interval {
@@ -809,6 +826,14 @@ impl Collation {
                     micros,
                 }
             }
+            // Array elements compare as BINARY, whatever the column's collation.
+            Value::Array(elements) if elements.iter().any(Value::holds_interval) => Value::Array(
+                elements
+                    .iter()
+                    .map(|element| Collation::Binary.group_key(element.clone()))
+                    .collect::<Vec<_>>()
+                    .into(),
+            ),
             other => self.fold(other),
         }
     }

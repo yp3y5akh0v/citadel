@@ -1985,10 +1985,7 @@ impl RowKeys {
 
     /// Whether the row has to be folded into its key.
     fn folds(&self, row: &[Value]) -> bool {
-        self.folding
-            || row
-                .iter()
-                .any(|value| matches!(value, Value::Interval { .. }))
+        self.folding || row.iter().any(Value::holds_interval)
     }
 }
 
