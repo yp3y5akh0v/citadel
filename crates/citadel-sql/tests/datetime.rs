@@ -607,6 +607,70 @@ fn intervals_sort_by_normalized_length() {
 }
 
 #[test]
+fn interval_arrays_compare_and_group_by_length() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    for sql in [
+        "CREATE TABLE s (id INTEGER PRIMARY KEY, v INTERVAL)",
+        "INSERT INTO s VALUES (1, INTERVAL '1 month'), (2, INTERVAL '30 days'), \
+         (3, INTERVAL '31 days'), (4, INTERVAL '29 days')",
+        "CREATE MATERIALIZED VIEW mv AS SELECT id, ARRAY[v] AS k FROM s",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+    let rows = |sql: &str| conn.query(sql).unwrap().rows;
+    let integers = |values: &[i64]| -> Vec<Vec<Value>> {
+        values.iter().map(|&v| vec![Value::Integer(v)]).collect()
+    };
+    // Array elements compare as intervals do: ids 1 and 2 hold one length.
+    assert_eq!(
+        rows(
+            "SELECT ARRAY[INTERVAL '1 month'] = ARRAY[INTERVAL '30 days'], \
+             ARRAY[INTERVAL '1 month'] < ARRAY[INTERVAL '31 days'], \
+             ARRAY[INTERVAL '1 month', INTERVAL '1 day'] > ARRAY[INTERVAL '30 days']"
+        ),
+        vec![[true, true, true].map(Value::Boolean).to_vec()]
+    );
+    for sql in [
+        "SELECT COUNT(DISTINCT ARRAY[v]) FROM s",
+        "SELECT COUNT(*) FROM (SELECT DISTINCT ARRAY[v] AS x FROM s) d",
+        "SELECT COUNT(*) FROM (SELECT ARRAY[v] AS x FROM s GROUP BY ARRAY[v]) d",
+        "SELECT COUNT(*) FROM (SELECT ARRAY[v] FROM s UNION SELECT ARRAY[v] FROM s) u",
+    ] {
+        assert_eq!(rows(sql), integers(&[3]), "{sql}");
+    }
+    assert_eq!(
+        rows("SELECT id FROM s ORDER BY ARRAY[v], id"),
+        integers(&[4, 1, 2, 3])
+    );
+    assert_eq!(
+        rows(
+            "WITH a AS (SELECT id, ARRAY[v] AS k FROM s) \
+             SELECT a.id, b.id FROM a JOIN a AS b ON a.k = b.k ORDER BY 1, 2"
+        ),
+        [(1, 1), (1, 2), (2, 1), (2, 2), (3, 3), (4, 4)]
+            .map(|(a, b)| vec![Value::Integer(a), Value::Integer(b)])
+            .to_vec()
+    );
+    assert_eq!(
+        rows(
+            "SELECT id FROM s WHERE ARRAY[v] IN (SELECT ARRAY[v] FROM s WHERE id = 2) ORDER BY id"
+        ),
+        integers(&[1, 2])
+    );
+    // A stored array column: the top-k sort and the scan filter read it raw.
+    assert_eq!(
+        rows("SELECT id FROM mv ORDER BY k DESC LIMIT 1"),
+        integers(&[3])
+    );
+    assert_eq!(
+        rows("SELECT id FROM mv WHERE k = ARRAY[INTERVAL '30 days'] ORDER BY id"),
+        integers(&[1, 2])
+    );
+}
+
+#[test]
 fn intervals_group_by_normalized_length() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());

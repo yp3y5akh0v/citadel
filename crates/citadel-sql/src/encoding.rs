@@ -1395,7 +1395,7 @@ impl<'a> RawColumn<'a> {
         Ok(match (self, other) {
             (RawColumn::Array(bytes), other) => {
                 let value = decode_array_v2(bytes)?;
-                matches!(other, Value::Array(_)).then(|| value.cmp(other))
+                matches!(other, Value::Array(_)).then(|| value.sql_cmp(other))
             }
             (RawColumn::Vector(bytes), other) => {
                 let value = decode_vector(bytes)?;
@@ -1438,7 +1438,10 @@ impl<'a> RawColumn<'a> {
 
     pub fn eq_value(&self, other: &Value) -> Result<bool> {
         Ok(match (self, other) {
-            (RawColumn::Array(bytes), other) => decode_array_v2(bytes)? == *other,
+            (RawColumn::Array(bytes), other) => {
+                let value = decode_array_v2(bytes)?;
+                matches!(other, Value::Array(_)) && value.sql_cmp(other).is_eq()
+            }
             (RawColumn::Vector(bytes), other) => decode_vector(bytes)? == *other,
             (RawColumn::Null, Value::Null) => true,
             (RawColumn::Integer(a), Value::Integer(b)) => a == b,
