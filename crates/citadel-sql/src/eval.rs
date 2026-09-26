@@ -2468,51 +2468,23 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
             if evaluated.iter().any(|v| v.is_null()) {
                 return Ok(Value::Null);
             }
+            let integer = |v: &Value| match v {
+                Value::Integer(i) => Ok(*i),
+                _ => Err(SqlError::TypeMismatch {
+                    expected: "INTEGER".into(),
+                    got: v.data_type().to_string(),
+                }),
+            };
+            let start = integer(&evaluated[1])?;
+            let count = evaluated.get(2).map(integer).transpose()?;
+            // A BLOB is cut in bytes, anything else in the characters of its text.
+            if let Value::Blob(bytes) = &evaluated[0] {
+                let (skip, take) = substr_span(bytes.len(), start, count);
+                return Ok(Value::Blob(bytes[skip..skip + take].to_vec()));
+            }
             let s = value_to_text_with_cancel(&evaluated[0], ctx.cancel)?;
-            let chars: Vec<char> = s.chars().collect();
-            let start = match &evaluated[1] {
-                Value::Integer(i) => *i,
-                _ => {
-                    return Err(SqlError::TypeMismatch {
-                        expected: "INTEGER".into(),
-                        got: evaluated[1].data_type().to_string(),
-                    })
-                }
-            };
-            let len = chars.len() as i64;
-
-            let (begin, count) = if evaluated.len() == 3 {
-                let cnt = match &evaluated[2] {
-                    Value::Integer(i) => *i,
-                    _ => {
-                        return Err(SqlError::TypeMismatch {
-                            expected: "INTEGER".into(),
-                            got: evaluated[2].data_type().to_string(),
-                        })
-                    }
-                };
-                if start >= 1 {
-                    let b = (start - 1).min(len) as usize;
-                    let c = cnt.max(0) as usize;
-                    (b, c)
-                } else if start == 0 {
-                    let c = (cnt - 1).max(0) as usize;
-                    (0usize, c)
-                } else {
-                    let adjusted_cnt = (cnt + start - 1).max(0) as usize;
-                    (0usize, adjusted_cnt)
-                }
-            } else if start >= 1 {
-                let b = (start - 1).min(len) as usize;
-                (b, chars.len() - b)
-            } else if start == 0 {
-                (0usize, chars.len())
-            } else {
-                let b = (len + start).max(0) as usize;
-                (b, chars.len() - b)
-            };
-
-            let result: String = chars.iter().skip(begin).take(count).collect();
+            let (skip, take) = substr_span(s.chars().count(), start, count);
+            let result: String = s.chars().skip(skip).take(take).collect();
             Ok(Value::Text(result.into()))
         }
         "TRIM" | "LTRIM" | "RTRIM" => {
@@ -3964,6 +3936,33 @@ fn make_time_micros(function: &str, hour: i64, minute: i64, seconds: &Value) -> 
             "{function}: time field value out of range: {hour}:{minute}:{seconds}"
         ))
     })
+}
+
+/// The part of a value SUBSTR takes, as SQLite computes it: `(skip, take)` in
+/// characters (bytes for a BLOB), within `len`. A negative start counts from
+/// the end, a start of 0 takes one fewer, and a negative length takes the
+/// characters before the start.
+fn substr_span(len: usize, start: i64, count: Option<i64>) -> (usize, usize) {
+    // The length of a value held in memory fits i64.
+    let len = len as i64;
+    let (mut skip, mut take) = (start, count.unwrap_or(i64::MAX));
+    if skip < 0 {
+        skip += len;
+        if skip < 0 {
+            take = if take < 0 { 0 } else { take + skip };
+            skip = 0;
+        }
+    } else if skip > 0 {
+        skip -= 1;
+    } else if take > 0 {
+        take -= 1;
+    }
+    if take < 0 {
+        take = if take < -skip { skip } else { -take };
+        skip -= take;
+    }
+    let skip = skip.min(len);
+    (skip as usize, take.min(len - skip) as usize)
 }
 
 /// For functions with optional trailing arguments, whose callee validates the upper bound.

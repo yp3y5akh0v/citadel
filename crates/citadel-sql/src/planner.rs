@@ -871,6 +871,8 @@ pub(crate) fn index_scan_preserves_pk_order(schema: &TableSchema, plan: &ScanPla
 }
 
 /// Proven non-NULL result types whose equality probes use typed key encoding.
+/// SUBSTR of a BLOB is a BLOB: its key never equals a TEXT probe, just as the
+/// row's value never equals the TEXT operand, so the index and a scan agree.
 fn expression_key_type(expr: &Expr) -> Option<DataType> {
     match expr {
         Expr::Cast {
