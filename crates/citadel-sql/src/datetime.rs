@@ -8,7 +8,7 @@ use crate::error::{Result, SqlError};
 use crate::types::Value;
 use jiff::civil::{Date as JDate, DateTime as JDateTime, Time as JTime};
 use jiff::tz::TimeZone;
-use jiff::{Span, Timestamp as JTimestamp, ToSpan, Unit, Zoned};
+use jiff::{Span, Timestamp as JTimestamp, Unit, Zoned};
 
 pub const MICROS_PER_SEC: i64 = 1_000_000;
 pub const MICROS_PER_MIN: i64 = 60 * MICROS_PER_SEC;
@@ -35,23 +35,59 @@ fn epoch_date() -> JDate {
     JDate::new(1970, 1, 1).expect("1970-01-01 is a valid date")
 }
 
-/// Convert i32 days-since-1970 to civil Gregorian (year, month, day).
-pub fn days_to_ymd(days: i32) -> (i32, u8, u8) {
-    let epoch = epoch_date();
-    let d = epoch.checked_add((days as i64).days()).unwrap_or(epoch);
-    (d.year() as i32, d.month() as u8, d.day() as u8)
+/// Days from 0000-03-01 to 1970-01-01. The civil conversions count 400-year
+/// eras of 146,097 days from 0000-03-01, so a leap day ends each counted year.
+const EPOCH_FROM_MARCH_ZERO: i64 = 719_468;
+const DAYS_PER_ERA: i64 = 146_097;
+
+/// Civil Gregorian (year, month, day) of a day count since 1970, with
+/// astronomical years (0 is 1 BC). Exact for every i64 day that fits.
+fn civil_from_days(days: i64) -> (i64, u8, u8) {
+    let z = days + EPOCH_FROM_MARCH_ZERO;
+    let era = z.div_euclid(DAYS_PER_ERA);
+    let day_of_era = z.rem_euclid(DAYS_PER_ERA);
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_from_march = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_from_march + 2) / 5 + 1;
+    let month = if month_from_march < 10 {
+        month_from_march + 3
+    } else {
+        month_from_march - 9
+    };
+    let year = era * 400 + year_of_era + i64::from(month <= 2);
+    (year, month as u8, day as u8)
 }
 
-/// Convert (year, month, day) Gregorian to i32 days-since-1970.
+/// Day count since 1970 of a civil Gregorian date whose month and day are valid.
+fn days_from_civil(year: i64, month: u8, day: u8) -> i64 {
+    let year = year - i64::from(month <= 2);
+    let era = year.div_euclid(400);
+    let year_of_era = year.rem_euclid(400);
+    let month_from_march = i64::from(if month > 2 { month - 3 } else { month + 9 });
+    let day_of_year = (153 * month_from_march + 2) / 5 + i64::from(day) - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * DAYS_PER_ERA + day_of_era - EPOCH_FROM_MARCH_ZERO
+}
+
+/// Convert i32 days-since-1970 to civil Gregorian (year, month, day), with
+/// astronomical years. Total: every i32 day has a calendar date.
+pub fn days_to_ymd(days: i32) -> (i32, u8, u8) {
+    let (year, month, day) = civil_from_days(i64::from(days));
+    // |days| / 365 bounds the year well inside i32.
+    (year as i32, month, day)
+}
+
+/// Convert (year, month, day) Gregorian to i32 days-since-1970. `None` for a
+/// day that does not exist, or one outside the finite DATE range.
 pub fn ymd_to_days(y: i32, m: u8, d: u8) -> Option<i32> {
-    let date = JDate::new(y as i16, m as i8, d as i8).ok()?;
-    let span = date.since((Unit::Day, epoch_date())).ok()?;
-    let days = span.get_days() as i64;
-    if (i32::MIN as i64..=i32::MAX as i64).contains(&days) {
-        Some(days as i32)
-    } else {
-        None
+    if !(1..=12).contains(&m) || d == 0 || d > days_in_month(y, m) {
+        return None;
     }
+    i32::try_from(days_from_civil(i64::from(y), m, d))
+        .ok()
+        .filter(|days| !is_infinity_date(*days))
 }
 
 /// Convert µs-since-midnight to (hour, minute, second, subsec_micros).
@@ -90,9 +126,16 @@ pub fn ts_combine(date_days: i32, time_micros: i64) -> i64 {
     (date_days as i64) * MICROS_PER_DAY + time_micros
 }
 
-/// Convert a date to a timestamp at midnight UTC.
-pub fn date_to_ts(days: i32) -> i64 {
-    (days as i64).saturating_mul(MICROS_PER_DAY)
+/// Convert a date to a timestamp at midnight UTC; an infinite date is the
+/// infinite timestamp of the same sign.
+pub fn date_to_ts(days: i32) -> Result<i64> {
+    match days {
+        DATE_INFINITY_DAYS => Ok(TS_INFINITY_MICROS),
+        DATE_NEG_INFINITY_DAYS => Ok(TS_NEG_INFINITY_MICROS),
+        _ => i64::from(days)
+            .checked_mul(MICROS_PER_DAY)
+            .ok_or_else(|| SqlError::InvalidValue("date out of range for timestamp".into())),
+    }
 }
 
 /// Floor-divide timestamp µs to date days (correct for pre-1970 negative values).
@@ -576,16 +619,6 @@ fn interval_clock(token: &str) -> Result<i64> {
     })
 }
 
-fn clamp_i32(n: i64) -> Result<i32> {
-    if (i32::MIN as i64..=i32::MAX as i64).contains(&n) {
-        Ok(n as i32)
-    } else {
-        Err(SqlError::InvalidIntervalLiteral(format!(
-            "interval component overflow: {n}"
-        )))
-    }
-}
-
 pub fn format_date(days: i32) -> String {
     if days == DATE_INFINITY_DAYS {
         return "infinity".to_string();
@@ -624,7 +657,11 @@ pub fn format_timestamp(micros: i64) -> String {
     let (date_days, time_micros) = ts_split(micros);
     let date_part = format_date(date_days);
     let time_part = format_time(time_micros);
-    format!("{date_part} {time_part}")
+    // The era follows the time, as PostgreSQL writes it and parse_timestamp reads it.
+    match date_part.strip_suffix(" BC") {
+        Some(date) => format!("{date} {time_part} BC"),
+        None => format!("{date_part} {time_part}"),
+    }
 }
 
 pub fn format_timestamp_in_zone(micros: i64, zone: &str) -> Result<String> {
@@ -975,29 +1012,30 @@ pub fn add_interval_to_timestamp(ts: i64, months: i32, days: i32, micros: i64) -
 
 /// PG rule: DATE + INTERVAL always yields TIMESTAMP.
 pub fn add_interval_to_date(days: i32, months: i32, i_days: i32, micros: i64) -> Result<i64> {
-    if is_infinity_date(days) {
-        return Ok(if days == DATE_INFINITY_DAYS {
-            TS_INFINITY_MICROS
-        } else {
-            TS_NEG_INFINITY_MICROS
-        });
-    }
-    let ts = date_to_ts(days);
-    add_interval_to_timestamp(ts, months, i_days, micros)
+    add_interval_to_timestamp(date_to_ts(days)?, months, i_days, micros)
 }
 
+/// DATE ± INTEGER: an infinite date stays infinite, and a finite result must
+/// be a finite date.
 pub fn add_days_to_date(days: i32, n: i64) -> Result<i32> {
     if is_infinity_date(days) {
         return Ok(days);
     }
-    let new_days = (days as i64)
+    i64::from(days)
         .checked_add(n)
-        .ok_or(SqlError::IntegerOverflow)?;
-    if new_days >= i32::MIN as i64 && new_days <= i32::MAX as i64 {
-        Ok(new_days as i32)
-    } else {
-        Err(SqlError::IntegerOverflow)
+        .and_then(|sum| i32::try_from(sum).ok())
+        .filter(|sum| !is_infinity_date(*sum))
+        .ok_or_else(|| SqlError::InvalidValue("date out of range".into()))
+}
+
+/// DATE - DATE in days; an infinite date has no finite difference.
+pub fn subtract_dates(a: i32, b: i32) -> Result<i64> {
+    if is_infinity_date(a) || is_infinity_date(b) {
+        return Err(SqlError::InvalidValue(
+            "cannot subtract infinite dates".into(),
+        ));
     }
+    Ok(i64::from(a) - i64::from(b))
 }
 
 pub fn add_interval_to_time(t: i64, months: i32, days: i32, micros: i64) -> Result<i64> {
@@ -1012,37 +1050,68 @@ pub fn add_interval_to_time(t: i64, months: i32, days: i32, micros: i64) -> Resu
 }
 
 /// PG `timestamp - timestamp`: returns `(days, remainder_micros)` with months = 0.
-pub fn subtract_timestamps(a: i64, b: i64) -> (i32, i64) {
-    let diff = a.saturating_sub(b);
-    let days = (diff / MICROS_PER_DAY) as i32;
-    let micros = diff % MICROS_PER_DAY;
-    (days, micros)
+/// An infinite timestamp has no finite difference.
+pub fn subtract_timestamps(a: i64, b: i64) -> Result<(i32, i64)> {
+    if is_infinity_ts(a) || is_infinity_ts(b) {
+        return Err(infinite_timestamps_difference());
+    }
+    let diff = a.checked_sub(b).ok_or_else(interval_overflow)?;
+    // At most i64::MAX / MICROS_PER_DAY, about 1.07e8 days, which fits i32.
+    Ok(((diff / MICROS_PER_DAY) as i32, diff % MICROS_PER_DAY))
 }
 
-/// AGE(a, b) — symbolic diff preserving months/years. Uses jiff's Span rounding to Year unit.
+fn infinite_timestamps_difference() -> SqlError {
+    SqlError::InvalidValue("cannot subtract infinite timestamps".into())
+}
+
+/// AGE(a, b): `a - b` field by field, as PostgreSQL's timestamp_age computes
+/// it. A negative time borrows a day, a negative day the length of the earlier
+/// timestamp's month, and a negative month a year.
 pub fn age(ts_a: i64, ts_b: i64) -> Result<(i32, i32, i64)> {
-    let a = JTimestamp::from_microsecond(ts_a)
-        .map_err(|e| SqlError::InvalidValue(format!("ts_a: {e}")))?
-        .to_zoned(TimeZone::UTC);
-    let b = JTimestamp::from_microsecond(ts_b)
-        .map_err(|e| SqlError::InvalidValue(format!("ts_b: {e}")))?
-        .to_zoned(TimeZone::UTC);
-    let span = a
-        .since((Unit::Year, &b))
-        .map_err(|e| SqlError::InvalidValue(format!("age: {e}")))?;
-    span_to_triple(&span)
+    if is_infinity_ts(ts_a) || is_infinity_ts(ts_b) {
+        return Err(infinite_timestamps_difference());
+    }
+    let (days_a, time_a) = ts_split(ts_a);
+    let (days_b, time_b) = ts_split(ts_b);
+    let (year_a, month_a, day_a) = days_to_ymd(days_a);
+    let (year_b, month_b, day_b) = days_to_ymd(days_b);
+    // The later minus the earlier, borrowing as needed; the sign returns last.
+    let sign: i64 = if ts_a < ts_b { -1 } else { 1 };
+    let (earlier_year, earlier_month) = if sign < 0 {
+        (year_a, month_a)
+    } else {
+        (year_b, month_b)
+    };
+    let mut micros = sign * (time_a - time_b);
+    let mut days = sign * (i64::from(day_a) - i64::from(day_b));
+    let mut months = sign * (i64::from(month_a) - i64::from(month_b));
+    let mut years = sign * (i64::from(year_a) - i64::from(year_b));
+    if micros < 0 {
+        micros += MICROS_PER_DAY;
+        days -= 1;
+    }
+    while days < 0 {
+        days += i64::from(days_in_month(earlier_year, earlier_month));
+        months -= 1;
+    }
+    while months < 0 {
+        months += 12;
+        years -= 1;
+    }
+    let months = i32::try_from(sign * (years * 12 + months)).map_err(|_| interval_overflow())?;
+    // Borrowing leaves fewer days than a month and less time than a day.
+    Ok((months, (sign * days) as i32, sign * micros))
 }
 
-fn span_to_triple(span: &Span) -> Result<(i32, i32, i64)> {
-    let months = i64::from(span.get_years()) * 12 + i64::from(span.get_months());
-    let days = i64::from(span.get_weeks()) * 7 + i64::from(span.get_days());
-    let micros = i64::from(span.get_hours()) * MICROS_PER_HOUR
-        + span.get_minutes() * MICROS_PER_MIN
-        + span.get_seconds() * MICROS_PER_SEC
-        + span.get_milliseconds() * 1000
-        + span.get_microseconds()
-        + span.get_nanoseconds() / 1000;
-    Ok((clamp_i32(months)?, clamp_i32(days)?, micros))
+/// Days in `month` of the astronomical `year`, in the proleptic Gregorian calendar.
+fn days_in_month(year: i32, month: u8) -> u8 {
+    let leap = year.rem_euclid(4) == 0 && (year.rem_euclid(100) != 0 || year.rem_euclid(400) == 0);
+    match month {
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => 31,
+    }
 }
 
 /// An interval result whose fields leave their range.
@@ -1296,17 +1365,25 @@ pub fn interval_to_total_micros(months: i32, days: i32, micros: i64) -> i128 {
 }
 
 pub fn extract(field: &str, v: &Value) -> Result<Value> {
-    let f = field.trim();
+    // PostgreSQL folds field names to lower case.
+    let field = field.trim().to_ascii_lowercase();
+    let field = field.as_str();
     match v {
         Value::Null => Ok(Value::Null),
-        Value::Date(d) => extract_from_date(f, *d),
-        Value::Time(t) => extract_from_time(f, *t),
-        Value::Timestamp(t) => extract_from_timestamp(f, *t),
+        Value::Date(d) if is_infinity_date(*d) => {
+            extract_from_infinity(field, *d == DATE_NEG_INFINITY_DAYS, "DATE")
+        }
+        Value::Date(d) => extract_from_date(field, *d),
+        Value::Time(t) => extract_from_time(field, *t),
+        Value::Timestamp(t) if is_infinity_ts(*t) => {
+            extract_from_infinity(field, *t == TS_NEG_INFINITY_MICROS, "TIMESTAMP")
+        }
+        Value::Timestamp(t) => extract_from_timestamp(field, *t),
         Value::Interval {
             months,
             days,
             micros,
-        } => extract_from_interval(f, *months, *days, *micros),
+        } => extract_from_interval(field, *months, *days, *micros),
         _ => Err(SqlError::TypeMismatch {
             expected: "temporal type".into(),
             got: v.data_type().to_string(),
@@ -1314,73 +1391,90 @@ pub fn extract(field: &str, v: &Value) -> Result<Value> {
     }
 }
 
-fn extract_from_date(field: &str, days: i32) -> Result<Value> {
-    if field.eq_ignore_ascii_case("epoch") {
-        return Ok(Value::Integer((days as i64) * 86400));
-    }
-    let (y, m, d) = days_to_ymd(days);
-    if field.eq_ignore_ascii_case("year") {
-        return Ok(Value::Integer(y as i64));
-    }
-    if field.eq_ignore_ascii_case("month") {
-        return Ok(Value::Integer(m as i64));
-    }
-    if field.eq_ignore_ascii_case("day") {
-        return Ok(Value::Integer(d as i64));
-    }
-    if field.eq_ignore_ascii_case("hour")
-        || field.eq_ignore_ascii_case("minute")
-        || field.eq_ignore_ascii_case("second")
-        || field.eq_ignore_ascii_case("microseconds")
-        || field.eq_ignore_ascii_case("milliseconds")
-    {
-        return Ok(Value::Integer(0));
-    }
-    // Fall-through: use a canonical lowercase form for the remaining rare fields.
-    let f = field.to_ascii_lowercase();
-    match f.as_str() {
-        "dow" => {
-            let jd = JDate::new(y as i16, m as i8, d as i8)
-                .map_err(|e| SqlError::InvalidValue(format!("{e}")))?;
-            // Jiff weekday: Monday=1..Sunday=7. PG dow: Sunday=0..Saturday=6.
-            let w = jd.weekday().to_monday_one_offset() as i64;
-            let dow = if w == 7 { 0 } else { w }; // Sunday: 7 → 0
-            Ok(Value::Integer(dow))
-        }
-        "isodow" => {
-            let jd = JDate::new(y as i16, m as i8, d as i8)
-                .map_err(|e| SqlError::InvalidValue(format!("{e}")))?;
-            Ok(Value::Integer(jd.weekday().to_monday_one_offset() as i64))
-        }
-        "doy" => {
-            let jd = JDate::new(y as i16, m as i8, d as i8)
-                .map_err(|e| SqlError::InvalidValue(format!("{e}")))?;
-            Ok(Value::Integer(jd.day_of_year() as i64))
-        }
-        "quarter" => Ok(Value::Integer(((m - 1) / 3 + 1) as i64)),
-        "decade" => Ok(Value::Integer((y / 10) as i64)),
-        "century" => Ok(Value::Integer(if y > 0 {
-            ((y - 1) / 100 + 1) as i64
-        } else {
-            (y / 100 - 1) as i64
-        })),
-        "millennium" => Ok(Value::Integer(if y > 0 {
-            ((y - 1) / 1000 + 1) as i64
-        } else {
-            (y / 1000 - 1) as i64
-        })),
-        "julian" => Ok(Value::Integer(days as i64 + 2_440_588)),
-        "week" | "isoyear" => {
-            let jd = JDate::new(y as i16, m as i8, d as i8)
-                .map_err(|e| SqlError::InvalidValue(format!("{e}")))?;
-            let iso = jd.iso_week_date();
-            if field == "week" {
-                Ok(Value::Integer(iso.week() as i64))
+/// EXTRACT from ±infinity, as PostgreSQL gives it: fields that grow with time
+/// are ±Infinity, fields that cycle are NULL.
+fn extract_from_infinity(field: &str, negative: bool, type_name: &str) -> Result<Value> {
+    match field {
+        "year" | "decade" | "century" | "millennium" | "julian" | "isoyear" | "epoch" => {
+            Ok(Value::Real(if negative {
+                f64::NEG_INFINITY
             } else {
-                Ok(Value::Integer(iso.year() as i64))
-            }
+                f64::INFINITY
+            }))
         }
-        _ => Err(SqlError::InvalidExtractField(format!("{field} from DATE"))),
+        "month" | "day" | "hour" | "minute" | "second" | "milliseconds" | "microseconds"
+        | "quarter" | "week" | "dow" | "isodow" | "doy" => Ok(Value::Null),
+        _ => Err(SqlError::InvalidExtractField(format!(
+            "{field} from {type_name}"
+        ))),
+    }
+}
+
+/// Julian day number of 1970-01-01.
+const JULIAN_DAY_OF_EPOCH: i64 = 2_440_588;
+
+/// ISO 8601 weekday of a day count since 1970: Monday 1 through Sunday 7.
+fn iso_weekday(days: i64) -> i64 {
+    // 1970-01-01 was a Thursday.
+    (days + 3).rem_euclid(7) + 1
+}
+
+/// ISO 8601 (week-numbering year, week) of a day count since 1970, with an
+/// astronomical year: a week belongs to the year of its Thursday.
+fn iso_week(days: i64) -> (i64, i64) {
+    let thursday = days - iso_weekday(days) + 4;
+    let (year, _, _) = civil_from_days(thursday);
+    (year, (thursday - days_from_civil(year, 1, 1)) / 7 + 1)
+}
+
+/// A calendar field of a finite date, as PostgreSQL's EXTRACT gives it; `None`
+/// when `field` is not a calendar field.
+fn date_field(field: &str, days: i32) -> Option<i64> {
+    let (year, month, day) = days_to_ymd(days);
+    let (year, days) = (i64::from(year), i64::from(days));
+    // PostgreSQL has no year 0: astronomical year 0 is 1 BC, given as -1.
+    let era_year = |year: i64| if year > 0 { year } else { year - 1 };
+    Some(match field {
+        "year" => era_year(year),
+        "month" => i64::from(month),
+        "day" => i64::from(day),
+        // Sunday is 0.
+        "dow" => iso_weekday(days) % 7,
+        "isodow" => iso_weekday(days),
+        "doy" => days - days_from_civil(year, 1, 1) + 1,
+        "quarter" => i64::from((month - 1) / 3 + 1),
+        // PostgreSQL's rules, over the astronomical year.
+        "decade" if year >= 0 => year / 10,
+        "decade" => -((8 - (year - 1)) / 10),
+        "century" if year > 0 => (year - 1) / 100 + 1,
+        "century" => year / 100 - 1,
+        "millennium" if year > 0 => (year - 1) / 1000 + 1,
+        "millennium" => year / 1000 - 1,
+        "julian" => days + JULIAN_DAY_OF_EPOCH,
+        "week" => iso_week(days).1,
+        "isoyear" => era_year(iso_week(days).0),
+        _ => return None,
+    })
+}
+
+fn extract_from_date(field: &str, days: i32) -> Result<Value> {
+    match field {
+        // A date is its midnight.
+        "hour" | "minute" | "second" | "microseconds" | "milliseconds" => Ok(Value::Integer(0)),
+        "epoch" => Ok(Value::Integer(i64::from(days) * 86_400)),
+        _ => date_field(field, days)
+            .map(Value::Integer)
+            .ok_or_else(|| SqlError::InvalidExtractField(format!("{field} from DATE"))),
+    }
+}
+
+/// Seconds since the epoch (or midnight) of a microsecond count: an integer
+/// when whole, else with its fraction.
+fn epoch_seconds(micros: i64) -> Value {
+    if micros % MICROS_PER_SEC == 0 {
+        Value::Integer(micros / MICROS_PER_SEC)
+    } else {
+        Value::Real(micros as f64 / MICROS_PER_SEC as f64)
     }
 }
 
@@ -1398,53 +1492,26 @@ fn extract_from_time(field: &str, micros: i64) -> Result<Value> {
         }
         "microseconds" => Ok(Value::Integer((s as i64) * 1_000_000 + us as i64)),
         "milliseconds" => Ok(Value::Real(s as f64 * 1000.0 + (us as f64) / 1000.0)),
-        "epoch" => Ok(Value::Integer(micros / MICROS_PER_SEC)),
+        "epoch" => Ok(epoch_seconds(micros)),
         _ => Err(SqlError::InvalidExtractField(format!("{field} from TIME"))),
     }
 }
 
 fn extract_from_timestamp(field: &str, ts: i64) -> Result<Value> {
-    if field.eq_ignore_ascii_case("hour") {
-        return Ok(Value::Integer(
-            ts.rem_euclid(MICROS_PER_DAY) / MICROS_PER_HOUR,
-        ));
+    let (days, time) = ts_split(ts);
+    match field {
+        "hour" | "minute" | "second" | "microseconds" | "milliseconds" => {
+            extract_from_time(field, time)
+        }
+        "epoch" => Ok(epoch_seconds(ts)),
+        // The Julian day carries the fraction of the day elapsed.
+        "julian" if time != 0 => Ok(Value::Real(
+            (i64::from(days) + JULIAN_DAY_OF_EPOCH) as f64 + time as f64 / MICROS_PER_DAY as f64,
+        )),
+        _ => date_field(field, days)
+            .map(Value::Integer)
+            .ok_or_else(|| SqlError::InvalidExtractField(format!("{field} from TIMESTAMP"))),
     }
-    if field.eq_ignore_ascii_case("minute") {
-        return Ok(Value::Integer(
-            ts.rem_euclid(MICROS_PER_HOUR) / MICROS_PER_MIN,
-        ));
-    }
-    if field.eq_ignore_ascii_case("epoch") {
-        return Ok(Value::Integer(ts / MICROS_PER_SEC));
-    }
-    let (date_days, time_micros) = ts_split(ts);
-    // Date-level fields.
-    let date_fields = [
-        "year",
-        "month",
-        "day",
-        "dow",
-        "isodow",
-        "doy",
-        "quarter",
-        "decade",
-        "century",
-        "millennium",
-        "julian",
-        "week",
-        "isoyear",
-    ];
-    if date_fields.iter().any(|&f| field.eq_ignore_ascii_case(f)) {
-        return extract_from_date(field, date_days);
-    }
-    // Time-of-day fields (second, microseconds, milliseconds).
-    let time_fields = ["second", "microseconds", "milliseconds"];
-    if time_fields.iter().any(|&f| field.eq_ignore_ascii_case(f)) {
-        return extract_from_time(field, time_micros);
-    }
-    Err(SqlError::InvalidExtractField(format!(
-        "{field} from TIMESTAMP"
-    )))
 }
 
 fn extract_from_interval(field: &str, months: i32, days: i32, micros: i64) -> Result<Value> {
@@ -1465,9 +1532,14 @@ fn extract_from_interval(field: &str, months: i32, days: i32, micros: i64) -> Re
             }
         }
         "microseconds" => Ok(Value::Integer(micros % MICROS_PER_MIN)),
+        // PostgreSQL counts 365.25 days in each whole year of months, 30 in
+        // each remaining month.
         "epoch" => {
-            let total = interval_to_total_micros(months, days, micros);
-            Ok(Value::Real(total as f64 / 1_000_000.0))
+            let days =
+                365.25 * f64::from(months / 12) + 30.0 * f64::from(months % 12) + f64::from(days);
+            Ok(Value::Real(
+                days * 86_400.0 + micros as f64 / MICROS_PER_SEC as f64,
+            ))
         }
         _ => Err(SqlError::InvalidExtractField(format!(
             "{field} from INTERVAL"
@@ -1502,16 +1574,11 @@ fn date_trunc_date(unit: &str, days: i32) -> Result<i32> {
     if is_infinity_date(days) {
         return Ok(days);
     }
-    let (y, m, d) = days_to_ymd(days);
+    let (y, m, _) = days_to_ymd(days);
     match unit {
         "microseconds" | "milliseconds" | "second" | "minute" | "hour" | "day" => Ok(days),
-        "week" => {
-            // Monday-based ISO 8601.
-            let jd = JDate::new(y as i16, m as i8, d as i8)
-                .map_err(|e| SqlError::InvalidValue(format!("{e}")))?;
-            let dow = jd.weekday().to_monday_one_offset() as i32; // 1=Mon..7=Sun
-            add_days_to_date(days, -(dow - 1) as i64)
-        }
+        // The Monday of the ISO 8601 week.
+        "week" => add_days_to_date(days, 1 - iso_weekday(i64::from(days))),
         "month" => {
             ymd_to_days(y, m, 1).ok_or_else(|| SqlError::InvalidValue("date_trunc month".into()))
         }
@@ -1522,8 +1589,17 @@ fn date_trunc_date(unit: &str, days: i32) -> Result<i32> {
         "year" => {
             ymd_to_days(y, 1, 1).ok_or_else(|| SqlError::InvalidValue("date_trunc year".into()))
         }
-        "decade" => ymd_to_days(y - (y % 10), 1, 1)
-            .ok_or_else(|| SqlError::InvalidValue("date_trunc decade".into())),
+        // PostgreSQL's rule, over the astronomical year.
+        "decade" => ymd_to_days(
+            if y > 0 {
+                y / 10 * 10
+            } else {
+                -((8 - (y - 1)) / 10) * 10
+            },
+            1,
+            1,
+        )
+        .ok_or_else(|| SqlError::InvalidValue("date_trunc decade".into())),
         "century" => {
             let cy = if y > 0 {
                 ((y - 1) / 100) * 100 + 1
@@ -1647,7 +1723,7 @@ pub fn strftime(fmt: &str, v: &Value) -> Result<String> {
     let ts_micros = match v {
         Value::Null => return Ok(String::new()),
         Value::Timestamp(t) => *t,
-        Value::Date(d) => date_to_ts(*d),
+        Value::Date(d) => date_to_ts(*d)?,
         Value::Time(t) => *t, // time-only: use epoch date as anchor
         _ => {
             return Err(SqlError::TypeMismatch {

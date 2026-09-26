@@ -774,6 +774,523 @@ fn year_0_rejected() {
     assert!(matches!(err, SqlError::InvalidDateLiteral(_)));
 }
 
+fn assert_invalid(conn: &Connection<'_>, sql: &str, message: &str) {
+    match conn.query(sql) {
+        Err(SqlError::InvalidValue(got)) => assert_eq!(got, message, "{sql}"),
+        other => panic!("{sql}: {other:?}"),
+    }
+}
+
+#[test]
+fn infinite_dates_and_timestamps_follow_postgresql() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    for sql in [
+        "CREATE TABLE spans (id INTEGER PRIMARY KEY, d DATE, ts TIMESTAMP)",
+        "CREATE TABLE strict_spans (id INTEGER PRIMARY KEY, d DATE, ts TIMESTAMP) STRICT",
+        "INSERT INTO spans VALUES (1, TIMESTAMP 'infinity', DATE '-infinity')",
+        "INSERT INTO strict_spans VALUES (1, TIMESTAMP '-infinity', DATE 'infinity')",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+    // PostgreSQL 17's answers. Conversions keep the sign of infinity.
+    for (sql, expected) in [
+        (
+            "SELECT CAST(TIMESTAMP 'infinity' AS DATE)",
+            Value::Date(i32::MAX),
+        ),
+        (
+            "SELECT CAST(TIMESTAMP '-infinity' AS DATE)",
+            Value::Date(i32::MIN),
+        ),
+        (
+            "SELECT CAST(DATE 'infinity' AS TIMESTAMP)",
+            Value::Timestamp(i64::MAX),
+        ),
+        ("SELECT d FROM spans", Value::Date(i32::MAX)),
+        ("SELECT ts FROM spans", Value::Timestamp(i64::MIN)),
+        ("SELECT d FROM strict_spans", Value::Date(i32::MIN)),
+        ("SELECT ts FROM strict_spans", Value::Timestamp(i64::MAX)),
+        (
+            "SELECT DATE 'infinity' = TIMESTAMP 'infinity'",
+            Value::Boolean(true),
+        ),
+        ("SELECT DATE 'infinity' - 1", Value::Date(i32::MAX)),
+        // Fields that keep growing are ±Infinity; fields that cycle are NULL.
+        (
+            "SELECT extract(year FROM DATE 'infinity')",
+            Value::Real(f64::INFINITY),
+        ),
+        (
+            "SELECT extract(decade FROM DATE '-infinity')",
+            Value::Real(f64::NEG_INFINITY),
+        ),
+        (
+            "SELECT extract(julian FROM d) FROM spans",
+            Value::Real(f64::INFINITY),
+        ),
+        (
+            "SELECT extract(epoch FROM ts) FROM spans",
+            Value::Real(f64::NEG_INFINITY),
+        ),
+        (
+            "SELECT date_part('year', TIMESTAMP 'infinity')",
+            Value::Real(f64::INFINITY),
+        ),
+        ("SELECT extract(month FROM DATE 'infinity')", Value::Null),
+        ("SELECT extract(dow FROM d) FROM spans", Value::Null),
+        (
+            "SELECT date_part('hour', TIMESTAMP 'infinity')",
+            Value::Null,
+        ),
+        ("SELECT extract(second FROM ts) FROM spans", Value::Null),
+        // As PostgreSQL's cast to TIME, which has no infinity.
+        ("SELECT time(TIMESTAMP 'infinity')", Value::Null),
+    ] {
+        assert_eq!(scalar(&conn, sql), expected, "{sql}");
+    }
+    for sql in [
+        "SELECT DATE 'infinity' - DATE '2024-01-01'",
+        "SELECT DATE '-infinity' - DATE 'infinity'",
+    ] {
+        assert_invalid(&conn, sql, "cannot subtract infinite dates");
+    }
+    for sql in [
+        "SELECT TIMESTAMP 'infinity' - TIMESTAMP '2024-01-01 00:00:00'",
+        "SELECT age(TIMESTAMP 'infinity', TIMESTAMP '2024-01-01 00:00:00')",
+        "SELECT timediff(TIMESTAMP '2024-01-01 00:00:00', TIMESTAMP '-infinity')",
+    ] {
+        assert_invalid(&conn, sql, "cannot subtract infinite timestamps");
+    }
+    assert_invalid(
+        &conn,
+        "SELECT julianday(TIMESTAMP 'infinity')",
+        "JULIANDAY is not defined for infinite timestamps",
+    );
+    assert_invalid(
+        &conn,
+        "SELECT unixepoch(DATE '-infinity')",
+        "UNIXEPOCH is not defined for infinite timestamps",
+    );
+    // Infinity has no count of days or seconds, and the day counts that stand
+    // for it are not days.
+    conn.execute("CREATE TABLE counts (id INTEGER PRIMARY KEY, n INTEGER)")
+        .unwrap();
+    for sql in [
+        "INSERT INTO counts VALUES (1, DATE 'infinity')",
+        "INSERT INTO counts VALUES (2, TIMESTAMP '-infinity')",
+        "INSERT INTO spans VALUES (2, 2147483647, NULL)",
+    ] {
+        assert!(
+            matches!(conn.execute(sql), Err(SqlError::TypeMismatch { .. })),
+            "{sql}"
+        );
+    }
+    for sql in [
+        "SELECT CAST(2147483647 AS DATE)",
+        "SELECT CAST(-2147483648 AS DATE)",
+    ] {
+        assert_invalid(&conn, sql, "cannot cast INTEGER to DATE");
+    }
+}
+
+#[test]
+fn dates_past_year_9999_compute_exactly() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE far (id INTEGER PRIMARY KEY, d DATE)")
+        .unwrap();
+    conn.execute("INSERT INTO far VALUES (1, 5000000)").unwrap();
+    // PostgreSQL 17's answers.
+    for (sql, expected) in [
+        ("SELECT DATE '9999-12-31' + 1", "10000-01-01"),
+        ("SELECT d FROM far", "15659-07-15"),
+        ("SELECT make_date(12345, 6, 7)", "12345-06-07"),
+        (
+            "SELECT CAST(make_date(12345, 6, 7) AS TIMESTAMP)",
+            "12345-06-07 00:00:00",
+        ),
+        (
+            "SELECT date_trunc('month', make_date(12345, 6, 7))",
+            "12345-06-01",
+        ),
+        (
+            "SELECT date_trunc('decade', make_date(12345, 6, 7))",
+            "12340-01-01",
+        ),
+        (
+            "SELECT date_trunc('week', make_date(10000, 1, 1))",
+            "9999-12-27",
+        ),
+        (
+            "SELECT CAST(300000000000 AS TIMESTAMP)",
+            "11476-08-15 05:20:00",
+        ),
+        ("SELECT make_date(5874897, 12, 31)", "5874897-12-31"),
+    ] {
+        assert_eq!(scalar(&conn, sql).to_string(), expected, "{sql}");
+    }
+    for (sql, expected) in [
+        (
+            "SELECT make_date(12345, 6, 7) - DATE '2000-01-01'",
+            3_778_591,
+        ),
+        (
+            "SELECT extract(epoch FROM make_date(12345, 6, 7))",
+            327_416_947_200,
+        ),
+        ("SELECT extract(dow FROM make_date(10000, 1, 1))", 6),
+        ("SELECT extract(isodow FROM make_date(10000, 1, 1))", 6),
+        ("SELECT extract(doy FROM make_date(10000, 3, 1))", 61),
+        ("SELECT extract(week FROM make_date(10000, 1, 1))", 52),
+        ("SELECT extract(isoyear FROM make_date(10000, 1, 1))", 9999),
+        ("SELECT extract(year FROM d) FROM far", 15_659),
+    ] {
+        assert_eq!(scalar(&conn, sql), Value::Integer(expected), "{sql}");
+    }
+    // The last finite day comes before the day count that stands for infinity.
+    assert_invalid(
+        &conn,
+        "SELECT DATE '2024-01-01' + 2147463924",
+        "date out of range",
+    );
+    assert_invalid(
+        &conn,
+        "SELECT make_date(5874897, 12, 31) + INTERVAL '1 day'",
+        "date out of range for timestamp",
+    );
+    for sql in [
+        "SELECT datetime(9223372036855)",
+        "SELECT date(-9223372036855)",
+    ] {
+        assert_invalid(&conn, sql, "timestamp out of range");
+    }
+}
+
+#[test]
+fn bc_dates_follow_postgresql_calendar_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    // PostgreSQL 17's answers. There is no year 0, and BC decades, centuries
+    // and ISO years count away from it.
+    for (sql, expected) in [
+        ("SELECT extract(year FROM DATE '0001-06-01 BC')", -1),
+        ("SELECT extract(year FROM DATE '0044-03-15 BC')", -44),
+        ("SELECT extract(decade FROM DATE '0001-06-01 BC')", 0),
+        ("SELECT extract(decade FROM DATE '0006-06-01 BC')", -1),
+        ("SELECT extract(decade FROM DATE '0011-06-01 BC')", -1),
+        ("SELECT extract(decade FROM DATE '0016-06-01 BC')", -2),
+        ("SELECT extract(century FROM DATE '0101-01-01 BC')", -2),
+        ("SELECT extract(millennium FROM DATE '1001-01-01 BC')", -2),
+        ("SELECT extract(isoyear FROM DATE '0001-01-01 BC')", -2),
+        ("SELECT extract(week FROM DATE '0001-01-01 BC')", 52),
+        ("SELECT extract(isoyear FROM DATE '0044-03-15 BC')", -44),
+        ("SELECT extract(week FROM DATE '0044-03-15 BC')", 11),
+        ("SELECT extract(dow FROM DATE '0044-03-15 BC')", 5),
+        ("SELECT extract(doy FROM DATE '0044-03-15 BC')", 74),
+        ("SELECT extract(julian FROM DATE '4714-11-24 BC')", 0),
+        (
+            "SELECT extract(epoch FROM TIMESTAMP '0044-03-15 12:00:00 BC')",
+            -63_517_780_800,
+        ),
+    ] {
+        assert_eq!(scalar(&conn, sql), Value::Integer(expected), "{sql}");
+    }
+    for (sql, expected) in [
+        (
+            "SELECT date_trunc('decade', DATE '0001-06-01 BC')",
+            "0001-01-01 BC",
+        ),
+        (
+            "SELECT date_trunc('decade', DATE '0006-06-01 BC')",
+            "0011-01-01 BC",
+        ),
+        (
+            "SELECT date_trunc('decade', DATE '0016-06-01 BC')",
+            "0021-01-01 BC",
+        ),
+        (
+            "SELECT date_trunc('decade', DATE '0005-06-01')",
+            "0001-01-01 BC",
+        ),
+        (
+            "SELECT date_trunc('decade', TIMESTAMP '0006-06-01 10:00:00 BC')",
+            "0011-01-01 00:00:00 BC",
+        ),
+        (
+            "SELECT date_trunc('century', TIMESTAMP '0101-06-01 10:00:00 BC')",
+            "0200-01-01 00:00:00 BC",
+        ),
+        // The era follows the time, so the text reads back as the same timestamp.
+        (
+            "SELECT CAST(TIMESTAMP '0044-03-15 12:00:00 BC' AS TEXT)",
+            "0044-03-15 12:00:00 BC",
+        ),
+        (
+            "SELECT CAST(CAST(TIMESTAMP '0044-03-15 12:00:00 BC' AS TEXT) AS TIMESTAMP) \
+             = TIMESTAMP '0044-03-15 12:00:00 BC'",
+            "TRUE",
+        ),
+    ] {
+        assert_eq!(scalar(&conn, sql).to_string(), expected, "{sql}");
+    }
+    assert_eq!(
+        scalar(
+            &conn,
+            "SELECT extract(julian FROM TIMESTAMP '4714-11-24 06:00:00 BC')"
+        ),
+        Value::Real(0.25)
+    );
+}
+
+#[test]
+fn extract_folds_field_names_and_keeps_fractions() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    // PostgreSQL 17's answers.
+    for (sql, expected) in [
+        (
+            "SELECT date_part('WEEK', DATE '2024-12-30')",
+            Value::Integer(1),
+        ),
+        (
+            "SELECT date_part('ISOYEAR', DATE '2024-12-30')",
+            Value::Integer(2025),
+        ),
+        (
+            "SELECT date_part('HOUR', TIME '10:30:00')",
+            Value::Integer(10),
+        ),
+        (
+            "SELECT date_part('Day', INTERVAL '3 days')",
+            Value::Integer(3),
+        ),
+        (
+            "SELECT extract(epoch FROM TIME '10:00:00.5')",
+            Value::Real(36_000.5),
+        ),
+        (
+            "SELECT extract(epoch FROM TIMESTAMP '1969-12-31 23:59:59.5')",
+            Value::Real(-0.5),
+        ),
+        (
+            "SELECT extract(epoch FROM TIMESTAMP '2024-06-01 00:00:00.25')",
+            Value::Real(1_717_200_000.25),
+        ),
+        // A year of months is 365.25 days, a leftover month 30.
+        (
+            "SELECT extract(epoch FROM INTERVAL '-13 months')",
+            Value::Real(-34_149_600.0),
+        ),
+        (
+            "SELECT extract(epoch FROM INTERVAL '25 months 3 days')",
+            Value::Real(65_966_400.0),
+        ),
+        (
+            "SELECT extract(julian FROM TIMESTAMP '2024-01-01 12:00:00')",
+            Value::Real(2_460_311.5),
+        ),
+        (
+            "SELECT extract(julian FROM TIMESTAMP '2024-01-01 00:00:00')",
+            Value::Integer(2_460_311),
+        ),
+    ] {
+        assert_eq!(scalar(&conn, sql), expected, "{sql}");
+    }
+}
+
+#[test]
+fn age_borrows_the_length_of_the_earlier_month() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    let interval = |months, days, micros| Value::Interval {
+        months,
+        days,
+        micros,
+    };
+    // PostgreSQL 17's answers.
+    for (a, b, expected) in [
+        ("2024-02-29", "2023-02-28", interval(12, 1, 0)),
+        ("2024-03-31", "2024-02-29", interval(1, 2, 0)),
+        ("2024-03-30", "2024-01-31", interval(1, 30, 0)),
+        ("2024-05-31", "2024-02-29", interval(3, 2, 0)),
+        ("2025-03-01", "2024-02-29", interval(12, 1, 0)),
+        ("2024-02-29", "2025-03-01", interval(-12, -1, 0)),
+        ("2024-03-01", "2024-01-31", interval(1, 1, 0)),
+        ("2024-01-31", "2024-03-01", interval(-1, -1, 0)),
+        (
+            "2024-01-01 00:00:00",
+            "2023-12-31 23:59:59",
+            interval(0, 0, 1_000_000),
+        ),
+        (
+            "2023-12-31 23:59:59",
+            "2024-01-01 00:00:00",
+            interval(0, 0, -1_000_000),
+        ),
+        (
+            "2024-03-31 10:00:00",
+            "2023-01-31 12:00:00",
+            interval(13, 30, 22 * 3_600_000_000),
+        ),
+        (
+            "2000-02-29 00:00:00",
+            "1999-12-31 23:59:59.999999",
+            interval(1, 28, 1),
+        ),
+        (
+            "1999-12-31 23:59:59.999999",
+            "2000-02-29 00:00:00",
+            interval(-1, -28, -1),
+        ),
+        (
+            "0001-01-01 00:00:00",
+            "0001-12-31 00:00:00 BC",
+            interval(0, 1, 0),
+        ),
+    ] {
+        let sql = format!("SELECT age(TIMESTAMP '{a}', TIMESTAMP '{b}')");
+        assert_eq!(scalar(&conn, &sql), expected, "{sql}");
+    }
+    assert_eq!(
+        scalar(&conn, "SELECT age(DATE '2024-03-31', DATE '2023-12-31')"),
+        interval(3, 0, 0)
+    );
+}
+
+#[test]
+fn make_functions_check_fields_as_postgresql() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    // PostgreSQL 17's answers. A negative year is BC.
+    for (sql, expected) in [
+        ("SELECT make_date(-44, 3, 15)", "0044-03-15 BC"),
+        ("SELECT make_date(-1, 12, 31)", "0001-12-31 BC"),
+        (
+            "SELECT make_timestamp(-44, 3, 15, 12, 0, 0)",
+            "0044-03-15 12:00:00 BC",
+        ),
+        (
+            "SELECT make_timestamp(2024, 2, 29, 23, 59, 59.999999)",
+            "2024-02-29 23:59:59.999999",
+        ),
+        ("SELECT make_time(24, 0, 0)", "24:00:00"),
+        ("SELECT make_time(23, 59, 60)", "24:00:00"),
+    ] {
+        assert_eq!(scalar(&conn, sql).to_string(), expected, "{sql}");
+    }
+    let interval = |months, days, micros| Value::Interval {
+        months,
+        days,
+        micros,
+    };
+    for (sql, expected) in [
+        (
+            "SELECT make_time(10, 30, 15.5)",
+            Value::Time(37_815_500_000),
+        ),
+        // Seconds round to the microsecond before the range check.
+        (
+            "SELECT make_time(10, 30, 59.9999999)",
+            Value::Time(37_860_000_000),
+        ),
+        (
+            "SELECT make_time(23, 59, 60.0000001)",
+            Value::Time(86_400_000_000),
+        ),
+        (
+            "SELECT make_time(10, 30, 0.0000025)",
+            Value::Time(37_800_000_002),
+        ),
+        (
+            "SELECT make_interval(1, 2, 3, 4, 5, 6, 7.5)",
+            interval(14, 25, 18_367_500_000),
+        ),
+        // Seconds round to the microsecond, an exact half to even.
+        (
+            "SELECT make_interval(0, 0, 0, 0, 0, 0, 0.0000025)",
+            interval(0, 0, 2),
+        ),
+        (
+            "SELECT make_interval(0, 0, 0, 0, 0, 0, 0.0000125)",
+            interval(0, 0, 12),
+        ),
+        (
+            "SELECT make_interval(0, 0, 0, 0, 0, 0, -0.0000025)",
+            interval(0, 0, -2),
+        ),
+        (
+            "SELECT make_interval(0, 0, 0, 0, 0, 0, 1.0000015)",
+            interval(0, 0, 1_000_002),
+        ),
+        (
+            "SELECT make_interval(0, 2147483647)",
+            interval(i32::MAX, 0, 0),
+        ),
+        (
+            "SELECT make_interval(0, 0, 306783378, 1)",
+            interval(0, i32::MAX, 0),
+        ),
+    ] {
+        assert_eq!(scalar(&conn, sql), expected, "{sql}");
+    }
+    for sql in [
+        "SELECT make_date(0, 1, 1)",
+        "SELECT make_date(2024, 13, 1)",
+        "SELECT make_date(2024, 2, 30)",
+        "SELECT make_date(2024, 258, 1)",
+        "SELECT make_timestamp(0, 1, 1, 0, 0, 0)",
+    ] {
+        match conn.query(sql) {
+            Err(SqlError::InvalidDateLiteral(message)) => {
+                assert!(
+                    message.contains("date field value out of range"),
+                    "{sql}: {message}"
+                )
+            }
+            other => panic!("{sql}: {other:?}"),
+        }
+    }
+    for sql in [
+        "SELECT make_time(24, 0, 0.5)",
+        "SELECT make_time(10, 60, 0)",
+        "SELECT make_time(-1, 0, 0)",
+        "SELECT make_time(280, 0, 0)",
+        "SELECT make_time(10, 30, -0.5)",
+        "SELECT make_time(10, 30, 60.5)",
+        "SELECT make_time(10, 30, CAST('NaN' AS REAL))",
+        "SELECT make_timestamp(2024, 1, 1, 25, 0, 0)",
+        "SELECT make_timestamp(2024, 1, 1, 10, 30, -0.5)",
+    ] {
+        match conn.query(sql) {
+            Err(SqlError::InvalidTimeLiteral(message)) => {
+                assert!(
+                    message.contains("time field value out of range"),
+                    "{sql}: {message}"
+                )
+            }
+            other => panic!("{sql}: {other:?}"),
+        }
+    }
+    for sql in [
+        "SELECT make_interval(178956971)",
+        "SELECT make_interval(1, 2147483647)",
+        "SELECT make_interval(0, 0, 306783379)",
+        "SELECT make_interval(0, 0, 0, 0, 2562047789)",
+        "SELECT make_interval(0, 0, 0, 0, 0, 0, 1e300)",
+        "SELECT make_interval(1e300)",
+        "SELECT make_interval(CAST('NaN' AS REAL))",
+    ] {
+        assert_invalid(&conn, sql, "interval out of range");
+    }
+}
+
 #[test]
 fn timezone_names_returns_rows() {
     let dir = tempfile::tempdir().unwrap();

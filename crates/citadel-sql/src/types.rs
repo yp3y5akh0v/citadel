@@ -249,13 +249,11 @@ impl Value {
             (Value::Integer(n), DataType::Timestamp) => {
                 n.checked_mul(1_000_000).map(Value::Timestamp)
             }
-            (Value::Integer(n), DataType::Date) => {
-                if n >= i32::MIN as i64 && n <= i32::MAX as i64 {
-                    Some(Value::Date(n as i32))
-                } else {
-                    None
-                }
-            }
+            // Days since 1970; the day counts reserved for ±infinity are not days.
+            (Value::Integer(n), DataType::Date) => i32::try_from(n)
+                .ok()
+                .filter(|d| !crate::datetime::is_infinity_date(*d))
+                .map(Value::Date),
             (Value::Integer(n), DataType::Time) => {
                 if (0..=86_400_000_000).contains(&n) {
                     Some(Value::Time(n))
@@ -274,20 +272,19 @@ impl Value {
                     None
                 }
             }
-            (Value::Timestamp(t), DataType::Integer) => Some(Value::Integer(t / 1_000_000)),
-            (Value::Date(d), DataType::Integer) => Some(Value::Integer(d as i64)),
+            // Infinity has no count of seconds or days.
+            (Value::Timestamp(t), DataType::Integer) => {
+                (!crate::datetime::is_infinity_ts(t)).then(|| Value::Integer(t / 1_000_000))
+            }
+            (Value::Date(d), DataType::Integer) => {
+                (!crate::datetime::is_infinity_date(d)).then(|| Value::Integer(d as i64))
+            }
             (Value::Time(t), DataType::Integer) => Some(Value::Integer(t)),
             (Value::Date(d), DataType::Timestamp) => {
-                (d as i64).checked_mul(86_400_000_000).map(Value::Timestamp)
+                crate::datetime::date_to_ts(d).ok().map(Value::Timestamp)
             }
             (Value::Timestamp(t), DataType::Date) => {
-                // div_euclid floors correctly for negative µs (pre-1970).
-                let days = t.div_euclid(86_400_000_000);
-                if days >= i32::MIN as i64 && days <= i32::MAX as i64 {
-                    Some(Value::Date(days as i32))
-                } else {
-                    None
-                }
+                Some(Value::Date(crate::datetime::ts_to_date_floor(t)))
             }
             (v, DataType::Text)
                 if matches!(
@@ -378,20 +375,14 @@ impl Value {
             | (Value::Json(_), DataType::Text)
             | (Value::Jsonb(_), DataType::Json)
             | (Value::Jsonb(_), DataType::Text) => self.clone().coerce_into(target),
-            (Value::Date(d), DataType::Timestamp) => (*d as i64)
-                .checked_mul(86_400_000_000)
-                .map(Value::Timestamp),
-            (Value::Timestamp(t), DataType::Date) => {
-                if t % 86_400_000_000 == 0 {
-                    let days = t.div_euclid(86_400_000_000);
-                    if days >= i32::MIN as i64 && days <= i32::MAX as i64 {
-                        Some(Value::Date(days as i32))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
+            (Value::Date(d), DataType::Timestamp) => {
+                crate::datetime::date_to_ts(*d).ok().map(Value::Timestamp)
+            }
+            // Only midnight converts without loss; infinity is its own midnight.
+            (Value::Timestamp(t), DataType::Date)
+                if crate::datetime::is_infinity_ts(*t) || t % 86_400_000_000 == 0 =>
+            {
+                Some(Value::Date(crate::datetime::ts_to_date_floor(*t)))
             }
             _ => None,
         }
