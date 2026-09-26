@@ -8,7 +8,7 @@ use crate::error::{Result, SqlError};
 use crate::types::Value;
 use jiff::civil::{Date as JDate, DateTime as JDateTime, Time as JTime};
 use jiff::tz::TimeZone;
-use jiff::{Span, Timestamp as JTimestamp, Unit, Zoned};
+use jiff::{Timestamp as JTimestamp, Unit, Zoned};
 
 pub const MICROS_PER_SEC: i64 = 1_000_000;
 pub const MICROS_PER_MIN: i64 = 60 * MICROS_PER_SEC;
@@ -82,7 +82,7 @@ pub fn days_to_ymd(days: i32) -> (i32, u8, u8) {
 /// Convert (year, month, day) Gregorian to i32 days-since-1970. `None` for a
 /// day that does not exist, or one outside the finite DATE range.
 pub fn ymd_to_days(y: i32, m: u8, d: u8) -> Option<i32> {
-    if !(1..=12).contains(&m) || d == 0 || d > days_in_month(y, m) {
+    if !(1..=12).contains(&m) || d == 0 || d > days_in_month(i64::from(y), m) {
         return None;
     }
     i32::try_from(days_from_civil(i64::from(y), m, d))
@@ -207,14 +207,9 @@ pub fn parse_time(s: &str) -> Result<i64> {
         .or_else(|_| JTime::strptime("%H:%M:%S", trimmed))
         .or_else(|_| JTime::strptime("%H:%M", trimmed))
         .map_err(|e| SqlError::InvalidTimeLiteral(format!("{trimmed}: {e}")))?;
-    let subsec_micros = (t.subsec_nanosecond() / 1000) as u32;
-    hmsn_to_micros(
-        t.hour() as u8,
-        t.minute() as u8,
-        t.second() as u8,
-        subsec_micros,
-    )
-    .ok_or_else(|| SqlError::InvalidTimeLiteral(format!("{trimmed}: out of range")))
+    let seconds = i64::from(t.hour()) * 3_600 + i64::from(t.minute()) * 60 + i64::from(t.second());
+    // A fraction that rounds up past 23:59:59 gives 24:00:00, the last time of day.
+    Ok(seconds * MICROS_PER_SEC + fraction_micros(t.subsec_nanosecond()))
 }
 
 /// Parse an ISO 8601 TIMESTAMP literal (naive `YYYY-MM-DD[T ]HH:MM:SS[.ffffff]` or with offset/zone).
@@ -242,13 +237,15 @@ pub fn parse_timestamp(s: &str) -> Result<i64> {
     // Try fully-qualified (Zoned with IANA zone or offset). BC+zone combos are rare; skip if BC.
     if !is_bc {
         if let Ok(z) = body.parse::<Zoned>() {
-            reject_year_zero_ts(z.timestamp().as_microsecond())?;
-            return Ok(z.timestamp().as_microsecond());
+            let micros = zoned_micros(&z);
+            reject_year_zero_ts(micros)?;
+            return Ok(micros);
         }
         // Try as bare RFC 3339 / ISO 8601 with offset / Z.
         if let Ok(ts) = body.parse::<JTimestamp>() {
-            reject_year_zero_ts(ts.as_microsecond())?;
-            return Ok(ts.as_microsecond());
+            let micros = zoned_micros(&ts.to_zoned(TimeZone::UTC));
+            reject_year_zero_ts(micros)?;
+            return Ok(micros);
         }
     }
 
@@ -265,11 +262,7 @@ pub fn parse_timestamp(s: &str) -> Result<i64> {
     ];
     for fmt in &parsers {
         if let Ok(dt) = JDateTime::strptime(fmt, body) {
-            let adjusted = apply_bc_and_check_year_zero(dt, is_bc, body)?;
-            return adjusted
-                .to_zoned(TimeZone::UTC)
-                .map(|z| z.timestamp().as_microsecond())
-                .map_err(|e| SqlError::InvalidTimestampLiteral(format!("{body}: {e}")));
+            return Ok(civil_micros(apply_bc_and_check_year_zero(dt, is_bc, body)?));
         }
     }
     // Also try "IANA-zone-suffix" parsing: e.g. "2024-01-15 12:00:00 America/New_York".
@@ -288,7 +281,7 @@ pub fn parse_timestamp(s: &str) -> Result<i64> {
                         }
                         return dt
                             .to_zoned(tz.clone())
-                            .map(|z| z.timestamp().as_microsecond())
+                            .map(|z| zoned_micros(&z))
                             .map_err(|e| {
                                 SqlError::InvalidTimestampLiteral(format!("{body}: {e}"))
                             });
@@ -300,6 +293,27 @@ pub fn parse_timestamp(s: &str) -> Result<i64> {
     Err(SqlError::InvalidTimestampLiteral(format!(
         "{trimmed}: unrecognized timestamp format"
     )))
+}
+
+/// A parsed fraction of a second in whole microseconds, as PostgreSQL rounds
+/// it: rint of the fraction times 10^6, in f64. 1,000,000 carries a second.
+fn fraction_micros(nanos: i32) -> i64 {
+    (f64::from(nanos) / 1e9 * 1e6).round_ties_even() as i64
+}
+
+/// Microseconds since 1970 of a UTC civil date and time, computed with the
+/// calendar arithmetic rather than a jiff timestamp, whose range stops short
+/// of the civil one (9999-12-30 22:00 UTC).
+fn civil_micros(dt: JDateTime) -> i64 {
+    let days = days_from_civil(i64::from(dt.year()), dt.month() as u8, dt.day() as u8);
+    let seconds =
+        i64::from(dt.hour()) * 3_600 + i64::from(dt.minute()) * 60 + i64::from(dt.second());
+    days * MICROS_PER_DAY + seconds * MICROS_PER_SEC + fraction_micros(dt.subsec_nanosecond())
+}
+
+/// The instant of a zoned time, its fraction rounded as [`fraction_micros`].
+fn zoned_micros(z: &Zoned) -> i64 {
+    civil_micros(z.datetime()) - i64::from(z.offset().seconds()) * MICROS_PER_SEC
 }
 
 fn reject_year_zero_ts(micros: i64) -> Result<()> {
@@ -976,38 +990,28 @@ pub fn current_time_micros() -> Result<i64> {
 }
 
 pub fn add_interval_to_timestamp(ts: i64, months: i32, days: i32, micros: i64) -> Result<i64> {
-    if ts == TS_INFINITY_MICROS || ts == TS_NEG_INFINITY_MICROS {
+    if is_infinity_ts(ts) {
         return Ok(ts);
     }
-    let jts =
-        JTimestamp::from_microsecond(ts).map_err(|e| SqlError::InvalidValue(format!("ts: {e}")))?;
     // PG order: the months (keeping the day inside the month), then the days,
-    // then the time, each with its own sign. One jiff span has a single sign,
-    // so '1 month -1 day' cannot be one span.
-    let mut zoned = jts.to_zoned(TimeZone::UTC);
+    // then the time, each with its own sign.
+    let (date_days, time) = ts_split(ts);
+    let mut day = i64::from(date_days);
     if months != 0 {
-        let span = Span::new()
-            .try_months(months as i64)
-            .map_err(|e| SqlError::InvalidValue(format!("months overflow: {e}")))?;
-        zoned = zoned
-            .checked_add(span)
-            .map_err(|_| SqlError::IntegerOverflow)?;
+        let (year, month, day_of_month) = civil_from_days(day);
+        let month_count = year * 12 + i64::from(month) - 1 + i64::from(months);
+        let (year, month) = (
+            month_count.div_euclid(12),
+            month_count.rem_euclid(12) as u8 + 1,
+        );
+        day = days_from_civil(year, month, day_of_month.min(days_in_month(year, month)));
     }
-    if days != 0 {
-        let span = Span::new()
-            .try_days(days as i64)
-            .map_err(|e| SqlError::InvalidValue(format!("days overflow: {e}")))?;
-        zoned = zoned
-            .checked_add(span)
-            .map_err(|_| SqlError::IntegerOverflow)?;
-    }
-    let result = zoned
-        .timestamp()
-        .as_microsecond()
-        .checked_add(micros)
-        .ok_or(SqlError::IntegerOverflow)?;
-    JTimestamp::from_microsecond(result).map_err(|_| SqlError::IntegerOverflow)?;
-    Ok(result)
+    day.checked_add(i64::from(days))
+        .and_then(|day| day.checked_mul(MICROS_PER_DAY))
+        .and_then(|midnight| midnight.checked_add(time))
+        .and_then(|ts| ts.checked_add(micros))
+        .filter(|ts| !is_infinity_ts(*ts))
+        .ok_or_else(|| SqlError::InvalidValue("timestamp out of range".into()))
 }
 
 /// PG rule: DATE + INTERVAL always yields TIMESTAMP.
@@ -1091,7 +1095,7 @@ pub fn age(ts_a: i64, ts_b: i64) -> Result<(i32, i32, i64)> {
         days -= 1;
     }
     while days < 0 {
-        days += i64::from(days_in_month(earlier_year, earlier_month));
+        days += i64::from(days_in_month(i64::from(earlier_year), earlier_month));
         months -= 1;
     }
     while months < 0 {
@@ -1104,7 +1108,7 @@ pub fn age(ts_a: i64, ts_b: i64) -> Result<(i32, i32, i64)> {
 }
 
 /// Days in `month` of the astronomical `year`, in the proleptic Gregorian calendar.
-fn days_in_month(year: i32, month: u8) -> u8 {
+fn days_in_month(year: i64, month: u8) -> u8 {
     let leap = year.rem_euclid(4) == 0 && (year.rem_euclid(100) != 0 || year.rem_euclid(400) == 0);
     match month {
         4 | 6 | 9 | 11 => 30,
