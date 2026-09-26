@@ -61,9 +61,8 @@ impl SortOrder {
     }
 
     fn compare(self, left: &Value, right: &Value) -> std::cmp::Ordering {
-        self.compare_by(left.is_null(), right.is_null(), || match (left, right) {
-            (Value::Text(left), Value::Text(right)) => self.collation.cmp_text(left, right),
-            _ => left.cmp(right),
+        self.compare_by(left.is_null(), right.is_null(), || {
+            self.collation.cmp_value(left, right)
         })
     }
 
@@ -81,7 +80,7 @@ impl SortOrder {
             (RawColumn::Text(left), Value::Text(right)) => self.collation.cmp_text(left, right),
             _ => match left.cmp_value(right)? {
                 Some(ordering) => ordering,
-                None => left.to_value()?.cmp(right),
+                None => self.collation.cmp_value(&left.to_value()?, right),
             },
         };
         Ok(if self.descending {

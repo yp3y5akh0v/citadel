@@ -1424,7 +1424,10 @@ impl<'a> RawColumn<'a> {
                     days: bd,
                     micros: bu,
                 },
-            ) => Some(am.cmp(bm).then(ad.cmp(bd)).then(au.cmp(bu))),
+            ) => Some(crate::datetime::pg_normalized_interval_cmp(
+                (*am, *ad, *au),
+                (*bm, *bd, *bu),
+            )),
             (RawColumn::Json(a), Value::Json(b)) => Some((*a).cmp(b.as_str())),
             (RawColumn::Jsonb(a), Value::Jsonb(b)) => Some((*a).cmp(b.as_ref())),
             (RawColumn::TsVector(a), Value::TsVector(b)) => Some((*a).cmp(b.as_ref())),
@@ -1459,7 +1462,8 @@ impl<'a> RawColumn<'a> {
                     days: bd,
                     micros: bu,
                 },
-            ) => am == bm && ad == bd && au == bu,
+            ) => crate::datetime::pg_normalized_interval_cmp((*am, *ad, *au), (*bm, *bd, *bu))
+                .is_eq(),
             (RawColumn::Json(a), Value::Json(b)) => *a == b.as_str(),
             (RawColumn::Jsonb(a), Value::Jsonb(b)) => *a == b.as_ref(),
             (RawColumn::TsVector(a), Value::TsVector(b)) => *a == b.as_ref(),

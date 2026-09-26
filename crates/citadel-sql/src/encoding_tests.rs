@@ -667,6 +667,33 @@ fn raw_column_cmp_value() {
 }
 
 #[test]
+fn raw_interval_comparisons_use_normalized_length() {
+    use std::cmp::Ordering;
+    let month = RawColumn::Interval {
+        months: 1,
+        days: 0,
+        micros: 0,
+    };
+    let interval = |months, days, micros| Value::Interval {
+        months,
+        days,
+        micros,
+    };
+    // A month counts 30 days, as the SQL operators compare intervals.
+    for (other, order) in [
+        (interval(1, 0, 0), Ordering::Equal),
+        (interval(0, 30, 0), Ordering::Equal),
+        (interval(0, 0, 30 * 86_400_000_000), Ordering::Equal),
+        (interval(0, 31, 0), Ordering::Less),
+        (interval(0, 29, 0), Ordering::Greater),
+        (interval(-1, 61, 0), Ordering::Less),
+    ] {
+        assert_eq!(month.cmp_value(&other).unwrap(), Some(order), "{other:?}");
+        assert_eq!(month.eq_value(&other).unwrap(), order.is_eq(), "{other:?}");
+    }
+}
+
+#[test]
 fn raw_column_as_numeric() {
     assert_eq!(RawColumn::Integer(42).as_i64(), Some(42));
     assert_eq!(RawColumn::Integer(42).as_f64(), Some(42.0));

@@ -1551,7 +1551,7 @@ fn try_inverted_index_only_with_read(
     };
 
     if !stmt.order_by.is_empty() {
-        let order_cols: Vec<(usize, bool)> = stmt
+        let order_cols: Vec<(usize, bool, Collation)> = stmt
             .order_by
             .iter()
             .map(|o| {
@@ -1569,15 +1569,19 @@ fn try_inverted_index_only_with_read(
                     .iter()
                     .position(|&p| p == pk_pos)
                     .unwrap_or(usize::MAX);
-                (out_pos, o.descending)
+                (
+                    out_pos,
+                    o.descending,
+                    table_schema.columns[schema_idx].collation,
+                )
             })
             .collect();
-        if order_cols.iter().any(|&(p, _)| p == usize::MAX) {
+        if order_cols.iter().any(|&(p, _, _)| p == usize::MAX) {
             return Ok(None);
         }
         result_rows = sort_vec_by(result_rows, cancel, |a, b| {
-            for &(pos, desc) in &order_cols {
-                let cmp = a[pos].cmp(&b[pos]);
+            for &(pos, desc, collation) in &order_cols {
+                let cmp = collation.cmp_value(&a[pos], &b[pos]);
                 if cmp != std::cmp::Ordering::Equal {
                     return if desc { cmp.reverse() } else { cmp };
                 }

@@ -107,6 +107,55 @@ fn fts_index_query_returns_correct_rows() {
 }
 
 #[test]
+fn fts_index_query_orders_keys_as_the_general_path_does() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    for sql in [
+        "CREATE TABLE docs (name TEXT COLLATE NOCASE PRIMARY KEY, body TEXT)",
+        "CREATE INDEX docs_body ON docs USING fts (body)",
+        "INSERT INTO docs VALUES ('b', 'quick fox'), ('A', 'lazy fox'), ('C', 'red fox'), \
+         ('a2', 'dog')",
+        "CREATE TABLE spans (k INTERVAL PRIMARY KEY, body TEXT)",
+        "CREATE INDEX spans_body ON spans USING fts (body)",
+        "INSERT INTO spans VALUES (INTERVAL '1 month', 'quick fox'), \
+         (INTERVAL '31 days', 'lazy fox'), (INTERVAL '29 days', 'red fox')",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+    let rows = |sql: &str| conn.query(sql).unwrap().rows;
+    // The index alone answers the search; `AND key IS NOT NULL` takes the general path.
+    for (select, key) in [
+        ("SELECT name FROM docs", "name"),
+        ("SELECT k FROM spans", "k"),
+    ] {
+        for direction in ["", " DESC"] {
+            let search = format!("{select} WHERE body @@ to_tsquery('fox')");
+            let indexed = format!("{search} ORDER BY {key}{direction}");
+            let general = format!("{search} AND {key} IS NOT NULL ORDER BY {key}{direction}");
+            assert_eq!(rows(&indexed), rows(&general), "{indexed}");
+        }
+    }
+    let text = |s: &str| vec![Value::Text(s.into())];
+    assert_eq!(
+        rows("SELECT name FROM docs WHERE body @@ to_tsquery('fox') ORDER BY name"),
+        vec![text("A"), text("b"), text("C")]
+    );
+    let interval = |months, days| {
+        vec![Value::Interval {
+            months,
+            days,
+            micros: 0,
+        }]
+    };
+    // A month counts 30 days.
+    assert_eq!(
+        rows("SELECT k FROM spans WHERE body @@ to_tsquery('fox') ORDER BY k"),
+        vec![interval(0, 29), interval(1, 0), interval(0, 31)]
+    );
+}
+
+#[test]
 fn fts_index_maintained_on_update_and_delete() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());

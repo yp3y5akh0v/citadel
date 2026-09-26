@@ -1627,7 +1627,7 @@ pub(super) fn compare_flat_key(
             }
         }
         (false, false) => {
-            let cmp = a.cmp(b);
+            let cmp = a.sql_cmp(b);
             if desc {
                 cmp.reverse()
             } else {
@@ -1721,7 +1721,7 @@ pub(super) fn compare_collated_key(
             };
         }
         (CollatedKey::Text(x), CollatedKey::Text(y)) => x.as_bytes().cmp(y.as_bytes()),
-        _ => fallback_a.cmp(fallback_b),
+        _ => fallback_a.sql_cmp(fallback_b),
     };
     if desc {
         ord.reverse()
@@ -1818,15 +1818,7 @@ pub(super) fn compare_sort_keys(
                     .get(i)
                     .copied()
                     .unwrap_or(crate::types::Collation::Binary);
-                let cmp = if coll != crate::types::Collation::Binary {
-                    if let (Value::Text(x), Value::Text(y)) = (&a[i], &b[i]) {
-                        coll.cmp_text(x, y)
-                    } else {
-                        a[i].cmp(&b[i])
-                    }
-                } else {
-                    a[i].cmp(&b[i])
-                };
+                let cmp = coll.cmp_value(&a[i], &b[i]);
                 if item.descending {
                     cmp.reverse()
                 } else {
