@@ -2,7 +2,8 @@ use citadel::{Argon2Profile, Database, DatabaseBuilder};
 use citadel_sql::executor::{exec_insert_in_txn, execute, execute_in_txn};
 use citadel_sql::parser::{parse_sql, Statement};
 use citadel_sql::schema::SchemaManager;
-use citadel_sql::{Connection, SqlError, Value};
+use citadel_sql::types::{Collation, IndexKey};
+use citadel_sql::{Connection, ExecutionResult, SqlError, Value};
 
 fn database() -> Database {
     DatabaseBuilder::new("")
@@ -680,4 +681,170 @@ fn stale_writer_maintains_new_pk_replacement_and_indexed_writes_do_not_scan_rows
             .unwrap();
         assert_eq!(scans.rows_scanned(), 0);
     }
+}
+
+fn interval(months: i32, days: i32, micros: i64) -> Value {
+    Value::Interval {
+        months,
+        days,
+        micros,
+    }
+}
+
+#[test]
+fn interval_keys_reject_values_of_equal_length() {
+    let db = database();
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE spans (v INTERVAL PRIMARY KEY, n INTEGER, w INTERVAL UNIQUE)")
+        .unwrap();
+    conn.execute("INSERT INTO spans VALUES (INTERVAL '1 day', 1, INTERVAL '1 month')")
+        .unwrap();
+    for sql in [
+        "INSERT INTO spans VALUES (INTERVAL '24 hours', 2, NULL)",
+        "INSERT INTO spans VALUES (INTERVAL '2 days', 2, NULL), (INTERVAL '86400 seconds', 3, NULL)",
+        "INSERT INTO spans SELECT INTERVAL '24 hours', 2, NULL",
+    ] {
+        assert!(
+            matches!(conn.execute(sql), Err(SqlError::DuplicateKey)),
+            "{sql}"
+        );
+    }
+    for spelling in ["30 days", "720 hours"] {
+        let sql = format!("INSERT INTO spans VALUES (INTERVAL '2 days', 2, INTERVAL '{spelling}')");
+        assert!(
+            matches!(conn.execute(&sql), Err(SqlError::UniqueViolation(_))),
+            "{sql}"
+        );
+    }
+    conn.execute("INSERT INTO spans VALUES (INTERVAL '2 days', 2, INTERVAL '31 days')")
+        .unwrap();
+    conn.execute(
+        "INSERT INTO spans VALUES (INTERVAL '24 hours', 3, NULL) \
+         ON CONFLICT (v) DO UPDATE SET n = excluded.n",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO spans VALUES (INTERVAL '86400 seconds', 4, NULL) ON CONFLICT DO NOTHING",
+    )
+    .unwrap();
+    assert_eq!(
+        conn.query("SELECT v, n, w FROM spans ORDER BY n")
+            .unwrap()
+            .rows,
+        vec![
+            vec![interval(0, 2, 0), Value::Integer(2), interval(0, 31, 0)],
+            vec![interval(0, 1, 0), Value::Integer(3), interval(1, 0, 0)],
+        ]
+    );
+    conn.execute("ALTER TABLE spans ADD COLUMN x INTERVAL")
+        .unwrap();
+    conn.execute("CREATE UNIQUE INDEX spans_x ON spans (x)")
+        .unwrap();
+    conn.execute("UPDATE spans SET x = INTERVAL '1 day' WHERE n = 2")
+        .unwrap();
+    assert!(matches!(
+        conn.execute("UPDATE spans SET x = INTERVAL '24 hours' WHERE n = 3"),
+        Err(SqlError::UniqueViolation(_))
+    ));
+    for sql in [
+        "CREATE TABLE exact (v INTERVAL COLLATE BINARY)",
+        "ALTER TABLE spans ADD COLUMN y INTERVAL COLLATE NOCASE",
+        "CREATE INDEX spans_w_exact ON spans (w COLLATE BINARY)",
+    ] {
+        match conn.execute(sql) {
+            Err(SqlError::Unsupported(message)) => assert_eq!(
+                message, "collations are not supported by type INTERVAL",
+                "{sql}"
+            ),
+            other => panic!("{sql}: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn interval_keys_stored_under_binary_keep_exact_fields() {
+    let db = database();
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE spans (v INTERVAL PRIMARY KEY, w INTERVAL UNIQUE)")
+        .unwrap();
+    let mut schema = conn.table_schema("spans").unwrap();
+    drop(conn);
+    // The catalog of a table whose interval keys hold exact fields.
+    let mut write = db.begin_write().unwrap();
+    write
+        .drop_table(&citadel_sql::TableSchema::index_table_name(
+            "spans",
+            "__pk_spans",
+        ))
+        .unwrap();
+    schema.indices.retain(|index| index.name != "__pk_spans");
+    for column in &mut schema.columns {
+        column.collation = Collation::Binary;
+    }
+    for key in schema.indices.iter_mut().flat_map(|index| &mut index.keys) {
+        if let IndexKey::Column { collate, .. } = key {
+            *collate = Collation::Binary;
+        }
+    }
+    SchemaManager::save_schema(&mut write, &schema).unwrap();
+    write.commit().unwrap();
+
+    let conn = Connection::open(&db).unwrap();
+    conn.execute(
+        "INSERT INTO spans VALUES (INTERVAL '1 day', INTERVAL '1 month'), \
+         (INTERVAL '24 hours', INTERVAL '30 days')",
+    )
+    .unwrap();
+    for sql in [
+        "SELECT COUNT(*) FROM spans WHERE v = INTERVAL '86400 seconds'",
+        "SELECT COUNT(*) FROM spans WHERE w = INTERVAL '720 hours'",
+    ] {
+        assert_eq!(
+            conn.query(sql).unwrap().rows,
+            vec![vec![Value::Integer(2)]],
+            "{sql}"
+        );
+    }
+    for sql in [
+        "UPDATE spans SET w = NULL WHERE v = INTERVAL '86400 seconds'",
+        "DELETE FROM spans WHERE v = INTERVAL '1 day'",
+    ] {
+        assert!(
+            matches!(conn.execute(sql), Ok(ExecutionResult::RowsAffected(2))),
+            "{sql}"
+        );
+    }
+    let schema = conn.table_schema("spans").unwrap();
+    assert!(schema
+        .columns
+        .iter()
+        .all(|column| column.collation == Collation::Binary));
+    assert_eq!(schema.indices.len(), 1);
+}
+
+#[test]
+fn materialized_interval_columns_key_by_length() {
+    let db = database();
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE s (id INTEGER PRIMARY KEY, v INTERVAL)")
+        .unwrap();
+    conn.execute("INSERT INTO s VALUES (1, INTERVAL '1 day'), (2, INTERVAL '24 hours')")
+        .unwrap();
+    for key in ["v", "v * 1"] {
+        let sql = format!("CREATE MATERIALIZED VIEW by_length AS SELECT {key} AS k, id FROM s");
+        assert!(
+            matches!(conn.execute(&sql), Err(SqlError::DuplicateKey)),
+            "{sql}"
+        );
+    }
+    conn.execute("CREATE MATERIALIZED VIEW by_id AS SELECT id, v FROM s")
+        .unwrap();
+    assert!(matches!(
+        conn.execute("CREATE UNIQUE INDEX by_id_v ON by_id (v)"),
+        Err(SqlError::UniqueViolation(_))
+    ));
+    // Cast to text, an interval's length no longer decides its key.
+    conn.execute("CREATE MATERIALIZED VIEW by_text AS SELECT CAST(v AS TEXT) AS t, id FROM s")
+        .unwrap();
+    assert!(conn.table_schema("by_text").unwrap().indices.is_empty());
 }

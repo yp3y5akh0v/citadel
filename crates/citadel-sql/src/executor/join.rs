@@ -229,11 +229,10 @@ fn hash_join_value(value: &Value, collation: Collation, state: &mut FxHasher) {
         crate::datetime::interval_to_total_micros(*months, *days, *micros).hash(state);
     } else if value.holds_interval() {
         Collation::Binary.group_key(value.clone()).hash(state);
+    } else if collation.folds_text() {
+        collation.fold(value.clone()).hash(state);
     } else {
-        match collation {
-            Collation::NoCase | Collation::Rtrim => collation.fold(value.clone()).hash(state),
-            Collation::Binary => value.hash(state),
-        }
+        value.hash(state);
     }
 }
 

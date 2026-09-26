@@ -1347,3 +1347,24 @@ fn bound_columns_preserve_implicit_collation_without_promoting_it() {
     };
     assert_eq!(compile_collation(&case, &literal(), &map), None);
 }
+
+#[test]
+fn interval_length_keys_leave_comparisons_uncollated() {
+    use crate::types::Collation;
+    let mut columns = vec![col("v", DataType::Interval, true, 0)];
+    columns[0].collation = Collation::IntervalLength;
+    let map = ColumnMap::new(&columns);
+    let column = || Expr::Column("v".into());
+    let cast = |data_type| Expr::Cast {
+        expr: Box::new(column()),
+        data_type,
+    };
+    let literal = Expr::Literal(Value::Text("1 day".into()));
+    assert!(!map.has_folding_collation());
+    assert_eq!(compile_collation(&column(), &literal, &map), None);
+    assert_eq!(
+        operand_collation(&cast(DataType::Interval), &map),
+        Some(Collation::IntervalLength)
+    );
+    assert_eq!(operand_collation(&cast(DataType::Text), &map), None);
+}

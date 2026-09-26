@@ -336,3 +336,80 @@ fn binary_override_and_collated_secondary_index_preserve_results() {
         vec![vec![Value::Integer(2)]]
     );
 }
+
+fn interval(months: i32, days: i32, micros: i64) -> Value {
+    Value::Interval {
+        months,
+        days,
+        micros,
+    }
+}
+
+#[test]
+fn interval_keys_find_values_of_equal_length_through_indexes() {
+    let db = database();
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE spans (v INTERVAL PRIMARY KEY, w INTERVAL, n INTEGER)")
+        .unwrap();
+    conn.execute("CREATE INDEX spans_w ON spans (w)").unwrap();
+    conn.execute(
+        "INSERT INTO spans VALUES (INTERVAL '1 day', INTERVAL '1 month', 1), \
+         (INTERVAL '2 days', INTERVAL '30 days', 2), \
+         (INTERVAL '3 days', INTERVAL '31 days', 3), \
+         (INTERVAL '4 days', INTERVAL '720 hours', 4)",
+    )
+    .unwrap();
+    let hour = 3_600_000_000;
+    for begin in [None, Some("BEGIN READ ONLY"), Some("BEGIN")] {
+        if let Some(begin) = begin {
+            conn.execute(begin).unwrap();
+        }
+        for (predicate, index, expected) in [
+            ("v = INTERVAL '24 hours'", "__pk_spans", vec![1]),
+            ("w = INTERVAL '1 month'", "spans_w", vec![1, 2, 4]),
+            ("w > INTERVAL '720 hours'", "spans_w", vec![3]),
+            (
+                "w >= INTERVAL '1 month' AND w < INTERVAL '31 days'",
+                "spans_w",
+                vec![1, 2, 4],
+            ),
+            ("w < INTERVAL '300000 years'", "spans_w", vec![1, 2, 3, 4]),
+        ] {
+            let sql = format!("SELECT n FROM spans WHERE {predicate} ORDER BY n");
+            let expected: Vec<_> = expected
+                .into_iter()
+                .map(|n| vec![Value::Integer(n)])
+                .collect();
+            assert_eq!(conn.query(&sql).unwrap().rows, expected, "{begin:?}: {sql}");
+            let plan = conn.query(&format!("EXPLAIN {sql}")).unwrap().rows;
+            assert!(
+                plan.iter().any(|row| matches!(
+                    &row[0],
+                    Value::Text(line) if line.contains(&format!("USING INDEX {index} "))
+                )),
+                "{begin:?}: {sql}: {plan:?}"
+            );
+        }
+        assert_eq!(
+            conn.query("SELECT v, w FROM spans WHERE w = INTERVAL '30 days' AND n = 4")
+                .unwrap()
+                .rows,
+            vec![vec![interval(0, 4, 0), interval(0, 0, 720 * hour)]]
+        );
+        if begin.is_some() {
+            conn.execute("ROLLBACK").unwrap();
+        }
+    }
+    assert_eq!(
+        conn.prepare("SELECT n FROM spans WHERE w = $1 ORDER BY n")
+            .unwrap()
+            .query_collect(&[interval(0, 0, 720 * hour)])
+            .unwrap()
+            .rows,
+        vec![
+            vec![Value::Integer(1)],
+            vec![Value::Integer(2)],
+            vec![Value::Integer(4)]
+        ]
+    );
+}

@@ -2,7 +2,9 @@
 
 use crate::encoding::encode_composite_key;
 use crate::parser::{BinOp, Expr};
-use crate::types::{DataType, IndexDef, IndexKey, IndexKind, InvertedKind, TableSchema, Value};
+use crate::types::{
+    Collation, DataType, IndexDef, IndexKey, IndexKind, InvertedKind, TableSchema, Value,
+};
 
 /// Normalize comparison bounds for typed key encoding.
 pub(crate) fn key_predicate(
@@ -95,7 +97,7 @@ enum CanonicalExpr {
     },
     Collate {
         expr: Box<CanonicalExpr>,
-        collation: crate::types::Collation,
+        collation: Collation,
     },
     Other(String),
 }
@@ -669,8 +671,6 @@ fn try_pk_prefix_scan(
     expressions: &[&Expr],
     predicates: &[Option<SimplePredicate>],
 ) -> Option<ScanPlan> {
-    use crate::types::{Collation, DataType};
-
     let mut prefix_values = Vec::new();
     for &column in &schema.primary_key_columns {
         if schema.primary_key_columns[..prefix_values.len()].contains(&column) {
@@ -713,7 +713,7 @@ fn try_pk_prefix_scan(
                     | DataType::Time
                     | DataType::Timestamp
             )
-            || (definition.data_type == DataType::Text && definition.collation != Collation::Binary)
+            || definition.key_collation() != Collation::Binary
         {
             break;
         }
@@ -870,8 +870,8 @@ pub(crate) fn index_scan_preserves_pk_order(schema: &TableSchema, plan: &ScanPla
     index.kind == IndexKind::BTree
         && index.is_pure_column_index()
         && index_columns.get(*num_prefix_cols) == Some(primary)
-        && schema.columns[*primary as usize].collation == crate::types::Collation::Binary
-        && index.collation_at(*num_prefix_cols) == crate::types::Collation::Binary
+        && schema.columns[*primary as usize].collation == Collation::Binary
+        && index.collation_at(*num_prefix_cols) == Collation::Binary
 }
 
 /// Proven non-NULL result types whose equality probes use typed key encoding.
@@ -946,17 +946,18 @@ fn try_expr_index_scan(
                 canonicalize(expr_side) == canonical_key
             };
             if matches_key {
-                let value = key_predicate(key_type, BinOp::Eq, &resolve_literal(value_side)?)?.1;
                 let collation = idx.collation_at(0);
+                let literal = resolve_literal(value_side)?;
+                let (_, value) = index_key_bound(key_type, collation, BinOp::Eq, &literal)?;
                 if matches!(value, Value::Text(_)) {
                     let comparison =
                         crate::eval::compile_collation(left, right, schema.column_map())
-                            .unwrap_or(crate::types::Collation::Binary);
+                            .unwrap_or_default();
                     if comparison != collation {
                         continue;
                     }
                 }
-                matched = Some(fold_probe_value(value, collation));
+                matched = Some(value);
                 break;
             }
         }
@@ -1019,10 +1020,19 @@ fn conjunct_proves_not_null(expr: &Expr, col: &str) -> bool {
     }
 }
 
-/// Fold a probe value the way index keys are folded at write time
-/// (`encode_key_value_collated_into`), so probe bytes match stored key bytes.
-fn fold_probe_value(value: Value, coll: crate::types::Collation) -> Value {
-    coll.fold(value)
+/// Folded the way index keys are folded at write time (`encode_key_value_collated_into`),
+/// so probe bytes match stored key bytes.
+fn index_key_bound(
+    data_type: DataType,
+    coll: Collation,
+    op: BinOp,
+    value: &Value,
+) -> Option<(BinOp, Value)> {
+    match (coll, value) {
+        // Canonical fields order as the lengths they hold.
+        (Collation::IntervalLength, Value::Interval { .. }) => Some((op, coll.fold(value.clone()))),
+        _ => key_predicate(data_type, op, value).map(|(op, value)| (op, coll.fold(value))),
+    }
 }
 
 fn try_index_scan(
@@ -1053,12 +1063,15 @@ fn try_index_scan(
             }
             if let Some(sp) = pred {
                 if sp.col_idx == col_idx as usize && sp.op == BinOp::Eq {
-                    let Some((_, value)) =
-                        key_predicate(schema.columns[col_idx as usize].data_type, sp.op, &sp.value)
-                    else {
+                    let Some((_, value)) = index_key_bound(
+                        schema.columns[col_idx as usize].data_type,
+                        coll,
+                        sp.op,
+                        &sp.value,
+                    ) else {
                         continue;
                     };
-                    equality_values.push(fold_probe_value(value, coll));
+                    equality_values.push(value);
                     used.push(i);
                     found_eq = true;
                     break;
@@ -1072,12 +1085,12 @@ fn try_index_scan(
                 }
                 if let Some(sp) = pred {
                     if sp.col_idx == col_idx as usize && is_range_op(sp.op) {
-                        let (op, value) = key_predicate(
+                        range_conds.push(index_key_bound(
                             schema.columns[col_idx as usize].data_type,
+                            coll,
                             sp.op,
                             &sp.value,
-                        )?;
-                        range_conds.push((op, fold_probe_value(value, coll)));
+                        )?);
                         used.push(i);
                     }
                 }

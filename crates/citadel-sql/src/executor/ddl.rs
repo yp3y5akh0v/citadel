@@ -451,48 +451,37 @@ fn build_index_def_for_create(
     table_schema: &TableSchema,
     name: String,
 ) -> Result<IndexDef> {
-    let mut keys: Vec<crate::types::IndexKey> = Vec::with_capacity(stmt.columns.len());
+    let mut keys = Vec::with_capacity(stmt.columns.len());
     for (i, raw_name) in stmt.columns.iter().enumerate() {
+        let written = stmt.collations.get(i).copied().flatten();
         if let Some(Some((expr, sql))) = stmt.key_exprs.get(i) {
-            if stmt
-                .collations
-                .get(i)
-                .copied()
-                .flatten()
-                .is_some_and(|collation| collation != crate::types::Collation::Binary)
-            {
+            if written.is_some_and(|collation| collation != Collation::Binary) {
                 return Err(SqlError::Unsupported(
                     "expression index keys require BINARY collation".into(),
                 ));
             }
-            keys.push(crate::types::IndexKey::Expr {
+            keys.push(IndexKey::Expr {
                 expr: expr.clone(),
                 original_sql: sql.clone(),
             });
             continue;
         }
-        let lower = raw_name.to_ascii_lowercase();
         let col_idx = table_schema
-            .column_index(&lower)
-            .ok_or_else(|| SqlError::ColumnNotFound(raw_name.clone()))?
-            as u16;
-        if matches!(
-            table_schema.columns[col_idx as usize].generated_kind,
-            Some(crate::parser::GeneratedKind::Virtual)
-        ) {
+            .column_index(&raw_name.to_ascii_lowercase())
+            .ok_or_else(|| SqlError::ColumnNotFound(raw_name.clone()))?;
+        let column = &table_schema.columns[col_idx];
+        if matches!(column.generated_kind, Some(GeneratedKind::Virtual)) {
             return Err(SqlError::Unsupported(format!(
                 "cannot CREATE INDEX on VIRTUAL generated column '{}'",
-                table_schema.columns[col_idx as usize].name
+                column.name
             )));
         }
-        let collate = stmt
-            .collations
-            .get(i)
-            .copied()
-            .flatten()
-            .unwrap_or(table_schema.columns[col_idx as usize].collation);
-        keys.push(crate::types::IndexKey::Column {
-            idx: col_idx,
+        let collate = match written {
+            None => column.collation,
+            written => Collation::for_type(column.data_type, written)?,
+        };
+        keys.push(IndexKey::Column {
+            idx: col_idx as u16,
             collate,
         });
     }

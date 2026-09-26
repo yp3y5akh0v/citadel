@@ -7,7 +7,9 @@ use crate::parser::{
     SelectQuery, SelectStmt,
 };
 use crate::schema::SchemaManager;
-use crate::types::{ColumnDef, DataType, ExecutionResult, MatviewDef, TableSchema, Value};
+use crate::types::{
+    Collation, ColumnDef, DataType, ExecutionResult, MatviewDef, TableSchema, Value,
+};
 
 pub(super) fn exec_create_matview_in_txn(
     wtx: &mut WriteTxn<'_>,
@@ -601,7 +603,7 @@ fn decode_pk_value(key: &[u8]) -> Result<Value> {
 fn derive_columns(
     column_names: &[String],
     rows: &[Vec<Value>],
-    collations: &[crate::types::Collation],
+    collations: &[Collation],
 ) -> Result<Vec<ColumnDef>> {
     let mut seen = rustc_hash::FxHashSet::default();
     column_names
@@ -637,10 +639,10 @@ fn derive_columns(
                 generated_expr: None,
                 generated_sql: None,
                 generated_kind: None,
-                collation: collations
-                    .get(i)
-                    .copied()
-                    .unwrap_or(crate::types::Collation::Binary),
+                collation: data_type
+                    .fixed_collation()
+                    .or_else(|| collations.get(i).copied())
+                    .unwrap_or_default(),
             })
         })
         .collect()

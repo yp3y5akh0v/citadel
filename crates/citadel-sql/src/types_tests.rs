@@ -517,6 +517,42 @@ fn schema_roundtrip_with_indices() {
 }
 
 #[test]
+fn schema_roundtrip_keeps_every_collation() {
+    let keys = [
+        (DataType::Integer, Collation::Binary),
+        (DataType::Text, Collation::NoCase),
+        (DataType::Text, Collation::Rtrim),
+        (DataType::Interval, Collation::IntervalLength),
+    ];
+    let columns = keys
+        .iter()
+        .zip(0..)
+        .map(|(&(data_type, collation), position)| ColumnDef {
+            collation,
+            ..col(&format!("c{position}"), data_type, true, position)
+        })
+        .collect();
+    let collations: Vec<_> = keys.iter().map(|&(_, collation)| collation).collect();
+    let index = IndexDef::from_column_lists(
+        "every_key".into(),
+        (0..4).collect(),
+        collations.clone(),
+        false,
+        None,
+        None,
+        IndexKind::default(),
+    );
+    let schema = TableSchema::new("t".into(), columns, vec![0], vec![index], vec![], vec![]);
+    let restored = TableSchema::deserialize(&schema.serialize()).unwrap();
+    let restored_columns: Vec<_> = restored.columns.iter().map(|c| c.collation).collect();
+    let restored_keys: Vec<_> = (0..4)
+        .map(|i| restored.indices[0].collation_at(i))
+        .collect();
+    assert_eq!(restored_columns, collations);
+    assert_eq!(restored_keys, collations);
+}
+
+#[test]
 fn schema_roundtrip_ann_filter_cols() {
     let mut ann = IndexDef::from_column_lists(
         "ix_v".into(),

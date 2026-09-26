@@ -13,6 +13,14 @@ fn text(value: &str) -> Value {
     Value::Text(value.into())
 }
 
+fn interval(months: i32, days: i32, micros: i64) -> Value {
+    Value::Interval {
+        months,
+        days,
+        micros,
+    }
+}
+
 #[test]
 fn parent_collation_controls_prepared_integer_child_inserts_and_updates() {
     for (collation, stored, equivalent, different) in [
@@ -92,53 +100,81 @@ fn deferred_checks_use_current_child_values_and_raw_child_identity() {
 
 #[test]
 fn equal_parent_spelling_change_does_not_trigger_any_referential_action() {
-    for action in [
-        "NO ACTION",
-        "RESTRICT",
-        "CASCADE",
-        "SET NULL",
-        "SET DEFAULT",
-    ] {
-        let db = database();
-        let c = Connection::open(&db).unwrap();
-        c.execute("CREATE TABLE p (id TEXT COLLATE NOCASE PRIMARY KEY)")
-            .unwrap();
-        c.execute(&format!("CREATE TABLE c (id INTEGER PRIMARY KEY, p TEXT DEFAULT 'fallback' REFERENCES p(id) ON UPDATE {action})")).unwrap();
-        c.execute("INSERT INTO p VALUES ('Alpha'),('fallback')")
-            .unwrap();
-        c.execute("INSERT INTO c VALUES (1,'aLPHA')").unwrap();
-        c.execute("UPDATE p SET id='ALPHA' WHERE id='Alpha'")
-            .unwrap();
-        assert_eq!(
-            c.query("SELECT p FROM c").unwrap().rows,
-            vec![vec![text("aLPHA")]],
-            "{action}"
-        );
-        let outcome = c.execute("UPDATE p SET id='Beta' WHERE id='ALPHA'");
-        let expected = match action {
-            "NO ACTION" | "RESTRICT" => {
-                assert!(matches!(outcome, Err(SqlError::ForeignKeyViolation(_))));
-                text("aLPHA")
-            }
-            "CASCADE" => {
-                outcome.unwrap();
-                text("Beta")
-            }
-            "SET NULL" => {
-                outcome.unwrap();
-                Value::Null
-            }
-            "SET DEFAULT" => {
-                outcome.unwrap();
-                text("fallback")
-            }
-            _ => unreachable!(),
-        };
-        assert_eq!(
-            c.query("SELECT p FROM c").unwrap().rows,
-            vec![vec![expected]],
-            "{action}"
-        );
+    let keys = [
+        (
+            "TEXT COLLATE NOCASE",
+            "TEXT",
+            ["'Alpha'", "'aLPHA'", "'ALPHA'", "'Beta'", "'fallback'"],
+            [text("aLPHA"), text("Beta"), text("fallback")],
+        ),
+        (
+            "INTERVAL",
+            "INTERVAL",
+            [
+                "INTERVAL '1 month'",
+                "INTERVAL '720 hours'",
+                "INTERVAL '30 days'",
+                "INTERVAL '2 months'",
+                "INTERVAL '1 year'",
+            ],
+            [
+                interval(0, 0, 720 * 3_600_000_000),
+                interval(2, 0, 0),
+                interval(12, 0, 0),
+            ],
+        ),
+    ];
+    for (parent_type, child_type, [key, spelling, respelling, other, fallback], values) in keys {
+        let [child, other_value, fallback_value] = values;
+        for action in [
+            "NO ACTION",
+            "RESTRICT",
+            "CASCADE",
+            "SET NULL",
+            "SET DEFAULT",
+        ] {
+            let db = database();
+            let c = Connection::open(&db).unwrap();
+            c.execute(&format!("CREATE TABLE p (id {parent_type} PRIMARY KEY)"))
+                .unwrap();
+            c.execute(&format!("CREATE TABLE c (id INTEGER PRIMARY KEY, p {child_type} DEFAULT {fallback} REFERENCES p(id) ON UPDATE {action})")).unwrap();
+            c.execute(&format!("INSERT INTO p VALUES ({key}),({fallback})"))
+                .unwrap();
+            c.execute(&format!("INSERT INTO c VALUES (1,{spelling})"))
+                .unwrap();
+            c.execute(&format!("UPDATE p SET id={respelling} WHERE id={key}"))
+                .unwrap();
+            assert_eq!(
+                c.query("SELECT p FROM c").unwrap().rows,
+                vec![vec![child.clone()]],
+                "{parent_type} {action}"
+            );
+            let outcome = c.execute(&format!("UPDATE p SET id={other} WHERE id={respelling}"));
+            let expected = match action {
+                "NO ACTION" | "RESTRICT" => {
+                    assert!(matches!(outcome, Err(SqlError::ForeignKeyViolation(_))));
+                    child.clone()
+                }
+                "CASCADE" => {
+                    outcome.unwrap();
+                    other_value.clone()
+                }
+                "SET NULL" => {
+                    outcome.unwrap();
+                    Value::Null
+                }
+                "SET DEFAULT" => {
+                    outcome.unwrap();
+                    fallback_value.clone()
+                }
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                c.query("SELECT p FROM c").unwrap().rows,
+                vec![vec![expected]],
+                "{parent_type} {action}"
+            );
+        }
     }
 }
 
@@ -389,4 +425,35 @@ fn existing_incompatible_parent_unique_constraint_is_not_silently_replaced() {
     assert_eq!(schema.get("p").unwrap().indices.len(), 1);
     assert_eq!(db.begin_read().table_entry_count(b"p").unwrap(), 1);
     assert_eq!(db.begin_read().table_entry_count(b"c").unwrap(), 1);
+}
+
+#[test]
+fn interval_references_match_parents_of_equal_length() {
+    let db = database();
+    let conn = Connection::open(&db).unwrap();
+    for sql in [
+        "CREATE TABLE parent (v INTERVAL PRIMARY KEY)",
+        "CREATE TABLE child (id INTEGER PRIMARY KEY, \
+         v INTERVAL REFERENCES parent(v) ON DELETE CASCADE)",
+        "INSERT INTO parent VALUES (INTERVAL '1 month'), (INTERVAL '1 day')",
+        "INSERT INTO child VALUES (1, INTERVAL '720 hours'), (2, INTERVAL '24 hours')",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+    assert!(matches!(
+        conn.execute("INSERT INTO child VALUES (3, INTERVAL '31 days')"),
+        Err(SqlError::ForeignKeyViolation(_))
+    ));
+    assert!(matches!(
+        conn.prepare("INSERT INTO child VALUES ($1, $2)")
+            .unwrap()
+            .execute(&[Value::Integer(3), interval(0, 31, 0)]),
+        Err(SqlError::ForeignKeyViolation(_))
+    ));
+    conn.execute("DELETE FROM parent WHERE v = INTERVAL '30 days'")
+        .unwrap();
+    assert_eq!(
+        conn.query("SELECT id, v FROM child").unwrap().rows,
+        vec![vec![Value::Integer(2), interval(0, 0, 86_400_000_000)]]
+    );
 }
