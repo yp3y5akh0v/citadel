@@ -5,8 +5,7 @@ use citadel_txn::read_txn::ReadTxn;
 use rustc_hash::FxHashMap;
 
 use crate::encoding::{
-    decode_column_raw, decode_column_with_offset, decode_composite_key, decode_pk_integer,
-    decode_stored_column_raw, RawColumn,
+    decode_composite_key, decode_pk_integer, decode_stored_column_raw, RawColumn,
 };
 use crate::error::{Result, SqlError};
 use crate::eval::{eval_expr, is_truthy, referenced_columns, ColumnMap, EvalCtx};
@@ -285,7 +284,7 @@ pub(super) fn exec_select_with_read(
         Strategy::Scan { limit } => limit,
     };
 
-    if let Some(result) = try_streaming_distinct_with_read(rtx, stmt, table_schema)? {
+    if let Some(result) = try_streaming_distinct_with_read(rtx, stmt, table_schema, cancel)? {
         return Ok(result);
     }
 
@@ -2987,11 +2986,22 @@ impl StreamGroupByPlan {
     }
 }
 
-/// Streaming DISTINCT: extract only needed columns from raw scan, dedup inline.
+/// Where a DISTINCT fast-path column comes from in a stored row.
+enum DistinctSource {
+    /// Position in the primary key.
+    Key(usize),
+    /// Physical position, and the value of a row stored before the column was added.
+    Stored(usize, Value),
+}
+
+/// `SELECT DISTINCT col, ...` over one table without WHERE, grouping or ordering: one
+/// scan decoding only the selected columns, deduplicated by the same keys as the general
+/// DISTINCT.
 fn try_streaming_distinct_with_read(
     rtx: &mut ReadTxn<'_>,
     stmt: &SelectStmt,
     table_schema: &TableSchema,
+    cancel: Option<&CancelToken>,
 ) -> Result<Option<ExecutionResult>> {
     if !stmt.distinct
         || stmt.where_clause.is_some()
@@ -3008,126 +3018,84 @@ fn try_streaming_distinct_with_read(
     let enc_pos = table_schema.encoding_positions();
     let num_pk_cols = table_schema.primary_key_columns.len();
 
-    let mut targets: Vec<RawAggTarget> = Vec::new();
-    let mut col_names: Vec<String> = Vec::new();
-
+    let mut sources = Vec::with_capacity(stmt.columns.len());
+    let mut col_names = Vec::with_capacity(stmt.columns.len());
     for sel_col in &stmt.columns {
-        let (expr, alias) = match sel_col {
-            SelectColumn::Expr { expr, alias } => (expr, alias),
-            _ => return Ok(None),
+        let SelectColumn::Expr { expr, alias } = sel_col else {
+            return Ok(None);
         };
-        let name = alias
-            .as_deref()
-            .unwrap_or(&expr_display_name(expr))
-            .to_string();
-        let col_idx = match resolve_simple_col(expr, col_map) {
-            Some(idx) => idx,
-            None => return Ok(None),
+        let Some(col_idx) = resolve_simple_col(expr, col_map) else {
+            return Ok(None);
         };
-        // The dedup key below is raw stored bytes, which cannot express a collation that
-        // calls two spellings equal. The general path folds the key instead, so leave
-        // collated columns to it rather than returning both spellings as distinct.
-        if table_schema.columns[col_idx].collation != crate::types::Collation::Binary {
+        let column = &table_schema.columns[col_idx];
+        // A virtual column is computed, not stored.
+        if matches!(
+            column.generated_kind,
+            Some(crate::parser::GeneratedKind::Virtual)
+        ) {
             return Ok(None);
         }
-        let target = if let Some(pk_pos) = table_schema
+        let source = match table_schema
             .primary_key_columns
             .iter()
             .position(|&i| i as usize == col_idx)
         {
-            // The dedup key below is the whole encoded row key, which identifies the selected
-            // column only when the primary key has one. A composite key would make every row
-            // unique and stop deduplicating, so leave those to the general DISTINCT path.
-            if table_schema.primary_key_columns.len() > 1 {
-                return Ok(None);
+            Some(pk_pos) => DistinctSource::Key(pk_pos),
+            None => {
+                let Some(default) =
+                    try_cached_column_default(column, table_schema.is_strict(), cancel)
+                else {
+                    return Ok(None);
+                };
+                let nonpk_order = non_pk.iter().position(|&i| i == col_idx).unwrap();
+                DistinctSource::Stored(
+                    enc_pos[nonpk_order] as usize,
+                    default.unwrap_or(Value::Null),
+                )
             }
-            RawAggTarget::Pk(pk_pos)
-        } else {
-            let nonpk_order = non_pk.iter().position(|&i| i == col_idx).unwrap();
-            RawAggTarget::NonPk(enc_pos[nonpk_order] as usize)
         };
-        targets.push(target);
-        col_names.push(name);
+        sources.push(source);
+        col_names.push(alias.clone().unwrap_or_else(|| expr_display_name(expr)));
     }
 
-    let lower_name = &table_schema.name;
-    let mut seen: rustc_hash::FxHashSet<Vec<u8>> = rustc_hash::FxHashSet::default();
+    check_cancel(cancel)?;
+    let mut seen = RowKeys::new(output_collations(&stmt.columns, col_map));
     let mut rows: Vec<Vec<Value>> = Vec::new();
     let mut scan_err: Option<SqlError> = None;
-    let mut raw_key_buf: Vec<u8> = Vec::with_capacity(64);
-
-    rtx.table_scan_raw(lower_name.as_bytes(), |key, value| {
-        raw_key_buf.clear();
-        for target in &targets {
-            match target {
-                RawAggTarget::CountStar => {}
-                RawAggTarget::Pk(_) => raw_key_buf.extend_from_slice(key),
-                RawAggTarget::NonPk(idx) => match decode_column_with_offset(value, *idx) {
-                    Ok((_, offset)) => {
-                        if offset == usize::MAX {
-                            raw_key_buf.push(0xFF);
-                        } else if offset + 5 <= value.len() {
-                            let data_len = u32::from_le_bytes(
-                                value[offset + 1..offset + 5].try_into().unwrap(),
-                            ) as usize;
-                            let end = (offset + 5 + data_len).min(value.len());
-                            raw_key_buf.extend_from_slice(&value[offset..end]);
-                        }
+    rtx.table_scan_raw(table_schema.name.as_bytes(), |key, value| {
+        let row = sources
+            .iter()
+            .map(|source| match source {
+                DistinctSource::Key(pk_pos) => {
+                    decode_composite_key(key, num_pk_cols).map(|mut pk| pk.swap_remove(*pk_pos))
+                }
+                DistinctSource::Stored(position, default) => {
+                    match decode_stored_column_raw(value, *position)? {
+                        Some(raw) => raw.to_value(),
+                        None => Ok(default.clone()),
                     }
-                    Err(e) => {
-                        scan_err = Some(e);
-                        return false;
-                    }
-                },
+                }
+            })
+            .collect::<Result<Vec<Value>>>();
+        match row {
+            Ok(row) => {
+                if seen.insert(&row) {
+                    rows.push(row);
+                }
+                true
+            }
+            Err(e) => {
+                scan_err = Some(e);
+                false
             }
         }
-        if seen.contains(raw_key_buf.as_slice()) {
-            return true;
-        }
-        seen.insert(raw_key_buf.clone());
-        let mut row_val: Vec<Value> = Vec::with_capacity(targets.len());
-        for target in &targets {
-            let val = match target {
-                RawAggTarget::CountStar => Value::Null,
-                RawAggTarget::Pk(pk_pos) => {
-                    if num_pk_cols == 1 && *pk_pos == 0 {
-                        match decode_pk_integer(key) {
-                            Ok(v) => Value::Integer(v),
-                            Err(e) => {
-                                scan_err = Some(e);
-                                return false;
-                            }
-                        }
-                    } else {
-                        match decode_composite_key(key, num_pk_cols) {
-                            Ok(pk) => pk[*pk_pos].clone(),
-                            Err(e) => {
-                                scan_err = Some(e);
-                                return false;
-                            }
-                        }
-                    }
-                }
-                RawAggTarget::NonPk(idx) => {
-                    match decode_column_raw(value, *idx).and_then(RawColumn::to_value) {
-                        Ok(value) => value,
-                        Err(e) => {
-                            scan_err = Some(e);
-                            return false;
-                        }
-                    }
-                }
-            };
-            row_val.push(val);
-        }
-        rows.push(row_val);
-        scan_err.is_none()
     })
     .map_err(SqlError::Storage)?;
 
     if let Some(e) = scan_err {
         return Err(e);
     }
+    check_cancel(cancel)?;
 
     if let Some(ref offset_expr) = stmt.offset {
         let offset = eval_row_count(offset_expr)?;
