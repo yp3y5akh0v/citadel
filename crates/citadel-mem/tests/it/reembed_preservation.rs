@@ -1,12 +1,11 @@
 //! Re-embedding replaces vectors while preserving atom identity and every other column.
 //! Whole rows are read directly because `AtomHit` omits persisted scoring fields.
 
-mod upgrade_fixtures;
-
 use std::sync::Arc;
 
 use citadel_mem::{AtomInput, EmbedError, Embedder, EmbeddingMetric, MemoryEngine};
-use upgrade_fixtures::{fixture_vault, reopen, NamedEmbedder};
+
+use crate::upgrade_fixtures::{fixture_vault, reopen, NamedEmbedder};
 
 const DIM: u16 = 32;
 

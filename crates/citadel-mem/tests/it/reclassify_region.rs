@@ -1,12 +1,11 @@
 //! Repair incorrect legacy model provenance without rewriting atom data.
 //! Fixtures preserve the already-written state that a fresh region cannot reproduce.
 
-mod upgrade_fixtures;
-
 use std::sync::Arc;
 
 use citadel_mem::{MemError, MemoryEngine};
-use upgrade_fixtures::{fixture_vault, seed_shim_region, NamedEmbedder};
+
+use crate::upgrade_fixtures::{fixture_vault, seed_shim_region, NamedEmbedder};
 
 const DIM: u16 = 32;
 const REGION: &str = "shimmed";

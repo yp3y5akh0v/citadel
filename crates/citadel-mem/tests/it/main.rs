@@ -1,0 +1,41 @@
+//! The integration tests, built as one binary: each file directly under `tests/` links
+//! its own copy of the crate and its dependencies.
+
+mod ann_persist_region;
+mod attach_existing;
+mod bm25_keyword;
+mod candidate_parity;
+mod crash_residue;
+mod cuda_precision;
+mod derived;
+mod encryption_roundtrip;
+mod engine_primitives;
+mod fetch_range;
+mod graph;
+mod if_absent;
+mod importance;
+mod key_lifecycle_race;
+mod lifecycle;
+mod long_horizon_recall;
+mod maintenance;
+mod multi_recall;
+mod overflow;
+mod owns_table;
+mod per_atom_erasure;
+mod reclassify_region;
+mod reembed_preservation;
+mod region_erasure;
+mod remember_recall;
+mod reuse_pagination;
+mod sealed_cache_epoch;
+mod sealed_kind_recall;
+mod sealed_recall_ann;
+mod secure_delete;
+mod similarity_lifecycle;
+mod stale_handle;
+mod stored_embeddings;
+mod structural;
+mod supersession;
+mod ttl;
+mod upgrade_fixture_provenance;
+mod upgrade_fixtures;

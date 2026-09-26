@@ -144,7 +144,7 @@ copy is what `forget` does. The rules that keep that true:
   so decrypted caches built under an old key state are refused.
 - HKDF info strings are part of the on-disk format. Keys are re-derived from them
   on every open rather than stored, so a released string is frozen.
-- The erasure tests in `crates/citadel-mem/tests/` (`region_erasure`,
+- The erasure tests in `crates/citadel-mem/tests/it/` (`region_erasure`,
   `per_atom_erasure`, `crash_residue`, `sealed_cache_epoch`) encode these rules,
   so they are the fastest way to check a change holds them.
 

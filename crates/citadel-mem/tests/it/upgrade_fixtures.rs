@@ -1,6 +1,3 @@
-// Each integration test binary uses a different subset of these shared fixtures.
-#![allow(dead_code)]
-
 //! Shared fixtures for re-embedding and repairing legacy provenance.
 
 use std::path::Path;
