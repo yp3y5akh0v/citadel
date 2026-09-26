@@ -560,6 +560,54 @@ fn fn_substr_negative_start() {
 }
 
 #[test]
+fn fn_min_max_and_replace_match_sqlite() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+    for sql in [
+        "CREATE TABLE names (id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE)",
+        "INSERT INTO names VALUES (1, 'B')",
+    ] {
+        conn.execute(sql).unwrap();
+        sqlite.execute(sql, []).unwrap();
+    }
+    for sql in [
+        "SELECT MAX(2, 9, 4)",
+        "SELECT MIN('b', 'a', 'c')",
+        // Of equal arguments MIN keeps the later, MAX the earlier.
+        "SELECT MIN(1, 1.0)",
+        "SELECT MAX(1, 1.0)",
+        // The first argument collation found orders the text.
+        "SELECT MAX(name, 'b') FROM names",
+        "SELECT MAX('b', name) FROM names",
+        "SELECT MIN(name, 'b') FROM names",
+        "SELECT REPLACE('ab', '', NULL)",
+        "SELECT REPLACE('ab', 'a', NULL)",
+        "SELECT REPLACE(NULL, '', 'x')",
+        "SELECT REPLACE('ab', NULL, 'x')",
+        "SELECT REPLACE('aba', 'a', 'xy')",
+    ] {
+        let expected: rusqlite::types::Value = sqlite.query_row(sql, [], |row| row.get(0)).unwrap();
+        // Debug text keeps INTEGER and REAL apart, which equality does not.
+        assert_eq!(
+            format!("{:?}", scalar(&conn, sql)),
+            format!("{expected:?}"),
+            "{sql}"
+        );
+    }
+    // Intervals compare as `<` compares them: 31 days exceed a 30-day month.
+    assert_eq!(
+        scalar(&conn, "SELECT MAX(INTERVAL '1 month', INTERVAL '31 days')"),
+        Value::Interval {
+            months: 0,
+            days: 31,
+            micros: 0
+        }
+    );
+}
+
+#[test]
 fn fn_substr_matches_sqlite_for_every_start_and_length() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
@@ -895,8 +943,10 @@ fn fn_min_max_scalar_with_null() {
     let conn = Connection::open(&db).unwrap();
     setup(&conn);
 
-    assert_eq!(scalar(&conn, "SELECT MIN(NULL, 5)"), Value::Integer(5));
-    assert_eq!(scalar(&conn, "SELECT MAX(3, NULL)"), Value::Integer(3));
+    // Any NULL argument makes the result NULL.
+    assert_eq!(scalar(&conn, "SELECT MIN(NULL, 5)"), Value::Null);
+    assert_eq!(scalar(&conn, "SELECT MAX(3, NULL)"), Value::Null);
+    assert_eq!(scalar(&conn, "SELECT MAX(1, 2, NULL)"), Value::Null);
 }
 
 #[test]

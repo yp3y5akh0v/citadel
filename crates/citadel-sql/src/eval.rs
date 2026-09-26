@@ -2523,15 +2523,19 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
         }
         "REPLACE" => {
             check_args(name, &evaluated, 3)?;
-            if evaluated.iter().any(|v| v.is_null()) {
+            if evaluated[..2].iter().any(Value::is_null) {
                 return Ok(Value::Null);
             }
             let s = value_to_text_with_cancel(&evaluated[0], ctx.cancel)?;
             let from = value_to_text_with_cancel(&evaluated[1], ctx.cancel)?;
-            let to = value_to_text_with_cancel(&evaluated[2], ctx.cancel)?;
+            // With nothing to find, the text comes back whatever the replacement is.
             if from.is_empty() {
                 return Ok(Value::Text(s.into()));
             }
+            if evaluated[2].is_null() {
+                return Ok(Value::Null);
+            }
+            let to = value_to_text_with_cancel(&evaluated[2], ctx.cancel)?;
             Ok(Value::Text(s.replace(&from, &to).into()))
         }
         "INSTR" => {
@@ -2706,33 +2710,33 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
             };
             Ok(Value::Text(type_name.into()))
         }
-        "MIN" => {
-            check_args(name, &evaluated, 2)?;
-            if evaluated[0].is_null() {
-                return Ok(evaluated[1].clone());
+        // The least or greatest of two or more arguments, compared as `<`
+        // compares them under the first argument collation found; NULL when
+        // any argument is NULL. Of equal arguments MIN keeps the later one,
+        // MAX the earlier.
+        "MIN" | "MAX" => {
+            check_min_args(name, &evaluated, 2)?;
+            if evaluated.iter().any(Value::is_null) {
+                return Ok(Value::Null);
             }
-            if evaluated[1].is_null() {
-                return Ok(evaluated[0].clone());
+            let greatest = name == "MAX";
+            let collation = args
+                .iter()
+                .find_map(|arg| operand_collation(arg, ctx.col_map));
+            let mut best = &evaluated[0];
+            for candidate in &evaluated[1..] {
+                let below = collated_compare_with_cancel(
+                    best,
+                    BinOp::Lt,
+                    candidate,
+                    collation,
+                    ctx.cancel,
+                )?;
+                if matches!(below, Value::Boolean(true)) == greatest {
+                    best = candidate;
+                }
             }
-            if evaluated[0] <= evaluated[1] {
-                Ok(evaluated[0].clone())
-            } else {
-                Ok(evaluated[1].clone())
-            }
-        }
-        "MAX" => {
-            check_args(name, &evaluated, 2)?;
-            if evaluated[0].is_null() {
-                return Ok(evaluated[1].clone());
-            }
-            if evaluated[1].is_null() {
-                return Ok(evaluated[0].clone());
-            }
-            if evaluated[0] >= evaluated[1] {
-                Ok(evaluated[0].clone())
-            } else {
-                Ok(evaluated[1].clone())
-            }
+            Ok(best.clone())
         }
         "HEX" => {
             check_args(name, &evaluated, 1)?;
