@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -47,6 +48,10 @@ impl DataType {
             DataType::Array => 14,
             DataType::Vector { .. } => 15,
         }
+    }
+
+    pub(crate) fn fixed_collation(self) -> Option<Collation> {
+        (self == Self::Interval).then_some(Collation::IntervalLength)
     }
 
     /// Vector returns a `dim: 0` sentinel; the real dim is read at the schema layer.
@@ -739,6 +744,9 @@ pub enum Collation {
     Binary = 0,
     NoCase = 1,
     Rtrim = 2,
+    /// Interval keys equal by length, as `=` compares intervals. An interval column under
+    /// BINARY keys by exact fields.
+    IntervalLength = 3,
 }
 
 impl Collation {
@@ -747,6 +755,7 @@ impl Collation {
             0 => Some(Self::Binary),
             1 => Some(Self::NoCase),
             2 => Some(Self::Rtrim),
+            3 => Some(Self::IntervalLength),
             _ => None,
         }
     }
@@ -760,9 +769,41 @@ impl Collation {
         }
     }
 
+    pub(crate) fn for_type(
+        data_type: DataType,
+        written: Option<Self>,
+    ) -> crate::error::Result<Self> {
+        match (data_type.fixed_collation(), written) {
+            (Some(_), Some(_)) => Err(crate::error::SqlError::Unsupported(format!(
+                "collations are not supported by type {data_type}"
+            ))),
+            (fixed, written) => Ok(fixed.or(written).unwrap_or_default()),
+        }
+    }
+
+    /// A collation changes only the keys it applies to; any other key equals byte for byte.
+    pub(crate) fn for_keys_of(self, data_type: DataType) -> Self {
+        match (data_type, self) {
+            (DataType::Text, _) | (DataType::Interval, Self::IntervalLength) => self,
+            _ => Self::Binary,
+        }
+    }
+
+    pub(crate) fn folds_text(self) -> bool {
+        matches!(self, Self::NoCase | Self::Rtrim)
+    }
+
+    pub(crate) fn fold_text(self, text: &str) -> Cow<'_, str> {
+        match self {
+            Self::NoCase => Cow::Owned(text.to_ascii_lowercase()),
+            Self::Rtrim => Cow::Borrowed(text.trim_end_matches(' ')),
+            Self::Binary | Self::IntervalLength => Cow::Borrowed(text),
+        }
+    }
+
     pub fn cmp_text(self, a: &str, b: &str) -> std::cmp::Ordering {
         match self {
-            Collation::Binary => a.cmp(b),
+            Collation::Binary | Collation::IntervalLength => a.cmp(b),
             Collation::NoCase => Iterator::cmp(
                 a.chars().map(|c| c.to_ascii_lowercase()),
                 b.chars().map(|c| c.to_ascii_lowercase()),
@@ -777,7 +818,7 @@ impl Collation {
 
     pub fn eq_text(self, a: &str, b: &str) -> bool {
         match self {
-            Collation::Binary => a == b,
+            Collation::Binary | Collation::IntervalLength => a == b,
             Collation::NoCase => a.eq_ignore_ascii_case(b),
             Collation::Rtrim => a.trim_end_matches(' ') == b.trim_end_matches(' '),
         }
@@ -792,18 +833,35 @@ impl Collation {
         }
     }
 
-    /// Fold a value so that plain `Eq` and `Hash` agree with [`eq_text`]: two values this
-    /// collation calls equal fold to one value.
+    /// Fold a value so that plain `Eq` and `Hash` agree with this collation: two values it
+    /// calls equal fold to one value.
     ///
     /// Hashing cannot consult a collation the way an operator does, so grouping and
     /// deduplicating (through [`group_key`](Self::group_key)) and hash joins need a key that
     /// already carries it. Index keys fold the same way at write time
     /// (`encode_key_value_collated_into`), which lets a probe find them.
     pub fn fold(self, value: Value) -> Value {
-        match (&value, self) {
-            (Value::Text(s), Collation::NoCase) => Value::Text(s.to_ascii_lowercase()),
-            (Value::Text(s), Collation::Rtrim) => Value::Text(s.trim_end_matches(' ').into()),
-            _ => value,
+        match (value, self) {
+            (Value::Text(text), Self::NoCase | Self::Rtrim) => {
+                Value::Text(self.fold_text(&text).into())
+            }
+            (
+                Value::Interval {
+                    months,
+                    days,
+                    micros,
+                },
+                Self::IntervalLength,
+            ) => {
+                let (months, days, micros) =
+                    crate::datetime::canonical_interval(months, days, micros);
+                Value::Interval {
+                    months,
+                    days,
+                    micros,
+                }
+            }
+            (value, _) => value,
         }
     }
 
@@ -813,19 +871,7 @@ impl Collation {
     /// collation and interval length call equal.
     pub(crate) fn group_key(self, value: Value) -> Value {
         match value {
-            Value::Interval {
-                months,
-                days,
-                micros,
-            } => {
-                let (months, days, micros) =
-                    crate::datetime::canonical_interval(months, days, micros);
-                Value::Interval {
-                    months,
-                    days,
-                    micros,
-                }
-            }
+            Value::Interval { .. } => Self::IntervalLength.fold(value),
             // Array elements compare as BINARY, whatever the column's collation.
             Value::Array(elements) if elements.iter().any(Value::holds_interval) => Value::Array(
                 elements
@@ -856,6 +902,12 @@ pub struct ColumnDef {
     pub generated_sql: Option<String>,
     pub generated_kind: Option<crate::parser::GeneratedKind>,
     pub collation: Collation,
+}
+
+impl ColumnDef {
+    pub(crate) fn key_collation(&self) -> Collation {
+        self.collation.for_keys_of(self.data_type)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2585,13 +2637,12 @@ impl TableSchema {
         &self.pk_idx_cache
     }
 
-    /// Physical primary keys store text verbatim, so only Binary text
-    /// comparison can be answered by seeking that key directly.
+    /// Physical primary keys store values verbatim, so only a key whose equality is
+    /// byte equality can be answered by seeking that key directly.
     pub(crate) fn primary_key_has_binary_collation(&self) -> bool {
-        self.primary_key_columns.iter().all(|&column| {
-            let definition = &self.columns[column as usize];
-            definition.data_type != DataType::Text || definition.collation == Collation::Binary
-        })
+        self.primary_key_columns
+            .iter()
+            .all(|&column| self.columns[column as usize].key_collation() == Collation::Binary)
     }
 
     /// A collated primary key's logical identity requires exactly its declared
@@ -2606,8 +2657,10 @@ impl TableSchema {
                 .enumerate()
                 .all(|(position, &column)| {
                     let definition = &self.columns[column as usize];
-                    definition.data_type != DataType::Text
-                        || index.collation_at(position) == definition.collation
+                    index
+                        .collation_at(position)
+                        .for_keys_of(definition.data_type)
+                        == definition.key_collation()
                 })
     }
 

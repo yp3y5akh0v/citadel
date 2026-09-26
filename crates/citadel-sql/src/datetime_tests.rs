@@ -424,13 +424,7 @@ fn canonical_interval_is_shared_by_every_interval_of_a_length() {
     );
     // Moving a month into days, or a day into micros, keeps the canonical fields.
     let mut state = 0x243f_6a88_85a3_08d3_u64;
-    let mut next = || {
-        state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^ (z >> 31)
-    };
+    let mut next = || splitmix64(&mut state);
     for _ in 0..20_000 {
         let (months, days, micros) = (next() as i32, next() as i32, next() as i64);
         let canonical = keeps_length((months, days, micros));
@@ -439,6 +433,48 @@ fn canonical_interval_is_shared_by_every_interval_of_a_length() {
         }
         if let (Some(d), Some(u)) = (days.checked_sub(1), micros.checked_add(day)) {
             assert_eq!(keeps_length((months, d, u)), canonical);
+        }
+    }
+}
+
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+#[test]
+fn canonical_intervals_order_as_their_lengths() {
+    let mut state = 0x1319_8a2e_0370_7344_u64;
+    let mut next = || splitmix64(&mut state);
+    // Each field near zero, at either limit, or anywhere, so lengths past the micros limit
+    // and months clamped at theirs both occur.
+    let mut field = |limit: i64| match next() % 4 {
+        0 => (next() % 5) as i64 - 2,
+        1 => limit - (next() % 3) as i64,
+        2 => -limit - 1 + (next() % 3) as i64,
+        _ => next() as i64 % limit,
+    };
+    let intervals: Vec<_> = (0..1_500)
+        .map(|_| {
+            let months = field(i32::MAX.into()) as i32;
+            let days = field(i32::MAX.into()) as i32;
+            let micros = field(i64::MAX);
+            (
+                (months, days, micros),
+                canonical_interval(months, days, micros),
+            )
+        })
+        .collect();
+    for (a, canonical_a) in &intervals {
+        for (b, canonical_b) in &intervals {
+            assert_eq!(
+                canonical_a.cmp(canonical_b),
+                pg_normalized_interval_cmp(*a, *b),
+                "{a:?} {b:?}"
+            );
         }
     }
 }

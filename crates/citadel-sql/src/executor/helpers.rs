@@ -1556,16 +1556,16 @@ pub(super) fn try_resolve_flat_sort_col(
         return None;
     }
     if let Some(idx) = order_by[0].output_ordinal {
-        return (col_map.collation_at(idx) == crate::types::Collation::Binary).then_some(idx);
+        return (!col_map.collation_at(idx).folds_text()).then_some(idx);
     }
     if let Some(name) = &order_by[0].output_name {
         let idx = col_map.resolve(&name.to_ascii_lowercase()).ok()?;
-        return (col_map.collation_at(idx) == crate::types::Collation::Binary).then_some(idx);
+        return (!col_map.collation_at(idx).folds_text()).then_some(idx);
     }
     match &order_by[0].expr {
         Expr::Column(name) => {
             let idx = col_map.resolve(&name.to_ascii_lowercase()).ok()?;
-            (col_map.collation_at(idx) == crate::types::Collation::Binary).then_some(idx)
+            (!col_map.collation_at(idx).folds_text()).then_some(idx)
         }
         _ => None,
     }
@@ -1574,18 +1574,18 @@ pub(super) fn try_resolve_flat_sort_col(
 pub(super) fn try_resolve_collated_flat_sort(
     order_by: &[OrderByItem],
     col_map: &ColumnMap,
-) -> Option<(usize, crate::types::Collation)> {
+) -> Option<(usize, Collation)> {
     if order_by.len() != 1 {
         return None;
     }
     if let Some(idx) = order_by[0].output_ordinal {
         let coll = col_map.collation_at(idx);
-        return (coll != crate::types::Collation::Binary).then_some((idx, coll));
+        return coll.folds_text().then_some((idx, coll));
     }
     if let Some(name) = &order_by[0].output_name {
         let idx = col_map.resolve(&name.to_ascii_lowercase()).ok()?;
         let coll = col_map.collation_at(idx);
-        return (coll != crate::types::Collation::Binary).then_some((idx, coll));
+        return coll.folds_text().then_some((idx, coll));
     }
     match &order_by[0].expr {
         Expr::Collate { expr: e, collation } => match e.as_ref() {
@@ -1598,7 +1598,7 @@ pub(super) fn try_resolve_collated_flat_sort(
         Expr::Column(name) => {
             let idx = col_map.resolve(&name.to_ascii_lowercase()).ok()?;
             let coll = col_map.collation_at(idx);
-            (coll != crate::types::Collation::Binary).then_some((idx, coll))
+            coll.folds_text().then_some((idx, coll))
         }
         _ => None,
     }
@@ -1643,32 +1643,28 @@ pub(super) enum CollatedKey {
     Other,
 }
 
+fn collated_key(value: &Value, coll: Collation) -> CollatedKey {
+    match value {
+        Value::Null => CollatedKey::Null,
+        Value::Text(text) => CollatedKey::Text(coll.fold_text(text).into_owned()),
+        _ => CollatedKey::Other,
+    }
+}
+
 pub(super) fn precompute_collated_keys(
     rows: &[Vec<Value>],
     col_idx: usize,
-    coll: crate::types::Collation,
+    coll: Collation,
 ) -> Vec<CollatedKey> {
     rows.iter()
-        .map(|row| match &row[col_idx] {
-            Value::Null => CollatedKey::Null,
-            Value::Text(s) => match coll {
-                crate::types::Collation::Binary => CollatedKey::Text(s.to_string()),
-                crate::types::Collation::NoCase => {
-                    CollatedKey::Text(s.as_str().to_ascii_lowercase())
-                }
-                crate::types::Collation::Rtrim => {
-                    CollatedKey::Text(s.trim_end_matches(' ').to_string())
-                }
-            },
-            _ => CollatedKey::Other,
-        })
+        .map(|row| collated_key(&row[col_idx], coll))
         .collect()
 }
 
 pub(super) fn precompute_collated_keys_with_cancel(
     rows: &[Vec<Value>],
     col_idx: usize,
-    coll: crate::types::Collation,
+    coll: Collation,
     cancel: Option<&citadel::CancelToken>,
 ) -> Result<Vec<CollatedKey>> {
     check_cancel(cancel)?;
@@ -1678,19 +1674,7 @@ pub(super) fn precompute_collated_keys_with_cancel(
     let mut keys = Vec::with_capacity(rows.len());
     for (row_idx, row) in rows.iter().enumerate() {
         check_cancel_at(cancel, row_idx)?;
-        keys.push(match &row[col_idx] {
-            Value::Null => CollatedKey::Null,
-            Value::Text(s) => match coll {
-                crate::types::Collation::Binary => CollatedKey::Text(s.to_string()),
-                crate::types::Collation::NoCase => {
-                    CollatedKey::Text(s.as_str().to_ascii_lowercase())
-                }
-                crate::types::Collation::Rtrim => {
-                    CollatedKey::Text(s.trim_end_matches(' ').to_string())
-                }
-            },
-            _ => CollatedKey::Other,
-        });
+        keys.push(collated_key(&row[col_idx], coll));
     }
     check_cancel(cancel)?;
     Ok(keys)
@@ -1941,19 +1925,17 @@ pub(crate) fn fold_key(row: &[Value], collations: &[crate::types::Collation]) ->
 /// allocate once per duplicate.
 pub(crate) struct RowKeys {
     seen: rustc_hash::FxHashSet<Vec<Value>>,
-    collations: Vec<crate::types::Collation>,
+    collations: Vec<Collation>,
     folding: bool,
 }
 
 impl RowKeys {
-    pub(crate) fn new(collations: Vec<crate::types::Collation>) -> Self {
+    pub(crate) fn new(collations: Vec<Collation>) -> Self {
         Self::with_capacity(collations, 0)
     }
 
-    pub(crate) fn with_capacity(collations: Vec<crate::types::Collation>, cap: usize) -> Self {
-        let folding = collations
-            .iter()
-            .any(|c| *c != crate::types::Collation::Binary);
+    pub(crate) fn with_capacity(collations: Vec<Collation>, cap: usize) -> Self {
+        let folding = collations.iter().copied().any(Collation::folds_text);
         Self {
             seen: rustc_hash::FxHashSet::with_capacity_and_hasher(cap, Default::default()),
             collations,

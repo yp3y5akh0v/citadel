@@ -3,7 +3,7 @@
 use sqlparser::ast as sp;
 
 use crate::error::{Result, SqlError};
-use crate::types::{DataType, Value};
+use crate::types::{Collation, DataType, Value};
 
 mod dml_aliases;
 mod expr_name;
@@ -1822,18 +1822,11 @@ fn convert_column_def(
     let mut generated_sql = None;
     let mut generated_kind = None;
     let mut fk_def = None;
-    let mut collation = crate::types::Collation::Binary;
+    let mut written_collation = None;
 
     for opt in &col_def.options {
         match &opt.option {
-            sp::ColumnOption::Collation(name) => {
-                let coll_name = object_name_to_string(name);
-                collation = crate::types::Collation::from_name(&coll_name).ok_or_else(|| {
-                    SqlError::Unsupported(format!(
-                        "collation '{coll_name}' not supported (BINARY/NOCASE/RTRIM only)"
-                    ))
-                })?;
-            }
+            sp::ColumnOption::Collation(name) => written_collation = Some(parse_collation(name)?),
             sp::ColumnOption::NotNull => nullable = false,
             sp::ColumnOption::Null => nullable = true,
             sp::ColumnOption::PrimaryKey(_) => {
@@ -1921,6 +1914,7 @@ fn convert_column_def(
         }
     }
 
+    let collation = Collation::for_type(data_type, written_collation)?;
     let spec = ColumnSpec {
         name: col_name,
         data_type,
@@ -2289,16 +2283,11 @@ fn convert_create_index(ci: sp::CreateIndex) -> Result<Statement> {
                 expr: inner,
                 collation,
             } => {
-                let coll_name = object_name_to_string(collation);
-                let coll = crate::types::Collation::from_name(&coll_name).ok_or_else(|| {
-                    SqlError::Unsupported(format!(
-                        "collation '{coll_name}' not supported (BINARY/NOCASE/RTRIM only)"
-                    ))
-                })?;
+                let coll = parse_collation(collation)?;
                 match inner.as_ref() {
                     sp::Expr::Identifier(ident) => (ident.value.clone(), Some(coll), None),
                     inner_expr => {
-                        if coll != crate::types::Collation::Binary {
+                        if coll != Collation::Binary {
                             return Err(SqlError::Unsupported(
                                 "expression index keys require BINARY collation".into(),
                             ));
@@ -4004,18 +3993,10 @@ fn convert_expr(expr: &sp::Expr) -> Result<Expr> {
         sp::Expr::Collate {
             expr: e,
             collation: name,
-        } => {
-            let coll_name = object_name_to_string(name);
-            let coll = crate::types::Collation::from_name(&coll_name).ok_or_else(|| {
-                SqlError::Unsupported(format!(
-                    "collation '{coll_name}' not supported (BINARY/NOCASE/RTRIM only)"
-                ))
-            })?;
-            Ok(Expr::Collate {
-                expr: Box::new(convert_expr(e)?),
-                collation: coll,
-            })
-        }
+        } => Ok(Expr::Collate {
+            collation: parse_collation(name)?,
+            expr: Box::new(convert_expr(e)?),
+        }),
         sp::Expr::Substring {
             expr: e,
             substring_from,
@@ -4859,6 +4840,15 @@ fn object_name_to_string(name: &sp::ObjectName) -> String {
         })
         .collect::<Vec<_>>()
         .join(".")
+}
+
+fn parse_collation(name: &sp::ObjectName) -> Result<Collation> {
+    let name = object_name_to_string(name);
+    Collation::from_name(&name).ok_or_else(|| {
+        SqlError::Unsupported(format!(
+            "collation '{name}' not supported (BINARY/NOCASE/RTRIM only)"
+        ))
+    })
 }
 
 #[cfg(test)]

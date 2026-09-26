@@ -1,6 +1,6 @@
 use super::*;
 use crate::eval::ColumnMap;
-use crate::parser::{BinOp, Expr, GeneratedKind, SelectColumn};
+use crate::parser::{BinOp, Expr, GeneratedKind, OrderByItem, SelectColumn};
 use crate::types::{Collation, ColumnDef, DataType, IndexDef, IndexKey, TableSchema, Value};
 
 fn col(name: &str, dt: DataType) -> ColumnDef {
@@ -40,6 +40,22 @@ fn schema(name: &str, cs: Vec<ColumnDef>, pk: Vec<u16>) -> TableSchema {
 
 fn i(n: i64) -> Value {
     Value::Integer(n)
+}
+
+#[test]
+fn interval_columns_keyed_by_length_sort_on_the_flat_path() {
+    let mut columns = cols(&[("id", DataType::Integer), ("v", DataType::Interval)]);
+    columns[1].collation = Collation::IntervalLength;
+    let map = ColumnMap::new(&columns);
+    let order_by = [OrderByItem {
+        expr: Expr::Column("v".into()),
+        output_name: None,
+        output_ordinal: None,
+        descending: false,
+        nulls_first: None,
+    }];
+    assert_eq!(try_resolve_flat_sort_col(&order_by, &map), Some(1));
+    assert_eq!(try_resolve_collated_flat_sort(&order_by, &map), None);
 }
 
 #[test]

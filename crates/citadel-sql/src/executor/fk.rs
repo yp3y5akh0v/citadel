@@ -5,9 +5,7 @@ use citadel_txn::write_txn::{DeferredFkCheck, WriteTxn};
 use crate::encoding::{encode_composite_key_from_indices, encode_key_value_collated_into};
 use crate::error::{Result, SqlError};
 use crate::schema::SchemaManager;
-use crate::types::{
-    Collation, DataType, ForeignKeySchemaEntry, IndexDef, IndexKind, TableSchema, Value,
-};
+use crate::types::{Collation, ForeignKeySchemaEntry, IndexDef, IndexKind, TableSchema, Value};
 
 use super::helpers::decode_full_row_with_cancel;
 
@@ -37,14 +35,7 @@ impl ReferenceKey {
         }
         let collations = columns
             .iter()
-            .map(|&i| {
-                let column = &parent.columns[i as usize];
-                if column.data_type == DataType::Text {
-                    column.collation
-                } else {
-                    Collation::Binary
-                }
-            })
+            .map(|&i| parent.columns[i as usize].key_collation())
             .collect();
         Ok(Self {
             columns,
@@ -92,6 +83,11 @@ impl ReferenceKey {
     pub(super) fn value_equal(&self, position: usize, a: &Value, b: &Value) -> bool {
         match (a, b) {
             (Value::Text(a), Value::Text(b)) => self.collations[position].eq_text(a, b),
+            (Value::Interval { .. }, Value::Interval { .. })
+                if self.collations[position] == Collation::IntervalLength =>
+            {
+                a.sql_cmp(b).is_eq()
+            }
             _ => a.bit_eq(b),
         }
     }

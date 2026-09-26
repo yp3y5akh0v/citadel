@@ -1035,7 +1035,7 @@ fn interval_keys_do_not_change_comparison_results() {
         "INSERT INTO spans VALUES (1, INTERVAL '1 month'), (2, INTERVAL '31 days'), \
          (3, INTERVAL '30 days'), (4, INTERVAL '720 hours'), (5, INTERVAL '29 days'), (6, NULL)",
         "CREATE TABLE periods (k INTERVAL NOT NULL PRIMARY KEY, n INTEGER)",
-        "INSERT INTO periods VALUES (INTERVAL '1 month', 1), (INTERVAL '30 days', 2), \
+        "INSERT INTO periods VALUES (INTERVAL '1 month', 1), (INTERVAL '29 days', 2), \
          (INTERVAL '31 days', 3)",
     ] {
         conn.execute(sql).unwrap();
@@ -1045,48 +1045,46 @@ fn interval_keys_do_not_change_comparison_results() {
     };
     let rows = |sql: &str| query_result(conn.execute(sql).unwrap()).rows;
     // A month compares as 30 days: '1 month', '30 days' and '720 hours' are equal.
-    let cases: [(&str, &[i64]); 7] = [
-        ("v > INTERVAL '1 month'", &[2]),
-        ("v >= INTERVAL '1 month'", &[1, 2, 3, 4]),
-        ("v < INTERVAL '31 days'", &[1, 3, 4, 5]),
-        ("v <= INTERVAL '30 days'", &[1, 3, 4, 5]),
-        ("v = INTERVAL '1 month'", &[1, 3, 4]),
-        ("v = INTERVAL '30 days'", &[1, 3, 4]),
+    let indexed = "IndexScan:spans_v";
+    let cases: [(&str, &str, &[i64]); 7] = [
+        ("v > INTERVAL '1 month'", indexed, &[2]),
+        ("v >= INTERVAL '1 month'", indexed, &[1, 2, 3, 4]),
+        ("v < INTERVAL '31 days'", indexed, &[1, 3, 4, 5]),
+        ("v <= INTERVAL '30 days'", indexed, &[1, 3, 4, 5]),
+        ("v = INTERVAL '1 month'", indexed, &[1, 3, 4]),
+        ("v = INTERVAL '30 days'", indexed, &[1, 3, 4]),
         (
             "v BETWEEN INTERVAL '30 days' AND INTERVAL '1 month'",
+            "SeqScan",
             &[1, 3, 4],
         ),
     ];
-    for (predicate, expected) in cases {
+    for (predicate, _, expected) in cases {
         let sql = format!("SELECT id FROM spans WHERE {predicate} ORDER BY id");
         assert_eq!(rows(&sql), integers(expected), "{sql}");
     }
     assert_ok(conn.execute("CREATE INDEX spans_v ON spans (v)").unwrap());
-    for (predicate, expected) in cases {
+    for (predicate, plan, expected) in cases {
         let sql = format!("SELECT id FROM spans WHERE {predicate} ORDER BY id");
-        assert_plan(&db, &sql, "SeqScan");
+        assert_plan(&db, &sql, plan);
         assert_eq!(rows(&sql), integers(expected), "{sql}");
     }
     for (predicate, expected) in [
-        ("k = INTERVAL '1 month'", &[1, 2][..]),
-        ("k > INTERVAL '29 days'", &[1, 2, 3]),
+        ("k = INTERVAL '720 hours'", &[1][..]),
+        ("k > INTERVAL '29 days'", &[1, 3]),
         ("k < INTERVAL '31 days'", &[1, 2]),
     ] {
         let sql = format!("SELECT n FROM periods WHERE {predicate} ORDER BY n");
-        assert_plan(&db, &sql, "SeqScan");
+        assert_plan(&db, &sql, "IndexScan:__pk_periods");
         assert_eq!(rows(&sql), integers(expected), "{sql}");
     }
-    assert_rows_affected(
-        conn.execute("UPDATE periods SET n = n + 10 WHERE k = INTERVAL '30 days'")
-            .unwrap(),
-        2,
-    );
-    assert_rows_affected(
-        conn.execute("DELETE FROM periods WHERE k = INTERVAL '720 hours'")
-            .unwrap(),
-        2,
-    );
-    assert_eq!(rows("SELECT n FROM periods"), integers(&[3]));
+    let update = "UPDATE periods SET n = n + 10 WHERE k = INTERVAL '30 days'";
+    let delete = "DELETE FROM periods WHERE k = INTERVAL '720 hours'";
+    assert_plan(&db, update, "IndexScan:__pk_periods");
+    assert_plan(&db, delete, "IndexScan:__pk_periods");
+    assert_rows_affected(conn.execute(update).unwrap(), 1);
+    assert_rows_affected(conn.execute(delete).unwrap(), 1);
+    assert_eq!(rows("SELECT n FROM periods ORDER BY n"), integers(&[2, 3]));
 }
 
 #[test]

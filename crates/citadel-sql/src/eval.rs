@@ -6,7 +6,7 @@ use rustc_hash::FxHashMap;
 
 use crate::error::{Result, SqlError};
 use crate::parser::{BinOp, Expr, QuantifiedRhs, UnaryOp};
-use crate::types::{ColumnDef, CompactString, DataType, Value};
+use crate::types::{Collation, ColumnDef, CompactString, DataType, Value};
 
 mod text_search;
 
@@ -14,8 +14,8 @@ mod text_search;
 pub struct ColumnMap {
     exact: FxHashMap<String, ShortMatch>,
     short: FxHashMap<String, ShortMatch>,
-    collations: Vec<crate::types::Collation>,
-    has_non_binary_collation: bool,
+    collations: Vec<Collation>,
+    has_folding_collation: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -30,7 +30,7 @@ impl Clone for ColumnMap {
             exact: self.exact.clone(),
             short: self.short.clone(),
             collations: self.collations.clone(),
-            has_non_binary_collation: self.has_non_binary_collation,
+            has_folding_collation: self.has_folding_collation,
         }
     }
 }
@@ -41,7 +41,6 @@ impl ColumnMap {
         let mut short: FxHashMap<String, ShortMatch> =
             FxHashMap::with_capacity_and_hasher(columns.len(), Default::default());
         let mut collations = Vec::with_capacity(columns.len());
-        let mut has_non_binary_collation = false;
 
         for (i, col) in columns.iter().enumerate() {
             let lower = col.name.to_ascii_lowercase();
@@ -60,16 +59,14 @@ impl ColumnMap {
                 .and_modify(|e| *e = ShortMatch::Ambiguous)
                 .or_insert(ShortMatch::Unique(i));
             collations.push(col.collation);
-            if col.collation != crate::types::Collation::Binary {
-                has_non_binary_collation = true;
-            }
         }
 
+        let has_folding_collation = collations.iter().copied().any(Collation::folds_text);
         Self {
             exact,
             short,
             collations,
-            has_non_binary_collation,
+            has_folding_collation,
         }
     }
 
@@ -77,16 +74,13 @@ impl ColumnMap {
         self.collations.len()
     }
 
-    pub(crate) fn collation_at(&self, idx: usize) -> crate::types::Collation {
-        self.collations
-            .get(idx)
-            .copied()
-            .unwrap_or(crate::types::Collation::Binary)
+    pub(crate) fn collation_at(&self, idx: usize) -> Collation {
+        self.collations.get(idx).copied().unwrap_or_default()
     }
 
     #[inline]
-    pub(crate) fn has_non_binary_collation(&self) -> bool {
-        self.has_non_binary_collation
+    pub(crate) fn has_folding_collation(&self) -> bool {
+        self.has_folding_collation
     }
 
     pub(crate) fn resolve(&self, name: &str) -> Result<usize> {
@@ -364,10 +358,10 @@ pub(crate) fn compile_collation(
     left: &Expr,
     right: &Expr,
     col_map: &ColumnMap,
-) -> Option<crate::types::Collation> {
+) -> Option<Collation> {
     let left_explicit = collation_of(left);
     let right_explicit = collation_of(right);
-    let needs_check = col_map.has_non_binary_collation()
+    let needs_check = col_map.has_folding_collation()
         || left_explicit.is_some()
         || right_explicit.is_some()
         || bound_column_operand(left)
@@ -379,7 +373,7 @@ pub(crate) fn compile_collation(
         .or(right_explicit)
         .or_else(|| column_collation(left, col_map))
         .or_else(|| column_collation(right, col_map))?;
-    (coll != crate::types::Collation::Binary).then_some(coll)
+    coll.folds_text().then_some(coll)
 }
 
 /// The collation an operand carries by itself, for a comparison whose other side is a bare
@@ -556,7 +550,7 @@ fn eval_expr_inner(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
             // `x IN (SELECT y)` collates as `x = y`, which takes it from either
             // operand, left first.
             let coll = operand_collation(e, ctx.col_map).unwrap_or(*collation);
-            let coll = (coll != crate::types::Collation::Binary).then_some(coll);
+            let coll = coll.folds_text().then_some(coll);
             eval_in_set(&lhs, values, *families, *has_null, *negated, coll)
         }
 
@@ -824,7 +818,7 @@ fn bound_column_operand(expr: &Expr) -> bool {
     }
 }
 
-fn column_collation(expr: &Expr, col_map: &ColumnMap) -> Option<crate::types::Collation> {
+fn column_collation(expr: &Expr, col_map: &ColumnMap) -> Option<Collation> {
     match expr {
         Expr::BoundColumn { collation, .. } => Some(*collation),
         Expr::Column(name) => col_map.resolve(name).ok().map(|i| col_map.collation_at(i)),
@@ -833,8 +827,10 @@ fn column_collation(expr: &Expr, col_map: &ColumnMap) -> Option<crate::types::Co
             .ok()
             .map(|i| col_map.collation_at(i)),
         // A CAST-wrapped column still counts as a column for implicit collation;
-        // Neg/Not must not inherit it.
-        Expr::Cast { expr, .. } => column_collation(expr, col_map),
+        // Neg/Not must not inherit it. Interval length stays with the interval type.
+        Expr::Cast { expr, data_type } => column_collation(expr, col_map).filter(|&collation| {
+            collation != Collation::IntervalLength || *data_type == DataType::Interval
+        }),
         _ => None,
     }
 }
