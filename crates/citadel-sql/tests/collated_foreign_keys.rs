@@ -1,4 +1,5 @@
 use citadel::{Argon2Profile, DatabaseBuilder};
+use citadel_sql::types::Collation;
 use citadel_sql::{Connection, SqlError, Value};
 
 fn database() -> citadel::Database {
@@ -378,13 +379,11 @@ fn existing_child_index_is_upgraded_to_cover_parent_equality() {
     let child = c.table_schema("c").unwrap();
     assert_eq!(
         child.index_by_name("old_binary").unwrap().collation_at(0),
-        citadel_sql::types::Collation::Binary
+        Collation::Binary
     );
-    assert!(child
-        .indices
-        .iter()
-        .any(|index| index.is_full_column_btree(&[1])
-            && index.collation_at(0) == citadel_sql::types::Collation::NoCase));
+    assert!(child.indices.iter().any(
+        |index| index.is_full_column_btree(&[1]) && index.collation_at(0) == Collation::NoCase
+    ));
     c.execute("DELETE FROM p WHERE id='Alpha'").unwrap();
     assert!(c.query("SELECT * FROM c").unwrap().rows.is_empty());
 }

@@ -443,7 +443,7 @@ fn group_rows<'r>(
     // Keyed, so a column whose collation calls two spellings equal groups them, as
     // do intervals of one length. The key decides equality by comparing, not by an
     // operator, so both have to be baked into it.
-    let group_colls: Vec<crate::types::Collation> = group_exprs
+    let group_colls: Vec<Collation> = group_exprs
         .iter()
         .map(|expr| expr_collation(expr, col_map))
         .collect();

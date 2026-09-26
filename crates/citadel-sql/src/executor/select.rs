@@ -4965,7 +4965,7 @@ struct CompoundPlanStatic {
     /// This lane runs the same six set operations as `apply_set_operation`, so it folds its
     /// keys by the same rule: without it, `UNION` and `UNION ... ORDER BY` deduplicated a
     /// collated column differently, the ORDER BY deciding which lane ran.
-    key_colls: Vec<crate::types::Collation>,
+    key_colls: Vec<Collation>,
 }
 
 struct BranchPlan {

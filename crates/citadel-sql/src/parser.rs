@@ -182,7 +182,7 @@ pub struct ColumnSpec {
     pub generated_expr: Option<Expr>,
     pub generated_sql: Option<String>,
     pub generated_kind: Option<GeneratedKind>,
-    pub collation: crate::types::Collation,
+    pub collation: Collation,
 }
 
 #[derive(Debug, Clone)]
@@ -212,7 +212,7 @@ pub struct CreateIndexStmt {
     pub predicate_expr: Option<Expr>,
     /// Per-key explicit collation. None inherits a column's declared collation;
     /// Some(Binary) is an explicit override, not an omitted clause.
-    pub collations: Vec<Option<crate::types::Collation>>,
+    pub collations: Vec<Option<Collation>>,
     pub kind: crate::types::IndexKind,
     /// ANN-only: filter-column names from `WITH (filters = '...')`, resolved to
     /// schema column indices in `build_index_def_for_create`. Empty otherwise.
@@ -508,7 +508,7 @@ pub enum Expr {
     #[doc(hidden)]
     BoundColumn {
         value: Value,
-        collation: crate::types::Collation,
+        collation: Collation,
     },
     Column(String),
     QualifiedColumn {
@@ -563,7 +563,7 @@ pub enum Expr {
         /// compares as `x = y` does, so when `x` carries no collation of its own the
         /// subquery's column supplies it - and by then the values are bare, with nothing
         /// left to read it from.
-        collation: crate::types::Collation,
+        collation: Collation,
     },
     Between {
         expr: Box<Expr>,
@@ -603,7 +603,7 @@ pub enum Expr {
     },
     Collate {
         expr: Box<Expr>,
-        collation: crate::types::Collation,
+        collation: Collation,
     },
     TypedNullRecord(String),
     ArrayLiteral(Vec<Expr>),
@@ -2270,7 +2270,7 @@ fn convert_create_index(ci: sp::CreateIndex) -> Result<Statement> {
     let table_name = object_name_to_string(&ci.table_name);
 
     let mut columns: Vec<String> = Vec::with_capacity(ci.columns.len());
-    let mut collations: Vec<Option<crate::types::Collation>> = Vec::with_capacity(ci.columns.len());
+    let mut collations: Vec<Option<Collation>> = Vec::with_capacity(ci.columns.len());
     let mut key_exprs: Vec<Option<(Expr, String)>> = Vec::with_capacity(ci.columns.len());
     for idx_col in &ci.columns {
         let mut key_expr = &idx_col.column.expr;

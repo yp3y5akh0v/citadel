@@ -1,5 +1,6 @@
 use citadel::DatabaseBuilder;
 use citadel_sql::planner::{plan_select, ScanPlan};
+use citadel_sql::types::Collation;
 use citadel_sql::{Connection, ReadBudget, SqlError, Value};
 
 fn database() -> citadel::Database {
@@ -250,7 +251,7 @@ fn prefix_planning_refuses_coercions_collations_and_volatile_bounds() {
     assert_eq!(schema.indices.len(), 1);
     let index = &schema.indices[0];
     assert!(index.unique && index.is_full_column_btree(&schema.primary_key_columns));
-    assert_eq!(index.collation_at(0), citadel_sql::types::Collation::NoCase);
+    assert_eq!(index.collation_at(0), Collation::NoCase);
     let logical_index = &index.name;
     let plan = plan_select(&schema, &predicate);
     assert!(matches!(

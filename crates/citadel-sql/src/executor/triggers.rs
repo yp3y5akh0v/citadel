@@ -3,7 +3,7 @@ use crate::parser::{
     CreateTriggerStmt, DropTriggerStmt, Statement, TriggerEvent, TriggerGranularity, TriggerTiming,
 };
 use crate::schema::SchemaManager;
-use crate::types::{ExecutionResult, TriggerDef, Value};
+use crate::types::{Collation, ExecutionResult, TriggerDef, Value};
 
 pub(super) const MAX_TRIGGER_DEPTH: usize = 32;
 
@@ -315,7 +315,7 @@ pub(crate) fn view_columns_from_aliases(aliases: &[String]) -> Vec<crate::types:
             generated_expr: None,
             generated_sql: None,
             generated_kind: None,
-            collation: crate::types::Collation::Binary,
+            collation: Collation::Binary,
         })
         .collect()
 }

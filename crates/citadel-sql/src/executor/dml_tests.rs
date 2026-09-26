@@ -4,7 +4,7 @@ use crate::parser::{
     CompoundSelect, DeleteStmt, Expr, InsertSource, InsertStmt, QueryBody, SelectColumn,
     SelectStmt, SetOp, UpdateStmt,
 };
-use crate::types::{ExecutionResult, QueryResult, Value};
+use crate::types::{Collation, ExecutionResult, QueryResult, Value};
 
 #[test]
 fn unique_probe_evaluates_expression_key_once_and_keeps_partial_predicate() {
@@ -1162,7 +1162,6 @@ fn selective_materialization_evaluates_closed_siblings_once_and_keeps_nested_sco
 
 #[test]
 fn selective_materialization_preserves_collation_nulls_and_refusal() {
-    use crate::types::Collation;
     let predicate = crate::parser::parse_sql_expr("'UPPER' IN (SELECT v FROM fixed)").unwrap();
     let result = materialize_expr_selective(&predicate, &mut |_| {
         Ok(Some(CteRows::new(

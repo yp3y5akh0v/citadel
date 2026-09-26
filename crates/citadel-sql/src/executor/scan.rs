@@ -1618,7 +1618,7 @@ pub(super) fn try_between_predicate(expr: &Expr, schema: &TableSchema) -> Option
     ) {
         return None;
     }
-    if schema.columns[col_idx].collation != crate::types::Collation::Binary {
+    if schema.columns[col_idx].collation != Collation::Binary {
         return None;
     }
 
@@ -1719,7 +1719,7 @@ pub(super) fn try_simple_predicate(expr: &Expr, schema: &TableSchema) -> Option<
     ) {
         return None;
     }
-    if schema.columns[col_idx].collation != crate::types::Collation::Binary {
+    if schema.columns[col_idx].collation != Collation::Binary {
         return None;
     }
 

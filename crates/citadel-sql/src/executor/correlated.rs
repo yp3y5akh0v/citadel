@@ -510,7 +510,7 @@ pub(super) fn handle_correlated_select_with_read(
                                 generated_expr: None,
                                 generated_sql: None,
                                 generated_kind: None,
-                                collation: crate::types::Collation::Binary,
+                                collation: Collation::Binary,
                             });
                             let slot = Expr::Column(col_name);
                             new_columns.push(SelectColumn::Expr {

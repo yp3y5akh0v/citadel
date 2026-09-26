@@ -2301,6 +2301,7 @@ fn ann_metric_to_prism(m: AnnMetric) -> Metric {
 #[cfg(test)]
 mod thrash_tests {
     use super::{tail_distance, tail_distance_checked, take_ann_rebuilds, AnnMetric};
+    use crate::types::Collation;
     use crate::{Connection, ExecutionResult, Value};
     use citadel::{Argon2Profile, CancelToken, DatabaseBuilder};
 
@@ -2961,7 +2962,7 @@ mod thrash_tests {
                 dim: DIM as u16,
                 metric: AnnMetric::L2,
                 filter_cols: vec![1],
-                filter_collations: vec![crate::types::Collation::Binary],
+                filter_collations: vec![Collation::Binary],
                 prism_config_hash: super::ann_persist::active_config_hash(
                     citadel_vector::Metric::L2,
                 ),
