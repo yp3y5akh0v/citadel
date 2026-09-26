@@ -440,9 +440,9 @@ fn group_rows<'r>(
         check_cancel(cancel)?;
         return Ok(vec![group]);
     }
-    // Folded, so a column whose collation calls two spellings equal groups them.
-    // The key decides equality by comparing, not by an operator, so the
-    // collation has to be baked into it.
+    // Keyed, so a column whose collation calls two spellings equal groups them, as
+    // do intervals of one length. The key decides equality by comparing, not by an
+    // operator, so both have to be baked into it.
     let group_colls: Vec<crate::types::Collation> = group_exprs
         .iter()
         .map(|expr| expr_collation(expr, col_map))
@@ -454,7 +454,7 @@ fn group_rows<'r>(
         let group_key: Vec<Value> = group_exprs
             .iter()
             .zip(&group_colls)
-            .map(|(expr, coll)| eval_expr(expr, &ctx).map(|v| coll.fold(v)))
+            .map(|(expr, coll)| eval_expr(expr, &ctx).map(|v| coll.group_key(v)))
             .collect::<Result<_>>()?;
         groups.entry(group_key).or_default().push(row);
     }
@@ -801,15 +801,15 @@ fn aggregate_value(
         )?);
     }
     if distinct {
-        // `COUNT(DISTINCT s)` counts the values `s = s` calls equal, so the argument's
-        // collation folds the key here as it does for GROUP BY. NULL stays once:
-        // the other aggregates skip it, and JSON_AGG keeps it as a value.
+        // `COUNT(DISTINCT s)` counts the values `s = s` calls equal, so the key is the
+        // argument's group key, as for GROUP BY. NULL stays once: the other aggregates
+        // skip it, and JSON_AGG keeps it as a value.
         let coll = expr_collation(arg, col_map);
         let mut seen: rustc_hash::FxHashSet<Value> = rustc_hash::FxHashSet::default();
         let mut distinct_values = Vec::with_capacity(values.len());
         for (value_idx, value) in values.into_iter().enumerate() {
             check_cancel_at(cancel, value_idx)?;
-            if seen.insert(coll.fold(value.clone())) {
+            if seen.insert(coll.group_key(value.clone())) {
                 distinct_values.push(value);
             }
         }

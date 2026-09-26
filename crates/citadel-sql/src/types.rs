@@ -778,14 +778,38 @@ impl Collation {
     /// Fold a value so that plain `Eq` and `Hash` agree with [`eq_text`]: two values this
     /// collation calls equal fold to one value.
     ///
-    /// Hashing cannot consult a collation the way an operator does, so grouping,
-    /// deduplicating and hash joins need a key that already carries it. Index keys fold the
-    /// same way at write time (`encode_key_value_collated_into`), which lets a probe find them.
+    /// Hashing cannot consult a collation the way an operator does, so grouping and
+    /// deduplicating (through [`group_key`](Self::group_key)) and hash joins need a key that
+    /// already carries it. Index keys fold the same way at write time
+    /// (`encode_key_value_collated_into`), which lets a probe find them.
     pub fn fold(self, value: Value) -> Value {
         match (&value, self) {
             (Value::Text(s), Collation::NoCase) => Value::Text(s.to_ascii_lowercase()),
             (Value::Text(s), Collation::Rtrim) => Value::Text(s.trim_end_matches(' ').into()),
             _ => value,
+        }
+    }
+
+    /// The value grouping and deduplication compare in place of `value`: text folded as
+    /// [`fold`](Self::fold) folds it, and an interval as the fields every interval of its
+    /// length shares, so plain `Eq` and `Hash` group what this collation and interval
+    /// length call equal.
+    pub(crate) fn group_key(self, value: Value) -> Value {
+        match value {
+            Value::Interval {
+                months,
+                days,
+                micros,
+            } => {
+                let (months, days, micros) =
+                    crate::datetime::canonical_interval(months, days, micros);
+                Value::Interval {
+                    months,
+                    days,
+                    micros,
+                }
+            }
+            other => self.fold(other),
         }
     }
 }
