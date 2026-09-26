@@ -496,7 +496,7 @@ mod post_scan_cancellation {
                 vec![OrderByItem {
                     expr: Expr::Collate {
                         expr: Box::new(Expr::Column("x".into())),
-                        collation: crate::types::Collation::NoCase,
+                        collation: Collation::NoCase,
                     },
                     output_name: None,
                     output_ordinal: None,

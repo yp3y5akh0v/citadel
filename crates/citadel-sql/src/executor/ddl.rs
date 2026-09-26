@@ -142,7 +142,7 @@ fn add_unique_auto_indices(
             return Err(SqlError::IndexAlreadyExists(idx_name));
         }
 
-        let collations: Vec<crate::types::Collation> = col_idxs
+        let collations: Vec<Collation> = col_idxs
             .iter()
             .map(|&i| table_schema.columns[i as usize].collation)
             .collect();

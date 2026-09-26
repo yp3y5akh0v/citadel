@@ -740,8 +740,8 @@ pub(super) fn body_output_collations(
     ctes: &CteContext,
     body: &QueryBody,
     width: usize,
-) -> Vec<crate::types::Collation> {
-    let binary = || vec![crate::types::Collation::Binary; width];
+) -> Vec<Collation> {
+    let binary = || vec![Collation::Binary; width];
     match body_output_columns(schema, ctes, body) {
         Some(columns) if columns.len() == width => {
             columns.iter().map(|col| col.collation).collect()
@@ -757,12 +757,12 @@ pub(super) fn query_output_collations(
     ctes: &CteContext,
     query: &SelectQuery,
     width: usize,
-) -> Vec<crate::types::Collation> {
+) -> Vec<Collation> {
     match query_output_columns(schema, ctes, query) {
         Some(columns) if columns.len() == width => {
             columns.iter().map(|col| col.collation).collect()
         }
-        _ => vec![crate::types::Collation::Binary; width],
+        _ => vec![Collation::Binary; width],
     }
 }
 
@@ -1067,10 +1067,7 @@ pub(super) fn apply_set_operation(
                 generated_kind: None,
                 // Carried from the branch, so ORDER BY over a compound sorts the way the
                 // same column sorts inside it.
-                collation: key_colls
-                    .get(i)
-                    .copied()
-                    .unwrap_or(crate::types::Collation::Binary),
+                collation: key_colls.get(i).copied().unwrap_or(Collation::Binary),
             })
             .collect();
         sort_rows(&mut rows, &comp.order_by, &col_defs, cancel)?;
@@ -1994,7 +1991,7 @@ struct FkCheckSpec {
 #[derive(Clone)]
 struct IndexInsertSpec {
     table: Vec<u8>,
-    key_params: Vec<(u8, crate::types::Collation)>,
+    key_params: Vec<(u8, Collation)>,
 }
 
 #[derive(Clone)]

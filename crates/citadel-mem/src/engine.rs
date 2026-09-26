@@ -20,6 +20,7 @@ use citadel_crypto::hkdf_utils::{
     derive_atom_wrap_key, derive_identity_mac_key, derive_seal_keys, AtomWrapKey, IdentityMacKey,
 };
 use citadel_sql::executor::{AnnIndexSource, AnnSegmentInfo};
+use citadel_sql::types::Collation;
 use citadel_sql::{Connection, ExecutionResult, Value};
 use citadel_vector::{AnnIndex, Filter, Metric};
 use zeroize::{Zeroize, Zeroizing};
@@ -12022,8 +12023,8 @@ fn ensure_region_cursor_index(conn: &Connection<'_>, table: &str) -> Result<()> 
         };
         schema.index_by_name(&name).is_some_and(|index| {
             index.is_full_column_btree(&[region as u16, id as u16])
-                && index.collation_at(0) == citadel_sql::types::Collation::Binary
-                && index.collation_at(1) == citadel_sql::types::Collation::Binary
+                && index.collation_at(0) == Collation::Binary
+                && index.collation_at(1) == Collation::Binary
         })
     };
     let schema = conn

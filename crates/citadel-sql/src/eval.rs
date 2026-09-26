@@ -292,7 +292,7 @@ pub(crate) enum CompiledExpr<'a> {
         left: Box<CompiledExpr<'a>>,
         op: BinOp,
         right: Box<CompiledExpr<'a>>,
-        collation: Option<crate::types::Collation>,
+        collation: Option<Collation>,
     },
     UnaryOp {
         op: UnaryOp,
@@ -378,10 +378,7 @@ pub(crate) fn compile_collation(
 
 /// The collation an operand carries by itself, for a comparison whose other side is a bare
 /// value rather than an expression - the result set of an `IN (subquery)`.
-pub(crate) fn operand_collation(
-    expr: &Expr,
-    col_map: &ColumnMap,
-) -> Option<crate::types::Collation> {
+pub(crate) fn operand_collation(expr: &Expr, col_map: &ColumnMap) -> Option<Collation> {
     collation_of(expr).or_else(|| column_collation(expr, col_map))
 }
 
@@ -749,7 +746,7 @@ fn eval_quantified(
     }
 }
 
-pub(crate) fn collation_of(expr: &Expr) -> Option<crate::types::Collation> {
+pub(crate) fn collation_of(expr: &Expr) -> Option<Collation> {
     match expr {
         Expr::Collate { collation, .. } => Some(*collation),
         Expr::BinaryOp { left, right, .. } | Expr::IsDistinctFrom { left, right, .. } => {
@@ -835,12 +832,7 @@ fn column_collation(expr: &Expr, col_map: &ColumnMap) -> Option<Collation> {
     }
 }
 
-fn eval_text_compare(
-    left: &Value,
-    op: BinOp,
-    right: &Value,
-    coll: crate::types::Collation,
-) -> Option<bool> {
+fn eval_text_compare(left: &Value, op: BinOp, right: &Value, coll: Collation) -> Option<bool> {
     let (a, b) = match (left, right) {
         (Value::Null, _) | (_, Value::Null) => return None,
         (Value::Text(a), Value::Text(b)) => (a.as_str(), b.as_str()),
@@ -869,7 +861,7 @@ fn collated_compare(
     left: &Value,
     op: BinOp,
     right: &Value,
-    coll: Option<crate::types::Collation>,
+    coll: Option<Collation>,
 ) -> Result<Value> {
     collated_compare_with_cancel(left, op, right, coll, None)
 }
@@ -878,7 +870,7 @@ fn collated_compare_with_cancel(
     left: &Value,
     op: BinOp,
     right: &Value,
-    coll: Option<crate::types::Collation>,
+    coll: Option<Collation>,
     cancel: Option<&citadel::CancelToken>,
 ) -> Result<Value> {
     if let Some(c) = coll {
@@ -953,11 +945,7 @@ impl ConversionFamilies {
 }
 
 /// Equality under `coll`, including the temporal normalization used by the `=` operator.
-pub(crate) fn collated_eq(
-    left: &Value,
-    right: &Value,
-    coll: Option<crate::types::Collation>,
-) -> Result<bool> {
+pub(crate) fn collated_eq(left: &Value, right: &Value, coll: Option<Collation>) -> Result<bool> {
     Ok(matches!(
         collated_compare(left, BinOp::Eq, right, coll)?,
         Value::Boolean(true)
@@ -1626,7 +1614,7 @@ fn eval_in_set(
     families: ConversionFamilies,
     has_null: bool,
     negated: bool,
-    coll: Option<crate::types::Collation>,
+    coll: Option<Collation>,
 ) -> Result<Value> {
     if values.is_empty() && !has_null {
         return Ok(Value::Boolean(negated));
@@ -1780,8 +1768,8 @@ fn eval_between(
     low: &Value,
     high: &Value,
     negated: bool,
-    low_coll: Option<crate::types::Collation>,
-    high_coll: Option<crate::types::Collation>,
+    low_coll: Option<Collation>,
+    high_coll: Option<Collation>,
 ) -> Result<Value> {
     let ge = collated_compare(val, BinOp::GtEq, low, low_coll)?;
     let le = collated_compare(val, BinOp::LtEq, high, high_coll)?;
@@ -3984,7 +3972,7 @@ enum Tie {
 }
 
 /// The collation that orders a function's text arguments: the first one an argument carries.
-fn args_collation(args: &[Expr], col_map: &ColumnMap) -> Option<crate::types::Collation> {
+fn args_collation(args: &[Expr], col_map: &ColumnMap) -> Option<Collation> {
     args.iter().find_map(|arg| operand_collation(arg, col_map))
 }
 
@@ -3995,7 +3983,7 @@ fn extreme<'v>(
     rest: impl IntoIterator<Item = &'v Value>,
     greatest: bool,
     tie: Tie,
-    collation: Option<crate::types::Collation>,
+    collation: Option<Collation>,
     cancel: Option<&citadel::CancelToken>,
 ) -> Result<&'v Value> {
     // Whether `a` lies strictly past `b` in the direction sought.

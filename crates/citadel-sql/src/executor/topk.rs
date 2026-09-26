@@ -148,7 +148,7 @@ pub(super) struct TopKScanPlan {
     descending: bool,
     nulls_first: bool,
     keep: usize,
-    collation: crate::types::Collation,
+    collation: Collation,
 }
 
 fn topk_simple_sort_column(expr: &Expr, col_map: &ColumnMap) -> Option<(usize, Option<Collation>)> {

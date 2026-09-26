@@ -201,11 +201,7 @@ pub(super) fn resolve_col_idx(expr: &Expr, columns: &[ColumnDef]) -> Option<usiz
 }
 
 /// Candidate hash only; bucket members still require equality verification.
-pub(super) fn join_key_hash(
-    row: &[Value],
-    col_indices: &[usize],
-    key_colls: &[crate::types::Collation],
-) -> u64 {
+pub(super) fn join_key_hash(row: &[Value], col_indices: &[usize], key_colls: &[Collation]) -> u64 {
     let mut state = FxHasher::default();
     col_indices.len().hash(&mut state);
     for (k, &i) in col_indices.iter().enumerate() {
@@ -242,7 +238,7 @@ pub(super) fn equi_key_collations(
     pairs: &[KeyPair],
     combined_cols: &[ColumnDef],
     outer_col_count: usize,
-) -> Vec<crate::types::Collation> {
+) -> Vec<Collation> {
     pairs
         .iter()
         .map(|pair| {
@@ -272,7 +268,7 @@ pub(super) struct EquiJoin {
     pairs: Vec<KeyPair>,
     /// Every ON conjunct is one of `pairs`; otherwise evaluate the full ON expression.
     pure: bool,
-    key_colls: Vec<crate::types::Collation>,
+    key_colls: Vec<Collation>,
 }
 
 /// One `outer.x = inner.y` of a join condition, as positions in the combined row.
@@ -345,7 +341,7 @@ impl KeyedRows {
     /// collation its `=` compares under. A row with a NULL key matches nothing.
     pub(in crate::executor) fn build(
         rows: Vec<Vec<Value>>,
-        keys: &[(usize, crate::types::Collation)],
+        keys: &[(usize, Collation)],
         cancel: Option<&citadel::CancelToken>,
     ) -> Result<Self> {
         let equi = EquiJoin {

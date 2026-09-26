@@ -1,4 +1,5 @@
 use citadel::{Argon2Profile, DatabaseBuilder};
+use citadel_sql::types::Collation;
 use citadel_sql::{Connection, ExecutionResult, SqlError, Value};
 
 fn database() -> citadel::Database {
@@ -187,11 +188,8 @@ fn literal_values_do_not_bind_referenced_parent_lazy_parameters() {
     assert_eq!(parent.indices.len(), 1);
     let index = &parent.indices[0];
     assert!(index.unique && index.is_full_column_btree(&[1]));
-    assert_eq!(
-        parent.columns[1].collation,
-        citadel_sql::types::Collation::Binary
-    );
-    assert_eq!(index.collation_at(0), citadel_sql::types::Collation::NoCase);
+    assert_eq!(parent.columns[1].collation, Collation::Binary);
+    assert_eq!(index.collation_at(0), Collation::NoCase);
     // The broader index must recheck the parent's Binary equality, decoding
     // its physically missing default and dependent virtual column.
     rejects_both(&conn, "INSERT INTO child VALUES (2, 'Alpha')", 1);

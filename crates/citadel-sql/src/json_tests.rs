@@ -1,4 +1,5 @@
 use super::*;
+use crate::types::Collation;
 
 fn roundtrip(input: &str) {
     let v: serde_json::Value = serde_json::from_str(input).unwrap();
@@ -451,7 +452,7 @@ fn populate_record_can_cancel_between_columns() {
             generated_expr: None,
             generated_sql: None,
             generated_kind: None,
-            collation: crate::types::Collation::Binary,
+            collation: Collation::Binary,
         })
         .collect();
     let token = CancelToken::new();

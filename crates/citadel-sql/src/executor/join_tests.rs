@@ -173,15 +173,15 @@ fn join_key_hash_empty_tuple_is_independent_of_row_contents() {
 fn join_key_hash_folds_a_collated_column() {
     let upper = vec![Value::Text("A".into()), i(1)];
     let lower = vec![Value::Text("a".into()), i(2)];
-    let colls = [crate::types::Collation::NoCase];
+    let colls = [Collation::NoCase];
 
     assert_eq!(
         join_key_hash(&upper, &[0], &colls),
         join_key_hash(&lower, &[0], &colls)
     );
     assert_ne!(
-        join_key_hash(&upper, &[0], &[crate::types::Collation::Binary]),
-        join_key_hash(&lower, &[0], &[crate::types::Collation::Binary])
+        join_key_hash(&upper, &[0], &[Collation::Binary]),
+        join_key_hash(&lower, &[0], &[Collation::Binary])
     );
 }
 
@@ -204,7 +204,7 @@ fn join_key_hash_collision_does_not_imply_numeric_equality() {
 #[test]
 fn equi_key_collations_follow_syntactic_left_precedence() {
     let mut cols = cols(&[("l", DataType::Text), ("r", DataType::Text)]);
-    cols[1].collation = crate::types::Collation::NoCase;
+    cols[1].collation = Collation::NoCase;
     assert_eq!(
         equi_key_collations(
             &[KeyPair {
@@ -215,7 +215,7 @@ fn equi_key_collations_follow_syntactic_left_precedence() {
             &cols,
             1,
         ),
-        vec![crate::types::Collation::Binary],
+        vec![Collation::Binary],
         "a BINARY left operand still wins over a NOCASE right operand"
     );
     assert_eq!(
@@ -228,11 +228,11 @@ fn equi_key_collations_follow_syntactic_left_precedence() {
             &cols,
             1,
         ),
-        vec![crate::types::Collation::NoCase],
+        vec![Collation::NoCase],
         "the inner column wins when it was written on the left"
     );
 
-    cols[0].collation = crate::types::Collation::Rtrim;
+    cols[0].collation = Collation::Rtrim;
     assert_eq!(
         equi_key_collations(
             &[KeyPair {
@@ -243,7 +243,7 @@ fn equi_key_collations_follow_syntactic_left_precedence() {
             &cols,
             1,
         ),
-        vec![crate::types::Collation::Rtrim],
+        vec![Collation::Rtrim],
         "a collated left wins"
     );
 }
@@ -256,7 +256,7 @@ fn equi_key_collations_offsets_inner_columns_past_the_outer_row() {
         ("inner_id", DataType::Integer),
         ("inner_text", DataType::Text),
     ]);
-    cols[3].collation = crate::types::Collation::NoCase;
+    cols[3].collation = Collation::NoCase;
 
     assert_eq!(
         equi_key_collations(
@@ -268,7 +268,7 @@ fn equi_key_collations_offsets_inner_columns_past_the_outer_row() {
             &cols,
             2,
         ),
-        vec![crate::types::Collation::NoCase]
+        vec![Collation::NoCase]
     );
 }
 

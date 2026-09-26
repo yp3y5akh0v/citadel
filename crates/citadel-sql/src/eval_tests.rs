@@ -1,5 +1,5 @@
 use super::*;
-use crate::types::DataType;
+use crate::types::{Collation, DataType};
 
 const TEXT_SEARCH_CONSTRUCTORS: [&str; 5] = [
     "to_tsvector",
@@ -477,7 +477,7 @@ fn col(name: &str, dt: DataType, nullable: bool, pos: u16) -> ColumnDef {
         generated_expr: None,
         generated_sql: None,
         generated_kind: None,
-        collation: crate::types::Collation::Binary,
+        collation: Collation::Binary,
     }
 }
 
@@ -1271,7 +1271,6 @@ fn empty_parameter_scope_restores_outer_after_unwind() {
 
 #[test]
 fn bound_columns_preserve_implicit_collation_without_promoting_it() {
-    use crate::types::Collation;
     let columns = vec![col("inner", DataType::Text, false, 0)];
     let map = ColumnMap::new(&columns);
     let row = vec![Value::Text("A".into())];
@@ -1350,7 +1349,6 @@ fn bound_columns_preserve_implicit_collation_without_promoting_it() {
 
 #[test]
 fn interval_length_keys_leave_comparisons_uncollated() {
-    use crate::types::Collation;
     let mut columns = vec![col("v", DataType::Interval, true, 0)];
     columns[0].collation = Collation::IntervalLength;
     let map = ColumnMap::new(&columns);

@@ -1431,7 +1431,7 @@ pub(super) fn sort_rows_by_keys(
     rows: &mut [Vec<Value>],
     keys: &[Vec<Value>],
     order_by: &[OrderByItem],
-    collations: &[crate::types::Collation],
+    collations: &[Collation],
     cancel: Option<&citadel::CancelToken>,
 ) -> Result<()> {
     debug_assert_eq!(rows.len(), keys.len(), "a key per row");
@@ -1452,7 +1452,7 @@ pub(super) fn topk_rows_by_keys(
     rows: &mut [Vec<Value>],
     keys: &[Vec<Value>],
     order_by: &[OrderByItem],
-    collations: &[crate::types::Collation],
+    collations: &[Collation],
     k: usize,
     cancel: Option<&citadel::CancelToken>,
 ) -> Result<()> {
@@ -1777,7 +1777,7 @@ pub(super) fn compare_sort_keys(
     a: &[Value],
     b: &[Value],
     order_by: &[OrderByItem],
-    collations: &[crate::types::Collation],
+    collations: &[Collation],
 ) -> std::cmp::Ordering {
     for (i, item) in order_by.iter().enumerate() {
         let nulls_first = item.nulls_first.unwrap_or(!item.descending);
@@ -1798,10 +1798,7 @@ pub(super) fn compare_sort_keys(
                 }
             }
             (false, false) => {
-                let coll = collations
-                    .get(i)
-                    .copied()
-                    .unwrap_or(crate::types::Collation::Binary);
+                let coll = collations.get(i).copied().unwrap_or(Collation::Binary);
                 let cmp = coll.cmp_value(&a[i], &b[i]);
                 if item.descending {
                     cmp.reverse()
@@ -1819,11 +1816,7 @@ pub(super) fn compare_sort_keys(
 
 /// A column that carries a name, a position and a collation and nothing else: the shape of a
 /// projected value, which has no stored column behind it to describe.
-pub(crate) fn projected_column(
-    name: String,
-    position: usize,
-    collation: crate::types::Collation,
-) -> ColumnDef {
+pub(crate) fn projected_column(name: String, position: usize, collation: Collation) -> ColumnDef {
     ColumnDef {
         name,
         data_type: DataType::Null,
@@ -1860,14 +1853,11 @@ pub(crate) fn written_alias(
 /// The collation a key expression carries: an explicit COLLATE anywhere in it, else a
 /// column's own preserved through CAST wrappers. Anything else has none. Grouping,
 /// deduplicating and sorting all key expressions by this same rule.
-pub(crate) fn expr_collation(expr: &Expr, col_map: &ColumnMap) -> crate::types::Collation {
-    operand_collation(expr, col_map).unwrap_or(crate::types::Collation::Binary)
+pub(crate) fn expr_collation(expr: &Expr, col_map: &ColumnMap) -> Collation {
+    operand_collation(expr, col_map).unwrap_or(Collation::Binary)
 }
 
-pub(super) fn sort_key_collations(
-    order_by: &[OrderByItem],
-    col_map: &ColumnMap,
-) -> Vec<crate::types::Collation> {
+pub(super) fn sort_key_collations(order_by: &[OrderByItem], col_map: &ColumnMap) -> Vec<Collation> {
     order_by
         .iter()
         .map(|item| {
@@ -1889,7 +1879,7 @@ pub(super) fn sort_key_collations(
 pub(crate) fn output_collations(
     select_cols: &[SelectColumn],
     col_map: &ColumnMap,
-) -> Vec<crate::types::Collation> {
+) -> Vec<Collation> {
     let mut out = Vec::with_capacity(select_cols.len());
     for col in select_cols {
         match col {
@@ -1904,9 +1894,7 @@ pub(crate) fn output_collations(
 
 /// A row folded into the key that decides its equality, value by value as
 /// [`Collation::group_key`] keys it. Values past the end of `collations` compare as BINARY.
-///
-/// [`Collation::group_key`]: crate::types::Collation::group_key
-pub(crate) fn fold_key(row: &[Value], collations: &[crate::types::Collation]) -> Vec<Value> {
+pub(crate) fn fold_key(row: &[Value], collations: &[Collation]) -> Vec<Value> {
     row.iter()
         .enumerate()
         .map(|(i, v)| {
@@ -2369,8 +2357,8 @@ pub(super) fn encode_index_key_into_with_schema_and_cancel(
 }
 
 #[inline]
-fn encode_index_key_component(value: &Value, coll: crate::types::Collation, buf: &mut Vec<u8>) {
-    if coll == crate::types::Collation::Binary {
+fn encode_index_key_component(value: &Value, coll: Collation, buf: &mut Vec<u8>) {
+    if coll == Collation::Binary {
         crate::encoding::encode_key_value_into(value, buf);
     } else {
         crate::encoding::encode_key_value_collated_into(value, coll, buf);
@@ -3021,8 +3009,8 @@ pub(super) fn scan_fk_index_keys(
     out: &mut FkChildHits,
 ) -> Result<()> {
     let idx_table = TableSchema::index_table_name(&child_schema.name, &cascading_idx.name);
-    let folded = (0..cascading_idx.keys.len())
-        .any(|i| cascading_idx.collation_at(i) != crate::types::Collation::Binary);
+    let folded =
+        (0..cascading_idx.keys.len()).any(|i| cascading_idx.collation_at(i) != Collation::Binary);
     let residual = !reference.exact_index_equality(cascading_idx);
     let values = (folded || residual)
         .then(|| decode_composite_key(parent_key, cascading_idx.keys.len()))

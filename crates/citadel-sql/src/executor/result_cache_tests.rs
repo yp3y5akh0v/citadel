@@ -1,6 +1,6 @@
 use super::*;
 use crate::schema::SchemaManager;
-use crate::types::{ColumnDef, DataType, QueryResult, TableSchema};
+use crate::types::{Collation, ColumnDef, DataType, QueryResult, TableSchema};
 
 fn parse_query(sql: &str) -> crate::parser::SelectQuery {
     match crate::parser::parse_sql(sql).unwrap() {
@@ -25,7 +25,7 @@ fn schema_with_t() -> SchemaManager {
         generated_expr: None,
         generated_sql: None,
         generated_kind: None,
-        collation: crate::types::Collation::Binary,
+        collation: Collation::Binary,
     };
     let mut v = id.clone();
     id.name = "id".into();
