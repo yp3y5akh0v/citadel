@@ -1,11 +1,10 @@
-mod upgrade_fixtures;
-
 use citadel_mem::{
     AtomInput, EmbedError, Embedder, EmbeddingMetric, MemError, MemoryEngine, MockEmbedder,
     RecallQuery,
 };
-use upgrade_fixtures::{
-    fixture_vault, seed_ordinary_region, seed_shim_region, NamedEmbedder, SHIM_VECTOR_MODEL,
+
+use crate::upgrade_fixtures::{
+    fixture_vault, reopen, seed_ordinary_region, seed_shim_region, NamedEmbedder, SHIM_VECTOR_MODEL,
 };
 
 struct LegacyMockEmbedder(MockEmbedder);
@@ -94,7 +93,7 @@ fn provenance_fixtures_survive_reopen() {
         seed_shim_region(&db, "documents", &["beta"]);
     }
 
-    let db = upgrade_fixtures::reopen(&path);
+    let db = reopen(&path);
     let engine = MemoryEngine::open(std::sync::Arc::clone(&db)).unwrap();
     let mut models: Vec<_> = engine
         .stored_region_identities()
