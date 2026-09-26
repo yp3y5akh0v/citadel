@@ -11,10 +11,10 @@ pub(crate) fn key_predicate(
     value: &Value,
 ) -> Option<(BinOp, Value)> {
     match (data_type, value) {
-        // Keys order an interval by its fields, but SQL compares its length with
-        // 30-day months ('1 month' = '30 days' < '31 days'), so no key range holds
-        // exactly the rows a comparison selects.
-        (DataType::Interval, _) => None,
+        // Keys hold an interval's fields, alone or in an array, but SQL compares its
+        // length with 30-day months ('1 month' = '30 days' < '31 days'), so no key
+        // range holds exactly the rows a comparison selects.
+        _ if value.holds_interval() => None,
         (DataType::Integer, Value::Real(v)) if v.is_finite() => {
             if op == BinOp::Eq {
                 let i = *v as i64;

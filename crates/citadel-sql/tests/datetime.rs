@@ -671,6 +671,51 @@ fn interval_arrays_compare_and_group_by_length() {
 }
 
 #[test]
+fn interval_array_keys_match_by_length() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    for sql in [
+        "CREATE TABLE s (id INTEGER PRIMARY KEY, v INTERVAL)",
+        "INSERT INTO s VALUES (1, INTERVAL '1 month'), (2, INTERVAL '30 days'), \
+         (3, INTERVAL '31 days')",
+        "CREATE MATERIALIZED VIEW by_key AS SELECT ARRAY[v] AS k, id FROM s",
+        "CREATE MATERIALIZED VIEW by_id AS SELECT id, ARRAY[v] AS k FROM s",
+        "CREATE INDEX by_id_k ON by_id (k)",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+    let interval = |months, days| Value::Interval {
+        months,
+        days,
+        micros: 0,
+    };
+    let ids = |sql: &str, element: Value| -> Vec<Value> {
+        let bound = Value::Array(std::sync::Arc::new(vec![element]));
+        conn.query_params(sql, &[bound])
+            .unwrap()
+            .rows
+            .into_iter()
+            .map(|row| row[0].clone())
+            .collect()
+    };
+    // Keys hold the fields: a key range from '1 month' skips '31 days', one up to
+    // '31 days' skips '1 month'.
+    for view in ["by_key", "by_id"] {
+        let query = |op: &str| format!("SELECT id FROM {view} WHERE k {op} $1 ORDER BY id");
+        assert_eq!(
+            ids(&query("="), interval(0, 30)),
+            [Value::Integer(1), Value::Integer(2)]
+        );
+        assert_eq!(ids(&query(">"), interval(1, 0)), [Value::Integer(3)]);
+        assert_eq!(
+            ids(&query("<"), interval(0, 31)),
+            [Value::Integer(1), Value::Integer(2)]
+        );
+    }
+}
+
+#[test]
 fn intervals_group_by_normalized_length() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
