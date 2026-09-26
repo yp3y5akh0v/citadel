@@ -102,6 +102,7 @@ parking_lot = "0.12"
 rayon = "1.10"
 
 libc = "0.2"
+windows-sys = "0.59"
 io-uring = "0.7"
 memmap2 = "0.9"
 

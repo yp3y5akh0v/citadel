@@ -299,8 +299,11 @@ pub fn unwrap_rek(
 
 /// Create a new key file for a fresh database.
 ///
-/// For Argon2id: m_cost, t_cost, p_cost are the standard Argon2 parameters.
-/// For PBKDF2: m_cost is the iteration count, t_cost and p_cost must be 0.
+/// For Argon2id: m_cost, t_cost, p_cost are the standard Argon2 parameters, with t_cost at most
+/// [`ARGON2_MAX_T_COST`](citadel_core::ARGON2_MAX_T_COST) and m_cost within physical memory.
+/// For PBKDF2: m_cost is the iteration count, from
+/// [`PBKDF2_MIN_ITERATIONS`](citadel_core::PBKDF2_MIN_ITERATIONS) to
+/// [`PBKDF2_MAX_ITERATIONS`](citadel_core::PBKDF2_MAX_ITERATIONS); t_cost and p_cost must be 0.
 pub fn create_key_file(
     passphrase: &[u8],
     file_id: u64,

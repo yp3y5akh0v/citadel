@@ -1,9 +1,16 @@
+use std::io;
+
 use hmac::Hmac;
 use sha2::Sha256;
 use zeroize::{Zeroize, Zeroizing};
 
 use citadel_core::types::KdfAlgorithm;
-use citadel_core::{Argon2Profile, ARGON2_SALT_SIZE, KEY_SIZE, PBKDF2_MIN_ITERATIONS};
+use citadel_core::{
+    Argon2Profile, ARGON2_MAX_T_COST, ARGON2_SALT_SIZE, KEY_SIZE, PBKDF2_MAX_ITERATIONS,
+    PBKDF2_MIN_ITERATIONS,
+};
+
+use crate::physical_memory;
 
 /// Derive a Master Key from a passphrase using Argon2id.
 ///
@@ -16,17 +23,69 @@ pub fn derive_mk_argon2id(
     t_cost: u32,
     p_cost: u32,
 ) -> citadel_core::Result<Zeroizing<[u8; KEY_SIZE]>> {
+    if t_cost > ARGON2_MAX_T_COST {
+        return Err(invalid_input(format!(
+            "Argon2 time cost too high: {t_cost} (maximum {ARGON2_MAX_T_COST})"
+        )));
+    }
     let params = argon2::Params::new(m_cost, t_cost, p_cost, Some(KEY_SIZE))
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
+        .map_err(|e| invalid_input(e.to_string()))?;
+    let mut memory = argon2_memory(params.block_count())?;
 
     let argon2 = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
 
     let mut mk = Zeroizing::new([0u8; KEY_SIZE]);
     argon2
-        .hash_password_into(passphrase, salt, &mut *mk)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
+        .hash_password_into_with_memory(passphrase, salt, &mut *mk, &mut memory)
+        .map_err(|e| invalid_input(e.to_string()))?;
 
     Ok(mk)
+}
+
+/// Argon2's working memory, sized by a memory cost that may come from an unauthenticated
+/// file: more than the machine has, or than it can allocate now, is an error rather than an
+/// aborted process.
+fn argon2_memory(blocks: usize) -> citadel_core::Result<Vec<argon2::Block>> {
+    const MIB: u64 = 1024 * 1024;
+    let bytes = (blocks as u64).saturating_mul(argon2::Block::SIZE as u64);
+    if let Some(total) = physical_memory::total().filter(|&total| bytes > total) {
+        return Err(out_of_memory(format!(
+            "Argon2 memory cost of {} MiB exceeds this machine's {} MiB of physical memory",
+            bytes / MIB,
+            total / MIB
+        )));
+    }
+    let mut memory = Vec::new();
+    memory.try_reserve_exact(blocks).map_err(|_| {
+        out_of_memory(format!(
+            "Argon2 memory cost of {} MiB cannot be allocated",
+            bytes / MIB
+        ))
+    })?;
+    memory.resize(blocks, argon2::Block::default());
+    Ok(memory)
+}
+
+fn check_pbkdf2_iterations(iterations: u32) -> citadel_core::Result<()> {
+    if iterations < PBKDF2_MIN_ITERATIONS {
+        return Err(invalid_input(format!(
+            "PBKDF2 iterations too low: {iterations} (minimum {PBKDF2_MIN_ITERATIONS})"
+        )));
+    }
+    if iterations > PBKDF2_MAX_ITERATIONS {
+        return Err(invalid_input(format!(
+            "PBKDF2 iterations too high: {iterations} (maximum {PBKDF2_MAX_ITERATIONS})"
+        )));
+    }
+    Ok(())
+}
+
+fn invalid_input(message: String) -> citadel_core::Error {
+    citadel_core::Error::Io(io::Error::new(io::ErrorKind::InvalidInput, message))
+}
+
+fn out_of_memory(message: String) -> citadel_core::Error {
+    citadel_core::Error::Io(io::Error::new(io::ErrorKind::OutOfMemory, message))
 }
 
 /// Derive a Master Key using the given Argon2 profile.
@@ -50,15 +109,7 @@ pub fn derive_mk_pbkdf2(
     salt: &[u8; ARGON2_SALT_SIZE],
     iterations: u32,
 ) -> citadel_core::Result<Zeroizing<[u8; KEY_SIZE]>> {
-    if iterations < PBKDF2_MIN_ITERATIONS {
-        return Err(citadel_core::Error::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "PBKDF2 iterations too low: {} (minimum {})",
-                iterations, PBKDF2_MIN_ITERATIONS
-            ),
-        )));
-    }
+    check_pbkdf2_iterations(iterations)?;
     let mut mk = Zeroizing::new([0u8; KEY_SIZE]);
     pbkdf2::pbkdf2::<Hmac<Sha256>>(passphrase, salt, iterations, &mut *mk)
         .expect("PBKDF2 should not fail with valid parameters");
