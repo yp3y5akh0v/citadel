@@ -1494,7 +1494,7 @@ fn eval_temporal_op(left: &Value, op: BinOp, right: &Value) -> Option<Result<Val
 /// Compares values where one side is temporal, coercing the other to match.
 fn temporal_compare(left: &Value, op: BinOp, right: &Value) -> Option<Result<Value>> {
     let (a, b) = coerce_temporal_pair(left, right)?;
-    let ord = a.cmp(&b);
+    let ord = a.sql_cmp(&b);
     use std::cmp::Ordering;
     let result = match op {
         BinOp::Eq => ord == Ordering::Equal,
