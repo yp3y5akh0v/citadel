@@ -200,3 +200,28 @@ fn vector_zero_dim_rejected() {
         .unwrap_err();
     assert!(err.to_string().contains("VECTOR dimension"), "{err}");
 }
+
+#[test]
+fn vector_keys_sort_by_value_under_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (v VECTOR(1) PRIMARY KEY)")
+        .unwrap();
+    conn.execute(
+        "INSERT INTO t VALUES ('[2]'::VECTOR(1)), ('[10]'::VECTOR(1)), \
+         ('[-1]'::VECTOR(1)), ('[0.5]'::VECTOR(1))",
+    )
+    .unwrap();
+    let vector = |x: f32| vec![Value::Vector(std::sync::Arc::from([x]))];
+    let rows = |sql: &str| conn.query(sql).unwrap().rows;
+    // Keys hold little-endian floats, so key order puts 0.5 first and -1 last.
+    assert_eq!(
+        rows("SELECT v FROM t ORDER BY v LIMIT 2"),
+        vec![vector(-1.0), vector(0.5)]
+    );
+    assert_eq!(
+        rows("SELECT v FROM t ORDER BY v LIMIT 2 OFFSET 1"),
+        vec![vector(0.5), vector(2.0)]
+    );
+}

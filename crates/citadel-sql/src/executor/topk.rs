@@ -1,7 +1,8 @@
 use citadel::CancelToken;
 
 use crate::encoding::{
-    decode_composite_key, decode_pk_integer, decode_stored_column_raw, RawColumn,
+    decode_composite_key, decode_pk_integer, decode_stored_column_raw, keys_sort_in_sql_order,
+    RawColumn,
 };
 use crate::error::{Result, SqlError};
 use crate::eval::ColumnMap;
@@ -354,7 +355,7 @@ impl TopKScanPlan {
         // Primary-tree order == output order: keep the first k, skip the heap.
         if matches!(self.sort_target, SortTarget::Primary(0))
             && !self.descending
-            && self.collation == crate::types::Collation::Binary
+            && keys_sort_in_sql_order(schema.columns[self.sort_column].data_type, self.collation)
         {
             let mut firsts = Vec::new();
             let mut scan_err = None;
