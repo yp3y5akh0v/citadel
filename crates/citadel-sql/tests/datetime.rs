@@ -559,6 +559,66 @@ fn intervals_sort_by_normalized_length() {
 }
 
 #[test]
+fn intervals_group_by_normalized_length() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    assert_ok(
+        conn.execute("CREATE TABLE g (id INTEGER PRIMARY KEY, v INTERVAL)")
+            .unwrap(),
+    );
+    assert_rows(
+        conn.execute(
+            "INSERT INTO g VALUES (1, INTERVAL '1 month'), (2, INTERVAL '30 days'), \
+             (3, INTERVAL '720 hours'), (4, INTERVAL '31 days'), (5, NULL), \
+             (6, INTERVAL '2147483647 months 30 days'), \
+             (7, INTERVAL '2147483646 months 60 days'), \
+             (8, INTERVAL '-2147483648 months -30 days'), \
+             (9, INTERVAL '-2147483647 months -60 days')",
+        )
+        .unwrap(),
+        9,
+    );
+    // A month counts 30 days: ids 1 to 3 share one length, as do 6 and 7, and 8 and 9.
+    for (sql, expected) in [
+        ("SELECT COUNT(DISTINCT v) FROM g", 4),
+        ("SELECT COUNT(*) FROM (SELECT DISTINCT v FROM g) d", 5),
+        (
+            "SELECT COUNT(*) FROM (SELECT DISTINCT v FROM g WHERE id > 0) d",
+            5,
+        ),
+        ("SELECT COUNT(*) FROM (SELECT v FROM g GROUP BY v) d", 5),
+        (
+            "SELECT COUNT(*) FROM (SELECT v FROM g UNION SELECT v FROM g) u",
+            5,
+        ),
+        (
+            "SELECT COUNT(*) FROM (SELECT v FROM g WHERE id IN (1, 4) \
+             INTERSECT SELECT v FROM g WHERE id IN (2, 6)) x",
+            1,
+        ),
+        (
+            "SELECT COUNT(*) FROM (SELECT v FROM g WHERE id IN (2, 4) \
+             EXCEPT SELECT v FROM g WHERE id = 3) x",
+            1,
+        ),
+        (
+            "SELECT COUNT(*) FROM (SELECT v FROM g WHERE id IN (6, 8) \
+             EXCEPT SELECT v FROM g WHERE id IN (7, 9)) x",
+            0,
+        ),
+    ] {
+        assert_eq!(scalar(&conn, sql), Value::Integer(expected), "{sql}");
+    }
+    assert_eq!(
+        conn.query("SELECT COUNT(*) FROM g GROUP BY v ORDER BY 1")
+            .unwrap()
+            .rows,
+        [1, 1, 2, 2, 3].map(|n| vec![Value::Integer(n)])
+    );
+}
+
+#[test]
 fn now_returns_timestamp() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());

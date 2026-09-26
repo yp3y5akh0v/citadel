@@ -1368,6 +1368,34 @@ pub fn interval_to_total_micros(months: i32, days: i32, micros: i64) -> i128 {
         + micros as i128
 }
 
+/// The fields every interval of one length shares: the length in micros when it fits,
+/// otherwise micros holding the most whole days they can and the other days split into
+/// 30-day months and days. Those other days never exceed the ones the interval itself
+/// spends outside its micros, so they always fit.
+pub(crate) fn canonical_interval(months: i32, days: i32, micros: i64) -> (i32, i32, i64) {
+    let total = interval_to_total_micros(months, days, micros);
+    if let Ok(micros) = i64::try_from(total) {
+        return (0, 0, micros);
+    }
+    let day = i128::from(MICROS_PER_DAY);
+    let part_day = total.rem_euclid(day);
+    let carried_days = if total > 0 {
+        (i128::from(i64::MAX) - part_day).div_euclid(day)
+    } else {
+        -(part_day - i128::from(i64::MIN)).div_euclid(day)
+    };
+    let other_days = total.div_euclid(day) - carried_days;
+    let months = other_days
+        .div_euclid(30)
+        .clamp(i128::from(i32::MIN), i128::from(i32::MAX));
+    let fits = "an interval's length has fields that fit";
+    (
+        i32::try_from(months).expect(fits),
+        i32::try_from(other_days - months * 30).expect(fits),
+        i64::try_from(part_day + carried_days * day).expect(fits),
+    )
+}
+
 pub fn extract(field: &str, v: &Value) -> Result<Value> {
     // PostgreSQL folds field names to lower case.
     let field = field.trim().to_ascii_lowercase();

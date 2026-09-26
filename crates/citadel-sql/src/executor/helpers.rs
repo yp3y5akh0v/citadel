@@ -1918,21 +1918,27 @@ pub(crate) fn output_collations(
     out
 }
 
-/// A row folded into the key that decides its equality. A row longer than `collations` keeps
-/// its extra values as they are, which is the binary comparison they had before.
+/// A row folded into the key that decides its equality, value by value as
+/// [`Collation::group_key`] keys it. Values past the end of `collations` compare as BINARY.
+///
+/// [`Collation::group_key`]: crate::types::Collation::group_key
 pub(crate) fn fold_key(row: &[Value], collations: &[crate::types::Collation]) -> Vec<Value> {
     row.iter()
         .enumerate()
-        .map(|(i, v)| match collations.get(i) {
-            Some(coll) => coll.fold(v.clone()),
-            None => v.clone(),
+        .map(|(i, v)| {
+            collations
+                .get(i)
+                .copied()
+                .unwrap_or_default()
+                .group_key(v.clone())
         })
         .collect()
 }
 
 /// The set of rows already seen, under the collations that decide when two of them are
-/// the same row. When nothing collates the probe borrows the row, so only a surviving
-/// row is copied; folding a key for every row would allocate once per duplicate.
+/// the same row. When no collation folds text and the row holds no interval, the probe
+/// borrows the row, so only a surviving row is copied; folding a key for every row would
+/// allocate once per duplicate.
 pub(crate) struct RowKeys {
     seen: rustc_hash::FxHashSet<Vec<Value>>,
     collations: Vec<crate::types::Collation>,
@@ -1957,7 +1963,7 @@ impl RowKeys {
 
     /// True the first time this row is seen.
     pub(crate) fn insert(&mut self, row: &[Value]) -> bool {
-        if self.folding {
+        if self.folds(row) {
             return self.seen.insert(fold_key(row, &self.collations));
         }
         if self.seen.contains(row) {
@@ -1970,11 +1976,19 @@ impl RowKeys {
 
     /// Whether this row was already seen, borrowing it when nothing has to be folded.
     pub(crate) fn contains_row(&self, row: &[Value]) -> bool {
-        if self.folding {
+        if self.folds(row) {
             self.seen.contains(&fold_key(row, &self.collations))
         } else {
             self.seen.contains(row)
         }
+    }
+
+    /// Whether the row has to be folded into its key.
+    fn folds(&self, row: &[Value]) -> bool {
+        self.folding
+            || row
+                .iter()
+                .any(|value| matches!(value, Value::Interval { .. }))
     }
 }
 

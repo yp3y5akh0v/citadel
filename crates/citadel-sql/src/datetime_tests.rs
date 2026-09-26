@@ -386,6 +386,64 @@ fn interval_normalized_compare() {
 }
 
 #[test]
+fn canonical_interval_is_shared_by_every_interval_of_a_length() {
+    let day = MICROS_PER_DAY;
+    let keeps_length = |(months, days, micros): (i32, i32, i64)| {
+        let canonical = canonical_interval(months, days, micros);
+        assert_eq!(
+            interval_to_total_micros(canonical.0, canonical.1, canonical.2),
+            interval_to_total_micros(months, days, micros),
+            "{months} {days} {micros}"
+        );
+        assert_eq!(
+            canonical_interval(canonical.0, canonical.1, canonical.2),
+            canonical
+        );
+        canonical
+    };
+    // A length that fits in micros is kept there alone.
+    assert_eq!(keeps_length((1, 0, 0)), (0, 0, 30 * day));
+    assert_eq!(keeps_length((0, 30, 0)), (0, 0, 30 * day));
+    assert_eq!(keeps_length((0, 0, i64::MIN)), (0, 0, i64::MIN));
+    // Longer ones meet too, up to the longest and shortest an interval can be.
+    assert_eq!(
+        keeps_length((i32::MAX, 30, 0)),
+        keeps_length((i32::MAX - 1, 60, 0))
+    );
+    assert_eq!(
+        keeps_length((i32::MIN, -30, 0)),
+        keeps_length((i32::MIN + 1, -60, 0))
+    );
+    assert_eq!(
+        keeps_length((i32::MAX, i32::MAX, i64::MAX)),
+        (i32::MAX, i32::MAX, i64::MAX)
+    );
+    assert_eq!(
+        keeps_length((i32::MIN, i32::MIN, i64::MIN)),
+        (i32::MIN, i32::MIN, i64::MIN)
+    );
+    // Moving a month into days, or a day into micros, keeps the canonical fields.
+    let mut state = 0x243f_6a88_85a3_08d3_u64;
+    let mut next = || {
+        state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    };
+    for _ in 0..20_000 {
+        let (months, days, micros) = (next() as i32, next() as i32, next() as i64);
+        let canonical = keeps_length((months, days, micros));
+        if let (Some(m), Some(d)) = (months.checked_sub(1), days.checked_add(30)) {
+            assert_eq!(keeps_length((m, d, micros)), canonical);
+        }
+        if let (Some(d), Some(u)) = (days.checked_sub(1), micros.checked_add(day)) {
+            assert_eq!(keeps_length((months, d, u)), canonical);
+        }
+    }
+}
+
+#[test]
 fn justify_days_basic() {
     let (m, d, us) = justify_days(0, 65, 0).unwrap();
     assert_eq!((m, d, us), (2, 5, 0));
