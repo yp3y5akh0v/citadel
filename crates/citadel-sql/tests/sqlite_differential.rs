@@ -15,9 +15,21 @@
 //! EXISTS-to-join rewrite, which returns wrong rows in 3.51.3. SQLite
 //! evaluates UPDATE SET subqueries against rows the statement has already
 //! changed, so they read only the other table.
+//!
+//! `CITADEL_SQL_DIFF_SEEDS=<n>` runs `n` seeds per test instead of the default
+//! for a longer sweep.
 
 use citadel::{Argon2Profile, DatabaseBuilder};
 use citadel_sql::{Connection, ExecutionResult, Value};
+
+const DEFAULT_SEEDS: u64 = 6;
+
+fn seeds() -> u64 {
+    match std::env::var("CITADEL_SQL_DIFF_SEEDS") {
+        Ok(count) => count.parse().expect("CITADEL_SQL_DIFF_SEEDS is a count"),
+        Err(_) => DEFAULT_SEEDS,
+    }
+}
 
 struct Rng(u64);
 
@@ -160,7 +172,7 @@ impl Gen {
             };
         }
         let depth = depth - 1;
-        match self.rng.below(11) {
+        match self.rng.below(15) {
             0 => format!(
                 "({} + {})",
                 self.int_expr(scope, depth),
@@ -209,7 +221,26 @@ impl Gen {
                 self.int_expr(scope, depth),
                 self.int_expr(scope, depth)
             ),
-            _ => format!("LENGTH({})", self.text_expr(scope, depth)),
+            10 => format!("LENGTH({})", self.text_expr(scope, depth)),
+            11 => format!(
+                "INSTR({}, {})",
+                self.text_expr(scope, depth),
+                self.text_expr(scope, depth)
+            ),
+            12 => format!("SIGN({})", self.int_expr(scope, depth)),
+            13 => format!(
+                "{}({}, {})",
+                self.rng.pick(&["MIN", "MAX"]),
+                self.int_expr(scope, depth),
+                self.int_expr(scope, depth)
+            ),
+            _ => format!(
+                "CASE {} WHEN {} THEN {} ELSE {} END",
+                self.int_expr(scope, depth),
+                self.int_literal(),
+                self.int_expr(scope, depth),
+                self.int_expr(scope, depth)
+            ),
         }
     }
 
@@ -225,7 +256,7 @@ impl Gen {
             };
         }
         let depth = depth - 1;
-        match self.rng.below(8) {
+        match self.rng.below(10) {
             0 => format!("UPPER({})", self.text_expr(scope, depth)),
             1 => format!("LOWER({})", self.text_expr(scope, depth)),
             2 => format!(
@@ -233,25 +264,46 @@ impl Gen {
                 self.text_expr(scope, depth),
                 self.text_expr(scope, depth)
             ),
+            // Starts and lengths from 0 up, whose meaning no engine disputes.
             3 => format!(
                 "SUBSTR({}, {}, {})",
                 self.text_expr(scope, depth),
-                1 + self.rng.below(2),
-                1 + self.rng.below(3)
+                self.rng.below(5),
+                self.rng.below(5)
             ),
             4 => format!(
+                "SUBSTR({}, {})",
+                self.text_expr(scope, depth),
+                self.rng.below(5)
+            ),
+            5 => format!(
                 "COALESCE({}, {})",
                 self.text_expr(scope, depth),
                 self.text_expr(scope, depth)
             ),
-            5 => format!("REPLACE({}, 'a', 'z')", self.text_expr(scope, depth)),
             6 => format!(
+                "REPLACE({}, {}, {})",
+                self.text_expr(scope, depth),
+                self.text_expr(scope, 0),
+                self.text_expr(scope, 0)
+            ),
+            7 => format!(
                 "CASE WHEN {} THEN {} ELSE {} END",
                 self.predicate(scope, depth),
                 self.text_expr(scope, depth),
                 self.text_expr(scope, depth)
             ),
-            _ => format!("TRIM({})", self.text_expr(scope, depth)),
+            8 => format!(
+                "{}({})",
+                self.rng.pick(&["TRIM", "LTRIM", "RTRIM"]),
+                self.text_expr(scope, depth)
+            ),
+            _ => format!(
+                "{}({}, {})",
+                self.rng.pick(&["TRIM", "LTRIM", "RTRIM"]),
+                self.text_expr(scope, depth),
+                text_literal(self.rng.pick(TEXTS))
+            ),
         }
     }
 
@@ -1161,7 +1213,7 @@ fn assert_clean(report: &Report) {
 #[test]
 fn generated_queries_match_sqlite() {
     let mut report = Report::default();
-    for seed in 0..6 {
+    for seed in 0..seeds() {
         run_queries(0xD1FF_0000 + seed, 250, &mut report);
     }
     assert_clean(&report);
@@ -1170,7 +1222,7 @@ fn generated_queries_match_sqlite() {
 #[test]
 fn generated_changes_match_sqlite() {
     let mut report = Report::default();
-    for seed in 0..6 {
+    for seed in 0..seeds() {
         run_changes(0xC4A6_0000 + seed, 80, &mut report);
     }
     assert_clean(&report);
