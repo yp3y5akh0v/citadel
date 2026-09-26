@@ -456,6 +456,54 @@ fn pg_normalized_interval_equality() {
 }
 
 #[test]
+fn intervals_compare_with_text_by_length() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    assert_ok(
+        conn.execute("CREATE TABLE s (id INTEGER PRIMARY KEY, v INTERVAL)")
+            .unwrap(),
+    );
+    assert_rows(
+        conn.execute(
+            "INSERT INTO s VALUES (1, INTERVAL '1 month'), (2, INTERVAL '30 days'), \
+             (3, INTERVAL '31 days')",
+        )
+        .unwrap(),
+        3,
+    );
+    // Text beside an interval reads as an interval and compares by length.
+    assert_eq!(
+        conn.query(
+            "SELECT INTERVAL '1 month' < '31 days', INTERVAL '1 month' = '30 days', \
+             '30 days' = INTERVAL '1 month', '31 days' > INTERVAL '1 month', \
+             INTERVAL '1 month' <> '720 hours'"
+        )
+        .unwrap()
+        .rows,
+        vec![[true, true, true, true, false].map(Value::Boolean).to_vec()]
+    );
+    for (predicate, expected) in [
+        ("v = '30 days'", &[1, 2][..]),
+        ("v > '29 days'", &[1, 2, 3]),
+        ("v < '31 days'", &[1, 2]),
+        ("v IN ('30 days')", &[1, 2]),
+        ("v BETWEEN '30 days' AND '30 days'", &[1, 2]),
+        ("v NOT IN ('720 hours')", &[3]),
+    ] {
+        let sql = format!("SELECT id FROM s WHERE {predicate} ORDER BY id");
+        assert_eq!(
+            conn.query(&sql).unwrap().rows,
+            expected
+                .iter()
+                .map(|&id| vec![Value::Integer(id)])
+                .collect::<Vec<_>>(),
+            "{sql}"
+        );
+    }
+}
+
+#[test]
 fn intervals_sort_by_normalized_length() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());

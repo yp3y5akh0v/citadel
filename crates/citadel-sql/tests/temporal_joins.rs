@@ -382,7 +382,7 @@ fn heterogeneous_cte_join_keys_keep_runtime_coercion_and_numeric_equality() {
     assert!(pairs.contains(&vec![Value::Integer(0), Value::Integer(1)]));
     assert!(pairs.contains(&vec![Value::Integer(3), Value::Integer(9)]));
     assert!(!pairs.contains(&vec![Value::Integer(0), Value::Integer(2)]));
-    assert!(!pairs.contains(&vec![Value::Integer(10), Value::Integer(11)]));
+    assert!(pairs.contains(&vec![Value::Integer(10), Value::Integer(11)]));
     for width in [1, 12] {
         let on = std::iter::repeat_n("a.k = b.k", width)
             .collect::<Vec<_>>()
