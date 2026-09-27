@@ -30,7 +30,7 @@ pub(super) fn exec_reindex_in_txn(
             }
             Scope::Index { table, index } => {
                 let table = schema
-                    .get(&table)
+                    .get_by_storage_name(&table)
                     .ok_or_else(|| SqlError::TableNotFound(table.clone()))?;
                 let index = table
                     .index_by_name(&index)
@@ -79,7 +79,7 @@ fn resolve(schema: &SchemaManager, target: &ReindexTarget) -> Result<Scope> {
 /// indexes are rebuilt, so REINDEX brings an older table's keys to length equality.
 fn reindex_table(wtx: &mut WriteTxn<'_>, schema: &mut SchemaManager, name: &str) -> Result<()> {
     let mut table = schema
-        .get(name)
+        .get_by_storage_name(name)
         .cloned()
         .ok_or_else(|| SqlError::TableNotFound(name.to_string()))?;
     for column in &mut table.columns {
