@@ -96,3 +96,7 @@ harness = false
 [[bench]]
 name = "payload_resize"
 harness = false
+
+[[bench]]
+name = "correlated_memo"
+harness = false
