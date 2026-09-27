@@ -96,6 +96,7 @@ struct LoadedLeaf {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WriteFailure {
     Cancelled,
+    TxnIdExhausted,
     Failed,
 }
 
@@ -120,6 +121,7 @@ impl WriteFailure {
     fn error(self) -> Error {
         match self {
             Self::Cancelled => Error::Interrupted,
+            Self::TxnIdExhausted => Error::TxnIdExhausted,
             Self::Failed => Error::TransactionFailed,
         }
     }
@@ -427,10 +429,10 @@ impl<'db> WriteTxn<'db> {
     #[inline]
     fn record_failure(failure: &mut Option<WriteFailure>, err: &Error) {
         if failure.is_none() {
-            *failure = Some(if matches!(err, Error::Interrupted) {
-                WriteFailure::Cancelled
-            } else {
-                WriteFailure::Failed
+            *failure = Some(match err {
+                Error::Interrupted => WriteFailure::Cancelled,
+                Error::TxnIdExhausted => WriteFailure::TxnIdExhausted,
+                _ => WriteFailure::Failed,
             });
         }
     }
@@ -2020,15 +2022,23 @@ impl<'db> WriteTxn<'db> {
         self.manager.abort_write();
     }
 
-    /// SAVEPOINT: snapshot state and advance txn_id.
-    pub fn begin_savepoint(&mut self) -> WriteTxnSnapshot {
+    /// SAVEPOINT: snapshot state and advance txn_id. Exhaustion leaves the
+    /// current writer unchanged, so its already staged work remains usable.
+    pub fn begin_savepoint(&mut self) -> Result<WriteTxnSnapshot> {
+        let txn_id = self.manager.next_write_txn_id()?;
         let snap = self.capture_snapshot();
-        self.txn_id = self.manager.next_write_txn_id();
-        snap
+        self.txn_id = txn_id;
+        Ok(snap)
     }
 
     /// ROLLBACK TO SAVEPOINT: restore state and drop post-savepoint pages.
-    pub fn restore_snapshot(&mut self, snap: WriteTxnSnapshot) {
+    /// If no fresh CoW ID remains, state is untouched and the writer is
+    /// poisoned: work from the failed statement must never be committed.
+    pub fn restore_snapshot(&mut self, snap: WriteTxnSnapshot) -> Result<()> {
+        let txn_id = match self.manager.next_write_txn_id() {
+            Ok(txn_id) => txn_id,
+            Err(error) => return self.fail(error),
+        };
         let pre_savepoint_alloc_len = snap.alloc_checkpoint.allocated_this_txn_len();
         for &page_id in self.alloc.allocated_since(pre_savepoint_alloc_len) {
             self.pages.remove_page(&page_id);
@@ -2044,7 +2054,8 @@ impl<'db> WriteTxn<'db> {
         self.deferred_fk_checks
             .truncate(snap.deferred_fk_checks_len);
         self.fk_check_cache.clear();
-        self.txn_id = self.manager.next_write_txn_id();
+        self.txn_id = txn_id;
+        Ok(())
     }
 
     fn capture_snapshot(&self) -> WriteTxnSnapshot {

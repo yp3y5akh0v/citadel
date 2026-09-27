@@ -187,6 +187,7 @@ fn core_kind(e: &CoreError) -> Kind {
         CoreError::TransactionTooLarge { .. }
         | CoreError::BufferPoolFull
         | CoreError::PageIdExhausted
+        | CoreError::TxnIdExhausted
         | CoreError::KeyTooLarge { .. }
         | CoreError::ValueTooLarge { .. }
         | CoreError::ReadBudgetExceeded { .. } => Kind::Capacity,
@@ -290,6 +291,11 @@ fn embed_kind(_: &EmbedError) -> Kind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transaction_id_exhaustion_is_capacity_exhaustion() {
+        assert_eq!(core_kind(&CoreError::TxnIdExhausted), Kind::Capacity);
+    }
 
     #[test]
     fn the_unlock_failures_stay_three_different_answers() {

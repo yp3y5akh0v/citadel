@@ -683,16 +683,15 @@ impl TxnManager {
 
     pub fn begin_read(&self) -> ReadTxn<'_> {
         let mut state = self.state.lock();
-        let txn_id = TxnId(self.next_txn_id.fetch_add(1, Ordering::SeqCst));
         let snapshot = state.current_slot.clone();
         let resolved_catalog = Arc::clone(&state.resolved_catalog);
         let commit_generation = self.commit_generation.load(Ordering::Acquire);
 
-        // Key by snapshot id (see reader_table): a reader beginning mid-write
-        // gets an id above the writer's but a snapshot predating its commit.
+        // Readers pin the committed snapshot even when a newer writer is
+        // active. They never consume the finite write-generation ID space.
         *state.reader_table.entry(snapshot.txn_id).or_insert(0) += 1;
 
-        ReadTxn::new(self, txn_id, snapshot, resolved_catalog, commit_generation)
+        ReadTxn::new(self, snapshot, resolved_catalog, commit_generation)
     }
 
     /// Unique process-local identity of this manager instance. It is not a
@@ -766,8 +765,14 @@ impl TxnManager {
             return Ok(None);
         }
 
+        let txn_id = match self.next_write_txn_id() {
+            Ok(txn_id) => txn_id,
+            Err(error) => {
+                self.write_active.store(false, Ordering::SeqCst);
+                return Err(error);
+            }
+        };
         let mut state = self.state.lock();
-        let txn_id = TxnId(self.next_txn_id.fetch_add(1, Ordering::SeqCst));
         let snapshot = state.current_slot.clone();
         // Keep the shared loan in state and the durable chain until a commit
         // records its consumption.
@@ -877,8 +882,17 @@ impl TxnManager {
         Ok(page)
     }
 
-    pub(crate) fn next_write_txn_id(&self) -> TxnId {
-        TxnId(self.next_txn_id.fetch_add(1, Ordering::SeqCst))
+    pub(crate) fn next_write_txn_id(&self) -> Result<TxnId> {
+        self.next_txn_id
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |next| {
+                if next <= TxnId::MAX_COMMITTED.as_u64() {
+                    Some(next + 1)
+                } else {
+                    None
+                }
+            })
+            .map(TxnId)
+            .map_err(|_| Error::TxnIdExhausted)
     }
 
     /// Build the new slot's named-table entries. Stale entries (SLOT_ENTRY_

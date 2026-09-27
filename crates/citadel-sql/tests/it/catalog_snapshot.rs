@@ -315,7 +315,7 @@ fn alternating_public_caches_observe_same_writer_catalog_edits() {
         let create_i = parser::parse_sql("CREATE UNIQUE INDEX i ON t(v)").unwrap();
         executor::execute_in_txn(&mut wtx, &mut a, &create_i, &[]).unwrap();
         if rollback_branch {
-            let checkpoint = wtx.begin_savepoint();
+            let checkpoint = wtx.begin_savepoint().unwrap();
             executor::execute_in_txn(
                 &mut wtx,
                 &mut b,
@@ -323,7 +323,7 @@ fn alternating_public_caches_observe_same_writer_catalog_edits() {
                 &[],
             )
             .unwrap();
-            wtx.restore_snapshot(checkpoint);
+            wtx.restore_snapshot(checkpoint).unwrap();
         }
         executor::execute_in_txn(
             &mut wtx,

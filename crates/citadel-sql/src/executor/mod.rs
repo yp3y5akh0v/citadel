@@ -682,18 +682,25 @@ fn with_statement_savepoint<T>(
     mutate: impl FnOnce(&mut citadel_txn::write_txn::WriteTxn<'_>, &mut SchemaManager) -> Result<T>,
 ) -> Result<T> {
     let catalog = schema.save_snapshot();
-    let savepoint = wtx.begin_savepoint();
+    let savepoint = wtx.begin_savepoint()?;
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let result = mutate(wtx, schema)?;
         helpers::check_cancel(wtx.cancel_token())?;
         Ok(result)
     }));
-    if !matches!(outcome, Ok(Ok(_))) {
-        wtx.restore_snapshot(savepoint);
+    let rollback = if !matches!(outcome, Ok(Ok(_))) {
+        let rollback = wtx.restore_snapshot(savepoint);
         schema.restore_snapshot(catalog);
-    }
+        rollback
+    } else {
+        Ok(())
+    };
     match outcome {
-        Ok(result) => result,
+        Ok(result) => {
+            rollback?;
+            result
+        }
+        // Failed rollback poisons the writer, but must not replace a panic.
         Err(payload) => std::panic::resume_unwind(payload),
     }
 }

@@ -369,7 +369,6 @@ pub fn upgrade_leaves(weak: &[Weak<Page>]) -> Option<LeafPages> {
 /// Read-only transaction with snapshot isolation.
 pub struct ReadTxn<'a> {
     manager: &'a TxnManager,
-    txn_id: TxnId,
     snapshot: Arc<CommitSlot>,
     resolved_catalog: Arc<ResolvedCatalog>,
     commit_generation: u64,
@@ -391,14 +390,12 @@ pub struct ReadTxn<'a> {
 impl<'db> ReadTxn<'db> {
     pub(crate) fn new(
         manager: &'db TxnManager,
-        txn_id: TxnId,
         snapshot: Arc<CommitSlot>,
         resolved_catalog: Arc<ResolvedCatalog>,
         commit_generation: u64,
     ) -> Self {
         Self {
             manager,
-            txn_id,
             snapshot,
             resolved_catalog,
             commit_generation,
@@ -475,8 +472,10 @@ impl<'db> ReadTxn<'db> {
         self.manager.instance_id()
     }
 
+    /// Committed snapshot ID. Readers of the same generation share this ID;
+    /// it is not a unique identity for each read-transaction handle.
     pub fn txn_id(&self) -> TxnId {
-        self.txn_id
+        self.snapshot.txn_id
     }
 
     pub fn commit_generation(&self) -> u64 {

@@ -675,10 +675,9 @@ fn a_writer_waiting_before_exclusion_observes_a_failed_full_sync() {
         let txns = workload(scenario.seed, scenario.txns);
         let (io, acked) = run(&scenario, &txns[..4], None);
         let (dek, mac_key, _) = test_keys();
-        let mgr = TxnManager::open_with_sync(
-            Box::new(io.clone()), dek, mac_key, 1, 64, SyncMode::Full,
-        )
-        .unwrap();
+        let mgr =
+            TxnManager::open_with_sync(Box::new(io.clone()), dek, mac_key, 1, 64, SyncMode::Full)
+                .unwrap();
         let expected_generation = mgr.commit_generation();
         let entered = Arc::new(std::sync::Barrier::new(2));
         let resume = Arc::new(std::sync::Barrier::new(2));

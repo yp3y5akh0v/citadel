@@ -35,8 +35,9 @@ pub struct TxnId(pub u64);
 
 impl TxnId {
     pub const ZERO: Self = Self(0);
-    /// The largest id a commit slot may carry, so later ids never wrap or
-    /// reach `u64::MAX`, the no-reader reclaim horizon.
+    /// The largest id a writer may allocate or a commit slot may carry.
+    /// Exhaustion is an error, never wraparound or the no-reader reclaim
+    /// horizon (`u64::MAX`). Readers use their committed snapshot's id.
     pub const MAX_COMMITTED: Self = Self(u64::MAX >> 1);
 
     #[inline]

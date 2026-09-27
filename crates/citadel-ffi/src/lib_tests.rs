@@ -6,6 +6,14 @@ fn page_id_exhaustion_reports_capacity_failure_without_changing_the_c_abi() {
     assert_eq!(map_error(&error), CitadelError::IoError);
     assert_eq!(error.to_string(), "database page ID space is exhausted");
 }
+
+#[test]
+fn transaction_id_exhaustion_uses_the_existing_capacity_error_code() {
+    assert_eq!(
+        map_error(&citadel_core::Error::TxnIdExhausted),
+        CitadelError::IoError
+    );
+}
 use std::ffi::CString;
 
 fn temp_path() -> (tempfile::TempDir, CString) {

@@ -114,7 +114,7 @@ fn range_leaf_mutations_respect_savepoint_and_old_reader() {
             .unwrap(),
         u64::from(ROWS)
     );
-    let snapshot = writer.begin_savepoint();
+    let snapshot = writer.begin_savepoint().unwrap();
     assert_eq!(
         writer
             .table_update_range::<_, Error>(TABLE, b"", |_, value| {
@@ -125,7 +125,7 @@ fn range_leaf_mutations_respect_savepoint_and_old_reader() {
             .unwrap(),
         u64::from(ROWS)
     );
-    writer.restore_snapshot(snapshot);
+    writer.restore_snapshot(snapshot).unwrap();
     for key in 0..ROWS {
         assert_eq!(
             writer

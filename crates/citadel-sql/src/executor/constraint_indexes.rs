@@ -70,7 +70,7 @@ pub(crate) fn reconcile_constraint_indexes_in_txn(
         return Ok(None);
     }
     let snapshot = schema.save_snapshot();
-    let savepoint = wtx.begin_savepoint();
+    let savepoint = wtx.begin_savepoint()?;
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut tables = schema.all_schemas().cloned().collect::<Vec<_>>();
         tables.sort_unstable_by(|a, b| a.name.cmp(&b.name));
@@ -136,10 +136,14 @@ pub(crate) fn reconcile_constraint_indexes_in_txn(
     match outcome {
         Ok(Ok(())) => Ok(Some(snapshot)),
         failure => {
-            wtx.restore_snapshot(savepoint);
+            let rollback = wtx.restore_snapshot(savepoint);
             schema.restore_snapshot(snapshot);
             match failure {
-                Ok(Err(error)) => Err(error),
+                Ok(Err(error)) => {
+                    rollback?;
+                    Err(error)
+                }
+                // Keep unwinding even if the writer also exhausted its IDs.
                 Err(payload) => std::panic::resume_unwind(payload),
                 Ok(Ok(())) => unreachable!(),
             }
