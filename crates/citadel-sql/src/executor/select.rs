@@ -368,6 +368,7 @@ fn exec_select_from_view_with_read(
         &outer,
         rows,
         view_schema.columns.clone(),
+        view_schema.columns.len(),
         cancel,
         &mut |sub| exec_subquery_with_read(rtx, schema, sub, ctes),
     )
@@ -396,7 +397,8 @@ fn exec_correlated_scan_with_read(
         let (rows, _) = collect_rows_with_read(rtx, table_schema, &None, None)?;
         (rows, stmt.where_clause.clone())
     };
-    let mut columns = table_schema.columns.clone();
+    let columns = table_schema.columns.clone();
+    let mut row_width = columns.len();
     let partial = SelectStmt {
         where_clause,
         ..stmt.clone()
@@ -407,7 +409,7 @@ fn exec_correlated_scan_with_read(
         &partial,
         &corr_ctx,
         &mut rows,
-        &mut columns,
+        &mut row_width,
     )?;
     finish_captured_select(
         schema,
@@ -416,6 +418,7 @@ fn exec_correlated_scan_with_read(
         outer,
         rows,
         columns,
+        row_width,
         cancel,
         &mut |sub| exec_subquery_with_read(rtx, schema, sub, ctes),
     )
@@ -442,6 +445,7 @@ fn exec_correlated_join_with_read(
         exec_subquery_with_read(rtx, schema, sub, ctes)
     })?;
     let (rows, columns) = super::join_rows_with_read(rtx, &stmt, &tables, None)?;
+    let row_width = columns.len();
     finish_captured_select(
         schema,
         ctes,
@@ -449,6 +453,7 @@ fn exec_correlated_join_with_read(
         &outer,
         rows,
         columns,
+        row_width,
         cancel,
         &mut |sub| exec_subquery_with_read(rtx, schema, sub, ctes),
     )
@@ -3590,6 +3595,7 @@ fn exec_select_lateral_with_io(
     if !stmt_has_subquery(&clean_stmt) {
         return process_select(outer_rows, SelectCtx::new(&columns, &clean_stmt, cancel));
     }
+    let row_width = columns.len();
     finish_captured_select(
         schema,
         ctes,
@@ -3597,6 +3603,7 @@ fn exec_select_lateral_with_io(
         &lateral_outer_scope(&sources),
         outer_rows,
         columns,
+        row_width,
         cancel,
         &mut |sub| io.exec_subquery(schema, sub, ctes),
     )
@@ -4280,14 +4287,16 @@ pub(super) fn process_select(
 
     if has_any_window_function(stmt) {
         if let Some(GroupedWindowInput {
-            columns: grouped_columns,
+            row_width,
             rows: grouped_rows,
             stmt: grouped_stmt,
         }) = group_for_windows(&rows, ctx)?
         {
             return eval_window_select(
                 grouped_rows,
-                SelectCtx::new(&grouped_columns, &grouped_stmt, ctx.cancel).predicate_applied(true),
+                SelectCtx::new(columns, &grouped_stmt, ctx.cancel)
+                    .row_width(row_width)
+                    .predicate_applied(true),
             );
         }
         return eval_window_select(rows, ctx);

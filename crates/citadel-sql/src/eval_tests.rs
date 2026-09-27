@@ -1348,6 +1348,43 @@ fn bound_columns_preserve_implicit_collation_without_promoting_it() {
 }
 
 #[test]
+fn input_slots_are_checked_and_keep_implicit_collation_separate_from_names() {
+    let columns = vec![col("visible", DataType::Text, false, 0)];
+    let map = ColumnMap::new(&columns);
+    let row = vec![Value::Text("A".into()), Value::Text("a".into())];
+    let ctx = EvalCtx::new(&map, &row);
+    for index in [2, usize::MAX] {
+        let invalid = Expr::InputRef {
+            index,
+            collation: None,
+        };
+        assert!(matches!(eval_expr(&invalid, &ctx), Err(SqlError::Plan(_))));
+        assert!(matches!(
+            CompiledExpr::compile(&invalid, &map).eval(&ctx),
+            Err(SqlError::Plan(_))
+        ));
+    }
+    for (collation, expected) in [(None, false), (Some(Collation::NoCase), true)] {
+        let slot = Expr::InputRef {
+            index: 1,
+            collation,
+        };
+        assert!(!is_statement_constant(&slot));
+        assert_eq!(operand_collation(&slot, &map), collation);
+        let expr = Expr::BinaryOp {
+            left: Box::new(slot),
+            op: BinOp::Eq,
+            right: Box::new(Expr::Column("visible".into())),
+        };
+        assert_eq!(eval_expr(&expr, &ctx).unwrap(), Value::Boolean(expected));
+        assert_eq!(
+            CompiledExpr::compile(&expr, &map).eval(&ctx).unwrap(),
+            Value::Boolean(expected)
+        );
+    }
+}
+
+#[test]
 fn interval_length_keys_leave_comparisons_uncollated() {
     let mut columns = vec![col("v", DataType::Interval, true, 0)];
     columns[0].collation = Collation::IntervalLength;

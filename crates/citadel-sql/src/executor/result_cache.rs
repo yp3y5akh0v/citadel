@@ -415,6 +415,7 @@ fn cacheable_window_bound(ctx: &mut WalkCtx<'_>, bound: &WindowFrameBound) -> bo
 
 fn cacheable_expr(ctx: &mut WalkCtx<'_>, expr: &Expr) -> bool {
     match expr {
+        Expr::InputRef { .. } => false,
         Expr::BoundColumn { .. }
         | Expr::Literal(_)
         | Expr::Column(_)

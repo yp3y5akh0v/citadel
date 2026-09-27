@@ -110,43 +110,60 @@ pub(super) fn has_any_window_function(stmt: &SelectStmt) -> bool {
     })
 }
 
-/// Extract window functions, replacing with column refs. Returns (rewritten_expr, window_list).
+/// Extract window functions, replacing each with an unnamed input reference.
 pub(super) fn extract_window_fns(
     expr: &Expr,
     slot_counter: &mut usize,
-    extracted: &mut Vec<(String, String, Vec<Expr>, WindowSpec)>,
+    extracted: &mut Vec<(String, Vec<Expr>, WindowSpec)>,
+    col_map: &ColumnMap,
 ) -> Expr {
     match expr {
         Expr::WindowFunction { name, args, spec } => {
-            let slot_name = format!("__win_{}", *slot_counter);
+            let index = *slot_counter;
             *slot_counter += 1;
-            extracted.push((slot_name.clone(), name.clone(), args.clone(), spec.clone()));
-            Expr::Column(slot_name)
+            extracted.push((name.clone(), args.clone(), spec.clone()));
+            let collation = args
+                .iter()
+                .find_map(collation_of)
+                .or_else(|| args.iter().find_map(|arg| operand_collation(arg, col_map)))
+                .unwrap_or_default();
+            Expr::InputRef {
+                index,
+                collation: Some(collation),
+            }
         }
         Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
-            left: Box::new(extract_window_fns(left, slot_counter, extracted)),
+            left: Box::new(extract_window_fns(left, slot_counter, extracted, col_map)),
             op: *op,
-            right: Box::new(extract_window_fns(right, slot_counter, extracted)),
+            right: Box::new(extract_window_fns(right, slot_counter, extracted, col_map)),
         },
         Expr::IsDistinctFrom {
             left,
             right,
             negated,
         } => Expr::IsDistinctFrom {
-            left: Box::new(extract_window_fns(left, slot_counter, extracted)),
-            right: Box::new(extract_window_fns(right, slot_counter, extracted)),
+            left: Box::new(extract_window_fns(left, slot_counter, extracted, col_map)),
+            right: Box::new(extract_window_fns(right, slot_counter, extracted, col_map)),
             negated: *negated,
         },
         Expr::UnaryOp { op, expr: e } => Expr::UnaryOp {
             op: *op,
-            expr: Box::new(extract_window_fns(e, slot_counter, extracted)),
+            expr: Box::new(extract_window_fns(e, slot_counter, extracted, col_map)),
         },
-        Expr::IsNull(e) => Expr::IsNull(Box::new(extract_window_fns(e, slot_counter, extracted))),
-        Expr::IsNotNull(e) => {
-            Expr::IsNotNull(Box::new(extract_window_fns(e, slot_counter, extracted)))
-        }
+        Expr::IsNull(e) => Expr::IsNull(Box::new(extract_window_fns(
+            e,
+            slot_counter,
+            extracted,
+            col_map,
+        ))),
+        Expr::IsNotNull(e) => Expr::IsNotNull(Box::new(extract_window_fns(
+            e,
+            slot_counter,
+            extracted,
+            col_map,
+        ))),
         Expr::Cast { expr: e, data_type } => Expr::Cast {
-            expr: Box::new(extract_window_fns(e, slot_counter, extracted)),
+            expr: Box::new(extract_window_fns(e, slot_counter, extracted, col_map)),
             data_type: *data_type,
         },
         // A FILTER calls no window function.
@@ -159,14 +176,14 @@ pub(super) fn extract_window_fns(
             name: name.clone(),
             args: args
                 .iter()
-                .map(|a| extract_window_fns(a, slot_counter, extracted))
+                .map(|a| extract_window_fns(a, slot_counter, extracted, col_map))
                 .collect(),
             distinct: *distinct,
             filter: filter.clone(),
         },
         Expr::Coalesce(args) => Expr::Coalesce(
             args.iter()
-                .map(|a| extract_window_fns(a, slot_counter, extracted))
+                .map(|a| extract_window_fns(a, slot_counter, extracted, col_map))
                 .collect(),
         ),
         Expr::Case {
@@ -176,19 +193,19 @@ pub(super) fn extract_window_fns(
         } => Expr::Case {
             operand: operand
                 .as_ref()
-                .map(|e| Box::new(extract_window_fns(e, slot_counter, extracted))),
+                .map(|e| Box::new(extract_window_fns(e, slot_counter, extracted, col_map))),
             conditions: conditions
                 .iter()
                 .map(|(c, r)| {
                     (
-                        extract_window_fns(c, slot_counter, extracted),
-                        extract_window_fns(r, slot_counter, extracted),
+                        extract_window_fns(c, slot_counter, extracted, col_map),
+                        extract_window_fns(r, slot_counter, extracted, col_map),
                     )
                 })
                 .collect(),
             else_result: else_result
                 .as_ref()
-                .map(|e| Box::new(extract_window_fns(e, slot_counter, extracted))),
+                .map(|e| Box::new(extract_window_fns(e, slot_counter, extracted, col_map))),
         },
         other => other.clone(),
     }
@@ -258,7 +275,8 @@ impl ResolvedFrame {
                             let mut row_dependent = false;
                             visit_expr(expr, &mut |node| {
                                 row_dependent |= match node {
-                                    Expr::Column(_)
+                                    Expr::InputRef { .. }
+                                    | Expr::Column(_)
                                     | Expr::QualifiedColumn { .. }
                                     | Expr::CountStar
                                     | Expr::WindowFunction { .. }
@@ -843,6 +861,7 @@ impl WindowOrderDescriptor {
         fn column_slot(expr: &Expr, col_map: &ColumnMap) -> Option<usize> {
             match expr {
                 Expr::Column(name) => col_map.resolve(name).ok(),
+                Expr::InputRef { index, .. } => Some(*index),
                 Expr::Collate { expr, .. } => column_slot(expr, col_map),
                 _ => None,
             }
@@ -1027,8 +1046,9 @@ pub(super) fn eval_window_select(
         cancel,
         ..
     } = ctx;
-    let mut slot_counter = 0usize;
-    let mut all_extracted: Vec<(String, String, Vec<Expr>, WindowSpec)> = Vec::new();
+    let col_map = ColumnMap::new(columns);
+    let mut slot_counter = ctx.row_width;
+    let mut all_extracted: Vec<(String, Vec<Expr>, WindowSpec)> = Vec::new();
     let mut rewritten_columns: Vec<SelectColumn> = Vec::new();
 
     for col in &stmt.columns {
@@ -1037,7 +1057,8 @@ pub(super) fn eval_window_select(
             SelectColumn::AllFromOld => rewritten_columns.push(SelectColumn::AllFromOld),
             SelectColumn::AllFromNew => rewritten_columns.push(SelectColumn::AllFromNew),
             SelectColumn::Expr { expr, alias } => {
-                let new_expr = extract_window_fns(expr, &mut slot_counter, &mut all_extracted);
+                let new_expr =
+                    extract_window_fns(expr, &mut slot_counter, &mut all_extracted, &col_map);
                 rewritten_columns.push(SelectColumn::Expr {
                     alias: written_alias(alias, expr, &new_expr),
                     expr: new_expr,
@@ -1052,7 +1073,7 @@ pub(super) fn eval_window_select(
 
     let frames = all_extracted
         .iter()
-        .map(|(_, name, args, spec)| {
+        .map(|(name, args, spec)| {
             check_cancel(cancel)?;
             let upper_name = name.to_ascii_uppercase();
             validate_window_args(&upper_name, args.len())?;
@@ -1066,16 +1087,9 @@ pub(super) fn eval_window_select(
         })
         .collect::<Result<Vec<_>>>()?;
     if rows.is_empty() {
-        let col_names = stmt
-            .columns
-            .iter()
-            .map(|c| match c {
-                SelectColumn::AllColumns => "*".into(),
-                SelectColumn::AllFromOld => "old.*".into(),
-                SelectColumn::AllFromNew => "new.*".into(),
-                SelectColumn::Expr { alias: Some(a), .. } => a.clone(),
-                SelectColumn::Expr { expr, .. } => expr_display_name(expr),
-            })
+        let col_names = build_output_columns(&stmt.columns, columns)
+            .into_iter()
+            .map(|column| column.name)
             .collect();
         return Ok(ExecutionResult::Query(QueryResult {
             columns: col_names,
@@ -1083,19 +1097,9 @@ pub(super) fn eval_window_select(
         }));
     }
 
-    let col_map = ColumnMap::new(columns);
-    let slot_collations: Vec<Collation> = all_extracted
-        .iter()
-        .map(|(_, _, args, _)| {
-            args.iter()
-                .find_map(collation_of)
-                .or_else(|| args.iter().find_map(|arg| operand_collation(arg, &col_map)))
-                .unwrap_or_default()
-        })
-        .collect();
     let num_win = all_extracted.len();
     let mut arg_values: Vec<WindowValues> = Vec::with_capacity(num_win);
-    for (window_idx, (_, _, args, _)) in all_extracted.iter().enumerate() {
+    for (window_idx, (_, args, _)) in all_extracted.iter().enumerate() {
         check_cancel_at(cancel, window_idx)?;
         let mut per_row = WindowValues::with_capacity(rows.len(), args.len())?;
         for (row_idx, row) in rows.iter().enumerate() {
@@ -1111,12 +1115,12 @@ pub(super) fn eval_window_select(
     let n = rows.len();
     let mut row_results = WindowValues::nulls(n, num_win)?;
     let mut orders = WindowOrders::new(
-        all_extracted.iter().map(|(_, _, _, spec)| spec),
+        all_extracted.iter().map(|(_, _, spec)| spec),
         &col_map,
         cancel,
     )?;
 
-    for (win_idx, (_, fn_name, args, spec)) in all_extracted.iter().enumerate() {
+    for (win_idx, (fn_name, args, spec)) in all_extracted.iter().enumerate() {
         check_cancel_at(cancel, win_idx)?;
         let WindowOrder {
             indices,
@@ -1422,27 +1426,6 @@ pub(super) fn eval_window_select(
         orders.release(win_idx);
     }
 
-    let base_col_count = columns.len();
-    let mut extended_columns: Vec<ColumnDef> = columns.to_vec();
-    for (i, (slot_name, _, _, _)) in all_extracted.iter().enumerate() {
-        extended_columns.push(ColumnDef {
-            name: slot_name.clone(),
-            data_type: DataType::Null,
-            nullable: true,
-            position: (base_col_count + i) as u16,
-            default_expr: None,
-            default_sql: None,
-            check_expr: None,
-            check_sql: None,
-            check_name: None,
-            is_with_timezone: false,
-            generated_expr: None,
-            generated_sql: None,
-            generated_kind: None,
-            collation: slot_collations[i],
-        });
-    }
-
     for (row_idx, row) in rows.iter_mut().enumerate() {
         check_cancel_at(cancel, row_idx)?;
         row.extend_from_slice(&row_results[row_idx]);
@@ -1469,7 +1452,8 @@ pub(super) fn eval_window_select(
 
     super::process_select(
         rows,
-        super::SelectCtx::new(&extended_columns, &rewritten_stmt, ctx.cancel)
+        super::SelectCtx::new(columns, &rewritten_stmt, ctx.cancel)
+            .row_width(slot_counter)
             .predicate_applied(true),
     )
 }

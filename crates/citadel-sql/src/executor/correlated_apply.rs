@@ -2,7 +2,7 @@ use super::super::CteRows;
 use super::binding::{bind_outer, OuterScope};
 use super::*;
 
-/// A subquery that reads the outer row, evaluated into a hidden column.
+/// A subquery that reads the outer row, evaluated into an unnamed input slot.
 struct Capture {
     node: Expr,
     positions: Vec<usize>,
@@ -115,7 +115,8 @@ impl Extractor<'_> {
                     }
                 }
             }
-            Expr::BoundColumn { .. }
+            Expr::InputRef { .. }
+            | Expr::BoundColumn { .. }
             | Expr::Literal(_)
             | Expr::Column(_)
             | Expr::QualifiedColumn { .. }
@@ -138,13 +139,11 @@ impl Extractor<'_> {
             if let Some(positions) =
                 bind_outer(self.schema, self.ctes, expr, self.outer, None, self.cancel)?
             {
-                let hidden = Expr::Column(hidden_name(self.first + self.captures.len()));
-                // A scalar subquery's value compares like a literal, without a
-                // column's implicit collation; COALESCE reads it that way.
-                let replacement = if matches!(expr, Expr::ScalarSubquery(_)) {
-                    Expr::Coalesce(vec![hidden])
-                } else {
-                    hidden
+                // A scalar subquery compares as a value without an implicit
+                // column collation. Boolean captures need none either.
+                let replacement = Expr::InputRef {
+                    index: self.first + self.captures.len(),
+                    collation: None,
                 };
                 let node = std::mem::replace(expr, replacement);
                 self.captures.push(Capture {
@@ -164,10 +163,6 @@ impl Extractor<'_> {
     }
 }
 
-fn hidden_name(position: usize) -> String {
-    format!("__captured_{position}")
-}
-
 fn conjunction(conjuncts: Vec<Expr>) -> Option<Expr> {
     conjuncts.into_iter().reduce(|left, right| Expr::BinaryOp {
         left: Box::new(left),
@@ -178,7 +173,7 @@ fn conjunction(conjuncts: Vec<Expr>) -> Option<Expr> {
 
 /// Evaluate every subquery in `stmt`'s per-row clauses that reads the `outer`
 /// row once per row of `rows`, binding that row into the subquery's lexical
-/// scopes. Each result becomes a hidden column the returned statement reads
+/// scopes. Each result becomes an unnamed slot the returned statement reads
 /// instead of the subquery. WHERE conjuncts that read no outer row filter
 /// `rows` first. Rows with equal captured values share one execution unless
 /// the subquery calls a volatile function. `ctes` are the CTEs visible to
@@ -190,7 +185,8 @@ pub(in crate::executor) fn apply_captured_subqueries(
     stmt: &SelectStmt,
     outer: &OuterScope,
     rows: &mut Vec<Vec<Value>>,
-    columns: &mut Vec<ColumnDef>,
+    columns: &[ColumnDef],
+    row_width: &mut usize,
     cancel: Option<&citadel::CancelToken>,
     exec_sub: &mut dyn FnMut(&SelectStmt) -> Result<CteRows>,
 ) -> Result<Option<SelectStmt>> {
@@ -200,7 +196,7 @@ pub(in crate::executor) fn apply_captured_subqueries(
         ctes,
         outer,
         cancel,
-        first: columns.len(),
+        first: *row_width,
         captures: Vec::new(),
     };
     let mut prefilter = Vec::new();
@@ -256,14 +252,8 @@ pub(in crate::executor) fn apply_captured_subqueries(
         *rows = kept;
     }
 
-    let first = columns.len();
-    for position in first..first + captures.len() {
-        columns.push(super::super::helpers::projected_column(
-            hidden_name(position),
-            position,
-            Collation::Binary,
-        ));
-    }
+    let first = *row_width;
+    *row_width += captures.len();
     let col_map = ColumnMap::new(columns);
     let mut memos: Vec<Option<FxHashMap<Vec<Value>, Expr>>> = captures
         .iter()

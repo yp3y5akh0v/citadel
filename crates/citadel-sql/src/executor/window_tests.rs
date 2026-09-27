@@ -338,17 +338,17 @@ fn window_frame_rejects_row_dependencies_in_unevaluated_branches() {
 }
 
 #[test]
-fn extract_window_fns_replaces_with_slot_column() {
+fn extract_window_fns_replaces_with_input_slot() {
     let original = empty_window_fn("ROW_NUMBER");
     let mut counter = 0;
     let mut out = Vec::new();
-    let rewritten = extract_window_fns(&original, &mut counter, &mut out);
+    let rewritten = extract_window_fns(&original, &mut counter, &mut out, &ColumnMap::new(&[]));
     assert_eq!(out.len(), 1);
     assert_eq!(counter, 1);
-    if let Expr::Column(name) = rewritten {
-        assert_eq!(name, "__win_0");
+    if let Expr::InputRef { index, .. } = rewritten {
+        assert_eq!(index, 0);
     } else {
-        panic!("expected column reference for slot");
+        panic!("expected input reference for slot");
     }
 }
 
@@ -357,7 +357,7 @@ fn extract_window_fns_passes_non_window_expressions_through() {
     let e = Expr::Literal(i(5));
     let mut counter = 0;
     let mut out = Vec::new();
-    let rewritten = extract_window_fns(&e, &mut counter, &mut out);
+    let rewritten = extract_window_fns(&e, &mut counter, &mut out, &ColumnMap::new(&[]));
     assert!(out.is_empty());
     assert!(matches!(rewritten, Expr::Literal(Value::Integer(5))));
 }
@@ -371,7 +371,7 @@ fn extract_window_fns_inside_binary_op() {
     };
     let mut counter = 0;
     let mut out = Vec::new();
-    let _ = extract_window_fns(&e, &mut counter, &mut out);
+    let _ = extract_window_fns(&e, &mut counter, &mut out, &ColumnMap::new(&[]));
     assert_eq!(out.len(), 1);
     assert_eq!(counter, 1);
 }
@@ -381,7 +381,7 @@ fn extract_window_fns_inside_coalesce() {
     let e = Expr::Coalesce(vec![empty_window_fn("LAG"), Expr::Literal(i(0))]);
     let mut counter = 0;
     let mut out = Vec::new();
-    let _ = extract_window_fns(&e, &mut counter, &mut out);
+    let _ = extract_window_fns(&e, &mut counter, &mut out, &ColumnMap::new(&[]));
     assert_eq!(out.len(), 1);
 }
 
@@ -394,11 +394,14 @@ fn extract_window_fns_multiple_slots_incrementing() {
     };
     let mut counter = 0;
     let mut out = Vec::new();
-    let _ = extract_window_fns(&e, &mut counter, &mut out);
+    let rewritten = extract_window_fns(&e, &mut counter, &mut out, &ColumnMap::new(&[]));
     assert_eq!(out.len(), 2);
     assert_eq!(counter, 2);
-    assert_eq!(out[0].0, "__win_0");
-    assert_eq!(out[1].0, "__win_1");
+    let Expr::BinaryOp { left, right, .. } = rewritten else {
+        panic!("expected subtraction of input slots");
+    };
+    assert!(matches!(*left, Expr::InputRef { index: 0, .. }));
+    assert!(matches!(*right, Expr::InputRef { index: 1, .. }));
 }
 
 #[test]
@@ -410,7 +413,7 @@ fn extract_window_fns_inside_case_else() {
     };
     let mut counter = 0;
     let mut out = Vec::new();
-    let _ = extract_window_fns(&e, &mut counter, &mut out);
+    let _ = extract_window_fns(&e, &mut counter, &mut out, &ColumnMap::new(&[]));
     assert_eq!(out.len(), 1);
 }
 
@@ -424,7 +427,7 @@ fn extract_window_fns_inside_function_args() {
     };
     let mut counter = 0;
     let mut out = Vec::new();
-    let _ = extract_window_fns(&e, &mut counter, &mut out);
+    let _ = extract_window_fns(&e, &mut counter, &mut out, &ColumnMap::new(&[]));
     assert_eq!(out.len(), 1);
 }
 
@@ -436,7 +439,7 @@ fn extract_window_fns_inside_unary_op() {
     };
     let mut counter = 0;
     let mut out = Vec::new();
-    let _ = extract_window_fns(&e, &mut counter, &mut out);
+    let _ = extract_window_fns(&e, &mut counter, &mut out, &ColumnMap::new(&[]));
     assert_eq!(out.len(), 1);
 }
 
@@ -448,7 +451,7 @@ fn extract_window_fns_inside_cast() {
     };
     let mut counter = 0;
     let mut out = Vec::new();
-    let _ = extract_window_fns(&e, &mut counter, &mut out);
+    let _ = extract_window_fns(&e, &mut counter, &mut out, &ColumnMap::new(&[]));
     assert_eq!(out.len(), 1);
 }
 

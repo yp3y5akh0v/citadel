@@ -24,6 +24,51 @@ fn setup(conn: &Connection<'_>) {
     }
 }
 
+#[test]
+fn grouped_and_window_slots_do_not_share_the_input_namespace() {
+    let db = database();
+    let conn = Connection::open(&db).unwrap();
+    conn.execute(
+        "CREATE TABLE slots (id INTEGER PRIMARY KEY, __aggregate_0 INTEGER, \
+        __win_0 INTEGER, x INTEGER)",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO slots VALUES (1,10,100,2),(2,20,200,3)")
+        .unwrap();
+    for begin in [None, Some("BEGIN READ ONLY"), Some("BEGIN")] {
+        if let Some(begin) = begin {
+            conn.execute(begin).unwrap();
+        }
+        let sql = "SELECT __aggregate_0, __win_0, SUM(x), SUM(SUM(x)) OVER () AS total, \
+            ROW_NUMBER() OVER (ORDER BY id) AS rn FROM slots GROUP BY id ORDER BY id";
+        let result = conn.query(sql).unwrap();
+        assert_eq!(
+            result.columns,
+            ["__aggregate_0", "__win_0", "SUM(x)", "total", "rn"]
+        );
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![int(10), int(100), int(2), int(5), int(1)],
+                vec![int(20), int(200), int(3), int(5), int(2)],
+            ]
+        );
+        let prepared = conn.prepare(sql).unwrap().query_collect(&[]).unwrap();
+        assert_eq!(prepared.columns, result.columns);
+        assert_eq!(prepared.rows, result.rows);
+        assert!(matches!(
+            conn.query(
+                "SELECT __aggregate_1, SUM(x), ROW_NUMBER() OVER () \
+            FROM slots"
+            ),
+            Err(SqlError::ColumnNotFound(_))
+        ));
+        if begin.is_some() {
+            conn.execute("ROLLBACK").unwrap();
+        }
+    }
+}
+
 fn int(value: i64) -> Value {
     Value::Integer(value)
 }

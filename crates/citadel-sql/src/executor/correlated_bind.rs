@@ -715,7 +715,8 @@ impl Binder<'_> {
                     QuantifiedRhs::Array(expr) => self.expr(expr)?,
                 }
             }
-            Expr::BoundColumn { .. }
+            Expr::InputRef { .. }
+            | Expr::BoundColumn { .. }
             | Expr::Literal(_)
             | Expr::Column(_)
             | Expr::QualifiedColumn { .. }

@@ -55,15 +55,26 @@ pub(super) fn exec_aggregate(
                     return Err(SqlError::Unsupported("SELECT * with GROUP BY".into()));
                 }
                 SelectColumn::Expr { expr, .. } => {
-                    let val = eval_aggregate_expr_with_cancel(expr, &col_map, group_rows, cancel)?;
+                    let val = eval_aggregate_expr_with_cancel(
+                        expr,
+                        &col_map,
+                        group_rows,
+                        cancel,
+                        ctx.row_width,
+                    )?;
                     result_row.push(val);
                 }
             }
         }
 
         if let Some(ref having) = stmt.having {
-            let passes = match eval_aggregate_expr_with_cancel(having, &col_map, group_rows, cancel)
-            {
+            let passes = match eval_aggregate_expr_with_cancel(
+                having,
+                &col_map,
+                group_rows,
+                cancel,
+                ctx.row_width,
+            ) {
                 Ok(val) => is_truthy(&val),
                 Err(SqlError::ColumnNotFound(_)) => {
                     let output_map = ColumnMap::new(&output_cols);
@@ -84,9 +95,13 @@ pub(super) fn exec_aggregate(
             for (item, output_position) in stmt.order_by.iter().zip(&order_output_positions) {
                 let value = match output_position {
                     Some(position) => result_row[*position].clone(),
-                    None => {
-                        eval_aggregate_expr_with_cancel(&item.expr, &col_map, group_rows, cancel)?
-                    }
+                    None => eval_aggregate_expr_with_cancel(
+                        &item.expr,
+                        &col_map,
+                        group_rows,
+                        cancel,
+                        ctx.row_width,
+                    )?,
                 };
                 key.push(value);
             }
@@ -190,7 +205,7 @@ pub(super) fn is_grouped(stmt: &SelectStmt) -> bool {
 /// NULLs for the one group of an ungrouped query over no rows, followed by the
 /// value of each aggregate call.
 pub(super) struct GroupedWindowInput {
-    pub(super) columns: Vec<ColumnDef>,
+    pub(super) row_width: usize,
     pub(super) rows: Vec<Vec<Value>>,
     /// Reads each aggregate call from its column. WHERE, GROUP BY and HAVING
     /// are gone: the rows already reflect them.
@@ -208,12 +223,16 @@ pub(super) fn group_for_windows(
         cancel,
         ..
     } = ctx;
+    // Ordinary window queries need no group map. Construct it only if an
+    // aggregate needs its collation or grouping itself is required.
+    let col_map = std::cell::LazyCell::new(|| ColumnMap::new(columns));
+    let collation = |expr: &Expr| expr_collation(expr, &col_map);
     let mut select = stmt.clone();
     let mut calls = Vec::new();
     for column in &mut select.columns {
         if let SelectColumn::Expr { expr, alias } = column {
             let written = alias.is_none().then(|| expr_display_name(expr));
-            lift_aggregates(expr, &mut calls);
+            lift_aggregates(expr, &mut calls, ctx.row_width, &collation);
             if let Some(written) = written {
                 if written != expr_display_name(expr) {
                     *alias = Some(written);
@@ -222,7 +241,7 @@ pub(super) fn group_for_windows(
         }
     }
     for item in &mut select.order_by {
-        lift_aggregates(&mut item.expr, &mut calls);
+        lift_aggregates(&mut item.expr, &mut calls, ctx.row_width, &collation);
     }
     if calls.is_empty() && stmt.group_by.is_empty() && stmt.having.is_none() {
         return Ok(None);
@@ -235,7 +254,6 @@ pub(super) fn group_for_windows(
         return Err(SqlError::Unsupported("SELECT * with GROUP BY".into()));
     }
     check_cancel(cancel)?;
-    let col_map = ColumnMap::new(columns);
     let group_exprs = resolve_group_by_exprs(&stmt.group_by, &stmt.columns, &col_map)?;
     if group_exprs
         .iter()
@@ -248,59 +266,66 @@ pub(super) fn group_for_windows(
     for (group_idx, group) in groups.iter().enumerate() {
         check_cancel_at(cancel, group_idx)?;
         if let Some(having) = &stmt.having {
-            if !having_keeps(having, stmt, columns, &col_map, group, cancel)? {
+            if !having_keeps(
+                having,
+                stmt,
+                columns,
+                &col_map,
+                group,
+                cancel,
+                ctx.row_width,
+            )? {
                 continue;
             }
         }
         let mut row = match group.first() {
             Some(first) => (*first).clone(),
-            None => vec![Value::Null; columns.len()],
+            None => vec![Value::Null; ctx.row_width],
         };
         for call in &calls {
             row.push(eval_aggregate_expr_with_cancel(
-                call, &col_map, group, cancel,
+                call,
+                &col_map,
+                group,
+                cancel,
+                ctx.row_width,
             )?);
         }
         grouped.push(row);
-    }
-    let mut extended = columns.to_vec();
-    for (index, call) in calls.iter().enumerate() {
-        let collation = expr_collation(call, &col_map);
-        extended.push(projected_column(
-            aggregate_column(index),
-            extended.len(),
-            collation,
-        ));
     }
     select.where_clause = None;
     select.group_by.clear();
     select.having = None;
     Ok(Some(GroupedWindowInput {
-        columns: extended,
+        row_width: ctx.row_width + calls.len(),
         rows: grouped,
         stmt: select,
     }))
 }
 
-fn aggregate_column(index: usize) -> String {
-    format!("__aggregate_{index}")
-}
-
 /// Replaces each aggregate call in `expr`, including those a window function
 /// reads, with the column holding its value, and appends the call to `calls`.
 /// A subquery's calls aggregate the subquery's rows and stay.
-fn lift_aggregates(expr: &mut Expr, calls: &mut Vec<Expr>) {
+fn lift_aggregates(
+    expr: &mut Expr,
+    calls: &mut Vec<Expr>,
+    first: usize,
+    collation: &impl Fn(&Expr) -> Collation,
+) {
     let aggregate = match expr {
         Expr::CountStar => true,
         Expr::Function { name, args, .. } => is_aggregate_function(name, args.len()),
         _ => false,
     };
     if aggregate {
-        let column = Expr::Column(aggregate_column(calls.len()));
+        let column = Expr::InputRef {
+            index: first + calls.len(),
+            collation: Some(collation(expr)),
+        };
         calls.push(std::mem::replace(expr, column));
         return;
     }
-    let mut lift = |expr: &mut Expr| lift_aggregates(expr, calls);
+    let mut lift = |expr: &mut Expr| lift_aggregates(expr, calls, first, collation);
     match expr {
         Expr::Function { args, .. } | Expr::Coalesce(args) | Expr::ArrayLiteral(args) => {
             args.iter_mut().for_each(&mut lift);
@@ -372,6 +397,7 @@ fn lift_aggregates(expr: &mut Expr, calls: &mut Vec<Expr>) {
         | Expr::Exists { .. }
         | Expr::ScalarSubquery(_)
         | Expr::Literal(_)
+        | Expr::InputRef { .. }
         | Expr::BoundColumn { .. }
         | Expr::Column(_)
         | Expr::QualifiedColumn { .. }
@@ -383,6 +409,7 @@ fn lift_aggregates(expr: &mut Expr, calls: &mut Vec<Expr>) {
 /// Whether HAVING keeps a group. HAVING may name an output column, as it
 /// may without window functions; one that holds a window function has no
 /// value yet, since windows run after HAVING.
+#[allow(clippy::too_many_arguments)]
 fn having_keeps(
     having: &Expr,
     stmt: &SelectStmt,
@@ -390,8 +417,9 @@ fn having_keeps(
     col_map: &ColumnMap,
     group: &[&Vec<Value>],
     cancel: Option<&citadel::CancelToken>,
+    row_width: usize,
 ) -> Result<bool> {
-    match eval_aggregate_expr_with_cancel(having, col_map, group, cancel) {
+    match eval_aggregate_expr_with_cancel(having, col_map, group, cancel, row_width) {
         Ok(value) => Ok(is_truthy(&value)),
         Err(SqlError::ColumnNotFound(_)) => {
             let outputs: Vec<SelectColumn> = stmt
@@ -407,7 +435,7 @@ fn having_keeps(
             for column in &outputs {
                 if let SelectColumn::Expr { expr, .. } = column {
                     values.push(eval_aggregate_expr_with_cancel(
-                        expr, col_map, group, cancel,
+                        expr, col_map, group, cancel, row_width,
                     )?);
                 }
             }
@@ -507,7 +535,7 @@ pub(super) fn eval_aggregate_expr(
     col_map: &ColumnMap,
     group_rows: &[&Vec<Value>],
 ) -> Result<Value> {
-    eval_aggregate_expr_with_cancel(expr, col_map, group_rows, None)
+    eval_aggregate_expr_with_cancel(expr, col_map, group_rows, None, col_map.len())
 }
 
 fn first_non_null_is_interval(
@@ -531,6 +559,7 @@ fn eval_aggregate_expr_with_cancel(
     col_map: &ColumnMap,
     group_rows: &[&Vec<Value>],
     cancel: Option<&citadel::CancelToken>,
+    row_width: usize,
 ) -> Result<Value> {
     check_cancel(cancel)?;
     let reduced;
@@ -544,7 +573,7 @@ fn eval_aggregate_expr_with_cancel(
     let row: &[Value] = match group_rows.first() {
         Some(row) => row,
         None => {
-            nulls = vec![Value::Null; col_map.len()];
+            nulls = vec![Value::Null; row_width];
             &nulls
         }
     };
@@ -701,6 +730,7 @@ fn reduce_aggregates(
             },
         },
         Expr::Literal(_)
+        | Expr::InputRef { .. }
         | Expr::BoundColumn { .. }
         | Expr::Column(_)
         | Expr::QualifiedColumn { .. }
