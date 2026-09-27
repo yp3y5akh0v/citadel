@@ -1,7 +1,7 @@
 use crate::encoding::{
-    decode_columns, decode_columns_into, decode_composite_key, decode_key_value, decode_pk_integer,
-    decode_pk_into, decode_row_into, decode_row_push, encode_composite_key, row_non_pk_count,
-    ProjectedOffsetPlan,
+    decode_column_raw, decode_columns, decode_columns_into, decode_composite_key, decode_key_value,
+    decode_pk_integer, decode_pk_into, decode_row_into, decode_row_push, encode_composite_key,
+    row_non_pk_count, ProjectedOffsetPlan,
 };
 pub(crate) use crate::parser::expr_display_name;
 #[cfg(test)]
@@ -1087,6 +1087,49 @@ impl PartialDecodeCtx {
             }
         }
         Ok(row)
+    }
+}
+
+/// Read one stored column without allocating a row. Schemas that need expression
+/// materialization use PartialDecodeCtx instead, so defaults and virtual values
+/// retain their normal evaluation and completion behavior.
+pub(super) enum StoredColumnDecoder {
+    IntegerKey,
+    Key,
+    Field(usize),
+}
+
+impl StoredColumnDecoder {
+    pub(super) fn try_new(schema: &TableSchema, column: usize) -> Option<Self> {
+        if schema.primary_key_columns.len() != 1
+            || schema.has_virtual_columns()
+            || schema
+                .columns
+                .iter()
+                .any(|column| column.default_expr.is_some())
+        {
+            return None;
+        }
+        if schema.primary_key_columns[0] as usize == column {
+            return Some(if schema.columns[column].data_type == DataType::Integer {
+                Self::IntegerKey
+            } else {
+                Self::Key
+            });
+        }
+        let logical = schema
+            .non_pk_indices()
+            .iter()
+            .position(|&index| index == column)?;
+        Some(Self::Field(schema.encoding_positions()[logical] as usize))
+    }
+
+    pub(super) fn decode(&self, key: &[u8], value: &[u8]) -> Result<Value> {
+        match self {
+            Self::IntegerKey => Ok(Value::Integer(decode_pk_integer(key)?)),
+            Self::Key => Ok(decode_key_value(key)?.0),
+            Self::Field(position) => decode_column_raw(value, *position)?.to_value(),
+        }
     }
 }
 

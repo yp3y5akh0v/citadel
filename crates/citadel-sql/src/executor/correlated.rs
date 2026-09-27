@@ -1,14 +1,16 @@
 use citadel_txn::read_txn::ReadView;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::encoding::{decode_column_raw, decode_composite_key, decode_pk_integer};
 use crate::error::{Result, SqlError};
 use crate::eval::{eval_expr, is_truthy, ColumnMap, EvalCtx};
 use crate::parser::*;
 use crate::schema::SchemaManager;
 use crate::types::*;
 
-use super::helpers::{check_cancel, check_cancel_at, decode_full_row_with_cancel};
+use super::helpers::{
+    check_cancel, check_cancel_at, decode_full_row_with_cancel, PartialDecodeCtx,
+    StoredColumnDecoder,
+};
 use super::join::{KeyedRowIndex, KeyedRows};
 use super::CteContext;
 
@@ -2003,10 +2005,26 @@ pub(super) fn build_and_scan_correlated_with_read(
                 )?;
                 let outer_col_indices: Vec<usize> =
                     corr_pairs.iter().map(|p| p.outer_col_idx).collect();
+                let operand_column = match expr.as_ref() {
+                    Expr::Column(name) => outer_col_map.resolve(name).ok(),
+                    Expr::QualifiedColumn { table, column }
+                        if table.eq_ignore_ascii_case(
+                            stmt.from_alias.as_deref().unwrap_or(&stmt.from),
+                        ) =>
+                    {
+                        outer_col_map.resolve_qualified(table, column).ok()
+                    }
+                    _ => None,
+                }
+                .and_then(|column| {
+                    StoredColumnDecoder::try_new(outer_schema, column)
+                        .map(|decoder| (column, decoder))
+                });
                 in_filters.push(InFilter {
                     rows,
                     outer_col_indices,
                     in_expr: (**expr).clone(),
+                    operand_column,
                     negated: *negated,
                 });
             }
@@ -2022,30 +2040,37 @@ pub(super) fn build_and_scan_correlated_with_read(
     }
 
     let lower = &outer_schema.name;
-    let num_pk_cols = outer_schema.primary_key_columns.len();
-    let non_pk = outer_schema.non_pk_indices();
-    let enc_pos = outer_schema.encoding_positions();
-    // Pre-compute how to extract each needed outer column from raw bytes
-    let mut needed_raw: Vec<(usize, RawColTarget)> = Vec::new();
+    let mut needed_columns = Vec::new();
     for ef in &exists_filters {
         for &oci in &ef.outer_col_indices {
-            if !needed_raw.iter().any(|(idx, _)| *idx == oci) {
-                needed_raw.push((oci, raw_col_target(oci, outer_schema, non_pk, enc_pos)));
+            if !needed_columns.contains(&oci) {
+                needed_columns.push(oci);
             }
         }
     }
     for inf in &in_filters {
         for &oci in &inf.outer_col_indices {
-            if !needed_raw.iter().any(|(idx, _)| *idx == oci) {
-                needed_raw.push((oci, raw_col_target(oci, outer_schema, non_pk, enc_pos)));
+            if !needed_columns.contains(&oci) {
+                needed_columns.push(oci);
             }
         }
     }
 
+    let raw_columns: Option<Vec<_>> = needed_columns
+        .iter()
+        .map(|&column| StoredColumnDecoder::try_new(outer_schema, column))
+        .collect();
+    let partial = raw_columns.is_none().then(|| {
+        let keys = PartialDecodeCtx::new(outer_schema, &needed_columns);
+        let all_columns: Vec<_> = (0..outer_schema.columns.len()).collect();
+        let remaining = PartialDecodeCtx::new(outer_schema, &all_columns).remaining_after(&keys);
+        (keys, remaining)
+    });
+
     let mut rows: Vec<Vec<Value>> = Vec::new();
     let mut scan_err: Option<SqlError> = None;
 
-    let mut col_vals: Vec<(usize, Value)> = Vec::with_capacity(needed_raw.len());
+    let mut col_vals: Vec<(usize, Value)> = Vec::with_capacity(needed_columns.len());
     let key_capacity = exists_filters
         .iter()
         .map(|filter| filter.outer_col_indices.len())
@@ -2059,28 +2084,43 @@ pub(super) fn build_and_scan_correlated_with_read(
     let mut corr_key = Vec::with_capacity(key_capacity + usize::from(!in_filters.is_empty()));
 
     rtx.table_scan_raw(lower.as_bytes(), |key, value| {
+        let mut decoded_row = CorrelatedRow::default();
         // Extract only the correlation columns from raw bytes (fast partial decode)
         col_vals.clear();
-        for &(col_idx, ref target) in &needed_raw {
-            let val = match extract_raw_value(key, value, target, num_pk_cols) {
-                Ok(v) => v,
-                Err(e) => {
-                    scan_err = Some(e);
+        if let Some(raw_columns) = &raw_columns {
+            for (&column, decoder) in needed_columns.iter().zip(raw_columns) {
+                match decoder.decode(key, value) {
+                    Ok(value) => col_vals.push((column, value)),
+                    Err(error) => {
+                        scan_err = Some(error);
+                        return false;
+                    }
+                }
+            }
+        } else if let Some((keys, remaining)) = &partial {
+            match keys.decode_with_cancel(key, value, cancel) {
+                Ok(row) => {
+                    col_vals.extend(
+                        needed_columns
+                            .iter()
+                            .map(|&column| (column, row[column].clone())),
+                    );
+                    decoded_row.values = Some(row);
+                    decoded_row.remaining = Some(remaining);
+                }
+                Err(error) => {
+                    scan_err = Some(error);
                     return false;
                 }
-            };
-            col_vals.push((col_idx, val));
+            }
         }
-        // A filter decodes the whole row only when it has to read more than
-        // the correlation values.
-        let mut decoded_row: Option<Vec<Value>> = None;
         let passes = (|| -> Result<bool> {
             for ef in &exists_filters {
                 partial_values_into(&col_vals, &ef.outer_col_indices, &mut corr_key);
                 let found = if ef.result.reads_outer_row() {
                     let candidates = ef.result.rows.matching(&corr_key, cancel)?;
                     !candidates.is_empty() && {
-                        let row = decode_once(&mut decoded_row, outer_schema, key, value, cancel)?;
+                        let row = decoded_row.complete(outer_schema, key, value, cancel)?;
                         ef.result
                             .satisfied_by(&candidates, row, &outer_col_map, ctx, cancel)?
                     }
@@ -2094,7 +2134,18 @@ pub(super) fn build_and_scan_correlated_with_read(
             for inf in &in_filters {
                 partial_values_into(&col_vals, &inf.outer_col_indices, &mut corr_key);
                 let passes = inf.rows.passes(&mut corr_key, inf.negated, cancel, || {
-                    let row = decode_once(&mut decoded_row, outer_schema, key, value, cancel)?;
+                    if let Some((column, decoder)) = &inf.operand_column {
+                        check_cancel(cancel)?;
+                        if decoded_row.values.is_none() {
+                            if let Some((_, value)) =
+                                col_vals.iter().find(|(index, _)| index == column)
+                            {
+                                return Ok(value.clone());
+                            }
+                            return decoder.decode(key, value);
+                        }
+                    }
+                    let row = decoded_row.complete(outer_schema, key, value, cancel)?;
                     eval_expr(
                         &inf.in_expr,
                         &EvalCtx::new(&outer_col_map, row).with_cancel(cancel),
@@ -2111,18 +2162,16 @@ pub(super) fn build_and_scan_correlated_with_read(
             Ok(true) => {
                 // Reuse a full decode a filter performed, or decode once now for
                 // the output.
-                let row = match decoded_row {
-                    Some(row) => row,
-                    None => match decode_full_row_with_cancel(outer_schema, key, value, cancel) {
-                        Ok(row) => row,
-                        Err(e) => {
-                            scan_err = Some(e);
-                            return false;
-                        }
-                    },
-                };
-                rows.push(row);
-                true
+                match decoded_row.into_complete(outer_schema, key, value, cancel) {
+                    Ok(row) => {
+                        rows.push(row);
+                        true
+                    }
+                    Err(error) => {
+                        scan_err = Some(error);
+                        false
+                    }
+                }
             }
             Err(e) => {
                 scan_err = Some(e);
@@ -2155,48 +2204,6 @@ pub(super) fn build_and_scan_correlated_with_read(
     Ok((rows, remaining))
 }
 
-enum RawColTarget {
-    Pk(usize),    // PK position
-    NonPk(usize), // Physical encoding position
-}
-
-fn raw_col_target(
-    col_idx: usize,
-    schema: &TableSchema,
-    non_pk: &[usize],
-    enc_pos: &[u16],
-) -> RawColTarget {
-    if let Some(pk_pos) = schema
-        .primary_key_columns
-        .iter()
-        .position(|&c| c as usize == col_idx)
-    {
-        RawColTarget::Pk(pk_pos)
-    } else {
-        let nonpk_order = non_pk.iter().position(|&i| i == col_idx).unwrap();
-        RawColTarget::NonPk(enc_pos[nonpk_order] as usize)
-    }
-}
-
-fn extract_raw_value(
-    key: &[u8],
-    value: &[u8],
-    target: &RawColTarget,
-    num_pk_cols: usize,
-) -> Result<Value> {
-    match target {
-        RawColTarget::Pk(pk_pos) => {
-            if num_pk_cols == 1 && *pk_pos == 0 {
-                Ok(Value::Integer(decode_pk_integer(key)?))
-            } else {
-                let pk = decode_composite_key(key, num_pk_cols)?;
-                Ok(pk[*pk_pos].clone())
-            }
-        }
-        RawColTarget::NonPk(idx) => decode_column_raw(value, *idx)?.to_value(),
-    }
-}
-
 /// The values at `columns` of a row decoded only at its correlation columns.
 fn partial_values_into(decoded: &[(usize, Value)], columns: &[usize], key: &mut Vec<Value>) {
     key.clear();
@@ -2210,18 +2217,46 @@ fn partial_values_into(decoded: &[(usize, Value)], columns: &[usize], key: &mut 
     }));
 }
 
-/// The whole row at `key`/`value`, decoded on first use.
-fn decode_once<'r>(
-    decoded: &'r mut Option<Vec<Value>>,
-    schema: &TableSchema,
-    key: &[u8],
-    value: &[u8],
-    cancel: Option<&citadel::CancelToken>,
-) -> Result<&'r [Value]> {
-    if decoded.is_none() {
-        *decoded = Some(decode_full_row_with_cancel(schema, key, value, cancel)?);
+/// Key materialization may already have evaluated defaults or virtual columns.
+/// Complete the same row on demand without evaluating those columns again.
+#[derive(Default)]
+struct CorrelatedRow<'a> {
+    values: Option<Vec<Value>>,
+    remaining: Option<&'a PartialDecodeCtx>,
+}
+
+impl CorrelatedRow<'_> {
+    fn complete(
+        &mut self,
+        schema: &TableSchema,
+        key: &[u8],
+        value: &[u8],
+        cancel: Option<&citadel::CancelToken>,
+    ) -> Result<&[Value]> {
+        if let Some(remaining) = self.remaining {
+            remaining.decode_additional_into_with_cancel(
+                key,
+                value,
+                self.values.as_mut().expect("partial row has values"),
+                cancel,
+            )?;
+            self.remaining = None;
+        } else if self.values.is_none() {
+            self.values = Some(decode_full_row_with_cancel(schema, key, value, cancel)?);
+        }
+        Ok(self.values.as_deref().unwrap())
     }
-    Ok(decoded.as_deref().unwrap())
+
+    fn into_complete(
+        mut self,
+        schema: &TableSchema,
+        key: &[u8],
+        value: &[u8],
+        cancel: Option<&citadel::CancelToken>,
+    ) -> Result<Vec<Value>> {
+        self.complete(schema, key, value, cancel)?;
+        Ok(self.values.unwrap())
+    }
 }
 
 struct ExistsFilter {
@@ -2234,6 +2269,7 @@ struct InFilter {
     rows: InRows,
     outer_col_indices: Vec<usize>,
     in_expr: Expr,
+    operand_column: Option<(usize, StoredColumnDecoder)>,
     negated: bool,
 }
 
