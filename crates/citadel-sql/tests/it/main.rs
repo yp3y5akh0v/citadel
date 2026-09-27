@@ -31,6 +31,7 @@ mod constraint_torture;
 mod constraints;
 mod correlated;
 mod correlated_mutations;
+mod correlated_partial_decode;
 mod correlated_scan;
 mod correlated_scopes;
 mod correlated_set_guard;
