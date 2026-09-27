@@ -10,7 +10,14 @@ fn database() -> citadel::Database {
 }
 
 fn assert_plan(conn: &Connection<'_>, sql: &str, streaming: bool) {
-    let ExecutionResult::Query(plan) = conn.execute(&format!("EXPLAIN {sql}")).unwrap() else {
+    assert_plan_params(conn, sql, &[], streaming);
+}
+
+fn assert_plan_params(conn: &Connection<'_>, sql: &str, params: &[Value], streaming: bool) {
+    let ExecutionResult::Query(plan) = conn
+        .execute_params(&format!("EXPLAIN {sql}"), params)
+        .unwrap()
+    else {
         panic!("EXPLAIN did not return rows");
     };
     assert_eq!(
@@ -180,7 +187,79 @@ fn ordered_group_guards_retain_generic_semantics() {
         "SELECT g FROM facts GROUP BY g ORDER BY 2",
         "SELECT g FROM facts WHERE id < 0 GROUP BY g ORDER BY 2",
         "SELECT g AS x, SUM(v) AS x FROM facts GROUP BY g ORDER BY x",
+        "SELECT g FROM facts GROUP BY g ORDER BY bogus.g",
+        "SELECT g FROM facts AS f GROUP BY g ORDER BY facts.g",
     ] {
         assert!(conn.query(sql).is_err(), "{sql}");
+    }
+}
+
+#[test]
+fn prepared_ordered_groups_bind_each_execution_without_retaining_predicate_values() {
+    let db = database();
+    let conn = Connection::open(&db).unwrap();
+    seed(&conn);
+    for predicate in ["id >= $1", "$1 <= id"] {
+        let sql = format!(
+            "SELECT g, COUNT(*) AS n, SUM(v) AS total FROM facts WHERE {predicate} GROUP BY g ORDER BY g"
+        );
+        // Decline both the raw predicate and fused grouping in the oracle.
+        let generic = format!(
+            "SELECT g, COUNT(*) AS n, SUM(v) AS total FROM facts WHERE COALESCE({predicate}, FALSE) GROUP BY g + 0 ORDER BY g"
+        );
+        let prepared = conn.prepare(&sql).unwrap();
+        in_transactions(&conn, || {
+            for (bound, streaming, count) in [
+                (Value::Integer(0), true, Some(9)),
+                (Value::Integer(1), true, Some(9)),
+                (Value::Integer(10), true, Some(0)),
+                (Value::Null, false, Some(0)),
+                (Value::Real(3.5), true, Some(6)),
+                (Value::Text("not numeric".into()), false, None),
+                (Value::Integer(2), true, Some(8)),
+                (Value::Integer(0), true, Some(9)),
+            ] {
+                let params = [bound];
+                assert_plan_params(&conn, &sql, &params, streaming);
+                assert_plan_params(&conn, &generic, &params, false);
+                let expected = conn.query_params(&generic, &params);
+                for actual in [
+                    conn.query_params(&sql, &params),
+                    prepared.query_collect(&params),
+                    prepared.query(&params).and_then(|rows| rows.collect()),
+                ] {
+                    match (actual, &expected) {
+                        (Ok(actual), Ok(expected)) => {
+                            assert_eq!(actual.columns, expected.columns);
+                            assert_eq!(actual.rows, expected.rows, "{sql}, {params:?}");
+                            if let Some(count) = count {
+                                assert_eq!(
+                                    actual
+                                        .rows
+                                        .iter()
+                                        .map(|row| match row[1] {
+                                            Value::Integer(n) => n,
+                                            _ => panic!("COUNT(*) is not an integer"),
+                                        })
+                                        .sum::<i64>(),
+                                    count,
+                                    "{sql}, {params:?}"
+                                );
+                            }
+                        }
+                        (Err(actual), Err(expected)) => {
+                            assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
+                        }
+                        (actual, expected) => {
+                            panic!("{sql}, {params:?}: actual={actual:?}, expected={expected:?}")
+                        }
+                    }
+                }
+            }
+        });
+        assert!(prepared.query_collect(&[]).is_err());
+        assert!(prepared
+            .query_collect(&[Value::Integer(0), Value::Integer(1)])
+            .is_err());
     }
 }

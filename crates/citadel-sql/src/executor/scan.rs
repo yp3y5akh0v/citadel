@@ -1677,10 +1677,25 @@ pub(super) fn try_between_predicate(expr: &Expr, schema: &TableSchema) -> Option
 }
 
 pub(super) fn try_simple_predicate(expr: &Expr, schema: &TableSchema) -> Option<SimplePredicate> {
+    // These raw predicates are constructed for one execution, never retained in
+    // a compiled plan. Bind only a parameter value, not an arbitrary expression;
+    // an absent/unsupported binding leaves evaluation to the ordinary path.
     let (operand, mut op, literal, reversed) = match expr {
         Expr::BinaryOp { left, op, right } => match (left.as_ref(), right.as_ref()) {
             (operand, Expr::Literal(lit)) => (operand, *op, lit.clone(), false),
             (Expr::Literal(lit), operand) => (operand, *op, lit.clone(), true),
+            (operand, Expr::Parameter(index)) => (
+                operand,
+                *op,
+                crate::eval::resolve_scoped_param(*index).ok()?,
+                false,
+            ),
+            (Expr::Parameter(index), operand) => (
+                operand,
+                *op,
+                crate::eval::resolve_scoped_param(*index).ok()?,
+                true,
+            ),
             _ => return None,
         },
         _ => return None,
