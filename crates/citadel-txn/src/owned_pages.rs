@@ -87,6 +87,13 @@ impl OwnedPages {
         self.pages.len()
     }
 
+    /// Retain immutable page versions without copying their bodies. Later
+    /// writer access goes through `Arc::make_mut`, including for pages whose
+    /// physical ID and transaction ID do not change.
+    pub(crate) fn snapshot(&self) -> FxHashMap<PageId, Arc<Page>> {
+        self.pages.clone()
+    }
+
     #[cfg(test)]
     pub(crate) fn capacity(&self) -> usize {
         self.pages.capacity()

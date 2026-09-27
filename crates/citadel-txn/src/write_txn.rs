@@ -24,7 +24,7 @@ use crate::merkle;
 use crate::overflow_io;
 use crate::owned_pages::OwnedPages;
 use crate::range_scan::{self, LeafLoader};
-use crate::read_txn::ScanCount;
+use crate::read_txn::{PendingReadRoots, ScanCount, StatementReadTxn};
 use crate::ReadBudget;
 
 thread_local! {
@@ -358,6 +358,45 @@ impl<'db> WriteTxn<'db> {
 
     pub fn read_budget(&self) -> Option<&ReadBudget> {
         self.read_budget.as_ref()
+    }
+
+    /// Freeze this writer's current data for later statement reads.
+    ///
+    /// The snapshot includes earlier uncommitted writes and catalog changes,
+    /// and remains unchanged as this writer mutates, restores a savepoint,
+    /// commits, or aborts. Capturing it clones page references, not page bodies;
+    /// later writes isolate shared pages through copy-on-write. It does not
+    /// consume a transaction ID or change the writer's mutation state.
+    ///
+    /// The returned view has no committed-generation identity or Merkle proof
+    /// API. Its independent reader registration protects disk-backed pages.
+    pub fn read_snapshot(&self) -> Result<StatementReadTxn<'db>> {
+        self.check_cancel()?;
+        let reader = self.manager.begin_read();
+        // This writer still holds exclusive commit admission, so the current
+        // committed snapshot must be the one from which it started.
+        debug_assert_eq!(reader.txn_id(), self.old_slot.txn_id);
+        let roots = PendingReadRoots {
+            tree_root: self.tree.root,
+            tree_entries: self.tree.entry_count,
+            catalog_root: self
+                .catalog
+                .as_ref()
+                .map_or(self.old_slot.catalog_root, |catalog| catalog.root),
+            named_trees: self
+                .named_trees
+                .iter()
+                .map(|(name, tree)| (name.clone(), TableDescriptor::from_tree(tree)))
+                .collect(),
+        };
+        let pages = self.pages.snapshot();
+        self.check_cancel()?;
+        Ok(reader.into_statement_snapshot(
+            roots,
+            pages,
+            self.cancel.clone(),
+            self.read_budget.clone(),
+        ))
     }
 
     /// Refuse a mutation once the token is tripped.
