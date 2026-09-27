@@ -98,6 +98,51 @@ fn sql_result_owns_ffi_strings_and_preserves_text_nuls() {
 }
 
 #[test]
+fn values_handed_to_c_round_trip_through_free_bytes() {
+    for value in [Some(b"value".to_vec()), Some(Vec::new()), None] {
+        let mut out = ptr::null_mut();
+        let mut len = usize::MAX;
+        unsafe { write_value(value.clone(), &mut out, &mut len) };
+        match &value {
+            Some(bytes) => assert_eq!(unsafe { slice::from_raw_parts(out, len) }, bytes),
+            None => assert!(out.is_null() && len == 0),
+        }
+        citadel_free_bytes(out, len);
+    }
+}
+
+#[test]
+fn sql_value_accessors_convert_or_refuse_each_cell() {
+    let result = Box::new(CitadelSqlResult {
+        columns: Vec::new(),
+        rows: prepare_sql_rows_for_ffi(vec![vec![
+            Value::Real(2.5),
+            Value::Blob(vec![1, 2, 3]),
+            Value::Integer(7),
+        ]]),
+        rows_affected: 0,
+        is_query: true,
+    });
+    let result_ptr = &*result as *const CitadelSqlResult;
+    assert_eq!(citadel_sql_value_real(result_ptr, 0, 0), 2.5);
+    assert_eq!(citadel_sql_value_real(result_ptr, 0, 2), 7.0);
+    assert_eq!(citadel_sql_value_real(result_ptr, 0, 1), 0.0);
+    assert_eq!(citadel_sql_value_real(ptr::null(), 0, 0), 0.0);
+
+    let mut len = usize::MAX;
+    let blob = citadel_sql_value_blob(result_ptr, 0, 1, &mut len);
+    assert_eq!(unsafe { slice::from_raw_parts(blob, len) }, [1, 2, 3]);
+    assert!(citadel_sql_value_blob(result_ptr, 0, 0, &mut len).is_null());
+    assert_eq!(len, 0);
+    assert!(citadel_sql_value_blob(result_ptr, 0, 1, ptr::null_mut()).is_null());
+
+    let mut text_len = usize::MAX;
+    assert!(citadel_sql_value_text(result_ptr, 0, 2, &mut text_len).is_null());
+    assert_eq!(text_len, 0);
+    assert!(citadel_sql_value_text(result_ptr, 1, 0, ptr::null_mut()).is_null());
+}
+
+#[test]
 fn cancellation_token_can_interrupt_sql_after_the_caller_frees_its_handle() {
     let (_dir, cpath) = temp_path();
     let mut db = ptr::null_mut();
@@ -641,6 +686,87 @@ fn named_table_roundtrip() {
     citadel_free_bytes(out_val, out_len);
 
     citadel_read_end(rtxn);
+    citadel_close(db);
+}
+
+#[test]
+fn named_table_writes_report_through_their_out_parameters() {
+    let (_dir, cpath) = temp_path();
+    let mut db = ptr::null_mut();
+    assert_eq!(
+        citadel_create(
+            cpath.as_ptr(),
+            b"test".as_ptr(),
+            b"test".len(),
+            ptr::null(),
+            &mut db,
+        ),
+        CitadelError::Ok
+    );
+    let mut wtxn = ptr::null_mut();
+    assert_eq!(citadel_write_begin(db, &mut wtxn), CitadelError::Ok);
+    let table = b"users";
+    let key = b"alice";
+    assert_eq!(
+        citadel_write_create_table(wtxn, table.as_ptr(), table.len()),
+        CitadelError::Ok
+    );
+
+    let mut was_new = -1;
+    assert_eq!(
+        citadel_write_table_put(
+            wtxn,
+            table.as_ptr(),
+            table.len(),
+            key.as_ptr(),
+            key.len(),
+            b"admin".as_ptr(),
+            b"admin".len(),
+            &mut was_new,
+        ),
+        CitadelError::Ok
+    );
+    assert_eq!(was_new, 1);
+
+    let get = |value: &mut *mut u8, len: &mut usize| {
+        citadel_write_table_get(
+            wtxn,
+            table.as_ptr(),
+            table.len(),
+            key.as_ptr(),
+            key.len(),
+            value,
+            len,
+        )
+    };
+    let (mut value, mut len) = (ptr::null_mut(), 0);
+    assert_eq!(get(&mut value, &mut len), CitadelError::Ok);
+    assert_eq!(unsafe { slice::from_raw_parts(value, len) }, b"admin");
+    citadel_free_bytes(value, len);
+
+    let mut existed = -1;
+    assert_eq!(
+        citadel_write_table_delete(
+            wtxn,
+            table.as_ptr(),
+            table.len(),
+            key.as_ptr(),
+            key.len(),
+            &mut existed,
+        ),
+        CitadelError::Ok
+    );
+    assert_eq!(existed, 1);
+    assert_eq!(get(&mut value, &mut len), CitadelError::Ok);
+    assert!(value.is_null());
+    assert_eq!(len, 0);
+
+    assert_eq!(
+        citadel_write_drop_table(wtxn, table.as_ptr(), table.len()),
+        CitadelError::Ok
+    );
+    assert_eq!(get(&mut value, &mut len), CitadelError::TableNotFound);
+    citadel_write_abort(wtxn);
     citadel_close(db);
 }
 
