@@ -296,3 +296,59 @@ fn correlated_in_probe_passes_cancellation_into_scalar_evaluation() {
         crate::error::SqlError::Storage(citadel_core::Error::Interrupted)
     ));
 }
+
+#[test]
+fn correlated_in_reused_key_survives_probe_branches_and_cancellation() {
+    let keys = [(0, Collation::Binary)];
+    let rows = InRows {
+        groups: KeyedRows::build(vec![vec![i(1)], vec![i(2)]], &keys, None).unwrap(),
+        nulls: KeyedRows::build(vec![vec![i(2)]], &keys, None).unwrap(),
+        values: KeyedRows::build(
+            vec![vec![i(1), i(7)], vec![i(2), i(9)]],
+            &[(0, Collation::Binary), (1, Collation::Binary)],
+            None,
+        )
+        .unwrap(),
+    };
+    let mut key = Vec::with_capacity(2);
+    for (group, selected, negated, expected) in [
+        (1, i(7), false, true),
+        (1, i(9), false, false),
+        (1, i(9), true, true),
+        (2, i(7), true, false),
+        (2, i(9), true, false),
+        (1, Value::Null, false, false),
+    ] {
+        key.clear();
+        key.push(i(group));
+        assert_eq!(
+            rows.passes(&mut key, negated, None, || Ok(selected))
+                .unwrap(),
+            expected,
+        );
+        assert_eq!(key, [i(group)], "probe value leaked into correlation key");
+    }
+    key[0] = i(3);
+    assert!(rows
+        .passes(&mut key, true, None, || panic!(
+            "empty group evaluated operand"
+        ))
+        .unwrap());
+    assert_eq!(key, [i(3)]);
+
+    key[0] = i(1);
+    let token = citadel::CancelToken::new();
+    let error = rows
+        .passes(&mut key, false, Some(&token), || {
+            token.cancel();
+            Ok(i(7))
+        })
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        SqlError::Storage(citadel_core::Error::Interrupted)
+    ));
+    assert_eq!(key, [i(1)], "cancelled probe left an appended value");
+    assert!(rows.passes(&mut key, false, None, || Ok(i(7))).unwrap());
+    assert_eq!(key, [i(1)]);
+}
