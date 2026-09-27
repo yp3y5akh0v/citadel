@@ -30,7 +30,8 @@ pub(super) fn expr_context_free(expr: &Expr) -> bool {
         | Expr::ScalarSubquery(_)
         | Expr::WindowFunction { .. }
         | Expr::Quantified { .. } => independent = false,
-        Expr::BoundColumn { .. }
+        Expr::InputRef { .. }
+        | Expr::BoundColumn { .. }
         | Expr::Literal(_)
         | Expr::Column(_)
         | Expr::QualifiedColumn { .. }
@@ -2037,6 +2038,7 @@ pub(super) fn try_build_index_map(
             SelectColumn::AllFromOld | SelectColumn::AllFromNew => return None,
             SelectColumn::Expr { expr, alias } => {
                 let idx = match expr {
+                    Expr::InputRef { index, .. } => *index,
                     Expr::Column(name) => col_map.resolve(name).ok()?,
                     Expr::QualifiedColumn { table, column } => {
                         col_map.resolve_qualified(table, column).ok()?
@@ -2071,37 +2073,38 @@ pub(super) fn project_rows_with_cancel(
     check_cancel(cancel)?;
     if select_cols.len() == 1 && matches!(select_cols[0], SelectColumn::AllColumns) {
         let col_names = columns.iter().map(|c| c.name.clone()).collect();
+        truncate_internal_slots(&mut rows, columns.len(), cancel)?;
         return Ok((col_names, rows));
     }
 
     if let Some(names) = try_identity_projection_names(select_cols, columns) {
+        truncate_internal_slots(&mut rows, columns.len(), cancel)?;
         return Ok((names, rows));
     }
 
     if let Some(map) = try_build_index_map(select_cols, columns) {
         let col_names: Vec<String> = map.iter().map(|(n, _)| n.clone()).collect();
         if map.len() == columns.len() && map.iter().enumerate().all(|(i, &(_, idx))| idx == i) {
+            truncate_internal_slots(&mut rows, columns.len(), cancel)?;
             return Ok((col_names, rows));
         }
-        if cancel.is_none() {
-            let projected = rows
-                .iter_mut()
-                .map(|row| {
-                    map.iter()
-                        .map(|&(_, idx)| std::mem::take(&mut row[idx]))
-                        .collect()
+        let move_row = |row: &mut Vec<Value>| {
+            map.iter()
+                .map(|&(_, index)| {
+                    row.get_mut(index).map(std::mem::take).ok_or_else(|| {
+                        SqlError::Plan(format!("input slot {index} is outside the projection row"))
+                    })
                 })
-                .collect();
+                .collect::<Result<Vec<_>>>()
+        };
+        if cancel.is_none() {
+            let projected = rows.iter_mut().map(move_row).collect::<Result<Vec<_>>>()?;
             return Ok((col_names, projected));
         }
         let mut projected = Vec::with_capacity(rows.len());
         for (row_idx, row) in rows.iter_mut().enumerate() {
             check_cancel_at(cancel, row_idx)?;
-            projected.push(
-                map.iter()
-                    .map(|&(_, idx)| std::mem::take(&mut row[idx]))
-                    .collect(),
-            );
+            projected.push(move_row(row)?);
         }
         check_cancel(cancel)?;
         return Ok((col_names, projected));
@@ -2159,6 +2162,22 @@ pub(super) fn project_rows_with_cancel(
     check_cancel(cancel)?;
 
     Ok((col_names, projected))
+}
+
+/// Identity projection can move the rows without copying their values. Trim
+/// execution-only slots only when they exist; ordinary rows keep the fast path.
+fn truncate_internal_slots(
+    rows: &mut [Vec<Value>],
+    visible: usize,
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<()> {
+    if rows.first().is_some_and(|row| row.len() > visible) {
+        for (index, row) in rows.iter_mut().enumerate() {
+            check_cancel_at(cancel, index)?;
+            row.truncate(visible);
+        }
+    }
+    check_cancel(cancel)
 }
 
 pub(super) fn project_returning(

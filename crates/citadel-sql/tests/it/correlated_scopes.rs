@@ -339,3 +339,140 @@ fn ordering_grouping_and_nesting_read_the_outer_row() {
         );
     });
 }
+
+#[test]
+fn internal_subquery_slots_do_not_expand_wildcards_or_shadow_columns() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = database(directory.path());
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute(
+            "CREATE TABLE slots (id INTEGER PRIMARY KEY, __captured_4 INTEGER, \
+        __corr_4 INTEGER, __win_0 INTEGER)",
+        )
+        .unwrap();
+    connection
+        .execute("INSERT INTO slots VALUES (1,10,100,1000),(2,20,200,2000)")
+        .unwrap();
+    let visible = ["id", "__captured_4", "__corr_4", "__win_0"];
+    let predicate = "EXISTS (SELECT 1 FROM slots AS i WHERE i.id < o.id)";
+    for begin in [None, Some("BEGIN READ ONLY"), Some("BEGIN")] {
+        if let Some(begin) = begin {
+            connection.execute(begin).unwrap();
+        }
+        for source in ["slots AS o", "(SELECT * FROM slots) AS o"] {
+            let sql = format!("SELECT * FROM {source} WHERE {predicate}");
+            let result = connection.query(&sql).unwrap();
+            assert_eq!(result.columns, visible, "{sql}");
+            assert_eq!(result.rows, ints(&[&[2, 20, 200, 2000]]), "{sql}");
+            let result = connection
+                .prepare(&sql)
+                .unwrap()
+                .query_collect(&[])
+                .unwrap();
+            assert_eq!(result.columns, visible, "prepared {sql}");
+            assert_eq!(result.rows, ints(&[&[2, 20, 200, 2000]]), "prepared {sql}");
+        }
+        let empty = connection
+            .query(
+                "SELECT * FROM slots AS o WHERE EXISTS \
+            (SELECT 1 FROM slots AS i WHERE i.id < o.id) AND o.id = 1",
+            )
+            .unwrap();
+        assert_eq!(empty.columns, visible);
+        assert!(empty.rows.is_empty());
+        assert_eq!(
+            rows(
+                &connection,
+                "SELECT o.__captured_4, (SELECT i.id FROM slots AS i WHERE i.id < o.id) \
+             FROM slots AS o ORDER BY o.id"
+            ),
+            vec![
+                vec![Value::Integer(10), Value::Null],
+                vec![Value::Integer(20), Value::Integer(1)]
+            ]
+        );
+        assert_eq!(
+            rows(
+                &connection,
+                "SELECT o.__corr_4, (SELECT COUNT(*) FROM slots AS i WHERE i.id = o.id) \
+             FROM slots AS o ORDER BY o.id"
+            ),
+            ints(&[&[100, 1], &[200, 1]])
+        );
+        let mixed = connection
+            .query(
+                "SELECT *, ROW_NUMBER() OVER (ORDER BY o.id) AS n \
+            FROM slots AS o WHERE EXISTS (SELECT 1 FROM slots AS i WHERE i.id < o.id)",
+            )
+            .unwrap();
+        assert_eq!(
+            mixed.columns,
+            ["id", "__captured_4", "__corr_4", "__win_0", "n"]
+        );
+        assert_eq!(mixed.rows, ints(&[&[2, 20, 200, 2000, 1]]));
+        for window in ["", ", ROW_NUMBER() OVER () AS rn"] {
+            let result = connection
+                .query(&format!(
+                    "SELECT \
+                (SELECT i.id FROM slots AS i WHERE i.id < o.id) AS captured, \
+                COUNT(*) AS n{window} FROM slots AS o WHERE o.id < 0"
+                ))
+                .unwrap();
+            let mut expected = vec![Value::Null, Value::Integer(0)];
+            if !window.is_empty() {
+                expected.push(Value::Integer(1));
+            }
+            assert_eq!(result.rows, vec![expected]);
+        }
+        if begin.is_some() {
+            connection.execute("ROLLBACK").unwrap();
+        }
+    }
+}
+
+#[test]
+fn captured_predicate_star_returns_only_the_original_schema() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = database(directory.path());
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    connection.execute("INSERT INTO t VALUES (1),(2)").unwrap();
+    let result = connection
+        .query(
+            "SELECT * FROM t AS o WHERE EXISTS \
+        (SELECT 1 FROM t AS i WHERE i.id < o.id)",
+        )
+        .unwrap();
+    assert_eq!(result.columns, ["id"]);
+    assert_eq!(result.rows, ints(&[&[2]]));
+}
+
+#[test]
+fn internal_slots_cannot_resolve_unbound_names_and_join_stars_stay_visible() {
+    with_setup(|connection| {
+        // t1 has three columns: neither internal-looking spelling names one.
+        for sql in [
+            "SELECT __captured_3 FROM t1 AS o WHERE EXISTS \
+             (SELECT 1 FROM t1 AS i WHERE i.id < o.id)",
+            "SELECT __corr_3, (SELECT COUNT(*) FROM t1 AS i WHERE i.id = o.id) FROM t1 AS o",
+            "SELECT __win_0, ROW_NUMBER() OVER () FROM t1",
+            "SELECT __aggregate_0, SUM(a), ROW_NUMBER() OVER () FROM t1",
+        ] {
+            assert!(
+                matches!(connection.query(sql), Err(SqlError::ColumnNotFound(_))),
+                "{sql}"
+            );
+        }
+        let result = connection
+            .query(
+                "SELECT * FROM t1 AS o JOIN t2 AS x ON x.id = o.id \
+            WHERE EXISTS (SELECT 1 FROM t1 AS i WHERE i.id < o.id)",
+            )
+            .unwrap();
+        assert_eq!(result.columns, ["o.id", "o.a", "o.b", "x.id", "x.e"]);
+        assert_eq!(result.rows, ints(&[&[2, 2, 1, 2, 5]]));
+    });
+}

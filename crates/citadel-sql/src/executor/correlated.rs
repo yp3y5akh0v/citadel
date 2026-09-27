@@ -445,7 +445,7 @@ pub(super) fn handle_correlated_select_with_read(
     stmt: &SelectStmt,
     ctx: &CorrelationCtx,
     rows: &mut [Vec<Value>],
-    columns: &mut Vec<ColumnDef>,
+    row_width: &mut usize,
 ) -> Result<SelectStmt> {
     let cancel = rtx.cancel_token().cloned();
     let cancel = cancel.as_ref();
@@ -453,7 +453,7 @@ pub(super) fn handle_correlated_select_with_read(
     let mut new_columns = Vec::new();
     // For each hashed subquery, its value for every row.
     let mut hashed: Vec<Vec<Value>> = Vec::new();
-    let mut corr_col_idx = columns.len();
+    let mut corr_col_idx = *row_width;
 
     for col in &stmt.columns {
         match col {
@@ -492,27 +492,10 @@ pub(super) fn handle_correlated_select_with_read(
                         };
                         if let Some(values) = values {
                             hashed.push(values);
-                            // The value sits in a hidden column named apart from
-                            // the query's names; the output keeps the name the
-                            // query gave it.
-                            let col_name = format!("__corr_{corr_col_idx}");
-                            columns.push(ColumnDef {
-                                name: col_name.clone(),
-                                data_type: DataType::Null,
-                                nullable: true,
-                                position: corr_col_idx as u16,
-                                default_expr: None,
-                                default_sql: None,
-                                check_expr: None,
-                                check_sql: None,
-                                check_name: None,
-                                is_with_timezone: false,
-                                generated_expr: None,
-                                generated_sql: None,
-                                generated_kind: None,
-                                collation: Collation::Binary,
-                            });
-                            let slot = Expr::Column(col_name);
+                            let slot = Expr::InputRef {
+                                index: corr_col_idx,
+                                collation: None,
+                            };
                             new_columns.push(SelectColumn::Expr {
                                 alias: super::helpers::written_alias(alias, written, &slot),
                                 expr: slot,
@@ -531,6 +514,8 @@ pub(super) fn handle_correlated_select_with_read(
     if hashed.is_empty() {
         return Ok(stmt.clone());
     }
+
+    *row_width = corr_col_idx;
 
     for (row_idx, row) in rows.iter_mut().enumerate() {
         check_cancel_at(cancel, row_idx)?;
@@ -784,7 +769,8 @@ pub(super) fn finish_captured_select(
     stmt: SelectStmt,
     outer: &OuterScope,
     mut rows: Vec<Vec<Value>>,
-    mut columns: Vec<ColumnDef>,
+    columns: Vec<ColumnDef>,
+    mut row_width: usize,
     cancel: Option<&citadel::CancelToken>,
     exec_sub: &mut dyn FnMut(&SelectStmt) -> Result<super::CteRows>,
 ) -> Result<ExecutionResult> {
@@ -794,7 +780,8 @@ pub(super) fn finish_captured_select(
         &stmt,
         outer,
         &mut rows,
-        &mut columns,
+        &columns,
+        &mut row_width,
         cancel,
         exec_sub,
     )?
@@ -804,7 +791,10 @@ pub(super) fn finish_captured_select(
     } else {
         stmt
     };
-    super::process_select(rows, super::SelectCtx::new(&columns, &stmt, cancel))
+    super::process_select(
+        rows,
+        super::SelectCtx::new(&columns, &stmt, cancel).row_width(row_width),
+    )
 }
 
 /// Join conditions are evaluated while rows are joined, before any per-row
@@ -1403,7 +1393,8 @@ pub(super) fn bind_outer_values_in_expr(
                 QuantifiedRhs::Array(expr) => QuantifiedRhs::Array(Box::new(bind(expr))),
             },
         },
-        Expr::BoundColumn { .. }
+        Expr::InputRef { .. }
+        | Expr::BoundColumn { .. }
         | Expr::Literal(_)
         | Expr::CountStar
         | Expr::Exists { .. }

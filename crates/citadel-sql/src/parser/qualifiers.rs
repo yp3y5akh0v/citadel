@@ -393,6 +393,7 @@ impl Resolver {
                 }
             }
             Expr::Literal(_)
+            | Expr::InputRef { .. }
             | Expr::BoundColumn { .. }
             | Expr::Column(_)
             | Expr::CountStar

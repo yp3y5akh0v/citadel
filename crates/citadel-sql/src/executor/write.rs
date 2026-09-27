@@ -293,6 +293,7 @@ fn compiled_target_patch_safe(target: &CompiledTarget) -> bool {
 /// No wildcard arm on purpose: new Expr variants must be classified here.
 fn fast_lane_column_refs(expr: &Expr, out: &mut Vec<String>) -> bool {
     match expr {
+        Expr::InputRef { .. } => false,
         Expr::BoundColumn { .. }
         | Expr::Literal(_)
         | Expr::Parameter(_)
@@ -1575,6 +1576,7 @@ pub(super) fn exec_select_in_txn(
                 &outer,
                 rows,
                 table_schema.columns.clone(),
+                table_schema.columns.len(),
                 cancel,
                 &mut |sub| exec_subquery_write(wtx, schema, sub, ctes),
             );
@@ -1705,6 +1707,7 @@ fn exec_correlated_join_in_txn(
         exec_subquery_write(wtx, schema, sub, ctes)
     })?;
     let (rows, columns) = super::join_rows_in_txn(wtx, &stmt, &tables, None)?;
+    let row_width = columns.len();
     finish_captured_select(
         schema,
         ctes,
@@ -1712,6 +1715,7 @@ fn exec_correlated_join_in_txn(
         &outer,
         rows,
         columns,
+        row_width,
         cancel,
         &mut |sub| exec_subquery_write(wtx, schema, sub, ctes),
     )

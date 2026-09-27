@@ -522,6 +522,15 @@ pub enum Expr {
         value: Value,
         collation: Collation,
     },
+    /// Runtime reference to a value in the current execution row. Internal
+    /// results have positions, not SQL names, and never enter a stored schema.
+    /// `collation` retains an implicit column collation; None compares as a
+    /// scalar value without an implicit collation.
+    #[doc(hidden)]
+    InputRef {
+        index: usize,
+        collation: Option<Collation>,
+    },
     Column(String),
     QualifiedColumn {
         table: String,
@@ -1502,7 +1511,8 @@ pub(crate) fn visit_expr(expr: &Expr, visitor: &mut impl FnMut(&Expr)) {
                 QuantifiedRhs::Array(e) => visit_expr(e, visitor),
             }
         }
-        Expr::BoundColumn { .. }
+        Expr::InputRef { .. }
+        | Expr::BoundColumn { .. }
         | Expr::Literal(_)
         | Expr::Column(_)
         | Expr::QualifiedColumn { .. }
@@ -2725,6 +2735,7 @@ fn calls_outside_subqueries(expr: &Expr, windows: bool) -> bool {
         Expr::Exists { .. }
         | Expr::ScalarSubquery(_)
         | Expr::Literal(_)
+        | Expr::InputRef { .. }
         | Expr::BoundColumn { .. }
         | Expr::Column(_)
         | Expr::QualifiedColumn { .. }

@@ -2026,7 +2026,7 @@ impl TableSchema {
         let mut bound = false;
         let mut check = |expr: &Expr| {
             crate::parser::visit_expr(expr, &mut |node| {
-                bound |= matches!(node, Expr::BoundColumn { .. });
+                bound |= matches!(node, Expr::BoundColumn { .. } | Expr::InputRef { .. });
             })
         };
         for column in &self.columns {

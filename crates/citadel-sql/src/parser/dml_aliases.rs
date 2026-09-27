@@ -206,6 +206,7 @@ impl<'a> Lowerer<'a> {
             }
             Expr::Literal(_)
             | Expr::Column(_)
+            | Expr::InputRef { .. }
             | Expr::BoundColumn { .. }
             | Expr::CountStar
             | Expr::Parameter(_)

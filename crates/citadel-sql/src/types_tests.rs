@@ -1,6 +1,28 @@
 use super::*;
 
 #[test]
+fn runtime_input_slots_cannot_be_saved_as_schema_expressions() {
+    let mut column = col("id", DataType::Integer, false, 0);
+    column.default_sql = Some("1".into());
+    column.default_expr = Some(Expr::InputRef {
+        index: 0,
+        collation: None,
+    });
+    let schema = TableSchema::new(
+        "slots".into(),
+        vec![column],
+        vec![0],
+        vec![],
+        vec![],
+        vec![],
+    );
+    assert!(matches!(
+        schema.try_serialize(),
+        Err(crate::error::SqlError::InvalidValue(_))
+    ));
+}
+
+#[test]
 fn rebuilding_schema_caches_preserves_flags_and_dropped_slots() {
     let mut schema = TableSchema::new(
         "t".into(),

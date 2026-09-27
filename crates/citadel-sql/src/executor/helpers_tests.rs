@@ -3,6 +3,65 @@ use crate::eval::ColumnMap;
 use crate::parser::{BinOp, Expr, GeneratedKind, OrderByItem, SelectColumn};
 use crate::types::{Collation, ColumnDef, DataType, IndexDef, IndexKey, TableSchema, Value};
 
+#[test]
+fn input_slot_projection_moves_unique_values_checks_bounds_and_preserves_repeats() {
+    let columns = vec![col("visible", DataType::Integer)];
+    let slot = |index, name: &str| SelectColumn::Expr {
+        expr: Expr::InputRef {
+            index,
+            collation: None,
+        },
+        alias: Some(name.into()),
+    };
+    let token = citadel::CancelToken::new();
+    for cancel in [None, Some(&token)] {
+        let payload = crate::types::CompactString::from("long window value ".repeat(128));
+        let original_allocation = payload.as_ptr();
+        let (names, rows) = project_rows_with_cancel(
+            &columns,
+            &[slot(1, "window_value")],
+            vec![vec![Value::Integer(7), Value::Text(payload)]],
+            cancel,
+        )
+        .unwrap();
+        assert_eq!(names, ["window_value"]);
+        let Value::Text(text) = &rows[0][0] else {
+            panic!("expected text slot");
+        };
+        assert_eq!(
+            text.as_ptr(),
+            original_allocation,
+            "unique projection cloned the owned value"
+        );
+
+        let (_, repeated) = project_rows_with_cancel(
+            &columns,
+            &[slot(1, "first"), slot(1, "second")],
+            vec![vec![Value::Integer(7), Value::Text("kept twice".into())]],
+            cancel,
+        )
+        .unwrap();
+        assert_eq!(
+            repeated,
+            vec![vec![
+                Value::Text("kept twice".into()),
+                Value::Text("kept twice".into())
+            ]]
+        );
+        for index in [2, usize::MAX] {
+            assert!(matches!(
+                project_rows_with_cancel(
+                    &columns,
+                    &[slot(index, "invalid")],
+                    vec![vec![Value::Integer(7), Value::Null]],
+                    cancel,
+                ),
+                Err(SqlError::Plan(_))
+            ));
+        }
+    }
+}
+
 fn col(name: &str, dt: DataType) -> ColumnDef {
     ColumnDef {
         name: name.into(),

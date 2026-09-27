@@ -611,6 +611,7 @@ pub(super) fn exec_select_from_cte(
             super::OuterScope::single(&stmt.from, stmt.from_alias.as_deref(), &cte_schema.columns);
         if super::correlated::captures_outer_row(schema, ctes, stmt, &outer, cancel)? {
             let rows = super::clone_cte_rows_with_cancel(&cte.result.rows, cancel)?;
+            let row_width = cte_schema.columns.len();
             return super::finish_captured_select(
                 schema,
                 ctes,
@@ -618,6 +619,7 @@ pub(super) fn exec_select_from_cte(
                 &outer,
                 rows,
                 cte_schema.columns,
+                row_width,
                 cancel,
                 exec_sub,
             );

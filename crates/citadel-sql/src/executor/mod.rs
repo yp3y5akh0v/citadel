@@ -312,6 +312,9 @@ type ScanTableFn<'a> = &'a mut dyn FnMut(&str) -> Result<(TableSchema, Vec<Vec<V
 #[derive(Clone, Copy)]
 pub(super) struct SelectCtx<'a> {
     pub columns: &'a [ColumnDef],
+    /// Physical row width, including unnamed execution slots. `columns` is
+    /// always the visible SQL schema and is the only input to name resolution.
+    pub row_width: usize,
     pub stmt: &'a SelectStmt,
     /// The scan already applied the WHERE clause, so the filter phase is a
     /// no-op rather than a second evaluation of the same predicate.
@@ -329,6 +332,7 @@ impl<'a> SelectCtx<'a> {
     ) -> Self {
         Self {
             columns,
+            row_width: columns.len(),
             stmt,
             predicate_applied: false,
             cancel,
@@ -338,6 +342,11 @@ impl<'a> SelectCtx<'a> {
     /// Only the few paths whose scan already applied the WHERE clause set this.
     pub fn predicate_applied(mut self, applied: bool) -> Self {
         self.predicate_applied = applied;
+        self
+    }
+
+    pub fn row_width(mut self, width: usize) -> Self {
+        self.row_width = width;
         self
     }
 
@@ -994,7 +1003,10 @@ pub(super) fn exec_select_join_with_ctes(
     let mut stmt = stmt.clone();
     materialize_join_conditions(schema, ctes, &mut stmt, &outer, cancel, exec_sub)?;
     let (rows, columns) = sources.join(&stmt, cancel)?;
-    finish_captured_select(schema, ctes, stmt, &outer, rows, columns, cancel, exec_sub)
+    let row_width = columns.len();
+    finish_captured_select(
+        schema, ctes, stmt, &outer, rows, columns, row_width, cancel, exec_sub,
+    )
 }
 
 #[cfg(test)]
