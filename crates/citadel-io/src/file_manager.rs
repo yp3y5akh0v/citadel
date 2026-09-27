@@ -643,6 +643,9 @@ pub fn recover_with_v1_requirement(
         (false, false) => return Err(Error::DatabaseCorrupted),
     };
 
+    if chosen_slot.txn_id > TxnId::MAX_COMMITTED {
+        return Err(Error::DatabaseCorrupted);
+    }
     if chosen_slot.high_water_mark > 0 {
         if chosen_slot.tree_root.as_u32() > 0
             && chosen_slot.tree_root.as_u32() >= chosen_slot.high_water_mark
