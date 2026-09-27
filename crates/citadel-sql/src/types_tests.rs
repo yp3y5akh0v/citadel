@@ -92,6 +92,128 @@ fn value_ordering() {
 }
 
 #[test]
+fn sql_order_keeps_integers_exact_at_float_and_storage_boundaries() {
+    let integers = [
+        i64::MIN,
+        i64::MIN + 1,
+        -(1i64 << 53) - 1,
+        -(1i64 << 53),
+        -1,
+        0,
+        1,
+        1i64 << 53,
+        (1i64 << 53) + 1,
+        i64::MAX - 1,
+        i64::MAX,
+    ];
+    for left in integers {
+        for right in integers {
+            let expected = left.cmp(&right);
+            let a = Value::Integer(left);
+            let b = Value::Integer(right);
+            assert_eq!(a.sql_cmp(&b), expected, "{left} vs {right}");
+            for collation in [
+                Collation::Binary,
+                Collation::NoCase,
+                Collation::Rtrim,
+                Collation::IntervalLength,
+            ] {
+                assert_eq!(collation.cmp_value(&a, &b), expected);
+            }
+        }
+    }
+}
+
+#[test]
+fn sql_order_preserves_mixed_numbers_signed_zero_and_nan_behavior() {
+    let cases = [
+        (Value::Integer(0), Value::Real(-0.0), Ordering::Equal),
+        (Value::Real(-0.0), Value::Real(0.0), Ordering::Equal),
+        (Value::Integer(1), Value::Real(1.5), Ordering::Less),
+        (
+            Value::Integer(i64::MAX),
+            Value::Real(f64::INFINITY),
+            Ordering::Less,
+        ),
+        (
+            Value::Real(f64::NEG_INFINITY),
+            Value::Integer(i64::MIN),
+            Ordering::Less,
+        ),
+        // Mixed numeric comparisons retain their existing f64 promotion.
+        // Integer/integer comparisons above must not inherit its rounding.
+        (
+            Value::Integer((1i64 << 53) + 1),
+            Value::Real((1i64 << 53) as f64),
+            Ordering::Equal,
+        ),
+        (Value::Real(f64::NAN), Value::Integer(0), Ordering::Equal),
+        (
+            Value::Real(f64::from_bits(0xfff8_0000_0000_0001)),
+            Value::Real(f64::INFINITY),
+            Ordering::Equal,
+        ),
+        (Value::Null, Value::Integer(i64::MIN), Ordering::Less),
+        (Value::Boolean(true), Value::Integer(0), Ordering::Less),
+    ];
+    for (left, right, expected) in cases {
+        assert_eq!(left.sql_cmp(&right), expected, "{left:?} vs {right:?}");
+        assert_eq!(right.sql_cmp(&left), expected.reverse());
+        for collation in [Collation::Binary, Collation::NoCase, Collation::Rtrim] {
+            assert_eq!(collation.cmp_value(&left, &right), expected);
+            assert_eq!(collation.cmp_value(&right, &left), expected.reverse());
+        }
+    }
+}
+
+#[test]
+fn sql_order_keeps_interval_lengths_and_nested_array_collations() {
+    let interval = |months, days, micros| Value::Interval {
+        months,
+        days,
+        micros,
+    };
+    let cases = [
+        (interval(1, 0, 0), interval(0, 30, 0), Ordering::Equal),
+        (interval(-1, 0, 0), interval(0, -30, 0), Ordering::Equal),
+        (interval(0, 1, 1), interval(0, 1, 0), Ordering::Greater),
+        (
+            interval(i32::MIN, i32::MAX, i64::MAX),
+            interval(i32::MAX, i32::MIN, i64::MIN),
+            Ordering::Less,
+        ),
+    ];
+    for (left, right, expected) in cases {
+        assert_eq!(left.sql_cmp(&right), expected);
+        assert_eq!(right.sql_cmp(&left), expected.reverse());
+        // Array comparisons must recursively use interval length, even though
+        // Value's field-wise Ord deliberately distinguishes equal lengths.
+        let nested = |value| Value::Array(vec![Value::Array(vec![value].into())].into());
+        let left = nested(left);
+        let right = nested(right);
+        for collation in [Collation::Binary, Collation::NoCase, Collation::Rtrim] {
+            assert_eq!(collation.cmp_value(&left, &right), expected);
+        }
+    }
+    let array = |values: Vec<Value>| Value::Array(values.into());
+    assert_eq!(
+        array(vec![interval(1, 0, 0)]).sql_cmp(&array(vec![interval(0, 30, 0), Value::Null])),
+        Ordering::Less,
+    );
+    // Text collation applies to scalar text, not text nested inside arrays.
+    let upper = Value::Text("Z".into());
+    let lower = Value::Text("a".into());
+    assert_eq!(
+        Collation::NoCase.cmp_value(&upper, &lower),
+        Ordering::Greater
+    );
+    assert_eq!(
+        Collation::NoCase.cmp_value(&array(vec![upper]), &array(vec![lower])),
+        Ordering::Less,
+    );
+}
+
+#[test]
 fn value_numeric_mixed() {
     assert_eq!(Value::Integer(1), Value::Real(1.0));
     assert!(Value::Integer(1) < Value::Real(1.5));
