@@ -47,6 +47,14 @@ fn argon2id_time_cost_is_bounded_by_the_format() {
 }
 
 #[test]
+fn argon2id_parallelism_beyond_the_algorithm_is_an_error_not_a_panic() {
+    let salt = [0x42u8; ARGON2_SALT_SIZE];
+    for p_cost in [argon2::Params::MAX_P_COST + 1, 1 << 29, u32::MAX] {
+        assert!(derive_mk_argon2id(b"test", &salt, 64, 1, p_cost).is_err());
+    }
+}
+
+#[test]
 fn argon2id_memory_beyond_the_machine_is_an_error_not_an_abort() {
     fn out_of_memory<T>(result: citadel_core::Result<T>) -> bool {
         matches!(result, Err(citadel_core::Error::Io(e)) if e.kind() == io::ErrorKind::OutOfMemory)

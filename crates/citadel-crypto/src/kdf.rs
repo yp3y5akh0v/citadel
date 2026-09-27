@@ -28,6 +28,13 @@ pub fn derive_mk_argon2id(
             "Argon2 time cost too high: {t_cost} (maximum {ARGON2_MAX_T_COST})"
         )));
     }
+    // argon2 0.5 multiplies p_cost by 8 before bounding it, which overflows.
+    if p_cost > argon2::Params::MAX_P_COST {
+        return Err(invalid_input(format!(
+            "Argon2 parallelism too high: {p_cost} (maximum {})",
+            argon2::Params::MAX_P_COST
+        )));
+    }
     let params = argon2::Params::new(m_cost, t_cost, p_cost, Some(KEY_SIZE))
         .map_err(|e| invalid_input(e.to_string()))?;
     let mut memory = argon2_memory(params.block_count())?;
