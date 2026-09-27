@@ -323,7 +323,7 @@ impl InRows {
     /// `in_value` runs only when the subquery has rows for the key.
     fn passes(
         &self,
-        key: &[Value],
+        key: &mut Vec<Value>,
         negated: bool,
         cancel: Option<&citadel::CancelToken>,
         in_value: impl FnOnce() -> Result<Value>,
@@ -337,9 +337,13 @@ impl InRows {
         if in_value.is_null() {
             return Ok(false);
         }
-        let mut probe = key.to_vec();
-        probe.push(in_value);
-        if self.values.contains(&probe, cancel)? {
+        // The caller reuses this correlation key across rows. Appending the
+        // selected value avoids cloning every correlation value for the probe;
+        // restore the key even if comparison or cancellation returns an error.
+        key.push(in_value);
+        let found = self.values.contains(key, cancel);
+        key.pop();
+        if found? {
             return Ok(!negated);
         }
         Ok(negated && !self.nulls.contains(key, cancel)?)
@@ -1591,7 +1595,8 @@ pub(super) fn decorrelate_in_with_read(
         if value.is_null() {
             nulls.insert(key.clone());
         } else {
-            let mut with_value = key.clone();
+            let mut with_value = Vec::with_capacity(key.len() + 1);
+            with_value.extend_from_slice(&key);
             with_value.push(value.clone());
             selected.insert(with_value);
         }
@@ -1970,6 +1975,17 @@ pub(super) fn build_and_scan_correlated_with_read(
     let mut scan_err: Option<SqlError> = None;
 
     let mut col_vals: Vec<(usize, Value)> = Vec::with_capacity(needed_raw.len());
+    let key_capacity = exists_filters
+        .iter()
+        .map(|filter| filter.outer_col_indices.len())
+        .chain(
+            in_filters
+                .iter()
+                .map(|filter| filter.outer_col_indices.len()),
+        )
+        .max()
+        .unwrap_or(0);
+    let mut corr_key = Vec::with_capacity(key_capacity + usize::from(!in_filters.is_empty()));
 
     rtx.table_scan_raw(lower.as_bytes(), |key, value| {
         // Extract only the correlation columns from raw bytes (fast partial decode)
@@ -1989,24 +2005,24 @@ pub(super) fn build_and_scan_correlated_with_read(
         let mut decoded_row: Option<Vec<Value>> = None;
         let passes = (|| -> Result<bool> {
             for ef in &exists_filters {
-                let outer_key = partial_values(&col_vals, &ef.outer_col_indices);
+                partial_values_into(&col_vals, &ef.outer_col_indices, &mut corr_key);
                 let found = if ef.result.reads_outer_row() {
-                    let candidates = ef.result.rows.matching(&outer_key, cancel)?;
+                    let candidates = ef.result.rows.matching(&corr_key, cancel)?;
                     !candidates.is_empty() && {
                         let row = decode_once(&mut decoded_row, outer_schema, key, value, cancel)?;
                         ef.result
                             .satisfied_by(&candidates, row, &outer_col_map, ctx, cancel)?
                     }
                 } else {
-                    ef.result.rows.contains(&outer_key, cancel)?
+                    ef.result.rows.contains(&corr_key, cancel)?
                 };
                 if ef.negated == found {
                     return Ok(false);
                 }
             }
             for inf in &in_filters {
-                let corr_key = partial_values(&col_vals, &inf.outer_col_indices);
-                let passes = inf.rows.passes(&corr_key, inf.negated, cancel, || {
+                partial_values_into(&col_vals, &inf.outer_col_indices, &mut corr_key);
+                let passes = inf.rows.passes(&mut corr_key, inf.negated, cancel, || {
                     let row = decode_once(&mut decoded_row, outer_schema, key, value, cancel)?;
                     eval_expr(
                         &inf.in_expr,
@@ -2111,18 +2127,16 @@ fn extract_raw_value(
 }
 
 /// The values at `columns` of a row decoded only at its correlation columns.
-fn partial_values(decoded: &[(usize, Value)], columns: &[usize]) -> Vec<Value> {
-    columns
-        .iter()
-        .map(|&column| {
-            decoded
-                .iter()
-                .find(|(index, _)| *index == column)
-                .unwrap()
-                .1
-                .clone()
-        })
-        .collect()
+fn partial_values_into(decoded: &[(usize, Value)], columns: &[usize], key: &mut Vec<Value>) {
+    key.clear();
+    key.extend(columns.iter().map(|&column| {
+        decoded
+            .iter()
+            .find(|(index, _)| *index == column)
+            .unwrap()
+            .1
+            .clone()
+    }));
 }
 
 /// The whole row at `key`/`value`, decoded on first use.
@@ -2260,9 +2274,11 @@ pub(super) fn handle_correlated_where_with_read(
                     let outer_col_indices: Vec<usize> =
                         corr_pairs.iter().map(|p| p.outer_col_idx).collect();
                     let is_negated = *negated;
+                    let mut key = Vec::with_capacity(outer_col_indices.len() + 1);
                     retain_cancellable(rows, cancel, |row| {
-                        let key = values_at(row, &outer_col_indices);
-                        in_rows.passes(&key, is_negated, cancel, || {
+                        key.clear();
+                        key.extend(outer_col_indices.iter().map(|&column| row[column].clone()));
+                        in_rows.passes(&mut key, is_negated, cancel, || {
                             eval_expr(in_expr, &EvalCtx::new(&col_map, row).with_cancel(cancel))
                         })
                     })?;
