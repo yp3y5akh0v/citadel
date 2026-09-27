@@ -241,6 +241,24 @@ fn c_string_for_ffi(text: String) -> CString {
     CString::new(text.replace('\0', "\\0")).expect("embedded NULs were escaped")
 }
 
+/// Hand a value to C, which frees it with `citadel_free_bytes`; `None` is NULL.
+///
+/// # Safety
+/// `out_val` and `out_val_len` must be valid for writes.
+unsafe fn write_value(value: Option<Vec<u8>>, out_val: *mut *mut u8, out_val_len: *mut usize) {
+    let (ptr, len) = match value {
+        Some(value) => {
+            let len = value.len();
+            (Box::into_raw(value.into_boxed_slice()).cast::<u8>(), len)
+        }
+        None => (ptr::null_mut(), 0),
+    };
+    unsafe {
+        *out_val = ptr;
+        *out_val_len = len;
+    }
+}
+
 fn prepare_sql_rows_for_ffi(mut rows: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
     for value in rows.iter_mut().flatten() {
         if let Value::Text(text) = value {
@@ -662,22 +680,8 @@ pub extern "C" fn citadel_read_get(
         let key_slice = unsafe { slice::from_raw_parts(key, key_len) };
 
         match txn_ref.txn.get(key_slice) {
-            Ok(Some(val)) => {
-                let mut boxed = val.into_boxed_slice();
-                let len = boxed.len();
-                let ptr = boxed.as_mut_ptr();
-                std::mem::forget(boxed);
-                unsafe {
-                    *out_val = ptr;
-                    *out_val_len = len;
-                }
-                CitadelError::Ok
-            }
-            Ok(None) => {
-                unsafe {
-                    *out_val = ptr::null_mut();
-                    *out_val_len = 0;
-                }
+            Ok(value) => {
+                unsafe { write_value(value, out_val, out_val_len) };
                 CitadelError::Ok
             }
             Err(e) => map_core_error(e),
@@ -712,22 +716,8 @@ pub extern "C" fn citadel_read_table_get(
         let key_slice = unsafe { slice::from_raw_parts(key, key_len) };
 
         match txn_ref.txn.table_get(table_slice, key_slice) {
-            Ok(Some(val)) => {
-                let mut boxed = val.into_boxed_slice();
-                let len = boxed.len();
-                let ptr = boxed.as_mut_ptr();
-                std::mem::forget(boxed);
-                unsafe {
-                    *out_val = ptr;
-                    *out_val_len = len;
-                }
-                CitadelError::Ok
-            }
-            Ok(None) => {
-                unsafe {
-                    *out_val = ptr::null_mut();
-                    *out_val_len = 0;
-                }
+            Ok(value) => {
+                unsafe { write_value(value, out_val, out_val_len) };
                 CitadelError::Ok
             }
             Err(e) => map_core_error(e),
@@ -923,22 +913,8 @@ pub extern "C" fn citadel_write_get(
         let key_slice = unsafe { slice::from_raw_parts(key, key_len) };
 
         match inner.get(key_slice) {
-            Ok(Some(val)) => {
-                let mut boxed = val.into_boxed_slice();
-                let len = boxed.len();
-                let ptr = boxed.as_mut_ptr();
-                std::mem::forget(boxed);
-                unsafe {
-                    *out_val = ptr;
-                    *out_val_len = len;
-                }
-                CitadelError::Ok
-            }
-            Ok(None) => {
-                unsafe {
-                    *out_val = ptr::null_mut();
-                    *out_val_len = 0;
-                }
+            Ok(value) => {
+                unsafe { write_value(value, out_val, out_val_len) };
                 CitadelError::Ok
             }
             Err(e) => map_core_error(e),
@@ -1126,22 +1102,8 @@ pub extern "C" fn citadel_write_table_get(
         let key_slice = unsafe { slice::from_raw_parts(key, key_len) };
 
         match inner.table_get(table_slice, key_slice) {
-            Ok(Some(val)) => {
-                let mut boxed = val.into_boxed_slice();
-                let len = boxed.len();
-                let ptr = boxed.as_mut_ptr();
-                std::mem::forget(boxed);
-                unsafe {
-                    *out_val = ptr;
-                    *out_val_len = len;
-                }
-                CitadelError::Ok
-            }
-            Ok(None) => {
-                unsafe {
-                    *out_val = ptr::null_mut();
-                    *out_val_len = 0;
-                }
+            Ok(value) => {
+                unsafe { write_value(value, out_val, out_val_len) };
                 CitadelError::Ok
             }
             Err(e) => map_core_error(e),
