@@ -31,7 +31,7 @@ fn exhaustion_after_cow_rejects_commit_and_savepoint_restores_the_writer() {
         seed.commit().unwrap();
 
         let mut writer = mgr.begin_write().unwrap();
-        let saved = writer.begin_savepoint();
+        let saved = writer.begin_savepoint().unwrap();
         writer.alloc = PageAllocator::new(u32::MAX - 1);
         assert!(matches!(
             writer.table_insert(b"t", &next.to_be_bytes(), &value),
@@ -41,7 +41,7 @@ fn exhaustion_after_cow_rejects_commit_and_savepoint_restores_the_writer() {
         assert!(writer.is_poisoned());
         assert!(writer.pages.get_page(&PageId::INVALID).is_none());
         if restore {
-            writer.restore_snapshot(saved);
+            writer.restore_snapshot(saved).unwrap();
             assert!(!writer.is_poisoned());
             assert!(writer.pages.get_page(&PageId(u32::MAX - 1)).is_none());
             writer
@@ -86,7 +86,7 @@ fn truncate_exhaustion_after_retirement_poisoning_can_be_rolled_back() {
     seed.commit().unwrap();
 
     let mut writer = mgr.begin_write().unwrap();
-    let saved = writer.begin_savepoint();
+    let saved = writer.begin_savepoint().unwrap();
     writer.alloc = PageAllocator::new(u32::MAX);
     assert!(matches!(
         writer.table_truncate(b"t"),
@@ -94,7 +94,7 @@ fn truncate_exhaustion_after_retirement_poisoning_can_be_rolled_back() {
     ));
     assert!(writer.alloc.freed_count() > 0);
     assert!(writer.is_poisoned());
-    writer.restore_snapshot(saved);
+    writer.restore_snapshot(saved).unwrap();
     assert_eq!(writer.alloc.freed_count(), 0);
     assert!(!writer.is_poisoned());
     assert_eq!(
@@ -117,7 +117,7 @@ fn overflow_exhaustion_after_partial_allocation_requires_rollback() {
         let mgr = create_test_manager();
         let mut writer = mgr.begin_write().unwrap();
         writer.set_cancel(cancel);
-        let saved = writer.begin_savepoint();
+        let saved = writer.begin_savepoint().unwrap();
         writer.alloc = PageAllocator::new(u32::MAX - 1);
         let value = vec![0x5a; citadel_page::overflow::OVERFLOW_DATA_CAPACITY + 1];
         assert!(matches!(
@@ -127,7 +127,7 @@ fn overflow_exhaustion_after_partial_allocation_requires_rollback() {
         assert_eq!(writer.alloc.allocated_this_txn(), &[PageId(u32::MAX - 1)]);
         assert!(writer.pages.get_page(&PageId(u32::MAX - 1)).is_none());
         assert!(writer.is_poisoned());
-        writer.restore_snapshot(saved);
+        writer.restore_snapshot(saved).unwrap();
         assert!(!writer.is_poisoned());
         writer.insert(b"key", &value).unwrap();
         writer.commit().unwrap();
@@ -328,11 +328,11 @@ fn exercise_deep_delete(named: bool) {
     let manager = TxnManager::open(Box::new(io.share()), dek, mac_key, 1, 32).unwrap();
     let mut old_reader = manager.begin_read();
     let mut writer = manager.begin_write().unwrap();
-    let checkpoint = writer.begin_savepoint();
+    let checkpoint = writer.begin_savepoint().unwrap();
     assert!(delete(&mut writer, &key(0)).unwrap());
     assert!(writer.pending_free_count() > 0);
     assert_eq!(get(&mut writer, &key(0)).unwrap(), None);
-    writer.restore_snapshot(checkpoint);
+    writer.restore_snapshot(checkpoint).unwrap();
     assert_eq!(get(&mut writer, &key(0)).unwrap(), Some(value(0)));
     // Alternate distant leaves, then drain every leaf and collapse the tree.
     for index in (0..ROWS / 2).flat_map(|i| [i, ROWS - 1 - i]) {
@@ -388,14 +388,14 @@ fn snapshot_and_restore_main_tree() {
 
     wtx.insert(b"a", b"1").unwrap();
     wtx.insert(b"b", b"2").unwrap();
-    let snap = wtx.begin_savepoint();
+    let snap = wtx.begin_savepoint().unwrap();
 
     wtx.insert(b"c", b"3").unwrap();
     wtx.delete(b"a").unwrap();
     assert_eq!(wtx.get(b"c").unwrap(), Some(b"3".to_vec()));
     assert_eq!(wtx.get(b"a").unwrap(), None);
 
-    wtx.restore_snapshot(snap);
+    wtx.restore_snapshot(snap).unwrap();
 
     assert_eq!(wtx.get(b"a").unwrap(), Some(b"1".to_vec()));
     assert_eq!(wtx.get(b"b").unwrap(), Some(b"2".to_vec()));
@@ -414,12 +414,12 @@ fn snapshot_reusable_across_multiple_restores() {
     let mut wtx = mgr.begin_write().unwrap();
 
     wtx.insert(b"base", b"v").unwrap();
-    let snap = wtx.begin_savepoint();
+    let snap = wtx.begin_savepoint().unwrap();
 
     for i in 0..5 {
         let k = format!("k{i}");
         wtx.insert(k.as_bytes(), b"x").unwrap();
-        wtx.restore_snapshot(snap.clone());
+        wtx.restore_snapshot(snap.clone()).unwrap();
         assert_eq!(wtx.get(k.as_bytes()).unwrap(), None);
     }
     assert_eq!(wtx.get(b"base").unwrap(), Some(b"v".to_vec()));
@@ -432,13 +432,13 @@ fn snapshot_restores_named_tables() {
 
     wtx.create_table(b"t1").unwrap();
     wtx.table_insert(b"t1", b"k1", b"v1").unwrap();
-    let snap = wtx.begin_savepoint();
+    let snap = wtx.begin_savepoint().unwrap();
 
     wtx.create_table(b"t2").unwrap();
     wtx.table_insert(b"t1", b"k2", b"v2").unwrap();
     wtx.table_insert(b"t2", b"k", b"v").unwrap();
 
-    wtx.restore_snapshot(snap);
+    wtx.restore_snapshot(snap).unwrap();
 
     assert_eq!(wtx.table_get(b"t1", b"k1").unwrap(), Some(b"v1".to_vec()));
     assert_eq!(wtx.table_get(b"t1", b"k2").unwrap(), None);
@@ -457,14 +457,14 @@ fn snapshot_drops_post_snapshot_pages() {
     }
     let pre_pages: std::collections::HashSet<PageId> =
         wtx.pages.iter().map(|(id, _)| id).copied().collect();
-    let snap = wtx.begin_savepoint();
+    let snap = wtx.begin_savepoint().unwrap();
 
     for i in 20..200u32 {
         let k = format!("k{i:03}");
         wtx.insert(k.as_bytes(), b"x").unwrap();
     }
 
-    wtx.restore_snapshot(snap);
+    wtx.restore_snapshot(snap).unwrap();
     for &page_id in wtx.pages.iter().map(|(id, _)| id) {
         assert!(
             pre_pages.contains(&page_id),
@@ -479,17 +479,17 @@ fn nested_savepoints_rollback_inner() {
     let mut wtx = mgr.begin_write().unwrap();
 
     wtx.insert(b"a", b"1").unwrap();
-    let outer = wtx.begin_savepoint();
+    let outer = wtx.begin_savepoint().unwrap();
     wtx.insert(b"b", b"2").unwrap();
-    let inner = wtx.begin_savepoint();
+    let inner = wtx.begin_savepoint().unwrap();
     wtx.insert(b"c", b"3").unwrap();
 
-    wtx.restore_snapshot(inner);
+    wtx.restore_snapshot(inner).unwrap();
     assert_eq!(wtx.get(b"a").unwrap(), Some(b"1".to_vec()));
     assert_eq!(wtx.get(b"b").unwrap(), Some(b"2".to_vec()));
     assert_eq!(wtx.get(b"c").unwrap(), None);
 
-    wtx.restore_snapshot(outer);
+    wtx.restore_snapshot(outer).unwrap();
     assert_eq!(wtx.get(b"a").unwrap(), Some(b"1".to_vec()));
     assert_eq!(wtx.get(b"b").unwrap(), None);
 }
@@ -500,7 +500,7 @@ fn base_txn_id_stays_fixed_across_savepoints() {
     let mut wtx = mgr.begin_write().unwrap();
     let base = wtx.base_txn_id();
     assert_eq!(wtx.txn_id, base);
-    let _snap = wtx.begin_savepoint();
+    let _snap = wtx.begin_savepoint().unwrap();
     assert!(wtx.txn_id.as_u64() > base.as_u64());
     assert_eq!(wtx.base_txn_id(), base);
 }
@@ -1605,12 +1605,12 @@ fn exercise_callback_split_overflow_and_savepoint(route: CallbackWriteRoute) {
         super::WriteTxn::descend_to_leaf(&mut writer.pages, &manager, root, &key(9)).unwrap();
     assert_ne!(first, tenth, "callback growth must actually split the leaf");
 
-    let checkpoint = writer.begin_savepoint();
+    let checkpoint = writer.begin_savepoint().unwrap();
     replace_existing(&mut writer, &key(0), &grown, &overflow, route);
     assert!(writer
         .table_insert_if_absent(b"deep", &key(ROWS), b"speculative")
         .unwrap());
-    writer.restore_snapshot(checkpoint);
+    writer.restore_snapshot(checkpoint).unwrap();
     assert_eq!(
         writer.table_get(b"deep", &key(0)).unwrap(),
         Some(grown.clone())
@@ -2081,7 +2081,7 @@ fn update_with_buffer_reuses_bytes_after_failure_missing_key_and_savepoint_resto
         Some(())
     );
     writer.set_read_budget(None);
-    let checkpoint = writer.begin_savepoint();
+    let checkpoint = writer.begin_savepoint().unwrap();
 
     for panic in [false, true] {
         let marker = writer.mutation_marker();
@@ -2152,7 +2152,7 @@ fn update_with_buffer_reuses_bytes_after_failure_missing_key_and_savepoint_resto
         })
         .unwrap();
     writer.set_read_budget(None);
-    writer.restore_snapshot(checkpoint);
+    writer.restore_snapshot(checkpoint).unwrap();
     writer
         .table_update_with_buffer::<_, (), Error>(b"buffered", b"b", &mut buffer, |value| {
             assert_eq!(value.as_ptr(), allocation);
@@ -2446,7 +2446,7 @@ mod eager_inline_append {
             let mut old = manager.begin_read();
             let mut writer = manager.begin_write().unwrap();
             assert!(insert(&mut writer, route, &32u32.to_be_bytes(), &value).unwrap());
-            let savepoint = writer.begin_savepoint();
+            let savepoint = writer.begin_savepoint().unwrap();
             for id in 33..96u32 {
                 assert!(insert(&mut writer, route, &id.to_be_bytes(), &value).unwrap());
             }
@@ -2463,7 +2463,7 @@ mod eager_inline_append {
                     Some(expected)
                 );
             }
-            writer.restore_snapshot(savepoint);
+            writer.restore_snapshot(savepoint).unwrap();
             assert!(insert(&mut writer, route, &33u32.to_be_bytes(), b"retained").unwrap());
             assert_eq!(get(&mut writer, route, &95u32.to_be_bytes()).unwrap(), None);
             assert_eq!(
@@ -2558,7 +2558,7 @@ fn buffered_owned_upsert_reuses_inline_bytes_and_refreshes_after_restore() {
     ));
     assert_eq!(buffer.as_ptr(), allocation);
     writer.set_read_budget(None);
-    let checkpoint = writer.begin_savepoint();
+    let checkpoint = writer.begin_savepoint().unwrap();
     assert!(matches!(
         writer
             .table_upsert_with_owned_buffer::<_, Error>(
@@ -2572,7 +2572,7 @@ fn buffered_owned_upsert_reuses_inline_bytes_and_refreshes_after_restore() {
         UpsertOutcome::Inserted
     ));
     assert_eq!(buffer.as_ptr(), allocation);
-    writer.restore_snapshot(checkpoint);
+    writer.restore_snapshot(checkpoint).unwrap();
     writer
         .table_upsert_with_owned_buffer::<_, Error>(
             b"buffered_upsert",
@@ -2819,7 +2819,7 @@ mod shared_write_scan {
         changed[2].1 = b"changed".to_vec();
         changed.remove(3);
         changed.push((40u32.to_be_bytes().to_vec(), b"new".to_vec()));
-        let savepoint = writer.begin_savepoint();
+        let savepoint = writer.begin_savepoint().unwrap();
         writer
             .table_insert(b"scan", &16u32.to_be_bytes(), b"shrunk")
             .unwrap();
@@ -2836,7 +2836,7 @@ mod shared_write_scan {
         let owned_count = writer.pages.len();
         assert_eq!(rows(&mut writer), speculative);
         assert_eq!(writer.pages.len(), owned_count);
-        writer.restore_snapshot(savepoint);
+        writer.restore_snapshot(savepoint).unwrap();
         assert_eq!(rows(&mut writer), changed);
         writer.commit().unwrap();
         let mut old_rows = Vec::new();
@@ -2988,7 +2988,7 @@ fn unique_writer_page_still_cows_after_reused_savepoint() {
         Arc::strong_count(writer.pages.get_shared(&original_root).unwrap()),
         1
     );
-    let savepoint = writer.begin_savepoint();
+    let savepoint = writer.begin_savepoint().unwrap();
     for replacement in [b"after-one".as_slice(), b"after-two"] {
         writer
             .table_insert(b"versions", b"key", replacement)
@@ -2999,7 +2999,7 @@ fn unique_writer_page_still_cows_after_reused_savepoint() {
             Arc::as_ptr(writer.pages.get_shared(&original_root).unwrap()),
             original_pointer
         );
-        writer.restore_snapshot(savepoint.clone());
+        writer.restore_snapshot(savepoint.clone()).unwrap();
         assert!(writer.pages.get_page(&replaced_root).is_none());
         assert_eq!(
             writer.table_get(b"versions", b"key").unwrap().as_deref(),
@@ -3095,12 +3095,12 @@ fn index_inserts_preserve_unchanged_owned_branches_savepoints_and_full_merkle() 
                 "unchanged current branch was cloned during mutable acquisition"
             );
         }
-        let saved = writer.begin_savepoint();
+        let saved = writer.begin_savepoint().unwrap();
         assert!(!writer
             .table_insert_index(b"index", &key(2), &changed)
             .unwrap());
         assert_ne!(writer.named_trees[b"index".as_slice()].root, root);
-        writer.restore_snapshot(saved);
+        writer.restore_snapshot(saved).unwrap();
         assert_eq!(writer.named_trees[b"index".as_slice()].root, root);
         assert_eq!(
             writer.table_get(b"index", &key(2)).unwrap(),
@@ -3203,7 +3203,7 @@ fn vacant_index_inserts_preserve_overflow_savepoint_snapshot_and_reopen() {
         let old_bytes = old_page.as_bytes().to_vec();
         let mut old_reader = manager.begin_read();
         let mut writer = manager.begin_write().unwrap();
-        let checkpoint = writer.begin_savepoint();
+        let checkpoint = writer.begin_savepoint().unwrap();
         assert!(writer
             .table_insert_index(b"index", &key(1), &overflow)
             .unwrap());
@@ -3211,7 +3211,7 @@ fn vacant_index_inserts_preserve_overflow_savepoint_snapshot_and_reopen() {
             writer.table_get(b"index", &key(1)).unwrap().as_deref(),
             Some(overflow.as_slice())
         );
-        writer.restore_snapshot(checkpoint);
+        writer.restore_snapshot(checkpoint).unwrap();
         assert_eq!(writer.table_get(b"index", &key(1)).unwrap(), None);
         assert_eq!(writer.table_entry_count(b"index").unwrap(), 384);
 

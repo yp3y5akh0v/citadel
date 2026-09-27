@@ -132,6 +132,7 @@ fn core_category(e: &CoreError) -> Category {
         | CoreError::PageOutOfBounds(_)
         | CoreError::BufferPoolFull
         | CoreError::PageIdExhausted
+        | CoreError::TxnIdExhausted
         | CoreError::Io(_)
         | CoreError::AuditFailureAfterOperation { .. }
         | CoreError::DurabilityFailureAfterOperation { .. }
@@ -489,6 +490,14 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn transaction_id_exhaustion_is_an_operational_error() {
+        assert!(matches!(
+            core_category(&CoreError::TxnIdExhausted),
+            Category::Operational
+        ));
+    }
 
     #[test]
     fn recovered_provider_failures_preserve_fields_and_dispatch_classification() {

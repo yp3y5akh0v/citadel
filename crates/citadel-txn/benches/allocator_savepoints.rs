@@ -158,9 +158,9 @@ fn smoke_test() {
         manager.begin_write().unwrap().commit().unwrap();
         let mut writer = manager.begin_write().unwrap();
         for index in 0usize..8 {
-            let snapshot = writer.begin_savepoint();
+            let snapshot = writer.begin_savepoint().unwrap();
             writer.insert(b"anchor", &index.to_le_bytes()).unwrap();
-            writer.restore_snapshot(snapshot);
+            writer.restore_snapshot(snapshot).unwrap();
             assert_eq!(
                 writer.get(b"anchor").unwrap().as_deref(),
                 Some(b"original".as_slice())
@@ -222,9 +222,9 @@ fn main() {
             50_000,
             started,
             |index| {
-                let snapshot = writer.begin_savepoint();
+                let snapshot = writer.begin_savepoint().unwrap();
                 writer.insert(b"anchor", &index.to_le_bytes()).unwrap();
-                writer.restore_snapshot(snapshot);
+                writer.restore_snapshot(snapshot).unwrap();
             },
         );
         assert_eq!(

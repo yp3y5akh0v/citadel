@@ -22,6 +22,9 @@ pub enum Error {
     #[error("database page ID space is exhausted")]
     PageIdExhausted,
 
+    #[error("database transaction ID space is exhausted")]
+    TxnIdExhausted,
+
     #[error("database file is corrupted")]
     DatabaseCorrupted,
 

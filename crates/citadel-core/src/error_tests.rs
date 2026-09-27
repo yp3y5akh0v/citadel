@@ -17,6 +17,14 @@ fn error_from_io() {
 }
 
 #[test]
+fn transaction_id_exhaustion_reports_the_exhausted_resource() {
+    assert_eq!(
+        Error::TxnIdExhausted.to_string(),
+        "database transaction ID space is exhausted"
+    );
+}
+
+#[test]
 fn post_operation_audit_error_preserves_the_outcome_and_source() {
     let error = Error::AuditFailureAfterOperation {
         operation: "passphrase change",

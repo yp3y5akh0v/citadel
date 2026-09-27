@@ -1523,7 +1523,7 @@ impl<'a> ConnectionInner<'a> {
             // closure runs. A refused prepared mutation must not advance
             // the write transaction just because a savepoint is pending.
             if !conn.savepoint_stack.is_empty() && executor::stmt_mutates(stmt) {
-                conn.capture_pending_snapshots();
+                conn.capture_pending_snapshots()?;
             }
             // Fast collection proves that all projected and hidden expressions
             // are independent of the session scope, just like streaming.
@@ -1843,7 +1843,7 @@ impl<'a> ConnectionInner<'a> {
                     return Err(SqlError::TableAlreadyExists(user_name));
                 }
                 if self.active_txn.as_write_mut().is_some() {
-                    self.capture_pending_snapshots();
+                    self.capture_pending_snapshots()?;
                 }
                 let mut clone = ct.clone();
                 clone.name = prefixed.clone();
@@ -1865,7 +1865,7 @@ impl<'a> ConnectionInner<'a> {
                 Ok(outcome)
             }
             Statement::Insert(ins) if self.active_txn.as_write_mut().is_some() => {
-                self.capture_pending_snapshots();
+                self.capture_pending_snapshots()?;
                 let wtx = self.active_txn.as_write_mut().unwrap();
                 executor::exec_insert_in_admitted_txn(wtx, &self.schema, ins, params)
             }
@@ -1876,7 +1876,7 @@ impl<'a> ConnectionInner<'a> {
                     ));
                 }
                 if self.active_txn.as_write_mut().is_some() && executor::stmt_mutates(stmt) {
-                    self.capture_pending_snapshots();
+                    self.capture_pending_snapshots()?;
                 }
                 let outcome = match &mut self.active_txn {
                     ActiveTxn::Write(wtx) => {
@@ -1920,20 +1920,20 @@ impl<'a> ConnectionInner<'a> {
         Ok(ExecutionResult::Ok)
     }
 
-    fn capture_pending_snapshots(&mut self) {
+    fn capture_pending_snapshots(&mut self) -> Result<()> {
         let last_pending = match self
             .savepoint_stack
             .iter()
             .rposition(|e| e.snapshot.is_none())
         {
             Some(i) => i,
-            None => return,
+            None => return Ok(()),
         };
         let wtx = match self.active_txn.as_write_mut() {
             Some(w) => w,
-            None => return,
+            None => return Ok(()),
         };
-        let wtx_snap = wtx.begin_savepoint();
+        let wtx_snap = wtx.begin_savepoint()?;
         let schema_snap = self.schema.save_snapshot();
         let temp_table_names_len = self.temp_table_names.len();
 
@@ -1951,6 +1951,7 @@ impl<'a> ConnectionInner<'a> {
             schema_snap,
             temp_table_names_len,
         });
+        Ok(())
     }
 
     fn do_release(&mut self, name: &str) -> Result<ExecutionResult> {
@@ -1979,26 +1980,24 @@ impl<'a> ConnectionInner<'a> {
             .rposition(|e| e.name == name)
             .ok_or_else(|| SqlError::SavepointNotFound(name.to_string()))?;
 
+        let snapshot = self.savepoint_stack[idx].snapshot.take();
+        if let Some(snapshot) = snapshot {
+            let wtx = match self.active_txn.as_write_mut() {
+                Some(w) => w,
+                None => return Err(SqlError::NoActiveTransaction),
+            };
+            wtx.restore_snapshot(snapshot.wtx_snap)?;
+            self.schema.restore_snapshot(snapshot.schema_snap);
+            self.temp_table_names
+                .truncate(snapshot.temp_table_names_len);
+        }
+
         self.savepoint_stack.truncate(idx + 1);
         let entry = self.savepoint_stack.last_mut().unwrap();
-        let snapshot = entry.snapshot.take();
         self.session_timezone = entry.timezone.clone();
         if let Some(transaction) = &mut self.transaction_timezone {
             transaction.after_commit = entry.timezone_after_commit.clone();
         }
-        let Some(snapshot) = snapshot else {
-            return Ok(ExecutionResult::Ok);
-        };
-
-        let wtx = match self.active_txn.as_write_mut() {
-            Some(w) => w,
-            None => return Err(SqlError::NoActiveTransaction),
-        };
-        wtx.restore_snapshot(snapshot.wtx_snap);
-        self.schema.restore_snapshot(snapshot.schema_snap);
-        self.temp_table_names
-            .truncate(snapshot.temp_table_names_len);
-
         Ok(ExecutionResult::Ok)
     }
 }

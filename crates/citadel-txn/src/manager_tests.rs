@@ -1643,9 +1643,9 @@ fn secure_delete_defers_newest_retirements_until_both_slots_release_them() {
         manager.begin_write().unwrap().commit().unwrap();
         let mut writer = manager.begin_write().unwrap();
         writer.insert(b"key", b"replacement").unwrap();
-        let checkpoint = writer.begin_savepoint();
+        let checkpoint = writer.begin_savepoint().unwrap();
         writer.insert(b"key", b"speculative").unwrap();
-        writer.restore_snapshot(checkpoint);
+        writer.restore_snapshot(checkpoint).unwrap();
         writer.commit().unwrap();
         let retired_at = manager.current_slot().txn_id;
         assert!(retired_at.as_u64() > original.txn_id.as_u64() + 1);
@@ -1738,10 +1738,10 @@ fn consuming_pending_head_preserves_aborted_and_restored_loans() {
     assert_eq!(manager.state.lock().reclaimed_pages, loan);
 
     let mut writer = manager.begin_write().unwrap();
-    let snapshot = writer.begin_savepoint();
+    let snapshot = writer.begin_savepoint().unwrap();
     for _ in 0..2 {
         writer.insert(b"key", &discarded).unwrap();
-        writer.restore_snapshot(snapshot.clone());
+        writer.restore_snapshot(snapshot.clone()).unwrap();
         assert_eq!(writer.pending_free_count(), 0);
         assert_eq!(
             writer.get(b"key").unwrap().as_deref(),
@@ -2408,10 +2408,10 @@ fn repeated_savepoint_rollback_preserves_the_reclaimed_loan_and_reader() {
     let before = manager.current_slot();
     let mut reader = manager.begin_read();
     let mut writer = manager.begin_write().unwrap();
-    let snapshot = writer.begin_savepoint();
+    let snapshot = writer.begin_savepoint().unwrap();
     for byte in 0..8 {
         writer.insert(b"key", &vec![byte; 128 * 1024]).unwrap();
-        writer.restore_snapshot(snapshot.clone());
+        writer.restore_snapshot(snapshot.clone()).unwrap();
         assert_eq!(
             writer.get(b"key").unwrap().as_deref(),
             Some(b"original".as_slice())
@@ -3878,6 +3878,9 @@ mod retry_tests;
 
 #[path = "manager_power_loss_tests.rs"]
 mod power_loss_tests;
+
+#[path = "manager_id_tests.rs"]
+mod transaction_id_tests;
 
 #[path = "manager_file_fuzz_tests.rs"]
 mod file_fuzz_tests;
