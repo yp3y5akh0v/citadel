@@ -337,7 +337,8 @@ fn datetime_to_micros(dt: &Bound<'_, PyDateTime>) -> PyResult<i64> {
         dt.get_microsecond(),
     )
     .ok_or_else(|| PyValueError::new_err("datetime out of range"))?;
-    let mut micros = datetime::ts_combine(days, time);
+    let mut micros = datetime::ts_combine(days, time)
+        .map_err(|_| PyValueError::new_err("datetime out of range"))?;
     let offset = dt.call_method0("utcoffset")?;
     if !offset.is_none() {
         let td = offset

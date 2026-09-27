@@ -121,9 +121,20 @@ pub fn ts_split(micros: i64) -> (i32, i64) {
     (days as i32, rem)
 }
 
-/// Combine i32 date-days and i64 µs-of-day into µs-since-1970-UTC.
-pub fn ts_combine(date_days: i32, time_micros: i64) -> i64 {
-    (date_days as i64) * MICROS_PER_DAY + time_micros
+/// Combine date-days and µs-of-day into a finite timestamp in µs-since-1970-UTC.
+/// Rejects a complete result outside the finite timestamp range.
+pub fn ts_combine(date_days: i32, time_micros: i64) -> Result<i64> {
+    timestamp_from_parts(i64::from(date_days), i128::from(time_micros))
+}
+
+/// Check the complete sum: the earliest finite timestamp's midnight is below
+/// i64::MIN, and interval days and time can cancel across either boundary.
+fn timestamp_from_parts(date_days: i64, time_micros: i128) -> Result<i64> {
+    let micros = i128::from(date_days) * i128::from(MICROS_PER_DAY) + time_micros;
+    i64::try_from(micros)
+        .ok()
+        .filter(|micros| !is_infinity_ts(*micros))
+        .ok_or_else(|| SqlError::InvalidValue("timestamp out of range".into()))
 }
 
 /// Convert a date to a timestamp at midnight UTC; an infinite date is the
@@ -132,9 +143,8 @@ pub fn date_to_ts(days: i32) -> Result<i64> {
     match days {
         DATE_INFINITY_DAYS => Ok(TS_INFINITY_MICROS),
         DATE_NEG_INFINITY_DAYS => Ok(TS_NEG_INFINITY_MICROS),
-        _ => i64::from(days)
-            .checked_mul(MICROS_PER_DAY)
-            .ok_or_else(|| SqlError::InvalidValue("date out of range for timestamp".into())),
+        _ => ts_combine(days, 0)
+            .map_err(|_| SqlError::InvalidValue("date out of range for timestamp".into())),
     }
 }
 
@@ -955,10 +965,7 @@ pub fn current_local_time_micros() -> Result<i64> {
 /// Transaction-start local timestamp, represented as a zone-less wall clock.
 pub fn current_local_timestamp_micros() -> Result<i64> {
     let (date, time) = local_parts(txn_or_clock_micros())?;
-    (date as i64)
-        .checked_mul(MICROS_PER_DAY)
-        .and_then(|value| value.checked_add(time))
-        .ok_or(SqlError::IntegerOverflow)
+    ts_combine(date, time)
 }
 
 pub fn round_time_precision(micros: i64, precision: u32) -> Result<i64> {
@@ -1006,12 +1013,9 @@ pub fn add_interval_to_timestamp(ts: i64, months: i32, days: i32, micros: i64) -
         );
         day = days_from_civil(year, month, day_of_month.min(days_in_month(year, month)));
     }
-    day.checked_add(i64::from(days))
-        .and_then(|day| day.checked_mul(MICROS_PER_DAY))
-        .and_then(|midnight| midnight.checked_add(time))
-        .and_then(|ts| ts.checked_add(micros))
-        .filter(|ts| !is_infinity_ts(*ts))
-        .ok_or_else(|| SqlError::InvalidValue("timestamp out of range".into()))
+    // Month shifting an i32 day by i32 months, then adding i32 days, stays
+    // inside i64 days. Its timestamp and the time adjustment need i128.
+    timestamp_from_parts(day + i64::from(days), i128::from(time) + i128::from(micros))
 }
 
 /// PG rule: DATE + INTERVAL always yields TIMESTAMP.
@@ -1668,24 +1672,15 @@ fn date_trunc_timestamp(unit: &str, ts: i64) -> Result<i64> {
     // time_micros is in 0..MICROS_PER_DAY (ts_split uses div_euclid), so `% unit_size` works.
     match unit {
         "microseconds" => Ok(ts),
-        "milliseconds" => Ok(ts_combine(date_days, time_micros - time_micros % 1000)),
-        "second" => Ok(ts_combine(
-            date_days,
-            time_micros - time_micros % MICROS_PER_SEC,
-        )),
-        "minute" => Ok(ts_combine(
-            date_days,
-            time_micros - time_micros % MICROS_PER_MIN,
-        )),
-        "hour" => Ok(ts_combine(
-            date_days,
-            time_micros - time_micros % MICROS_PER_HOUR,
-        )),
-        "day" => Ok(ts_combine(date_days, 0)),
+        "milliseconds" => ts_combine(date_days, time_micros - time_micros % 1000),
+        "second" => ts_combine(date_days, time_micros - time_micros % MICROS_PER_SEC),
+        "minute" => ts_combine(date_days, time_micros - time_micros % MICROS_PER_MIN),
+        "hour" => ts_combine(date_days, time_micros - time_micros % MICROS_PER_HOUR),
+        "day" => ts_combine(date_days, 0),
         _ => {
             // Weekly+ units delegate to date-level truncation (time zeroed).
             let trunc_days = date_trunc_date(unit, date_days)?;
-            Ok(ts_combine(trunc_days, 0))
+            ts_combine(trunc_days, 0)
         }
     }
 }

@@ -2980,7 +2980,7 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
                 int_arg(&evaluated[4], "MAKE_TIMESTAMP min")?,
                 &evaluated[5],
             )?;
-            Ok(Value::Timestamp(crate::datetime::ts_combine(days, tmicros)))
+            crate::datetime::ts_combine(days, tmicros).map(Value::Timestamp)
         }
         "MAKE_INTERVAL" => {
             // Positional args: years, months, weeks, days, hours, mins, secs.

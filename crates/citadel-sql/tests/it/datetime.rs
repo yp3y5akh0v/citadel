@@ -1149,6 +1149,92 @@ fn assert_invalid(conn: &Connection<'_>, sql: &str, message: &str) {
 }
 
 #[test]
+fn make_timestamp_rejects_dates_outside_the_timestamp_range() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    for sql in [
+        "SELECT make_timestamp(300000, 1, 1, 0, 0, 0)",
+        "SELECT make_timestamp(-300000, 1, 1, 0, 0, 0)",
+        // Finite civil fields must not manufacture either infinity sentinel.
+        "SELECT make_timestamp(294247, 1, 10, 4, 0, 54.775807)",
+        "SELECT make_timestamp(-290309, 12, 21, 19, 59, 5.224192)",
+    ] {
+        assert_invalid(&conn, sql, "timestamp out of range");
+    }
+}
+
+#[test]
+fn make_timestamp_preserves_both_finite_endpoints_through_storage() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let db = create_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("CREATE TABLE endpoints (id INTEGER PRIMARY KEY, ts TIMESTAMP)")
+            .unwrap();
+        for (id, sql, expected) in [
+            (
+                1,
+                "make_timestamp(-290309, 12, 21, 19, 59, 5.224193)",
+                i64::MIN + 1,
+            ),
+            (
+                2,
+                "make_timestamp(294247, 1, 10, 4, 0, 54.775806)",
+                i64::MAX - 1,
+            ),
+        ] {
+            assert_eq!(
+                scalar(&conn, &format!("SELECT {sql}")),
+                Value::Timestamp(expected)
+            );
+            conn.execute(&format!("INSERT INTO endpoints VALUES ({id}, {sql})"))
+                .unwrap();
+        }
+    }
+    let db = open_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    assert_eq!(
+        conn.query("SELECT ts, ts + INTERVAL '1 day -24 hours' FROM endpoints ORDER BY id")
+            .unwrap()
+            .rows,
+        vec![
+            vec![Value::Timestamp(i64::MIN + 1); 2],
+            vec![Value::Timestamp(i64::MAX - 1); 2],
+        ]
+    );
+}
+
+#[test]
+fn timestamp_truncation_at_the_lower_endpoint_reports_out_of_range() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    assert_eq!(
+        scalar(
+            &conn,
+            "SELECT date_trunc('second', datetime(-9223372036854))"
+        ),
+        Value::Timestamp(-9_223_372_036_854_000_000)
+    );
+    for unit in [
+        "day",
+        "week",
+        "month",
+        "year",
+        "decade",
+        "century",
+        "millennium",
+    ] {
+        assert_invalid(
+            &conn,
+            &format!("SELECT date_trunc('{unit}', datetime(-9223372036854))"),
+            "timestamp out of range",
+        );
+    }
+}
+
+#[test]
 fn infinite_dates_and_timestamps_follow_postgresql() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
