@@ -9,7 +9,7 @@ use crate::schema::SchemaManager;
 use crate::types::*;
 
 use super::helpers::{check_cancel, check_cancel_at, decode_full_row_with_cancel};
-use super::join::KeyedRows;
+use super::join::{KeyedRowIndex, KeyedRows};
 use super::CteContext;
 
 #[path = "correlated_bind.rs"]
@@ -308,16 +308,95 @@ pub(super) fn filter_mutation_correlated_rows<T>(
 /// A correlated IN subquery's rows, found by an outer row's correlation values
 /// as `=` compares them.
 pub(super) struct InRows {
+    /// Distinct complete tuples, including rows whose selected value is NULL.
+    /// Every index below addresses this immutable store.
+    tuples: Vec<Vec<Value>>,
     /// The distinct correlation values of every row.
-    groups: KeyedRows,
+    groups: KeyedRowIndex,
     /// The distinct correlation values of the rows selecting NULL.
-    nulls: KeyedRows,
+    nulls: KeyedRowIndex,
     /// The distinct correlation values, then selected value, of the rows
     /// selecting a value.
-    values: KeyedRows,
+    values: KeyedRowIndex,
+}
+
+/// Deduplication must retain type distinctions used by SQL coercion. In
+/// particular, equal INTEGER/REAL values do not compare alike to a DATE.
+struct InTupleKey<T>(T);
+
+impl<T: AsRef<[Value]>> PartialEq for InTupleKey<T> {
+    fn eq(&self, other: &Self) -> bool {
+        let (left, right) = (self.0.as_ref(), other.0.as_ref());
+        left.len() == right.len()
+            && left
+                .iter()
+                .zip(right)
+                .all(|(a, b)| a.data_type() == b.data_type() && a == b)
+    }
+}
+
+impl<T: AsRef<[Value]>> Eq for InTupleKey<T> {}
+
+impl<T: AsRef<[Value]>> std::hash::Hash for InTupleKey<T> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        let values = self.0.as_ref();
+        values.len().hash(state);
+        for value in values {
+            value.data_type().type_tag().hash(state);
+            value.hash(state);
+        }
+    }
 }
 
 impl InRows {
+    fn from_distinct_tuples(
+        tuples: Vec<Vec<Value>>,
+        key_collations: &[Collation],
+        value_collation: Collation,
+        cancel: Option<&citadel::CancelToken>,
+    ) -> Result<Self> {
+        let width = key_collations.len();
+        let mut seen_groups = FxHashSet::default();
+        let mut groups = Vec::new();
+        let mut nulls = Vec::new();
+        for (index, row) in tuples.iter().enumerate() {
+            check_cancel_at(cancel, index)?;
+            if seen_groups.insert(InTupleKey(&row[..width])) {
+                groups.push(index);
+            }
+            if row[width].is_null() {
+                nulls.push(index);
+            }
+        }
+        drop(seen_groups);
+        // NULL selected values cannot match the value index. Keep its capacity
+        // proportional to indexed tuples, especially for an all-NULL RHS.
+        let selected = if nulls.is_empty() {
+            None
+        } else {
+            let mut selected = Vec::with_capacity(tuples.len() - nulls.len());
+            for (index, row) in tuples.iter().enumerate() {
+                check_cancel_at(cancel, index)?;
+                if !row[width].is_null() {
+                    selected.push(index);
+                }
+            }
+            Some(selected)
+        };
+        let mut keys: Vec<_> = key_collations.iter().copied().enumerate().collect();
+        let groups = KeyedRowIndex::build(&tuples, &keys, Some(groups), cancel)?;
+        let nulls = KeyedRowIndex::build(&tuples, &keys, Some(nulls), cancel)?;
+        keys.push((width, value_collation));
+        let values = KeyedRowIndex::build(&tuples, &keys, selected, cancel)?;
+        check_cancel(cancel)?;
+        Ok(Self {
+            tuples,
+            groups,
+            nulls,
+            values,
+        })
+    }
+
     /// Whether `in_value IN (subquery)`, or NOT IN when `negated`, holds for the
     /// outer row whose correlation values are `key`. NULL does not hold.
     /// `in_value` runs only when the subquery has rows for the key.
@@ -328,7 +407,7 @@ impl InRows {
         cancel: Option<&citadel::CancelToken>,
         in_value: impl FnOnce() -> Result<Value>,
     ) -> Result<bool> {
-        if !self.groups.contains(key, cancel)? {
+        if !self.groups.contains(&self.tuples, key, cancel)? {
             // The subquery is empty for this row: NULL NOT IN (empty) is true,
             // unlike NULL NOT IN (nonempty).
             return Ok(negated);
@@ -341,12 +420,12 @@ impl InRows {
         // selected value avoids cloning every correlation value for the probe;
         // restore the key even if comparison or cancellation returns an error.
         key.push(in_value);
-        let found = self.values.contains(key, cancel);
+        let found = self.values.contains(&self.tuples, key, cancel);
         key.pop();
         if found? {
             return Ok(!negated);
         }
-        Ok(negated && !self.nulls.contains(key, cancel)?)
+        Ok(negated && !self.nulls.contains(&self.tuples, key, cancel)?)
     }
 }
 
@@ -1584,34 +1663,23 @@ pub(super) fn decorrelate_in_with_read(
 
     let keys = inner_keys(corr_pairs, inner_schema)?;
     let key_columns: Vec<usize> = keys.iter().map(|&(column, _)| column).collect();
-    // A repeated row never changes whether one matches, so each set keeps one.
-    let mut groups = FxHashSet::default();
-    let mut nulls = FxHashSet::default();
-    let mut selected = FxHashSet::default();
+    // Keep complete tuples once. The prefix and NULL indexes use row IDs into
+    // this same storage rather than owning copies of the correlation values.
+    let mut tuples = FxHashSet::default();
     for (row_idx, row) in inner_rows.iter().enumerate() {
         check_cancel_at(cancel, row_idx)?;
-        let key = values_at(row, &key_columns);
-        let value = &row[in_col_idx];
-        if value.is_null() {
-            nulls.insert(key.clone());
-        } else {
-            let mut with_value = Vec::with_capacity(key.len() + 1);
-            with_value.extend_from_slice(&key);
-            with_value.push(value.clone());
-            selected.insert(with_value);
-        }
-        groups.insert(key);
+        let mut tuple = Vec::with_capacity(keys.len() + 1);
+        tuple.extend(key_columns.iter().map(|&column| row[column].clone()));
+        tuple.push(row[in_col_idx].clone());
+        tuples.insert(InTupleKey(tuple));
     }
-    let by_key = leading_keys(&keys);
-    let mut by_value = by_key.clone();
-    by_value.push((keys.len(), value_collation));
-    let rows = InRows {
-        groups: KeyedRows::build(groups.into_iter().collect(), &by_key, cancel)?,
-        nulls: KeyedRows::build(nulls.into_iter().collect(), &by_key, cancel)?,
-        values: KeyedRows::build(selected.into_iter().collect(), &by_value, cancel)?,
-    };
-    check_cancel(cancel)?;
-    Ok(rows)
+    let key_collations: Vec<_> = keys.iter().map(|&(_, collation)| collation).collect();
+    InRows::from_distinct_tuples(
+        tuples.into_iter().map(|tuple| tuple.0).collect(),
+        &key_collations,
+        value_collation,
+        cancel,
+    )
 }
 
 /// Decorrelate scalar subquery: each group of an aggregate, or each row of a

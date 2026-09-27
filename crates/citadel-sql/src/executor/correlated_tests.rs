@@ -299,17 +299,13 @@ fn correlated_in_probe_passes_cancellation_into_scalar_evaluation() {
 
 #[test]
 fn correlated_in_reused_key_survives_probe_branches_and_cancellation() {
-    let keys = [(0, Collation::Binary)];
-    let rows = InRows {
-        groups: KeyedRows::build(vec![vec![i(1)], vec![i(2)]], &keys, None).unwrap(),
-        nulls: KeyedRows::build(vec![vec![i(2)]], &keys, None).unwrap(),
-        values: KeyedRows::build(
-            vec![vec![i(1), i(7)], vec![i(2), i(9)]],
-            &[(0, Collation::Binary), (1, Collation::Binary)],
-            None,
-        )
-        .unwrap(),
-    };
+    let rows = InRows::from_distinct_tuples(
+        vec![vec![i(1), i(7)], vec![i(2), i(9)], vec![i(2), Value::Null]],
+        &[Collation::Binary],
+        Collation::Binary,
+        None,
+    )
+    .unwrap();
     let mut key = Vec::with_capacity(2);
     for (group, selected, negated, expected) in [
         (1, i(7), false, true),
@@ -351,4 +347,119 @@ fn correlated_in_reused_key_survives_probe_branches_and_cancellation() {
     assert_eq!(key, [i(1)], "cancelled probe left an appended value");
     assert!(rows.passes(&mut key, false, None, || Ok(i(7))).unwrap());
     assert_eq!(key, [i(1)]);
+}
+
+#[test]
+fn shared_in_tuple_indexes_match_rowwise_coercion_collation_and_null_semantics() {
+    fn verify(
+        source: Vec<Vec<Value>>,
+        collations: &[Collation],
+        value_collation: Collation,
+        outer_keys: &[Vec<Value>],
+        operands: &[Value],
+    ) {
+        let distinct: FxHashSet<_> = source.iter().cloned().map(InTupleKey).collect();
+        let rows = InRows::from_distinct_tuples(
+            distinct.into_iter().map(|tuple| tuple.0).collect(),
+            collations,
+            value_collation,
+            None,
+        )
+        .unwrap();
+        for key in outer_keys {
+            let matched: Vec<_> = source
+                .iter()
+                .filter(|row| {
+                    key.iter()
+                        .zip(row.iter())
+                        .zip(collations)
+                        .all(|((a, b), coll)| crate::eval::collated_eq(a, b, Some(*coll)).unwrap())
+                })
+                .map(|row| &row[key.len()])
+                .collect();
+            for operand in operands {
+                for negated in [false, true] {
+                    let expected = if matched.is_empty() {
+                        negated
+                    } else if operand.is_null() {
+                        false
+                    } else if matched.iter().any(|value| {
+                        crate::eval::collated_eq(operand, value, Some(value_collation)).unwrap()
+                    }) {
+                        !negated
+                    } else {
+                        negated && !matched.iter().any(|value| value.is_null())
+                    };
+                    let mut probe = key.clone();
+                    let mut calls = 0;
+                    assert_eq!(
+                        rows.passes(&mut probe, negated, None, || {
+                            calls += 1;
+                            Ok(operand.clone())
+                        })
+                        .unwrap(),
+                        expected,
+                        "key={key:?}, operand={operand:?}, negated={negated}"
+                    );
+                    assert_eq!(probe, *key);
+                    assert_eq!(calls, usize::from(!matched.is_empty()));
+                }
+            }
+        }
+    }
+    let text = |s: &str| Value::Text(s.into());
+    verify(
+        vec![
+            vec![text("A"), i(1), text("one")],
+            vec![text("a"), i(1), text("TWO")],
+            vec![text("a"), i(1), Value::Null],
+            vec![text("a"), i(2), text("three")],
+            vec![Value::Null, i(1), text("one")],
+        ],
+        &[Collation::NoCase, Collation::Binary],
+        Collation::NoCase,
+        &[
+            vec![text("A"), i(1)],
+            vec![text("a"), i(2)],
+            vec![text("missing"), i(1)],
+            vec![Value::Null, i(1)],
+        ],
+        &[
+            text("ONE"),
+            text("two"),
+            text("three"),
+            text("absent"),
+            Value::Null,
+        ],
+    );
+    let values = [
+        Value::Date(0),
+        Value::Date(1),
+        Value::Timestamp(0),
+        text("1970-01-01"),
+        text("1970-01-01 00:00:00"),
+        i(0),
+        Value::Real(0.0),
+        Value::Null,
+    ];
+    // Equal INTEGER/REAL values must both survive deduplication: their
+    // comparisons to temporal values follow different coercion rules.
+    let mut source = vec![vec![Value::Real(0.0), i(42)], vec![i(0), i(42)]];
+    for (index, value) in values.iter().enumerate() {
+        source.push(vec![
+            value.clone(),
+            values[(index + 2) % values.len()].clone(),
+        ]);
+        source.push(vec![
+            value.clone(),
+            values[(index + 5) % values.len()].clone(),
+        ]);
+    }
+    verify(
+        source,
+        &[Collation::Binary],
+        Collation::Binary,
+        &values.iter().cloned().map(|v| vec![v]).collect::<Vec<_>>(),
+        &values.iter().cloned().chain([i(42)]).collect::<Vec<_>>(),
+    );
 }
