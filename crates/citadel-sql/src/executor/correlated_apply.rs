@@ -268,28 +268,35 @@ pub(in crate::executor) fn apply_captured_subqueries(
                 .iter()
                 .map(|&position| row[position].clone())
                 .collect();
-            let memo = &mut memos[index];
-            let materialized = match memo.as_ref().and_then(|memo| memo.get(&key)) {
-                Some(materialized) => materialized.clone(),
-                None => {
-                    let mut bound = capture.node.clone();
-                    bind_outer(
-                        schema,
-                        ctes,
-                        &mut bound,
-                        outer,
-                        Some(row.as_slice()),
-                        cancel,
-                    )?;
-                    let materialized = super::super::dml::materialize_expr(&bound, exec_sub)?;
-                    if let Some(memo) = memo {
-                        memo.insert(key, materialized.clone());
+            let mut materialize = || {
+                let mut bound = capture.node.clone();
+                bind_outer(
+                    schema,
+                    ctes,
+                    &mut bound,
+                    outer,
+                    Some(row.as_slice()),
+                    cancel,
+                )?;
+                super::super::dml::materialize_expr(&bound, exec_sub)
+            };
+            let uncached;
+            // IN captures may own a large set. Cache hits evaluate the same
+            // immutable expression; only its current outer-row operand varies.
+            let materialized: &Expr = match &mut memos[index] {
+                Some(memo) => match memo.entry(key) {
+                    std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(materialize()?)
                     }
-                    materialized
+                },
+                None => {
+                    uncached = materialize()?;
+                    &uncached
                 }
             };
             let value = eval_expr(
-                &materialized,
+                materialized,
                 &EvalCtx::new(&col_map, row).with_cancel(cancel),
             )?;
             row[first + index] = value;

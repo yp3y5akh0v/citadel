@@ -451,6 +451,79 @@ fn captured_predicate_star_returns_only_the_original_schema() {
 }
 
 #[test]
+fn repeated_correlation_keys_keep_in_operands_and_nulls_row_local() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = database(directory.path());
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute("CREATE TABLE needles (id INTEGER PRIMARY KEY, bucket INTEGER, needle TEXT)")
+        .unwrap();
+    connection
+        .execute("CREATE TABLE haystack (id INTEGER PRIMARY KEY, bucket INTEGER, value TEXT)")
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO haystack VALUES \
+             (1,1,'a text value longer than an inline string'), \
+             (2,1,'another text value longer than an inline string'), \
+             (3,1,'a text value longer than an inline string'), (4,2,NULL)",
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO needles VALUES \
+             (1,1,'a text value longer than an inline string'), (2,2,'missing'), \
+             (3,0,NULL), (4,1,'missing'), (5,2,'a text value longer than an inline string'), \
+             (6,0,'missing'), (7,1,NULL), (8,2,NULL), (9,NULL,'missing'), \
+             (10,1,'another text value longer than an inline string'), (11,NULL,NULL)",
+        )
+        .unwrap();
+    let expected: Vec<Vec<Value>> = [
+        (1, Some(true), Some(false)),
+        (2, None, None),
+        (3, Some(false), Some(true)),
+        (4, Some(false), Some(true)),
+        (5, Some(true), Some(false)),
+        (6, Some(false), Some(true)),
+        (7, None, None),
+        (8, None, None),
+        (9, Some(false), Some(true)),
+        (10, Some(true), Some(false)),
+        (11, Some(false), Some(true)),
+    ]
+    .into_iter()
+    .map(|(id, member, absent)| {
+        vec![
+            Value::Integer(id),
+            member.map_or(Value::Null, Value::Boolean),
+            absent.map_or(Value::Null, Value::Boolean),
+        ]
+    })
+    .collect();
+    // The non-equality correlation selects the general capture/memo lane.
+    // Only bucket is captured; the IN operand must still vary with every row.
+    let sql = "SELECT o.id AS id, o.needle IN \
+        (SELECT i.value FROM haystack i WHERE i.bucket <= o.bucket) AS member, \
+        o.needle NOT IN \
+        (SELECT i.value FROM haystack i WHERE i.bucket <= o.bucket) AS absent \
+        FROM needles o WHERE o.id >= $1 ORDER BY o.id";
+    for begin in [None, Some("BEGIN READ ONLY"), Some("BEGIN")] {
+        if let Some(begin) = begin {
+            connection.execute(begin).unwrap();
+        }
+        let statement = connection.prepare(sql).unwrap();
+        for first in [1, 2, 1] {
+            let result = statement.query_collect(&[Value::Integer(first)]).unwrap();
+            assert_eq!(result.columns, ["id", "member", "absent"]);
+            assert_eq!(result.rows, expected[(first - 1) as usize..]);
+        }
+        if begin.is_some() {
+            connection.execute("ROLLBACK").unwrap();
+        }
+    }
+}
+
+#[test]
 fn internal_slots_cannot_resolve_unbound_names_and_join_stars_stay_visible() {
     with_setup(|connection| {
         // t1 has three columns: neither internal-looking spelling names one.
