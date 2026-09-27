@@ -77,6 +77,23 @@ impl BTree {
         }
     }
 
+    // The count comes from file metadata; one that cannot move was damaged.
+    fn count_insert(&mut self) -> Result<()> {
+        self.entry_count = self
+            .entry_count
+            .checked_add(1)
+            .ok_or(Error::DatabaseCorrupted)?;
+        Ok(())
+    }
+
+    fn count_delete(&mut self) -> Result<()> {
+        self.entry_count = self
+            .entry_count
+            .checked_sub(1)
+            .ok_or(Error::DatabaseCorrupted)?;
+        Ok(())
+    }
+
     pub fn search_at_leaf(
         pages: &impl PageMap,
         leaf_id: PageId,
@@ -307,7 +324,7 @@ impl BTree {
             if cow_id != cached_leaf {
                 self.root = propagate_cow_up(pages, alloc, txn_id, &mut cached_path, cow_id)?;
             }
-            self.entry_count += 1;
+            self.count_insert()?;
             self.last_delete = None;
             self.last_insert = Some((cached_path, cow_id));
             return Ok(());
@@ -327,7 +344,7 @@ impl BTree {
         )?;
         self.last_delete = None;
         self.last_insert = Some((cached_path, right_id));
-        self.entry_count += 1;
+        self.count_insert()?;
         Ok(())
     }
 
@@ -405,7 +422,7 @@ impl BTree {
             if cow_id != cached_leaf {
                 self.root = propagate_cow_up(pages, alloc, txn_id, &mut cached_path, cow_id)?;
             }
-            self.entry_count -= 1;
+            self.count_delete()?;
             self.clear_lil_caches();
             self.last_delete = Some((cached_path, cow_id));
             return Ok(Some((true, overflow_head)));
@@ -414,7 +431,7 @@ impl BTree {
         alloc.free(cow_id);
         pages.remove_page(&cow_id);
         self.root = propagate_remove_up(pages, alloc, txn_id, &mut cached_path, &mut self.depth)?;
-        self.entry_count -= 1;
+        self.count_delete()?;
         self.clear_lil_caches();
         self.last_delete = None;
         Ok(Some((true, overflow_head)))
@@ -457,7 +474,7 @@ impl BTree {
                         self.root =
                             propagate_cow_up(pages, alloc, txn_id, &mut cached_path, cow_id)?;
                     }
-                    self.entry_count += 1;
+                    self.count_insert()?;
                     self.last_delete = None;
                     self.last_insert = Some((cached_path, cow_id));
                     return Ok(true);
@@ -478,7 +495,7 @@ impl BTree {
                 )?;
                 self.last_delete = None;
                 self.last_insert = Some((cached_path, right_id));
-                self.entry_count += 1;
+                self.count_insert()?;
                 return Ok(true);
             }
         }
@@ -617,7 +634,7 @@ impl BTree {
             }
 
             if !key_exists {
-                self.entry_count += 1;
+                self.count_insert()?;
             }
             return Ok((!key_exists, replaced_overflow));
         }
@@ -650,7 +667,7 @@ impl BTree {
         }
 
         if !key_exists {
-            self.entry_count += 1;
+            self.count_insert()?;
         }
         Ok((!key_exists, replaced_overflow))
     }
@@ -692,7 +709,7 @@ impl BTree {
                         self.root =
                             propagate_cow_up(pages, alloc, txn_id, &mut cached_path, cow_id)?;
                     }
-                    self.entry_count += 1;
+                    self.count_insert()?;
                     self.last_delete = None;
                     self.last_insert = Some((cached_path, cow_id));
                     return Ok(None);
@@ -713,7 +730,7 @@ impl BTree {
                 )?;
                 self.last_delete = None;
                 self.last_insert = Some((cached_path, right_id));
-                self.entry_count += 1;
+                self.count_insert()?;
                 return Ok(None);
             }
             self.last_insert = Some((cached_path, cached_leaf));
@@ -788,7 +805,7 @@ impl BTree {
             } else {
                 self.remap_lil_paths(&moved);
             }
-            self.entry_count += 1;
+            self.count_insert()?;
             return Ok(None);
         }
 
@@ -818,7 +835,7 @@ impl BTree {
         if append_rightmost {
             self.last_insert = Some((path, right_id));
         }
-        self.entry_count += 1;
+        self.count_insert()?;
         Ok(None)
     }
 
@@ -857,7 +874,7 @@ impl BTree {
                         self.root =
                             propagate_cow_up(pages, alloc, txn_id, &mut cached_path, cow_id)?;
                     }
-                    self.entry_count += 1;
+                    self.count_insert()?;
                     self.last_delete = None;
                     self.last_insert = Some((cached_path, cow_id));
                     return Ok(true);
@@ -878,7 +895,7 @@ impl BTree {
                 )?;
                 self.last_delete = None;
                 self.last_insert = Some((cached_path, right_id));
-                self.entry_count += 1;
+                self.count_insert()?;
                 return Ok(true);
             }
             self.last_insert = Some((cached_path, cached_leaf));
@@ -948,7 +965,7 @@ impl BTree {
             } else {
                 self.remap_lil_paths(&moved);
             }
-            self.entry_count += 1;
+            self.count_insert()?;
             return Ok(true);
         }
 
@@ -978,7 +995,7 @@ impl BTree {
         if append_rightmost {
             self.last_insert = Some((path, right_id));
         }
-        self.entry_count += 1;
+        self.count_insert()?;
         Ok(true)
     }
 
@@ -1179,7 +1196,7 @@ impl BTree {
 
         if !leaf_empty || path.is_empty() {
             self.root = propagate_cow_up(pages, alloc, txn_id, path, new_leaf_id)?;
-            self.entry_count -= 1;
+            self.count_delete()?;
             self.last_delete = Some((path.clone(), new_leaf_id));
             return Ok((true, overflow_head));
         }
@@ -1188,7 +1205,7 @@ impl BTree {
         pages.remove_page(&new_leaf_id);
 
         self.root = propagate_remove_up(pages, alloc, txn_id, path, &mut self.depth)?;
-        self.entry_count -= 1;
+        self.count_delete()?;
         self.last_delete = None;
         Ok((true, overflow_head))
     }

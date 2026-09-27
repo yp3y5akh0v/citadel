@@ -525,6 +525,39 @@ fn delete_existing_key() {
 }
 
 #[test]
+fn a_count_the_metadata_cannot_move_is_corruption() {
+    let (mut pages, mut alloc, tree) = new_tree();
+    let mut full = BTree::from_existing(tree.root, tree.depth, u64::MAX);
+    assert!(matches!(
+        full.insert(
+            &mut pages,
+            &mut alloc,
+            TxnId(1),
+            b"a",
+            ValueType::Inline,
+            b"1"
+        ),
+        Err(Error::DatabaseCorrupted)
+    ));
+
+    let (mut pages, mut alloc, mut tree) = new_tree();
+    tree.insert(
+        &mut pages,
+        &mut alloc,
+        TxnId(1),
+        b"a",
+        ValueType::Inline,
+        b"1",
+    )
+    .unwrap();
+    let mut empty = BTree::from_existing(tree.root, tree.depth, 0);
+    assert!(matches!(
+        empty.delete(&mut pages, &mut alloc, TxnId(1), b"a"),
+        Err(Error::DatabaseCorrupted)
+    ));
+}
+
+#[test]
 fn delete_nonexistent_key() {
     let (mut pages, mut alloc, mut tree) = new_tree();
     tree.insert(
