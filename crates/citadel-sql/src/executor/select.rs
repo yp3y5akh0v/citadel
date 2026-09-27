@@ -393,6 +393,31 @@ fn exec_select_from_view_with_read(
     )
 }
 
+/// Separate complete AND conjuncts; conditional branches remain indivisible.
+fn split_outer_predicate(where_clause: Option<&Expr>) -> (Option<Expr>, Option<Expr>) {
+    let mut independent = Vec::new();
+    let mut deferred = Vec::new();
+    if let Some(predicate) = where_clause {
+        for conjunct in flatten_and_exprs(predicate) {
+            if super::dml::has_subquery(conjunct) {
+                deferred.push(conjunct.clone());
+            } else {
+                independent.push(conjunct.clone());
+            }
+        }
+    }
+    let conjunction = |expressions: Vec<Expr>| {
+        expressions
+            .into_iter()
+            .reduce(|left, right| Expr::BinaryOp {
+                left: Box::new(left),
+                op: BinOp::And,
+                right: Box::new(right),
+            })
+    };
+    (conjunction(independent), conjunction(deferred))
+}
+
 /// A single-table SELECT whose subqueries read its row. Hash decorrelation
 /// takes the shapes it reproduces exactly; every other subquery that reads
 /// the row runs per row.
@@ -413,23 +438,55 @@ fn exec_correlated_scan_with_read(
     let (mut rows, where_clause) = if has_correlated_where(&stmt.where_clause, &corr_ctx, schema) {
         build_and_scan_correlated_with_read(rtx, schema, stmt, table_schema, &corr_ctx)?
     } else {
-        let (rows, _) = collect_rows_with_read(rtx, table_schema, &None, None)?;
-        (rows, stmt.where_clause.clone())
+        // Keep index bounds on the outer table. A whole conditional containing
+        // a subquery stays deferred; the scan never evaluates one of its arms.
+        let (independent, deferred) = split_outer_predicate(stmt.where_clause.as_ref());
+        let (rows, applied) = collect_rows_with_read(rtx, table_schema, &independent, None)?;
+        // This also keeps volatile scan predicates from being evaluated twice.
+        let remaining = if applied {
+            deferred
+        } else {
+            stmt.where_clause.clone()
+        };
+        (rows, remaining)
     };
+    // Hash WHERE decorrelation can leave ordinary conjuncts behind. Apply them
+    // before computing projected scalars, just as the storage scan does above.
+    let (independent, where_clause) = split_outer_predicate(where_clause.as_ref());
+    if let Some(predicate) = independent {
+        let column_map = table_schema.column_map();
+        let mut kept = Vec::with_capacity(rows.len());
+        for (index, row) in rows.into_iter().enumerate() {
+            check_cancel_at(cancel, index)?;
+            if is_truthy(&eval_expr(
+                &predicate,
+                &EvalCtx::new(column_map, &row).with_cancel(cancel),
+            )?) {
+                kept.push(row);
+            }
+        }
+        rows = kept;
+    }
     let columns = table_schema.columns.clone();
     let mut row_width = columns.len();
     let partial = SelectStmt {
         where_clause,
         ..stmt.clone()
     };
-    let partial = handle_correlated_select_with_read(
-        rtx,
-        schema,
-        &partial,
-        &corr_ctx,
-        &mut rows,
-        &mut row_width,
-    )?;
+    let partial = if partial.where_clause.is_none() {
+        handle_correlated_select_with_read(
+            rtx,
+            schema,
+            &partial,
+            &corr_ctx,
+            &mut rows,
+            &mut row_width,
+        )?
+    } else {
+        // An unresolved predicate can still exclude a row. Its projected
+        // scalar must not raise a cardinality error before that decision.
+        partial
+    };
     finish_captured_select(
         schema,
         ctes,
