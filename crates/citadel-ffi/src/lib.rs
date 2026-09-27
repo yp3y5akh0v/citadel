@@ -42,6 +42,7 @@ pub enum CitadelError {
     TransactionFailed = -19,
     RegionInUse = -20,
     AtomInUse = -21,
+    ReopenRequired = -22,
     InternalPanic = -99,
 }
 
@@ -212,6 +213,7 @@ fn map_error(err: &citadel_core::Error) -> CitadelError {
         citadel_core::Error::WriteTransactionActive => CitadelError::WriteTransactionActive,
         citadel_core::Error::Interrupted => CitadelError::Interrupted,
         citadel_core::Error::TransactionFailed => CitadelError::TransactionFailed,
+        citadel_core::Error::ReopenRequired => CitadelError::ReopenRequired,
         citadel_core::Error::RegionInUse { .. } => CitadelError::RegionInUse,
         citadel_core::Error::AtomInUse { .. } => CitadelError::AtomInUse,
         citadel_core::Error::ChecksumMismatch(_)

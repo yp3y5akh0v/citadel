@@ -137,6 +137,7 @@ fn core_category(e: &CoreError) -> Category {
         | CoreError::DurabilityFailureAfterOperation { .. }
         | CoreError::DurabilityAndAuditFailureAfterOperation { .. }
         | CoreError::Sync(_)
+        | CoreError::ReopenRequired
         | CoreError::FipsViolation(_) => Operational,
         CoreError::NoWriteTransaction
         | CoreError::WriteTransactionActive

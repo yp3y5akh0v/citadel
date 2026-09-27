@@ -286,6 +286,8 @@ pub struct TxnManager {
     named_table_hash_collisions: OnceLock<NamedTableHashCollisions>,
     named_table_hash_collision_init: Mutex<()>,
     write_active: AtomicBool,
+    /// Set when a commit's selector flip was written but never confirmed durable.
+    reopen_required: AtomicBool,
     /// Effective V1 requirement: either the compatibility data-header bit or
     /// an authenticated key-file requirement supplied by the facade.
     slots_flagged: AtomicBool,
@@ -524,6 +526,7 @@ impl TxnManager {
             named_table_hash_collisions: OnceLock::new(),
             named_table_hash_collision_init: Mutex::new(()),
             write_active: AtomicBool::new(false),
+            reopen_required: AtomicBool::new(false),
             slots_flagged: AtomicBool::new(slots_flagged),
             state: Mutex::new(ManagerState {
                 active_slot,
@@ -643,6 +646,7 @@ impl TxnManager {
             named_table_hash_collisions: OnceLock::new(),
             named_table_hash_collision_init: Mutex::new(()),
             write_active: AtomicBool::new(false),
+            reopen_required: AtomicBool::new(false),
             // New files are flagged at birth (FileHeader::new).
             slots_flagged: AtomicBool::new(true),
             state: Mutex::new(ManagerState {
@@ -737,6 +741,9 @@ impl TxnManager {
     }
 
     fn begin_write_inner(&self, expected_generation: Option<u64>) -> Result<Option<WriteTxn<'_>>> {
+        if self.reopen_required.load(Ordering::Acquire) {
+            return Err(Error::ReopenRequired);
+        }
         if self
             .write_active
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -1041,8 +1048,8 @@ impl TxnManager {
 
         // Both the committed metadata and the new delta are checked before
         // changing the recovery marker. Staged pages remain writer-private.
+        let recovery_god_byte = current_god_byte | GOD_BIT_RECOVERY;
         if self.sync_mode != citadel_core::types::SyncMode::Off {
-            let recovery_god_byte = current_god_byte | GOD_BIT_RECOVERY;
             write_god_byte(&*self.io, recovery_god_byte)?;
         }
 
@@ -1260,7 +1267,10 @@ impl TxnManager {
 
         if self.sync_mode == citadel_core::types::SyncMode::Full {
             if let Err(e) = self.io.fsync() {
-                let _ = write_god_byte(&*self.io, current_god_byte);
+                // The disk may select either slot now: recovery on reopen decides,
+                // and no writer may reuse the candidate's pages before then.
+                self.reopen_required.store(true, Ordering::Release);
+                let _ = write_god_byte(&*self.io, recovery_god_byte);
                 let _ = self.io.fsync();
                 return Err(e);
             }

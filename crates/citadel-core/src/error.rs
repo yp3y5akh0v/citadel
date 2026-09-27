@@ -161,6 +161,9 @@ pub enum Error {
     )]
     TransactionFailed,
 
+    #[error("an earlier commit's durability is unknown; reopen the database before writing")]
+    ReopenRequired,
+
     #[error("memory region {region_id} is in use by another operation")]
     RegionInUse { region_id: u64 },
 
