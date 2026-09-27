@@ -683,6 +683,28 @@ fn recovery_keeps_slots_that_are_not_an_interrupted_candidate() {
     }
 }
 
+#[test]
+fn recovery_refuses_a_slot_that_leaves_no_transaction_ids() {
+    let mac_key = test_mac_key();
+    let recovered = |txn_id| {
+        let io = crate::memory_io::MemoryPageIO::new();
+        let mut header = FileHeader::new(0xC3, [0x21; MAC_SIZE]);
+        header.slots[0] = CommitSlot {
+            txn_id,
+            ..sample_slot()
+        };
+        for slot in &mut header.slots {
+            slot.seal(&mac_key);
+        }
+        write_file_header(&io, &header).unwrap();
+        recover(&io, &mac_key)
+    };
+    assert!(recovered(TxnId::MAX_COMMITTED).is_ok());
+    for txn_id in [TxnId::MAX_COMMITTED.next(), TxnId(u64::MAX)] {
+        assert!(matches!(recovered(txn_id), Err(Error::DatabaseCorrupted)));
+    }
+}
+
 /// Exactly the V1 capacity seals V1 and preserves every entry; one more entry
 /// tips it to the legacy fallback. Pins the seal boundary both sides.
 #[test]

@@ -35,6 +35,9 @@ pub struct TxnId(pub u64);
 
 impl TxnId {
     pub const ZERO: Self = Self(0);
+    /// The largest id a commit slot may carry, so later ids never wrap or
+    /// reach `u64::MAX`, the no-reader reclaim horizon.
+    pub const MAX_COMMITTED: Self = Self(u64::MAX >> 1);
 
     #[inline]
     pub fn next(self) -> Self {
