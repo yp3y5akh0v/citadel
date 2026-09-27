@@ -1,4 +1,4 @@
-use citadel_txn::read_txn::ReadTxn;
+use citadel_txn::read_txn::ReadView;
 
 use crate::encoding::{
     decode_composite_key, decode_key_value, decode_stored_column_raw, encode_composite_key,
@@ -147,7 +147,7 @@ pub(super) fn covered_index_components(
 
 /// Index-only row service; only Binary components and pk columns reconstruct.
 pub(super) fn try_covered_index_collect_read(
-    rtx: &mut ReadTxn<'_>,
+    rtx: &mut ReadView<'_, '_>,
     table_schema: &TableSchema,
     plan: &ScanPlan,
     where_clause: &Option<Expr>,
@@ -304,7 +304,7 @@ pub(super) fn try_covered_index_collect_read(
 
 /// Entry count in bounds; caller proves full cover, NULL components skip.
 pub(super) fn covered_index_count_read(
-    rtx: &mut ReadTxn<'_>,
+    rtx: &mut ReadView<'_, '_>,
     table_schema: &TableSchema,
     plan: &ScanPlan,
 ) -> Result<Option<u64>> {
@@ -658,7 +658,7 @@ fn scan_step(
 }
 
 pub(super) fn collect_rows_with_read(
-    rtx: &mut ReadTxn<'_>,
+    rtx: &mut ReadView<'_, '_>,
     table_schema: &TableSchema,
     where_clause: &Option<Expr>,
     limit: Option<usize>,
@@ -668,7 +668,7 @@ pub(super) fn collect_rows_with_read(
 }
 
 pub(super) fn collect_rows_with_read_planned(
-    rtx: &mut ReadTxn<'_>,
+    rtx: &mut ReadView<'_, '_>,
     table_schema: &TableSchema,
     where_clause: &Option<Expr>,
     limit: Option<usize>,
@@ -678,7 +678,7 @@ pub(super) fn collect_rows_with_read_planned(
 }
 
 pub(super) fn collect_select_rows_with_read(
-    rtx: &mut ReadTxn<'_>,
+    rtx: &mut ReadView<'_, '_>,
     table_schema: &TableSchema,
     stmt: &SelectStmt,
     limit: Option<usize>,
@@ -700,7 +700,7 @@ pub(super) fn collect_select_rows_with_read(
 }
 
 pub(super) fn collect_rows_with_read_decoded(
-    rtx: &mut ReadTxn<'_>,
+    rtx: &mut ReadView<'_, '_>,
     table_schema: &TableSchema,
     where_clause: &Option<Expr>,
     limit: Option<usize>,
@@ -942,7 +942,7 @@ pub(super) fn collect_rows_with_read_decoded(
 }
 
 fn inverted_intersect_candidates(
-    rtx: &mut ReadTxn<'_>,
+    rtx: &mut ReadView<'_, '_>,
     idx_table: &[u8],
     probe_entries: &[Vec<u8>],
 ) -> Result<Vec<Vec<u8>>> {

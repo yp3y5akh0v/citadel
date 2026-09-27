@@ -1,9 +1,11 @@
-use citadel_txn::read_txn::ReadTxn;
+use citadel_txn::read_txn::ReadView;
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use std::hash::{Hash, Hasher};
 
 use crate::error::{Result, SqlError};
-use crate::eval::{eval_expr, is_truthy, referenced_columns, ColumnMap, EvalCtx};
+use crate::eval::{
+    eval_expr_with_resolver, is_truthy, referenced_columns, ColumnMap, EvalCtx, InputResolver,
+};
 use crate::parser::*;
 use crate::schema::SchemaManager;
 use crate::types::*;
@@ -918,6 +920,7 @@ pub(super) fn exec_join_step(
     projection: Option<&CombineProjection>,
     equi: &EquiJoin,
     token: Option<&citadel::CancelToken>,
+    resolver: Option<&dyn InputResolver>,
 ) -> Result<Vec<Vec<Value>>> {
     let mut cancel = JoinCancel::new(token)?;
     let effective_proj = if equi.is_pure() { projection } else { None };
@@ -960,6 +963,7 @@ pub(super) fn exec_join_step(
         equi,
         &buckets,
         &mut cancel,
+        resolver,
     )
 }
 
@@ -975,6 +979,7 @@ fn exec_hash_join(
     equi: &EquiJoin,
     buckets: &ProbeTable,
     cancel: &mut JoinCancel<'_>,
+    resolver: Option<&dyn InputResolver>,
 ) -> Result<Vec<Vec<Value>>> {
     let preserve_outer = matches!(join.join_type, JoinType::Left | JoinType::FullOuter);
     let preserve_inner = matches!(join.join_type, JoinType::Right | JoinType::FullOuter);
@@ -1024,9 +1029,10 @@ fn exec_hash_join(
             } else {
                 let combined = combine_row(&outer, inner, cap);
                 if let Some(on) = &join.on_clause {
-                    if !is_truthy(&eval_expr(
+                    if !is_truthy(&eval_expr_with_resolver(
                         on,
                         &EvalCtx::new(&combined_map, &combined).with_cancel(cancel.token),
+                        resolver,
                     )?) {
                         continue;
                     }
@@ -1082,7 +1088,7 @@ pub(super) fn table_alias_or_name(name: &str, alias: &Option<String>) -> String 
 }
 
 pub(super) fn collect_all_rows_raw(
-    rtx: &mut citadel_txn::read_txn::ReadTxn<'_>,
+    rtx: &mut citadel_txn::read_txn::ReadView<'_, '_>,
     table_schema: &TableSchema,
 ) -> Result<Vec<Vec<Value>>> {
     let cancel = rtx.cancel_token().cloned();
@@ -1270,7 +1276,7 @@ pub(super) fn compute_join_needed_columns(
 }
 
 pub(super) fn collect_rows_partial(
-    rtx: &mut citadel_txn::read_txn::ReadTxn<'_>,
+    rtx: &mut citadel_txn::read_txn::ReadView<'_, '_>,
     table_schema: &TableSchema,
     needed: &[usize],
 ) -> Result<Vec<Vec<Value>>> {
@@ -1284,7 +1290,7 @@ pub(super) fn collect_rows_partial(
 }
 
 pub(super) fn collect_rows_partial_with_ctx(
-    rtx: &mut citadel_txn::read_txn::ReadTxn<'_>,
+    rtx: &mut citadel_txn::read_txn::ReadView<'_, '_>,
     table_schema: &TableSchema,
     ctx: &PartialDecodeCtx,
     cached_count: Option<&std::sync::OnceLock<u64>>,
@@ -1384,7 +1390,7 @@ pub(super) fn join_tables<'a>(
 }
 
 pub(super) fn exec_select_join_with_read(
-    rtx: &mut ReadTxn<'_>,
+    rtx: &mut ReadView<'_, '_>,
     schema: &SchemaManager,
     stmt: &SelectStmt,
 ) -> Result<ExecutionResult> {
@@ -1398,7 +1404,7 @@ pub(super) fn exec_select_join_with_read(
 /// The joined rows with the columns that describe them. A plan limits the
 /// decoded columns to the ones the statement reads.
 pub(super) fn join_rows_with_read(
-    rtx: &mut ReadTxn<'_>,
+    rtx: &mut ReadView<'_, '_>,
     stmt: &SelectStmt,
     all_tables: &[(String, &TableSchema)],
     plan: Option<JoinColumnPlan>,
@@ -1464,6 +1470,7 @@ pub(super) fn join_rows_with_read(
             proj.as_ref(),
             &equi,
             cancel,
+            None,
         )?;
         cur_outer_pk_col = None;
     }
@@ -1560,6 +1567,7 @@ pub(super) fn join_rows_in_txn(
             proj.as_ref(),
             &equi,
             cancel,
+            None,
         )?;
         cur_outer_pk_col = None;
     }
@@ -1944,6 +1952,7 @@ pub(super) fn exec_join_step_borrowed(
         equi,
         buckets,
         &mut cancel,
+        None,
     )
 }
 

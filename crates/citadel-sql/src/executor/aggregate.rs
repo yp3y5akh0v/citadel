@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 
 use crate::error::{Result, SqlError};
-use crate::eval::{eval_expr, is_truthy, operand_collation, ColumnMap, EvalCtx};
+use crate::eval::{
+    eval_expr_with_resolver, is_truthy, operand_collation, ColumnMap, EvalCtx, InputResolver,
+};
 use crate::parser::*;
 use crate::types::*;
 
@@ -17,12 +19,13 @@ pub(super) fn exec_aggregate(
         columns,
         stmt,
         cancel,
+        resolver,
         ..
     } = ctx;
     check_cancel(cancel)?;
     let col_map = ColumnMap::new(columns);
     let group_exprs = resolve_group_by_exprs(&stmt.group_by, &stmt.columns, &col_map)?;
-    let groups = group_rows(rows, &group_exprs, &col_map, cancel)?;
+    let groups = group_rows(rows, &group_exprs, &col_map, cancel, resolver)?;
 
     let mut result_rows = Vec::new();
     let output_cols = build_output_columns(&stmt.columns, columns);
@@ -61,6 +64,7 @@ pub(super) fn exec_aggregate(
                         group_rows,
                         cancel,
                         ctx.row_width,
+                        resolver,
                     )?;
                     result_row.push(val);
                 }
@@ -74,13 +78,18 @@ pub(super) fn exec_aggregate(
                 group_rows,
                 cancel,
                 ctx.row_width,
+                resolver,
             ) {
                 Ok(val) => is_truthy(&val),
                 Err(SqlError::ColumnNotFound(_)) => {
                     let output_map = ColumnMap::new(&output_cols);
-                    is_truthy(&eval_expr(
+                    is_truthy(&eval_group_output(
                         having,
                         &EvalCtx::new(&output_map, &result_row).with_cancel(cancel),
+                        &col_map,
+                        group_rows,
+                        ctx.row_width,
+                        resolver,
                     )?)
                 }
                 Err(e) => return Err(e),
@@ -101,6 +110,7 @@ pub(super) fn exec_aggregate(
                         group_rows,
                         cancel,
                         ctx.row_width,
+                        resolver,
                     )?,
                 };
                 key.push(value);
@@ -221,6 +231,7 @@ pub(super) fn group_for_windows(
         columns,
         stmt,
         cancel,
+        resolver,
         ..
     } = ctx;
     // Ordinary window queries need no group map. Construct it only if an
@@ -262,7 +273,7 @@ pub(super) fn group_for_windows(
         return Err(SqlError::Unsupported("window functions in GROUP BY".into()));
     }
     let mut grouped = Vec::new();
-    let groups = group_rows(rows, &group_exprs, &col_map, cancel)?;
+    let groups = group_rows(rows, &group_exprs, &col_map, cancel, resolver)?;
     for (group_idx, group) in groups.iter().enumerate() {
         check_cancel_at(cancel, group_idx)?;
         if let Some(having) = &stmt.having {
@@ -274,6 +285,7 @@ pub(super) fn group_for_windows(
                 group,
                 cancel,
                 ctx.row_width,
+                resolver,
             )? {
                 continue;
             }
@@ -289,6 +301,7 @@ pub(super) fn group_for_windows(
                 group,
                 cancel,
                 ctx.row_width,
+                resolver,
             )?);
         }
         grouped.push(row);
@@ -418,8 +431,9 @@ fn having_keeps(
     group: &[&Vec<Value>],
     cancel: Option<&citadel::CancelToken>,
     row_width: usize,
+    resolver: Option<&dyn InputResolver>,
 ) -> Result<bool> {
-    match eval_aggregate_expr_with_cancel(having, col_map, group, cancel, row_width) {
+    match eval_aggregate_expr_with_cancel(having, col_map, group, cancel, row_width, resolver) {
         Ok(value) => Ok(is_truthy(&value)),
         Err(SqlError::ColumnNotFound(_)) => {
             let outputs: Vec<SelectColumn> = stmt
@@ -435,17 +449,58 @@ fn having_keeps(
             for column in &outputs {
                 if let SelectColumn::Expr { expr, .. } = column {
                     values.push(eval_aggregate_expr_with_cancel(
-                        expr, col_map, group, cancel, row_width,
+                        expr, col_map, group, cancel, row_width, resolver,
                     )?);
                 }
             }
             let output_columns = build_output_columns(&outputs, columns);
             let output_map = ColumnMap::new(&output_columns);
             let ctx = EvalCtx::new(&output_map, &values).with_cancel(cancel);
-            Ok(is_truthy(&eval_expr(having, &ctx)?))
+            Ok(is_truthy(&eval_group_output(
+                having, &ctx, col_map, group, row_width, resolver,
+            )?))
         }
         Err(error) => Err(error),
     }
+}
+
+/// Output aliases resolve in the projected row, but a captured query still
+/// binds the original group's input columns.
+fn eval_group_output(
+    expr: &Expr,
+    output: &EvalCtx<'_>,
+    input_columns: &ColumnMap,
+    group: &[&Vec<Value>],
+    row_width: usize,
+    resolver: Option<&dyn InputResolver>,
+) -> Result<Value> {
+    let Some(resolver) = resolver else {
+        return eval_expr_with_resolver(expr, output, None);
+    };
+    struct GroupInput<'input, 'resolver> {
+        input: EvalCtx<'input>,
+        resolver: &'resolver dyn InputResolver,
+    }
+
+    impl InputResolver for GroupInput<'_, '_> {
+        fn resolve(&self, index: usize, _: &EvalCtx<'_>) -> Result<Option<Value>> {
+            self.resolver.resolve(index, &self.input)
+        }
+    }
+
+    let nulls;
+    let input_row: &[Value] = match group.first() {
+        Some(row) => row,
+        None => {
+            nulls = vec![Value::Null; row_width];
+            &nulls
+        }
+    };
+    let input = GroupInput {
+        input: EvalCtx::new(input_columns, input_row).with_cancel(output.cancel),
+        resolver,
+    };
+    eval_expr_with_resolver(expr, output, Some(&input))
 }
 
 /// Each group's rows, in group key order. Without GROUP BY every row is in
@@ -455,6 +510,7 @@ fn group_rows<'r>(
     group_exprs: &[&Expr],
     col_map: &ColumnMap,
     cancel: Option<&citadel::CancelToken>,
+    resolver: Option<&dyn InputResolver>,
 ) -> Result<Vec<Vec<&'r Vec<Value>>>> {
     if group_exprs.is_empty() {
         if cancel.is_none() {
@@ -482,7 +538,9 @@ fn group_rows<'r>(
         let group_key: Vec<Value> = group_exprs
             .iter()
             .zip(&group_colls)
-            .map(|(expr, coll)| eval_expr(expr, &ctx).map(|v| coll.group_key(v)))
+            .map(|(expr, coll)| {
+                eval_expr_with_resolver(expr, &ctx, resolver).map(|v| coll.group_key(v))
+            })
             .collect::<Result<_>>()?;
         groups.entry(group_key).or_default().push(row);
     }
@@ -535,7 +593,7 @@ pub(super) fn eval_aggregate_expr(
     col_map: &ColumnMap,
     group_rows: &[&Vec<Value>],
 ) -> Result<Value> {
-    eval_aggregate_expr_with_cancel(expr, col_map, group_rows, None, col_map.len())
+    eval_aggregate_expr_with_cancel(expr, col_map, group_rows, None, col_map.len(), None)
 }
 
 fn first_non_null_is_interval(
@@ -560,11 +618,12 @@ fn eval_aggregate_expr_with_cancel(
     group_rows: &[&Vec<Value>],
     cancel: Option<&citadel::CancelToken>,
     row_width: usize,
+    resolver: Option<&dyn InputResolver>,
 ) -> Result<Value> {
     check_cancel(cancel)?;
     let reduced;
     let expr = if is_aggregate_expr(expr) {
-        reduced = reduce_aggregates(expr, col_map, group_rows, cancel)?;
+        reduced = reduce_aggregates(expr, col_map, group_rows, cancel, resolver)?;
         &reduced
     } else {
         expr
@@ -577,7 +636,11 @@ fn eval_aggregate_expr_with_cancel(
             &nulls
         }
     };
-    eval_expr(expr, &EvalCtx::new(col_map, row).with_cancel(cancel))
+    eval_expr_with_resolver(
+        expr,
+        &EvalCtx::new(col_map, row).with_cancel(cancel),
+        resolver,
+    )
 }
 
 /// A copy of `expr` with each aggregate call replaced by its value over the
@@ -587,8 +650,9 @@ fn reduce_aggregates(
     col_map: &ColumnMap,
     group_rows: &[&Vec<Value>],
     cancel: Option<&citadel::CancelToken>,
+    resolver: Option<&dyn InputResolver>,
 ) -> Result<Expr> {
-    let reduce = |expr: &Expr| reduce_aggregates(expr, col_map, group_rows, cancel);
+    let reduce = |expr: &Expr| reduce_aggregates(expr, col_map, group_rows, cancel, resolver);
     let boxed = |expr: &Expr| reduce(expr).map(Box::new);
     let all = |exprs: &[Expr]| exprs.iter().map(reduce).collect::<Result<Vec<_>>>();
     Ok(match expr {
@@ -606,6 +670,7 @@ fn reduce_aggregates(
             col_map,
             group_rows,
             cancel,
+            resolver,
         )?),
         Expr::Function {
             name,
@@ -748,12 +813,13 @@ fn filter_rows<'r>(
     col_map: &ColumnMap,
     group_rows: &[&'r Vec<Value>],
     cancel: Option<&citadel::CancelToken>,
+    resolver: Option<&dyn InputResolver>,
 ) -> Result<Vec<&'r Vec<Value>>> {
     let mut passing = Vec::with_capacity(group_rows.len());
     for (row_idx, row) in group_rows.iter().enumerate() {
         check_cancel_at(cancel, row_idx)?;
         let ctx = EvalCtx::new(col_map, row).with_cancel(cancel);
-        if is_truthy(&eval_expr(filter, &ctx)?) {
+        if is_truthy(&eval_expr_with_resolver(filter, &ctx, resolver)?) {
             passing.push(*row);
         }
     }
@@ -762,6 +828,7 @@ fn filter_rows<'r>(
 
 /// The value of aggregate `name` over the group's rows, or over those its
 /// FILTER holds for.
+#[allow(clippy::too_many_arguments)]
 fn aggregate_value(
     name: &str,
     args: &[Expr],
@@ -770,11 +837,12 @@ fn aggregate_value(
     col_map: &ColumnMap,
     group_rows: &[&Vec<Value>],
     cancel: Option<&citadel::CancelToken>,
+    resolver: Option<&dyn InputResolver>,
 ) -> Result<Value> {
     let passing;
     let group_rows = match filter {
         Some(filter) => {
-            passing = filter_rows(filter, col_map, group_rows, cancel)?;
+            passing = filter_rows(filter, col_map, group_rows, cancel, resolver)?;
             passing.as_slice()
         }
         None => group_rows,
@@ -802,8 +870,8 @@ fn aggregate_value(
         for (row_idx, row) in group_rows.iter().enumerate() {
             check_cancel_at(cancel, row_idx)?;
             let ctx = EvalCtx::new(col_map, row).with_cancel(cancel);
-            let k = eval_expr(&args[0], &ctx)?;
-            let v = eval_expr(&args[1], &ctx)?;
+            let k = eval_expr_with_resolver(&args[0], &ctx, resolver)?;
+            let v = eval_expr_with_resolver(&args[1], &ctx, resolver)?;
             pairs.push((k, v));
         }
         let target = if func == "JSONB_OBJECT_AGG" {
@@ -825,9 +893,10 @@ fn aggregate_value(
     let mut values: Vec<Value> = Vec::with_capacity(group_rows.len());
     for (row_idx, row) in group_rows.iter().enumerate() {
         check_cancel_at(cancel, row_idx)?;
-        values.push(eval_expr(
+        values.push(eval_expr_with_resolver(
             arg,
             &EvalCtx::new(col_map, row).with_cancel(cancel),
+            resolver,
         )?);
     }
     if distinct {

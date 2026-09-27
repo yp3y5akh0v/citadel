@@ -28,10 +28,12 @@ impl Scope {
 
 /// The sources of the statement whose row a correlated subquery captures, in
 /// the order their columns appear in that row.
+#[derive(Clone)]
 pub(in crate::executor) struct OuterScope {
     relations: Vec<OuterRelation>,
 }
 
+#[derive(Clone)]
 struct OuterRelation {
     qualifiers: Vec<String>,
     columns: Vec<(String, Collation)>,

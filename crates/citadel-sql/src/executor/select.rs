@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use citadel::CancelToken;
-use citadel_txn::read_txn::ReadTxn;
+use citadel_txn::read_txn::{ReadTxn, ReadView};
 use rustc_hash::FxHashMap;
 
 use crate::encoding::{
@@ -9,7 +9,10 @@ use crate::encoding::{
     RawColumn,
 };
 use crate::error::{Result, SqlError};
-use crate::eval::{eval_expr, is_truthy, referenced_columns, ColumnMap, EvalCtx};
+use crate::eval::{
+    eval_expr, eval_expr_with_resolver, is_truthy, referenced_columns, ColumnMap, EvalCtx,
+    InputResolver,
+};
 use crate::parser::*;
 use crate::schema::SchemaManager;
 use crate::types::*;
@@ -107,7 +110,7 @@ fn choose_strategy_with_cancel(
 }
 
 pub(super) fn exec_select_with_read(
-    rtx: &mut ReadTxn<'_>,
+    rtx: &mut ReadView<'_, '_>,
     schema: &SchemaManager,
     stmt: &SelectStmt,
     ctes: &CteContext,
@@ -118,15 +121,20 @@ pub(super) fn exec_select_with_read(
     let cancel = rtx.cancel_token().cloned();
     let cancel = cancel.as_ref();
     if stmt.from.is_empty() && stmt.from_subquery.is_none() {
-        let materialized;
-        let stmt = if stmt_has_subquery(stmt) {
-            materialized = materialize_stmt(stmt, &mut |sub| {
-                exec_subquery_with_read(rtx, schema, sub, ctes)
-            })?;
-            &materialized
-        } else {
-            stmt
-        };
+        if stmt_has_subquery(stmt) {
+            let outer = OuterScope::single("", None, &[]);
+            return finish_captured_select(
+                schema,
+                ctes,
+                stmt.clone(),
+                &outer,
+                vec![Vec::new()],
+                Vec::new(),
+                0,
+                cancel,
+                &mut |sub| exec_subquery_with_read(rtx, schema, sub, ctes),
+            );
+        }
         return exec_select_no_from(stmt, cancel);
     }
 
@@ -214,7 +222,7 @@ pub(super) fn exec_select_with_read(
                 stmt.from_alias.as_deref(),
                 &table_schema.columns,
             );
-            if captures_outer_row(schema, ctes, stmt, &outer, cancel)? {
+            if requires_subquery_runtime(schema, ctes, stmt, &outer, cancel)? {
                 return exec_correlated_scan_with_read(
                     rtx,
                     schema,
@@ -274,7 +282,18 @@ pub(super) fn exec_select_with_read(
                 rtx.table_scan_raw(lower.as_bytes(), |key, value| cb(key, value))
             });
         }
-        Strategy::AnnTopK(plan) => return plan.execute_with_read(rtx, schema, stmt, table_schema),
+        Strategy::AnnTopK(plan) if rtx.cache_generation().is_some() => {
+            return plan.execute_with_read(rtx, schema, stmt, table_schema);
+        }
+        Strategy::AnnTopK(_) => {
+            // A pending snapshot's local root stamp is not a committed ANN
+            // identity. Match writer execution: scan exact distances without
+            // consulting either the shared index or its persisted segment.
+            if let Some(plan) = super::ann_topk::VectorTopKPlan::try_new(stmt, table_schema)? {
+                return plan.execute(rtx, table_schema, stmt);
+            }
+            None
+        }
         Strategy::VectorTopK(plan) => return plan.execute(rtx, table_schema, stmt),
         Strategy::TopKScan(plan) => {
             let lower = lower_name.clone();
@@ -308,7 +327,7 @@ pub(super) fn exec_select_with_read(
 /// A join over CTEs, views and tables. `sources` resolves the joined names;
 /// subqueries run with the statement's own `ctes`.
 fn exec_join_sources_with_read(
-    rtx: &mut ReadTxn<'_>,
+    rtx: &mut ReadView<'_, '_>,
     schema: &SchemaManager,
     stmt: &SelectStmt,
     sources: &CteContext,
@@ -330,7 +349,7 @@ fn exec_join_sources_with_read(
 /// A SELECT over one view's rows. Hash decorrelation takes the WHERE shapes
 /// it reproduces exactly; every other subquery that reads the row runs per row.
 fn exec_select_from_view_with_read(
-    rtx: &mut ReadTxn<'_>,
+    rtx: &mut ReadView<'_, '_>,
     schema: &SchemaManager,
     stmt: &SelectStmt,
     ctes: &CteContext,
@@ -341,7 +360,7 @@ fn exec_select_from_view_with_read(
     let cancel = cancel.as_ref();
     let view_schema = build_view_schema(name, view_qr)?;
     let outer = OuterScope::single(&stmt.from, stmt.from_alias.as_deref(), &view_schema.columns);
-    if !stmt_has_subquery(stmt) || !captures_outer_row(schema, ctes, stmt, &outer, cancel)? {
+    if !stmt_has_subquery(stmt) || !requires_subquery_runtime(schema, ctes, stmt, &outer, cancel)? {
         return exec_select_from_cte(
             schema,
             ctes,
@@ -378,7 +397,7 @@ fn exec_select_from_view_with_read(
 /// takes the shapes it reproduces exactly; every other subquery that reads
 /// the row runs per row.
 fn exec_correlated_scan_with_read(
-    rtx: &mut ReadTxn<'_>,
+    rtx: &mut ReadView<'_, '_>,
     schema: &SchemaManager,
     stmt: &SelectStmt,
     ctes: &CteContext,
@@ -428,7 +447,7 @@ fn exec_correlated_scan_with_read(
 /// row keeps every column, since such a subquery may read any of them.
 /// Returns None when no subquery reads the joined row.
 fn exec_correlated_join_with_read(
-    rtx: &mut ReadTxn<'_>,
+    rtx: &mut ReadView<'_, '_>,
     schema: &SchemaManager,
     stmt: &SelectStmt,
     ctes: &CteContext,
@@ -437,13 +456,21 @@ fn exec_correlated_join_with_read(
     let cancel = cancel.as_ref();
     let tables = super::join_tables(schema, stmt)?;
     let outer = joined_scope(stmt, &tables);
-    if !captures_outer_row(schema, ctes, stmt, &outer, cancel)? {
+    if !requires_subquery_runtime(schema, ctes, stmt, &outer, cancel)? {
         return Ok(None);
     }
     let mut stmt = stmt.clone();
     materialize_join_conditions(schema, ctes, &mut stmt, &outer, cancel, &mut |sub| {
         exec_subquery_with_read(rtx, schema, sub, ctes)
     })?;
+    if stmt.joins.iter().any(|join| {
+        join.on_clause
+            .as_ref()
+            .is_some_and(super::dml::has_conditional_subquery)
+    }) {
+        // Load source rows before a lazy ON query borrows the same reader.
+        return exec_join_sources_with_read(rtx, schema, &stmt, ctes, ctes).map(Some);
+    }
     let (rows, columns) = super::join_rows_with_read(rtx, &stmt, &tables, None)?;
     let row_width = columns.len();
     finish_captured_select(
@@ -475,7 +502,7 @@ pub(super) fn joined_scope(stmt: &SelectStmt, tables: &[(String, &TableSchema)])
 /// The streaming-aggregate lane, lifted out of the strategy match so that arm
 /// stays one line like the others.
 fn exec_stream_agg(
-    rtx: &mut ReadTxn<'_>,
+    rtx: &mut ReadView<'_, '_>,
     stmt: &SelectStmt,
     table_schema: &TableSchema,
     lower_name: &str,
@@ -736,7 +763,7 @@ fn ts_rank_probe_indices(
 }
 
 fn try_inverted_ts_rank_topk_with_read(
-    rtx: &mut ReadTxn<'_>,
+    rtx: &mut ReadView<'_, '_>,
     table_schema: &TableSchema,
     stmt: &SelectStmt,
 ) -> Result<Option<ExecutionResult>> {
@@ -1021,7 +1048,7 @@ fn try_inverted_ts_rank_topk_with_read(
 }
 
 fn try_inverted_index_only_with_read(
-    rtx: &mut ReadTxn<'_>,
+    rtx: &mut ReadView<'_, '_>,
     table_schema: &TableSchema,
     stmt: &SelectStmt,
 ) -> Result<Option<ExecutionResult>> {
@@ -2273,7 +2300,7 @@ const MIN_PARALLEL_LEAVES: usize = 256;
 /// `Ok(None)` means "run the serial scan".
 #[cfg(not(target_arch = "wasm32"))]
 fn try_parallel_stream_agg(
-    rtx: &ReadTxn<'_>,
+    rtx: &ReadView<'_, '_>,
     plan: &StreamAggPlan,
     leaves: &citadel_txn::read_txn::LeafPages,
 ) -> Result<Option<Vec<AggState>>> {
@@ -2285,7 +2312,7 @@ fn try_parallel_stream_agg(
 
 #[cfg(target_arch = "wasm32")]
 fn try_parallel_stream_agg(
-    _rtx: &ReadTxn<'_>,
+    _rtx: &ReadView<'_, '_>,
     _plan: &StreamAggPlan,
     _leaves: &citadel_txn::read_txn::LeafPages,
 ) -> Result<Option<Vec<AggState>>> {
@@ -2298,7 +2325,7 @@ fn try_parallel_stream_agg(
 /// tables; production dispatch goes through `try_parallel_stream_agg`.
 #[cfg(not(target_arch = "wasm32"))]
 pub(super) fn parallel_stream_agg_sharded(
-    rtx: &ReadTxn<'_>,
+    rtx: &ReadView<'_, '_>,
     plan: &StreamAggPlan,
     leaves: &citadel_txn::read_txn::LeafPages,
     leaves_per_shard: usize,
@@ -3009,7 +3036,7 @@ enum DistinctSource {
 /// scan decoding only the selected columns, deduplicated by the same keys as the general
 /// DISTINCT.
 fn try_streaming_distinct_with_read(
-    rtx: &mut ReadTxn<'_>,
+    rtx: &mut ReadView<'_, '_>,
     stmt: &SelectStmt,
     table_schema: &TableSchema,
     cancel: Option<&CancelToken>,
@@ -3149,11 +3176,11 @@ pub(super) trait LateralIo {
     ) -> Result<(TableSchema, Vec<Vec<Value>>)>;
 }
 
-pub(super) struct ReadHeldIo<'a, 'db: 'a> {
-    pub rtx: &'a mut ReadTxn<'db>,
+pub(super) struct ReadHeldIo<'a, 'view, 'db> {
+    pub rtx: &'a mut ReadView<'view, 'db>,
 }
 
-impl LateralIo for ReadHeldIo<'_, '_> {
+impl LateralIo for ReadHeldIo<'_, '_, '_> {
     fn exec_select(
         &mut self,
         schema: &SchemaManager,
@@ -3438,7 +3465,7 @@ fn populate_record_dispatch(
 }
 
 fn exec_select_with_derived_with_read(
-    rtx: &mut ReadTxn<'_>,
+    rtx: &mut ReadView<'_, '_>,
     schema: &SchemaManager,
     stmt: &SelectStmt,
     ctes: &CteContext,
@@ -3449,7 +3476,7 @@ fn exec_select_with_derived_with_read(
 }
 
 fn exec_select_lateral_with_read(
-    rtx: &mut ReadTxn<'_>,
+    rtx: &mut ReadView<'_, '_>,
     schema: &SchemaManager,
     stmt: &SelectStmt,
     ctes: &CteContext,
@@ -3523,25 +3550,55 @@ fn exec_select_lateral_with_io(
                 )?),
                 None => None,
             };
+            let expressions = on_clause
+                .as_ref()
+                .filter(|condition| super::dml::has_conditional_subquery(condition))
+                .map(|condition| {
+                    super::correlated::RowExpressions::new(
+                        schema,
+                        ctes,
+                        vec![condition.clone()],
+                        lateral_outer_scope(&sources),
+                        combined_cols.len(),
+                        cancel,
+                    )
+                })
+                .transpose()?;
             let step = JoinClause {
                 join_type: join.join_type,
                 table: join.table.clone(),
                 subquery: None,
-                on_clause,
+                on_clause: expressions
+                    .as_ref()
+                    .map(|expressions| expressions.expressions[0].clone())
+                    .or(on_clause),
             };
             let equi = super::join::compute_equi_join_meta(&step, &combined_cols, outer_col_count);
-            outer_rows = super::join::exec_join_step(
-                std::mem::take(&mut outer_rows),
-                &mut inner_rows,
-                &step,
-                &combined_cols,
-                outer_col_count,
-                inner_col_count,
-                None,
-                None,
-                &equi,
-                cancel,
-            )?;
+            let run = |resolver: Option<&dyn InputResolver>| {
+                super::join::exec_join_step(
+                    outer_rows,
+                    &mut inner_rows,
+                    &step,
+                    &combined_cols,
+                    outer_col_count,
+                    inner_col_count,
+                    None,
+                    None,
+                    &equi,
+                    cancel,
+                    resolver,
+                )
+            };
+            outer_rows = match &expressions {
+                Some(expressions) => expressions.with_resolver(
+                    schema,
+                    ctes,
+                    cancel,
+                    &mut |sub| io.exec_subquery(schema, sub, ctes),
+                    |resolver| run(Some(resolver)),
+                )?,
+                None => run(None)?,
+            };
             continue;
         };
 
@@ -3628,7 +3685,11 @@ fn lateral_join_condition(
             "a subquery in a JOIN condition that reads a joined row".into(),
         ));
     }
-    materialize_expr(condition, &mut |sub| io.exec_subquery(schema, sub, ctes))
+    if super::dml::has_conditional_subquery(condition) {
+        Ok(condition.clone())
+    } else {
+        materialize_expr(condition, &mut |sub| io.exec_subquery(schema, sub, ctes))
+    }
 }
 
 /// A derived table or a relation in the FROM of a query with LATERAL, and its
@@ -3809,7 +3870,14 @@ fn lateral_rows_per_outer_row(
     let relation_columns =
         |inner: &QueryResult| lateral_column_names(&derived.query.body, inner.columns.clone());
     let mut columns = closed.as_ref().map(relation_columns);
-    let mut on: Option<(Expr, ColumnMap)> = None;
+    struct OnPredicate {
+        expression: Expr,
+        columns: ColumnMap,
+        // Retained across all outer iterations, including a closed volatile
+        // subquery's statement-scoped materialized result.
+        subqueries: Option<super::correlated::RowExpressions>,
+    }
+    let mut on: Option<OnPredicate> = None;
     let mut rows = Vec::new();
     let mut expansion_work = 0usize;
     for (outer_idx, outer_row) in outer_rows.into_iter().enumerate() {
@@ -3837,7 +3905,24 @@ fn lateral_rows_per_outer_row(
                 io,
                 cancel,
             )?;
-            on = Some((condition, ColumnMap::new(&lateral_row_columns(visible()))));
+            let columns = lateral_row_columns(visible());
+            let subqueries = super::dml::has_conditional_subquery(&condition)
+                .then(|| {
+                    super::correlated::RowExpressions::new(
+                        schema,
+                        ctes,
+                        vec![condition.clone()],
+                        lateral_outer_scope(visible()),
+                        columns.len(),
+                        cancel,
+                    )
+                })
+                .transpose()?;
+            on = Some(OnPredicate {
+                expression: condition,
+                columns: ColumnMap::new(&columns),
+                subqueries,
+            });
         }
         let mut matched = false;
         for inner_row in &inner.rows {
@@ -3845,9 +3930,15 @@ fn lateral_rows_per_outer_row(
             expansion_work += 1;
             let mut combined = outer_row.clone();
             combined.extend(inner_row.iter().cloned());
-            if let Some((condition, on_columns)) = &on {
-                let ctx = EvalCtx::new(on_columns, &combined).with_cancel(cancel);
-                if !is_truthy(&eval_expr(condition, &ctx)?) {
+            if let Some(condition) = &on {
+                let ctx = EvalCtx::new(&condition.columns, &combined).with_cancel(cancel);
+                let value = match &condition.subqueries {
+                    Some(expressions) => expressions.eval(0, schema, ctes, &ctx, &mut |sub| {
+                        io.exec_subquery(schema, sub, ctes)
+                    })?,
+                    None => eval_expr(&condition.expression, &ctx)?,
+                };
+                if !is_truthy(&value) {
                     continue;
                 }
             }
@@ -4176,6 +4267,7 @@ fn extract_pre_projection_sort_keys(
     order_by: &[OrderByItem],
     columns: &[ColumnDef],
     cancel: Option<&citadel::CancelToken>,
+    resolver: Option<&dyn InputResolver>,
 ) -> Result<Vec<Vec<Value>>> {
     let col_map = ColumnMap::new(columns);
     let mut keys = Vec::with_capacity(rows.len());
@@ -4188,7 +4280,11 @@ fn extract_pre_projection_sort_keys(
                     if order_by_uses_projected_output(item) {
                         Ok(Value::Null)
                     } else {
-                        eval_expr(&item.expr, &EvalCtx::new(&col_map, row).with_cancel(cancel))
+                        eval_expr_with_resolver(
+                            &item.expr,
+                            &EvalCtx::new(&col_map, row).with_cancel(cancel),
+                            resolver,
+                        )
                     }
                 })
                 .collect::<Result<Vec<_>>>()?,
@@ -4270,9 +4366,10 @@ pub(super) fn process_select(
             let mut keep = Vec::with_capacity(rows.len());
             for (row_idx, row) in rows.iter().enumerate() {
                 check_cancel_at(ctx.cancel, row_idx)?;
-                let value = eval_expr(
+                let value = eval_expr_with_resolver(
                     where_expr,
                     &EvalCtx::new(&col_map, row).with_cancel(ctx.cancel),
+                    ctx.resolver,
                 )?;
                 keep.push(is_truthy(&value));
             }
@@ -4296,6 +4393,7 @@ pub(super) fn process_select(
                 grouped_rows,
                 SelectCtx::new(columns, &grouped_stmt, ctx.cancel)
                     .row_width(row_width)
+                    .with_resolver(ctx.resolver)
                     .predicate_applied(true),
             );
         }
@@ -4320,10 +4418,11 @@ pub(super) fn process_select(
                 &stmt.order_by,
                 columns,
                 ctx.cancel,
+                ctx.resolver,
             )?)
         };
         let (col_names, mut projected) =
-            project_rows_with_cancel(columns, &stmt.columns, rows, ctx.cancel)?;
+            project_rows_with_resolver(columns, &stmt.columns, rows, ctx.cancel, ctx.resolver)?;
         if let Some(keys) = &mut sort_keys {
             fill_projected_sort_keys(
                 keys,
@@ -4405,10 +4504,15 @@ pub(super) fn process_select(
 
     if stmt.order_by.iter().any(order_by_uses_projected_output) {
         let output_columns = build_output_columns(&stmt.columns, columns);
-        let mut sort_keys =
-            extract_pre_projection_sort_keys(&rows, &stmt.order_by, columns, ctx.cancel)?;
+        let mut sort_keys = extract_pre_projection_sort_keys(
+            &rows,
+            &stmt.order_by,
+            columns,
+            ctx.cancel,
+            ctx.resolver,
+        )?;
         let (col_names, mut projected) =
-            project_rows_with_cancel(columns, &stmt.columns, rows, ctx.cancel)?;
+            project_rows_with_resolver(columns, &stmt.columns, rows, ctx.cancel, ctx.resolver)?;
         fill_projected_sort_keys(
             &mut sort_keys,
             &projected,
@@ -4487,13 +4591,26 @@ pub(super) fn process_select(
             if keep == 0 {
                 rows.clear();
             } else if keep < rows.len() {
-                topk_rows(&mut rows, &stmt.order_by, columns, keep, ctx.cancel)?;
+                topk_rows_with_resolver(
+                    &mut rows,
+                    &stmt.order_by,
+                    columns,
+                    keep,
+                    ctx.cancel,
+                    ctx.resolver,
+                )?;
                 rows.truncate(keep);
             } else {
-                sort_rows(&mut rows, &stmt.order_by, columns, ctx.cancel)?;
+                sort_rows_with_resolver(
+                    &mut rows,
+                    &stmt.order_by,
+                    columns,
+                    ctx.cancel,
+                    ctx.resolver,
+                )?;
             }
         } else {
-            sort_rows(&mut rows, &stmt.order_by, columns, ctx.cancel)?;
+            sort_rows_with_resolver(&mut rows, &stmt.order_by, columns, ctx.cancel, ctx.resolver)?;
         }
     }
 
@@ -4512,7 +4629,7 @@ pub(super) fn process_select(
     }
 
     let (col_names, projected) =
-        project_rows_with_cancel(columns, &stmt.columns, rows, ctx.cancel)?;
+        project_rows_with_resolver(columns, &stmt.columns, rows, ctx.cancel, ctx.resolver)?;
     ctx.check()?;
 
     Ok(ExecutionResult::Query(QueryResult {
@@ -4740,7 +4857,7 @@ fn build_select_lane(schema: &SchemaManager, sel: &SelectStmt) -> Option<Compile
 }
 
 impl CompiledSelectLane {
-    fn run(&self, rtx: &mut ReadTxn<'_>) -> Result<QueryResult> {
+    fn run(&self, rtx: &mut ReadView<'_, '_>) -> Result<QueryResult> {
         match self {
             CompiledSelectLane::Point(p) => p.run(rtx),
             CompiledSelectLane::Scan(s) => s.run(rtx),
@@ -4760,7 +4877,7 @@ pub(super) fn select_would_cover(schema: &SchemaManager, sel: &SelectStmt) -> bo
 }
 
 impl SimpleScanPlan {
-    fn run(&self, rtx: &mut ReadTxn<'_>) -> Result<QueryResult> {
+    fn run(&self, rtx: &mut ReadView<'_, '_>) -> Result<QueryResult> {
         let cancel = rtx.cancel_token().cloned();
         let cancel = cancel.as_ref();
         let plan = crate::planner::plan_select_inverted(&self.table_schema, &self.where_expr);
@@ -4833,7 +4950,7 @@ impl SimpleScanPlan {
 }
 
 impl PkPointPlan {
-    fn run(&self, rtx: &mut ReadTxn<'_>) -> Result<QueryResult> {
+    fn run(&self, rtx: &mut ReadView<'_, '_>) -> Result<QueryResult> {
         let cancel = rtx.cancel_token().cloned();
         let cancel = cancel.as_ref();
         let decoder = self
@@ -5089,7 +5206,7 @@ impl CompiledSelect {
             return Ok(ExecutionResult::Query(qr));
         }
         if let Some(lane) = &self.lane {
-            let qr = lane.run(rtx)?;
+            let qr = lane.run(&mut rtx.view())?;
             slot.store(gen, params, &qr);
             return Ok(ExecutionResult::Query(qr));
         }
@@ -5103,7 +5220,7 @@ impl CompiledSelect {
             };
             execute_cached_join_with_read(rtx, plan, cache, sel)?
         } else {
-            exec_select_query_with_read(rtx, schema, sq)?
+            exec_select_query_with_read(&mut rtx.view(), schema, sq)?
         };
         if let ExecutionResult::Query(ref qr) = result {
             slot.store(gen, params, qr);
@@ -5137,7 +5254,7 @@ impl CompiledPlan for CompiledSelect {
                     return self.execute_cached_read(schema, sq, params, slot, rtx);
                 }
                 if let Some(lane) = &self.lane {
-                    return Ok(ExecutionResult::Query(lane.run(rtx)?));
+                    return Ok(ExecutionResult::Query(lane.run(&mut rtx.view())?));
                 }
                 if let (Some(plan), Some(cache)) = (&self.compound_plan, &self.compound_cache) {
                     return execute_cached_compound_with_read(rtx, plan, cache);
@@ -5149,7 +5266,7 @@ impl CompiledPlan for CompiledSelect {
                     };
                     return execute_cached_join_with_read(rtx, plan, cache, sel);
                 }
-                exec_select_query_with_read(rtx, schema, sq)
+                exec_select_query_with_read(&mut rtx.view(), schema, sq)
             }
             // A writer must observe its own pending changes, never a read cache.
             ActiveTxnRef::Write(outer) => exec_select_query_in_txn(outer, schema, sq),
@@ -5706,6 +5823,7 @@ fn execute_cached_join_with_read(
     let cancel = rtx.cancel_token().cloned();
     let cancel = cancel.as_ref();
     let snapshot_gen = rtx.commit_generation();
+    let rtx = &mut rtx.view();
 
     let cached: Arc<CachedJoin> = {
         let mut slot = cache.write();
@@ -5829,7 +5947,7 @@ fn execute_cached_join_with_read(
 }
 
 fn build_inner_data(
-    rtx: &mut citadel_txn::read_txn::ReadTxn<'_>,
+    rtx: &mut citadel_txn::read_txn::ReadView<'_, '_>,
     plan: &Arc<JoinPlanStatic>,
 ) -> Result<Vec<Vec<Vec<Value>>>> {
     let mut out = Vec::with_capacity(plan.table_lowers.len() - 1);
@@ -5984,6 +6102,7 @@ fn execute_cached_compound_with_read(
     let cancel = cancel.as_ref();
     check_cancel(cancel)?;
     let snapshot_gen = rtx.commit_generation();
+    let rtx = &mut rtx.view();
 
     let cached: Arc<CachedCompound> = {
         let mut slot = cache.write();
@@ -6125,7 +6244,7 @@ fn execute_cached_compound_with_read(
 }
 
 fn build_compound_branches(
-    rtx: &mut citadel_txn::read_txn::ReadTxn<'_>,
+    rtx: &mut citadel_txn::read_txn::ReadView<'_, '_>,
     plan: &Arc<CompoundPlanStatic>,
     cancel: Option<&CancelToken>,
 ) -> Result<Vec<Vec<Vec<Value>>>> {

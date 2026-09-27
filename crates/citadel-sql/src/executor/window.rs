@@ -4,7 +4,9 @@ use std::ops::Range;
 use rustc_hash::FxHashMap;
 
 use crate::error::{Result, SqlError};
-use crate::eval::{collation_of, eval_expr, operand_collation, ColumnMap, EvalCtx};
+use crate::eval::{
+    collation_of, eval_expr_with_resolver, operand_collation, ColumnMap, EvalCtx, InputResolver,
+};
 use crate::parser::*;
 use crate::types::*;
 
@@ -87,7 +89,16 @@ pub(super) fn has_window_function(expr: &Expr) -> bool {
         | Expr::IsNull(e)
         | Expr::IsNotNull(e)
         | Expr::Cast { expr: e, .. } => has_window_function(e),
-        Expr::Function { args, .. } | Expr::Coalesce(args) => args.iter().any(has_window_function),
+        Expr::Function { args, .. } | Expr::Coalesce(args) | Expr::ArrayLiteral(args) => {
+            args.iter().any(has_window_function)
+        }
+        Expr::Quantified { left, right, .. } => {
+            has_window_function(left)
+                || match right {
+                    QuantifiedRhs::Array(expr) => has_window_function(expr),
+                    QuantifiedRhs::Subquery(_) => false,
+                }
+        }
         Expr::Case {
             operand,
             conditions,
@@ -186,6 +197,29 @@ pub(super) fn extract_window_fns(
                 .map(|a| extract_window_fns(a, slot_counter, extracted, col_map))
                 .collect(),
         ),
+        Expr::ArrayLiteral(args) => Expr::ArrayLiteral(
+            args.iter()
+                .map(|arg| extract_window_fns(arg, slot_counter, extracted, col_map))
+                .collect(),
+        ),
+        Expr::Quantified {
+            left,
+            op,
+            quantifier,
+            right,
+        } => {
+            Expr::Quantified {
+                left: Box::new(extract_window_fns(left, slot_counter, extracted, col_map)),
+                op: *op,
+                quantifier: *quantifier,
+                right: match right {
+                    QuantifiedRhs::Array(expr) => QuantifiedRhs::Array(Box::new(
+                        extract_window_fns(expr, slot_counter, extracted, col_map),
+                    )),
+                    QuantifiedRhs::Subquery(query) => QuantifiedRhs::Subquery(query.clone()),
+                },
+            }
+        }
         Expr::Case {
             operand,
             conditions,
@@ -906,6 +940,7 @@ impl WindowOrder {
         rows: &[Vec<Value>],
         col_map: &ColumnMap,
         cancel: Option<&citadel::CancelToken>,
+        resolver: Option<&dyn InputResolver>,
     ) -> Result<Self> {
         note_window_order_build();
         let mut sort_keys: Vec<OrderByItem> = spec
@@ -932,7 +967,11 @@ impl WindowOrder {
                 check_cancel_at(cancel, position)?;
                 note_window_key_evaluation();
                 keys.push_row(sort_keys.iter().map(|item| {
-                    eval_expr(&item.expr, &EvalCtx::new(col_map, row).with_cancel(cancel))
+                    eval_expr_with_resolver(
+                        &item.expr,
+                        &EvalCtx::new(col_map, row).with_cancel(cancel),
+                        resolver,
+                    )
                 }))?;
             }
             sort_indices_by(&mut indices, cancel, |a, b| {
@@ -1011,6 +1050,7 @@ impl WindowOrders {
         Ok(Self { groups, slots })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn get_or_build(
         &mut self,
         index: usize,
@@ -1018,11 +1058,12 @@ impl WindowOrders {
         rows: &[Vec<Value>],
         col_map: &ColumnMap,
         cancel: Option<&citadel::CancelToken>,
+        resolver: Option<&dyn InputResolver>,
     ) -> Result<&WindowOrder> {
         check_cancel(cancel)?;
         let slot = &mut self.slots[self.groups[index]];
         if slot.order.is_none() {
-            slot.order = Some(WindowOrder::build(spec, rows, col_map, cancel)?);
+            slot.order = Some(WindowOrder::build(spec, rows, col_map, cancel, resolver)?);
         }
         Ok(slot.order.as_ref().unwrap())
     }
@@ -1044,6 +1085,7 @@ pub(super) fn eval_window_select(
         columns,
         stmt,
         cancel,
+        resolver,
         ..
     } = ctx;
     let col_map = ColumnMap::new(columns);
@@ -1106,7 +1148,11 @@ pub(super) fn eval_window_select(
             check_cancel_at(cancel, row_idx)?;
             per_row.push_row(args.iter().map(|a| {
                 note_window_argument_evaluation();
-                eval_expr(a, &EvalCtx::new(&col_map, row).with_cancel(cancel))
+                eval_expr_with_resolver(
+                    a,
+                    &EvalCtx::new(&col_map, row).with_cancel(cancel),
+                    resolver,
+                )
             }))?;
         }
         arg_values.push(per_row);
@@ -1127,7 +1173,7 @@ pub(super) fn eval_window_select(
             keys,
             key_collations,
             partitions,
-        } = orders.get_or_build(win_idx, spec, &rows, &col_map, cancel)?;
+        } = orders.get_or_build(win_idx, spec, &rows, &col_map, cancel, resolver)?;
         let part_count = spec.partition_by.len();
         let order_collations = &key_collations[part_count..];
 
@@ -1454,6 +1500,7 @@ pub(super) fn eval_window_select(
         rows,
         super::SelectCtx::new(columns, &rewritten_stmt, ctx.cancel)
             .row_width(slot_counter)
+            .with_resolver(resolver)
             .predicate_applied(true),
     )
 }

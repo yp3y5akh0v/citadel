@@ -1344,7 +1344,7 @@ fn point_lookup_does_not_turn_scalar_cancellation_into_no_match() {
     let mut rtx = db.begin_read();
     let _cancel = crate::fts::cancel_tokenize_after(token, 1);
     let err = collect_rows_with_read_planned(
-        &mut rtx,
+        &mut rtx.view(),
         table,
         &where_clause,
         None,

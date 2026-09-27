@@ -1,4 +1,4 @@
-use citadel_txn::read_txn::ReadTxn;
+use citadel_txn::read_txn::ReadView;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::encoding::{decode_column_raw, decode_composite_key, decode_pk_integer};
@@ -18,7 +18,7 @@ mod binding;
 #[path = "correlated_apply.rs"]
 mod apply;
 
-pub(super) use apply::apply_captured_subqueries;
+pub(super) use apply::RowExpressions;
 pub(super) use binding::{bind_outer_query, OuterScope};
 
 /// Unlike the conjunct-only decorrelator, mutation predicates may contain a
@@ -46,14 +46,15 @@ pub(super) fn mutation_has_correlated_expr(
     if !super::dml::has_subquery(expr) {
         return Ok(false);
     }
-    binding::bind_predicate(
-        wtx,
-        schema,
-        &CteContext::default(),
-        &mut expr.clone(),
-        ctx,
-        None,
-    )
+    Ok(super::dml::has_conditional_subquery(expr)
+        || binding::bind_predicate(
+            wtx,
+            schema,
+            &CteContext::default(),
+            &mut expr.clone(),
+            ctx,
+            None,
+        )?)
 }
 
 fn complete_exists_semijoin(
@@ -123,6 +124,9 @@ pub(super) fn materialize_closed_subqueries(
     expr: &Expr,
     ctx: &CorrelationCtx<'_>,
 ) -> Result<Expr> {
+    if super::dml::has_conditional_subquery(expr) {
+        return Ok(expr.clone());
+    }
     super::dml::materialize_expr_selective(expr, &mut |query| {
         let mut candidate = Expr::ScalarSubquery(Box::new(query.clone()));
         if binding::bind_predicate(wtx, schema, ctes, &mut candidate, ctx, None)? {
@@ -133,24 +137,18 @@ pub(super) fn materialize_closed_subqueries(
     })
 }
 
-/// UPDATE SET expressions whose subqueries read the target row, bound to one
-/// row at a time. A subquery runs once per distinct captured value unless it
-/// calls a volatile function.
-pub(super) struct SetRowBinder {
-    outer: OuterScope,
-    assignments: Vec<SetAssignment>,
+/// UPDATE SET expressions with correlated or conditional subqueries. Query
+/// results are shared by captured values; conditional branches are evaluated
+/// against the current target row.
+pub(super) struct SetRowBinder<'db> {
+    names: Vec<String>,
+    deferred: Vec<bool>,
+    columns: ColumnMap,
+    expressions: RowExpressions,
+    snapshot: Option<citadel_txn::read_txn::StatementReadTxn<'db>>,
 }
 
-struct SetAssignment {
-    name: String,
-    expr: Expr,
-    /// The row positions its subqueries read; None when they read none.
-    captured: Option<Vec<usize>>,
-    memo: Option<FxHashMap<Vec<Value>, Expr>>,
-}
-
-impl SetRowBinder {
-    /// None when no SET expression reads the row through a subquery.
+impl<'db> SetRowBinder<'db> {
     pub(super) fn new(
         schema: &SchemaManager,
         ctes: &CteContext,
@@ -158,37 +156,57 @@ impl SetRowBinder {
         ctx: &CorrelationCtx<'_>,
         cancel: Option<&citadel::CancelToken>,
     ) -> Result<Option<Self>> {
+        let deferred: Vec<bool> = assignments
+            .iter()
+            .map(|(_, expr)| super::dml::has_subquery(expr))
+            .collect();
+        if !deferred.iter().any(|&has| has) {
+            return Ok(None);
+        }
         let outer = OuterScope::single(
             &ctx.outer_schema.name,
             ctx.outer_alias,
             &ctx.outer_schema.columns,
         );
-        let mut bound = Vec::with_capacity(assignments.len());
-        for (name, expr) in assignments {
-            let captured = if super::dml::has_subquery(expr) {
-                binding::bind_outer(schema, ctes, &mut expr.clone(), &outer, None, cancel)?
-            } else {
-                None
-            };
-            let memo = (captured.is_some() && !calls_volatile(expr)).then(FxHashMap::default);
-            bound.push(SetAssignment {
-                name: name.clone(),
-                expr: expr.clone(),
-                captured,
-                memo,
-            });
-        }
-        Ok(bound
-            .iter()
-            .any(|assignment| assignment.captured.is_some())
-            .then_some(Self {
-                outer,
-                assignments: bound,
-            }))
+        let expressions = RowExpressions::new(
+            schema,
+            ctes,
+            assignments.iter().map(|(_, expr)| expr.clone()).collect(),
+            outer,
+            ctx.outer_schema.columns.len(),
+            cancel,
+        )?;
+        Ok(Some(Self {
+            names: assignments.iter().map(|(name, _)| name.clone()).collect(),
+            deferred,
+            columns: ColumnMap::new(&ctx.outer_schema.columns),
+            expressions,
+            snapshot: None,
+        }))
     }
 
-    /// `row`'s SET expressions, with its captured values bound in and the
-    /// subqueries that read them run against the writer.
+    /// A trigger or cascade can change a later selected row. Its conditional
+    /// SET expression must see that current row, while a newly demanded closed
+    /// subquery still reads the statement's original pending-write snapshot.
+    pub(super) fn prepare_refresh(
+        &mut self,
+        wtx: &citadel_txn::write_txn::WriteTxn<'db>,
+        schema: &SchemaManager,
+        table: &TableSchema,
+    ) -> Result<bool> {
+        if self.expressions.captures_outer()
+            || (!super::triggers::has_update_triggers(schema, &table.name)
+                && schema.child_fks_for(&table.name).is_empty()
+                && table.foreign_keys.is_empty())
+        {
+            return Ok(false);
+        }
+        self.snapshot = Some(wtx.read_snapshot().map_err(SqlError::Storage)?);
+        Ok(true)
+    }
+
+    /// The mutation engine invokes this immediately before evaluating the row's
+    /// assignments, and before changing any row. Resolve only demanded branches.
     pub(super) fn bind(
         &mut self,
         wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
@@ -197,35 +215,34 @@ impl SetRowBinder {
         row: &[Value],
     ) -> Result<Vec<(String, Expr)>> {
         let cancel = wtx.cancel_token().cloned();
-        let mut bound = Vec::with_capacity(self.assignments.len());
-        for assignment in &mut self.assignments {
-            let Some(positions) = &assignment.captured else {
-                bound.push((assignment.name.clone(), assignment.expr.clone()));
-                continue;
-            };
-            let key: Vec<Value> = positions.iter().map(|&p| row[p].clone()).collect();
-            if let Some(expr) = assignment.memo.as_ref().and_then(|memo| memo.get(&key)) {
-                bound.push((assignment.name.clone(), expr.clone()));
-                continue;
-            }
-            let mut expr = assignment.expr.clone();
-            binding::bind_outer(
-                schema,
-                ctes,
-                &mut expr,
-                &self.outer,
-                Some(row),
-                cancel.as_ref(),
-            )?;
-            let expr = super::dml::materialize_expr(&expr, &mut |query| {
-                super::dml::exec_subquery_write(wtx, schema, query, ctes)
-            })?;
-            if let Some(memo) = &mut assignment.memo {
-                memo.insert(key, expr.clone());
-            }
-            bound.push((assignment.name.clone(), expr));
-        }
-        Ok(bound)
+        let ctx = EvalCtx::new(&self.columns, row).with_cancel(cancel.as_ref());
+        let snapshot = &mut self.snapshot;
+        self.names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let expr = if self.deferred[index] {
+                    Expr::Literal(self.expressions.eval(
+                        index,
+                        schema,
+                        ctes,
+                        &ctx,
+                        &mut |query| match snapshot.as_mut() {
+                            Some(snapshot) => super::dml::exec_subquery_with_read(
+                                &mut snapshot.view(),
+                                schema,
+                                query,
+                                ctes,
+                            ),
+                            None => super::dml::exec_subquery_write(wtx, schema, query, ctes),
+                        },
+                    )?)
+                } else {
+                    self.expressions.expressions[index].clone()
+                };
+                Ok((name.clone(), expr))
+            })
+            .collect()
     }
 }
 
@@ -262,16 +279,27 @@ pub(super) fn filter_mutation_correlated_rows<T>(
     }
     let cancel = wtx.cancel_token().cloned();
     let columns = ctx.outer_schema.column_map();
+    let outer = OuterScope::single(
+        &ctx.outer_schema.name,
+        ctx.outer_alias,
+        &ctx.outer_schema.columns,
+    );
+    let expressions = RowExpressions::new(
+        schema,
+        ctes,
+        vec![predicate],
+        outer,
+        ctx.outer_schema.columns.len(),
+        cancel.as_ref(),
+    )?;
     retain_cancellable(rows, cancel.as_ref(), |item| {
-        let row = values(item);
-        let mut bound = predicate.clone();
-        binding::bind_predicate(wtx, schema, ctes, &mut bound, ctx, Some(row))?;
-        let materialized = super::dml::materialize_expr(&bound, &mut |query| {
-            super::dml::exec_subquery_write(wtx, schema, query, ctes)
-        })?;
-        Ok(is_truthy(&eval_expr(
-            &materialized,
-            &EvalCtx::new(columns, row).with_cancel(cancel.as_ref()),
+        let ctx = EvalCtx::new(columns, values(item)).with_cancel(cancel.as_ref());
+        Ok(is_truthy(&expressions.eval(
+            0,
+            schema,
+            ctes,
+            &ctx,
+            &mut |query| super::dml::exec_subquery_write(wtx, schema, query, ctes),
         )?))
     })?;
     Ok(None)
@@ -440,7 +468,7 @@ fn any_cancellable<T>(
 }
 
 pub(super) fn handle_correlated_select_with_read(
-    rtx: &mut ReadTxn<'_>,
+    rtx: &mut ReadView<'_, '_>,
     schema: &SchemaManager,
     stmt: &SelectStmt,
     ctx: &CorrelationCtx,
@@ -543,7 +571,7 @@ pub(super) fn handle_correlated_select_with_read(
 }
 
 pub(super) fn resolve_inner_schema_with_read(
-    rtx: &mut ReadTxn<'_>,
+    rtx: &mut ReadView<'_, '_>,
     schema: &SchemaManager,
     name: &str,
 ) -> Result<TableSchema> {
@@ -720,9 +748,10 @@ pub(super) fn collect_column_names(expr: &Expr, out: &mut Vec<ColumnName>) {
     }
 }
 
-/// Whether a subquery in a clause evaluated per source row reads that row.
+/// Whether subqueries must run at expression evaluation: either they capture
+/// the source row or occur beneath conditional evaluation.
 /// `ctes` are the CTEs visible to `stmt`.
-pub(super) fn captures_outer_row(
+pub(super) fn requires_subquery_runtime(
     schema: &SchemaManager,
     ctes: &CteContext,
     stmt: &SelectStmt,
@@ -740,7 +769,9 @@ pub(super) fn captures_outer_row(
         .chain(stmt.order_by.iter().map(|item| &item.expr))
         .chain(stmt.joins.iter().filter_map(|join| join.on_clause.as_ref()));
     for expr in clauses {
-        if expr_captures_outer(schema, ctes, expr, outer, cancel)? {
+        if super::dml::has_conditional_subquery(expr)
+            || expr_captures_outer(schema, ctes, expr, outer, cancel)?
+        {
             return Ok(true);
         }
     }
@@ -768,37 +799,19 @@ pub(super) fn finish_captured_select(
     ctes: &CteContext,
     stmt: SelectStmt,
     outer: &OuterScope,
-    mut rows: Vec<Vec<Value>>,
+    rows: Vec<Vec<Value>>,
     columns: Vec<ColumnDef>,
-    mut row_width: usize,
+    row_width: usize,
     cancel: Option<&citadel::CancelToken>,
     exec_sub: &mut dyn FnMut(&SelectStmt) -> Result<super::CteRows>,
 ) -> Result<ExecutionResult> {
-    let stmt = apply_captured_subqueries(
-        schema,
-        ctes,
-        &stmt,
-        outer,
-        &mut rows,
-        &columns,
-        &mut row_width,
-        cancel,
-        exec_sub,
-    )?
-    .unwrap_or(stmt);
-    let stmt = if super::dml::stmt_has_subquery(&stmt) {
-        super::dml::materialize_stmt(&stmt, exec_sub)?
-    } else {
-        stmt
-    };
-    super::process_select(
-        rows,
-        super::SelectCtx::new(&columns, &stmt, cancel).row_width(row_width),
+    apply::finish_subqueries(
+        schema, ctes, stmt, outer, rows, columns, row_width, cancel, exec_sub,
     )
 }
 
-/// Join conditions are evaluated while rows are joined, before any per-row
-/// subquery can run, so their subqueries must be closed. Those run once.
+/// JOIN subqueries must be closed. Conditional ones retain their plans for
+/// demand evaluation by the join predicate; other closed queries run here.
 pub(super) fn materialize_join_conditions(
     schema: &SchemaManager,
     ctes: &CteContext,
@@ -819,7 +832,9 @@ pub(super) fn materialize_join_conditions(
                 "a subquery in a JOIN condition that reads a joined row".into(),
             ));
         }
-        *condition = super::dml::materialize_expr(condition, exec_sub)?;
+        if !super::dml::has_conditional_subquery(condition) {
+            *condition = super::dml::materialize_expr(condition, exec_sub)?;
+        }
     }
     Ok(())
 }
@@ -1458,7 +1473,7 @@ impl ExistsRows {
 }
 
 pub(super) fn decorrelate_exists_with_read(
-    rtx: &mut ReadTxn<'_>,
+    rtx: &mut ReadView<'_, '_>,
     schema: &SchemaManager,
     subquery: &SelectStmt,
     corr_pairs: &[CorrEqPair],
@@ -1534,7 +1549,7 @@ pub(super) fn decorrelate_exists_with_read(
 /// Decorrelate IN/NOT IN subquery: its rows, found by correlation values and
 /// by the selected value, which compares under `value_collation`.
 pub(super) fn decorrelate_in_with_read(
-    rtx: &mut ReadTxn<'_>,
+    rtx: &mut ReadView<'_, '_>,
     schema: &SchemaManager,
     subquery: &SelectStmt,
     corr_pairs: &[CorrEqPair],
@@ -1598,7 +1613,7 @@ pub(super) fn decorrelate_in_with_read(
 /// plain value, as its correlation values then the value, found by the
 /// correlation values.
 pub(super) fn decorrelate_scalar_with_read(
-    rtx: &mut ReadTxn<'_>,
+    rtx: &mut ReadView<'_, '_>,
     schema: &SchemaManager,
     subquery: &SelectStmt,
     corr_pairs: &[CorrEqPair],
@@ -1818,7 +1833,7 @@ pub(super) fn has_correlated_where(
 
 /// Decorrelate + partial-decode scan: only fully decode rows matching correlation.
 pub(super) fn build_and_scan_correlated_with_read(
-    rtx: &mut ReadTxn<'_>,
+    rtx: &mut ReadView<'_, '_>,
     schema: &SchemaManager,
     stmt: &SelectStmt,
     outer_schema: &TableSchema,
@@ -2138,7 +2153,7 @@ struct InFilter {
 }
 
 pub(super) fn handle_correlated_where_with_read(
-    rtx: &mut ReadTxn<'_>,
+    rtx: &mut ReadView<'_, '_>,
     schema: &SchemaManager,
     stmt: &SelectStmt,
     ctx: &CorrelationCtx,

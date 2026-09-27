@@ -8,7 +8,10 @@ pub(crate) use crate::parser::expr_display_name;
 pub(crate) use crate::parser::op_symbol;
 
 use crate::error::{Result, SqlError};
-use crate::eval::{eval_expr, is_truthy, operand_collation, ColumnMap, EvalCtx};
+use crate::eval::{
+    eval_expr, eval_expr_with_resolver, is_truthy, operand_collation, ColumnMap, EvalCtx,
+    InputResolver,
+};
 use crate::parser::*;
 use crate::types::*;
 
@@ -1754,6 +1757,84 @@ pub(super) fn extract_sort_keys_with_cancel(
     Ok(keys)
 }
 
+pub(super) fn extract_sort_keys_with_resolver(
+    rows: &[Vec<Value>],
+    order_by: &[OrderByItem],
+    col_map: &ColumnMap,
+    cancel: Option<&citadel::CancelToken>,
+    resolver: Option<&dyn InputResolver>,
+) -> Result<Vec<Vec<Value>>> {
+    if resolver.is_none() {
+        return extract_sort_keys_with_cancel(rows, order_by, col_map, cancel);
+    }
+    let mut keys = Vec::with_capacity(rows.len());
+    for (index, row) in rows.iter().enumerate() {
+        check_cancel_at(cancel, index)?;
+        keys.push(
+            order_by
+                .iter()
+                .map(|item| {
+                    if order_by_uses_projected_output(item) {
+                        sort_item_value(item, row, col_map, cancel)
+                    } else {
+                        eval_expr_with_resolver(
+                            &item.expr,
+                            &EvalCtx::new(col_map, row).with_cancel(cancel),
+                            resolver,
+                        )
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?,
+        );
+    }
+    check_cancel(cancel)?;
+    Ok(keys)
+}
+
+pub(super) fn sort_rows_with_resolver(
+    rows: &mut [Vec<Value>],
+    order_by: &[OrderByItem],
+    columns: &[ColumnDef],
+    cancel: Option<&citadel::CancelToken>,
+    resolver: Option<&dyn InputResolver>,
+) -> Result<()> {
+    if resolver.is_none() {
+        return sort_rows(rows, order_by, columns, cancel);
+    }
+    let map = ColumnMap::new(columns);
+    let keys = extract_sort_keys_with_resolver(rows, order_by, &map, cancel, resolver)?;
+    sort_rows_by_keys(
+        rows,
+        &keys,
+        order_by,
+        &sort_key_collations(order_by, &map),
+        cancel,
+    )
+}
+
+pub(super) fn topk_rows_with_resolver(
+    rows: &mut [Vec<Value>],
+    order_by: &[OrderByItem],
+    columns: &[ColumnDef],
+    k: usize,
+    cancel: Option<&citadel::CancelToken>,
+    resolver: Option<&dyn InputResolver>,
+) -> Result<()> {
+    if resolver.is_none() {
+        return topk_rows(rows, order_by, columns, k, cancel);
+    }
+    let map = ColumnMap::new(columns);
+    let keys = extract_sort_keys_with_resolver(rows, order_by, &map, cancel, resolver)?;
+    topk_rows_by_keys(
+        rows,
+        &keys,
+        order_by,
+        &sort_key_collations(order_by, &map),
+        k,
+        cancel,
+    )
+}
+
 fn sort_item_value(
     item: &OrderByItem,
     row: &[Value],
@@ -2067,8 +2148,18 @@ pub(super) fn project_rows(
 pub(super) fn project_rows_with_cancel(
     columns: &[ColumnDef],
     select_cols: &[SelectColumn],
+    rows: Vec<Vec<Value>>,
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
+    project_rows_with_resolver(columns, select_cols, rows, cancel, None)
+}
+
+pub(super) fn project_rows_with_resolver(
+    columns: &[ColumnDef],
+    select_cols: &[SelectColumn],
     mut rows: Vec<Vec<Value>>,
     cancel: Option<&citadel::CancelToken>,
+    resolver: Option<&dyn InputResolver>,
 ) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
     check_cancel(cancel)?;
     if select_cols.len() == 1 && matches!(select_cols[0], SelectColumn::AllColumns) {
@@ -2082,7 +2173,11 @@ pub(super) fn project_rows_with_cancel(
         return Ok((names, rows));
     }
 
-    if let Some(map) = try_build_index_map(select_cols, columns) {
+    if let Some(map) = try_build_index_map(select_cols, columns).filter(|map| {
+        // Visible source columns never overlap deferred or aggregate/window
+        // slots, so their existing move-only projection needs no resolver.
+        resolver.is_none() || map.iter().all(|(_, index)| *index < columns.len())
+    }) {
         let col_names: Vec<String> = map.iter().map(|(n, _)| n.clone()).collect();
         if map.len() == columns.len() && map.iter().enumerate().all(|(i, &(_, idx))| idx == i) {
             truncate_internal_slots(&mut rows, columns.len(), cancel)?;
@@ -2111,7 +2206,7 @@ pub(super) fn project_rows_with_cancel(
     }
 
     let mut col_names = Vec::new();
-    type Projector = Box<dyn Fn(&[Value], Option<&citadel::CancelToken>) -> Result<Value>>;
+    type Projector<'a> = Box<dyn Fn(&[Value], Option<&citadel::CancelToken>) -> Result<Value> + 'a>;
     let mut projectors: Vec<Projector> = Vec::new();
     let col_map = std::sync::Arc::new(ColumnMap::new(columns));
 
@@ -2130,7 +2225,11 @@ pub(super) fn project_rows_with_cancel(
                 let expr = expr.clone();
                 let map = col_map.clone();
                 projectors.push(Box::new(move |row: &[Value], cancel| {
-                    eval_expr(&expr, &EvalCtx::new(&map, row).with_cancel(cancel))
+                    eval_expr_with_resolver(
+                        &expr,
+                        &EvalCtx::new(&map, row).with_cancel(cancel),
+                        resolver,
+                    )
                 }));
             }
         }

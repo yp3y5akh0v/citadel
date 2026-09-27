@@ -1008,7 +1008,7 @@ fn window_orders_release_last_consumers_and_check_cancelled_hits() {
     take_window_key_evaluations();
     for (index, expected_retained) in [1, 2, 1, 1, 0].into_iter().enumerate() {
         orders
-            .get_or_build(index, &specs[index], &rows, &col_map, None)
+            .get_or_build(index, &specs[index], &rows, &col_map, None, None)
             .unwrap();
         orders.release(index);
         assert_eq!(
@@ -1027,12 +1027,12 @@ fn window_orders_release_last_consumers_and_check_cancelled_hits() {
     let mut orders = WindowOrders::new(repeated.iter(), &col_map, None).unwrap();
     let token = citadel::CancelToken::new();
     orders
-        .get_or_build(0, &repeated[0], &rows, &col_map, Some(&token))
+        .get_or_build(0, &repeated[0], &rows, &col_map, Some(&token), None)
         .unwrap();
     orders.release(0);
     token.cancel();
     assert!(matches!(
-        orders.get_or_build(1, &repeated[1], &rows, &col_map, Some(&token)),
+        orders.get_or_build(1, &repeated[1], &rows, &col_map, Some(&token), None),
         Err(SqlError::Storage(citadel_core::Error::Interrupted))
     ));
 }

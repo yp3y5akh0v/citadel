@@ -1385,6 +1385,123 @@ fn input_slots_are_checked_and_keep_implicit_collation_separate_from_names() {
 }
 
 #[test]
+fn lazy_input_resolver_is_reentrant_and_leaves_ordinary_slots_checked() {
+    struct Resolver {
+        calls: std::cell::RefCell<Vec<usize>>,
+    }
+    let slot = |index| Expr::InputRef {
+        index,
+        collation: None,
+    };
+    impl InputResolver for Resolver {
+        fn resolve(&self, index: usize, ctx: &EvalCtx<'_>) -> Result<Option<Value>> {
+            if !(2..=4).contains(&index) {
+                return Ok(None);
+            }
+            // Release mutable bookkeeping before recursively resolving an
+            // argument. A resolver is not a RefCell borrow of its whole runtime.
+            self.calls.borrow_mut().push(index);
+            match index {
+                2 => eval_expr_with_resolver(
+                    &Expr::BinaryOp {
+                        left: Box::new(Expr::Function {
+                            name: "ABS".into(),
+                            args: vec![Expr::InputRef {
+                                index: 3,
+                                collation: None,
+                            }],
+                            distinct: false,
+                            filter: None,
+                        }),
+                        op: BinOp::Add,
+                        right: Box::new(Expr::InputRef {
+                            index: 1,
+                            collation: None,
+                        }),
+                    },
+                    ctx,
+                    Some(self),
+                )
+                .map(Some),
+                3 => Ok(Some(ctx.row[0].clone())),
+                4 => Err(SqlError::InvalidValue("unchosen input".into())),
+                _ => unreachable!(),
+            }
+        }
+    }
+    let resolver = Resolver {
+        calls: std::cell::RefCell::new(Vec::new()),
+    };
+    let map = ColumnMap::new(&[]);
+    let row = [Value::Integer(-7), Value::Integer(5), Value::Integer(999)];
+    let token = citadel::CancelToken::new();
+    let ctx = EvalCtx::new(&map, &row).with_cancel(Some(&token));
+    let expression = Expr::Case {
+        operand: None,
+        conditions: vec![(
+            Expr::Literal(Value::Boolean(true)),
+            Expr::Coalesce(vec![Expr::Literal(Value::Null), slot(2), slot(4)]),
+        )],
+        else_result: Some(Box::new(slot(4))),
+    };
+    assert_eq!(
+        eval_expr_with_resolver(&expression, &ctx, Some(&resolver)).unwrap(),
+        Value::Integer(12),
+    );
+    assert_eq!(*resolver.calls.borrow(), [2, 3]);
+    assert_eq!(eval_expr(&slot(2), &ctx).unwrap(), Value::Integer(999));
+    assert_eq!(
+        eval_expr_with_resolver(&slot(1), &ctx, Some(&resolver)).unwrap(),
+        Value::Integer(5),
+    );
+    assert!(matches!(
+        eval_expr_with_resolver(&slot(usize::MAX), &ctx, Some(&resolver)),
+        Err(SqlError::Plan(_)),
+    ));
+    assert!(matches!(
+        eval_expr_with_resolver(&slot(4), &ctx, Some(&resolver)),
+        Err(SqlError::InvalidValue(_)),
+    ));
+    token.cancel();
+    let calls = resolver.calls.borrow().len();
+    assert!(matches!(
+        eval_expr_with_resolver(&slot(2), &ctx, Some(&resolver)),
+        Err(SqlError::Storage(citadel_core::Error::Interrupted)),
+    ));
+    assert_eq!(resolver.calls.borrow().len(), calls);
+}
+
+#[test]
+fn lazy_input_resolver_retains_slot_collation_without_entering_namespaces() {
+    struct Resolver;
+    impl InputResolver for Resolver {
+        fn resolve(&self, index: usize, _: &EvalCtx<'_>) -> Result<Option<Value>> {
+            Ok((index == 9).then(|| Value::Text("a".into())))
+        }
+    }
+    let map = ColumnMap::new(&[]);
+    let ctx = EvalCtx::new(&map, &[]);
+    for (collation, expected) in [(None, false), (Some(Collation::NoCase), true)] {
+        let expression = Expr::BinaryOp {
+            left: Box::new(Expr::InputRef {
+                index: 9,
+                collation,
+            }),
+            op: BinOp::Eq,
+            right: Box::new(Expr::Literal(Value::Text("A".into()))),
+        };
+        assert_eq!(
+            eval_expr_with_resolver(&expression, &ctx, Some(&Resolver)).unwrap(),
+            Value::Boolean(expected),
+        );
+    }
+    assert!(matches!(
+        eval_expr_with_resolver(&Expr::Column("__captured_9".into()), &ctx, Some(&Resolver)),
+        Err(SqlError::ColumnNotFound(_)),
+    ));
+}
+
+#[test]
 fn interval_length_keys_leave_comparisons_uncollated() {
     let mut columns = vec![col("v", DataType::Interval, true, 0)];
     columns[0].collation = Collation::IntervalLength;

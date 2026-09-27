@@ -8,7 +8,7 @@ use std::collections::{BinaryHeap, VecDeque};
 use std::sync::Arc;
 
 use citadel::CancelToken;
-use citadel_txn::read_txn::ReadTxn;
+use citadel_txn::read_txn::{ReadTxn, ReadView};
 use citadel_txn::write_txn::WriteTxn;
 use citadel_vector::segment::SegmentOperationError;
 use citadel_vector::{AnnIndex, Filter, Metric};
@@ -94,6 +94,34 @@ impl AnnScan for ReadTxn<'_> {
 
     fn ann_table_root_stamp(&mut self, table: &[u8]) -> Result<Option<(u64, u64)>> {
         ReadTxn::table_root_stamp(self, table)
+            .map(|stamp| stamp.map(|(page, txn)| (u64::from(page.0), txn.as_u64())))
+            .map_err(SqlError::Storage)
+    }
+
+    fn ann_cancel_token(&self) -> Option<CancelToken> {
+        self.cancel_token().cloned()
+    }
+}
+
+impl AnnScan for ReadView<'_, '_> {
+    fn ann_scan(&mut self, table: &[u8], f: &mut ScanRow<'_>) -> Result<()> {
+        bridge_scan(|cb| self.table_scan_from(table, b"", cb), f)
+    }
+
+    fn ann_scan_from(&mut self, table: &[u8], start_key: &[u8], f: &mut ScanRow<'_>) -> Result<()> {
+        bridge_scan(|cb| self.table_scan_from(table, start_key, cb), f)
+    }
+
+    fn ann_get(&mut self, table: &[u8], key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.table_get(table, key).map_err(SqlError::Storage)
+    }
+
+    fn cache_generation(&self) -> Option<u64> {
+        ReadView::cache_generation(self)
+    }
+
+    fn ann_table_root_stamp(&mut self, table: &[u8]) -> Result<Option<(u64, u64)>> {
+        self.table_root_stamp(table)
             .map(|stamp| stamp.map(|(page, txn)| (u64::from(page.0), txn.as_u64())))
             .map_err(SqlError::Storage)
     }
@@ -434,7 +462,7 @@ impl AnnTopKPlan {
 
     pub(super) fn execute_with_read(
         &self,
-        rtx: &mut ReadTxn<'_>,
+        rtx: &mut dyn AnnScan,
         schema: &SchemaManager,
         stmt: &SelectStmt,
         table_schema: &TableSchema,

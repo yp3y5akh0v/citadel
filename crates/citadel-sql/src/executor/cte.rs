@@ -1,4 +1,4 @@
-use citadel_txn::read_txn::ReadTxn;
+use citadel_txn::read_txn::ReadView;
 
 use crate::error::{Result, SqlError};
 use crate::eval::{eval_expr, is_truthy, ColumnMap, EvalCtx};
@@ -10,7 +10,7 @@ use super::aggregate::*;
 use super::{CteContext, CteRows};
 
 pub(super) fn exec_select_query_with_read(
-    rtx: &mut ReadTxn<'_>,
+    rtx: &mut ReadView<'_, '_>,
     schema: &SchemaManager,
     sq: &SelectQuery,
 ) -> Result<ExecutionResult> {
@@ -25,7 +25,7 @@ pub(super) fn exec_select_query_with_read(
 /// A query whose own CTEs are defined over `outer`, the CTEs of the statement
 /// a derived table is part of.
 pub(super) fn exec_nested_query_with_read(
-    rtx: &mut ReadTxn<'_>,
+    rtx: &mut ReadView<'_, '_>,
     schema: &SchemaManager,
     sq: &SelectQuery,
     outer: &CteContext,
@@ -609,7 +609,7 @@ pub(super) fn exec_select_from_cte(
     if super::stmt_has_subquery(stmt) {
         let outer =
             super::OuterScope::single(&stmt.from, stmt.from_alias.as_deref(), &cte_schema.columns);
-        if super::correlated::captures_outer_row(schema, ctes, stmt, &outer, cancel)? {
+        if super::correlated::requires_subquery_runtime(schema, ctes, stmt, &outer, cancel)? {
             let rows = super::clone_cte_rows_with_cancel(&cte.result.rows, cancel)?;
             let row_width = cte_schema.columns.len();
             return super::finish_captured_select(
