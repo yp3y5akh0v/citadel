@@ -2183,20 +2183,23 @@ pub(super) fn project_rows_with_resolver(
             truncate_internal_slots(&mut rows, columns.len(), cancel)?;
             return Ok((col_names, rows));
         }
-        let move_row = |row: &mut Vec<Value>| {
-            map.iter()
-                .map(|&(_, index)| {
-                    row.get_mut(index).map(std::mem::take).ok_or_else(|| {
-                        SqlError::Plan(format!("input slot {index} is outside the projection row"))
-                    })
-                })
-                .collect::<Result<Vec<_>>>()
+        let move_row = |row: &mut Vec<Value>| -> Result<Vec<Value>> {
+            let mut projected = Vec::with_capacity(map.len());
+            for &(_, index) in &map {
+                let value = row.get_mut(index).ok_or_else(|| {
+                    SqlError::Plan(format!("input slot {index} is outside the projection row"))
+                })?;
+                projected.push(std::mem::take(value));
+            }
+            Ok(projected)
         };
+        let mut projected = Vec::with_capacity(rows.len());
         if cancel.is_none() {
-            let projected = rows.iter_mut().map(move_row).collect::<Result<Vec<_>>>()?;
+            for row in &mut rows {
+                projected.push(move_row(row)?);
+            }
             return Ok((col_names, projected));
         }
-        let mut projected = Vec::with_capacity(rows.len());
         for (row_idx, row) in rows.iter_mut().enumerate() {
             check_cancel_at(cancel, row_idx)?;
             projected.push(move_row(row)?);
