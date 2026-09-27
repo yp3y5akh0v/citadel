@@ -24,7 +24,7 @@ initialization failures return an error. For CPU inference, enable `candle-embed
 without `cuda-embed`. Both CUDA constructors enable Candle's process-wide TF32
 mode for f32 matrix multiplication, including standalone reranking.
 
-In 2.2, `Embedder` requires `embed_with_cancel`, and `Reranker` requires
+`Embedder` requires `embed_with_cancel`, and `Reranker` requires
 `rerank_with_cancel`. Implementations must poll the optional cancellation token during
 bounded work. Asymmetric embedders override `embed_queries_with_cancel`.
 
