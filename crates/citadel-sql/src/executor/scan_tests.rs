@@ -1495,3 +1495,111 @@ fn compiled_raw_array_predicate_propagates_malformed_storage_error() {
         ));
     }
 }
+
+#[test]
+fn raw_array_predicates_match_operator_for_keys_cells_and_missing_defaults() {
+    let array = |values: Vec<Value>| Value::Array(values.into());
+    let interval = |months, days| Value::Interval {
+        months,
+        days,
+        micros: 0,
+    };
+    let values = vec![
+        array(vec![]),
+        array(vec![interval(1, 0)]),
+        array(vec![interval(0, 30)]),
+        array(vec![interval(0, 31)]),
+        array(vec![Value::Null, array(vec![interval(1, 0)])]),
+        array(vec![Value::Null, array(vec![interval(0, 30)])]),
+        array(vec![array(vec![Value::Null]), i(1)]),
+        array(vec![Value::Real(f64::NAN)]),
+    ];
+    for value in &values {
+        let single_pk = schema("single", columns(&[("v", DataType::Array)]), vec![0]);
+        let composite_pk = schema(
+            "composite",
+            columns(&[("id", DataType::Integer), ("v", DataType::Array)]),
+            vec![0, 1],
+        );
+        let stored = schema(
+            "stored",
+            columns(&[("id", DataType::Integer), ("v", DataType::Array)]),
+            vec![0],
+        );
+        let mut default_columns = columns(&[("id", DataType::Integer), ("v", DataType::Array)]);
+        default_columns[1].default_expr = Some(Expr::Literal(value.clone()));
+        let defaulted = schema("defaulted", default_columns, vec![0]);
+        let layouts = [
+            (
+                &single_pk,
+                encode_composite_key(std::slice::from_ref(value)),
+                crate::encoding::encode_row(&[]),
+            ),
+            (
+                &composite_pk,
+                encode_composite_key(&[i(1), value.clone()]),
+                crate::encoding::encode_row(&[]),
+            ),
+            (
+                &stored,
+                encode_composite_key(&[i(1)]),
+                crate::encoding::encode_row(std::slice::from_ref(value)),
+            ),
+            (
+                &defaulted,
+                encode_composite_key(&[i(1)]),
+                crate::encoding::encode_row(&[]),
+            ),
+        ];
+        for bound in &values {
+            for op in [
+                BinOp::Eq,
+                BinOp::NotEq,
+                BinOp::Lt,
+                BinOp::LtEq,
+                BinOp::Gt,
+                BinOp::GtEq,
+            ] {
+                let expected = is_truthy(&eval_binary_op_public(value, op, bound).unwrap());
+                let expr = Expr::BinaryOp {
+                    left: Box::new(Expr::Column("v".into())),
+                    op,
+                    right: Box::new(Expr::Parameter(1)),
+                };
+                crate::eval::with_scoped_params(std::slice::from_ref(bound), || {
+                    for (table, key, encoded) in &layouts {
+                        let predicate = try_simple_predicate(&expr, table)
+                            .expect("bound array comparison is admitted");
+                        assert_eq!(
+                            predicate.matches_raw(key, encoded).unwrap(),
+                            expected,
+                            "{}: {value:?} {op:?} {bound:?}",
+                            table.name
+                        );
+                    }
+                });
+            }
+        }
+        let low = array(vec![interval(0, 30)]);
+        let high = array(vec![interval(0, 31)]);
+        let expected = is_truthy(&eval_binary_op_public(value, BinOp::GtEq, &low).unwrap())
+            && is_truthy(&eval_binary_op_public(value, BinOp::LtEq, &high).unwrap());
+        for negated in [false, true] {
+            let expr = Expr::Between {
+                expr: Box::new(Expr::Column("v".into())),
+                low: Box::new(Expr::Literal(low.clone())),
+                high: Box::new(Expr::Literal(high.clone())),
+                negated,
+            };
+            for (table, key, encoded) in &layouts {
+                let predicate = try_between_predicate(&expr, table).unwrap();
+                assert_eq!(
+                    predicate.matches_raw(key, encoded).unwrap(),
+                    expected != negated,
+                    "{}: {value:?} BETWEEN interval arrays, negated={negated}",
+                    table.name
+                );
+            }
+        }
+    }
+}

@@ -1942,6 +1942,21 @@ pub(super) fn raw_matches_op_value(val: &Value, op: BinOp, literal: &Value) -> b
     if val.is_null() || literal.is_null() {
         return false;
     }
+    // Decoded keys and missing-column defaults must compare arrays just as
+    // stored RawColumn arrays and the expression evaluator do: recursively in
+    // SQL order, including intervals by length rather than physical fields.
+    if let (Value::Array(_), Value::Array(_)) = (val, literal) {
+        let order = val.sql_cmp(literal);
+        return match op {
+            BinOp::Eq => order.is_eq(),
+            BinOp::NotEq => order.is_ne(),
+            BinOp::Lt => order.is_lt(),
+            BinOp::Gt => order.is_gt(),
+            BinOp::LtEq => order.is_le(),
+            BinOp::GtEq => order.is_ge(),
+            _ => false,
+        };
+    }
     match op {
         BinOp::Eq => val == literal,
         BinOp::NotEq => val != literal,
