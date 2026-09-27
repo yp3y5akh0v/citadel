@@ -14,9 +14,17 @@ pub struct MemIO {
 
 impl MemIO {
     pub fn new(size: usize) -> Self {
+        Self::from_bytes(vec![0u8; size])
+    }
+
+    pub fn from_bytes(bytes: Vec<u8>) -> Self {
         Self {
-            data: Arc::new(StdMutex::new(vec![0u8; size])),
+            data: Arc::new(StdMutex::new(bytes)),
         }
+    }
+
+    pub fn bytes(&self) -> Vec<u8> {
+        self.data.lock().unwrap().clone()
     }
 
     /// Second handle over the same backing buffer (close/reopen tests).
@@ -3856,6 +3864,26 @@ mod retry_tests;
 
 #[path = "manager_power_loss_tests.rs"]
 mod power_loss_tests;
+
+#[path = "manager_file_fuzz_tests.rs"]
+mod file_fuzz_tests;
+
+/// Seeded SplitMix64, so every case replays exactly.
+struct SplitMix(u64);
+
+impl SplitMix {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    fn below(&mut self, bound: u64) -> u64 {
+        self.next() % bound
+    }
+}
 
 struct PausedCatalogIO {
     inner: MemIO,
