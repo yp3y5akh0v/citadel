@@ -221,9 +221,9 @@ fn hmac_verification() {
 }
 
 #[test]
-fn tamper_detected() {
+fn every_bit_flip_outside_the_memory_cost_is_rejected() {
     let rek = [0x42u8; KEY_SIZE];
-    let mut backup_data = create_key_backup(
+    let image = create_key_backup(
         &rek,
         b"backup-pass",
         42,
@@ -235,11 +235,15 @@ fn tamper_detected() {
         0,
     )
     .unwrap();
-
-    backup_data[60] ^= 0x01;
-
-    let result = restore_rek_from_backup(&backup_data, b"backup-pass");
-    assert!(result.is_err());
+    // A flipped memory cost can demand gigabytes; its bound has its own tests.
+    for bit in (0..KEY_BACKUP_SIZE * 8).filter(|bit| !(20 * 8..24 * 8).contains(bit)) {
+        let mut flipped = image;
+        flipped[bit / 8] ^= 1 << (bit % 8);
+        assert!(
+            restore_rek_from_backup(&flipped, b"backup-pass").is_err(),
+            "bit {bit}"
+        );
+    }
 }
 
 #[test]
