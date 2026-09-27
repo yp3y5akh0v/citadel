@@ -324,8 +324,10 @@ CITADEL_API citadel_error_t citadel_write_begin(struct CitadelDb *db, struct Cit
 /**
  * Commit a write transaction.
  *
- * The handle is consumed and freed whether commit succeeds or fails. A failed
- * commit has already rolled back; do not pass the pointer to another function.
+ * The handle is consumed and freed whether commit succeeds or fails; do not
+ * pass the pointer to another function. A final sync failure can leave the
+ * commit's durability unknown. Reopen the database before further writes and
+ * inspect the recovered state before retrying the operation.
  */
 CITADEL_API citadel_error_t citadel_write_commit(struct CitadelWriteTxn *txn);
 

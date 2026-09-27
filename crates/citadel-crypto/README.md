@@ -2,6 +2,10 @@
 
 Cryptographic primitives for the [Citadel](https://github.com/yp3y5akh0v/citadel) encrypted embedded database engine. Includes AES-256-CTR encryption, HMAC-SHA256 authentication, Argon2id key derivation, and AES Key Wrap.
 
+Key derivation accepts Argon2id time costs from 1 through 16 and
+PBKDF2-HMAC-SHA256 iteration counts from 600,000 through 10,000,000. These limits
+apply to creating and opening key files and key backups.
+
 Key files and key backups accept the authenticated legacy cipher identifier `1` as
 AES-256-CTR. New files use the canonical identifier `0`.
 

@@ -176,13 +176,19 @@ that closure rejects the entire cascade. The default remains targeted deletion.
 ## SQL and vector search
 
 The same file is a full SQL database with JSON, full-text search, and filtered
-vector search.
+vector search. See the [SQL reference](https://github.com/yp3y5akh0v/citadel/blob/HEAD/crates/citadel-sql/README.md) for supported
+statements, aggregate filters, correlated queries, and index rebuilding.
 
 ```python
 db.execute("CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT)")
 db.execute("INSERT INTO notes VALUES (1, $1)", ["hello"])
 print(db.query("SELECT body FROM notes").to_dicts())  # [{'body': 'hello'}]
 ```
+
+If `citadeldb.OperationalError` reports that an earlier commit's durability is
+unknown, close all database handles and release memory and maintenance handles for
+that file, then reconnect. Inspect the recovered state before retrying the write:
+a final sync failure does not guarantee that the commit was lost.
 
 Long SQL, integrity, and memory operations can be stopped cooperatively from
 another Python thread. Tokens are one-shot; install a fresh one for each unit

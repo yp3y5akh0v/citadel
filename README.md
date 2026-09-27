@@ -467,7 +467,7 @@ medians, intervals and evidence hashes are in
 
 ## SQL
 
-**Statements** - CREATE/DROP TABLE (incl. `TEMP`), ALTER TABLE (ADD/DROP/RENAME COLUMN, RENAME TABLE, DISABLE/ENABLE TRIGGER), CREATE/DROP INDEX (incl. partial `WHERE`, expression keys, `CONCURRENTLY`), REINDEX [DATABASE | TABLE | INDEX], CREATE/DROP VIEW, CREATE/DROP MATERIALIZED VIEW (with `REFRESH [CONCURRENTLY]`), CREATE/DROP TRIGGER (BEFORE/AFTER/INSTEAD OF, FOR EACH ROW/STATEMENT, `REFERENCING NEW/OLD TABLE`, `WHEN`, `UPDATE OF cols`), INSERT (VALUES, SELECT, ON CONFLICT DO NOTHING/DO UPDATE, ON CONSTRAINT), SELECT, UPDATE, DELETE, TRUNCATE TABLE, RETURNING (with `OLD`/`NEW`), BEGIN [READ ONLY | READ WRITE]/COMMIT/ROLLBACK, SAVEPOINT/RELEASE/ROLLBACK TO, SET [LOCAL] TIME ZONE, EXPLAIN, REFRESH MATERIALIZED VIEW
+**Statements** - CREATE/DROP TABLE (incl. `TEMP`), ALTER TABLE (ADD/DROP/RENAME COLUMN, RENAME TABLE, DISABLE/ENABLE TRIGGER), CREATE/DROP INDEX (incl. partial `WHERE`, expression keys, `CONCURRENTLY`), `REINDEX [DATABASE]` / `REINDEX [TABLE | INDEX] name`, CREATE/DROP VIEW, CREATE/DROP MATERIALIZED VIEW (with `REFRESH [CONCURRENTLY]`), CREATE/DROP TRIGGER (BEFORE/AFTER/INSTEAD OF, FOR EACH ROW/STATEMENT, `REFERENCING NEW/OLD TABLE`, `WHEN`, `UPDATE OF cols`), INSERT (VALUES, SELECT, ON CONFLICT DO NOTHING/DO UPDATE, ON CONSTRAINT), SELECT, UPDATE (including correlated subqueries in `SET`), DELETE, TRUNCATE TABLE, RETURNING (with `OLD`/`NEW`), BEGIN [READ ONLY | READ WRITE]/COMMIT/ROLLBACK, SAVEPOINT/RELEASE/ROLLBACK TO, SET [LOCAL] TIME ZONE, EXPLAIN, REFRESH MATERIALIZED VIEW
 
 **Constraints** - PRIMARY KEY, NOT NULL, UNIQUE, DEFAULT, CHECK (column + table level), FOREIGN KEY with full referential actions (`ON DELETE` / `ON UPDATE` `CASCADE` / `SET NULL` / `SET DEFAULT` / `RESTRICT` / `NO ACTION`), GENERATED ALWAYS AS (...) STORED|VIRTUAL
 
@@ -477,9 +477,9 @@ medians, intervals and evidence hashes are in
 
 **JSON / JSONB** - Postgres operators plus SQL/JSON path functions and the SQL:2023 item methods `.bigint()`, `.decimal()`, `.integer()`, `.number()`, `.string()`, `.boolean()`, `.date()`, `.time()`, `.time_tz()`, `.timestamp()`, and `.timestamp_tz()`. Time-zone-dependent evaluation uses the connection's transactional `SET [LOCAL] TIME ZONE` context.
 
-**Clauses** - JOINs (INNER, LEFT, RIGHT, CROSS, FULL OUTER, LATERAL), subqueries (scalar, IN, EXISTS, correlated), CTEs (`WITH` / `WITH RECURSIVE` / WITH-DML: `WITH x AS (INSERT/UPDATE/DELETE ... [RETURNING *]) SELECT ...`), UNION/INTERSECT/EXCEPT [ALL], CASE, BETWEEN, LIKE, DISTINCT, `ANY` / `ALL` (subquery + array forms), GROUP BY/HAVING, ORDER BY, LIMIT/OFFSET
+**Clauses** - JOINs (INNER, LEFT, RIGHT, CROSS, FULL OUTER; LATERAL with CROSS/INNER/LEFT), subqueries (scalar, IN, EXISTS, correlated), CTEs (`WITH` / `WITH RECURSIVE` / WITH-DML: `WITH x AS (INSERT/UPDATE/DELETE ... [RETURNING *]) SELECT ...`), UNION/INTERSECT/EXCEPT [ALL], CASE, BETWEEN, LIKE, DISTINCT, `ANY` / `ALL` (subquery + array forms), GROUP BY/HAVING, ORDER BY, LIMIT/OFFSET
 
-**Window functions** - ROW_NUMBER, RANK, DENSE_RANK, NTILE, LAG, LEAD, FIRST_VALUE, LAST_VALUE, SUM/COUNT/AVG/MIN/MAX OVER with PARTITION BY, ORDER BY, ROWS/RANGE frames
+**Window functions** - ROW_NUMBER, RANK, DENSE_RANK, NTILE, LAG, LEAD, FIRST_VALUE, LAST_VALUE, SUM/COUNT/AVG/MIN/MAX OVER with PARTITION BY, ORDER BY, ROWS/RANGE frames. In grouped queries, window functions operate on the groups remaining after `GROUP BY` and `HAVING`.
 
 **Views** - CREATE/DROP VIEW, OR REPLACE, IF NOT EXISTS/IF EXISTS, column aliases, nested views
 
@@ -489,7 +489,7 @@ medians, intervals and evidence hashes are in
 
 **TEMP tables** - `CREATE TEMP TABLE ...` lives in a per-connection in-memory database, dropped on disconnect. Full DDL/DML/index/constraint/trigger parity with persistent tables.
 
-**Functions** - COUNT, SUM, AVG, MIN, MAX, LENGTH, UPPER, LOWER, SUBSTR/SUBSTRING, TRIM/LTRIM/RTRIM, REPLACE, INSTR, CONCAT, HEX, ABS, ROUND, CEIL/CEILING, FLOOR, SIGN, SQRT, RANDOM, COALESCE, NULLIF, GREATEST, LEAST, CAST, TYPEOF, IIF
+**Functions** - COUNT, SUM, AVG, MIN, MAX, LENGTH, UPPER, LOWER, SUBSTR/SUBSTRING, TRIM/LTRIM/RTRIM, REPLACE, INSTR, CONCAT, HEX, ABS, ROUND, CEIL/CEILING, FLOOR, SIGN, SQRT, RANDOM, COALESCE, NULLIF, GREATEST, LEAST, CAST, TYPEOF, IIF. Non-window aggregates support `FILTER (WHERE ...)`.
 
 **Date/Time Functions** - NOW, CURRENT_TIMESTAMP, CURRENT_DATE, CURRENT_TIME, LOCALTIMESTAMP, LOCALTIME, CLOCK_TIMESTAMP, EXTRACT, DATE_PART, DATE_TRUNC, DATE_BIN, AGE, MAKE_DATE, MAKE_TIME, MAKE_TIMESTAMP, MAKE_INTERVAL, JUSTIFY_DAYS, JUSTIFY_HOURS, JUSTIFY_INTERVAL, ISFINITE, DATE, TIME, DATETIME, STRFTIME, JULIANDAY, UNIXEPOCH, TIMEDIFF, AT TIME ZONE. Supports `INTERVAL '1 year 2 months'`, `DATE '2024-01-15'`, `TIMESTAMP '2024-01-15 12:30:00Z'`, `infinity`/`-infinity` sentinels, BC dates, full IANA zone parsing (jiff), PG-normalized INTERVAL comparison.
 
@@ -585,6 +585,11 @@ Shadow paging with a god byte - one byte selects the active commit slot. Atomic 
 2. Compute Merkle hashes bottom-up
 3. Update the inactive commit slot
 4. Flip the god byte
+
+`SyncMode::Full` flushes the pages and commit slot before the flip, then flushes
+the selector before returning success. If that final flush fails, the commit's
+durability is uncertain and further writes return `Error::ReopenRequired`.
+Close and reopen the database before writing again.
 
 ### Integrity Boundary
 
