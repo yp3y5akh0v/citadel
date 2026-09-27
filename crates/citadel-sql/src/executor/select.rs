@@ -2773,6 +2773,12 @@ pub(super) struct StreamGroupByPlan {
     nonpk_agg_defaults: Vec<Option<Value>>,
     output: Vec<(GroupByOutputCol, String)>,
     where_pred: Option<SimplePredicate>,
+    output_order: Option<StreamGroupOrder>,
+}
+
+struct StreamGroupOrder {
+    items: Vec<OrderByItem>,
+    columns: Vec<ColumnDef>,
 }
 
 impl StreamGroupByPlan {
@@ -2780,7 +2786,6 @@ impl StreamGroupByPlan {
         if stmt.group_by.len() != 1
             || stmt.having.is_some()
             || !stmt.joins.is_empty()
-            || !stmt.order_by.is_empty()
             || stmt.limit.is_some()
             || stmt.offset.is_some()
             || stmt.distinct
@@ -2937,6 +2942,36 @@ impl StreamGroupByPlan {
             }
         }
 
+        let output_order = if stmt.order_by.is_empty() {
+            None
+        } else {
+            let columns = build_output_columns(&stmt.columns, &schema.columns);
+            let output_map = ColumnMap::new(&columns);
+            let group_output = output
+                .iter()
+                .position(|(col, _)| matches!(col, GroupByOutputCol::GroupKey));
+            let mut items = Vec::with_capacity(stmt.order_by.len());
+            for item in &stmt.order_by {
+                // The parser's explicit output alias/ordinal binding takes precedence
+                // over input names. Otherwise only a projected group key is available.
+                let position = match order_by_output_position(item, &output_map)? {
+                    Some(position) => Some(position),
+                    None if resolve_simple_col(&item.expr, col_map) == Some(group_col_idx) => {
+                        group_output
+                    }
+                    None => None,
+                };
+                let Some(position) = position else {
+                    return Ok(None);
+                };
+                let mut item = item.clone();
+                item.output_ordinal = Some(position);
+                item.output_name = None;
+                items.push(item);
+            }
+            Some(StreamGroupOrder { items, columns })
+        };
+
         Ok(Some(Self {
             group_target,
             group_default,
@@ -2946,6 +2981,7 @@ impl StreamGroupByPlan {
             nonpk_agg_defaults,
             output,
             where_pred,
+            output_order,
         }))
     }
 
@@ -3057,6 +3093,29 @@ impl StreamGroupByPlan {
             }
             result_rows.push(row);
         }
+        if let Some(order) = &self.output_order {
+            // Generic grouping visits NULL, then ascending group keys before its
+            // stable final sort. Preserve that order when output sort keys tie.
+            let groups = sort_vec_by(groups.into_iter().collect(), cancel, |a, b| a.0.cmp(&b.0))?;
+            self.append_groups(groups, &mut result_rows, cancel)?;
+            sort_rows(&mut result_rows, &order.items, &order.columns, cancel)?;
+        } else {
+            self.append_groups(groups, &mut result_rows, cancel)?;
+        }
+        check_cancel(cancel)?;
+
+        Ok(ExecutionResult::Query(QueryResult {
+            columns: col_names,
+            rows: result_rows,
+        }))
+    }
+
+    fn append_groups(
+        &self,
+        groups: impl IntoIterator<Item = (i64, Vec<AggState>)>,
+        result_rows: &mut Vec<Vec<Value>>,
+        cancel: Option<&CancelToken>,
+    ) -> Result<()> {
         for (group_idx, (group_key, states)) in groups.into_iter().enumerate() {
             check_cancel_at(cancel, group_idx)?;
             let mut row = Vec::with_capacity(self.output.len());
@@ -3072,12 +3131,7 @@ impl StreamGroupByPlan {
             }
             result_rows.push(row);
         }
-        check_cancel(cancel)?;
-
-        Ok(ExecutionResult::Query(QueryResult {
-            columns: col_names,
-            rows: result_rows,
-        }))
+        Ok(())
     }
 }
 

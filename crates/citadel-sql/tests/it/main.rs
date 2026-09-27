@@ -119,6 +119,7 @@ mod select_point;
 mod session_timezone_clock;
 mod signed_zero_hashing;
 mod sqlite_differential;
+mod stream_group_order;
 mod stress;
 mod strict;
 mod strict_insert_paths;
