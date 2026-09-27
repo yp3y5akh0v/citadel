@@ -9,7 +9,41 @@ use crate::error::Result;
 use crate::eval::ConversionFamilies;
 use crate::types::{Collation, DataType, Value};
 
-type Buckets = FxHashMap<u64, Vec<usize>>;
+/// Most distinct keys have one candidate. Keep that row in the hash table and
+/// allocate a list only when another row has the same hash. Equality is still
+/// checked by the caller, so collisions retain every candidate in row order.
+enum RowBucket {
+    Single(usize),
+    Multiple(Vec<usize>),
+}
+
+impl RowBucket {
+    fn push(&mut self, row: usize) {
+        match self {
+            Self::Single(first) => *self = Self::Multiple(vec![*first, row]),
+            Self::Multiple(rows) => rows.push(row),
+        }
+    }
+
+    fn as_slice(&self) -> &[usize] {
+        match self {
+            Self::Single(row) => std::slice::from_ref(row),
+            Self::Multiple(rows) => rows,
+        }
+    }
+}
+
+type Buckets = FxHashMap<u64, RowBucket>;
+
+fn insert_candidate(buckets: &mut Buckets, hash: u64, row: usize) {
+    use std::collections::hash_map::Entry;
+    match buckets.entry(hash) {
+        Entry::Vacant(entry) => {
+            entry.insert(RowBucket::Single(row));
+        }
+        Entry::Occupied(mut entry) => entry.get_mut().push(row),
+    }
+}
 
 pub(in crate::executor) struct ProbeTable {
     tuples: Buckets,
@@ -32,10 +66,11 @@ impl ProbeTable {
             if columns.iter().any(|&column| inner[column].is_null()) {
                 continue;
             }
-            tuples
-                .entry(join_key_hash(inner, &columns, &equi.key_colls))
-                .or_default()
-                .push(index);
+            insert_candidate(
+                &mut tuples,
+                join_key_hash(inner, &columns, &equi.key_colls),
+                index,
+            );
             for (family, &column) in families.iter_mut().zip(&columns) {
                 family.add(&inner[column]);
             }
@@ -72,7 +107,11 @@ impl ProbeTable {
         for (pair, &collation) in equi.pairs.iter().zip(&equi.key_colls) {
             hash_join_value(&outer[pair.outer], collation, &mut hash);
         }
-        Some(self.tuples.get(&hash.finish()).map_or(&[], Vec::as_slice))
+        Some(
+            self.tuples
+                .get(&hash.finish())
+                .map_or(&[], RowBucket::as_slice),
+        )
     }
 
     pub(super) fn comparison_candidates(
@@ -213,7 +252,7 @@ impl CoercedTupleIndex {
         for (row, inner) in inner_rows.iter().enumerate() {
             cancel.work()?;
             if let Some(key) = index.hash_row(inner, equi, false) {
-                index.tuples.entry(key).or_default().push(row);
+                insert_candidate(&mut index.tuples, key, row);
             }
         }
         cancel.check()?;
@@ -230,7 +269,7 @@ impl CoercedTupleIndex {
     fn lookup(&self, outer: &[Value], equi: &EquiJoin) -> &[usize] {
         self.hash_row(outer, equi, true)
             .and_then(|key| self.tuples.get(&key))
-            .map_or(&[], Vec::as_slice)
+            .map_or(&[], RowBucket::as_slice)
     }
 
     fn hash_row(&self, row: &[Value], equi: &EquiJoin, outer: bool) -> Option<u64> {
@@ -308,33 +347,30 @@ struct ColumnIndex {
 
 impl ColumnIndex {
     fn insert(&mut self, value: &Value, collation: Collation, row: usize) {
-        self.native
-            .entry(scalar_hash(value, collation))
-            .or_default()
-            .push(row);
+        insert_candidate(&mut self.native, scalar_hash(value, collation), row);
         if let Some(domain) = Domain::of(value) {
-            self.domains[domain as usize]
-                .actual
-                .entry(scalar_hash(value, Collation::Binary))
-                .or_default()
-                .push(row);
+            insert_candidate(
+                &mut self.domains[domain as usize].actual,
+                scalar_hash(value, Collation::Binary),
+                row,
+            );
             if let Value::Date(_) = value {
                 if let Some(timestamp) = value.clone().coerce_into(DataType::Timestamp) {
-                    self.domains[Domain::Timestamp as usize]
-                        .actual
-                        .entry(scalar_hash(&timestamp, Collation::Binary))
-                        .or_default()
-                        .push(row);
+                    insert_candidate(
+                        &mut self.domains[Domain::Timestamp as usize].actual,
+                        scalar_hash(&timestamp, Collation::Binary),
+                        row,
+                    );
                 }
             }
         } else if matches!(value, Value::Text(_) | Value::Integer(_)) {
             for domain in Domain::ALL {
                 if let Some(converted) = value.clone().coerce_into(domain.data_type()) {
-                    self.domains[domain as usize]
-                        .converted
-                        .entry(scalar_hash(&converted, Collation::Binary))
-                        .or_default()
-                        .push(row);
+                    insert_candidate(
+                        &mut self.domains[domain as usize].converted,
+                        scalar_hash(&converted, Collation::Binary),
+                        row,
+                    );
                 }
             }
         }
@@ -449,9 +485,9 @@ struct CandidateLists<'a> {
 }
 
 impl<'a> CandidateLists<'a> {
-    fn push(&mut self, values: Option<&'a Vec<usize>>) {
+    fn push(&mut self, values: Option<&'a RowBucket>) {
         if let Some(values) = values {
-            self.lists[self.count] = values;
+            self.lists[self.count] = values.as_slice();
             self.count += 1;
         }
     }
@@ -514,6 +550,40 @@ mod tests {
             days,
             micros,
         }
+    }
+
+    #[test]
+    fn tuple_bucket_promotes_without_losing_collision_candidates() {
+        let equi = keys(&[Collation::Binary]);
+        let inner = vec![
+            vec![Value::Integer(7)],
+            vec![Value::Integer(9)],
+            vec![Value::Real(7.0)],
+            vec![Value::Integer(7)],
+        ];
+        let mut cancel = JoinCancel::new(None).unwrap();
+        let mut probe = ProbeTable::build(&inner, &equi, &mut cancel).unwrap();
+        assert_eq!(
+            probe.cached_candidates(&inner[0], &equi),
+            Some(&[0, 2, 3][..])
+        );
+        assert_eq!(probe.cached_candidates(&inner[1], &equi), Some(&[1][..]));
+
+        // Deliberately put an unequal row in the same hash bucket. Hashes only
+        // select candidates: the ordinary equality check must still reject it.
+        let hash = join_key_hash(&inner[0], &[0], &equi.key_colls);
+        insert_candidate(&mut probe.tuples, hash, 1);
+        let found = probe
+            .candidates(&inner[0], &equi, &inner, &mut cancel)
+            .unwrap();
+        assert!(matches!(found, Cow::Borrowed(_)));
+        assert_eq!(found.as_ref(), &[0, 2, 3, 1]);
+        let equal: Vec<_> = found
+            .iter()
+            .copied()
+            .filter(|&row| equi.keys_match(&inner[0], &inner[row]).unwrap())
+            .collect();
+        assert_eq!(equal, [0, 2, 3]);
     }
 
     #[test]
@@ -713,13 +783,25 @@ mod tests {
             .columns
             .iter()
             .map(|column| {
-                column.native.values().map(Vec::len).sum::<usize>()
+                column
+                    .native
+                    .values()
+                    .map(|bucket| bucket.as_slice().len())
+                    .sum::<usize>()
                     + column
                         .domains
                         .iter()
                         .map(|domain| {
-                            domain.actual.values().map(Vec::len).sum::<usize>()
-                                + domain.converted.values().map(Vec::len).sum::<usize>()
+                            domain
+                                .actual
+                                .values()
+                                .map(|bucket| bucket.as_slice().len())
+                                .sum::<usize>()
+                                + domain
+                                    .converted
+                                    .values()
+                                    .map(|bucket| bucket.as_slice().len())
+                                    .sum::<usize>()
                         })
                         .sum::<usize>()
             })
@@ -833,7 +915,14 @@ mod tests {
         assert!(probe.coerced_tuples.get().unwrap().is_some());
         assert!(probe.comparison.get().is_none());
         let index = probe.coerced_tuples.get().unwrap().as_ref().unwrap();
-        assert_eq!(index.tuples.values().map(Vec::len).sum::<usize>(), 128);
+        assert_eq!(
+            index
+                .tuples
+                .values()
+                .map(|bucket| bucket.as_slice().len())
+                .sum::<usize>(),
+            128
+        );
     }
 
     #[test]
