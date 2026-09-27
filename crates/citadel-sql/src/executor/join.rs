@@ -14,7 +14,7 @@ use super::helpers::*;
 use super::scan::*;
 
 mod keys;
-use keys::ProbeTable;
+use keys::{IndexedRows, ProbeTable};
 
 /// JOIN sources currently support relations and derived tables. Function
 /// arguments must not be discarded by resolving only a same-named relation.
@@ -334,8 +334,15 @@ impl EquiJoin {
 /// indexes of an equi-join where it converts a date, time, interval or text.
 pub(in crate::executor) struct KeyedRows {
     rows: Vec<Vec<Value>>,
+    index: KeyedRowIndex,
+}
+
+/// An equality index over one immutable row store. The owner supplies that
+/// same store on every lookup; selections retain physical row IDs, not copies.
+pub(in crate::executor) struct KeyedRowIndex {
     equi: EquiJoin,
     probe: ProbeTable,
+    selection: Option<Box<[usize]>>,
 }
 
 impl KeyedRows {
@@ -346,21 +353,8 @@ impl KeyedRows {
         keys: &[(usize, Collation)],
         cancel: Option<&citadel::CancelToken>,
     ) -> Result<Self> {
-        let equi = EquiJoin {
-            pairs: keys
-                .iter()
-                .enumerate()
-                .map(|(position, &(column, _))| KeyPair {
-                    outer: position,
-                    inner: column,
-                    left_is_outer: true,
-                })
-                .collect(),
-            pure: true,
-            key_colls: keys.iter().map(|&(_, collation)| collation).collect(),
-        };
-        let probe = ProbeTable::build(&rows, &equi, &mut JoinCancel::new(cancel)?)?;
-        Ok(Self { rows, equi, probe })
+        let index = KeyedRowIndex::build(&rows, keys, None, cancel)?;
+        Ok(Self { rows, index })
     }
 
     /// Whether some row whose keys equal `key`, one value for each key
@@ -369,27 +363,9 @@ impl KeyedRows {
         &'s self,
         key: &[Value],
         cancel: Option<&citadel::CancelToken>,
-        mut accept: impl FnMut(&'s [Value]) -> Result<bool>,
+        accept: impl FnMut(&'s [Value]) -> Result<bool>,
     ) -> Result<bool> {
-        let mut cancel = JoinCancel::new(cancel)?;
-        let comparison;
-        let candidates = match self.probe.cached_candidates(key, &self.equi) {
-            Some(candidates) => candidates,
-            None => {
-                comparison =
-                    self.probe
-                        .comparison_candidates(key, &self.equi, &self.rows, &mut cancel)?;
-                comparison.as_ref()
-            }
-        };
-        for &index in candidates {
-            cancel.work()?;
-            let row = &self.rows[index];
-            if self.equi.keys_match(key, row)? && accept(row)? {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+        self.index.any_match(&self.rows, key, cancel, accept)
     }
 
     /// Whether some row's keys equal `key`.
@@ -413,6 +389,85 @@ impl KeyedRows {
             Ok(false)
         })?;
         Ok(found)
+    }
+}
+
+impl KeyedRowIndex {
+    /// A selection lists row IDs in insertion order. `None` indexes all rows.
+    /// Rows with NULL in any indexed column match nothing.
+    pub(in crate::executor) fn build(
+        rows: &[Vec<Value>],
+        keys: &[(usize, Collation)],
+        selection: Option<Vec<usize>>,
+        cancel: Option<&citadel::CancelToken>,
+    ) -> Result<Self> {
+        let equi = EquiJoin {
+            pairs: keys
+                .iter()
+                .enumerate()
+                .map(|(position, &(column, _))| KeyPair {
+                    outer: position,
+                    inner: column,
+                    left_is_outer: true,
+                })
+                .collect(),
+            pure: true,
+            key_colls: keys.iter().map(|&(_, collation)| collation).collect(),
+        };
+        let selection = selection.map(Vec::into_boxed_slice);
+        let probe = ProbeTable::build_indexed(
+            IndexedRows::new(rows, selection.as_deref()),
+            &equi,
+            &mut JoinCancel::new(cancel)?,
+        )?;
+        Ok(Self {
+            equi,
+            probe,
+            selection,
+        })
+    }
+
+    /// Whether some row whose keys equal `key`, one value for each key
+    /// position, satisfies `accept`. Rows are offered in insertion order.
+    pub(in crate::executor) fn any_match<'s>(
+        &self,
+        rows: &'s [Vec<Value>],
+        key: &[Value],
+        cancel: Option<&citadel::CancelToken>,
+        mut accept: impl FnMut(&'s [Value]) -> Result<bool>,
+    ) -> Result<bool> {
+        let mut cancel = JoinCancel::new(cancel)?;
+        let comparison;
+        let candidates = match self.probe.cached_candidates(key, &self.equi) {
+            Some(candidates) => candidates,
+            None => {
+                comparison = self.probe.comparison_candidates_indexed(
+                    key,
+                    &self.equi,
+                    IndexedRows::new(rows, self.selection.as_deref()),
+                    &mut cancel,
+                )?;
+                comparison.as_ref()
+            }
+        };
+        for &index in candidates {
+            cancel.work()?;
+            let row = &rows[index];
+            if self.equi.keys_match(key, row)? && accept(row)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Whether some row's keys equal `key`.
+    pub(in crate::executor) fn contains(
+        &self,
+        rows: &[Vec<Value>],
+        key: &[Value],
+        cancel: Option<&citadel::CancelToken>,
+    ) -> Result<bool> {
+        self.any_match(rows, key, cancel, |_| Ok(true))
     }
 }
 

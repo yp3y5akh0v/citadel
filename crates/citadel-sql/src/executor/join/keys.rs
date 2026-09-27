@@ -45,6 +45,31 @@ fn insert_candidate(buckets: &mut Buckets, hash: u64, row: usize) {
     }
 }
 
+/// A fixed subset of one immutable row store. Candidate IDs always address the
+/// original store, including when a comparison index is initialized lazily.
+#[derive(Clone, Copy)]
+pub(super) struct IndexedRows<'a> {
+    rows: &'a [Vec<Value>],
+    selection: Option<&'a [usize]>,
+}
+
+impl<'a> IndexedRows<'a> {
+    pub(super) fn new(rows: &'a [Vec<Value>], selection: Option<&'a [usize]>) -> Self {
+        Self { rows, selection }
+    }
+
+    fn len(self) -> usize {
+        self.selection.map_or(self.rows.len(), <[usize]>::len)
+    }
+
+    fn iter(self) -> impl ExactSizeIterator<Item = (usize, &'a [Value])> {
+        (0..self.len()).map(move |position| {
+            let index = self.selection.map_or(position, |rows| rows[position]);
+            (index, self.rows[index].as_slice())
+        })
+    }
+}
+
 pub(in crate::executor) struct ProbeTable {
     tuples: Buckets,
     families: Vec<ConversionFamilies>,
@@ -58,10 +83,18 @@ impl ProbeTable {
         equi: &EquiJoin,
         cancel: &mut JoinCancel<'_>,
     ) -> Result<Self> {
+        Self::build_indexed(IndexedRows::new(inner_rows, None), equi, cancel)
+    }
+
+    pub(super) fn build_indexed(
+        inner_rows: IndexedRows<'_>,
+        equi: &EquiJoin,
+        cancel: &mut JoinCancel<'_>,
+    ) -> Result<Self> {
         let columns = equi.inner_cols();
         let mut tuples = Buckets::with_capacity_and_hasher(inner_rows.len(), Default::default());
         let mut families = vec![ConversionFamilies::default(); columns.len()];
-        for (index, inner) in inner_rows.iter().enumerate() {
+        for (index, inner) in inner_rows.iter() {
             cancel.work()?;
             if columns.iter().any(|&column| inner[column].is_null()) {
                 continue;
@@ -119,6 +152,16 @@ impl ProbeTable {
         outer: &[Value],
         equi: &EquiJoin,
         inner_rows: &[Vec<Value>],
+        cancel: &mut JoinCancel<'_>,
+    ) -> Result<Cow<'_, [usize]>> {
+        self.comparison_candidates_indexed(outer, equi, IndexedRows::new(inner_rows, None), cancel)
+    }
+
+    pub(super) fn comparison_candidates_indexed(
+        &self,
+        outer: &[Value],
+        equi: &EquiJoin,
+        inner_rows: IndexedRows<'_>,
         cancel: &mut JoinCancel<'_>,
     ) -> Result<Cow<'_, [usize]>> {
         let coerced = match self.coerced_tuples.get() {
@@ -200,13 +243,13 @@ struct CoercedTupleIndex {
 
 impl CoercedTupleIndex {
     fn build(
-        inner_rows: &[Vec<Value>],
+        inner_rows: IndexedRows<'_>,
         outer: &[Value],
         equi: &EquiJoin,
         cancel: &mut JoinCancel<'_>,
     ) -> Result<Option<Self>> {
         let mut inner_types: Option<Vec<DataType>> = None;
-        for inner in inner_rows {
+        for (_, inner) in inner_rows.iter() {
             cancel.work()?;
             if equi.pairs.iter().any(|pair| inner[pair.inner].is_null()) {
                 continue;
@@ -249,7 +292,7 @@ impl CoercedTupleIndex {
             coercions,
             tuples: Buckets::with_capacity_and_hasher(inner_rows.len(), Default::default()),
         };
-        for (row, inner) in inner_rows.iter().enumerate() {
+        for (row, inner) in inner_rows.iter() {
             cancel.work()?;
             if let Some(key) = index.hash_row(inner, equi, false) {
                 insert_candidate(&mut index.tuples, key, row);
@@ -414,7 +457,7 @@ struct ComparisonIndex {
 
 impl ComparisonIndex {
     fn build(
-        inner_rows: &[Vec<Value>],
+        inner_rows: IndexedRows<'_>,
         equi: &EquiJoin,
         cancel: &mut JoinCancel<'_>,
     ) -> Result<Self> {
@@ -432,7 +475,7 @@ impl ComparisonIndex {
             pair_columns.push(column);
         }
         let mut columns: Vec<_> = definitions.iter().map(|_| ColumnIndex::default()).collect();
-        for (row, inner) in inner_rows.iter().enumerate() {
+        for (row, inner) in inner_rows.iter() {
             cancel.work()?;
             if equi.pairs.iter().any(|pair| inner[pair.inner].is_null()) {
                 continue;
@@ -584,6 +627,61 @@ mod tests {
             .filter(|&row| equi.keys_match(&inner[0], &inner[row]).unwrap())
             .collect();
         assert_eq!(equal, [0, 2, 3]);
+    }
+
+    #[test]
+    fn selected_rows_keep_original_ids_in_native_and_lazy_indexes() {
+        let equi = keys(&[Collation::Binary]);
+        let rows = vec![
+            vec![Value::Text("1970-01-01".into())],
+            vec![Value::Date(0)],
+            vec![Value::Date(1)],
+            vec![Value::Date(0)],
+        ];
+        let selection = [1, 3];
+        let source = IndexedRows::new(&rows, Some(&selection));
+        let mut cancel = JoinCancel::new(None).unwrap();
+        let probe = ProbeTable::build_indexed(source, &equi, &mut cancel).unwrap();
+        assert_eq!(
+            probe.cached_candidates(&[Value::Date(0)], &equi),
+            Some(&[1, 3][..])
+        );
+        let coerced = probe
+            .comparison_candidates_indexed(&[Value::Timestamp(0)], &equi, source, &mut cancel)
+            .unwrap();
+        assert_eq!(coerced.as_ref(), &[1, 3]);
+        assert!(probe.coerced_tuples.get().unwrap().is_some());
+        assert!(probe.comparison.get().is_none());
+
+        // An empty selection cannot pick up matching rows when the backing
+        // store is nonempty, including during lazy comparison construction.
+        let empty = IndexedRows::new(&rows, Some(&[]));
+        let empty_probe = ProbeTable::build_indexed(empty, &equi, &mut cancel).unwrap();
+        assert!(empty_probe
+            .comparison_candidates_indexed(&[Value::Timestamp(0)], &equi, empty, &mut cancel)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn selected_mixed_rows_exclude_unselected_temporal_matches() {
+        let equi = keys(&[Collation::Binary]);
+        let rows = vec![
+            vec![Value::Date(0)],
+            vec![Value::Timestamp(0)],
+            vec![Value::Integer(0)],
+            vec![Value::Text("1970-01-01".into())],
+        ];
+        let selection = [1, 3];
+        let source = IndexedRows::new(&rows, Some(&selection));
+        let mut cancel = JoinCancel::new(None).unwrap();
+        let probe = ProbeTable::build_indexed(source, &equi, &mut cancel).unwrap();
+        let found = probe
+            .comparison_candidates_indexed(&[Value::Date(0)], &equi, source, &mut cancel)
+            .unwrap();
+        assert_eq!(found.as_ref(), &[1, 3]);
+        assert!(probe.coerced_tuples.get().unwrap().is_none());
+        assert!(probe.comparison.get().is_some());
     }
 
     #[test]
@@ -768,7 +866,8 @@ mod tests {
         let mut outer = vec![Value::Date(0); KEYS];
         outer[KEYS - 1] = Value::Integer(42);
         let mut cancel = JoinCancel::new(None).unwrap();
-        let comparison = ComparisonIndex::build(&inner, &equi, &mut cancel).unwrap();
+        let comparison =
+            ComparisonIndex::build(IndexedRows::new(&inner, None), &equi, &mut cancel).unwrap();
         let found = comparison.candidates(&outer, &equi, &mut cancel).unwrap();
         assert_eq!(found.as_ref(), &[42]);
         assert!(matches!(found, Cow::Borrowed(_)));
@@ -842,7 +941,8 @@ mod tests {
         }
         let inner = vec![vec![Value::Text("1970-01-01".into())]; 32];
         let mut cancel = JoinCancel::new(None).unwrap();
-        let comparison = ComparisonIndex::build(&inner, &equi, &mut cancel).unwrap();
+        let comparison =
+            ComparisonIndex::build(IndexedRows::new(&inner, None), &equi, &mut cancel).unwrap();
         let found = comparison
             .candidates(&[Value::Date(0)], &equi, &mut cancel)
             .unwrap();
@@ -860,7 +960,7 @@ mod tests {
             let probe =
                 ProbeTable::build(&inner, &equi, &mut JoinCancel::new(None).unwrap()).unwrap();
             let homogeneous = CoercedTupleIndex::build(
-                &inner,
+                IndexedRows::new(&inner, None),
                 &[Value::Date(0)],
                 &equi,
                 &mut JoinCancel::new(None).unwrap(),
