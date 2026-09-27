@@ -156,13 +156,16 @@ impl<'db> SetRowBinder<'db> {
         ctx: &CorrelationCtx<'_>,
         cancel: Option<&citadel::CancelToken>,
     ) -> Result<Option<Self>> {
+        if !assignments
+            .iter()
+            .any(|(_, expr)| super::dml::has_subquery(expr))
+        {
+            return Ok(None);
+        }
         let deferred: Vec<bool> = assignments
             .iter()
             .map(|(_, expr)| super::dml::has_subquery(expr))
             .collect();
-        if !deferred.iter().any(|&has| has) {
-            return Ok(None);
-        }
         let outer = OuterScope::single(
             &ctx.outer_schema.name,
             ctx.outer_alias,
