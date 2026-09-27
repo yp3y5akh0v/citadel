@@ -630,7 +630,7 @@ impl PageIO for FailingIO {
 
 #[test]
 fn failed_commit_releases_writer_lock() {
-    // FailingIO fails on second fsync - commit must still release writer lock.
+    // The first fsync precedes the selector flip, so the handle stays writable.
     let storage = std::sync::Arc::new(SharedStorage::new(4 * 1024 * 1024));
 
     {
@@ -641,7 +641,7 @@ fn failed_commit_releases_writer_lock() {
     }
 
     let (dek, mac_key, _) = test_keys();
-    let failing_io = Box::new(FailingIO::new(storage.clone(), 2));
+    let failing_io = Box::new(FailingIO::new(storage.clone(), 1));
     let mgr = TxnManager::open(failing_io, dek, mac_key, 1, 256).unwrap();
 
     // Attempt a write - commit should fail

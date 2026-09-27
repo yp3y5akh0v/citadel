@@ -79,6 +79,14 @@ fn failed_transaction_tells_the_caller_to_roll_back() {
 }
 
 #[test]
+fn reopen_required_tells_the_caller_to_reopen() {
+    assert_eq!(
+        Error::ReopenRequired.to_string(),
+        "an earlier commit's durability is unknown; reopen the database before writing"
+    );
+}
+
+#[test]
 fn region_in_use_keeps_the_region_id() {
     assert_eq!(
         Error::RegionInUse { region_id: 42 }.to_string(),

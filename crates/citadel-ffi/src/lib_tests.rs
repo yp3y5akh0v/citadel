@@ -251,6 +251,15 @@ fn failed_transaction_has_a_dedicated_ffi_code() {
 }
 
 #[test]
+fn reopen_required_has_a_dedicated_ffi_code() {
+    assert_eq!(
+        map_error(&citadel_core::Error::ReopenRequired),
+        CitadelError::ReopenRequired
+    );
+    assert!(include_str!("../citadel.h").contains("CITADEL_ERROR_T_REOPEN_REQUIRED = -22"));
+}
+
+#[test]
 fn memory_resource_guards_have_dedicated_ffi_codes() {
     assert_eq!(
         map_error(&citadel_core::Error::RegionInUse { region_id: 7 }),

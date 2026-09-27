@@ -14,12 +14,26 @@ enum Op {
     SetLen(usize),
 }
 
+/// How one fsync fails.
+#[derive(Clone, Copy, Debug)]
+enum SyncFault {
+    /// The writes reached the disk, but the sync still reports an error.
+    Persisted,
+    /// The writes stay readable but never reach the disk, as when a failed
+    /// writeback marks their pages clean.
+    Dropped,
+    /// Power is lost as the sync starts.
+    PowerLoss,
+}
+
 struct Disk {
     durable: Vec<u8>,
     pending: Vec<Op>,
     view: Vec<u8>,
     ops: u64,
     syncs: u64,
+    sync_calls: u64,
+    sync_faults: BTreeMap<u64, SyncFault>,
     crash_at: Option<u64>,
     crashed: bool,
 }
@@ -29,6 +43,10 @@ struct PowerLossIO(Arc<Mutex<Disk>>);
 
 fn power_lost() -> Error {
     Error::Io(std::io::Error::other("simulated power loss"))
+}
+
+fn sync_failed() -> Error {
+    Error::Io(std::io::Error::other("simulated fsync failure"))
 }
 
 fn apply(image: &mut Vec<u8>, op: &Op) {
@@ -52,6 +70,8 @@ impl PowerLossIO {
             view: image,
             ops: 0,
             syncs: 0,
+            sync_calls: 0,
+            sync_faults: BTreeMap::new(),
             crash_at: None,
             crashed: false,
         })))
@@ -61,6 +81,13 @@ impl PowerLossIO {
     fn arm(&self, count: u64) {
         let mut disk = self.0.lock();
         disk.crash_at = Some(disk.ops + count);
+    }
+
+    /// Fail the `nth` fsync from now, counting from zero.
+    fn fail_sync(&self, nth: u64, fault: SyncFault) {
+        let mut disk = self.0.lock();
+        let call = disk.sync_calls + nth;
+        disk.sync_faults.insert(call, fault);
     }
 
     fn ops(&self) -> u64 {
@@ -100,6 +127,18 @@ impl PowerLossIO {
         let mut image = disk.durable.clone();
         for op in &disk.pending[..count] {
             apply(&mut image, op);
+        }
+        image
+    }
+
+    /// Every pending operation lands except the writes to the header sector.
+    fn image_without_header(&self) -> Vec<u8> {
+        let disk = self.0.lock();
+        let mut image = disk.durable.clone();
+        for op in &disk.pending {
+            if !matches!(op, Op::Write { offset, .. } if *offset < SECTOR) {
+                apply(&mut image, op);
+            }
         }
         image
     }
@@ -194,17 +233,39 @@ impl PageIO for PowerLossIO {
 
     fn fsync(&self) -> Result<()> {
         let mut disk = self.mutate()?;
+        let call = disk.sync_calls;
+        disk.sync_calls += 1;
         let Disk {
             durable,
             pending,
             syncs,
+            sync_faults,
+            crashed,
             ..
         } = &mut *disk;
-        for op in pending.drain(..) {
-            apply(durable, &op);
+        match sync_faults.remove(&call) {
+            None => {
+                for op in pending.drain(..) {
+                    apply(durable, &op);
+                }
+                *syncs += 1;
+                Ok(())
+            }
+            Some(SyncFault::Persisted) => {
+                for op in pending.drain(..) {
+                    apply(durable, &op);
+                }
+                Err(sync_failed())
+            }
+            Some(SyncFault::Dropped) => {
+                pending.clear();
+                Err(sync_failed())
+            }
+            Some(SyncFault::PowerLoss) => {
+                *crashed = true;
+                Err(power_lost())
+            }
         }
-        *syncs += 1;
-        Ok(())
     }
 
     fn file_size(&self) -> Result<u64> {
@@ -355,14 +416,7 @@ fn run(
     }
     let mut acked = 0;
     for txn in txns {
-        let Ok(mut wtx) = mgr.begin_write() else {
-            break;
-        };
-        let applied = txn.iter().try_for_each(|change| match change {
-            Change::Put(key, value) => wtx.insert(key, value).map(drop),
-            Change::Delete(key) => wtx.delete(key).map(drop),
-        });
-        if applied.is_err() || wtx.commit().is_err() {
+        if commit(&mgr, txn).is_err() {
             break;
         }
         acked += 1;
@@ -378,6 +432,17 @@ fn run(
         }
     }
     (io, acked)
+}
+
+fn commit(mgr: &TxnManager, txn: &[Change]) -> Result<()> {
+    let mut wtx = mgr.begin_write()?;
+    for change in txn {
+        match change {
+            Change::Put(key, value) => wtx.insert(key, value).map(drop)?,
+            Change::Delete(key) => wtx.delete(key).map(drop)?,
+        }
+    }
+    wtx.commit()
 }
 
 fn read_state(mgr: &TxnManager) -> Result<State> {
@@ -520,6 +585,63 @@ fn assert_no_violations((checked, violations): (usize, Vec<String>)) {
     );
 }
 
+/// Four acknowledged commits, then a fifth whose syncs fail as `faults` says.
+struct FailedCommit {
+    scenario: Scenario,
+    io: PowerLossIO,
+    txns: Vec<Vec<Change>>,
+    acked: usize,
+}
+
+impl FailedCommit {
+    fn new(mode: SyncMode, faults: &[(u64, SyncFault)]) -> (Self, TxnManager) {
+        let failing = scenario(mode, 0xF11F);
+        let txns = workload(failing.seed, failing.txns);
+        let (io, acked) = run(&failing, &txns[..4], None);
+        let (dek, mac_key, _) = test_keys();
+        let mgr =
+            TxnManager::open_with_sync(Box::new(io.clone()), dek, mac_key, 1, 64, mode).unwrap();
+        for &(nth, fault) in faults {
+            io.fail_sync(nth, fault);
+        }
+        assert!(commit(&mgr, &txns[acked]).is_err());
+        let failed = Self {
+            scenario: failing,
+            io,
+            txns,
+            acked,
+        };
+        (failed, mgr)
+    }
+
+    fn next_txn(&self) -> &[Change] {
+        &self.txns[self.acked + 1]
+    }
+
+    /// The durable image, every pending write landing, all but the header's,
+    /// and random sector images, each checked against the mode's contract.
+    fn crash_image_problems(&self, rng: &mut SplitMix) -> (usize, Vec<String>) {
+        let states = states(&self.txns);
+        let mode = self.scenario.mode;
+        let allowed = match mode {
+            SyncMode::Normal => normal_allowed(self.acked),
+            _ => full_allowed(self.acked),
+        };
+        let mut images = vec![
+            self.io.ordered_image(0),
+            self.io.ordered_image(self.io.pending()),
+            self.io.image_without_header(),
+        ];
+        images.extend((0..self.scenario.sector_images).map(|_| self.io.sector_image(rng)));
+        let checked = images.len();
+        let problems = images
+            .into_iter()
+            .filter_map(|image| verify_recovery(image, mode, &states, allowed.clone()).err())
+            .collect();
+        (checked, problems)
+    }
+}
+
 // Each sync mode and each secure-delete setting runs once with reopens, which
 // rebuild reclamation state from the selected slot, and once without.
 
@@ -536,6 +658,101 @@ fn full_sync_secure_delete_survives_power_loss_across_reopens() {
         ..scenario(SyncMode::Full, 0x5EC0)
     };
     assert_no_violations(explore(secure, full_allowed));
+}
+
+#[test]
+fn full_sync_selector_failure_keeps_recovery_armed_and_refuses_writers() {
+    let (failed, mgr) = FailedCommit::new(SyncMode::Full, &[(1, SyncFault::Dropped)]);
+    let states = states(&failed.txns);
+    assert!(matches!(mgr.begin_write(), Err(Error::ReopenRequired)));
+    assert!(mgr.integrity_check().unwrap().is_ok());
+    assert_eq!(read_state(&mgr).unwrap(), states[failed.acked]);
+
+    let disk = PowerLossIO::new(failed.io.ordered_image(0));
+    assert!(file_manager::read_file_header(&disk)
+        .unwrap()
+        .recovery_required());
+    let (dek, mac_key, _) = test_keys();
+    let reopened =
+        TxnManager::open_with_sync(Box::new(disk.clone()), dek, mac_key, 1, 64, SyncMode::Full)
+            .unwrap();
+    let [first, second] = file_manager::read_file_header(&disk).unwrap().slots;
+    assert_eq!(first, second);
+    assert_eq!(read_state(&reopened).unwrap(), states[failed.acked]);
+    commit(&reopened, failed.next_txn()).unwrap();
+}
+
+/// A failed sync is followed by another commit that loses power at its first
+/// sync. After an unconfirmed Full flip the disk may select the failed commit,
+/// whose pages that next commit would reuse.
+#[test]
+fn sync_failures_leave_every_later_crash_recoverable() {
+    use SyncFault::{Dropped, Persisted, PowerLoss};
+    let flip = |flip, restore| vec![(1, flip), (2, restore), (3, PowerLoss)];
+    let pages = |fault| vec![(0, fault), (1, PowerLoss)];
+    let mut rng = SplitMix(0xF11F);
+    let mut checked = 0;
+    let mut violations = Vec::new();
+    for (mode, faults) in [
+        (SyncMode::Full, flip(Persisted, Dropped)),
+        (SyncMode::Full, flip(Persisted, Persisted)),
+        (SyncMode::Full, flip(Dropped, Persisted)),
+        (SyncMode::Full, flip(Dropped, Dropped)),
+        (SyncMode::Full, pages(Persisted)),
+        (SyncMode::Full, pages(Dropped)),
+        (SyncMode::Normal, pages(Persisted)),
+        (SyncMode::Normal, pages(Dropped)),
+    ] {
+        let (failed, mgr) = FailedCommit::new(mode, &faults);
+        assert!(commit(&mgr, failed.next_txn()).is_err());
+        let (count, problems) = failed.crash_image_problems(&mut rng);
+        checked += count;
+        violations.extend(
+            problems
+                .into_iter()
+                .map(|problem| format!("{mode:?}, sync faults {faults:?}: {problem}")),
+        );
+    }
+    assert_no_violations((checked, violations));
+}
+
+/// The reopen that `ReopenRequired` asks for reads the page cache, which after
+/// a failed sync may differ from the disk; its first commit must still be safe.
+#[test]
+fn a_reopen_after_an_unconfirmed_flip_commits_safely() {
+    use SyncFault::{Dropped, Persisted, PowerLoss};
+    let mut rng = SplitMix(0x0E0F);
+    let mut checked = 0;
+    let mut violations = Vec::new();
+    for (flip, restore) in [
+        (Persisted, Dropped),
+        (Persisted, Persisted),
+        (Dropped, Persisted),
+        (Dropped, Dropped),
+    ] {
+        let (failed, mgr) = FailedCommit::new(SyncMode::Full, &[(1, flip), (2, restore)]);
+        drop(mgr);
+        let (dek, mac_key, _) = test_keys();
+        let reopened = TxnManager::open_with_sync(
+            Box::new(failed.io.clone()),
+            dek,
+            mac_key,
+            1,
+            64,
+            SyncMode::Full,
+        )
+        .unwrap();
+        failed.io.fail_sync(0, PowerLoss);
+        assert!(commit(&reopened, failed.next_txn()).is_err());
+        let (count, problems) = failed.crash_image_problems(&mut rng);
+        checked += count;
+        violations.extend(
+            problems
+                .into_iter()
+                .map(|problem| format!("{flip:?} flip, {restore:?} restore: {problem}")),
+        );
+    }
+    assert_no_violations((checked, violations));
 }
 
 #[test]

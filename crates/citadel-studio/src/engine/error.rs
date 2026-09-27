@@ -202,7 +202,7 @@ fn core_kind(e: &CoreError) -> Kind {
         CoreError::AuditFailureAfterOperation { .. }
         | CoreError::DurabilityFailureAfterOperation { .. }
         | CoreError::DurabilityAndAuditFailureAfterOperation { .. } => Kind::Completed,
-        CoreError::Sync(_) => Kind::Io,
+        CoreError::Sync(_) | CoreError::ReopenRequired => Kind::Io,
     }
 }
 
