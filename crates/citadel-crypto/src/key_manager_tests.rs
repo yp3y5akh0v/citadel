@@ -490,14 +490,18 @@ fn invalid_magic_rejected() {
 }
 
 #[test]
-fn tampered_key_file_detected() {
+fn every_bit_flip_outside_the_memory_cost_is_rejected() {
     let (kf, _) = create_key_file(b"password", 42, KdfAlgorithm::Argon2id, 64, 1, 1).unwrap();
-
-    let mut serialized = kf.serialize();
-    serialized[50] ^= 0x01;
-
-    let result = open_key_file(&serialized, b"password", 42);
-    assert!(result.is_err());
+    let image = kf.serialize();
+    // A flipped memory cost can demand gigabytes; its bound has its own tests.
+    for bit in (0..KEY_FILE_SIZE * 8).filter(|bit| !(32 * 8..36 * 8).contains(bit)) {
+        let mut flipped = image;
+        flipped[bit / 8] ^= 1 << (bit % 8);
+        assert!(
+            open_key_file(&flipped, b"password", 42).is_err(),
+            "bit {bit}"
+        );
+    }
 }
 
 #[test]
