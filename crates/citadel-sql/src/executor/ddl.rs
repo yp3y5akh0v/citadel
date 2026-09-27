@@ -754,11 +754,15 @@ pub(super) fn exec_drop_index_in_txn(
         }
     };
 
-    ensure_drop_index_keeps_constraints(schema, schema.get(&table_name).unwrap(), &lower_idx)?;
+    ensure_drop_index_keeps_constraints(
+        schema,
+        schema.get_by_storage_name(&table_name).unwrap(),
+        &lower_idx,
+    )?;
     let idx_table = TableSchema::index_table_name(&table_name, &lower_idx);
     wtx.drop_table(&idx_table).map_err(SqlError::Storage)?;
 
-    let table_schema = schema.get(&table_name).unwrap();
+    let table_schema = schema.get_by_storage_name(&table_name).unwrap();
     // Dropping the ANN index orphans its persisted segment - drop it with us.
     if table_schema
         .index_by_name(&lower_idx)
@@ -1323,11 +1327,9 @@ pub(super) fn find_index_in_schemas(
     schema: &SchemaManager,
     index_name: &str,
 ) -> Option<(String, usize)> {
-    for table_name in schema.table_names() {
-        if let Some(ts) = schema.get(table_name) {
-            if let Some(pos) = ts.indices.iter().position(|i| i.name == index_name) {
-                return Some((table_name.to_string(), pos));
-            }
+    for table in schema.all_schemas() {
+        if let Some(pos) = table.indices.iter().position(|i| i.name == index_name) {
+            return Some((table.name.clone(), pos));
         }
     }
     None

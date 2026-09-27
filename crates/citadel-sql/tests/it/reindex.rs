@@ -64,6 +64,122 @@ fn every_form_rebuilds_an_index_from_its_rows() {
 }
 
 #[test]
+fn reindex_database_rebuilds_permanent_tables_shadowed_by_temp() {
+    for form in ["REINDEX", "REINDEX DATABASE"] {
+        let db = database();
+        let temporary = Connection::open(&db).unwrap();
+        temporary
+            .execute("CREATE TEMP TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+            .unwrap();
+        temporary
+            .execute("CREATE INDEX temporary_v ON t (v)")
+            .unwrap();
+        temporary.execute("INSERT INTO t VALUES (9, 90)").unwrap();
+
+        // A separate connection may create a permanent name after this
+        // connection's TEMP alias exists. Both physical tables must be rebuilt.
+        let permanent = Connection::open(&db).unwrap();
+        permanent
+            .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+            .unwrap();
+        permanent
+            .execute("CREATE INDEX permanent_v ON t (v)")
+            .unwrap();
+        permanent.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+        empty_index(&db, &permanent, "t", "permanent_v");
+        empty_index(&db, &temporary, "t", "temporary_v");
+        let permanent_lookup = "SELECT id FROM t WHERE v = 10";
+        let temporary_lookup = "SELECT id FROM t WHERE v = 90";
+        assert!(ids(&permanent, permanent_lookup).is_empty());
+        assert!(ids(&temporary, temporary_lookup).is_empty());
+
+        temporary.execute(form).unwrap();
+
+        assert_eq!(
+            ids(&permanent, permanent_lookup),
+            [Value::Integer(1)],
+            "{form}"
+        );
+        assert_eq!(
+            ids(&temporary, temporary_lookup),
+            [Value::Integer(9)],
+            "{form}"
+        );
+    }
+}
+
+#[test]
+fn reindex_named_index_finds_permanent_table_shadowed_by_temp() {
+    for form in ["REINDEX INDEX permanent_v", "REINDEX permanent_v"] {
+        let db = database();
+        let temporary = Connection::open(&db).unwrap();
+        temporary
+            .execute("CREATE TEMP TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+            .unwrap();
+        temporary.execute("INSERT INTO t VALUES (9, 90)").unwrap();
+        let permanent = Connection::open(&db).unwrap();
+        permanent
+            .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+            .unwrap();
+        permanent
+            .execute("CREATE INDEX permanent_v ON t (v)")
+            .unwrap();
+        permanent.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+        empty_index(&db, &permanent, "t", "permanent_v");
+        let lookup = "SELECT id FROM t WHERE v = 10";
+        assert!(ids(&permanent, lookup).is_empty());
+
+        temporary.execute(form).unwrap();
+
+        assert_eq!(ids(&permanent, lookup), [Value::Integer(1)], "{form}");
+        assert_eq!(
+            ids(&temporary, "SELECT id FROM t"),
+            [Value::Integer(9)],
+            "{form}"
+        );
+    }
+}
+
+#[test]
+fn drop_index_uses_its_permanent_table_when_shadowed_by_temp() {
+    let db = database();
+    let temporary = Connection::open(&db).unwrap();
+    temporary
+        .execute("CREATE TEMP TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    temporary
+        .execute("CREATE INDEX temporary_v ON t (v)")
+        .unwrap();
+    temporary.execute("INSERT INTO t VALUES (9, 90)").unwrap();
+    let permanent = Connection::open(&db).unwrap();
+    permanent
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    permanent
+        .execute("CREATE INDEX permanent_v ON t (v)")
+        .unwrap();
+    permanent.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+
+    temporary.execute("DROP INDEX permanent_v").unwrap();
+
+    // table_schema reads the connection's admitted catalog. Reopen to check
+    // persisted metadata after another connection performed the DDL.
+    let reopened = Connection::open(&db).unwrap();
+    assert!(reopened.table_schema("t").unwrap().indices.is_empty());
+    let temp_schema = temporary.table_schema("t").unwrap();
+    assert!(temp_schema.index_by_name("temporary_v").is_some());
+    assert_eq!(temp_schema.indices.len(), 1);
+    assert_eq!(
+        ids(&reopened, "SELECT id FROM t WHERE v = 10"),
+        [Value::Integer(1)]
+    );
+    assert_eq!(
+        ids(&temporary, "SELECT id FROM t WHERE v = 90"),
+        [Value::Integer(9)]
+    );
+}
+
+#[test]
 fn reindex_drops_keys_no_row_holds() {
     let db = database();
     let conn = Connection::open(&db).unwrap();

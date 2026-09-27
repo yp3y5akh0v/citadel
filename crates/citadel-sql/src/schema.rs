@@ -759,6 +759,12 @@ impl SchemaManager {
         }
     }
 
+    /// Look up a resolved physical table name.
+    /// Catalog-wide operations must not apply TEMP or view shadowing again.
+    pub(crate) fn get_by_storage_name(&self, name: &str) -> Option<&TableSchema> {
+        self.tables.get(lower_cow(name).as_ref())
+    }
+
     /// Resolution precedence: transition > matview > temp alias > base table.
     fn get_lower(&self, lower: &str) -> Option<&TableSchema> {
         if let Some(prefixed) = transition_table_lookup(lower) {
