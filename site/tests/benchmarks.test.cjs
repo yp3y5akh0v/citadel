@@ -21,6 +21,18 @@ const INVENTORY = {
   only: `date_arith date_extract date_groupby date_range_scan date_sort json_table lateral`.split(' ').sort(),
   index: ['fts_index', 'json_gin'],
 };
+const REFRESHED = {
+  execution: ('join_param update update_gen_propagate update_returning ' +
+    'upsert_counter upsert_mixed upsert_returning window_agg window_rank').split(/\s+/).sort(),
+  cached: ('correlated_exists correlated_in correlated_scalar full_outer_join ' +
+    'group_by join sum').split(/\s+/).sort(),
+};
+const ENGINE_ORDER = ['citadel', 'sqlite', 'sqlite', 'citadel',
+  'sqlite', 'citadel', 'citadel', 'sqlite'];
+const HASH = /^[a-f0-9]{64}$/;
+const approximately = (actual, expected) =>
+  assert.ok(Math.abs(actual - expected) <= Math.max(1e-10, Math.abs(expected) * 1e-12),
+    actual + ' matches ' + expected);
 
 function element(fragment = false) {
   return {
@@ -169,11 +181,12 @@ test('ratios use every per-run median and times use three significant digits', (
 });
 
 test('public data contains all 129 IDs with valid samples and public source provenance', () => {
-  assert.equal(DATA.schema_version, 1);
+  assert.equal(DATA.schema_version, 2);
   assert.equal(DATA.measurement.passes, 2);
   assert.equal(DATA.measurement.samples_per_pass, 30);
   assert.deepEqual(Object.keys(DATA.sources).sort(), [
-    'complete_6b41d0c3', 'selected_2bb8516f', 'selected_74aa7020', 'selected_ea8827d7',
+    'complete_6b41d0c3', 'selected_0dbe126c', 'selected_2bb8516f',
+    'selected_74aa7020', 'selected_ea8827d7',
   ]);
   for (const source of Object.values(DATA.sources)) {
     assert.deepEqual(Object.keys(source).sort(), ['executable_sha256', 'revision']);
@@ -182,15 +195,20 @@ test('public data contains all 129 IDs with valid samples and public source prov
   }
   assert.deepEqual(DATA.execution.filter(row => row.source === 'selected_ea8827d7')
     .map(row => row.name).sort(), [
-    'covered_range', 'fk_cascade', 'upsert_all_new', 'upsert_dedup', 'upsert_returning',
+    'covered_range', 'fk_cascade', 'upsert_all_new', 'upsert_dedup',
   ]);
   assert.deepEqual(DATA.execution.filter(row => row.source === 'selected_2bb8516f')
     .map(row => row.name).sort(), [
-    'insert', 'insert_select', 'scan', 'update', 'update_gen_propagate',
-    'update_returning', 'upsert_counter', 'upsert_mixed',
+    'insert', 'insert_select', 'scan',
   ]);
   assert.deepEqual(DATA.execution.filter(row => row.source === 'selected_74aa7020')
-    .map(row => row.name).sort(), ['window_agg', 'window_rank']);
+    .map(row => row.name).sort(), []);
+  for (const category of ['execution', 'cached']) {
+    assert.deepEqual(DATA[category].filter(row => row.source === 'selected_0dbe126c')
+      .map(row => row.name).sort(), REFRESHED[category]);
+  }
+  assert.equal(DATA.sources.selected_0dbe126c.revision,
+    '0dbe126c99d3ed1c024332cc2004f23af8a608a4');
   assert.doesNotMatch(DATA_TEXT, /[A-Z]:[\\/]|\/(?:Users|home)\/|notes[\\/]|\.exe\b|source[\\/]repos/i);
   assert.doesNotMatch(DATA_TEXT, /</, 'embedded JSON cannot contain HTML tag delimiters');
   const names = new Set();
@@ -207,17 +225,73 @@ test('public data contains all 129 IDs with valid samples and public source prov
       assert.deepEqual(Object.keys(row.samples_ns).sort(), expectedArms);
       const cohort = DATA.cohorts[row.provenance.cohort];
       assert.equal(cohort.source, row.source, row.name);
-      assert.match(cohort.reference.revision, /^[a-f0-9]{40}$/);
-      assert.match(cohort.reference.executable_sha256, /^[a-f0-9]{64}$/);
       const settings = { ...DATA.measurement, ...cohort.measurement };
+      const engineComparison = cohort.kind === 'engine_comparison';
+      assert.equal(engineComparison, row.source === 'selected_0dbe126c', row.name);
       const roles = cohort.jobs.map(job => job.role);
-      assert.deepEqual(roles, settings.comparison_order, row.name);
-      assert.equal(roles.filter(role => role === 'candidate').length, settings.passes, row.name);
+      if (engineComparison) {
+        assert.equal(cohort.source, 'selected_0dbe126c', row.name);
+        assert.ok(!Object.hasOwn(cohort, 'reference'), 'no fabricated source reference');
+        assert.deepEqual(cohort.jobs.map(job => job.engine), ENGINE_ORDER);
+        assert.deepEqual(settings.comparison_order, ENGINE_ORDER);
+        assert.equal(settings.passes, 4);
+        assert.equal(settings.samples_per_pass, 30);
+        assert.equal(settings.warmup_seconds, 3);
+        assert.equal(settings.measurement_target_seconds, 8);
+        assert.match(cohort.plan_sha256, HASH);
+        assert.match(cohort.complete_sha256, HASH);
+        assert.match(cohort.summary_sha256, HASH);
+        assert.match(cohort.build_record_sha256, HASH);
+        let previousFinish = -Infinity;
+        for (const [index, job] of cohort.jobs.entries()) {
+          assert.equal(job.step, index + 1);
+          assert.ok(!Object.hasOwn(job, 'role'), 'engine identity is not a source role');
+          const start = Date.parse(job.started_utc);
+          const finish = Date.parse(job.finished_utc);
+          assert.ok(Number.isFinite(start) && Number.isFinite(finish));
+          assert.ok(start >= previousFinish && finish >= start, 'serial complete jobs');
+          previousFinish = finish;
+          for (const field of ['receipt_sha256', 'result_sha256']) {
+            assert.match(job[field], HASH, field);
+          }
+        }
+      } else {
+        assert.equal(cohort.kind, undefined, 'only known cohort kinds are accepted');
+        assert.match(cohort.reference.revision, /^[a-f0-9]{40}$/);
+        assert.match(cohort.reference.executable_sha256, HASH);
+        assert.deepEqual(roles, settings.comparison_order, row.name);
+        assert.equal(roles.filter(role => role === 'candidate').length, settings.passes, row.name);
+      }
       for (const [arm, samples] of Object.entries(row.samples_ns)) {
         const evidence = row.provenance.arms[arm];
-        assert.equal(evidence.runs.length, roles.length, row.name);
-        assert.deepEqual(evidence.runs.filter((_, i) => roles[i] === 'candidate')
-          .map(run => run.median_ns), samples, row.name);
+        if (engineComparison) {
+          const jobs = cohort.jobs.filter(job => job.engine === arm);
+          assert.equal(jobs.length, 4);
+          assert.equal(evidence.criterion_id, row.name + '/' + arm + '/');
+          assert.deepEqual(evidence.runs.map(run => run.step), jobs.map(job => job.step));
+          assert.deepEqual(evidence.runs.map(run => run.median_ns), samples, row.name);
+          for (const run of evidence.runs) {
+            assert.equal(run.sample_count, 30);
+            assert.deepEqual(Object.keys(run.raw_sha256).sort(),
+              ['benchmark', 'estimates', 'sample']);
+            for (const digest of Object.values(run.raw_sha256)) assert.match(digest, HASH);
+          }
+          assert.deepEqual(evidence.median_range_ns, [Math.min(...samples), Math.max(...samples)]);
+          approximately(evidence.first_to_last_drift_percent,
+            (samples[3] / samples[0] - 1) * 100);
+          approximately(evidence.relative_range_percent,
+            100 * (Math.max(...samples) - Math.min(...samples)) / mean(samples));
+          assert.equal(evidence.range_exceeds_5_percent, evidence.relative_range_percent > 5);
+          assert.equal(evidence.absolute_drift_exceeds_5_percent,
+            Math.abs(evidence.first_to_last_drift_percent) > 5);
+          assert.equal(evidence.block_drift_percent.length, 2);
+          approximately(evidence.block_drift_percent[0], (samples[1] / samples[0] - 1) * 100);
+          approximately(evidence.block_drift_percent[1], (samples[3] / samples[2] - 1) * 100);
+        } else {
+          assert.equal(evidence.runs.length, roles.length, row.name);
+          assert.deepEqual(evidence.runs.filter((_, i) => roles[i] === 'candidate')
+            .map(run => run.median_ns), samples, row.name);
+        }
         for (const run of evidence.runs) {
           assert.ok(run.median_ci95_ns[0] > 0 && run.median_ci95_ns[0] <= run.median_ns
             && run.median_ns <= run.median_ci95_ns[1], row.name);
@@ -226,13 +300,30 @@ test('public data contains all 129 IDs with valid samples and public source prov
         assert.ok(samples.every(value => typeof value === 'number' && Number.isFinite(value) && value > 0), row.name);
         sourceIds[row.source]++;
       }
+      if (engineComparison) {
+        assert.equal(row.provenance.chronological_sqlite_over_citadel.length, 4);
+        for (let index = 0; index < 4; index++) {
+          const pair = cohort.jobs.slice(index * 2, index * 2 + 2);
+          const values = Object.fromEntries(pair.map(job => [job.engine,
+            row.provenance.arms[job.engine].runs.find(run => run.step === job.step).median_ns]));
+          approximately(row.provenance.chronological_sqlite_over_citadel[index],
+            values.sqlite / values.citadel);
+        }
+      }
     }
   }
   assert.equal(names.size, 68);
   assert.deepEqual(sourceIds, {
-    complete_6b41d0c3: 99, selected_ea8827d7: 10,
-    selected_2bb8516f: 16, selected_74aa7020: 4,
+    complete_6b41d0c3: 83, selected_ea8827d7: 8,
+    selected_2bb8516f: 6, selected_74aa7020: 0, selected_0dbe126c: 32,
   });
+  const newCohorts = Object.values(DATA.cohorts).filter(cohort => cohort.kind === 'engine_comparison');
+  assert.equal(newCohorts.length, 2);
+  const refreshedIds = newCohorts.flatMap(cohort => cohort.criterion_ids);
+  assert.equal(refreshedIds.length, 32);
+  assert.equal(new Set(refreshedIds).size, 32);
+  assert.deepEqual(refreshedIds.toSorted(), Object.values(REFRESHED).flat()
+    .flatMap(name => ['citadel', 'sqlite'].map(arm => name + '/' + arm + '/')).sort());
   assert.deepEqual(DATA.configuration, {
     citadel: { sync: 'Off', page_size: 8208, cached_body_bytes: 8160, cache_pages: 4096 },
     sqlite: { journal_mode: 'MEMORY', synchronous: 'OFF', page_size: 8192, cache_pages: 4096 },

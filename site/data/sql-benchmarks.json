@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "measured_on": "2026-09-13",
   "environment": {
     "cpu": "Intel Core i9-12900HX",
@@ -13,8 +13,8 @@
     "samples_per_pass": 30,
     "warmup_seconds": 1,
     "measurement_target_seconds": 2,
-    "statistic": "Arithmetic mean of all candidate per-run sample medians, in nanoseconds; two or four runs as specified by the cohort.",
-    "scope": "Top-level date and measurement settings are the September 13 historical defaults; per-cohort measurement fields override them for September 20 results. Rows use matched Citadel and SQLite runs from their declared source and cohort. This is not a full-suite run at the latest revision.",
+    "statistic": "Arithmetic mean of each engine's two or four per-run sample medians, in nanoseconds; run selection is declared by each cohort.",
+    "scope": "Top-level date and measurement settings are the September 13 historical defaults; per-cohort measurement fields override them for September 20 and 27 results. Refreshed rows use matched engines from one source build; historical rows retain their source-comparison cohorts. This is not a full-suite run at the latest revision.",
     "comparison_order": [
       "reference",
       "candidate",
@@ -53,98 +53,186 @@
     "selected_74aa7020": {
       "revision": "74aa7020f13ea9a7b872ada784a2935066f50698",
       "executable_sha256": "267107a7199d421e026cc76680e9c46eed69cd7896a5f81703f6fdbc78b353aa"
+    },
+    "selected_0dbe126c": {
+      "revision": "0dbe126c99d3ed1c024332cc2004f23af8a608a4",
+      "executable_sha256": "b7af499a5a7c2fbb788f01b521001a8b24ade7c48905e4a3a99457e6df0d0cf4"
     }
   },
   "execution": [
     {
       "name": "join_param",
-      "source": "complete_6b41d0c3",
+      "source": "selected_0dbe126c",
       "samples_ns": {
         "citadel": [
-          2767.275080416929,
-          2704.923043095866
+          2519.2252141094496,
+          2615.173241775504,
+          2622.523164262548,
+          2643.059679463805
         ],
         "sqlite": [
-          53362.97276563099,
-          54872.18947368421
+          51150.02059873661,
+          50144.26688722959,
+          51368.88810306598,
+          52045.280390107975
         ]
       },
       "provenance": {
-        "cohort": "complete3-execution",
+        "cohort": "sql-engines-20260927-main",
         "arms": {
           "citadel": {
             "criterion_id": "join_param/citadel/",
             "runs": [
               {
-                "median_ns": 3268.5524378626483,
+                "step": 1,
+                "median_ns": 2519.2252141094496,
                 "median_ci95_ns": [
-                  3208.9114055598857,
-                  3356.0666406858927
-                ]
+                  2486.797067789229,
+                  2545.572861417868
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "c02927a6674268155413121feb3500fdcbc4529604f3f08c21285c744972b108",
+                  "estimates": "0cf38d15b175dd3d809ccf03e98e88714e58397ac53200a93aaa762988637802",
+                  "sample": "3b97b37d899c3d5848747910c245107ff50508e1956795b264ddbd915fad7d32"
+                }
               },
               {
-                "median_ns": 2767.275080416929,
+                "step": 4,
+                "median_ns": 2615.173241775504,
                 "median_ci95_ns": [
-                  2700.1126427955696,
-                  2818.802544591251
-                ]
+                  2589.2488053309526,
+                  2640.8389445496596
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "c02927a6674268155413121feb3500fdcbc4529604f3f08c21285c744972b108",
+                  "estimates": "e9b8c8f485e72ca4aeda1610131bac0729eb9677478849e5017dc09abfecce43",
+                  "sample": "dc075ba9baaf80e0c8bcc0814bac1386671df9b897ad13c4a2542f85037edca3"
+                }
               },
               {
-                "median_ns": 2704.923043095866,
+                "step": 6,
+                "median_ns": 2622.523164262548,
                 "median_ci95_ns": [
-                  2643.54668218096,
-                  2897.295116458921
-                ]
+                  2590.0507536142723,
+                  2661.778303914378
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "c02927a6674268155413121feb3500fdcbc4529604f3f08c21285c744972b108",
+                  "estimates": "c87cd3826763ccffe50d2d908bcb4db8e1fe3e8afa58c522c9c25bba25712950",
+                  "sample": "90b3bdf92a2eae55ed714450b0d90cd498798e3670ddef2a068f100474a2d99c"
+                }
               },
               {
-                "median_ns": 3242.9746537946994,
+                "step": 7,
+                "median_ns": 2643.059679463805,
                 "median_ci95_ns": [
-                  3152.739291616419,
-                  3291.6448079887714
-                ]
+                  2591.2803633179865,
+                  2686.385242485805
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "c02927a6674268155413121feb3500fdcbc4529604f3f08c21285c744972b108",
+                  "estimates": "28a24dc097b8fb087f0a31ba4d5c059b5e7b3aab325807f89277b281ac348545",
+                  "sample": "8f96571a137f25b5440a2c26ba56ff931e3cdd9a88fead3fd122e556c535c5bc"
+                }
               }
             ],
-            "reference_drift_percent": -0.7825416466218482,
-            "candidate_drift_percent": -2.253192599547016,
-            "change_from_reference_percent": -15.9613705589301
+            "median_range_ns": [
+              2519.2252141094496,
+              2643.059679463805
+            ],
+            "relative_range_percent": 4.762872616279941,
+            "first_to_last_drift_percent": 4.91557740295685,
+            "block_drift_percent": [
+              3.808632397321099,
+              0.7830823186277369
+            ],
+            "range_exceeds_5_percent": false,
+            "absolute_drift_exceeds_5_percent": false
           },
           "sqlite": {
             "criterion_id": "join_param/sqlite/",
             "runs": [
               {
-                "median_ns": 53749.916387959864,
+                "step": 2,
+                "median_ns": 51150.02059873661,
                 "median_ci95_ns": [
-                  52244.04223227753,
-                  54933.443223443224
-                ]
+                  50090.07552870091,
+                  51716.50841605524
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "39daf1d24db91734d253cc2e55275187627de72d2a5c3f0697cb289ce44b5f94",
+                  "estimates": "2caf125042db726ff6665752803e196344c047324232b79a1d3da6e1c87d651b",
+                  "sample": "4cf47c3ecbe30b1ebea852fbfcdb3513e5d8e1f2fe22800a54683f6efcb96fda"
+                }
               },
               {
-                "median_ns": 53362.97276563099,
+                "step": 3,
+                "median_ns": 50144.26688722959,
                 "median_ci95_ns": [
-                  52648.50813743219,
-                  55534.34821230291
-                ]
+                  49220.48982517039,
+                  51006.54518950437
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "39daf1d24db91734d253cc2e55275187627de72d2a5c3f0697cb289ce44b5f94",
+                  "estimates": "cec370bffac6823ecc2bf4dd0b361e0952145c267329fc03fd8a9b03f13f2073",
+                  "sample": "6694dea85a8e3bdabf408a68bc4a367b24de9be3c06113c0146f5ff3cb8bdd76"
+                }
               },
               {
-                "median_ns": 54872.18947368421,
+                "step": 5,
+                "median_ns": 51368.88810306598,
                 "median_ci95_ns": [
-                  53726.044444444444,
-                  58161.4540229885
-                ]
+                  50856.38138792102,
+                  52245.93495934959
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "39daf1d24db91734d253cc2e55275187627de72d2a5c3f0697cb289ce44b5f94",
+                  "estimates": "f7ff7e21e9f7dcba8beb49d0ee51066c35a1e799329d8c09de7e8b891d93fc6c",
+                  "sample": "c739e4f4c57af1d7c56c121c12e8db76b22c845093cd5b48b7c65a553084b78c"
+                }
               },
               {
-                "median_ns": 51819.385655496764,
+                "step": 8,
+                "median_ns": 52045.280390107975,
                 "median_ci95_ns": [
-                  51248.67901234568,
-                  53465.38923182442
-                ]
+                  51604.726308174584,
+                  52935.27608205467
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "39daf1d24db91734d253cc2e55275187627de72d2a5c3f0697cb289ce44b5f94",
+                  "estimates": "46b9405fe5b6e8095abfb9e9c65b60daeefab7d20d33db071903e07d02ce4cf4",
+                  "sample": "dc6f86cffbc4056850fdd806bbf2cb7f07a384526db5bda5db293d516290c1fa"
+                }
               }
             ],
-            "reference_drift_percent": -3.5916906707887386,
-            "candidate_drift_percent": 2.828209580230223,
-            "change_from_reference_percent": 2.5252229050081176
+            "median_range_ns": [
+              50144.26688722959,
+              52045.280390107975
+            ],
+            "relative_range_percent": 3.7145773852587665,
+            "first_to_last_drift_percent": 1.7502628168901913,
+            "block_drift_percent": [
+              -1.9662821241011708,
+              1.3167353081205313
+            ],
+            "range_exceeds_5_percent": false,
+            "absolute_drift_exceeds_5_percent": false
           }
-        }
+        },
+        "chronological_sqlite_over_citadel": [
+          20.30386974227639,
+          19.174357586033363,
+          19.587582219702103,
+          19.691299744191305
+        ]
       }
     },
     {
@@ -331,184 +419,527 @@
     },
     {
       "name": "update_returning",
-      "source": "selected_2bb8516f",
+      "source": "selected_0dbe126c",
       "samples_ns": {
         "citadel": [
-          55410.04268086545,
-          58471.00610085304
+          63892.973918575066,
+          67086.55343847963,
+          65676.8995430872,
+          66241.00671303004
         ],
         "sqlite": [
-          206949.60843373492,
-          211484.22949002218
+          229754.7369281046,
+          232713.15238095238,
+          230175.98641588297,
+          235584.49683877768
         ]
       },
       "provenance": {
-        "cohort": "sql-writes-20260920",
+        "cohort": "sql-engines-20260927-main",
         "arms": {
           "citadel": {
             "criterion_id": "update_returning/citadel/",
             "runs": [
               {
-                "median_ns": 57491.483208149875,
+                "step": 1,
+                "median_ns": 63892.973918575066,
                 "median_ci95_ns": [
-                  57237.494553376906,
-                  58019.708994709
-                ]
+                  63251.37984583146,
+                  64728.61323155216
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "666df0b061f2abaea873006e576ea076971b17e199f547176682c5f6e52c57aa",
+                  "estimates": "c90852b38f11286ceabd2f049d4fc47878b4931903d3b8e47012c3f110498d32",
+                  "sample": "46c777f366eb79eee4c2580e46ebacefc21ed083b4bea4f767aeb414086050cf"
+                }
               },
               {
-                "median_ns": 55410.04268086545,
+                "step": 4,
+                "median_ns": 67086.55343847963,
                 "median_ci95_ns": [
-                  55249.89106753813,
-                  55826.993464052284
-                ]
+                  66072.67766955268,
+                  68413.24931129477
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "666df0b061f2abaea873006e576ea076971b17e199f547176682c5f6e52c57aa",
+                  "estimates": "217a3211446225f1f4a8ebf168c266d4694c2fc11e040ded66aebdb983fe8780",
+                  "sample": "ac095653187452cc7d901a17ae839a81fe6bdac4663d4310460479a97aa2b6ee"
+                }
               },
               {
-                "median_ns": 58471.00610085304,
+                "step": 6,
+                "median_ns": 65676.8995430872,
                 "median_ci95_ns": [
-                  58236.91002591513,
-                  58998.117656153365
-                ]
+                  64607.58739524651,
+                  66389.92958738207
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "666df0b061f2abaea873006e576ea076971b17e199f547176682c5f6e52c57aa",
+                  "estimates": "d6c73338e07ff1b91be39fdd12c9bf05d178f76c4612abcf886fb5f53e7f47f2",
+                  "sample": "bc505630d33091ed6d3c91ed59581837574b346f481b9cc477c9d102c34e5d3a"
+                }
               },
               {
-                "median_ns": 59812.920415224915,
+                "step": 7,
+                "median_ns": 66241.00671303004,
                 "median_ci95_ns": [
-                  59435.427202555235,
-                  60011.30157040192
-                ]
+                  65318.48500083794,
+                  67438.94509803921
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "666df0b061f2abaea873006e576ea076971b17e199f547176682c5f6e52c57aa",
+                  "estimates": "c7559100e7b2769e73d8d28dff19edcc5a20618166ec735e792503e3361329d0",
+                  "sample": "a4ce1a8f58e378842f7df8d3020b565b2bcc75208da53b746f472c24b53ff269"
+                }
               }
             ],
-            "reference_drift_percent": 4.037880182478859,
-            "candidate_drift_percent": 5.524203324688326,
-            "change_from_reference_percent": -2.9183515161524065
+            "median_range_ns": [
+              63892.973918575066,
+              67086.55343847963
+            ],
+            "relative_range_percent": 4.859050126147082,
+            "first_to_last_drift_percent": 3.674946790624123,
+            "block_drift_percent": [
+              4.998326614088189,
+              0.8589126068181185
+            ],
+            "range_exceeds_5_percent": false,
+            "absolute_drift_exceeds_5_percent": false
           },
           "sqlite": {
             "criterion_id": "update_returning/sqlite/",
             "runs": [
               {
-                "median_ns": 207728.6746987952,
+                "step": 2,
+                "median_ns": 229754.7369281046,
                 "median_ci95_ns": [
-                  207147.38271266886,
-                  208575.9036144578
-                ]
+                  225721.46296296298,
+                  231424.40909090912
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "640652406546721e05438edfbadd329a0aeed0b53b005223c9063fd274f05629",
+                  "estimates": "945935a97d41b6105cbb7940e0dba5f06e95f886092ef69147698ceef6a586b8",
+                  "sample": "f9118faa2dbc4b84d855d7f555479f1506cd683d949dd2be17c8eeb77f2f83c9"
+                }
               },
               {
-                "median_ns": 206949.60843373492,
+                "step": 3,
+                "median_ns": 232713.15238095238,
                 "median_ci95_ns": [
-                  206105.0441767068,
-                  207622.79888785913
-                ]
+                  227750.93246187363,
+                  235664.3111111111
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "640652406546721e05438edfbadd329a0aeed0b53b005223c9063fd274f05629",
+                  "estimates": "b374557ec9112c7cb0fa5dd3ea05104e3001dcff3f15fcdd2e8c6e444be22f68",
+                  "sample": "442a67fc2d76b5927d2c7b44929c39a22497dc9cfbcf645b4ffa920a421af88b"
+                }
               },
               {
-                "median_ns": 211484.22949002218,
+                "step": 5,
+                "median_ns": 230175.98641588297,
                 "median_ci95_ns": [
-                  210282.7218098268,
-                  213302.9725609756
-                ]
+                  226884.0761904762,
+                  232975.91269841272
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "640652406546721e05438edfbadd329a0aeed0b53b005223c9063fd274f05629",
+                  "estimates": "7fb9044199d2a930dc659c11f1e4559d4e4d2bb094fcebbf8c7ec83bbcb9ba6b",
+                  "sample": "9f516d01849b22e19ce023657d1ac03699649756482c36ba29d7342f47994ee8"
+                }
               },
               {
-                "median_ns": 208522.2891566265,
+                "step": 8,
+                "median_ns": 235584.49683877768,
                 "median_ci95_ns": [
-                  207539.2594186269,
-                  210558.37636259323
-                ]
+                  233469.52054794523,
+                  240917.96101159113
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "640652406546721e05438edfbadd329a0aeed0b53b005223c9063fd274f05629",
+                  "estimates": "df6407581def58888eaf032c0b264455a44c668f5439cca49e27f197cda0120a",
+                  "sample": "ce8aebdaf776713aa6e3937f799ca962832b0c91a756e65001cfc84d80171f12"
+                }
               }
             ],
-            "reference_drift_percent": 0.38204376886439295,
-            "candidate_drift_percent": 2.1911716048205188,
-            "change_from_reference_percent": 0.5244129762768779
+            "median_range_ns": [
+              229754.7369281046,
+              235584.49683877768
+            ],
+            "relative_range_percent": 2.5122093152880423,
+            "first_to_last_drift_percent": 2.537383989822728,
+            "block_drift_percent": [
+              1.287640678230506,
+              2.3497283565986793
+            ],
+            "range_exceeds_5_percent": false,
+            "absolute_drift_exceeds_5_percent": false
           }
-        }
+        },
+        "chronological_sqlite_over_citadel": [
+          3.5959311773608014,
+          3.4688494259040636,
+          3.5046719320980806,
+          3.556475188539619
+        ]
+      }
+    },
+    {
+      "name": "window_agg",
+      "source": "selected_0dbe126c",
+      "samples_ns": {
+        "citadel": [
+          32883964.88095238,
+          33907136.66666667,
+          33946540.95860566,
+          33805981.25
+        ],
+        "sqlite": [
+          107115950.0,
+          106145050.0,
+          107801666.66666666,
+          109713833.33333334
+        ]
+      },
+      "provenance": {
+        "cohort": "sql-engines-20260927-main",
+        "arms": {
+          "citadel": {
+            "criterion_id": "window_agg/citadel/",
+            "runs": [
+              {
+                "step": 1,
+                "median_ns": 32883964.88095238,
+                "median_ci95_ns": [
+                  32679858.333333336,
+                  33165284.166666664
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "0c1ecb3de4df2a532ccff11062d4a2596342c30f064de1a8cd1a753bd1b7f114",
+                  "estimates": "f9ce729c7e8a05cff674b90816dbc30c85301e9e225d505c09a26b55a6d92653",
+                  "sample": "28623993c1eda1710153194bf3a5fbbeaf6709c00b0d4d08cfca8552669f7348"
+                }
+              },
+              {
+                "step": 4,
+                "median_ns": 33907136.66666667,
+                "median_ci95_ns": [
+                  33787314.61640212,
+                  34188986.538461536
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "0c1ecb3de4df2a532ccff11062d4a2596342c30f064de1a8cd1a753bd1b7f114",
+                  "estimates": "8251fec6302137f67a0131b807edb02eea98a2c601105e60482ba8c42e019444",
+                  "sample": "4cb0a7a52ac5402d1a9ef9b7322bdce85e71eb8251c587ca04e9842f028dde01"
+                }
+              },
+              {
+                "step": 6,
+                "median_ns": 33946540.95860566,
+                "median_ci95_ns": [
+                  33739385.38961039,
+                  34384399.28571428
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "0c1ecb3de4df2a532ccff11062d4a2596342c30f064de1a8cd1a753bd1b7f114",
+                  "estimates": "b4c958fa3eeaf0092720a34a661c962c7c037b03e71d81f2aa412bd22b1e7a1b",
+                  "sample": "59d17e32a87bbc1cf13986642ff814d03de254f5fa10bd3483f993856ae84a8d"
+                }
+              },
+              {
+                "step": 7,
+                "median_ns": 33805981.25,
+                "median_ci95_ns": [
+                  33538975.0,
+                  34057693.75
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "0c1ecb3de4df2a532ccff11062d4a2596342c30f064de1a8cd1a753bd1b7f114",
+                  "estimates": "59434d36fa7b1e4b00661ef9d3a9a72f1ebe55325f148ab3fe6dffa62002d6d4",
+                  "sample": "91a1af8736279edce217440702fc66a0384e2fb5e090fc0e07f06e437df7f5de"
+                }
+              }
+            ],
+            "median_range_ns": [
+              32883964.88095238,
+              33946540.95860566
+            ],
+            "relative_range_percent": 3.1590529465105797,
+            "first_to_last_drift_percent": 2.80384793131101,
+            "block_drift_percent": [
+              3.1114611313398877,
+              -0.4140619475105245
+            ],
+            "range_exceeds_5_percent": false,
+            "absolute_drift_exceeds_5_percent": false
+          },
+          "sqlite": {
+            "criterion_id": "window_agg/sqlite/",
+            "runs": [
+              {
+                "step": 2,
+                "median_ns": 107115950.0,
+                "median_ci95_ns": [
+                  106379100.0,
+                  108089383.33333333
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "77cb268bd7768c2350c1c7582c5ef7aa0eea79804ad6ef15cdbcc54e2d884c28",
+                  "estimates": "53fdfdd7313b92d384a2462817b1001cb75438ca8fe0559d242ffa38772fd991",
+                  "sample": "34f5002289cc1e6c45197c82aa20a82bd08ce310c95853d0121f439d0b29446d"
+                }
+              },
+              {
+                "step": 3,
+                "median_ns": 106145050.0,
+                "median_ci95_ns": [
+                  105686750.0,
+                  107679716.66666666
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "77cb268bd7768c2350c1c7582c5ef7aa0eea79804ad6ef15cdbcc54e2d884c28",
+                  "estimates": "c74a2f2c8985c3ef26541f06e95606b072964a23be63278ca01cc8559189d48c",
+                  "sample": "0caab4b03532057c43f84902297d431a6fdce4a28dace8870301c3020298bebc"
+                }
+              },
+              {
+                "step": 5,
+                "median_ns": 107801666.66666666,
+                "median_ci95_ns": [
+                  106791166.66666667,
+                  108963000.0
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "77cb268bd7768c2350c1c7582c5ef7aa0eea79804ad6ef15cdbcc54e2d884c28",
+                  "estimates": "d57dc64e29a5d98af83b7cac345d8a9db9fdb06ed3aba89a5386496d5eb2078d",
+                  "sample": "af1696a38a26ea25ebd7cb571f64eaf1d77e9a645aa05d3ef7602f9a79ac94c1"
+                }
+              },
+              {
+                "step": 8,
+                "median_ns": 109713833.33333334,
+                "median_ci95_ns": [
+                  108685366.66666666,
+                  110644816.66666666
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "77cb268bd7768c2350c1c7582c5ef7aa0eea79804ad6ef15cdbcc54e2d884c28",
+                  "estimates": "ed9d9604f33dbd39387bc3b69941a1e5996f42d2d4d2ade08b56ad97316067e2",
+                  "sample": "72d7256e65fe4d9681f6d472afe21b39598d68c5b5dda7f3f2e6ee83e10a0a9a"
+                }
+              }
+            ],
+            "median_range_ns": [
+              106145050.0,
+              109713833.33333334
+            ],
+            "relative_range_percent": 3.31381431747864,
+            "first_to_last_drift_percent": 2.4253001848308697,
+            "block_drift_percent": [
+              -0.9064009608279577,
+              1.773782099843868
+            ],
+            "range_exceeds_5_percent": false,
+            "absolute_drift_exceeds_5_percent": false
+          }
+        },
+        "chronological_sqlite_over_citadel": [
+          3.2573915702618192,
+          3.130463390155523,
+          3.1756303771309065,
+          3.2453970947325583
+        ]
       }
     },
     {
       "name": "upsert_returning",
-      "source": "selected_ea8827d7",
+      "source": "selected_0dbe126c",
       "samples_ns": {
         "citadel": [
-          135006.4321095571,
-          134653.19734345353
+          120180.04254377336,
+          123835.82033788174,
+          124055.99404761905,
+          126866.53330449827
         ],
         "sqlite": [
-          376624.8106060606,
-          408371.7803030303
+          361278.1794662309,
+          358311.65561868687,
+          361234.53191489365,
+          373164.0824468085
         ]
       },
       "provenance": {
-        "cohort": "c6r3-vs-c5-main-001",
+        "cohort": "sql-engines-20260927-main",
         "arms": {
           "citadel": {
             "criterion_id": "upsert_returning/citadel/",
             "runs": [
               {
-                "median_ns": 132315.8279220779,
+                "step": 1,
+                "median_ns": 120180.04254377336,
                 "median_ci95_ns": [
-                  128270.96354166666,
-                  135022.89747807017
-                ]
+                  118721.76776960785,
+                  121949.86054766734
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "d0d8f12500927c01ad0bf8134602b0f70ef7440f069552a6b1d3eb8834029719",
+                  "estimates": "1ec40492133f95686858066e0eda88e62bffab28901ab45d0b8676b54cbe9c95",
+                  "sample": "9e68341e46881d0e38b91cfd9578c45b73eef1e16f4a01fe368fb21a05d19ce4"
+                }
               },
               {
-                "median_ns": 135006.4321095571,
+                "step": 4,
+                "median_ns": 123835.82033788174,
                 "median_ci95_ns": [
-                  130625.78406442043,
-                  139256.11225895316
-                ]
+                  121155.31569664902,
+                  127763.80920314253
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "d0d8f12500927c01ad0bf8134602b0f70ef7440f069552a6b1d3eb8834029719",
+                  "estimates": "f3bc9fd75850f3701dc9342d00556368384ab80ebfa63413efe048c62c256dc7",
+                  "sample": "8b0864f7b81d6a1594d79fffbd5e2e3b485b3dfe50c72280e4d13baf7fe74ef2"
+                }
               },
               {
-                "median_ns": 134653.19734345353,
+                "step": 6,
+                "median_ns": 124055.99404761905,
                 "median_ci95_ns": [
-                  131999.53917050693,
-                  143977.97653958946
-                ]
+                  122140.89130434782,
+                  127024.66269841269
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "d0d8f12500927c01ad0bf8134602b0f70ef7440f069552a6b1d3eb8834029719",
+                  "estimates": "edb3f3c29e4aaa1e648588c114fef3e6e5a816c25bb726532624d7d41ffb346c",
+                  "sample": "cd47dc6aeeddf8578973d4f008b40c1f8cde4d6e84daecb68ef9f74049106898"
+                }
               },
               {
-                "median_ns": 132388.2068452381,
+                "step": 7,
+                "median_ns": 126866.53330449827,
                 "median_ci95_ns": [
-                  129464.13541666666,
-                  134434.45789124668
-                ]
+                  124639.4063180828,
+                  128369.8161764706
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "d0d8f12500927c01ad0bf8134602b0f70ef7440f069552a6b1d3eb8834029719",
+                  "estimates": "360a0f0ef15b8612b1ec31101fda4d4ea04e63362e0942beb5dc32daf9b65dfa",
+                  "sample": "91282dbc51430ae8347f0743ea78ae93a3ad89e43e576ba1b10d1a31cd2bbdf5"
+                }
               }
             ],
-            "reference_drift_percent": 0.05470163645335813,
-            "candidate_drift_percent": -0.2616429162552114,
-            "change_from_reference_percent": 1.872126614938363
+            "median_range_ns": [
+              120180.04254377336,
+              126866.53330449827
+            ],
+            "relative_range_percent": 5.403897448784846,
+            "first_to_last_drift_percent": 5.563728069316887,
+            "block_drift_percent": [
+              3.0419175403244125,
+              2.2655408780976716
+            ],
+            "range_exceeds_5_percent": true,
+            "absolute_drift_exceeds_5_percent": true
           },
           "sqlite": {
             "criterion_id": "upsert_returning/sqlite/",
             "runs": [
               {
-                "median_ns": 378315.05555555556,
+                "step": 2,
+                "median_ns": 361278.1794662309,
                 "median_ci95_ns": [
-                  366574.1283524904,
-                  389746.2698412698
-                ]
+                  355284.9228896104,
+                  367723.37072649575
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "4a3355b769e713d08c3ec2d21f16784a5d4a06b10276bd6146c100dc0036debc",
+                  "estimates": "60507f9385f46532c30e083e110f7f29dfcee0224a0037736a3417411ce95f92",
+                  "sample": "cf8f72878ff78fe50672d572ac102f6d9fab3ba10bb55665f309387b5d1f906d"
+                }
               },
               {
-                "median_ns": 376624.8106060606,
+                "step": 3,
+                "median_ns": 358311.65561868687,
                 "median_ci95_ns": [
-                  366627.2058823529,
-                  383847.1875
-                ]
+                  354401.75836894586,
+                  360967.9257246377
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "4a3355b769e713d08c3ec2d21f16784a5d4a06b10276bd6146c100dc0036debc",
+                  "estimates": "e9a76126587f545ac230090c8073d04d03e4b4f87c93ff6aba88071c1cb1ab00",
+                  "sample": "864d7f7d761617383379c1f26a4c69053244a0ea478b506caabbeaca02d4e28a"
+                }
               },
               {
-                "median_ns": 408371.7803030303,
+                "step": 5,
+                "median_ns": 361234.53191489365,
                 "median_ci95_ns": [
-                  382291.645021645,
-                  418912.23140495864
-                ]
+                  357836.26568466995,
+                  366137.44680851063
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "4a3355b769e713d08c3ec2d21f16784a5d4a06b10276bd6146c100dc0036debc",
+                  "estimates": "fbbcbd10b3ae51d68ad6a84193a54dbd23185d6fe0cd0db70035374d6fd0f03d",
+                  "sample": "aa49505525830b51d78e21180f7359564bbbd5c12da3b3d9080c86b1b6aaa255"
+                }
               },
               {
-                "median_ns": 382170.7115800866,
+                "step": 8,
+                "median_ns": 373164.0824468085,
                 "median_ci95_ns": [
-                  367813.6111111111,
-                  388376.1805555555
-                ]
+                  364595.5996131528,
+                  380490.4068682344
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "4a3355b769e713d08c3ec2d21f16784a5d4a06b10276bd6146c100dc0036debc",
+                  "estimates": "d17a12085717bacdf5134b698bd713f927892ed7cb6824a611d9688d7830d3b7",
+                  "sample": "96291c0f2ac8d0686c0e702f8d851985858863989d521c67145a1c975fc45a43"
+                }
               }
             ],
-            "reference_drift_percent": 1.0191653670428291,
-            "candidate_drift_percent": 8.429335721638399,
-            "change_from_reference_percent": 3.2230483242004837
+            "median_range_ns": [
+              358311.65561868687,
+              373164.0824468085
+            ],
+            "relative_range_percent": 4.085982067814748,
+            "first_to_last_drift_percent": 3.2899587232581906,
+            "block_drift_percent": [
+              -0.8211190202316976,
+              3.302439129691348
+            ],
+            "range_exceeds_5_percent": false,
+            "absolute_drift_exceeds_5_percent": false
           }
-        }
+        },
+        "chronological_sqlite_over_citadel": [
+          3.006141217953405,
+          2.893441127462522,
+          2.911866812144791,
+          2.941391025095326
+        ]
       }
     },
     {
@@ -691,6 +1122,181 @@
             "change_from_reference_percent": -1.8068273581775096
           }
         }
+      }
+    },
+    {
+      "name": "window_rank",
+      "source": "selected_0dbe126c",
+      "samples_ns": {
+        "citadel": [
+          67422200.0,
+          69811675.0,
+          70324025.0,
+          69110150.0
+        ],
+        "sqlite": [
+          180364475.0,
+          180393575.0,
+          181367100.0,
+          186554925.0
+        ]
+      },
+      "provenance": {
+        "cohort": "sql-engines-20260927-main",
+        "arms": {
+          "citadel": {
+            "criterion_id": "window_rank/citadel/",
+            "runs": [
+              {
+                "step": 1,
+                "median_ns": 67422200.0,
+                "median_ci95_ns": [
+                  66915212.5,
+                  68235512.5
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "edbbc349476501bba3d0f8ed6c88a3adb7cab79fa82ec84b6cf782a384145e87",
+                  "estimates": "7aecb2fd357bfbcec7e313bdaa25f7de2e30516cc270810604675c1a87bd51dc",
+                  "sample": "74df77fa6af2821b95b7fd14b3e500d79f824f7d776971b781fc2348200b4b1f"
+                }
+              },
+              {
+                "step": 4,
+                "median_ns": 69811675.0,
+                "median_ci95_ns": [
+                  69224062.5,
+                  70596912.5
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "edbbc349476501bba3d0f8ed6c88a3adb7cab79fa82ec84b6cf782a384145e87",
+                  "estimates": "07c3a6685d15fc2f39cfab0a0b569da870e914b50b165b2fba999c4e84f90ed3",
+                  "sample": "30067bd95e10727552f729f55f2f43079d70c142aef5a40e84c7f94a0d0a074d"
+                }
+              },
+              {
+                "step": 6,
+                "median_ns": 70324025.0,
+                "median_ci95_ns": [
+                  70001087.5,
+                  71596212.5
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "edbbc349476501bba3d0f8ed6c88a3adb7cab79fa82ec84b6cf782a384145e87",
+                  "estimates": "feb0da399cd0cfe3df44fcc23a4b793929ff31ce8c5bdc73078e440e6b69ba87",
+                  "sample": "77809cdc9830c1ce05e9ae9b86af1ccce4b3a93ab58e5483d9701a4c097ebff2"
+                }
+              },
+              {
+                "step": 7,
+                "median_ns": 69110150.0,
+                "median_ci95_ns": [
+                  68499775.0,
+                  69505262.5
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "edbbc349476501bba3d0f8ed6c88a3adb7cab79fa82ec84b6cf782a384145e87",
+                  "estimates": "3f7bf4cfe7a4b3de6f77e4a55c08444c27484f8b46402dd64e5b16190a9d82f0",
+                  "sample": "a3c6f7149ebc8676a46aa736f6dcbc95cf3008538e40662c2c51c33e3833f740"
+                }
+              }
+            ],
+            "median_range_ns": [
+              67422200.0,
+              70324025.0
+            ],
+            "relative_range_percent": 4.195388661610909,
+            "first_to_last_drift_percent": 2.5035522424364576,
+            "block_drift_percent": [
+              3.5440478062122027,
+              -1.726117070233113
+            ],
+            "range_exceeds_5_percent": false,
+            "absolute_drift_exceeds_5_percent": false
+          },
+          "sqlite": {
+            "criterion_id": "window_rank/sqlite/",
+            "runs": [
+              {
+                "step": 2,
+                "median_ns": 180364475.0,
+                "median_ci95_ns": [
+                  179239750.0,
+                  182379275.0
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "3a38c90cf20e0cd63a9b605e0d7be5b0310168e17d67dbf7786a32e85fdd58c8",
+                  "estimates": "704c0ef37e3a216b5fd024bc9ca476a7ddf5254e5fe642fcf92d2567176b0940",
+                  "sample": "ed2aba1ba9272a6236c1e66e3d567015b02324a087385b68199e4cca17a7331e"
+                }
+              },
+              {
+                "step": 3,
+                "median_ns": 180393575.0,
+                "median_ci95_ns": [
+                  179364400.0,
+                  182628125.0
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "3a38c90cf20e0cd63a9b605e0d7be5b0310168e17d67dbf7786a32e85fdd58c8",
+                  "estimates": "996d92063635caaa6476c96095c785c4c616c6d012f20ecdab9872c4f07945b0",
+                  "sample": "a8730cbf482eab115fc414139d0e736c559fc51db975e72a9df522d369eb0867"
+                }
+              },
+              {
+                "step": 5,
+                "median_ns": 181367100.0,
+                "median_ci95_ns": [
+                  180106025.0,
+                  182460800.0
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "3a38c90cf20e0cd63a9b605e0d7be5b0310168e17d67dbf7786a32e85fdd58c8",
+                  "estimates": "4caf9640a86fa66307957d1c07b81935dea81b44884e838504c70d91e276e104",
+                  "sample": "db96535ad692aa76cd14b287ed0b2d7dfd7ff32dfda804b0dac183b636171f80"
+                }
+              },
+              {
+                "step": 8,
+                "median_ns": 186554925.0,
+                "median_ci95_ns": [
+                  185202775.0,
+                  187302750.0
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "3a38c90cf20e0cd63a9b605e0d7be5b0310168e17d67dbf7786a32e85fdd58c8",
+                  "estimates": "807462abeff2f90610d0c8497f1a090b49c01ff7efb9296dcd0f27084b4aebea",
+                  "sample": "3a632cd2104e4de2d008cce554a0b9161d1a6314583c70c462b849ecb160273f"
+                }
+              }
+            ],
+            "median_range_ns": [
+              180364475.0,
+              186554925.0
+            ],
+            "relative_range_percent": 3.3981716873485253,
+            "first_to_last_drift_percent": 3.4321891824872885,
+            "block_drift_percent": [
+              0.016133997562439717,
+              2.86040026002512
+            ],
+            "range_exceeds_5_percent": false,
+            "absolute_drift_exceeds_5_percent": false
+          }
+        },
+        "chronological_sqlite_over_citadel": [
+          2.6751496539715407,
+          2.584002962255239,
+          2.579020469889202,
+          2.6993853290725025
+        ]
       }
     },
     {
@@ -967,356 +1573,6 @@
       }
     },
     {
-      "name": "window_rank",
-      "source": "selected_74aa7020",
-      "samples_ns": {
-        "citadel": [
-          60330950.0,
-          63162800.0,
-          65882612.5,
-          66327337.5
-        ],
-        "sqlite": [
-          149621375.0,
-          159356750.0,
-          166593625.0,
-          166465800.0
-        ]
-      },
-      "provenance": {
-        "cohort": "sql-window-20260920",
-        "arms": {
-          "citadel": {
-            "criterion_id": "window_rank/citadel/",
-            "runs": [
-              {
-                "median_ns": 60080200.0,
-                "median_ci95_ns": [
-                  59789720.0,
-                  60454360.0
-                ]
-              },
-              {
-                "median_ns": 60330950.0,
-                "median_ci95_ns": [
-                  60113920.0,
-                  60482470.0
-                ]
-              },
-              {
-                "median_ns": 63162800.0,
-                "median_ci95_ns": [
-                  62885250.0,
-                  64148220.0
-                ]
-              },
-              {
-                "median_ns": 65226087.5,
-                "median_ci95_ns": [
-                  64936812.5,
-                  65852600.0
-                ]
-              },
-              {
-                "median_ns": 65882612.5,
-                "median_ci95_ns": [
-                  65485925.0,
-                  66645687.5
-                ]
-              },
-              {
-                "median_ns": 68596900.0,
-                "median_ci95_ns": [
-                  68099750.0,
-                  69343500.0
-                ]
-              },
-              {
-                "median_ns": 68235975.0,
-                "median_ci95_ns": [
-                  67762087.5,
-                  68709487.5
-                ]
-              },
-              {
-                "median_ns": 66327337.5,
-                "median_ci95_ns": [
-                  66083637.5,
-                  66708400.0
-                ]
-              }
-            ],
-            "reference_drift_percent": 13.574813332845093,
-            "candidate_drift_percent": 9.939156436290153,
-            "change_from_reference_percent": -2.4549794233816535,
-            "blocks": {
-              "abba": {
-                "reference_drift_percent": 8.565030575797028,
-                "candidate_drift_percent": 4.693859453564042,
-                "change_from_reference_percent": -1.4464856761477352
-              },
-              "baab": {
-                "reference_drift_percent": -0.5261535142258578,
-                "candidate_drift_percent": 0.6750263584341054,
-                "change_from_reference_percent": -3.378519233773314
-              }
-            }
-          },
-          "sqlite": {
-            "criterion_id": "window_rank/sqlite/",
-            "runs": [
-              {
-                "median_ns": 143909500.0,
-                "median_ci95_ns": [
-                  142812175.0,
-                  144653250.0
-                ]
-              },
-              {
-                "median_ns": 149621375.0,
-                "median_ci95_ns": [
-                  149180700.0,
-                  150470225.0
-                ]
-              },
-              {
-                "median_ns": 159356750.0,
-                "median_ci95_ns": [
-                  158486350.0,
-                  160908075.0
-                ]
-              },
-              {
-                "median_ns": 160161650.0,
-                "median_ci95_ns": [
-                  159759175.0,
-                  161249475.0
-                ]
-              },
-              {
-                "median_ns": 166593625.0,
-                "median_ci95_ns": [
-                  165326300.0,
-                  167538275.0
-                ]
-              },
-              {
-                "median_ns": 167243975.0,
-                "median_ci95_ns": [
-                  165827975.0,
-                  168956475.0
-                ]
-              },
-              {
-                "median_ns": 165592250.0,
-                "median_ci95_ns": [
-                  164482625.0,
-                  166912350.0
-                ]
-              },
-              {
-                "median_ns": 166465800.0,
-                "median_ci95_ns": [
-                  165629725.0,
-                  167186200.0
-                ]
-              }
-            ],
-            "reference_drift_percent": 15.066934427539525,
-            "candidate_drift_percent": 11.25803382036825,
-            "change_from_reference_percent": 0.8054821158257175,
-            "blocks": {
-              "abba": {
-                "reference_drift_percent": 11.29331281117647,
-                "candidate_drift_percent": 6.506673929443574,
-                "change_from_reference_percent": 1.6137588192763452
-              },
-              "baab": {
-                "reference_drift_percent": -0.9876140530623023,
-                "candidate_drift_percent": -0.07672862632048805,
-                "change_from_reference_percent": 0.06706000826683933
-              }
-            }
-          }
-        }
-      }
-    },
-    {
-      "name": "window_agg",
-      "source": "selected_74aa7020",
-      "samples_ns": {
-        "citadel": [
-          27614251.81818182,
-          28947391.666666664,
-          29933614.102564104,
-          30597422.807017542
-        ],
-        "sqlite": [
-          90995066.66666666,
-          97515833.33333333,
-          100716650.0,
-          100423383.33333334
-        ]
-      },
-      "provenance": {
-        "cohort": "sql-window-20260920",
-        "arms": {
-          "citadel": {
-            "criterion_id": "window_agg/citadel/",
-            "runs": [
-              {
-                "median_ns": 30998348.615384616,
-                "median_ci95_ns": [
-                  30372093.38235294,
-                  31643094.444444444
-                ]
-              },
-              {
-                "median_ns": 27614251.81818182,
-                "median_ci95_ns": [
-                  27434750.0,
-                  27782745.512820512
-                ]
-              },
-              {
-                "median_ns": 28947391.666666664,
-                "median_ci95_ns": [
-                  28809983.94736842,
-                  29151223.569023572
-                ]
-              },
-              {
-                "median_ns": 32040959.615384616,
-                "median_ci95_ns": [
-                  31877684.640522875,
-                  32360100.0
-                ]
-              },
-              {
-                "median_ns": 29933614.102564104,
-                "median_ci95_ns": [
-                  29736169.242424242,
-                  30086702.272727273
-                ]
-              },
-              {
-                "median_ns": 33283895.748987854,
-                "median_ci95_ns": [
-                  32988010.714285716,
-                  33694557.57575758
-                ]
-              },
-              {
-                "median_ns": 33630012.14285714,
-                "median_ci95_ns": [
-                  33368480.92105263,
-                  34371922.08333333
-                ]
-              },
-              {
-                "median_ns": 30597422.807017542,
-                "median_ci95_ns": [
-                  30478151.363636363,
-                  30924536.296296295
-                ]
-              }
-            ],
-            "reference_drift_percent": 8.489689435154046,
-            "candidate_drift_percent": 10.803012185438021,
-            "change_from_reference_percent": -9.896281224813897,
-            "blocks": {
-              "abba": {
-                "reference_drift_percent": 3.3634404623817504,
-                "candidate_drift_percent": 4.827723949439311,
-                "change_from_reference_percent": -10.27559617597299
-              },
-              "baab": {
-                "reference_drift_percent": 1.0398914732804743,
-                "candidate_drift_percent": 2.2176029335414515,
-                "change_from_reference_percent": -9.538930221472308
-              }
-            }
-          },
-          "sqlite": {
-            "criterion_id": "window_agg/sqlite/",
-            "runs": [
-              {
-                "median_ns": 87240075.0,
-                "median_ci95_ns": [
-                  86936800.0,
-                  87607350.0
-                ]
-              },
-              {
-                "median_ns": 90995066.66666666,
-                "median_ci95_ns": [
-                  90539416.66666666,
-                  91715400.0
-                ]
-              },
-              {
-                "median_ns": 97515833.33333333,
-                "median_ci95_ns": [
-                  96779466.66666667,
-                  98046383.33333333
-                ]
-              },
-              {
-                "median_ns": 96509933.33333333,
-                "median_ci95_ns": [
-                  96373183.33333334,
-                  97160100.0
-                ]
-              },
-              {
-                "median_ns": 100716650.0,
-                "median_ci95_ns": [
-                  100182966.66666666,
-                  101100750.0
-                ]
-              },
-              {
-                "median_ns": 99977366.66666666,
-                "median_ci95_ns": [
-                  99510066.66666666,
-                  101219350.0
-                ]
-              },
-              {
-                "median_ns": 97207516.66666667,
-                "median_ci95_ns": [
-                  96660683.33333333,
-                  97824083.33333334
-                ]
-              },
-              {
-                "median_ns": 100423383.33333334,
-                "median_ci95_ns": [
-                  100049916.66666667,
-                  100744150.0
-                ]
-              }
-            ],
-            "reference_drift_percent": 11.425301579195878,
-            "candidate_drift_percent": 10.361349259959907,
-            "change_from_reference_percent": 2.288065981179166,
-            "blocks": {
-              "abba": {
-                "reference_drift_percent": 10.625688175226045,
-                "candidate_drift_percent": 7.16606614571047,
-                "change_from_reference_percent": 2.590961333743258
-              },
-              "baab": {
-                "reference_drift_percent": -2.7704770513059307,
-                "candidate_drift_percent": -0.2911799257289238,
-                "change_from_reference_percent": 2.0058079164790854
-              }
-            }
-          }
-        }
-      }
-    },
-    {
       "name": "scan",
       "source": "selected_2bb8516f",
       "samples_ns": {
@@ -1403,6 +1659,97 @@
             "reference_drift_percent": 2.2401251369069675,
             "candidate_drift_percent": 10.81958399754146,
             "change_from_reference_percent": 1.4079350623846354
+          }
+        }
+      }
+    },
+    {
+      "name": "insert",
+      "source": "selected_2bb8516f",
+      "samples_ns": {
+        "citadel": [
+          25771.446251768033,
+          25242.56343903621
+        ],
+        "sqlite": [
+          51782.27146814404,
+          51854.150250926315
+        ]
+      },
+      "provenance": {
+        "cohort": "sql-writes-20260920",
+        "arms": {
+          "citadel": {
+            "criterion_id": "insert/citadel/",
+            "runs": [
+              {
+                "median_ns": 26084.119985758367,
+                "median_ci95_ns": [
+                  26007.267188859878,
+                  26151.301007086906
+                ]
+              },
+              {
+                "median_ns": 25771.446251768033,
+                "median_ci95_ns": [
+                  25677.567185289958,
+                  25931.239686468645
+                ]
+              },
+              {
+                "median_ns": 25242.56343903621,
+                "median_ci95_ns": [
+                  25198.14710042433,
+                  25323.978076379066
+                ]
+              },
+              {
+                "median_ns": 27650.924796747968,
+                "median_ci95_ns": [
+                  27528.316556975093,
+                  27858.51154707199
+                ]
+              }
+            ],
+            "reference_drift_percent": 6.006738244744536,
+            "candidate_drift_percent": -2.052204628195975,
+            "change_from_reference_percent": -5.0637998027461055
+          },
+          "sqlite": {
+            "criterion_id": "insert/sqlite/",
+            "runs": [
+              {
+                "median_ns": 50377.802355560765,
+                "median_ci95_ns": [
+                  50216.02156334232,
+                  50668.6382524708
+                ]
+              },
+              {
+                "median_ns": 51782.27146814404,
+                "median_ci95_ns": [
+                  51623.05123604466,
+                  52079.828548644335
+                ]
+              },
+              {
+                "median_ns": 51854.150250926315,
+                "median_ci95_ns": [
+                  51723.40210355987,
+                  52125.76647930506
+                ]
+              },
+              {
+                "median_ns": 54499.609097370296,
+                "median_ci95_ns": [
+                  53941.04690224094,
+                  54995.06633499171
+                ]
+              }
+            ],
+            "reference_drift_percent": 8.181791481728972,
+            "candidate_drift_percent": 0.13880963647276978,
+            "change_from_reference_percent": -1.1832764717097044
           }
         }
       }
@@ -1949,97 +2296,6 @@
             "reference_drift_percent": 2.808504157460967,
             "candidate_drift_percent": -1.432207693693388,
             "change_from_reference_percent": 2.3731755322531134
-          }
-        }
-      }
-    },
-    {
-      "name": "insert",
-      "source": "selected_2bb8516f",
-      "samples_ns": {
-        "citadel": [
-          25771.446251768033,
-          25242.56343903621
-        ],
-        "sqlite": [
-          51782.27146814404,
-          51854.150250926315
-        ]
-      },
-      "provenance": {
-        "cohort": "sql-writes-20260920",
-        "arms": {
-          "citadel": {
-            "criterion_id": "insert/citadel/",
-            "runs": [
-              {
-                "median_ns": 26084.119985758367,
-                "median_ci95_ns": [
-                  26007.267188859878,
-                  26151.301007086906
-                ]
-              },
-              {
-                "median_ns": 25771.446251768033,
-                "median_ci95_ns": [
-                  25677.567185289958,
-                  25931.239686468645
-                ]
-              },
-              {
-                "median_ns": 25242.56343903621,
-                "median_ci95_ns": [
-                  25198.14710042433,
-                  25323.978076379066
-                ]
-              },
-              {
-                "median_ns": 27650.924796747968,
-                "median_ci95_ns": [
-                  27528.316556975093,
-                  27858.51154707199
-                ]
-              }
-            ],
-            "reference_drift_percent": 6.006738244744536,
-            "candidate_drift_percent": -2.052204628195975,
-            "change_from_reference_percent": -5.0637998027461055
-          },
-          "sqlite": {
-            "criterion_id": "insert/sqlite/",
-            "runs": [
-              {
-                "median_ns": 50377.802355560765,
-                "median_ci95_ns": [
-                  50216.02156334232,
-                  50668.6382524708
-                ]
-              },
-              {
-                "median_ns": 51782.27146814404,
-                "median_ci95_ns": [
-                  51623.05123604466,
-                  52079.828548644335
-                ]
-              },
-              {
-                "median_ns": 51854.150250926315,
-                "median_ci95_ns": [
-                  51723.40210355987,
-                  52125.76647930506
-                ]
-              },
-              {
-                "median_ns": 54499.609097370296,
-                "median_ci95_ns": [
-                  53941.04690224094,
-                  54995.06633499171
-                ]
-              }
-            ],
-            "reference_drift_percent": 8.181791481728972,
-            "candidate_drift_percent": 0.13880963647276978,
-            "change_from_reference_percent": -1.1832764717097044
           }
         }
       }
@@ -2682,6 +2938,272 @@
       }
     },
     {
+      "name": "update",
+      "source": "selected_0dbe126c",
+      "samples_ns": {
+        "citadel": [
+          35241.61981258367,
+          35986.54786862334,
+          36585.77766179541,
+          36465.24478089775
+        ],
+        "sqlite": [
+          45191.68006731488,
+          46184.78234728235,
+          45389.064897366785,
+          46362.59065185496
+        ]
+      },
+      "provenance": {
+        "cohort": "sql-engines-20260927-main",
+        "arms": {
+          "citadel": {
+            "criterion_id": "update/citadel/",
+            "runs": [
+              {
+                "step": 1,
+                "median_ns": 35241.61981258367,
+                "median_ci95_ns": [
+                  34757.6864275283,
+                  35560.06316934404
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "642ad65952308b764b0b659f0f2f1d5558e2c07b4bb28c93b4fceb1ce45eaa88",
+                  "estimates": "8463ada27fea7ee23dbc95090860df42b703b17f47a0f680e44eb9684bbcbf1c",
+                  "sample": "f1eee2fcfe558c1c619377d61b7b30d5852fe3ff34f0649b807af4c8368eef92"
+                }
+              },
+              {
+                "step": 4,
+                "median_ns": 35986.54786862334,
+                "median_ci95_ns": [
+                  35541.74243460031,
+                  36442.65493758649
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "642ad65952308b764b0b659f0f2f1d5558e2c07b4bb28c93b4fceb1ce45eaa88",
+                  "estimates": "f8e2d13ddbd3fb287ef51e7e5be928bd3f8e3f5f47b60436dfe951b2c268400b",
+                  "sample": "258a960c1c1af603bb24482450fcdaa0e404ece86f7cd8807897da55eeb74d1a"
+                }
+              },
+              {
+                "step": 6,
+                "median_ns": 36585.77766179541,
+                "median_ci95_ns": [
+                  35799.84342379958,
+                  37190.73369895395
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "642ad65952308b764b0b659f0f2f1d5558e2c07b4bb28c93b4fceb1ce45eaa88",
+                  "estimates": "000605a0f5c5a25ba7480a7c17cbd4979f1f53a7bf6db4c811195be04098da5c",
+                  "sample": "9aa0fdc63b7eead939d4e48c189bfa66fa398f1657441ab227a911dff4eec907"
+                }
+              },
+              {
+                "step": 7,
+                "median_ns": 36465.24478089775,
+                "median_ci95_ns": [
+                  35760.90003377237,
+                  36685.85790273556
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "642ad65952308b764b0b659f0f2f1d5558e2c07b4bb28c93b4fceb1ce45eaa88",
+                  "estimates": "f59e9de755539847140b0c4c2978b354dab52772263fb3c2ace668f2af82ffdb",
+                  "sample": "95850ff4408d9d8f3955f3a966fa6f48646fe72a1e9474db4cad4c627c25b658"
+                }
+              }
+            ],
+            "median_range_ns": [
+              35241.61981258367,
+              36585.77766179541
+            ],
+            "relative_range_percent": 3.726546698958987,
+            "first_to_last_drift_percent": 3.4721019488359817,
+            "block_drift_percent": [
+              2.113773600649549,
+              -0.3294528327698276
+            ],
+            "range_exceeds_5_percent": false,
+            "absolute_drift_exceeds_5_percent": false
+          },
+          "sqlite": {
+            "criterion_id": "update/sqlite/",
+            "runs": [
+              {
+                "step": 2,
+                "median_ns": 45191.68006731488,
+                "median_ci95_ns": [
+                  44887.27788354752,
+                  45741.201279813846
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "f7e22b91a51c73c3cd2e3d69035a2fe84f3f6b60d4a0dfe069ee33550b9d6d37",
+                  "estimates": "0fd010da65ef5b1615a00afe16668ef72e0c5c4ac29fe4089d9155209f5b25ae",
+                  "sample": "61567d3970c5cbac4e57959ee0a24288fa9313b0888ede4b63b574bbab129412"
+                }
+              },
+              {
+                "step": 3,
+                "median_ns": 46184.78234728235,
+                "median_ci95_ns": [
+                  45520.70845246311,
+                  46764.7681890977
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "f7e22b91a51c73c3cd2e3d69035a2fe84f3f6b60d4a0dfe069ee33550b9d6d37",
+                  "estimates": "520d6cb10007578f1f6d97d8edaf6ae2f0dabe76ad0f8c26da5d92bf0e0e710e",
+                  "sample": "af4de08fb08190c24357d076d4ea6bde6b50c09964ad4c91be0310203bab1a49"
+                }
+              },
+              {
+                "step": 5,
+                "median_ns": 45389.064897366785,
+                "median_ci95_ns": [
+                  45032.185738789514,
+                  45692.868373764606
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "f7e22b91a51c73c3cd2e3d69035a2fe84f3f6b60d4a0dfe069ee33550b9d6d37",
+                  "estimates": "2b82b8b6568cf7976edfc6e4fe80dba08cb9d88a2bf391d8b25be39d9c3f7834",
+                  "sample": "1cd4b16641b2e1d393818bd79d99ae457fd9f65f2634a5b92b87d813c0ec9468"
+                }
+              },
+              {
+                "step": 8,
+                "median_ns": 46362.59065185496,
+                "median_ci95_ns": [
+                  45961.388066184896,
+                  46921.520208901
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "f7e22b91a51c73c3cd2e3d69035a2fe84f3f6b60d4a0dfe069ee33550b9d6d37",
+                  "estimates": "eddf71ea2bfebe8cb32b2e1c622911b50fa27334ea37ce4c84c666789f24d540",
+                  "sample": "5655b322af747e5740a42eb91975f3c780950b0cac236e7952e1a83f241cb9e5"
+                }
+              }
+            ],
+            "median_range_ns": [
+              45191.68006731488,
+              46362.59065185496
+            ],
+            "relative_range_percent": 2.557576843052396,
+            "first_to_last_drift_percent": 2.590987063981598,
+            "block_drift_percent": [
+              2.1975334364382926,
+              2.1448464661907085
+            ],
+            "range_exceeds_5_percent": false,
+            "absolute_drift_exceeds_5_percent": false
+          }
+        },
+        "chronological_sqlite_over_citadel": [
+          1.2823383348338138,
+          1.2833901855740615,
+          1.24062047599344,
+          1.271418605042298
+        ]
+      }
+    },
+    {
+      "name": "insert_select",
+      "source": "selected_2bb8516f",
+      "samples_ns": {
+        "citadel": [
+          170187.33579638752,
+          171542.68235071807
+        ],
+        "sqlite": [
+          210290.11672407197,
+          217676.64220647773
+        ]
+      },
+      "provenance": {
+        "cohort": "sql-writes-20260920",
+        "arms": {
+          "citadel": {
+            "criterion_id": "insert_select/citadel/",
+            "runs": [
+              {
+                "median_ns": 169890.49719326384,
+                "median_ci95_ns": [
+                  169434.75636766333,
+                  170618.50775193798
+                ]
+              },
+              {
+                "median_ns": 170187.33579638752,
+                "median_ci95_ns": [
+                  169623.31215970963,
+                  170874.82533243182
+                ]
+              },
+              {
+                "median_ns": 171542.68235071807,
+                "median_ci95_ns": [
+                  171134.74571846283,
+                  171879.71638655462
+                ]
+              },
+              {
+                "median_ns": 186270.6119791667,
+                "median_ci95_ns": [
+                  185466.9760338346,
+                  187891.3802083333
+                ]
+              }
+            ],
+            "reference_drift_percent": 9.641572104688812,
+            "candidate_drift_percent": 0.7963850823495378,
+            "change_from_reference_percent": -4.051843576873615
+          },
+          "sqlite": {
+            "criterion_id": "insert_select/sqlite/",
+            "runs": [
+              {
+                "median_ns": 210733.37121212122,
+                "median_ci95_ns": [
+                  209833.12709673872,
+                  212018.42320261436
+                ]
+              },
+              {
+                "median_ns": 210290.11672407197,
+                "median_ci95_ns": [
+                  209053.63805970148,
+                  211440.26119402985
+                ]
+              },
+              {
+                "median_ns": 217676.64220647773,
+                "median_ci95_ns": [
+                  215940.35294117645,
+                  219965.02197802198
+                ]
+              },
+              {
+                "median_ns": 229378.47148736037,
+                "median_ci95_ns": [
+                  225414.38084812468,
+                  233319.2328042328
+                ]
+              }
+            ],
+            "reference_drift_percent": 8.847720780052093,
+            "candidate_drift_percent": 3.5125404833446616,
+            "change_from_reference_percent": -2.7595448680586387
+          }
+        }
+      }
+    },
+    {
       "name": "with_dml",
       "source": "complete_6b41d0c3",
       "samples_ns": {
@@ -2859,97 +3381,6 @@
             "reference_drift_percent": 0.12259967689811635,
             "candidate_drift_percent": -1.7420691647531794,
             "change_from_reference_percent": -1.4264763583766271
-          }
-        }
-      }
-    },
-    {
-      "name": "insert_select",
-      "source": "selected_2bb8516f",
-      "samples_ns": {
-        "citadel": [
-          170187.33579638752,
-          171542.68235071807
-        ],
-        "sqlite": [
-          210290.11672407197,
-          217676.64220647773
-        ]
-      },
-      "provenance": {
-        "cohort": "sql-writes-20260920",
-        "arms": {
-          "citadel": {
-            "criterion_id": "insert_select/citadel/",
-            "runs": [
-              {
-                "median_ns": 169890.49719326384,
-                "median_ci95_ns": [
-                  169434.75636766333,
-                  170618.50775193798
-                ]
-              },
-              {
-                "median_ns": 170187.33579638752,
-                "median_ci95_ns": [
-                  169623.31215970963,
-                  170874.82533243182
-                ]
-              },
-              {
-                "median_ns": 171542.68235071807,
-                "median_ci95_ns": [
-                  171134.74571846283,
-                  171879.71638655462
-                ]
-              },
-              {
-                "median_ns": 186270.6119791667,
-                "median_ci95_ns": [
-                  185466.9760338346,
-                  187891.3802083333
-                ]
-              }
-            ],
-            "reference_drift_percent": 9.641572104688812,
-            "candidate_drift_percent": 0.7963850823495378,
-            "change_from_reference_percent": -4.051843576873615
-          },
-          "sqlite": {
-            "criterion_id": "insert_select/sqlite/",
-            "runs": [
-              {
-                "median_ns": 210733.37121212122,
-                "median_ci95_ns": [
-                  209833.12709673872,
-                  212018.42320261436
-                ]
-              },
-              {
-                "median_ns": 210290.11672407197,
-                "median_ci95_ns": [
-                  209053.63805970148,
-                  211440.26119402985
-                ]
-              },
-              {
-                "median_ns": 217676.64220647773,
-                "median_ci95_ns": [
-                  215940.35294117645,
-                  219965.02197802198
-                ]
-              },
-              {
-                "median_ns": 229378.47148736037,
-                "median_ci95_ns": [
-                  225414.38084812468,
-                  233319.2328042328
-                ]
-              }
-            ],
-            "reference_drift_percent": 8.847720780052093,
-            "candidate_drift_percent": 3.5125404833446616,
-            "change_from_reference_percent": -2.7595448680586387
           }
         }
       }
@@ -3137,6 +3568,181 @@
       }
     },
     {
+      "name": "upsert_mixed",
+      "source": "selected_0dbe126c",
+      "samples_ns": {
+        "citadel": [
+          55220.66534040672,
+          55312.7657807309,
+          57296.26570388634,
+          56389.09371492705
+        ],
+        "sqlite": [
+          64818.25480543835,
+          63573.0311155453,
+          64762.58789686767,
+          65757.6296510507
+        ]
+      },
+      "provenance": {
+        "cohort": "sql-engines-20260927-main",
+        "arms": {
+          "citadel": {
+            "criterion_id": "upsert_mixed/citadel/",
+            "runs": [
+              {
+                "step": 1,
+                "median_ns": 55220.66534040672,
+                "median_ci95_ns": [
+                  54023.886494252874,
+                  55717.49548440066
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "855a2caa2ce416239991f4c7f6b0fb1333256033c1ebfcd25e6622af78a1a077",
+                  "estimates": "44eadfabefecd0d6fda9463933e318d4339278b9d01b97fc153912d049d2322b",
+                  "sample": "f11e36df45536699a88556383348e29d2f26dec247333fbf274edc538df8e3f4"
+                }
+              },
+              {
+                "step": 4,
+                "median_ns": 55312.7657807309,
+                "median_ci95_ns": [
+                  54587.61627906977,
+                  56362.23064725971
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "855a2caa2ce416239991f4c7f6b0fb1333256033c1ebfcd25e6622af78a1a077",
+                  "estimates": "537d0c02ed8b2913ed68c747d192fcdd12c1beb4b5fae4e73c0ca69e6b8c9cf8",
+                  "sample": "11ebcc7a03995048d3429ee382cf88ae5ddfbb50092a7dd671bf29b03943d58d"
+                }
+              },
+              {
+                "step": 6,
+                "median_ns": 57296.26570388634,
+                "median_ci95_ns": [
+                  55635.798403193614,
+                  59015.48099453267
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "855a2caa2ce416239991f4c7f6b0fb1333256033c1ebfcd25e6622af78a1a077",
+                  "estimates": "3a0222e7993aacc08277572202541e4dc85fb7e2d5358af3688d05bee64d3c9b",
+                  "sample": "afb3996590c9b56703c197f2670c19d2d4b5050fb54e1dc304388d877cd54a64"
+                }
+              },
+              {
+                "step": 7,
+                "median_ns": 56389.09371492705,
+                "median_ci95_ns": [
+                  55582.94039294039,
+                  56975.64992025518
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "855a2caa2ce416239991f4c7f6b0fb1333256033c1ebfcd25e6622af78a1a077",
+                  "estimates": "3599841c7b15294f5f272ffe064c57ac4295a901189b541946a3d98e78335e47",
+                  "sample": "a64c6dd81652f8f1ce4fc8a9f94b2e99b020973427066cad38d4a03f7b5910ed"
+                }
+              }
+            ],
+            "median_range_ns": [
+              55220.66534040672,
+              57296.26570388634
+            ],
+            "relative_range_percent": 3.7028125225031823,
+            "first_to_last_drift_percent": 2.115925926132145,
+            "block_drift_percent": [
+              0.16678618368037856,
+              -1.5833003736188678
+            ],
+            "range_exceeds_5_percent": false,
+            "absolute_drift_exceeds_5_percent": false
+          },
+          "sqlite": {
+            "criterion_id": "upsert_mixed/sqlite/",
+            "runs": [
+              {
+                "step": 2,
+                "median_ns": 64818.25480543835,
+                "median_ci95_ns": [
+                  63528.074141048826,
+                  65694.5663118527
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "1b2385321f36e4528976cc5fa649e523c6b001164456203d4168c9d3e8494b35",
+                  "estimates": "d4a58c06268631d355955d81d6839cb8f4a66d087985379a566183e75a1349c6",
+                  "sample": "86fe03508df1869a1cca93692f61dbc42da37a85d503e086a429c385bdc0d5d4"
+                }
+              },
+              {
+                "step": 3,
+                "median_ns": 63573.0311155453,
+                "median_ci95_ns": [
+                  63180.38933640199,
+                  64696.26160337553
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "1b2385321f36e4528976cc5fa649e523c6b001164456203d4168c9d3e8494b35",
+                  "estimates": "ed111b492bbf2aaaf31e6de75edc01b0a87591d0603624c34d4e8425d4dbaa1c",
+                  "sample": "556c4014a31fd79ee3f6d357d65aef67b88fe4e35e41e9dfa6493add92fc5178"
+                }
+              },
+              {
+                "step": 5,
+                "median_ns": 64762.58789686767,
+                "median_ci95_ns": [
+                  64266.837719298244,
+                  65461.66588345865
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "1b2385321f36e4528976cc5fa649e523c6b001164456203d4168c9d3e8494b35",
+                  "estimates": "3065fdd74a98a1d1f95967401a34e24aea4eff562ecce578b189791a02c9654c",
+                  "sample": "83f05e51bb5503ce961ee2baeb7b3ce5a3d9f054e9f59034410f4888437555d1"
+                }
+              },
+              {
+                "step": 8,
+                "median_ns": 65757.6296510507,
+                "median_ci95_ns": [
+                  65158.66304747884,
+                  66887.90707236843
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "1b2385321f36e4528976cc5fa649e523c6b001164456203d4168c9d3e8494b35",
+                  "estimates": "257c5906af5c36d2b8413d2526aac77cfe2d6ff04c4e341139ed95cc982dbd14",
+                  "sample": "2b297ab23037fae4993c2b277252060515e800c080f293a545537d79f0ef4e81"
+                }
+              }
+            ],
+            "median_range_ns": [
+              63573.0311155453,
+              65757.6296510507
+            ],
+            "relative_range_percent": 3.375050557794603,
+            "first_to_last_drift_percent": 1.4492442729783672,
+            "block_drift_percent": [
+              -1.92110030365793,
+              1.5364453251429655
+            ],
+            "range_exceeds_5_percent": false,
+            "absolute_drift_exceeds_5_percent": false
+          }
+        },
+        "chronological_sqlite_over_citadel": [
+          1.1738043068816262,
+          1.1493374127694045,
+          1.130310799512976,
+          1.1661409205029243
+        ]
+      }
+    },
+    {
       "name": "covered_range",
       "source": "selected_ea8827d7",
       "samples_ns": {
@@ -3228,628 +3834,530 @@
       }
     },
     {
-      "name": "update",
-      "source": "selected_2bb8516f",
-      "samples_ns": {
-        "citadel": [
-          33261.51605675877,
-          32816.55950095969,
-          34148.19985495234,
-          33552.73944805194
-        ],
-        "sqlite": [
-          41388.86598683735,
-          41845.067905035576,
-          43186.19795525263,
-          43592.59588268471
-        ]
-      },
-      "provenance": {
-        "cohort": "sql-update-20260920",
-        "arms": {
-          "citadel": {
-            "criterion_id": "update/citadel/",
-            "runs": [
-              {
-                "median_ns": 32615.659224594587,
-                "median_ci95_ns": [
-                  32493.98605830165,
-                  32853.14566891395
-                ]
-              },
-              {
-                "median_ns": 33261.51605675877,
-                "median_ci95_ns": [
-                  33175.54247572816,
-                  33446.35999383572
-                ]
-              },
-              {
-                "median_ns": 32816.55950095969,
-                "median_ci95_ns": [
-                  32511.834695656013,
-                  32983.15807513024
-                ]
-              },
-              {
-                "median_ns": 33809.00066800267,
-                "median_ci95_ns": [
-                  33724.497033282256,
-                  33869.305807381956
-                ]
-              },
-              {
-                "median_ns": 34148.19985495234,
-                "median_ci95_ns": [
-                  33492.32507158196,
-                  34437.819881889765
-                ]
-              },
-              {
-                "median_ns": 34650.30240549828,
-                "median_ci95_ns": [
-                  34536.96735395189,
-                  34958.46649484536
-                ]
-              },
-              {
-                "median_ns": 36476.67258207631,
-                "median_ci95_ns": [
-                  35731.139365197334,
-                  36953.87551759834
-                ]
-              },
-              {
-                "median_ns": 33552.73944805194,
-                "median_ci95_ns": [
-                  33326.98696145124,
-                  34033.44486345263
-                ]
-              }
-            ],
-            "reference_drift_percent": 11.837912981903598,
-            "candidate_drift_percent": 0.8755565765439455,
-            "change_from_reference_percent": -2.7426936966148174,
-            "blocks": {
-              "abba": {
-                "reference_drift_percent": 3.6587990915364355,
-                "candidate_drift_percent": -1.3377518782962117,
-                "change_from_reference_percent": -0.5217705825505181
-              },
-              "baab": {
-                "reference_drift_percent": 5.270863599413267,
-                "candidate_drift_percent": -1.7437534318929582,
-                "change_from_reference_percent": -4.816788124574134
-              }
-            }
-          },
-          "sqlite": {
-            "criterion_id": "update/sqlite/",
-            "runs": [
-              {
-                "median_ns": 40093.25485359115,
-                "median_ci95_ns": [
-                  39953.79126171088,
-                  40176.438573247084
-                ]
-              },
-              {
-                "median_ns": 41388.86598683735,
-                "median_ci95_ns": [
-                  41177.06233978609,
-                  41609.223438400135
-                ]
-              },
-              {
-                "median_ns": 41845.067905035576,
-                "median_ci95_ns": [
-                  41691.748768472906,
-                  42099.24297305129
-                ]
-              },
-              {
-                "median_ns": 42558.87778474628,
-                "median_ci95_ns": [
-                  42397.10286883461,
-                  42698.68505150764
-                ]
-              },
-              {
-                "median_ns": 43186.19795525263,
-                "median_ci95_ns": [
-                  42999.21781784436,
-                  43576.135300467795
-                ]
-              },
-              {
-                "median_ns": 42612.03818369453,
-                "median_ci95_ns": [
-                  42414.660059239,
-                  42841.13408521304
-                ]
-              },
-              {
-                "median_ns": 46746.476145962006,
-                "median_ci95_ns": [
-                  46284.90145672665,
-                  47091.37663964142
-                ]
-              },
-              {
-                "median_ns": 43592.59588268471,
-                "median_ci95_ns": [
-                  43349.244096226,
-                  43785.60252445689
-                ]
-              }
-            ],
-            "reference_drift_percent": 16.594365602559535,
-            "candidate_drift_percent": 5.3244510167256065,
-            "change_from_reference_percent": -1.1615090538874773,
-            "blocks": {
-              "abba": {
-                "reference_drift_percent": 6.149720046822993,
-                "candidate_drift_percent": 1.1022334324001681,
-                "change_from_reference_percent": 0.703915597775695
-              },
-              "baab": {
-                "reference_drift_percent": 9.702511634023448,
-                "candidate_drift_percent": 0.9410365965838663,
-                "change_from_reference_percent": -2.886933059565222
-              }
-            }
-          }
-        }
-      }
-    },
-    {
-      "name": "upsert_mixed",
-      "source": "selected_2bb8516f",
-      "samples_ns": {
-        "citadel": [
-          47125.052374301675,
-          50152.00408997956
-        ],
-        "sqlite": [
-          56265.98981129368,
-          59094.64508376975
-        ]
-      },
-      "provenance": {
-        "cohort": "sql-writes-20260920",
-        "arms": {
-          "citadel": {
-            "criterion_id": "upsert_mixed/citadel/",
-            "runs": [
-              {
-                "median_ns": 49121.58263305322,
-                "median_ci95_ns": [
-                  48913.71250209486,
-                  49827.389173060525
-                ]
-              },
-              {
-                "median_ns": 47125.052374301675,
-                "median_ci95_ns": [
-                  46707.304469273746,
-                  47313.109446419505
-                ]
-              },
-              {
-                "median_ns": 50152.00408997956,
-                "median_ci95_ns": [
-                  49991.41104294478,
-                  50406.53118609407
-                ]
-              },
-              {
-                "median_ns": 52075.183722360714,
-                "median_ci95_ns": [
-                  51890.52441229657,
-                  52312.35615650173
-                ]
-              }
-            ],
-            "reference_drift_percent": 6.012837801606286,
-            "candidate_drift_percent": 6.423232576243332,
-            "change_from_reference_percent": -3.8733548830663933
-          },
-          "sqlite": {
-            "criterion_id": "upsert_mixed/sqlite/",
-            "runs": [
-              {
-                "median_ns": 57242.59746954602,
-                "median_ci95_ns": [
-                  56669.22651933702,
-                  57623.81675874769
-                ]
-              },
-              {
-                "median_ns": 56265.98981129368,
-                "median_ci95_ns": [
-                  56030.215299990305,
-                  56919.626414101556
-                ]
-              },
-              {
-                "median_ns": 59094.64508376975,
-                "median_ci95_ns": [
-                  58840.61143984221,
-                  59223.05416477014
-                ]
-              },
-              {
-                "median_ns": 59756.65444893832,
-                "median_ci95_ns": [
-                  59352.61627906977,
-                  60364.28779069767
-                ]
-              }
-            ],
-            "reference_drift_percent": 4.3919337879973375,
-            "candidate_drift_percent": 5.0272914098959065,
-            "change_from_reference_percent": -1.4005363252771685
-          }
-        }
-      }
-    },
-    {
-      "name": "upsert_counter",
-      "source": "selected_2bb8516f",
-      "samples_ns": {
-        "citadel": [
-          63416.15911661867,
-          63901.11111111111
-        ],
-        "sqlite": [
-          73181.55601659752,
-          75830.73750606502
-        ]
-      },
-      "provenance": {
-        "cohort": "sql-writes-20260920",
-        "arms": {
-          "citadel": {
-            "criterion_id": "upsert_counter/citadel/",
-            "runs": [
-              {
-                "median_ns": 63456.03543647364,
-                "median_ci95_ns": [
-                  63335.37814573888,
-                  63713.907095297545
-                ]
-              },
-              {
-                "median_ns": 63416.15911661867,
-                "median_ci95_ns": [
-                  63236.69117647059,
-                  63779.10774886877
-                ]
-              },
-              {
-                "median_ns": 63901.11111111111,
-                "median_ci95_ns": [
-                  63797.85806544202,
-                  64060.347814498935
-                ]
-              },
-              {
-                "median_ns": 67040.1607854297,
-                "median_ci95_ns": [
-                  66877.09163346613,
-                  67329.8406374502
-                ]
-              }
-            ],
-            "reference_drift_percent": 5.6482024511981255,
-            "candidate_drift_percent": 0.7647136017818967,
-            "change_from_reference_percent": -2.436029620946145
-          },
-          "sqlite": {
-            "criterion_id": "upsert_counter/sqlite/",
-            "runs": [
-              {
-                "median_ns": 74181.1757852077,
-                "median_ci95_ns": [
-                  73481.94958371879,
-                  74458.48789435069
-                ]
-              },
-              {
-                "median_ns": 73181.55601659752,
-                "median_ci95_ns": [
-                  72794.73462222425,
-                  73837.32365145229
-                ]
-              },
-              {
-                "median_ns": 75830.73750606502,
-                "median_ci95_ns": [
-                  75490.25536358458,
-                  76248.84539405281
-                ]
-              },
-              {
-                "median_ns": 75904.60264075734,
-                "median_ci95_ns": [
-                  75737.30677921392,
-                  76194.3759342302
-                ]
-              }
-            ],
-            "reference_drift_percent": 2.323267105579241,
-            "candidate_drift_percent": 3.620012519092475,
-            "change_from_reference_percent": -0.7152475834557803
-          }
-        }
-      }
-    },
-    {
       "name": "update_gen_propagate",
-      "source": "selected_2bb8516f",
+      "source": "selected_0dbe126c",
       "samples_ns": {
         "citadel": [
-          58814.707167832166,
-          58905.78389830509,
-          60280.16333548249,
-          59690.67071577848
+          66313.65727795007,
+          64241.69755244756,
+          65396.79609512625,
+          66901.69619047618
         ],
         "sqlite": [
-          65432.76759056369,
-          64622.723135642984,
-          67000.97785356407,
-          67255.77256944444
+          71282.50688705234,
+          67685.95059076263,
+          70399.11605131271,
+          73881.55508284818
         ]
       },
       "provenance": {
-        "cohort": "sql-update-20260920",
+        "cohort": "sql-engines-20260927-main",
         "arms": {
           "citadel": {
             "criterion_id": "update_gen_propagate/citadel/",
             "runs": [
               {
-                "median_ns": 55838.87229275578,
+                "step": 1,
+                "median_ns": 66313.65727795007,
                 "median_ci95_ns": [
-                  55387.18258249003,
-                  56689.530070118664
-                ]
+                  65312.506242197254,
+                  67072.0706260032
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "d9e97d4c992f4ce715480f8ed12e9efadb170c9fdac3e60889183ee6693eb2ab",
+                  "estimates": "9c8410642893453507f9ab42cce868679730a484eb9a8e5b1d5a08811f044193",
+                  "sample": "7644c7ce37547bea577f255ba44c910c97e7b71f1efa98653f5e6dc17c1cbf4c"
+                }
               },
               {
-                "median_ns": 58814.707167832166,
+                "step": 4,
+                "median_ns": 64241.69755244756,
                 "median_ci95_ns": [
-                  58429.868320085705,
-                  59168.29020979021
-                ]
+                  63072.62337662338,
+                  65680.0703030303
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "d9e97d4c992f4ce715480f8ed12e9efadb170c9fdac3e60889183ee6693eb2ab",
+                  "estimates": "81882a5f1e1a9c066130684aad5c98edc1c3441bea7e1edf7590cdc9177f365d",
+                  "sample": "b782cabbf3b2fc33d850d6b7d8ed198422f785036569a1a5c64a865819a8d160"
+                }
               },
               {
-                "median_ns": 58905.78389830509,
+                "step": 6,
+                "median_ns": 65396.79609512625,
                 "median_ci95_ns": [
-                  58701.21398305085,
-                  59253.52861704741
-                ]
+                  64570.32851690294,
+                  66060.39821882952
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "d9e97d4c992f4ce715480f8ed12e9efadb170c9fdac3e60889183ee6693eb2ab",
+                  "estimates": "66b8ad8a124c283cb32f11fb152bcda9167cca0cad8e9d72b9d732b4dd840416",
+                  "sample": "61131e7bf33693a6cf16f73a0506968c8a7715e5815f82f3485e338a01d5374b"
+                }
               },
               {
-                "median_ns": 60148.98029556651,
+                "step": 7,
+                "median_ns": 66901.69619047618,
                 "median_ci95_ns": [
-                  59980.76309067688,
-                  60575.317733990145
-                ]
-              },
-              {
-                "median_ns": 60280.16333548249,
-                "median_ci95_ns": [
-                  60092.85460992908,
-                  60546.791666666664
-                ]
-              },
-              {
-                "median_ns": 61261.82598320408,
-                "median_ci95_ns": [
-                  60977.94102595345,
-                  62009.68366145044
-                ]
-              },
-              {
-                "median_ns": 60600.222419928825,
-                "median_ci95_ns": [
-                  60364.52748121787,
-                  60890.75368581596
-                ]
-              },
-              {
-                "median_ns": 59690.67071577848,
-                "median_ci95_ns": [
-                  59506.58620689655,
-                  60110.9518678161
-                ]
+                  65286.46335403727,
+                  68411.26771159875
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "d9e97d4c992f4ce715480f8ed12e9efadb170c9fdac3e60889183ee6693eb2ab",
+                  "estimates": "f06ae1e1e34d2ad801e1b0cf759c8977f2df069bc765196d3547ad2cca18ccf6",
+                  "sample": "d6811f121a733113a3bdb488f379e2074ba8f78b8cf6f7f6534644a8fb14f41a"
+                }
               }
             ],
-            "reference_drift_percent": 8.52694535485945,
-            "candidate_drift_percent": 1.4893614031719737,
-            "change_from_reference_percent": -0.06667056551040718,
-            "blocks": {
-              "abba": {
-                "reference_drift_percent": 7.718830674468857,
-                "candidate_drift_percent": 0.15485366646990073,
-                "change_from_reference_percent": 1.493810290604003
-              },
-              "baab": {
-                "reference_drift_percent": -1.0799605670530288,
-                "candidate_drift_percent": -0.9779214041329864,
-                "change_from_reference_percent": -1.5519305449516296
-              }
-            }
+            "median_range_ns": [
+              64241.69755244756,
+              66901.69619047618
+            ],
+            "relative_range_percent": 4.047874767234803,
+            "first_to_last_drift_percent": 0.8867538553353871,
+            "block_drift_percent": [
+              -3.1244841719677896,
+              2.3011832157050938
+            ],
+            "range_exceeds_5_percent": false,
+            "absolute_drift_exceeds_5_percent": false
           },
           "sqlite": {
             "criterion_id": "update_gen_propagate/sqlite/",
             "runs": [
               {
-                "median_ns": 62530.227068345324,
+                "step": 2,
+                "median_ns": 71282.50688705234,
                 "median_ci95_ns": [
-                  61589.946043165466,
-                  64491.934309695105
-                ]
+                  70332.15988556898,
+                  72420.88252656435
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "4b18052e55066b14e4d4e45e6151146bb6d80fd376d797bf6f67838ff8a9615c",
+                  "estimates": "8d4d1ddeb301d770ca613acdd6793dae8d7df1e46041fc8ff2cb7a67f1657f7b",
+                  "sample": "06f144adc9f62b9fd9386271ac30d085e550c78ab55e44795f1852e7df7b6c14"
+                }
               },
               {
-                "median_ns": 65432.76759056369,
+                "step": 3,
+                "median_ns": 67685.95059076263,
                 "median_ci95_ns": [
-                  65199.28872468528,
-                  65660.77700237183
-                ]
+                  67333.34795918368,
+                  68699.28571428571
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "4b18052e55066b14e4d4e45e6151146bb6d80fd376d797bf6f67838ff8a9615c",
+                  "estimates": "1ac89974b9924d770041828e5468cd4ebc3527ef5a995bf466ecaa460d386299",
+                  "sample": "686a3f4e3884edae5b1926bb88dfb7c505328a1b7ce439ff98396cf1bbb270a0"
+                }
               },
               {
-                "median_ns": 64622.723135642984,
+                "step": 5,
+                "median_ns": 70399.11605131271,
                 "median_ci95_ns": [
-                  64429.19211195929,
-                  64908.03137701993
-                ]
+                  69640.24712627962,
+                  71014.93026499302
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "4b18052e55066b14e4d4e45e6151146bb6d80fd376d797bf6f67838ff8a9615c",
+                  "estimates": "4e16793a26a2bf2ed8a66698cacd8d74db754dddb188a3b9abeed877b5b3b566",
+                  "sample": "8200712c025cda7931ce3bcafa860751585e2de87c882ca442091dd5e05e844c"
+                }
               },
               {
-                "median_ns": 65918.64249342511,
+                "step": 8,
+                "median_ns": 73881.55508284818,
                 "median_ci95_ns": [
-                  65692.36574236574,
-                  66309.38299152584
-                ]
-              },
-              {
-                "median_ns": 67000.97785356407,
-                "median_ci95_ns": [
-                  66384.98126102293,
-                  67304.10052910054
-                ]
-              },
-              {
-                "median_ns": 67101.26236263735,
-                "median_ci95_ns": [
-                  66543.70384615383,
-                  67302.17548076922
-                ]
-              },
-              {
-                "median_ns": 67359.78346121057,
-                "median_ci95_ns": [
-                  67201.56862745098,
-                  67626.16339869282
-                ]
-              },
-              {
-                "median_ns": 67255.77256944444,
-                "median_ci95_ns": [
-                  66980.52455357142,
-                  67724.5958652421
-                ]
+                  72327.28345648604,
+                  74839.20874384238
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "4b18052e55066b14e4d4e45e6151146bb6d80fd376d797bf6f67838ff8a9615c",
+                  "estimates": "50393f2a24dc76722a3d7dfb0a7f40da23409a7db107a10f8cdbcc8404bbc712",
+                  "sample": "5a020299046bee2234475e6a57247aa42be915d97428a03d2992ccc0a167d96d"
+                }
               }
             ],
-            "reference_drift_percent": 7.723554861853543,
-            "candidate_drift_percent": 2.7860734705399404,
-            "change_from_reference_percent": 0.5333864116688236,
-            "blocks": {
-              "abba": {
-                "reference_drift_percent": 5.418843947865826,
-                "candidate_drift_percent": -1.2379798146235355,
-                "change_from_reference_percent": 1.2507865346869762
-              },
-              "baab": {
-                "reference_drift_percent": 0.3852700969708689,
-                "candidate_drift_percent": 0.38028507052128013,
-                "change_from_reference_percent": -0.15193649550149235
-              }
-            }
+            "median_range_ns": [
+              67685.95059076263,
+              73881.55508284818
+            ],
+            "relative_range_percent": 8.74933599611942,
+            "first_to_last_drift_percent": 3.646123445004612,
+            "block_drift_percent": [
+              -5.045496368398606,
+              4.94670846292613
+            ],
+            "range_exceeds_5_percent": true,
+            "absolute_drift_exceeds_5_percent": false
           }
-        }
+        },
+        "chronological_sqlite_over_citadel": [
+          1.0749295064254352,
+          1.0536139792305947,
+          1.0764918200107247,
+          1.1043300736725659
+        ]
+      }
+    },
+    {
+      "name": "upsert_counter",
+      "source": "selected_0dbe126c",
+      "samples_ns": {
+        "citadel": [
+          78139.2750373692,
+          78044.49336812351,
+          79703.90937019969,
+          80343.49298634182
+        ],
+        "sqlite": [
+          81683.12843406593,
+          81630.16896764887,
+          81924.73947550035,
+          85533.51026272579
+        ]
+      },
+      "provenance": {
+        "cohort": "sql-engines-20260927-main",
+        "arms": {
+          "citadel": {
+            "criterion_id": "upsert_counter/citadel/",
+            "runs": [
+              {
+                "step": 1,
+                "median_ns": 78139.2750373692,
+                "median_ci95_ns": [
+                  77249.65792802116,
+                  78882.70292421902
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "cedfb9992a41fa6ecc9122ae4d08faad0964e55969e78348478518db9dca59b8",
+                  "estimates": "4dca3867990bd2cf895d66e30bc17626e82482802ded8570488d5796983eed83",
+                  "sample": "80e7a52cbf2a9d7ec19ea357efcd7d7d459487410ceff146ab80d83ead5a468c"
+                }
+              },
+              {
+                "step": 4,
+                "median_ns": 78044.49336812351,
+                "median_ci95_ns": [
+                  77180.37567455375,
+                  79237.1982203489
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "cedfb9992a41fa6ecc9122ae4d08faad0964e55969e78348478518db9dca59b8",
+                  "estimates": "9ab5bb0158be204f9b478dbeeb7df9ac8ea9b4815c88bf24810fa1a464aa821a",
+                  "sample": "3548137be2099c6ecbe3068a0f9e2b482826b3b46311fc3d4a39cac57acde00c"
+                }
+              },
+              {
+                "step": 6,
+                "median_ns": 79703.90937019969,
+                "median_ci95_ns": [
+                  78716.91711747812,
+                  81355.8988502537
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "cedfb9992a41fa6ecc9122ae4d08faad0964e55969e78348478518db9dca59b8",
+                  "estimates": "95cef62fae9b413aa5158bbbc0a244ab8ceba6564bd543a896780de72e5f54c9",
+                  "sample": "e10cfeb0206cd5578b3653da434f0bf0cdf531bc4154361652de77431dca4d63"
+                }
+              },
+              {
+                "step": 7,
+                "median_ns": 80343.49298634182,
+                "median_ci95_ns": [
+                  79630.62518876472,
+                  81191.8287526427
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "cedfb9992a41fa6ecc9122ae4d08faad0964e55969e78348478518db9dca59b8",
+                  "estimates": "1490634bd864096ab92275da38d169ab41551f7b8793889d028ee4d6f18ebeda",
+                  "sample": "ed81fadee67c0badfdf71551d2e9bf5719b8768e1e4b7abc382e5216f3f37ae2"
+                }
+              }
+            ],
+            "median_range_ns": [
+              78044.49336812351,
+              80343.49298634182
+            ],
+            "relative_range_percent": 2.907998743676435,
+            "first_to_last_drift_percent": 2.8208835414949673,
+            "block_drift_percent": [
+              -0.12129837293775036,
+              0.8024494923724035
+            ],
+            "range_exceeds_5_percent": false,
+            "absolute_drift_exceeds_5_percent": false
+          },
+          "sqlite": {
+            "criterion_id": "upsert_counter/sqlite/",
+            "runs": [
+              {
+                "step": 2,
+                "median_ns": 81683.12843406593,
+                "median_ci95_ns": [
+                  80694.17735042734,
+                  82943.60977564103
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "2d39ee599ec933c73e3db6d6f9248651c2338f645ca796b8e79b8fd21b1c8874",
+                  "estimates": "cf794ce174483a54e91dc31075fae2e3d4379e1424ec5dc55b444cc2f3af3960",
+                  "sample": "d38a6cfc04c1b811b845814e6a5af07f563d53fe6acd581254cc31f1b0c70e70"
+                }
+              },
+              {
+                "step": 3,
+                "median_ns": 81630.16896764887,
+                "median_ci95_ns": [
+                  80283.44075829384,
+                  82633.02019860077
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "2d39ee599ec933c73e3db6d6f9248651c2338f645ca796b8e79b8fd21b1c8874",
+                  "estimates": "1e879c1103b8e0b6ce5a4473754474f97fce5363c909e0eb9f244f798124b756",
+                  "sample": "39eef4db153f58d78ce1f1199402e22acd8366d6bb123179940f29141d366a5e"
+                }
+              },
+              {
+                "step": 5,
+                "median_ns": 81924.73947550035,
+                "median_ci95_ns": [
+                  81490.25950699864,
+                  83063.49033816425
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "2d39ee599ec933c73e3db6d6f9248651c2338f645ca796b8e79b8fd21b1c8874",
+                  "estimates": "3637ad0de2daa06a4331e56c7af711d8f6d6627694f16d9823ebaf4ee8df97fa",
+                  "sample": "2ed1f4e538740d7db2d89414eab85d7eec78b32d38eb7da1e14b107101c62c2d"
+                }
+              },
+              {
+                "step": 8,
+                "median_ns": 85533.51026272579,
+                "median_ci95_ns": [
+                  84306.87956514354,
+                  86040.56562280084
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "2d39ee599ec933c73e3db6d6f9248651c2338f645ca796b8e79b8fd21b1c8874",
+                  "estimates": "34dc59b3c28ffae22345313a14216259dfecf8c0df907234d2fa44a1224995ab",
+                  "sample": "d7bbbc6a8b83fab916b43a567f8a4479871facc732f9903cf48ee75259fae753"
+                }
+              }
+            ],
+            "median_range_ns": [
+              81630.16896764887,
+              85533.51026272579
+            ],
+            "relative_range_percent": 4.720286649595661,
+            "first_to_last_drift_percent": 4.7138030857472035,
+            "block_drift_percent": [
+              -0.06483525720958339,
+              4.404982927415535
+            ],
+            "range_exceeds_5_percent": false,
+            "absolute_drift_exceeds_5_percent": false
+          }
+        },
+        "chronological_sqlite_over_citadel": [
+          1.0453530365491865,
+          1.0459439922636475,
+          1.027863502842572,
+          1.0645978545800374
+        ]
       }
     }
   ],
   "cached": [
     {
       "name": "correlated_in",
-      "source": "complete_6b41d0c3",
+      "source": "selected_0dbe126c",
       "samples_ns": {
         "citadel": [
-          263.79013458335817,
-          271.56332158131306
+          247.93537987792615,
+          240.56149549043474,
+          240.51974220152402,
+          239.48891628514798
         ],
         "sqlite": [
-          2937692050.0,
-          2776841550.0
+          2816759450.0,
+          2777698450.0,
+          2756753700.0,
+          2753895900.0
         ]
       },
       "provenance": {
-        "cohort": "complete3-slow",
+        "cohort": "sql-engines-20260927-correlated_in",
         "arms": {
           "citadel": {
             "criterion_id": "correlated_in/citadel/",
             "runs": [
               {
-                "median_ns": 787.3722764838467,
+                "step": 1,
+                "median_ns": 247.93537987792615,
                 "median_ci95_ns": [
-                  776.2675083181282,
-                  795.7762803656399
-                ]
+                  245.25022694131394,
+                  250.12064315921836
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "c9ad3c26d45e6fb629783a38922cd61bc9e42d40a888b859634564ce4826409f",
+                  "estimates": "0f57ccb50fd573d6144002add9d7a8fa4bd26b2a19215cc8587d00579fe1c071",
+                  "sample": "37952d56865a45ed0e52f1f9573d2a3321ac39049309b9a738a738218f49bc22"
+                }
               },
               {
-                "median_ns": 263.79013458335817,
+                "step": 4,
+                "median_ns": 240.56149549043474,
                 "median_ci95_ns": [
-                  259.49229470128773,
-                  270.1869624288877
-                ]
+                  238.29887109311807,
+                  242.2448335049777
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "c9ad3c26d45e6fb629783a38922cd61bc9e42d40a888b859634564ce4826409f",
+                  "estimates": "ca7b9a7dcb705895a24a83b498fffbbb9fa32fd6275f722c73c44df59a117967",
+                  "sample": "e1945ad86d809a2aaf375145606e8296ddae91f0304fe1fc504c9e2b4a44b5ae"
+                }
               },
               {
-                "median_ns": 271.56332158131306,
+                "step": 6,
+                "median_ns": 240.51974220152402,
                 "median_ci95_ns": [
-                  264.45861956166175,
-                  280.33321438130076
-                ]
+                  238.2295480375658,
+                  242.11903877292423
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "c9ad3c26d45e6fb629783a38922cd61bc9e42d40a888b859634564ce4826409f",
+                  "estimates": "1f894ac128daa1625ef23b3df8f0af2edb41160d1d510f54007ecb470ac6f0d0",
+                  "sample": "4090c414c1772cccb0023ad15f0dd2c7d9098466ece10bc3e49d670913c22e41"
+                }
               },
               {
-                "median_ns": 758.7184047931098,
+                "step": 7,
+                "median_ns": 239.48891628514798,
                 "median_ci95_ns": [
-                  752.8122966093383,
-                  764.4846470698371
-                ]
+                  238.04448383497407,
+                  241.1201965294665
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "c9ad3c26d45e6fb629783a38922cd61bc9e42d40a888b859634564ce4826409f",
+                  "estimates": "2c99860240fee4a2ff5b1a5b6cee72554f6bd626ce756d6985f476f361dd264e",
+                  "sample": "758aab330e318b95d82ffbee2b431eaa6918434fb051f56beab8b78bae2cdce7"
+                }
               }
             ],
-            "reference_drift_percent": -3.6391771143754137,
-            "candidate_drift_percent": 2.9467315031444175,
-            "change_from_reference_percent": -65.37373501776048
+            "median_range_ns": [
+              239.48891628514798,
+              247.93537987792615
+            ],
+            "relative_range_percent": 3.4884523825725293,
+            "first_to_last_drift_percent": -3.406719765826438,
+            "block_drift_percent": [
+              -2.974115429238877,
+              -0.4285826630864853
+            ],
+            "range_exceeds_5_percent": false,
+            "absolute_drift_exceeds_5_percent": false
           },
           "sqlite": {
             "criterion_id": "correlated_in/sqlite/",
             "runs": [
               {
-                "median_ns": 2901662450.0,
+                "step": 2,
+                "median_ns": 2816759450.0,
                 "median_ci95_ns": [
-                  2896260350.0,
-                  2913405000.0
-                ]
+                  2804941400.0,
+                  2834611350.0
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "3e7da420380dd245cce577c8004da53b4923971ad07f45ee324dd006545a13aa",
+                  "estimates": "d36366fd3dd8ffde0db824a2e46d2804f3210ce8cf8c3c1dee9f17f6209fe7a7",
+                  "sample": "9f1e6646083fe469d926ff3dc63a5d47ce7658949c856878469149ef165c105c"
+                }
               },
               {
-                "median_ns": 2937692050.0,
+                "step": 3,
+                "median_ns": 2777698450.0,
                 "median_ci95_ns": [
-                  2920224100.0,
-                  2970947900.0
-                ]
+                  2767018850.0,
+                  2794613900.0
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "3e7da420380dd245cce577c8004da53b4923971ad07f45ee324dd006545a13aa",
+                  "estimates": "e3344322c31a177490dea97f5764e76d23f714e76b0d53f71fcff7c1aea63ebc",
+                  "sample": "b2b40dd98cd04cd60eee400b059b6c1fd3a0e43de673ee5e12b3c2e34b1fe8be"
+                }
               },
               {
-                "median_ns": 2776841550.0,
+                "step": 5,
+                "median_ns": 2756753700.0,
                 "median_ci95_ns": [
-                  2760002100.0,
-                  2813328450.0
-                ]
+                  2739952450.0,
+                  2770755850.0
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "3e7da420380dd245cce577c8004da53b4923971ad07f45ee324dd006545a13aa",
+                  "estimates": "1ed5c3aeeb6e09bcb8f69ea2557ec5fff79236e52b423eafe934351ab0ad9b73",
+                  "sample": "25b836862679966c2f6b2a7e8fe8441f0a1e81777f8b831a9d66e797d0605aa2"
+                }
               },
               {
-                "median_ns": 2782494400.0,
+                "step": 8,
+                "median_ns": 2753895900.0,
                 "median_ci95_ns": [
-                  2762326550.0,
-                  2800572000.0
-                ]
+                  2744576300.0,
+                  2766360350.0
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "3e7da420380dd245cce577c8004da53b4923971ad07f45ee324dd006545a13aa",
+                  "estimates": "e61a00d1981b7ceaea5b465fe8069a6a3ec429a1822178335c5fe1011c4b9467",
+                  "sample": "2bdfc8331054154a36244e4d0cb19c4fb12cead6396c1046bcb3adca87e6cf26"
+                }
               }
             ],
-            "reference_drift_percent": -4.106888794042874,
-            "candidate_drift_percent": -5.475403727221851,
-            "change_from_reference_percent": 0.5344108335082254
+            "median_range_ns": [
+              2753895900.0,
+              2816759450.0
+            ],
+            "relative_range_percent": 2.264311263983712,
+            "first_to_last_drift_percent": -2.231768495531272,
+            "block_drift_percent": [
+              -1.386735384876403,
+              -0.10366540906429078
+            ],
+            "range_exceeds_5_percent": false,
+            "absolute_drift_exceeds_5_percent": false
           }
-        }
+        },
+        "chronological_sqlite_over_citadel": [
+          11360861.250971379,
+          11546729.2233825,
+          11461652.48127616,
+          11499053.662763532
+        ]
       }
     },
     {
@@ -3945,93 +4453,177 @@
     },
     {
       "name": "correlated_exists",
-      "source": "complete_6b41d0c3",
+      "source": "selected_0dbe126c",
       "samples_ns": {
         "citadel": [
-          265.31855951377145,
-          267.9486275596282
+          234.48542312040644,
+          241.06246335093476,
+          239.16173314171033,
+          240.55678851831215
         ],
         "sqlite": [
-          10218785.714285715,
-          9979350.0
+          9522303.333333332,
+          9343311.77536232,
+          9727660.96491228,
+          9845707.043650795
         ]
       },
       "provenance": {
-        "cohort": "complete3-cached",
+        "cohort": "sql-engines-20260927-main",
         "arms": {
           "citadel": {
             "criterion_id": "correlated_exists/citadel/",
             "runs": [
               {
-                "median_ns": 816.795024990295,
+                "step": 1,
+                "median_ns": 234.48542312040644,
                 "median_ci95_ns": [
-                  799.2395833333333,
-                  833.5633616727941
-                ]
+                  231.13359952602747,
+                  236.1018301352828
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "d51341cc3a4182ea7cf0c283d5b48ac62e822b163c896e358130f48060ec4d3b",
+                  "estimates": "2850580dfbbb2ecb63fe73932d0f1ec4fee45a4711a68f83e5a842ecc426252d",
+                  "sample": "73bf14550672ce9bcde2e9151fd6f0889eedbf7404c8f1f5d8a1daeb245ca726"
+                }
               },
               {
-                "median_ns": 265.31855951377145,
+                "step": 4,
+                "median_ns": 241.06246335093476,
                 "median_ci95_ns": [
-                  261.2571273149865,
-                  269.6464159434265
-                ]
+                  236.85468713075514,
+                  244.95189937602998
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "d51341cc3a4182ea7cf0c283d5b48ac62e822b163c896e358130f48060ec4d3b",
+                  "estimates": "0a809ae2582c7a117af2f02609e403a44673df4257a47a7171ebf61265b981eb",
+                  "sample": "4448264aec2dfea5b34b9083bca7b25ed85b871343b2f824e61c0e2206151e7b"
+                }
               },
               {
-                "median_ns": 267.9486275596282,
+                "step": 6,
+                "median_ns": 239.16173314171033,
                 "median_ci95_ns": [
-                  260.2852852852853,
-                  270.9510218463707
-                ]
+                  235.01522964780503,
+                  241.25618469231233
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "d51341cc3a4182ea7cf0c283d5b48ac62e822b163c896e358130f48060ec4d3b",
+                  "estimates": "7f30f5f0046b528d86588b50125a5c1adf25a275e68c1bf2a683328814b554ef",
+                  "sample": "4fe6ac0b5ef1e23f39aed360441f001395de16f5ec5620e9128eced9d8ccf1bc"
+                }
               },
               {
-                "median_ns": 798.1351662046885,
+                "step": 7,
+                "median_ns": 240.55678851831215,
                 "median_ci95_ns": [
-                  786.1570779346355,
-                  829.9297928958281
-                ]
+                  238.87580784196064,
+                  243.67530076996294
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "d51341cc3a4182ea7cf0c283d5b48ac62e822b163c896e358130f48060ec4d3b",
+                  "estimates": "072ec03cafc96ffe5e6a51265341e43697c290b75960eb5bc47459d9fce34686",
+                  "sample": "80835e38a8426942014db28406d38a9595852867f42c317582ed037ef45bff53"
+                }
               }
             ],
-            "reference_drift_percent": -2.2845216014664382,
-            "candidate_drift_percent": 0.9912868706496436,
-            "change_from_reference_percent": -66.97893258910447
+            "median_range_ns": [
+              234.48542312040644,
+              241.06246335093476
+            ],
+            "relative_range_percent": 2.7540129850871433,
+            "first_to_last_drift_percent": 2.5892293504266695,
+            "block_drift_percent": [
+              2.8048823432197167,
+              0.5833104478195184
+            ],
+            "range_exceeds_5_percent": false,
+            "absolute_drift_exceeds_5_percent": false
           },
           "sqlite": {
             "criterion_id": "correlated_exists/sqlite/",
             "runs": [
               {
-                "median_ns": 10223478.57142857,
+                "step": 2,
+                "median_ns": 9522303.333333332,
                 "median_ci95_ns": [
-                  10013078.57142857,
-                  10450757.142857142
-                ]
+                  9420604.058441557,
+                  9626730.615942027
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "66806e5622fd15290ce7bd5c14acde83afe2debff5d928cb67cfa416bb62ea91",
+                  "estimates": "d04f4fa3bc23c5041e31c62445b4b1c75fbebe28cd28efb67898224e6232f37c",
+                  "sample": "89d80b57593d1e3aa7171ad79eff224c6f88425b9d76ab66248ea4080a143ac4"
+                }
               },
               {
-                "median_ns": 10218785.714285715,
+                "step": 3,
+                "median_ns": 9343311.77536232,
                 "median_ci95_ns": [
-                  9921114.285714287,
-                  10390871.42857143
-                ]
+                  9250447.777777776,
+                  9519166.033138402
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "66806e5622fd15290ce7bd5c14acde83afe2debff5d928cb67cfa416bb62ea91",
+                  "estimates": "b08eb2c5ae6c318835e4bbaece9c3c3712742ab476b01371dbfa833be8c5c94c",
+                  "sample": "e8d5950871f469b2973a698879de8e1d754c3ba3eaf552ea589423536c74166b"
+                }
               },
               {
-                "median_ns": 9979350.0,
+                "step": 5,
+                "median_ns": 9727660.96491228,
                 "median_ci95_ns": [
-                  9640971.42857143,
-                  10327514.285714285
-                ]
+                  9523041.07142857,
+                  9811414.52991453
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "66806e5622fd15290ce7bd5c14acde83afe2debff5d928cb67cfa416bb62ea91",
+                  "estimates": "6bd324bd1a9cc1fdbce39dee3f2c37792e2503f808fd37e3a320c4573c0d3277",
+                  "sample": "0cb91610205a7bbc0f60ba173e9c939a987979b7ad3c59ff04687d17d99e05c3"
+                }
               },
               {
-                "median_ns": 10201464.285714285,
+                "step": 8,
+                "median_ns": 9845707.043650795,
                 "median_ci95_ns": [
-                  10001442.857142858,
-                  10890728.57142857
-                ]
+                  9765895.169082126,
+                  9913767.24137931
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "66806e5622fd15290ce7bd5c14acde83afe2debff5d928cb67cfa416bb62ea91",
+                  "estimates": "b0a452dd455b64b56bb7665ecdf26b71c4c619a9d6c04ea5ac9c5b01c6fa390d",
+                  "sample": "8170930dc2b881b0ad656edd6ceecfbe53103792035403c26623961459d621c3"
+                }
               }
             ],
-            "reference_drift_percent": -0.21533067791434934,
-            "candidate_drift_percent": -2.3430936021193505,
-            "change_from_reference_percent": -1.1104419945920374
+            "median_range_ns": [
+              9343311.77536232,
+              9845707.043650795
+            ],
+            "relative_range_percent": 5.22797667936126,
+            "first_to_last_drift_percent": 3.3962760793953217,
+            "block_drift_percent": [
+              -1.879708634616184,
+              1.2135093848799627
+            ],
+            "range_exceeds_5_percent": true,
+            "absolute_drift_exceeds_5_percent": false
           }
-        }
+        },
+        "chronological_sqlite_over_citadel": [
+          40609.36158254794,
+          38758.882845067754,
+          40673.98591374297,
+          40928.82642927909
+        ]
       }
     },
     {
@@ -4308,97 +4900,6 @@
       }
     },
     {
-      "name": "group_by",
-      "source": "complete_6b41d0c3",
-      "samples_ns": {
-        "citadel": [
-          2654.2870257037944,
-          2582.68634195754
-        ],
-        "sqlite": [
-          16063940.0,
-          15691090.0
-        ]
-      },
-      "provenance": {
-        "cohort": "complete3-cached",
-        "arms": {
-          "citadel": {
-            "criterion_id": "group_by/citadel/",
-            "runs": [
-              {
-                "median_ns": 3120.188046766413,
-                "median_ci95_ns": [
-                  3089.851606573461,
-                  3226.645809545558
-                ]
-              },
-              {
-                "median_ns": 2654.2870257037944,
-                "median_ci95_ns": [
-                  2595.965640846302,
-                  2700.8632530939753
-                ]
-              },
-              {
-                "median_ns": 2582.68634195754,
-                "median_ci95_ns": [
-                  2538.710265317877,
-                  2608.7953896368826
-                ]
-              },
-              {
-                "median_ns": 3136.1545093531195,
-                "median_ci95_ns": [
-                  3062.2348207754203,
-                  3243.356701617492
-                ]
-              }
-            ],
-            "reference_drift_percent": 0.5117147539634104,
-            "candidate_drift_percent": -2.6975486468826415,
-            "change_from_reference_percent": -16.293372354765335
-          },
-          "sqlite": {
-            "criterion_id": "group_by/sqlite/",
-            "runs": [
-              {
-                "median_ns": 15611390.0,
-                "median_ci95_ns": [
-                  15335980.0,
-                  16228670.0
-                ]
-              },
-              {
-                "median_ns": 16063940.0,
-                "median_ci95_ns": [
-                  15536100.0,
-                  16565910.0
-                ]
-              },
-              {
-                "median_ns": 15691090.0,
-                "median_ci95_ns": [
-                  15095600.0,
-                  16091290.0
-                ]
-              },
-              {
-                "median_ns": 15814350.0,
-                "median_ci95_ns": [
-                  15455550.0,
-                  16287080.0
-                ]
-              }
-            ],
-            "reference_drift_percent": 1.3000764185636227,
-            "candidate_drift_percent": -2.3210370556662974,
-            "change_from_reference_percent": 1.0478353095265236
-          }
-        }
-      }
-    },
-    {
       "name": "sort",
       "source": "complete_6b41d0c3",
       "samples_ns": {
@@ -4490,94 +4991,353 @@
       }
     },
     {
-      "name": "sum",
-      "source": "complete_6b41d0c3",
+      "name": "group_by",
+      "source": "selected_0dbe126c",
       "samples_ns": {
         "citadel": [
-          858.9863579874972,
-          843.5866524868156
+          2355.7560310686895,
+          2489.2386996459263,
+          2533.369563486376,
+          2489.1887199480184
         ],
         "sqlite": [
-          2897452.2727272725,
-          2867375.8620689656
+          14312297.94117647,
+          14347324.523809524,
+          14431228.652597403,
+          14761044.708333332
         ]
       },
       "provenance": {
-        "cohort": "complete3-cached",
+        "cohort": "sql-engines-20260927-main",
+        "arms": {
+          "citadel": {
+            "criterion_id": "group_by/citadel/",
+            "runs": [
+              {
+                "step": 1,
+                "median_ns": 2355.7560310686895,
+                "median_ci95_ns": [
+                  2332.9999792017634,
+                  2383.240842755482
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "7f85c161e64a4bb64984ddd38b7b6a3704c60e1a27dbf3e1b3f9a51e5f6f3f1d",
+                  "estimates": "08260d04369ba8e6bd6f8eabc035f969f413f8fc2fc7f4ffe8bcb083112297f5",
+                  "sample": "b9651ab2b1085a3c03efeacf0bec106c485ee20313303839ffe7c14b46aa2fcd"
+                }
+              },
+              {
+                "step": 4,
+                "median_ns": 2489.2386996459263,
+                "median_ci95_ns": [
+                  2473.6122084949484,
+                  2538.0636925206672
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "7f85c161e64a4bb64984ddd38b7b6a3704c60e1a27dbf3e1b3f9a51e5f6f3f1d",
+                  "estimates": "00851ab67c50d2b1e26b13f3ad633c7ebda978c91c628bd579fbf18252f3bb60",
+                  "sample": "46d9f47350733310b878cbc3ab6ce4552bf048b7b335b40b312401d9a82fd521"
+                }
+              },
+              {
+                "step": 6,
+                "median_ns": 2533.369563486376,
+                "median_ci95_ns": [
+                  2511.148876922132,
+                  2551.421957861545
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "7f85c161e64a4bb64984ddd38b7b6a3704c60e1a27dbf3e1b3f9a51e5f6f3f1d",
+                  "estimates": "fb6c1cbc7bf9b8722e8dfbac85826d7e3bfa3277fccd367ab5c1bcc050afea8d",
+                  "sample": "02f8d51d352767d88b1d273f3e82dd913b14ab05a0283d79b5194a74c4e1b57f"
+                }
+              },
+              {
+                "step": 7,
+                "median_ns": 2489.1887199480184,
+                "median_ci95_ns": [
+                  2470.696402116402,
+                  2525.487886920737
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "7f85c161e64a4bb64984ddd38b7b6a3704c60e1a27dbf3e1b3f9a51e5f6f3f1d",
+                  "estimates": "c82ffde46f40907db3f1dbe3aa8a9c525abab734762ab418860466deee532046",
+                  "sample": "978ecabf9c0cfa4fd47279a7ae3d684fdd13a6b554520aaffce430d111d954fc"
+                }
+              }
+            ],
+            "median_range_ns": [
+              2355.7560310686895,
+              2533.369563486376
+            ],
+            "relative_range_percent": 7.199901826238296,
+            "first_to_last_drift_percent": 5.664113223931655,
+            "block_drift_percent": [
+              5.666234822995753,
+              -1.743955725020907
+            ],
+            "range_exceeds_5_percent": true,
+            "absolute_drift_exceeds_5_percent": true
+          },
+          "sqlite": {
+            "criterion_id": "group_by/sqlite/",
+            "runs": [
+              {
+                "step": 2,
+                "median_ns": 14312297.94117647,
+                "median_ci95_ns": [
+                  14220446.59090909,
+                  14423578.57142857
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "51bfb00c604aeb2f4fc7f380fbecbb9f41dd7fcca407b0eed7f46bf23b74ae0a",
+                  "estimates": "b0c4446b2185ede8cea391620fbb2b8d7626c0d2aa098b11d713fd690a6a57c6",
+                  "sample": "2f07de3bfe8fc4174caf90b31480957a79ea3c4f32b83bfb71fb03989ee816ff"
+                }
+              },
+              {
+                "step": 3,
+                "median_ns": 14347324.523809524,
+                "median_ci95_ns": [
+                  14248811.666666668,
+                  14499316.666666668
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "51bfb00c604aeb2f4fc7f380fbecbb9f41dd7fcca407b0eed7f46bf23b74ae0a",
+                  "estimates": "92b084845919d04196b48b6844ab4c563b2bbf225b3eef0657a91a6b5d5945e4",
+                  "sample": "506dd7b93ddf40ff2639772432035d2fcc527b44a3fc5d160e39bfaaec9e81a6"
+                }
+              },
+              {
+                "step": 5,
+                "median_ns": 14431228.652597403,
+                "median_ci95_ns": [
+                  14242056.465517242,
+                  14557475.961538462
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "51bfb00c604aeb2f4fc7f380fbecbb9f41dd7fcca407b0eed7f46bf23b74ae0a",
+                  "estimates": "f922b800651e3d2d284447012279de2303461e35e7692d47c9257464863f7589",
+                  "sample": "38bd0495332adfcbab15f064b36059a2e6be1b2b7921af2cb207bf7bd2442579"
+                }
+              },
+              {
+                "step": 8,
+                "median_ns": 14761044.708333332,
+                "median_ci95_ns": [
+                  14651537.82051282,
+                  14874679.359243698
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "51bfb00c604aeb2f4fc7f380fbecbb9f41dd7fcca407b0eed7f46bf23b74ae0a",
+                  "estimates": "ed03df6fea5f078302fed303c875820a3a01ea73570025cd736ed01c772a62b3",
+                  "sample": "8825f23473f4fdb1d4955a7d2ea34c9ea12157ba11c7a85e2c751b688b231b8e"
+                }
+              }
+            ],
+            "median_range_ns": [
+              14312297.94117647,
+              14761044.708333332
+            ],
+            "relative_range_percent": 3.102728169926838,
+            "first_to_last_drift_percent": 3.1353928558587096,
+            "block_drift_percent": [
+              0.2447306699246532,
+              2.2854329570654253
+            ],
+            "range_exceeds_5_percent": false,
+            "absolute_drift_exceeds_5_percent": false
+          }
+        },
+        "chronological_sqlite_over_citadel": [
+          6075.4584738062595,
+          5763.739944204754,
+          5696.456158862749,
+          5930.0625099416275
+        ]
+      }
+    },
+    {
+      "name": "sum",
+      "source": "selected_0dbe126c",
+      "samples_ns": {
+        "citadel": [
+          515.1977523425454,
+          532.2104801713514,
+          535.2604784747641,
+          532.5041054038572
+        ],
+        "sqlite": [
+          2699247.380952381,
+          2706047.5187969925,
+          2760741.3485221677,
+          2788566.1344537814
+        ]
+      },
+      "provenance": {
+        "cohort": "sql-engines-20260927-main",
         "arms": {
           "citadel": {
             "criterion_id": "sum/citadel/",
             "runs": [
               {
-                "median_ns": 830.6335679570973,
+                "step": 1,
+                "median_ns": 515.1977523425454,
                 "median_ci95_ns": [
-                  818.2566844919786,
-                  847.1583333333333
-                ]
+                  508.4583679278852,
+                  521.1196382593901
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "668c7ed0894901aedf75e952d2bc760213dd5d96498cc33d87b04c538d995239",
+                  "estimates": "255113d1e54b997299b377a7f3723652825bad8c9075483b8bbd73db62a04219",
+                  "sample": "698c2000d0467295bb86a44027dee9c48bb6122f28d3ee82e62a0cbf5829ccac"
+                }
               },
               {
-                "median_ns": 858.9863579874972,
+                "step": 4,
+                "median_ns": 532.2104801713514,
                 "median_ci95_ns": [
-                  847.5407928856562,
-                  882.3993018706376
-                ]
+                  522.4205878681977,
+                  540.5374750374438
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "668c7ed0894901aedf75e952d2bc760213dd5d96498cc33d87b04c538d995239",
+                  "estimates": "f3e8831cecee6d1badf7238b86e12e3d4695a40f182bcf50d56a590b398ce83f",
+                  "sample": "208b84002d9553bca57df0dad1a741804835566b475c597dc554d9a2063f0a01"
+                }
               },
               {
-                "median_ns": 843.5866524868156,
+                "step": 6,
+                "median_ns": 535.2604784747641,
                 "median_ci95_ns": [
-                  831.6649103723344,
-                  870.5657589402235
-                ]
+                  532.3974977483749,
+                  544.850626865933
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "668c7ed0894901aedf75e952d2bc760213dd5d96498cc33d87b04c538d995239",
+                  "estimates": "91629bedf0e961c81e034dc7bdcaddf17f4159e24cdabb5cfbbbaa995e0ca471",
+                  "sample": "fd705ad95256f154f5d068a674156e61190df10b6400a31931f7ffe8293c08f2"
+                }
               },
               {
-                "median_ns": 830.1704758336456,
+                "step": 7,
+                "median_ns": 532.5041054038572,
                 "median_ci95_ns": [
-                  822.2017648619958,
-                  834.6779398282185
-                ]
+                  529.944088024414,
+                  537.4680337201819
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "668c7ed0894901aedf75e952d2bc760213dd5d96498cc33d87b04c538d995239",
+                  "estimates": "acc70dbe58da3bad721fa94f368cf97bf7cc33a9ea82434b97ee2bdef3632300",
+                  "sample": "e186466805b8bc7b8d2fe6850528db4939a9ad3b3a4775b8259727eec5ca27f9"
+                }
               }
             ],
-            "reference_drift_percent": -0.0557516745429254,
-            "candidate_drift_percent": -1.792776492604753,
-            "change_from_reference_percent": 2.5149846449213475
+            "median_range_ns": [
+              515.1977523425454,
+              535.2604784747641
+            ],
+            "relative_range_percent": 3.7940589963587366,
+            "first_to_last_drift_percent": 3.359167034914612,
+            "block_drift_percent": [
+              3.302174311019601,
+              -0.5149591986991497
+            ],
+            "range_exceeds_5_percent": false,
+            "absolute_drift_exceeds_5_percent": false
           },
           "sqlite": {
             "criterion_id": "sum/sqlite/",
             "runs": [
               {
-                "median_ns": 2830890.833333333,
+                "step": 2,
+                "median_ns": 2699247.380952381,
                 "median_ci95_ns": [
-                  2771909.659090909,
-                  2847416.9540229887
-                ]
+                  2680039.0062111802,
+                  2737358.157894737
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "a541c58ac5aaac7e8da85532302de8a789e3528c493fedecf3d2194a7f3769bd",
+                  "estimates": "78a33ae61c64561162baf76bc0fc94a0ff14f08ba3107d8772e0ff96cf613d3f",
+                  "sample": "a3a9c42fbb81d43d4cdb8156d14b5de249bb6c69ff6d7f258e2bd427c47a38d6"
+                }
               },
               {
-                "median_ns": 2897452.2727272725,
+                "step": 3,
+                "median_ns": 2706047.5187969925,
                 "median_ci95_ns": [
-                  2807237.5,
-                  2942572.175925926
-                ]
+                  2686552.7116402118,
+                  2724457.9387755105
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "a541c58ac5aaac7e8da85532302de8a789e3528c493fedecf3d2194a7f3769bd",
+                  "estimates": "89bd0d1321647e6f7d62e39271bdfd3717e933e5b66204f42bdeb531c439d5c4",
+                  "sample": "442e57eb07ac527ddb263bded21f7c7a307e066cbe698bf4da72fe2d56ec02da"
+                }
               },
               {
-                "median_ns": 2867375.8620689656,
+                "step": 5,
+                "median_ns": 2760741.3485221677,
                 "median_ci95_ns": [
-                  2814301.470588235,
-                  2914671.770833333
-                ]
+                  2728358.6940836944,
+                  2788984.5761381476
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "a541c58ac5aaac7e8da85532302de8a789e3528c493fedecf3d2194a7f3769bd",
+                  "estimates": "9fa0586884d7665393f9d354cf0c6f69ddda297d1374aa035e824ec29f074256",
+                  "sample": "7702007608cfec246cbbe8d3d33d77a5eeab7ebcb6468c19bda7bae315ced7c6"
+                }
               },
               {
-                "median_ns": 2931008.9285714286,
+                "step": 8,
+                "median_ns": 2788566.1344537814,
                 "median_ci95_ns": [
-                  2869457.476190476,
-                  3048606.923076923
-                ]
+                  2767088.4532019706,
+                  2805716.7137210616
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "a541c58ac5aaac7e8da85532302de8a789e3528c493fedecf3d2194a7f3769bd",
+                  "estimates": "bf9bc993bdc348478cfdb130504c0608710a27cd4197ecb035dfc21ddb07a2b3",
+                  "sample": "1416073093d595e0dbbca7c3c9e9f5e62925ecb27c3b9260bdc840c0c5f76319"
+                }
               }
             ],
-            "reference_drift_percent": 3.53662861383488,
-            "candidate_drift_percent": -1.038029545521968,
-            "change_from_reference_percent": 0.0508230446985225
+            "median_range_ns": [
+              2699247.380952381,
+              2788566.1344537814
+            ],
+            "relative_range_percent": 3.2614147143213548,
+            "first_to_last_drift_percent": 3.30902436478,
+            "block_drift_percent": [
+              0.25192718135422787,
+              1.0078736983639702
+            ],
+            "range_exceeds_5_percent": false,
+            "absolute_drift_exceeds_5_percent": false
           }
-        }
+        },
+        "chronological_sqlite_over_citadel": [
+          5239.245258115377,
+          5084.543840485345,
+          5157.753018472347,
+          5236.703541165943
+        ]
       }
     },
     {
@@ -4673,184 +5433,352 @@
     },
     {
       "name": "full_outer_join",
-      "source": "complete_6b41d0c3",
+      "source": "selected_0dbe126c",
       "samples_ns": {
         "citadel": [
-          26085.830277632267,
-          25231.102693602694
+          24950.234272774996,
+          25503.77900787737,
+          24822.441823338977,
+          26220.176800697394
         ],
         "sqlite": [
-          30838750.0,
-          31119283.333333336
+          31355570.588235296,
+          31105327.525252525,
+          31607906.57894737,
+          32547554.166666668
         ]
       },
       "provenance": {
-        "cohort": "complete3-cached",
+        "cohort": "sql-engines-20260927-main",
         "arms": {
           "citadel": {
             "criterion_id": "full_outer_join/citadel/",
             "runs": [
               {
-                "median_ns": 26017.766211234004,
+                "step": 1,
+                "median_ns": 24950.234272774996,
                 "median_ci95_ns": [
-                  25353.71119097534,
-                  26918.008385744237
-                ]
+                  24533.02239571578,
+                  25139.314255731355
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "dcc4993a07a948692db47d78b741397ccb8c8ea441cb1f1336b4c4cc26796313",
+                  "estimates": "26fb4221084d1f9d9f9ced5b6954ab29a6848e1b83e2f5bb8631b6d5fea650e5",
+                  "sample": "afaf0909e0a5a64296d2cd512608e1c67fca3c85b55e53e32fd2901917ebaba5"
+                }
               },
               {
-                "median_ns": 26085.830277632267,
+                "step": 4,
+                "median_ns": 25503.77900787737,
                 "median_ci95_ns": [
-                  25242.319277108432,
-                  26925.386513373756
-                ]
+                  25366.318926974665,
+                  26085.13926717714
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "dcc4993a07a948692db47d78b741397ccb8c8ea441cb1f1336b4c4cc26796313",
+                  "estimates": "da6b3eafbc1afdada5f0961e200cdb4e1cac9fcda1b4e2dd8eed5ed256f493f1",
+                  "sample": "9b49bab7133f18f3cd334e49da9a9a593ba90f98d4db0ecbdcde788f136c9211"
+                }
               },
               {
-                "median_ns": 25231.102693602694,
+                "step": 6,
+                "median_ns": 24822.441823338977,
                 "median_ci95_ns": [
-                  24661.018228259607,
-                  25609.58818958819
-                ]
+                  24526.981019151848,
+                  25186.330602536997
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "dcc4993a07a948692db47d78b741397ccb8c8ea441cb1f1336b4c4cc26796313",
+                  "estimates": "c706b7729b25a458acf7b05714ac70d067062cf28ff5f19f684c9aaed8fa9a3d",
+                  "sample": "7a1b7c05ed5455a01fafdad67f09cd8e5179324ddd11d96e7697c1b21ba44226"
+                }
               },
               {
-                "median_ns": 26341.889425657544,
+                "step": 7,
+                "median_ns": 26220.176800697394,
                 "median_ci95_ns": [
-                  25691.42331433998,
-                  27091.17798353909
-                ]
+                  25831.02748345715,
+                  26550.287821650396
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "dcc4993a07a948692db47d78b741397ccb8c8ea441cb1f1336b4c4cc26796313",
+                  "estimates": "2d69c61b476bbf9392f7bad2d48b3e9d6c3da9ac1c8a97230a7156318c8f879d",
+                  "sample": "8cc016f6f54081f0f509ab1b6f94b840aac68e0e7e587c892b3484b68daf5855"
+                }
               }
             ],
-            "reference_drift_percent": 1.2457764890038359,
-            "candidate_drift_percent": -3.276597198297626,
-            "change_from_reference_percent": -1.9914620388028492
+            "median_range_ns": [
+              24822.441823338977,
+              26220.176800697394
+            ],
+            "relative_range_percent": 5.508497971325677,
+            "first_to_last_drift_percent": 5.089902219107123,
+            "block_drift_percent": [
+              2.218595340831664,
+              5.630932634694363
+            ],
+            "range_exceeds_5_percent": true,
+            "absolute_drift_exceeds_5_percent": true
           },
           "sqlite": {
             "criterion_id": "full_outer_join/sqlite/",
             "runs": [
               {
-                "median_ns": 31092183.333333332,
+                "step": 2,
+                "median_ns": 31355570.588235296,
                 "median_ci95_ns": [
-                  30962200.0,
-                  31763766.666666668
-                ]
+                  31161491.07142857,
+                  31798665.833333336
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "47f8e4a1a66885a74cfb2bac9438bf0d00d8fcead91e3de238c4c5b2e2a79d52",
+                  "estimates": "b37d1f4d2821024a9c20643dff82403010a183154079a29a99ccc15a6e5a724a",
+                  "sample": "6a8c13fc5da92f9628c9e87b1d9ad7468aee654145aa7bee89387aeb24785e9b"
+                }
               },
               {
-                "median_ns": 30838750.0,
+                "step": 3,
+                "median_ns": 31105327.525252525,
                 "median_ci95_ns": [
-                  30442633.333333332,
-                  31156766.666666664
-                ]
+                  30666131.333333336,
+                  31345661.60714286
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "47f8e4a1a66885a74cfb2bac9438bf0d00d8fcead91e3de238c4c5b2e2a79d52",
+                  "estimates": "7482144473e1c94512a0876d3d1e5ea1413a3a20f0a65b8b14895498496ef9ea",
+                  "sample": "904619fe17491e9e86e86ac837c6aa61d8b398ea717687bed767edfab4a1e74f"
+                }
               },
               {
-                "median_ns": 31119283.333333336,
+                "step": 5,
+                "median_ns": 31607906.57894737,
                 "median_ci95_ns": [
-                  30340233.333333332,
-                  31898266.666666668
-                ]
+                  31256432.222222224,
+                  31891609.615384616
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "47f8e4a1a66885a74cfb2bac9438bf0d00d8fcead91e3de238c4c5b2e2a79d52",
+                  "estimates": "ce05004f363bc4cfb7cddb357f0206fedb538dcbb0a840e0006090d78fe50f89",
+                  "sample": "e59b57309651312b1d86e91cfb7014f7d9d1c3e04ed685a9de26639ea8b0e22b"
+                }
               },
               {
-                "median_ns": 31166650.0,
+                "step": 8,
+                "median_ns": 32547554.166666668,
                 "median_ci95_ns": [
-                  30314933.333333336,
-                  31619516.666666664
-                ]
+                  32323583.279220782,
+                  32743131.034502257
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "47f8e4a1a66885a74cfb2bac9438bf0d00d8fcead91e3de238c4c5b2e2a79d52",
+                  "estimates": "65907f741f068503cb75d7d4d486cf32bbfa7301cce2b5cd587b232c567c02c4",
+                  "sample": "a5a2f4f3be3766cc71aaaa3b2c3cbb3a549a5b179efa6988787f204887d253dd"
+                }
               }
             ],
-            "reference_drift_percent": 0.23950285468319343,
-            "candidate_drift_percent": 0.9096780295353657,
-            "change_from_reference_percent": -0.4831442927777152
+            "median_range_ns": [
+              31105327.525252525,
+              32547554.166666668
+            ],
+            "relative_range_percent": 4.556209495864738,
+            "first_to_last_drift_percent": 3.80150498322811,
+            "block_drift_percent": [
+              -0.7980816750841169,
+              2.972824490518944
+            ],
+            "range_exceeds_5_percent": false,
+            "absolute_drift_exceeds_5_percent": false
           }
-        }
+        },
+        "chronological_sqlite_over_citadel": [
+          1256.7244958677452,
+          1219.6360200441277,
+          1273.360082940287,
+          1241.3171129265986
+        ]
       }
     },
     {
       "name": "correlated_scalar",
-      "source": "complete_6b41d0c3",
+      "source": "selected_0dbe126c",
       "samples_ns": {
         "citadel": [
-          24539.248223514212,
-          23634.40274414851
+          22631.124162198394,
+          23978.27387164336,
+          24069.77938379612,
+          23609.34659090909
         ],
         "sqlite": [
-          29105716.666666664,
-          28280483.333333332
+          27801581.666666664,
+          28033029.344729345,
+          28043224.166666664,
+          28624574.75490196
         ]
       },
       "provenance": {
-        "cohort": "complete3-cached",
+        "cohort": "sql-engines-20260927-main",
         "arms": {
           "citadel": {
             "criterion_id": "correlated_scalar/citadel/",
             "runs": [
               {
-                "median_ns": 24266.029283216783,
+                "step": 1,
+                "median_ns": 22631.124162198394,
                 "median_ci95_ns": [
-                  23551.044034090908,
-                  24869.30994729908
-                ]
+                  22342.10480303802,
+                  22866.247127537343
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "ff0f7af678c52a745798c90b9e45a5793132273d01a16a3295da55686f8247fa",
+                  "estimates": "8faaab184b02c025f4ba431114f53bc7eb699f63d72d55907f7b206fb88cb605",
+                  "sample": "ea912c2c9a02ddd1c5fd888f233776002588ca99c4f18a73e79a12f20fb334d8"
+                }
               },
               {
-                "median_ns": 24539.248223514212,
+                "step": 4,
+                "median_ns": 23978.27387164336,
                 "median_ci95_ns": [
-                  24133.16106804479,
-                  25141.661683277962
-                ]
+                  23733.20408468457,
+                  24602.07267833109
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "ff0f7af678c52a745798c90b9e45a5793132273d01a16a3295da55686f8247fa",
+                  "estimates": "cefc1807a82a26c0200952a4530aa7979124d906929626b7e9b01784ad9f025b",
+                  "sample": "5eb39dcdc5d0f1479ee4c6e19d777e8c70e3c0002e5a6049dda1999c2f09a872"
+                }
               },
               {
-                "median_ns": 23634.40274414851,
+                "step": 6,
+                "median_ns": 24069.77938379612,
                 "median_ci95_ns": [
-                  23307.01694915254,
-                  24151.783941105976
-                ]
+                  23780.40874501456,
+                  24402.519033370343
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "ff0f7af678c52a745798c90b9e45a5793132273d01a16a3295da55686f8247fa",
+                  "estimates": "8d25095282dd8472f3d09ac8c3409de9b75b28fe5b3a5e50d3af36337830c70c",
+                  "sample": "9f3e88dc16b32558b9b89b8f3efe797f93bfb00481e19706cf9b3f0006efffee"
+                }
               },
               {
-                "median_ns": 24490.20926458067,
+                "step": 7,
+                "median_ns": 23609.34659090909,
                 "median_ci95_ns": [
-                  23579.712643678162,
-                  25022.44458128079
-                ]
+                  23279.322884012538,
+                  24080.148692810457
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "ff0f7af678c52a745798c90b9e45a5793132273d01a16a3295da55686f8247fa",
+                  "estimates": "b9f2406820207efd2def9af1a6c9ade50dc947a7846809864e27b5fffb44146c",
+                  "sample": "44022ab8bf0f6795921c3715a0b676bb199fc4d983629b15000f1587f3d1b7b6"
+                }
               }
             ],
-            "reference_drift_percent": 0.9238428699949619,
-            "candidate_drift_percent": -3.6873398529733925,
-            "change_from_reference_percent": -1.194898535012301
+            "median_range_ns": [
+              22631.124162198394,
+              24069.77938379612
+            ],
+            "relative_range_percent": 6.103203912566575,
+            "first_to_last_drift_percent": 4.322465033993561,
+            "block_drift_percent": [
+              5.952641591243446,
+              -1.912908238772637
+            ],
+            "range_exceeds_5_percent": true,
+            "absolute_drift_exceeds_5_percent": false
           },
           "sqlite": {
             "criterion_id": "correlated_scalar/sqlite/",
             "runs": [
               {
-                "median_ns": 28174266.666666664,
+                "step": 2,
+                "median_ns": 27801581.666666664,
                 "median_ci95_ns": [
-                  27756000.0,
-                  28736550.0
-                ]
+                  27596225.9057971,
+                  28042440.909090906
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "5512ad8403b3f7dfc8fa9e044e5fa1bb59f09e2218d1ba31a8a0d3dd9afaf96f",
+                  "estimates": "a4e243e121977961fdb31310444caa6298793e9f2e9b5e06efdab66976c3aa63",
+                  "sample": "017f9077bc0ed500c44e7a9ec6ab418c61c65f7974bb8fa3d8716d5d3bf59ed5"
+                }
               },
               {
-                "median_ns": 29105716.666666664,
+                "step": 3,
+                "median_ns": 28033029.344729345,
                 "median_ci95_ns": [
-                  28678850.0,
-                  30291300.0
-                ]
+                  27647893.076923076,
+                  28247530.0
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "5512ad8403b3f7dfc8fa9e044e5fa1bb59f09e2218d1ba31a8a0d3dd9afaf96f",
+                  "estimates": "4068cde5dfdf6044d879686836bb523738dbe820b747c7a5ca341b80a183f80a",
+                  "sample": "666037dff28d1e9310f8c6fcf20a7cacc4ec4de1f166cc2d1baf1bce876c7ab5"
+                }
               },
               {
-                "median_ns": 28280483.333333332,
+                "step": 5,
+                "median_ns": 28043224.166666664,
                 "median_ci95_ns": [
-                  27574216.666666664,
-                  29240383.333333336
-                ]
+                  27830701.28205128,
+                  28427602.48275862
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "5512ad8403b3f7dfc8fa9e044e5fa1bb59f09e2218d1ba31a8a0d3dd9afaf96f",
+                  "estimates": "dd7e78b8bc7e1afd164428532f5c6e0bbec9ede4caff1fe68fdea21781da661a",
+                  "sample": "13aef012efe84e6e4cd98e13020500c9eb88b6d077229062fe21aac6d954ba50"
+                }
               },
               {
-                "median_ns": 28836433.333333336,
+                "step": 8,
+                "median_ns": 28624574.75490196,
                 "median_ci95_ns": [
-                  27845300.0,
-                  29519183.333333336
-                ]
+                  28524278.273809522,
+                  28815357.246376812
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "5512ad8403b3f7dfc8fa9e044e5fa1bb59f09e2218d1ba31a8a0d3dd9afaf96f",
+                  "estimates": "f6f8a4beb8233b7a02afe6612ba5b65354d21b6b05af59227b7366debaefa1c6",
+                  "sample": "1a17eb9ffa169a0994165645ea738a78e3ba6e2997b0e6fdd2d8099625de5b44"
+                }
               }
             ],
-            "reference_drift_percent": 2.35025342274513,
-            "candidate_drift_percent": -2.835296387937536,
-            "change_from_reference_percent": 0.6586482888299994
+            "median_range_ns": [
+              27801581.666666664,
+              28624574.75490196
+            ],
+            "relative_range_percent": 2.9261349644889654,
+            "first_to_last_drift_percent": 2.9602383709774305,
+            "block_drift_percent": [
+              0.832498239983881,
+              2.0730518886851623
+            ],
+            "range_exceeds_5_percent": false,
+            "absolute_drift_exceeds_5_percent": false
           }
-        }
+        },
+        "chronological_sqlite_over_citadel": [
+          1228.466666852753,
+          1169.1012244997805,
+          1165.0802327480194,
+          1212.4255385332865
+        ]
       }
     },
     {
@@ -5583,93 +6511,177 @@
     },
     {
       "name": "join",
-      "source": "complete_6b41d0c3",
+      "source": "selected_0dbe126c",
       "samples_ns": {
         "citadel": [
-          25642.050811943423,
-          24986.065088757397
+          23457.69178978147,
+          24839.4597480953,
+          25526.0576538769,
+          24810.155788446224
         ],
         "sqlite": [
-          151759.88095238095,
-          149518.00492610838
+          142386.99294532626,
+          142753.01239669422,
+          149186.9224219799,
+          151902.59545259544
         ]
       },
       "provenance": {
-        "cohort": "complete3-cached",
+        "cohort": "sql-engines-20260927-main",
         "arms": {
           "citadel": {
             "criterion_id": "join/citadel/",
             "runs": [
               {
-                "median_ns": 24709.947018678162,
+                "step": 1,
+                "median_ns": 23457.69178978147,
                 "median_ci95_ns": [
-                  24482.679924242424,
-                  25873.20063405797
-                ]
+                  23168.20879951074,
+                  23999.9160580878
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "bd7a8763dbb3f1631cb8a900ed38c27b8e6e4b647811cc254e127fcb62309f70",
+                  "estimates": "72dce544bbbd5527822eafcaffddfc77349995ab47a8cde70342a38f0fe78770",
+                  "sample": "beb8dfd735ff87ac99c1bb463d644943616d88fb99d8e4dac5f90c565a2b4d23"
+                }
               },
               {
-                "median_ns": 25642.050811943423,
+                "step": 4,
+                "median_ns": 24839.4597480953,
                 "median_ci95_ns": [
-                  25310.629948364887,
-                  26125.342278203723
-                ]
+                  24625.77688834154,
+                  25097.203663793105
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "bd7a8763dbb3f1631cb8a900ed38c27b8e6e4b647811cc254e127fcb62309f70",
+                  "estimates": "fef623d85ae9867def02381865a070f4fc245ebb79f8a9f7302ba2e5212e78af",
+                  "sample": "401424fb7a6b211903ec54ca913b032f9e276d7104a9a27a4da674e31b7c1018"
+                }
               },
               {
-                "median_ns": 24986.065088757397,
+                "step": 6,
+                "median_ns": 25526.0576538769,
                 "median_ci95_ns": [
-                  24285.405748098055,
-                  25265.531135531135
-                ]
+                  25064.34380445954,
+                  25748.827338129497
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "bd7a8763dbb3f1631cb8a900ed38c27b8e6e4b647811cc254e127fcb62309f70",
+                  "estimates": "80650c9e94b9a2f1d68f7f71ae0ad82a1421d135fd6ed15fdea75607d83afede",
+                  "sample": "c86ccb60054403cf3a4cf86caff3723841d692df2c7ae5e512d834fdf9d136b2"
+                }
               },
               {
-                "median_ns": 26871.698987154152,
+                "step": 7,
+                "median_ns": 24810.155788446224,
                 "median_ci95_ns": [
-                  26078.742766203704,
-                  27328.89880952381
-                ]
+                  24635.936833298474,
+                  25016.773895333557
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "bd7a8763dbb3f1631cb8a900ed38c27b8e6e4b647811cc254e127fcb62309f70",
+                  "estimates": "8a6fbeaba9ac716f1b09cfb738d189ae141b03de8d91b6db5624b656501fcccf",
+                  "sample": "4c7b7a39a6afac7c9af9a2819e76cf8d5d0baa1d0c0a263d76344aa83e170b0e"
+                }
               }
             ],
-            "reference_drift_percent": 8.74850911999905,
-            "candidate_drift_percent": -2.558242037647329,
-            "change_from_reference_percent": -1.8485840971877332
+            "median_range_ns": [
+              23457.69178978147,
+              25526.0576538769
+            ],
+            "relative_range_percent": 8.388098143100523,
+            "first_to_last_drift_percent": 5.765545948787287,
+            "block_drift_percent": [
+              5.890468553754924,
+              -2.8045923704240416
+            ],
+            "range_exceeds_5_percent": true,
+            "absolute_drift_exceeds_5_percent": true
           },
           "sqlite": {
             "criterion_id": "join/sqlite/",
             "runs": [
               {
-                "median_ns": 149405.80067109302,
+                "step": 2,
+                "median_ns": 142386.99294532626,
                 "median_ci95_ns": [
-                  144552.40937223696,
-                  153972.65160523186
-                ]
+                  141870.57387057386,
+                  143934.8824786325
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "067df385c33dedbb66fb0a339319136ff5d1d01c25cc43c8199c3174d8fe2010",
+                  "estimates": "839ae343763ca1dde0a78dcb483fb84dddb2a9406a83c6b3fc03780b7c16325c",
+                  "sample": "b1db8f792fa035bd979852e88ff800b267fcb9da57c372050a8c26f9f6724411"
+                }
               },
               {
-                "median_ns": 151759.88095238095,
+                "step": 3,
+                "median_ns": 142753.01239669422,
                 "median_ci95_ns": [
-                  148697.906940554,
-                  157359.8935786436
-                ]
+                  141539.10533910536,
+                  144012.5337730451
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "067df385c33dedbb66fb0a339319136ff5d1d01c25cc43c8199c3174d8fe2010",
+                  "estimates": "2b27eb62a021fa445d4025eeb80f8ee4bc0e3f593c0db38e3688c1f9454fdc83",
+                  "sample": "ab94339dd2a2fbcc7d65cd01ba4321cf99349be9bda3c272e65e3102919f6e7c"
+                }
               },
               {
-                "median_ns": 149518.00492610838,
+                "step": 5,
+                "median_ns": 149186.9224219799,
                 "median_ci95_ns": [
-                  145217.2193877551,
-                  153314.52380952382
-                ]
+                  146012.10792131844,
+                  151209.8598783695
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "067df385c33dedbb66fb0a339319136ff5d1d01c25cc43c8199c3174d8fe2010",
+                  "estimates": "08bcb91c82a1362c278c258db65d5de61f9c9b27302ce64663d5d1fae1a92406",
+                  "sample": "4f6840a2ecfe92fc18853343be69cf7995cbfb40e09ac541bed113674a72bb67"
+                }
               },
               {
-                "median_ns": 151202.12049147842,
+                "step": 8,
+                "median_ns": 151902.59545259544,
                 "median_ci95_ns": [
-                  148716.97612732096,
-                  153265.59561128527
-                ]
+                  150247.52252252251,
+                  154451.59266409266
+                ],
+                "sample_count": 30,
+                "raw_sha256": {
+                  "benchmark": "067df385c33dedbb66fb0a339319136ff5d1d01c25cc43c8199c3174d8fe2010",
+                  "estimates": "4a963bfe01d2015100c18236341ddaadb6bf35ceeebfd01516ddd527fb532abf",
+                  "sample": "a9b21b6fceea4c490be00a5772e15cf7d8ca0f6c9471c313b385be0c01757347"
+                }
               }
             ],
-            "reference_drift_percent": 1.202309289409631,
-            "candidate_drift_percent": -1.4772520986465643,
-            "change_from_reference_percent": 0.22286994744746824
+            "median_range_ns": [
+              142386.99294532626,
+              151902.59545259544
+            ],
+            "relative_range_percent": 6.492748748004237,
+            "first_to_last_drift_percent": 6.682915560217628,
+            "block_drift_percent": [
+              0.2570596118344204,
+              1.8203157398301917
+            ],
+            "range_exceeds_5_percent": true,
+            "absolute_drift_exceeds_5_percent": true
           }
-        }
+        },
+        "chronological_sqlite_over_citadel": [
+          6.0699490052705105,
+          5.747025653713767,
+          5.844495238743668,
+          6.122597405185766
+        ]
       }
     },
     {
@@ -6928,6 +7940,230 @@
           "finished_utc": "2026-09-20T17:50:24.763831+00:00",
           "receipt_sha256": "38ea91891da119d50724516afe22db8a59640a9a52b613c3e4e5c4090d2a840d",
           "result_sha256": "8e35cbd573027e50783efb9044e53e80263ad86f08bfb62df80f06369e955e20"
+        }
+      ]
+    },
+    "sql-engines-20260927-main": {
+      "kind": "engine_comparison",
+      "source": "selected_0dbe126c",
+      "plan_sha256": "3bd46b7276cbfe3c7565cdd6972e6cd45bb364d43f43c242452a52dc3d29bd00",
+      "complete_sha256": "8245795cac48430e8480260abda0b8e2276d4635121ebdedae9a60aa14e3c18a",
+      "summary_sha256": "2ed806bd472b47e2b112576144c8c89043e9bd77f09f78f04d9d23e3c7c04da0",
+      "build_record_sha256": "131f5ff6291be329487748433e9ed0a6ba1ae01d561a957fd65d5fd11b86a3ec",
+      "measurement": {
+        "measured_on": "2026-09-27",
+        "passes": 4,
+        "samples_per_pass": 30,
+        "warmup_seconds": 3,
+        "measurement_target_seconds": 8,
+        "logical_processor": 0,
+        "comparison_order": [
+          "citadel",
+          "sqlite",
+          "sqlite",
+          "citadel",
+          "sqlite",
+          "citadel",
+          "citadel",
+          "sqlite"
+        ],
+        "statistic": "Arithmetic mean of all four per-engine run medians, in nanoseconds.",
+        "uncertainty": "Four original Criterion median intervals per engine; no pooled interval. Range and drift flags above 5 percent are descriptive and never exclude a run."
+      },
+      "criterion_ids": [
+        "correlated_exists/citadel/",
+        "correlated_exists/sqlite/",
+        "correlated_scalar/citadel/",
+        "correlated_scalar/sqlite/",
+        "full_outer_join/citadel/",
+        "full_outer_join/sqlite/",
+        "group_by/citadel/",
+        "group_by/sqlite/",
+        "join/citadel/",
+        "join/sqlite/",
+        "join_param/citadel/",
+        "join_param/sqlite/",
+        "sum/citadel/",
+        "sum/sqlite/",
+        "update/citadel/",
+        "update/sqlite/",
+        "update_gen_propagate/citadel/",
+        "update_gen_propagate/sqlite/",
+        "update_returning/citadel/",
+        "update_returning/sqlite/",
+        "upsert_counter/citadel/",
+        "upsert_counter/sqlite/",
+        "upsert_mixed/citadel/",
+        "upsert_mixed/sqlite/",
+        "upsert_returning/citadel/",
+        "upsert_returning/sqlite/",
+        "window_agg/citadel/",
+        "window_agg/sqlite/",
+        "window_rank/citadel/",
+        "window_rank/sqlite/"
+      ],
+      "jobs": [
+        {
+          "step": 1,
+          "engine": "citadel",
+          "started_utc": "2026-09-27T18:14:35.807161+00:00",
+          "finished_utc": "2026-09-27T18:18:22.845498+00:00",
+          "receipt_sha256": "93db53dc552eb0a1ace058abf645ce52a5655b7a9b8295314d2483c5c11a692b",
+          "result_sha256": "e78cc171819ad3954b6761e88bea07af2cda81bb3bda961df036a188c41c1e40"
+        },
+        {
+          "step": 2,
+          "engine": "sqlite",
+          "started_utc": "2026-09-27T18:18:23.344846+00:00",
+          "finished_utc": "2026-09-27T18:22:32.091558+00:00",
+          "receipt_sha256": "3bbea03c6b09167cec5294b748c7f4a1efb582f9e70a177c348ca76ea68ec58e",
+          "result_sha256": "0dd8dda52e56e7de5c179fe700b8e97dbe4ba99e9121213f13ffbdeb1f95bd64"
+        },
+        {
+          "step": 3,
+          "engine": "sqlite",
+          "started_utc": "2026-09-27T18:22:32.585699+00:00",
+          "finished_utc": "2026-09-27T18:26:41.070294+00:00",
+          "receipt_sha256": "3d127be11e4b89e55515f76a4fc4228a9cce5d65868c00c7fef163b95fd209c5",
+          "result_sha256": "be662183b6f8a52ea61a9bb7be0aa4c6dddc8e71b92f841234bedcd19b6c2ca1"
+        },
+        {
+          "step": 4,
+          "engine": "citadel",
+          "started_utc": "2026-09-27T18:26:41.525900+00:00",
+          "finished_utc": "2026-09-27T18:30:31.996323+00:00",
+          "receipt_sha256": "8b68301b318b1975dc37927a51ccacf82c7b584d04b6ac706092941e2f76e414",
+          "result_sha256": "f9300d200cbed6811802739dfa7053b8258219b2c8a5ceca39a1baa76626d4a1"
+        },
+        {
+          "step": 5,
+          "engine": "sqlite",
+          "started_utc": "2026-09-27T18:30:32.472905+00:00",
+          "finished_utc": "2026-09-27T18:34:39.633824+00:00",
+          "receipt_sha256": "edb9ff13bca7c1dc88298a08a37b0559cf474b6e7f9ea62aa541f1a7ee889a9a",
+          "result_sha256": "accc74f6b98cc15af8416ee9a386e50cddd247f06a1179ad522ea66c98865d18"
+        },
+        {
+          "step": 6,
+          "engine": "citadel",
+          "started_utc": "2026-09-27T18:34:40.169132+00:00",
+          "finished_utc": "2026-09-27T18:38:31.774463+00:00",
+          "receipt_sha256": "428b3aa9ccedf0b82232254b7d76c137f46c00ca30cf8f6e0874af54fbd6ea43",
+          "result_sha256": "3328e39da19eb8d80494d6b9740b4c48c9c578ec7f7562ce0e52aa162fc6cfa5"
+        },
+        {
+          "step": 7,
+          "engine": "citadel",
+          "started_utc": "2026-09-27T18:38:32.260570+00:00",
+          "finished_utc": "2026-09-27T18:42:15.468400+00:00",
+          "receipt_sha256": "6fca2fde7af1a6fa76f745b27997342504ac1649c8e408edd5cb29376845b5ea",
+          "result_sha256": "374265de5689b2ee4c2ab2576a3ddc024c5af20e14ef982887c796951f95557d"
+        },
+        {
+          "step": 8,
+          "engine": "sqlite",
+          "started_utc": "2026-09-27T18:42:15.988484+00:00",
+          "finished_utc": "2026-09-27T18:46:24.661133+00:00",
+          "receipt_sha256": "52990fd162dc1e54826d1868eeb9fafb6c7e81153ea3e718affc6a56bbff5f94",
+          "result_sha256": "385918e325051c9ccc10c3e491e0c0461e5a4f23548a4f5d79873b399a7d6314"
+        }
+      ]
+    },
+    "sql-engines-20260927-correlated_in": {
+      "kind": "engine_comparison",
+      "source": "selected_0dbe126c",
+      "plan_sha256": "109af27d2d299e1b6eda4955af19acbb2dbf19732d86eb7967296034669ca77b",
+      "complete_sha256": "9abf7cac6f200c7c40928e84ea1464b04e1067c445798b67217e1c155287b211",
+      "summary_sha256": "3cef591ab4cd670dc0c24d4310c8e6bbc4ee6cf2d583896e3dcc1a61be8c0774",
+      "build_record_sha256": "131f5ff6291be329487748433e9ed0a6ba1ae01d561a957fd65d5fd11b86a3ec",
+      "measurement": {
+        "measured_on": "2026-09-27",
+        "passes": 4,
+        "samples_per_pass": 30,
+        "warmup_seconds": 3,
+        "measurement_target_seconds": 8,
+        "logical_processor": 0,
+        "comparison_order": [
+          "citadel",
+          "sqlite",
+          "sqlite",
+          "citadel",
+          "sqlite",
+          "citadel",
+          "citadel",
+          "sqlite"
+        ],
+        "statistic": "Arithmetic mean of all four per-engine run medians, in nanoseconds.",
+        "uncertainty": "Four original Criterion median intervals per engine; no pooled interval. Range and drift flags above 5 percent are descriptive and never exclude a run."
+      },
+      "criterion_ids": [
+        "correlated_in/citadel/",
+        "correlated_in/sqlite/"
+      ],
+      "jobs": [
+        {
+          "step": 1,
+          "engine": "citadel",
+          "started_utc": "2026-09-27T18:46:40.568835+00:00",
+          "finished_utc": "2026-09-27T18:47:29.594019+00:00",
+          "receipt_sha256": "6410af1c2b5afe0d09a4d336f4cd2a616ed09ed83665067f0af6faaf083eb2f1",
+          "result_sha256": "a307f825969925957c6be4d51fd23c6f5f27cfc362e014395b6c4b3fbaefec6f"
+        },
+        {
+          "step": 2,
+          "engine": "sqlite",
+          "started_utc": "2026-09-27T18:47:30.111460+00:00",
+          "finished_utc": "2026-09-27T18:49:39.864790+00:00",
+          "receipt_sha256": "09df45995c416eb68f786fd9957b15744dd573f433d2b39033f1f1db38ca6112",
+          "result_sha256": "5c61c83fe33853af1cdb5215b8f40b745ee7b909c435422c1b0ba523829a9f8a"
+        },
+        {
+          "step": 3,
+          "engine": "sqlite",
+          "started_utc": "2026-09-27T18:49:40.359273+00:00",
+          "finished_utc": "2026-09-27T18:51:48.393318+00:00",
+          "receipt_sha256": "81ed0326f3202f84ac1a6f1a1a88860a6b775652049cd190260645fb0f84282f",
+          "result_sha256": "657f16d20978579d2dbd89889398fa26f401d42167656f4fb5df3b5d2a6bbfb8"
+        },
+        {
+          "step": 4,
+          "engine": "citadel",
+          "started_utc": "2026-09-27T18:51:48.904467+00:00",
+          "finished_utc": "2026-09-27T18:52:35.952894+00:00",
+          "receipt_sha256": "1d8504a96980e0ba62487eb68e4117f4ba8b807c9955b925447694875a85241c",
+          "result_sha256": "caf2a9f09b22aa08c09eda92b95b823357fa675d89f78d18e1e5618c58319f14"
+        },
+        {
+          "step": 5,
+          "engine": "sqlite",
+          "started_utc": "2026-09-27T18:52:36.419412+00:00",
+          "finished_utc": "2026-09-27T18:54:42.816534+00:00",
+          "receipt_sha256": "dae8628eb2762f227c3b237666e65096d44acaa3d9fffa9528ec3962826401c3",
+          "result_sha256": "931e168b654e616a9fcc3dd2580e5ec79ad2acac03a44bb5c301448bb189ef82"
+        },
+        {
+          "step": 6,
+          "engine": "citadel",
+          "started_utc": "2026-09-27T18:54:43.306096+00:00",
+          "finished_utc": "2026-09-27T18:55:30.548541+00:00",
+          "receipt_sha256": "9f0a3fe8af52fdb89c3dca9f9d3361b249c438af0ce3ee98b5c8a3533500d636",
+          "result_sha256": "c10fd8d41ab6c4a206d635c73ac9083d9eba5228509bcdb1a7fb28b36aca5121"
+        },
+        {
+          "step": 7,
+          "engine": "citadel",
+          "started_utc": "2026-09-27T18:55:31.045515+00:00",
+          "finished_utc": "2026-09-27T18:56:18.496410+00:00",
+          "receipt_sha256": "dbbfe0e7171628785122003db1b6013f0afc946a7eed4155897b36b4fce289ec",
+          "result_sha256": "1ff630446b3102dc8384b8c2385bf6663a409814e2c1a7883dcb462d457d33f7"
+        },
+        {
+          "step": 8,
+          "engine": "sqlite",
+          "started_utc": "2026-09-27T18:56:18.969576+00:00",
+          "finished_utc": "2026-09-27T18:58:25.477407+00:00",
+          "receipt_sha256": "81f23385324005bd3bb046bad6d586ffcc2709f4284508ee11eea5b1fd17323f",
+          "result_sha256": "48fd82a602e2b7c47230c4d5b017077d985b9b0fcc717ffd9f2c96c05f5035a7"
         }
       ]
     }
