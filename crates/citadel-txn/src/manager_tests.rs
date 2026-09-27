@@ -4,6 +4,20 @@ use citadel_crypto::hkdf_utils::derive_keys_from_rek;
 use citadel_crypto::page_cipher::compute_dek_id;
 use std::sync::Mutex as StdMutex;
 
+std::thread_local! {
+    static BEFORE_WRITER_EXCLUSION: std::cell::RefCell<
+        Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>
+    > = const { std::cell::RefCell::new(None) };
+}
+
+pub(super) fn pause_before_writer_exclusion() {
+    let pause = BEFORE_WRITER_EXCLUSION.with(|slot| slot.borrow_mut().take());
+    if let Some((entered, resume)) = pause {
+        entered.wait();
+        resume.wait();
+    }
+}
+
 #[cfg(feature = "parallel")]
 #[path = "manager_parallel_tests.rs"]
 mod parallel_commit_batches;

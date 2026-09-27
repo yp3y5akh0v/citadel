@@ -741,15 +741,22 @@ impl TxnManager {
     }
 
     fn begin_write_inner(&self, expected_generation: Option<u64>) -> Result<Option<WriteTxn<'_>>> {
-        if self.reopen_required.load(Ordering::Acquire) {
-            return Err(Error::ReopenRequired);
-        }
+        #[cfg(test)]
+        tests::pause_before_writer_exclusion();
         if self
             .write_active
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
         {
             return Err(Error::WriteTransactionActive);
+        }
+
+        // A previous writer can fail its final sync immediately before this
+        // acquisition. Inspect the latch while holding writer exclusion, so
+        // no failed commit can publish it between admission and acquisition.
+        if self.reopen_required.load(Ordering::Acquire) {
+            self.write_active.store(false, Ordering::SeqCst);
+            return Err(Error::ReopenRequired);
         }
 
         if expected_generation

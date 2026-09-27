@@ -666,6 +666,49 @@ fn full_sync_selector_failure_keeps_recovery_armed_and_refuses_writers() {
     commit(&reopened, failed.next_txn()).unwrap();
 }
 
+#[test]
+fn a_writer_waiting_before_exclusion_observes_a_failed_full_sync() {
+    // Exercise both public writer entrypoints with a contender paused between
+    // the old admission check and acquisition of single-writer exclusion.
+    for conditional in [false, true] {
+        let scenario = scenario(SyncMode::Full, 0xFA11);
+        let txns = workload(scenario.seed, scenario.txns);
+        let (io, acked) = run(&scenario, &txns[..4], None);
+        let (dek, mac_key, _) = test_keys();
+        let mgr = TxnManager::open_with_sync(
+            Box::new(io.clone()), dek, mac_key, 1, 64, SyncMode::Full,
+        )
+        .unwrap();
+        let expected_generation = mgr.commit_generation();
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        std::thread::scope(|scope| {
+            let contender = scope.spawn(|| {
+                BEFORE_WRITER_EXCLUSION.with(|slot| {
+                    *slot.borrow_mut() = Some((Arc::clone(&entered), Arc::clone(&resume)));
+                });
+                if conditional {
+                    mgr.begin_write_if_generation(expected_generation).map(drop)
+                } else {
+                    mgr.begin_write().map(drop)
+                }
+            });
+            entered.wait();
+            io.fail_sync(1, SyncFault::Dropped);
+            let commit_failed = commit(&mgr, &txns[acked]).is_err();
+            resume.wait();
+            let result = contender.join().unwrap();
+            assert!(commit_failed);
+            assert!(mgr.reopen_required.load(Ordering::Acquire));
+            assert!(
+                matches!(result, Err(Error::ReopenRequired)),
+                "conditional={conditional}: contender returned {result:?}"
+            );
+            assert!(!mgr.write_active.load(Ordering::SeqCst));
+        });
+    }
+}
+
 /// A failed sync is followed by another commit that loses power at its first
 /// sync. After an unconfirmed Full flip the disk may select the failed commit,
 /// whose pages that next commit would reuse.
