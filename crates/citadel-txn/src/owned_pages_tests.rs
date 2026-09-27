@@ -65,6 +65,24 @@ fn discard_does_not_clone_a_shared_page() {
 }
 
 #[test]
+fn snapshot_shares_allocations_and_survives_same_id_mutation_and_discard() {
+    let mut pages = OwnedPages::default();
+    pages.insert_page(PageId(1), page(1));
+    let snapshot = pages.snapshot();
+    assert!(Arc::ptr_eq(
+        snapshot.get(&PageId(1)).unwrap(),
+        pages.get_shared(&PageId(1)).unwrap(),
+    ));
+    pages.get_page_mut(&PageId(1)).unwrap().data[200] = 0x5a;
+    assert_eq!(snapshot[&PageId(1)].data[200], 0);
+    assert_eq!(pages.get_page(&PageId(1)).unwrap().data[200], 0x5a);
+    pages.remove_page(&PageId(1));
+    pages.insert_page(PageId(1), page(1));
+    pages.get_page_mut(&PageId(1)).unwrap().data[200] = 0xa5;
+    assert_eq!(snapshot[&PageId(1)].data[200], 0);
+}
+
+#[test]
 fn unique_old_generation_requires_physical_cow_but_current_generation_does_not() {
     use citadel_buffer::allocator::PageAllocator;
     use citadel_buffer::btree;

@@ -19,6 +19,19 @@ use crate::overflow_io;
 use crate::range_scan::{self, LeafLoader};
 use crate::ReadBudget;
 
+#[path = "read_view.rs"]
+mod view;
+pub use view::{ReadView, StatementReadTxn};
+
+/// Effective roots captured before a writer resumes mutation. The committed
+/// slot remains separate: it pins and bounds only the disk-backed fallback.
+pub(crate) struct PendingReadRoots {
+    pub tree_root: PageId,
+    pub tree_entries: u64,
+    pub catalog_root: PageId,
+    pub named_trees: FxHashMap<Vec<u8>, TableDescriptor>,
+}
+
 struct ReadPages<'a> {
     cache: &'a mut FxHashMap<PageId, Arc<Page>>,
     manager: &'a TxnManager,
@@ -373,6 +386,9 @@ pub struct ReadTxn<'a> {
     resolved_catalog: Arc<ResolvedCatalog>,
     commit_generation: u64,
     page_cache: FxHashMap<PageId, Arc<Page>>,
+    /// Present only inside `StatementReadTxn`, which never exposes this reader
+    /// as a committed transaction or an authenticated commit/proof source.
+    pending: Option<Box<PendingReadRoots>>,
     /// Exact catalog resolutions for this immutable snapshot. Commit-slot
     /// entries are keyed by a 32-bit hash, so a slot root is trusted only
     /// after this cache has proved the requested name itself is live.
@@ -400,6 +416,7 @@ impl<'db> ReadTxn<'db> {
             resolved_catalog,
             commit_generation,
             page_cache: FxHashMap::default(),
+            pending: None,
             resolved_tables: FxHashMap::default(),
             scan_measurements: manager
                 .active_scan_measurements()
@@ -409,6 +426,43 @@ impl<'db> ReadTxn<'db> {
             cancel: None,
             read_budget: None,
         }
+    }
+
+    pub(crate) fn into_statement_snapshot(
+        mut self,
+        roots: PendingReadRoots,
+        pages: FxHashMap<PageId, Arc<Page>>,
+        cancel: Option<CancelToken>,
+        budget: Option<ReadBudget>,
+    ) -> StatementReadTxn<'db> {
+        self.pending = Some(Box::new(roots));
+        self.page_cache = pages;
+        // A writer's descriptors must never populate the committed catalog's
+        // shared resolution cache, even if its catalog root has not moved.
+        self.resolved_catalog = Arc::new(ResolvedCatalog::default());
+        self.cancel = cancel;
+        self.read_budget = budget;
+        StatementReadTxn::new(self)
+    }
+
+    fn data_root(&self) -> PageId {
+        self.pending
+            .as_ref()
+            .map_or(self.snapshot.tree_root, |roots| roots.tree_root)
+    }
+
+    fn catalog_root(&self) -> PageId {
+        self.pending
+            .as_ref()
+            .map_or(self.snapshot.catalog_root, |roots| roots.catalog_root)
+    }
+
+    fn fetch_snapshot_page(&self, id: PageId) -> Result<Arc<Page>> {
+        if let Some(page) = self.page_cache.get(&id) {
+            return Ok(Arc::clone(page));
+        }
+        self.manager
+            .fetch_reachable_page(id, self.snapshot.high_water_mark, self.snapshot.txn_id)
     }
 
     pub fn set_cancel(&mut self, token: Option<CancelToken>) {
@@ -503,7 +557,9 @@ impl<'db> ReadTxn<'db> {
     }
 
     pub fn entry_count(&self) -> u64 {
-        self.snapshot.tree_entries
+        self.pending
+            .as_ref()
+            .map_or(self.snapshot.tree_entries, |roots| roots.tree_entries)
     }
 
     /// Metadata protected by this transaction's reader registration.
@@ -643,7 +699,7 @@ impl<'db> ReadTxn<'db> {
 
     pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         self.check_cancel()?;
-        let value = self.search_tree(self.snapshot.tree_root, key)?;
+        let value = self.search_tree(self.data_root(), key)?;
         self.check_cancel()?;
         Ok(value)
     }
@@ -657,7 +713,7 @@ impl<'db> ReadTxn<'db> {
         F: FnMut(&[u8], &[u8]) -> Result<()>,
     {
         self.check_cancel()?;
-        let root = self.snapshot.tree_root;
+        let root = self.data_root();
         self.preload_all_pages(root)?;
         let measurements = self.captured_scan_measurements();
         let mut count = ScanCount::with_measurements(self.manager, measurements);
@@ -690,6 +746,25 @@ impl<'db> ReadTxn<'db> {
     }
 
     fn materialize_overflow(&mut self, oref: &OverflowRef) -> Result<Vec<u8>> {
+        if self.pending.is_some() {
+            let mut view = StreamingReadPages {
+                cache: &self.page_cache,
+                manager: self.manager,
+                high_water_mark: self.snapshot.high_water_mark,
+                snapshot_txn_id: self.snapshot.txn_id,
+                current: None,
+                cached_leaves: Vec::new(),
+            };
+            // Pending overflow pages have not passed commit-time Merkle
+            // finalization. Read them with the writer's validated chain walk;
+            // uncaptured disk pages still use the pinned committed bounds.
+            return overflow_io::read_chain_value_with_budget(
+                &mut view,
+                oref,
+                self.cancel.as_ref(),
+                self.read_budget.as_ref(),
+            );
+        }
         self.read_reachable_overflow_value(oref)
     }
 
@@ -918,7 +993,11 @@ impl<'db> ReadTxn<'db> {
         let measurements = self.captured_scan_measurements();
         LeafShardScanner {
             manager: self.manager,
-            cache: FxHashMap::default(),
+            cache: if self.pending.is_some() {
+                self.page_cache.clone()
+            } else {
+                FxHashMap::default()
+            },
             measurements,
             high_water_mark: self.snapshot.high_water_mark,
             snapshot_txn_id: self.snapshot.txn_id,
@@ -977,6 +1056,17 @@ impl<'db> ReadTxn<'db> {
     fn lookup_table_uncached(&self, name: &[u8]) -> Result<TableDescriptor> {
         self.check_cancel()?;
 
+        // Creation and rename do not serialize their catalog descriptors until
+        // commit. This exact-name map also carries current roots/counts for
+        // loaded tables whose catalog descriptors are intentionally stale.
+        if let Some(desc) = self
+            .pending
+            .as_ref()
+            .and_then(|roots| roots.named_trees.get(name))
+        {
+            return Ok(desc.clone());
+        }
+
         let mut desc = self
             .resolved_catalog
             .resolve(name, || self.read_catalog_descriptor(name))?;
@@ -999,7 +1089,7 @@ impl<'db> ReadTxn<'db> {
     }
 
     fn read_catalog_descriptor(&self, name: &[u8]) -> Result<TableDescriptor> {
-        let catalog_root = self.snapshot.catalog_root;
+        let catalog_root = self.catalog_root();
         if !catalog_root.is_valid() {
             return Err(Error::TableNotFound(
                 String::from_utf8_lossy(name).into_owned(),
@@ -1010,11 +1100,7 @@ impl<'db> ReadTxn<'db> {
         let mut descent = DescentGuard::new(catalog_root);
         let descriptor = loop {
             self.check_cancel()?;
-            let page = self.manager.fetch_reachable_page(
-                current,
-                self.snapshot.high_water_mark,
-                self.snapshot.txn_id,
-            )?;
+            let page = self.fetch_snapshot_page(current)?;
             self.check_cancel()?;
             match page.page_type() {
                 Some(PageType::Leaf) => {
@@ -1230,3 +1316,7 @@ mod tests;
 #[cfg(test)]
 #[path = "read_txn_stream_tests.rs"]
 mod stream_tests;
+
+#[cfg(test)]
+#[path = "statement_read_tests.rs"]
+mod statement_tests;
