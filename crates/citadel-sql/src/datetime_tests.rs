@@ -113,6 +113,96 @@ fn hmsn_roundtrip() {
 }
 
 #[test]
+fn timestamp_arithmetic_checks_the_complete_finite_result() {
+    for timestamp in [i64::MIN + 1, -1, 0, i64::MAX - 1] {
+        assert_eq!(
+            add_interval_to_timestamp(timestamp, 0, 0, 0).unwrap(),
+            timestamp
+        );
+        // A day and its opposite time cancel even when the intermediate
+        // midnight or next day is outside the timestamp range.
+        for days in [-1, 1] {
+            assert_eq!(
+                add_interval_to_timestamp(timestamp, 0, days, -i64::from(days) * MICROS_PER_DAY)
+                    .unwrap(),
+                timestamp
+            );
+        }
+    }
+    for (timestamp, shift) in [(i64::MIN + 1, -1), (i64::MAX - 1, 1)] {
+        assert!(matches!(
+            add_interval_to_timestamp(timestamp, 0, 0, shift),
+            Err(SqlError::InvalidValue(message)) if message == "timestamp out of range"
+        ));
+    }
+}
+
+#[test]
+fn timestamp_composition_preserves_finite_endpoints_and_rejects_infinity() {
+    for timestamp in [i64::MIN + 1, -1, 0, i64::MAX - 1] {
+        let (date, time) = ts_split(timestamp);
+        assert_eq!(ts_combine(date, time).unwrap(), timestamp);
+    }
+    for timestamp in [i64::MIN, i64::MAX] {
+        let (date, time) = ts_split(timestamp);
+        assert!(matches!(
+            ts_combine(date, time),
+            Err(SqlError::InvalidValue(message)) if message == "timestamp out of range"
+        ));
+    }
+    for date in [i32::MIN, i32::MAX] {
+        assert!(matches!(
+            ts_combine(date, 0),
+            Err(SqlError::InvalidValue(message)) if message == "timestamp out of range"
+        ));
+    }
+}
+
+#[test]
+fn timestamp_truncation_checks_the_complete_finite_result() {
+    for timestamp in [
+        i64::MIN + 1,
+        -9_223_372_036_854_000_000,
+        -1,
+        0,
+        i64::MAX - 1,
+    ] {
+        for (unit, quantum) in [
+            ("microseconds", 1),
+            ("milliseconds", 1_000),
+            ("second", MICROS_PER_SEC),
+            ("minute", MICROS_PER_MIN),
+            ("hour", MICROS_PER_HOUR),
+            ("day", MICROS_PER_DAY),
+        ] {
+            let expected =
+                i128::from(timestamp).div_euclid(i128::from(quantum)) * i128::from(quantum);
+            let actual = date_trunc(unit, &Value::Timestamp(timestamp));
+            match i64::try_from(expected)
+                .ok()
+                .filter(|ts| !is_infinity_ts(*ts))
+            {
+                Some(expected) => assert_eq!(
+                    actual.unwrap(),
+                    Value::Timestamp(expected),
+                    "{unit} of {timestamp}"
+                ),
+                None => assert!(
+                    matches!(actual, Err(SqlError::InvalidValue(message)) if message == "timestamp out of range"),
+                    "{unit} of {timestamp}"
+                ),
+            }
+        }
+    }
+    for unit in ["week", "month", "year", "decade", "century", "millennium"] {
+        assert!(matches!(
+            date_trunc(unit, &Value::Timestamp(i64::MIN + 1)),
+            Err(SqlError::InvalidValue(message)) if message == "timestamp out of range"
+        ));
+    }
+}
+
+#[test]
 fn time_upper_bound_inclusive() {
     assert_eq!(hmsn_to_micros(24, 0, 0, 0), Some(MICROS_PER_DAY));
     assert_eq!(hmsn_to_micros(24, 0, 0, 1), None);
