@@ -184,7 +184,13 @@ impl<'a> ConflictUpdates<'a> {
             count: 0,
             root: true,
         };
-        let mut result = run(wtx, self.schema, operation, &mut self.no_action_checks)?;
+        let mut result = run(
+            wtx,
+            self.schema,
+            operation,
+            &mut self.no_action_checks,
+            None,
+        )?;
         if !capture {
             return Ok(None);
         }
@@ -245,17 +251,19 @@ enum Work<'a> {
     ForeignKeys(ParentChange<'a>, usize),
 }
 
-/// `bind` gives each row its own SET expressions when their subqueries read
-/// the row. Every row's values are computed before any row changes.
+/// `bind` computes the initial SET values before mutation. `refresh_bound`
+/// permits rebinding a row changed by an earlier trigger or cascade when the
+/// binder retains a stable snapshot for its closed subqueries.
 pub(super) fn update_rows(
     wtx: &mut WriteTxn<'_>,
     schema: &SchemaManager,
     table: &TableSchema,
     stmt: &UpdateStmt,
     rows: Vec<KeyedRow>,
-    bind: Option<&mut BindRow<'_>>,
+    mut bind: Option<&mut BindRow<'_>>,
+    refresh_bound: bool,
 ) -> Result<ExecutionResult> {
-    let change = match bind {
+    let change = match bind.as_deref_mut() {
         Some(bind) => Change::AssignBound(&stmt.assignments, bind),
         None => Change::Assign(&stmt.assignments),
     };
@@ -269,7 +277,13 @@ pub(super) fn update_rows(
         true,
     )?;
     let mut checks = Vec::new();
-    let result = run(wtx, schema, operation, &mut checks)?;
+    let result = run(
+        wtx,
+        schema,
+        operation,
+        &mut checks,
+        if refresh_bound { bind } else { None },
+    )?;
     check_no_action(wtx, schema, checks)?;
     result.project(table, stmt.returning.as_deref(), wtx.cancel_token())
 }
@@ -291,7 +305,7 @@ pub(super) fn delete_rows(
         true,
     )?;
     let mut checks = Vec::new();
-    let result = run(wtx, schema, operation, &mut checks)?;
+    let result = run(wtx, schema, operation, &mut checks, None)?;
     check_no_action(wtx, schema, checks)?;
     result.project(table, returning.as_deref(), wtx.cancel_token())
 }
@@ -705,6 +719,7 @@ fn run<'a>(
     schema: &'a SchemaManager,
     operation: Operation<'a>,
     no_action_checks: &mut Vec<NoActionCheck<'a>>,
+    mut refresh_bound: Option<&mut BindRow<'_>>,
 ) -> Result<MutationResult> {
     let mut work = vec![Work::Row(operation)];
     let mut completed = None;
@@ -746,11 +761,22 @@ fn run<'a>(
                                     ))
                                 }
                                 Mutation::BoundUpdate => {
-                                    return Err(SqlError::Unsupported(
-                                        "SET subqueries that read the row, for a row a cascade \
-                                         or trigger changed earlier in the same UPDATE"
-                                            .into(),
-                                    ))
+                                    let Some(bind) =
+                                        refresh_bound.as_deref_mut().filter(|_| operation.root)
+                                    else {
+                                        return Err(SqlError::Unsupported(
+                                            "SET subqueries that read the row, for a row a cascade \
+                                             or trigger changed earlier in the same UPDATE"
+                                                .into(),
+                                        ));
+                                    };
+                                    let assignments = bind(wtx, &current)?;
+                                    Some(evaluate_update(
+                                        operation.table,
+                                        &assignments,
+                                        &current,
+                                        wtx.cancel_token(),
+                                    )?)
                                 }
                             };
                             row.old = current;

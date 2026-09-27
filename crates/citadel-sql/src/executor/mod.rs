@@ -44,7 +44,7 @@ use write::*;
 
 use citadel::Database;
 use citadel_txn::manager::ScanMeasurement;
-use citadel_txn::read_txn::ReadTxn;
+use citadel_txn::read_txn::ReadView;
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
 
@@ -320,6 +320,7 @@ pub(super) struct SelectCtx<'a> {
     /// no-op rather than a second evaluation of the same predicate.
     pub predicate_applied: bool,
     pub cancel: Option<&'a citadel::CancelToken>,
+    pub resolver: Option<&'a dyn crate::eval::InputResolver>,
 }
 
 impl<'a> SelectCtx<'a> {
@@ -336,6 +337,7 @@ impl<'a> SelectCtx<'a> {
             stmt,
             predicate_applied: false,
             cancel,
+            resolver: None,
         }
     }
 
@@ -347,6 +349,11 @@ impl<'a> SelectCtx<'a> {
 
     pub fn row_width(mut self, width: usize) -> Self {
         self.row_width = width;
+        self
+    }
+
+    pub fn with_resolver(mut self, resolver: Option<&'a dyn crate::eval::InputResolver>) -> Self {
+        self.resolver = resolver;
         self
     }
 
@@ -553,7 +560,7 @@ pub(crate) fn execute_with_admitted_read(
     guard_legacy_volatile_schema(schema, stmt)?;
     check_cancelled(rtx.cancel_token())?;
     match stmt {
-        Statement::Select(sq) => cte::exec_select_query_with_read(rtx, schema, sq),
+        Statement::Select(sq) => cte::exec_select_query_with_read(&mut rtx.view(), schema, sq),
         Statement::Explain { inner, analyze } => {
             if *analyze && stmt_mutates(inner) {
                 return Err(SqlError::Unsupported(
@@ -826,7 +833,7 @@ fn materialized_source(
 }
 
 pub(super) fn scan_table_with_read_or_view(
-    rtx: &mut ReadTxn<'_>,
+    rtx: &mut ReadView<'_, '_>,
     schema: &SchemaManager,
     name: &str,
 ) -> Result<(TableSchema, Vec<Vec<Value>>)> {
@@ -939,10 +946,14 @@ impl JoinSources {
 
     /// Join the sources in order. Returns the rows and the columns that
     /// describe them.
-    pub(super) fn join(
+    fn join(
         self,
         stmt: &SelectStmt,
+        schema: &SchemaManager,
+        ctes: &CteContext,
+        outer: &OuterScope,
         cancel: Option<&citadel::CancelToken>,
+        exec_sub: &mut dyn FnMut(&SelectStmt) -> Result<CteRows>,
     ) -> Result<(Vec<Vec<Value>>, Vec<ColumnDef>)> {
         let JoinSources {
             names,
@@ -968,19 +979,56 @@ impl JoinSources {
             };
             let inner_col_count = inner_schema.columns.len();
 
+            let expressions = join
+                .on_clause
+                .as_ref()
+                .filter(|condition| dml::has_conditional_subquery(condition))
+                .map(|condition| {
+                    correlated::RowExpressions::new(
+                        schema,
+                        ctes,
+                        vec![condition.clone()],
+                        outer.clone(),
+                        combined_cols.len(),
+                        cancel,
+                    )
+                })
+                .transpose()?;
+            let rewritten;
+            let join = match &expressions {
+                Some(expressions) => {
+                    rewritten = JoinClause {
+                        on_clause: Some(expressions.expressions[0].clone()),
+                        ..join.clone()
+                    };
+                    &rewritten
+                }
+                None => join,
+            };
             let equi = compute_equi_join_meta(join, &combined_cols, outer_col_count);
-            outer_rows = exec_join_step(
-                outer_rows,
-                &mut inner_rows,
-                join,
-                &combined_cols,
-                outer_col_count,
-                inner_col_count,
-                None,
-                None,
-                &equi,
-                cancel,
-            )?;
+            let run = |resolver: Option<&dyn crate::eval::InputResolver>| {
+                exec_join_step(
+                    outer_rows,
+                    &mut inner_rows,
+                    join,
+                    &combined_cols,
+                    outer_col_count,
+                    inner_col_count,
+                    None,
+                    None,
+                    &equi,
+                    cancel,
+                    resolver,
+                )
+            };
+            outer_rows = match &expressions {
+                Some(expressions) => {
+                    expressions.with_resolver(schema, ctes, cancel, exec_sub, |resolver| {
+                        run(Some(resolver))
+                    })?
+                }
+                None => run(None)?,
+            };
             cur_tables.push((inner_alias.clone(), inner_schema));
         }
 
@@ -1002,7 +1050,7 @@ pub(super) fn exec_select_join_with_ctes(
     let outer = sources.outer_scope();
     let mut stmt = stmt.clone();
     materialize_join_conditions(schema, ctes, &mut stmt, &outer, cancel, exec_sub)?;
-    let (rows, columns) = sources.join(&stmt, cancel)?;
+    let (rows, columns) = sources.join(&stmt, schema, ctes, &outer, cancel, exec_sub)?;
     let row_width = columns.len();
     finish_captured_select(
         schema, ctes, stmt, &outer, rows, columns, row_width, cancel, exec_sub,

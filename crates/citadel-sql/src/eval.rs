@@ -416,11 +416,51 @@ fn next_random() -> i64 {
     }
 }
 
+/// Resolves runtime query slots before ordinary input-row lookup. Returning
+/// `None` leaves the slot to the row; implementations may recursively evaluate
+/// another slot, so they must release mutable state before that evaluation.
+pub(crate) trait InputResolver {
+    fn resolve(&self, index: usize, ctx: &EvalCtx<'_>) -> Result<Option<Value>>;
+}
+
+/// Private execution state keeps the public context's API and auto traits
+/// independent of a statement-local, possibly mutable subquery runtime.
+struct EvalFrame<'ctx, 'values> {
+    base: &'ctx EvalCtx<'values>,
+    resolver: Option<&'ctx dyn InputResolver>,
+}
+
+impl<'values> std::ops::Deref for EvalFrame<'_, 'values> {
+    type Target = EvalCtx<'values>;
+
+    fn deref(&self) -> &Self::Target {
+        self.base
+    }
+}
+
 pub fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
+    eval_expr_with_resolver(expr, ctx, None)
+}
+
+pub(crate) fn eval_expr_with_resolver(
+    expr: &Expr,
+    ctx: &EvalCtx<'_>,
+    resolver: Option<&dyn InputResolver>,
+) -> Result<Value> {
+    eval_expr_scoped(
+        expr,
+        &EvalFrame {
+            base: ctx,
+            resolver,
+        },
+    )
+}
+
+fn eval_expr_scoped(expr: &Expr, ctx: &EvalFrame<'_, '_>) -> Result<Value> {
     let Some(timezone) = ctx.session_tz.as_ref() else {
         return eval_expr_inner(expr, ctx);
     };
-    let identity = std::ptr::from_ref(ctx).cast::<()>();
+    let identity = std::ptr::from_ref(ctx.base).cast::<()>();
     JSONPATH_OVERRIDE_CTX.with(|slot| {
         if slot.get() == identity {
             return eval_expr_inner(expr, ctx);
@@ -442,14 +482,24 @@ pub fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
     })
 }
 
-fn eval_expr_inner(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
+fn eval_expr_inner(expr: &Expr, ctx: &EvalFrame<'_, '_>) -> Result<Value> {
     match expr {
         Expr::Literal(v) | Expr::BoundColumn { value: v, .. } => Ok(v.clone()),
-        Expr::InputRef { index, .. } => ctx.row.get(*index).cloned().ok_or_else(|| {
-            SqlError::Plan(format!(
-                "internal input slot {index} is outside the execution row"
-            ))
-        }),
+        Expr::InputRef { index, .. } => {
+            if let Some(resolver) = ctx.resolver {
+                if let Some(cancel) = ctx.cancel {
+                    cancel.check().map_err(SqlError::Storage)?;
+                }
+                if let Some(value) = resolver.resolve(*index, ctx.base)? {
+                    return Ok(value);
+                }
+            }
+            ctx.row.get(*index).cloned().ok_or_else(|| {
+                SqlError::Plan(format!(
+                    "internal input slot {index} is outside the execution row"
+                ))
+            })
+        }
 
         Expr::Column(name) => {
             let idx = ctx.col_map.resolve(name)?;
@@ -499,8 +549,8 @@ fn eval_expr_inner(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
         }
 
         Expr::BinaryOp { left, op, right } => {
-            let lval = eval_expr(left, ctx)?;
-            let rval = eval_expr(right, ctx)?;
+            let lval = eval_expr_scoped(left, ctx)?;
+            let rval = eval_expr_scoped(right, ctx)?;
             collated_compare_with_cancel(
                 &lval,
                 *op,
@@ -511,17 +561,17 @@ fn eval_expr_inner(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
         }
 
         Expr::UnaryOp { op, expr } => {
-            let val = eval_expr(expr, ctx)?;
+            let val = eval_expr_scoped(expr, ctx)?;
             eval_unary_op(*op, &val)
         }
 
         Expr::IsNull(e) => {
-            let val = eval_expr(e, ctx)?;
+            let val = eval_expr_scoped(e, ctx)?;
             Ok(Value::Boolean(val.is_null()))
         }
 
         Expr::IsNotNull(e) => {
-            let val = eval_expr(e, ctx)?;
+            let val = eval_expr_scoped(e, ctx)?;
             Ok(Value::Boolean(!val.is_null()))
         }
 
@@ -536,7 +586,7 @@ fn eval_expr_inner(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
             list,
             negated,
         } => {
-            let lhs = eval_expr(e, ctx)?;
+            let lhs = eval_expr_scoped(e, ctx)?;
             eval_in_values(e, &lhs, list, ctx, *negated)
         }
 
@@ -548,7 +598,7 @@ fn eval_expr_inner(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
             negated,
             collation,
         } => {
-            let lhs = eval_expr(e, ctx)?;
+            let lhs = eval_expr_scoped(e, ctx)?;
             // `x IN (SELECT y)` collates as `x = y`, which takes it from either
             // operand, left first.
             let coll = operand_collation(e, ctx.col_map).unwrap_or(*collation);
@@ -562,9 +612,9 @@ fn eval_expr_inner(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
             high,
             negated,
         } => {
-            let val = eval_expr(e, ctx)?;
-            let lo = eval_expr(low, ctx)?;
-            let hi = eval_expr(high, ctx)?;
+            let val = eval_expr_scoped(e, ctx)?;
+            let lo = eval_expr_scoped(low, ctx)?;
+            let hi = eval_expr_scoped(high, ctx)?;
             eval_between(
                 &val,
                 &lo,
@@ -581,9 +631,12 @@ fn eval_expr_inner(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
             escape,
             negated,
         } => {
-            let val = eval_expr(e, ctx)?;
-            let pat = eval_expr(pattern, ctx)?;
-            let esc = escape.as_ref().map(|e| eval_expr(e, ctx)).transpose()?;
+            let val = eval_expr_scoped(e, ctx)?;
+            let pat = eval_expr_scoped(pattern, ctx)?;
+            let esc = escape
+                .as_ref()
+                .map(|e| eval_expr_scoped(e, ctx))
+                .transpose()?;
             eval_like(&val, &pat, esc.as_ref(), *negated)
         }
 
@@ -592,8 +645,8 @@ fn eval_expr_inner(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
             right,
             negated,
         } => {
-            let lval = eval_expr(left, ctx)?;
-            let rval = eval_expr(right, ctx)?;
+            let lval = eval_expr_scoped(left, ctx)?;
+            let rval = eval_expr_scoped(right, ctx)?;
             // NULL is a value here, so the answer is never unknown: two NULLs are alike and
             // a NULL beside anything else is not.
             let alike = match (lval.is_null(), rval.is_null()) {
@@ -614,7 +667,7 @@ fn eval_expr_inner(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
 
         Expr::Coalesce(args) => {
             for arg in args {
-                let val = eval_expr(arg, ctx)?;
+                let val = eval_expr_scoped(arg, ctx)?;
                 if !val.is_null() {
                     return Ok(val);
                 }
@@ -623,11 +676,11 @@ fn eval_expr_inner(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
         }
 
         Expr::Cast { expr: e, data_type } => {
-            let val = eval_expr(e, ctx)?;
+            let val = eval_expr_scoped(e, ctx)?;
             eval_cast_with_cancel(&val, *data_type, ctx.cancel)
         }
 
-        Expr::Collate { expr: e, .. } => eval_expr(e, ctx),
+        Expr::Collate { expr: e, .. } => eval_expr_scoped(e, ctx),
 
         Expr::InSubquery { .. } | Expr::Exists { .. } | Expr::ScalarSubquery(_) => Err(
             SqlError::Unsupported("subquery not materialized (internal error)".into()),
@@ -644,7 +697,7 @@ fn eval_expr_inner(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
         Expr::ArrayLiteral(elems) => {
             let mut out = Vec::with_capacity(elems.len());
             for e in elems {
-                out.push(eval_expr(e, ctx)?);
+                out.push(eval_expr_scoped(e, ctx)?);
             }
             Ok(Value::Array(std::sync::Arc::new(out)))
         }
@@ -663,7 +716,7 @@ fn eval_quantified(
     op: crate::parser::BinOp,
     quantifier: crate::parser::Quantifier,
     right: &crate::parser::QuantifiedRhs,
-    ctx: &EvalCtx,
+    ctx: &EvalFrame<'_, '_>,
 ) -> Result<Value> {
     use crate::parser::{BinOp, QuantifiedRhs, Quantifier};
     if !matches!(
@@ -674,7 +727,7 @@ fn eval_quantified(
             "ANY/ALL comparison op {op:?}"
         )));
     }
-    let lhs = eval_expr(left, ctx)?;
+    let lhs = eval_expr_scoped(left, ctx)?;
     let array = match right {
         QuantifiedRhs::Array(array) => array,
         QuantifiedRhs::Subquery(_) => {
@@ -683,7 +736,7 @@ fn eval_quantified(
             ));
         }
     };
-    let elems = match eval_expr(array, ctx)? {
+    let elems = match eval_expr_scoped(array, ctx)? {
         Value::Array(elems) => elems,
         Value::Null => return Ok(Value::Null),
         other => {
@@ -1593,7 +1646,7 @@ fn eval_in_values(
     lhs_expr: &Expr,
     lhs: &Value,
     list: &[Expr],
-    ctx: &EvalCtx,
+    ctx: &EvalFrame<'_, '_>,
     negated: bool,
 ) -> Result<Value> {
     if list.is_empty() {
@@ -1604,7 +1657,7 @@ fn eval_in_values(
     }
     let mut has_null = false;
     for item in list {
-        let rhs = eval_expr(item, ctx)?;
+        let rhs = eval_expr_scoped(item, ctx)?;
         if rhs.is_null() {
             has_null = true;
         } else if collated_eq(lhs, &rhs, compile_collation(lhs_expr, item, ctx.col_map))? {
@@ -1935,13 +1988,13 @@ fn eval_case(
     operand: Option<&Expr>,
     conditions: &[(Expr, Expr)],
     else_result: Option<&Expr>,
-    ctx: &EvalCtx,
+    ctx: &EvalFrame<'_, '_>,
 ) -> Result<Value> {
     if let Some(op_expr) = operand {
         // `CASE x WHEN c` is `x = c`, down to the collation that comparison would use.
-        let op_val = eval_expr(op_expr, ctx)?;
+        let op_val = eval_expr_scoped(op_expr, ctx)?;
         for (cond, result) in conditions {
-            let cond_val = eval_expr(cond, ctx)?;
+            let cond_val = eval_expr_scoped(cond, ctx)?;
             if !op_val.is_null()
                 && !cond_val.is_null()
                 && collated_eq(
@@ -1950,19 +2003,19 @@ fn eval_case(
                     compile_collation(op_expr, cond, ctx.col_map),
                 )?
             {
-                return eval_expr(result, ctx);
+                return eval_expr_scoped(result, ctx);
             }
         }
     } else {
         for (cond, result) in conditions {
-            let cond_val = eval_expr(cond, ctx)?;
+            let cond_val = eval_expr_scoped(cond, ctx)?;
             if is_truthy(&cond_val) {
-                return eval_expr(result, ctx);
+                return eval_expr_scoped(result, ctx);
             }
         }
     }
     match else_result {
-        Some(e) => eval_expr(e, ctx),
+        Some(e) => eval_expr_scoped(e, ctx),
         None => Ok(Value::Null),
     }
 }
@@ -2403,10 +2456,10 @@ pub(crate) fn is_session_dependent_jsonpath_op(op: &BinOp, left: &Expr, right: &
     }
 }
 
-fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Value> {
+fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalFrame<'_, '_>) -> Result<Value> {
     let evaluated: Vec<Value> = args
         .iter()
-        .map(|a| eval_expr(a, ctx))
+        .map(|a| eval_expr_scoped(a, ctx))
         .collect::<Result<Vec<_>>>()?;
 
     match name {

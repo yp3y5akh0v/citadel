@@ -257,7 +257,7 @@ mod owned_projection {
                     matches!(lane, CompiledSelectLane::Point(_)),
                     predicate == "id = 7"
                 );
-                let actual = lane.run(&mut db.begin_read()).unwrap();
+                let actual = lane.run(&mut db.begin_read().view()).unwrap();
                 assert_eq!(actual.rows, vec![expected], "{sql}");
             }
         }
@@ -266,7 +266,11 @@ mod owned_projection {
             &agg_select_stmt("SELECT label FROM t WHERE id = 404"),
         )
         .unwrap();
-        assert!(missing.run(&mut db.begin_read()).unwrap().rows.is_empty());
+        assert!(missing
+            .run(&mut db.begin_read().view())
+            .unwrap()
+            .rows
+            .is_empty());
     }
 }
 
@@ -1406,7 +1410,8 @@ mod parallel {
                 .unwrap();
             let mut rtx = db.begin_read();
             let leaves = rtx.collect_table_leaves(b"t").unwrap();
-            let states = parallel_stream_agg_sharded(&rtx, &plan, &leaves, shard_leaves).unwrap();
+            let states =
+                parallel_stream_agg_sharded(&rtx.view(), &plan, &leaves, shard_leaves).unwrap();
             assert_eq!(
                 agg_rows(plan, states, &stmt),
                 serial_rows,
@@ -2057,7 +2062,7 @@ fn compiled_select_defaults_reuse_selective_plans_for_point_and_fallback() {
             (i(1), vec![vec![i(1), Value::Real(7.0), Value::Real(7.0)]]),
         ] {
             crate::eval::with_scoped_params(&[parameter], || {
-                let actual = lane.run(&mut db.begin_read()).unwrap();
+                let actual = lane.run(&mut db.begin_read().view()).unwrap();
                 assert_eq!(actual.rows, expected, "{sql}");
             });
         }

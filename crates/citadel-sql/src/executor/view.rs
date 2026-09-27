@@ -1,6 +1,6 @@
 use std::cell::Cell;
 
-use citadel_txn::read_txn::ReadTxn;
+use citadel_txn::read_txn::ReadView;
 
 use crate::error::{Result, SqlError};
 use crate::parser::*;
@@ -16,7 +16,7 @@ thread_local! {
 const MAX_VIEW_DEPTH: u32 = 32;
 
 pub(super) fn exec_view_with_read(
-    rtx: &mut ReadTxn<'_>,
+    rtx: &mut ReadView<'_, '_>,
     schema: &SchemaManager,
     view_def: &ViewDef,
 ) -> Result<CteRows> {

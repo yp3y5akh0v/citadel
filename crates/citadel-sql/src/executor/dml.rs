@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::sync::Arc;
 
 use citadel_buffer::btree::{UpsertAction, UpsertOutcome};
-use citadel_txn::read_txn::ReadTxn;
+use citadel_txn::read_txn::ReadView;
 use citadel_txn::write_txn::WriteTxn;
 use rustc_hash::FxHashMap;
 
@@ -135,6 +135,18 @@ pub(super) fn stmt_has_subquery(stmt: &SelectStmt) -> bool {
         }
     }
     false
+}
+
+/// Conditional subqueries need a row-time evaluator even when the query itself
+/// captures no outer columns: the branch deciding whether to run it may do so.
+pub(super) fn has_conditional_subquery(expr: &Expr) -> bool {
+    let mut found = false;
+    crate::parser::visit_expr(expr, &mut |node| {
+        if matches!(node, Expr::Case { .. } | Expr::Coalesce(_)) && has_subquery(node) {
+            found = true;
+        }
+    });
+    found
 }
 
 pub(super) fn materialize_expr(
@@ -505,7 +517,7 @@ fn subquery_rows(
 }
 
 pub(super) fn exec_subquery_with_read(
-    rtx: &mut ReadTxn<'_>,
+    rtx: &mut ReadView<'_, '_>,
     schema: &SchemaManager,
     stmt: &SelectStmt,
     ctes: &CteContext,
@@ -559,6 +571,9 @@ pub(super) fn insert_has_subquery(stmt: &InsertStmt) -> bool {
 
 pub(super) fn materialize_insert(
     stmt: &InsertStmt,
+    schema: &SchemaManager,
+    params: &[Value],
+    cancel: Option<&citadel::CancelToken>,
     exec_sub: &mut dyn FnMut(&SelectStmt) -> Result<CteRows>,
 ) -> Result<InsertStmt> {
     let source = match &stmt.source {
@@ -567,7 +582,27 @@ pub(super) fn materialize_insert(
                 .iter()
                 .map(|row| {
                     row.iter()
-                        .map(|e| materialize_expr(e, exec_sub))
+                        .map(|expr| {
+                            if !has_conditional_subquery(expr) {
+                                return materialize_expr(expr, exec_sub);
+                            }
+                            let ctes = CteContext::default();
+                            let outer = super::OuterScope::single("", None, &[]);
+                            let expressions = super::correlated::RowExpressions::new(
+                                schema,
+                                &ctes,
+                                vec![expr.clone()],
+                                outer,
+                                0,
+                                cancel,
+                            )?;
+                            let columns = ColumnMap::new(&[]);
+                            let ctx =
+                                EvalCtx::with_params(&columns, &[], params).with_cancel(cancel);
+                            expressions
+                                .eval(0, schema, &ctes, &ctx, exec_sub)
+                                .map(Expr::Literal)
+                        })
                         .collect::<Result<Vec<_>>>()
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -624,7 +659,7 @@ pub(super) fn materialize_query_body(
 }
 
 pub(super) fn exec_query_body_with_read(
-    rtx: &mut ReadTxn<'_>,
+    rtx: &mut ReadView<'_, '_>,
     schema: &SchemaManager,
     body: &QueryBody,
     ctes: &CteContext,
@@ -654,7 +689,7 @@ pub(super) fn exec_query_body_in_txn(
 }
 
 pub(super) fn exec_query_body_with_read_qr(
-    rtx: &mut ReadTxn<'_>,
+    rtx: &mut ReadView<'_, '_>,
     schema: &SchemaManager,
     body: &QueryBody,
     ctes: &CteContext,
@@ -684,7 +719,7 @@ pub(super) fn exec_query_body_write(
 }
 
 pub(super) fn exec_compound_select_with_read(
-    rtx: &mut ReadTxn<'_>,
+    rtx: &mut ReadView<'_, '_>,
     schema: &SchemaManager,
     comp: &CompoundSelect,
     ctes: &CteContext,
@@ -1260,7 +1295,8 @@ fn exec_insert_in_txn_impl(
         None => insert_has_subquery(stmt),
     };
     let stmt = if has_sub {
-        materialized = materialize_insert(stmt, &mut |sub| {
+        let cancel = wtx.cancel_token().cloned();
+        materialized = materialize_insert(stmt, schema, params, cancel.as_ref(), &mut |sub| {
             exec_subquery_write(wtx, schema, sub, &empty_ctes)
         })?;
         &materialized

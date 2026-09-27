@@ -1,12 +1,18 @@
 use super::super::CteRows;
 use super::binding::{bind_outer, OuterScope};
 use super::*;
+use crate::eval::{eval_expr_with_resolver, InputResolver};
+use std::cell::RefCell;
+use std::sync::Arc;
 
-/// A subquery that reads the outer row, evaluated into an unnamed input slot.
+/// A deferred subquery addressed by an unnamed execution slot.
 struct Capture {
     node: Expr,
+    array_result: bool,
+    cache_row_value: bool,
     positions: Vec<usize>,
-    volatile: bool,
+    memo: Option<RefCell<FxHashMap<Vec<Value>, Arc<Expr>>>>,
+    row_values: RefCell<Vec<Option<Value>>>,
 }
 
 struct Extractor<'a> {
@@ -124,6 +130,41 @@ impl Extractor<'_> {
             | Expr::Parameter(_)
             | Expr::TypedNullRecord(_) => {}
         }
+        // Aggregate/window arguments belong to the surrounding SELECT phase.
+        // Keep such an IN/ANY operand visible, deferring only its query side.
+        match expr {
+            Expr::InSubquery {
+                expr: left,
+                subquery,
+                negated,
+            } if crate::parser::calls_aggregate_or_window(left) => {
+                let array = self.capture_array(subquery)?;
+                let left = std::mem::replace(left, Box::new(Expr::Literal(Value::Null)));
+                *expr = Expr::Quantified {
+                    left,
+                    op: if *negated { BinOp::NotEq } else { BinOp::Eq },
+                    quantifier: if *negated {
+                        Quantifier::All
+                    } else {
+                        Quantifier::Any
+                    },
+                    right: QuantifiedRhs::Array(Box::new(array)),
+                };
+                return Ok(());
+            }
+            Expr::Quantified {
+                left,
+                right: QuantifiedRhs::Subquery(query),
+                ..
+            } if crate::parser::calls_aggregate_or_window(left) => {
+                let array = self.capture_array(query)?;
+                if let Expr::Quantified { right, .. } = expr {
+                    *right = QuantifiedRhs::Array(Box::new(array));
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
         let is_query = matches!(
             expr,
             Expr::Exists { .. }
@@ -136,24 +177,80 @@ impl Extractor<'_> {
         );
         if is_query {
             // Without a row the binder only resolves names; it changes nothing.
-            if let Some(positions) =
+            let positions =
                 bind_outer(self.schema, self.ctes, expr, self.outer, None, self.cancel)?
-            {
-                // A scalar subquery compares as a value without an implicit
-                // column collation. Boolean captures need none either.
-                let replacement = Expr::InputRef {
-                    index: self.first + self.captures.len(),
-                    collation: None,
-                };
-                let node = std::mem::replace(expr, replacement);
-                self.captures.push(Capture {
-                    volatile: calls_volatile(&node),
-                    node,
-                    positions,
-                });
-            }
+                    .unwrap_or_default();
+            // A scalar subquery compares as a value without an implicit
+            // column collation. Boolean captures need none either.
+            let replacement = Expr::InputRef {
+                index: self.first + self.captures.len(),
+                collation: None,
+            };
+            let node = std::mem::replace(expr, replacement);
+            let volatile_operand = match &node {
+                Expr::InSubquery { expr, .. } => calls_volatile(expr),
+                Expr::Quantified { left, .. } => calls_volatile(left),
+                _ => false,
+            };
+            let volatile = calls_volatile(&node);
+            self.captures.push(Capture {
+                cache_row_value: volatile_operand || (!positions.is_empty() && volatile),
+                memo: (positions.is_empty() || !volatile)
+                    .then(|| RefCell::new(FxHashMap::default())),
+                row_values: RefCell::new(Vec::new()),
+                array_result: false,
+                node,
+                positions,
+            });
         }
         Ok(())
+    }
+
+    fn capture_array(&mut self, query: &SelectStmt) -> Result<Expr> {
+        let node = Expr::ScalarSubquery(Box::new(query.clone()));
+        let positions = bind_outer(
+            self.schema,
+            self.ctes,
+            &mut node.clone(),
+            self.outer,
+            None,
+            self.cancel,
+        )?
+        .unwrap_or_default();
+        // Bind NULL placeholders for shape analysis so an outer column keeps
+        // its collation even when it is the subquery's projected expression.
+        let mut shape = node.clone();
+        bind_outer(
+            self.schema,
+            self.ctes,
+            &mut shape,
+            self.outer,
+            Some(&vec![Value::Null; self.first]),
+            self.cancel,
+        )?;
+        let Expr::ScalarSubquery(query_shape) = shape else {
+            unreachable!()
+        };
+        let collation = super::super::dml::body_output_collations(
+            self.schema,
+            self.ctes,
+            &QueryBody::Select(query_shape),
+            1,
+        )[0];
+        let index = self.first + self.captures.len();
+        self.captures.push(Capture {
+            cache_row_value: !positions.is_empty() && calls_volatile(&node),
+            memo: (positions.is_empty() || !calls_volatile(&node))
+                .then(|| RefCell::new(FxHashMap::default())),
+            row_values: RefCell::new(Vec::new()),
+            array_result: true,
+            node,
+            positions,
+        });
+        Ok(Expr::InputRef {
+            index,
+            collation: Some(collation),
+        })
     }
 
     fn captured_by(&mut self, expr: &mut Expr) -> Result<bool> {
@@ -171,77 +268,260 @@ fn conjunction(conjuncts: Vec<Expr>) -> Option<Expr> {
     })
 }
 
-/// Evaluate every subquery in `stmt`'s per-row clauses that reads the `outer`
-/// row once per row of `rows`, binding that row into the subquery's lexical
-/// scopes. Each result becomes an unnamed slot the returned statement reads
-/// instead of the subquery. WHERE conjuncts that read no outer row filter
-/// `rows` first. Rows with equal captured values share one execution unless
-/// the subquery calls a volatile function. `ctes` are the CTEs visible to
-/// `stmt`. Returns None when no subquery reads the outer row.
+type SubqueryExecutor<'a> = &'a mut dyn FnMut(&SelectStmt) -> Result<CteRows>;
+
+/// Subqueries are immutable plans. Each memo holds materialized query results,
+/// not the enclosing conditional expression or an IN operand's current value.
+/// A runtime borrows the executor only while running a cache miss, and releases
+/// it before evaluating a dependent input slot.
+struct SubqueryRuntime<'a, 'e> {
+    captures: &'a [Capture],
+    first: usize,
+    row_identity: Option<usize>,
+    schema: &'a SchemaManager,
+    ctes: &'a CteContext,
+    outer: &'a OuterScope,
+    cancel: Option<&'a citadel::CancelToken>,
+    exec_sub: RefCell<SubqueryExecutor<'e>>,
+}
+
+impl InputResolver for SubqueryRuntime<'_, '_> {
+    fn resolve(&self, index: usize, ctx: &EvalCtx<'_>) -> Result<Option<Value>> {
+        let Some(capture) = index
+            .checked_sub(self.first)
+            .and_then(|i| self.captures.get(i))
+        else {
+            return Ok(None);
+        };
+        check_cancel(self.cancel)?;
+        let row_id = self
+            .row_identity
+            .filter(|_| capture.cache_row_value)
+            .map(|position| {
+                match ctx.row.get(position) {
+                    Some(Value::Integer(id)) if *id >= 0 => usize::try_from(*id)
+                        .map_err(|_| SqlError::Plan("invalid subquery row identity".into())),
+                    // An aggregate over no source rows has one synthetic NULL row.
+                    Some(Value::Null) => capture
+                        .row_values
+                        .borrow()
+                        .len()
+                        .checked_sub(1)
+                        .ok_or_else(|| SqlError::Plan("missing empty-group subquery slot".into())),
+                    _ => Err(SqlError::Plan("missing subquery row identity".into())),
+                }
+            })
+            .transpose()?;
+        if let Some(row_id) = row_id {
+            let values = capture.row_values.borrow();
+            let cached = values.get(row_id).ok_or_else(|| {
+                SqlError::Plan("subquery row identity outside its statement".into())
+            })?;
+            if let Some(value) = cached {
+                return Ok(Some(value.clone()));
+            }
+        }
+        let key = capture
+            .positions
+            .iter()
+            .map(|&position| {
+                ctx.row.get(position).cloned().ok_or_else(|| {
+                    SqlError::Plan(format!("captured input slot {position} is outside the row"))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let cached = capture
+            .memo
+            .as_ref()
+            .and_then(|memo| memo.borrow().get(&key).cloned());
+        let materialized = match cached {
+            Some(expr) => expr,
+            None => {
+                let mut bound = capture.node.clone();
+                bind_outer(
+                    self.schema,
+                    self.ctes,
+                    &mut bound,
+                    self.outer,
+                    Some(ctx.row),
+                    self.cancel,
+                )?;
+                let expr = {
+                    let mut exec = self.exec_sub.borrow_mut();
+                    if capture.array_result {
+                        let Expr::ScalarSubquery(query) = &bound else {
+                            return Err(SqlError::Plan("array capture has no query".into()));
+                        };
+                        let selected = exec(query)?;
+                        if selected.result.columns.len() != 1 {
+                            return Err(SqlError::SubqueryMultipleColumns);
+                        }
+                        let collation = selected.collation_at(0);
+                        let values = selected
+                            .result
+                            .rows
+                            .into_iter()
+                            .map(|mut row| row.remove(0))
+                            .collect();
+                        Expr::BoundColumn {
+                            value: Value::Array(Arc::new(values)),
+                            collation,
+                        }
+                    } else {
+                        super::super::dml::materialize_expr(&bound, &mut **exec)?
+                    }
+                };
+                let expr = Arc::new(expr);
+                if let Some(memo) = &capture.memo {
+                    memo.borrow_mut().insert(key, Arc::clone(&expr));
+                }
+                expr
+            }
+        };
+        let value = eval_expr_with_resolver(&materialized, ctx, Some(self))?;
+        if let Some(row_id) = row_id {
+            capture.row_values.borrow_mut()[row_id] = Some(value.clone());
+        }
+        Ok(Some(value))
+    }
+}
+
+/// A collection of expressions sharing one outer row. The execution callback
+/// is borrowed for each evaluation, so UPDATE can retain these memos while its
+/// writer moves through the normal mutation phases.
+pub(in crate::executor) struct RowExpressions {
+    pub expressions: Vec<Expr>,
+    captures: Vec<Capture>,
+    outer: OuterScope,
+    first: usize,
+}
+
+impl RowExpressions {
+    pub(in crate::executor) fn captures_outer(&self) -> bool {
+        self.captures
+            .iter()
+            .any(|capture| !capture.positions.is_empty())
+    }
+
+    pub(in crate::executor) fn new(
+        schema: &SchemaManager,
+        ctes: &CteContext,
+        mut expressions: Vec<Expr>,
+        outer: OuterScope,
+        first: usize,
+        cancel: Option<&citadel::CancelToken>,
+    ) -> Result<Self> {
+        let mut extractor = Extractor {
+            schema,
+            ctes,
+            outer: &outer,
+            cancel,
+            first,
+            captures: Vec::new(),
+        };
+        for expr in &mut expressions {
+            extractor.expr(expr)?;
+        }
+        let captures = extractor.captures;
+        Ok(Self {
+            expressions,
+            captures,
+            outer,
+            first,
+        })
+    }
+
+    pub(in crate::executor) fn eval(
+        &self,
+        index: usize,
+        schema: &SchemaManager,
+        ctes: &CteContext,
+        ctx: &EvalCtx<'_>,
+        exec_sub: &mut dyn FnMut(&SelectStmt) -> Result<CteRows>,
+    ) -> Result<Value> {
+        self.with_resolver(schema, ctes, ctx.cancel, exec_sub, |resolver| {
+            eval_expr_with_resolver(&self.expressions[index], ctx, Some(resolver))
+        })
+    }
+
+    pub(in crate::executor) fn with_resolver<R>(
+        &self,
+        schema: &SchemaManager,
+        ctes: &CteContext,
+        cancel: Option<&citadel::CancelToken>,
+        exec_sub: &mut dyn FnMut(&SelectStmt) -> Result<CteRows>,
+        evaluate: impl FnOnce(&dyn InputResolver) -> Result<R>,
+    ) -> Result<R> {
+        let runtime = SubqueryRuntime {
+            captures: &self.captures,
+            first: self.first,
+            row_identity: None,
+            schema,
+            ctes,
+            outer: &self.outer,
+            cancel,
+            exec_sub: RefCell::new(exec_sub),
+        };
+        evaluate(&runtime)
+    }
+}
+
+/// Post-scan execution owns the runtime through filtering, grouping, windows,
+/// ordering and projection. Only the expression evaluator decides whether a
+/// conditional branch demands a subquery.
 #[allow(clippy::too_many_arguments)]
-pub(in crate::executor) fn apply_captured_subqueries(
+pub(in crate::executor) fn finish_subqueries(
     schema: &SchemaManager,
     ctes: &CteContext,
-    stmt: &SelectStmt,
+    mut stmt: SelectStmt,
     outer: &OuterScope,
-    rows: &mut Vec<Vec<Value>>,
-    columns: &[ColumnDef],
-    row_width: &mut usize,
+    mut rows: Vec<Vec<Value>>,
+    columns: Vec<ColumnDef>,
+    first: usize,
     cancel: Option<&citadel::CancelToken>,
     exec_sub: &mut dyn FnMut(&SelectStmt) -> Result<CteRows>,
-) -> Result<Option<SelectStmt>> {
-    let mut rewritten = stmt.clone();
+) -> Result<ExecutionResult> {
     let mut extractor = Extractor {
         schema,
         ctes,
         outer,
         cancel,
-        first: *row_width,
+        first,
         captures: Vec::new(),
     };
     let mut prefilter = Vec::new();
     let mut deferred = Vec::new();
-    if let Some(where_clause) = rewritten.where_clause.take() {
-        for conjunct in flatten_and_exprs(&where_clause) {
-            let mut conjunct = conjunct.clone();
-            if extractor.captured_by(&mut conjunct)? {
-                deferred.push(conjunct);
+    if let Some(predicate) = stmt.where_clause.take() {
+        for conjunct in flatten_and_exprs(&predicate) {
+            let mut expr = conjunct.clone();
+            if extractor.captured_by(&mut expr)? {
+                deferred.push(expr);
             } else {
-                prefilter.push(conjunct);
+                prefilter.push(expr);
             }
         }
     }
-    rewritten.where_clause = conjunction(deferred);
-    for column in &mut rewritten.columns {
+    stmt.where_clause = conjunction(deferred);
+    for column in &mut stmt.columns {
         if let SelectColumn::Expr { expr, alias } = column {
             let name = crate::parser::expr_display_name(expr);
-            // A projection keeps the name of the expression it was written as.
             if extractor.captured_by(expr)? && alias.is_none() {
                 *alias = Some(name);
             }
         }
     }
-    for expr in rewritten
-        .group_by
-        .iter_mut()
-        .chain(rewritten.having.iter_mut())
-    {
+    for expr in stmt.group_by.iter_mut().chain(stmt.having.iter_mut()) {
         extractor.expr(expr)?;
     }
-    for item in &mut rewritten.order_by {
+    for item in &mut stmt.order_by {
         extractor.expr(&mut item.expr)?;
     }
     let captures = extractor.captures;
-    if captures.is_empty() {
-        return Ok(None);
-    }
-
     if let Some(filter) = conjunction(prefilter) {
-        let filter = super::super::dml::materialize_expr(&filter, exec_sub)?;
-        let col_map = ColumnMap::new(columns);
+        let col_map = ColumnMap::new(&columns);
         let mut kept = Vec::with_capacity(rows.len());
-        for (row_idx, row) in std::mem::take(rows).into_iter().enumerate() {
-            check_cancel_at(cancel, row_idx)?;
+        for (index, row) in rows.into_iter().enumerate() {
+            check_cancel_at(cancel, index)?;
             if is_truthy(&eval_expr(
                 &filter,
                 &EvalCtx::new(&col_map, &row).with_cancel(cancel),
@@ -249,59 +529,47 @@ pub(in crate::executor) fn apply_captured_subqueries(
                 kept.push(row);
             }
         }
-        *rows = kept;
+        rows = kept;
     }
-
-    let first = *row_width;
-    *row_width += captures.len();
-    let col_map = ColumnMap::new(columns);
-    let mut memos: Vec<Option<FxHashMap<Vec<Value>, Expr>>> = captures
+    if captures.is_empty() {
+        return super::super::process_select(
+            rows,
+            super::super::SelectCtx::new(&columns, &stmt, cancel).row_width(first),
+        );
+    }
+    let row_identity = captures
         .iter()
-        .map(|capture| (!capture.volatile).then(FxHashMap::default))
-        .collect();
-    for (row_idx, row) in rows.iter_mut().enumerate() {
-        check_cancel_at(cancel, row_idx)?;
-        row.extend(std::iter::repeat_n(Value::Null, captures.len()));
-        for (index, capture) in captures.iter().enumerate() {
-            let key: Vec<Value> = capture
-                .positions
-                .iter()
-                .map(|&position| row[position].clone())
-                .collect();
-            let mut materialize = || {
-                let mut bound = capture.node.clone();
-                bind_outer(
-                    schema,
-                    ctes,
-                    &mut bound,
-                    outer,
-                    Some(row.as_slice()),
-                    cancel,
-                )?;
-                super::super::dml::materialize_expr(&bound, exec_sub)
-            };
-            let uncached;
-            // IN captures may own a large set. Cache hits evaluate the same
-            // immutable expression; only its current outer-row operand varies.
-            let materialized: &Expr = match &mut memos[index] {
-                Some(memo) => match memo.entry(key) {
-                    std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-                    std::collections::hash_map::Entry::Vacant(entry) => {
-                        entry.insert(materialize()?)
-                    }
-                },
-                None => {
-                    uncached = materialize()?;
-                    &uncached
-                }
-            };
-            let value = eval_expr(
-                materialized,
-                &EvalCtx::new(&col_map, row).with_cancel(cancel),
-            )?;
-            row[first + index] = value;
+        .any(|capture| capture.cache_row_value)
+        .then_some(first + captures.len());
+    for capture in &captures {
+        if capture.cache_row_value {
+            capture.row_values.borrow_mut().resize(rows.len() + 1, None);
         }
     }
-    check_cancel(cancel)?;
-    Ok(Some(rewritten))
+    for (index, row) in rows.iter_mut().enumerate() {
+        check_cancel_at(cancel, index)?;
+        row.extend(std::iter::repeat_n(Value::Null, captures.len()));
+        if row_identity.is_some() {
+            row.push(Value::Integer(i64::try_from(index).map_err(|_| {
+                SqlError::Plan("too many subquery input rows".into())
+            })?));
+        }
+    }
+
+    let runtime = SubqueryRuntime {
+        captures: &captures,
+        first,
+        row_identity,
+        schema,
+        ctes,
+        outer,
+        cancel,
+        exec_sub: RefCell::new(exec_sub),
+    };
+    super::super::process_select(
+        rows,
+        super::super::SelectCtx::new(&columns, &stmt, cancel)
+            .row_width(first + captures.len() + usize::from(row_identity.is_some()))
+            .with_resolver(Some(&runtime)),
+    )
 }

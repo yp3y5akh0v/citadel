@@ -1,4 +1,5 @@
 use super::*;
+use crate::eval::eval_expr;
 use crate::parser::{BinOp, Expr};
 use crate::types::{Collation, ColumnDef, DataType, TableSchema, Value};
 
@@ -359,6 +360,7 @@ fn materialized_integer_join_observes_an_async_cancel() {
         None,
         &equi,
         Some(&token),
+        None,
     )
     .expect_err("the materialized join ignored cancellation");
     stopper.join().unwrap();
@@ -490,6 +492,7 @@ fn residual_join_predicate_propagates_scalar_cancellation() {
         None,
         &equi,
         Some(&token),
+        None,
     )
     .expect_err("the residual ON expression discarded its cancellation token");
 
@@ -625,6 +628,7 @@ fn check_numeric_join_paths(
                         outer_pk,
                         projection,
                         &equi,
+                        None,
                         None,
                     )
                     .unwrap();

@@ -153,7 +153,7 @@ pub(super) fn exec_refresh_matview(
     };
     reject_non_deterministic(&sq)?;
     let rows = {
-        let qr = super::cte::exec_select_query_with_read(&mut rtx, schema, &sq)?;
+        let qr = super::cte::exec_select_query_with_read(&mut rtx.view(), schema, &sq)?;
         match qr {
             ExecutionResult::Query(q) => {
                 TableSchema::validate_column_count(q.columns.len())?;

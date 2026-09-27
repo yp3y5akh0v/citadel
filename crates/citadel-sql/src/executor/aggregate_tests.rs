@@ -209,8 +209,8 @@ fn aggregate_materialization_honors_cancellation() {
     let token = citadel::CancelToken::new();
     token.cancel();
 
-    let err =
-        eval_aggregate_expr_with_cancel(&expr, &cm, &rows, Some(&token), cs.len()).unwrap_err();
+    let err = eval_aggregate_expr_with_cancel(&expr, &cm, &rows, Some(&token), cs.len(), None)
+        .unwrap_err();
 
     assert!(matches!(
         err,
@@ -267,7 +267,7 @@ fn aggregate_argument_passes_cancellation_into_scalar_evaluation() {
     let token = citadel::CancelToken::new();
     let _cancel = crate::fts::cancel_tokenize_after(token.clone(), 1);
 
-    let err = eval_aggregate_expr_with_cancel(&expr, &col_map, &rows, Some(&token), cs.len())
+    let err = eval_aggregate_expr_with_cancel(&expr, &col_map, &rows, Some(&token), cs.len(), None)
         .expect_err("the aggregate argument discarded its cancellation token");
 
     assert!(matches!(
