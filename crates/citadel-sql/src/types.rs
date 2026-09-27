@@ -407,8 +407,10 @@ impl Value {
     /// The SQL order of two values without a collation: intervals by length with 30-day
     /// months (so '1 month' and '30 days' tie), arrays element by element in this order and
     /// then by length, everything else in the total order.
+    #[inline]
     pub(crate) fn sql_cmp(&self, other: &Value) -> Ordering {
         match (self, other) {
+            (Value::Integer(a), Value::Integer(b)) => a.cmp(b),
             (
                 Value::Interval {
                     months: am,
@@ -826,6 +828,7 @@ impl Collation {
 
     /// The SQL order of two values: text under this collation, anything else as
     /// [`Value::sql_cmp`] orders it.
+    #[inline]
     pub(crate) fn cmp_value(self, a: &Value, b: &Value) -> std::cmp::Ordering {
         match (a, b) {
             (Value::Text(a), Value::Text(b)) => self.cmp_text(a, b),
